@@ -1,0 +1,9 @@
+# rust-lld ships inside the toolchain and links this workspace several times
+# faster than link.exe. Nothing extra to install.
+#
+# @note: do not add `rustflags` to this table. `just hot` passes -Cprefer-dynamic
+# through the RUSTFLAGS environment variable, and an environment RUSTFLAGS
+# replaces a config `rustflags` list outright instead of merging with it. The
+# `linker` key is a separate setting and survives.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

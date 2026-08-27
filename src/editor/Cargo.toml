@@ -1,0 +1,23 @@
+[package]
+name = "colby_editor"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+
+[dependencies]
+colby_core.workspace = true
+colby_engine.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true

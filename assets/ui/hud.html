@@ -1,0 +1,54 @@
+<!-- the demo game's interface.
+     Edit this file while colby is running and the window changes: it compiles
+     like a mesh does, and the game addresses what is in it by id rather than by
+     a handle that a recompile would invalidate. -->
+<link rel="stylesheet" href="theme.css">
+<script src="hud.lua"></script>
+
+<body>
+	<div class="panel">
+		<div class="row">
+			<div class="heading">colby</div>
+			<img class="badge" src="textures/tiles">
+		</div>
+
+		<div class="row">
+			<div class="dim">simulated</div>
+			<div id="time">0.0 s</div>
+		</div>
+
+		<div class="row">
+			<div class="dim">entities</div>
+			<div id="entities">0</div>
+		</div>
+
+		<div class="row">
+			<div class="dim">spin rate</div>
+			<div id="rate">0.00</div>
+		</div>
+
+		<div class="row">
+			<div class="dim">under the cursor</div>
+			<div id="hit">nothing</div>
+		</div>
+
+		<div class="row">
+			<div class="dim">physics</div>
+			<div id="physics">0/0 asleep</div>
+		</div>
+
+		<div class="row">
+			<div class="dim">joints</div>
+			<div id="joints">0 held</div>
+		</div>
+
+		<div class="track">
+			<div id="fill" class="fill"></div>
+		</div>
+
+		<div class="row buttons">
+			<div id="reset" class="button">reset</div>
+			<div id="hold" class="button">hold</div>
+		</div>
+	</div>
+</body>

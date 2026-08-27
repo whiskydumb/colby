@@ -1,0 +1,26 @@
+[package]
+name = "colby_script"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+
+# @note: named for the job rather than for the library behind it, the same way
+# `colby_physics` is: what a document can reach is a table this crate builds by
+# hand, so the VM under it stays a decision that can be taken again without a
+# call site moving. `colby_asset` is here for one function - `css::declarations`,
+# so that `width: 37%` written from a script means exactly what the same words
+# mean in a `style` attribute rather than being parsed a second way. @ref the
+# pre-commit audit list.
+[dependencies]
+colby_asset.workspace = true
+colby_core.workspace = true
+mlua.workspace = true
+
+[lints]
+workspace = true

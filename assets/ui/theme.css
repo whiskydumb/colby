@@ -1,0 +1,86 @@
+/* the stylesheet every colby document shares.
+ *
+ * Linked rather than pasted into each one: the compiler resolves the link and
+ * folds this in, so editing this file recompiles every document that names it
+ * and all of them change at once in a running window. */
+
+/* align-items is `stretch` by default, which is what CSS and Yoga both say and
+ * what colby keeps. It bites harder here than in a browser: there is no block
+ * layout at all, so every box is a flex container and a panel left to itself
+ * fills the height of the screen instead of hugging its rows. Say so once, at
+ * the top, and every document inherits the sane thing. */
+body {
+	align-items: flex-start;
+	font-family: "fonts/hack";
+	font-size: 15px;
+	color: #e8ecf2;
+	padding: 20px;
+}
+
+.panel {
+	flex-direction: column;
+	background-color: #12161ecc;
+	border-radius: 10px;
+	padding: 16px 18px;
+	gap: 10px;
+	width: 300px;
+}
+
+.heading {
+	font-size: 22px;
+	color: #f4c02f;
+}
+
+.row {
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px;
+}
+
+.dim {
+	color: #8b95a6;
+	font-size: 13px;
+}
+
+.track {
+	height: 8px;
+	background-color: #262d3a;
+	border-radius: 4px;
+}
+
+.fill {
+	height: 8px;
+	background-color: #4c8dff;
+	border-radius: 4px;
+}
+
+.buttons {
+	gap: 10px;
+}
+
+.button {
+	background-color: #262d3a;
+	border-radius: 6px;
+	padding: 8px 14px;
+	justify-content: center;
+	flex-grow: 1;
+}
+
+.button:hover {
+	background-color: #3b4757;
+}
+
+/* what the hold button looks like while it is holding, written from hud.lua by
+ * putting a second class on the box. A selector here is one class at a time, so
+ * this is `.on` rather than `.button.on` -- and it comes after `.button`
+ * because two rules of equal weight are settled by which was written last. */
+.on {
+	background-color: #f4c02f;
+	color: #12161e;
+}
+
+.badge {
+	width: 26px;
+	height: 26px;
+	border-radius: 6px;
+}

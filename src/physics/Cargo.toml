@@ -1,0 +1,27 @@
+[package]
+name = "colby_physics"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+
+# @note: no dependency but the core, and that is the whole argument for this
+# crate existing rather than a physics library being added to the runner.
+# `rapier3d` with `default-features = false` is 48 lockfile entries in the
+# shipping binary and brings `nalgebra` into a workspace that funnels glam
+# through one crate on purpose; `parry3d` alone is 34 for the half of the
+# problem that is easy. Bindings to a C++ solver want a C++ toolchain in
+# `just ci` and turn every call into unsafe FFI in a workspace that
+# denies unsafe. What crosses to the game is two function pointers either way,
+# so the library behind them stays a decision that can be taken again. @ref the
+# pre-commit audit list.
+[dependencies]
+colby_core.workspace = true
+
+[lints]
+workspace = true

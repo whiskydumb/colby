@@ -1,0 +1,41 @@
+[package]
+name = "colby_core"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+# @note: the dylib artifact is what makes hot-reload work at all. The host and
+# the game module both link colby_core dynamically under `just hot`, so there is
+# exactly one copy of the tracing dispatcher, the unload canary and every other
+# static in the process. A plain `cargo build` also emits the dylib and simply
+# never loads it; that costs one extra link and keeps the manifest honest.
+crate-type = [
+	"rlib",
+	"dylib",
+]
+
+[features]
+default = ["hot_reload"]
+hot_reload = [
+	"dep:ctor",
+	"dep:dtor",
+	"dep:libloading",
+]
+
+[dependencies]
+bytemuck.workspace = true
+ctor = { workspace = true, optional = true }
+dtor = { workspace = true, optional = true }
+glam.workspace = true
+libloading = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

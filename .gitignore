@@ -1,0 +1,36 @@
+# build
+/target
+**/*.rs.bk
+
+# what running the engine leaves behind. The console archive is a user file
+# rather than a derived one, which is why it stays in the workspace root and out
+# of target/: cargo clean should not take somebody's settings. colby.png is what
+# `just shot` writes when nobody names a path.
+/cvars.cfg
+/colby.png
+
+# secrets and local overrides
+.env
+.env.*
+!.env.example
+.cargo/credentials*
+
+# coverage
+*.profraw
+/coverage
+lcov.info
+
+# profiling
+*.mm_profdata
+flamegraph.svg
+perf.data*
+
+# rustc crash dumps
+rustc-ice-*
+
+# patch and merge leftovers
+*.orig
+*.rej
+
+# nix
+/result*

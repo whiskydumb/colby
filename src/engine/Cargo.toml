@@ -1,0 +1,28 @@
+[package]
+name = "colby_engine"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+
+[dependencies]
+colby_core.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+# @note: a dev-dependency, deliberately. The renderer reads geometry out of the
+# world's registry and does not care where it came from, so it must not depend
+# on the asset pipeline - but the question "does a mesh compiled from a file
+# actually reach the screen" can only be answered with both halves present, and
+# a pixel test is the only honest way to answer it.
+[dev-dependencies]
+colby_asset.workspace = true
+
+[lints]
+workspace = true

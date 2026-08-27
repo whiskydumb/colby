@@ -1,0 +1,33 @@
+[package]
+name = "colby_ui"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+
+# @note: taffy is the one dependency here, and it is the flexbox half of the
+# game's interface. `default-features = false` drops the grid, block and float
+# layout modes and the CSS parser feature, none of which colby's subset has any
+# way to ask for; what is left is two crates in the lockfile. @ref the
+# pre-commit audit list.
+[dependencies]
+colby_core.workspace = true
+colby_engine.workspace = true
+pollster.workspace = true
+taffy.workspace = true
+wgpu.workspace = true
+
+# @note: a dev-dependency, deliberately, and for the same reason the engine's
+# is. The interface lays out a `DocumentData`, and where that came from is not
+# its business - but the question "does this stylesheet lay out the way it
+# reads" can only be answered with the parser present.
+[dev-dependencies]
+colby_asset.workspace = true
+
+[lints]
+workspace = true

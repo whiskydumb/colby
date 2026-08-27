@@ -1,0 +1,383 @@
+[workspace]
+resolver = "3"
+members = ["src/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+authors = ["whisky <me@whisky.sh>"]
+license = "MIT"
+
+#
+# Dependencies
+#
+
+[workspace.dependencies.colby_asset]
+path = "src/asset"
+
+[workspace.dependencies.colby_core]
+path = "src/core"
+
+[workspace.dependencies.colby_editor]
+path = "src/editor"
+
+[workspace.dependencies.colby_engine]
+path = "src/engine"
+
+[workspace.dependencies.colby_game]
+path = "src/game"
+
+[workspace.dependencies.colby_physics]
+path = "src/physics"
+
+[workspace.dependencies.colby_script]
+path = "src/script"
+
+[workspace.dependencies.colby_ui]
+path = "src/ui"
+
+[workspace.dependencies.bytemuck]
+version = "1.25"
+default-features = false
+features = ["derive"]
+
+[workspace.dependencies.ctor]
+version = "1.0"
+default-features = false
+features = ["std", "proc_macro"]
+
+[workspace.dependencies.dtor]
+version = "1.0"
+default-features = false
+features = ["std", "proc_macro"]
+
+# @note: three crates for one subsystem, and the only place in the workspace
+# where a dependency draws the user interface rather than helping colby draw it.
+# Approved with the architecture: the editor is egui, the *game's* UI is
+# HTML/CSS over taffy, and the two never meet. `default-features = false`
+# everywhere: egui keeps only its bundled fonts, egui-wgpu's defaults would drag
+# in `wgpu/default` and `wgpu/webgl` and undo the feature set the renderer was
+# configured with, and egui-winit's optional clipboard and browser-opener are
+# not things an editor here needs yet. @ref the pre-commit audit list.
+[workspace.dependencies.egui]
+version = "0.36"
+default-features = false
+features = ["default_fonts"]
+
+[workspace.dependencies.egui-wgpu]
+version = "0.36"
+default-features = false
+
+[workspace.dependencies.egui-winit]
+version = "0.36"
+default-features = false
+
+[workspace.dependencies.glam]
+version = "0.33"
+default-features = false
+features = ["std"]
+
+[workspace.dependencies.libloading]
+version = "0.9"
+default-features = false
+features = ["std"]
+
+# @note: the one dependency taken purely for the asset compiler. It decodes PNG,
+# which happens offline: `.ctex` holds bytes the GPU can take as they are, so
+# nothing in the engine or the runner links this. The alternative was writing
+# inflate by hand, which is three hundred lines of reproducing someone else's
+# work - a different size of problem from the PNG *writer* in `colby_engine`,
+# which was sixty lines of arithmetic against pulling a compressor into a
+# renderer. @ref the pre-commit audit list.
+# @note: the Lua the game's interface is scripted in, and the first dependency
+# in the workspace that is a language rather than a library. `vendored` builds
+# Lua 5.4 from C sources with `cc`, which is seven lockfile entries - three of
+# them linked (`mlua`, `mlua-sys`, `bstr`) and four build-time only (`lua-src`,
+# `luajit-src`, `pkg-config`, `which`, none of which a `lua54` build ever calls).
+# Against egui's thirty-one and rapier's rejected forty-eight that is cheap, and
+# unlike bindings to Jolt it wants no cmake, no C++ and not one `unsafe` block:
+# `Lua::new_with` is a safe function, and only the debug library needs the
+# unsafe constructor. The cost that is real is a C compiler in `just ci`. @ref
+# the pre-commit audit list.
+[workspace.dependencies.mlua]
+version = "0.12"
+default-features = false
+features = ["lua54", "vendored"]
+
+[workspace.dependencies.png]
+version = "0.18"
+default-features = false
+
+# @note: the two halves of turning an outline font into an atlas, and the second
+# pair of dependencies taken purely for the asset compiler. `ttf-parser` reads
+# the tables and hands out contours; `ab_glyph_rasterizer` fills them. Neither
+# has a dependency of its own, and neither is linked by the engine or the
+# runner: a `.cfont` holds metrics and a distance field, so the font library
+# lands offline exactly the way `png` did. Writing the rasterizer by hand was
+# the alternative and is the same three hundred lines of reproducing someone
+# else's work that argued for taking `png`. @ref the pre-commit audit list.
+[workspace.dependencies.ab_glyph_rasterizer]
+version = "0.1"
+default-features = false
+features = ["std"]
+
+[workspace.dependencies.ttf-parser]
+version = "0.25"
+default-features = false
+features = ["std", "opentype-layout"]
+
+[workspace.dependencies.taffy]
+version = "0.14"
+default-features = false
+features = [
+	"std",
+	"taffy_tree",
+	"flexbox",
+	"content_size",
+]
+
+[workspace.dependencies.pollster]
+version = "1.0"
+default-features = false
+
+[workspace.dependencies.thiserror]
+version = "2.0"
+default-features = false
+features = ["std"]
+
+[workspace.dependencies.tracing]
+version = "0.1"
+default-features = false
+features = ["std", "attributes"]
+
+[workspace.dependencies.tracing-subscriber]
+version = "0.3"
+default-features = false
+features = ["std", "fmt", "ansi", "env-filter", "smallvec"]
+
+[workspace.dependencies.wgpu]
+version = "30.0"
+default-features = false
+features = ["std", "parking_lot", "wgpu-core", "dx12", "vulkan", "wgsl"]
+
+[workspace.dependencies.winit]
+version = "0.30"
+default-features = false
+features = ["rwh_06"]
+
+#
+# Profiles
+#
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# @note: the asset compiler is optimized even in a debug build, and it is the
+# only workspace crate that is. Baking a font is a distance transform over a
+# few million supersampled texels, which unoptimized takes thirteen seconds and
+# optimized takes a fraction of one - and the runner compiles assets
+# synchronously, on the frame that notices the file changed. Nobody steps
+# through this crate with a debugger; `just dbg` overrides it back for the day
+# somebody does.
+[profile.dev.package.colby_asset]
+opt-level = 2
+
+[profile.dbg]
+inherits = "dev"
+debug = "full"
+
+[profile.dbg.package."*"]
+debug = "limited"
+
+# the one place the asset compiler is built the way everything else is.
+[profile.dbg.package.colby_asset]
+opt-level = 0
+
+[profile.bench]
+strip = "none"
+debug = "line-tables-only"
+overflow-checks = false
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+overflow-checks = true
+
+[profile.release-dbg]
+inherits = "release"
+debug = "full"
+strip = "none"
+
+[profile.release-dbg.package."*"]
+debug = "limited"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# Hot-reload build. `-Cprefer-dynamic` is not set here because cargo only honours
+# per-profile rustflags on nightly; `just hot` exports RUSTFLAGS instead.
+[profile.hot]
+inherits = "dev"
+
+[profile.hot.package."*"]
+opt-level = 2
+
+[profile.hot.package.colby_asset]
+opt-level = 2
+
+# Incremental compilation lets rustc choose different codegen-unit names between
+# builds, which changes the mangled symbols colby_core.dll exports. A running
+# process keeps the core.dll it started with, so a game module rebuilt against a
+# renamed symbol set would fail to load mid-session. Deterministic symbol names
+# are worth more than incremental on a crate that is not the one being edited.
+[profile.hot.package.colby_core]
+incremental = false
+
+[workspace.lints.rust]
+absolute-paths-not-starting-with-crate = "warn"
+ambiguous-negative-literals = "warn"
+closure-returning-async-block = "warn"
+deprecated-in-future = "warn"
+deref-into-dyn-supertrait = "warn"
+elided-lifetimes-in-paths = "warn"
+explicit-outlives-requirements = "warn"
+ffi-unwind-calls = "warn"
+impl-trait-redundant-captures = "warn"
+keyword-idents = "warn"
+macro-use-extern-crate = "warn"
+meta-variable-misuse = "warn"
+missing-abi = "warn"
+missing-copy-implementations = "warn"
+non-ascii-idents = "warn"
+redundant-imports = "warn"
+redundant-lifetimes = "warn"
+semicolon-in-expressions-from-macros = "warn"
+single-use-lifetimes = "warn"
+trivial-casts = "warn"
+trivial-numeric-casts = "warn"
+unit-bindings = "warn"
+unnameable-types = "warn"
+unreachable-pub = "warn"
+unsafe-op-in-unsafe-fn = "warn"
+unstable-features = "warn"
+unused-extern-crates = "warn"
+unused-import-braces = "warn"
+unused-lifetimes = "warn"
+unused-macro-rules = "warn"
+unused-must-use = "warn"
+unused-qualifications = "warn"
+
+unsafe-code = "deny"
+
+dead-code-pub-in-binary = "allow"
+mismatched-lifetime-syntaxes = "allow"
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+cargo_common_metadata = { level = "allow", priority = 1 }
+multiple_crate_versions = { level = "allow", priority = 1 }
+
+complexity = { level = "warn", priority = -1 }
+needless_update = { level = "allow", priority = 1 }
+
+correctness = { level = "deny", priority = -1 }
+
+nursery = { level = "warn", priority = -1 }
+missing_const_for_fn = { level = "allow", priority = 1 }
+redundant_pub_crate = { level = "allow", priority = 1 }
+significant_drop_tightening = { level = "allow", priority = 1 }
+tuple_array_conversions = { level = "allow", priority = 1 }
+
+pedantic = { level = "warn", priority = -1 }
+default_trait_access = { level = "allow", priority = 1 }
+doc_markdown = { level = "allow", priority = 1 }
+enum_glob_use = { level = "allow", priority = 1 }
+if_not_else = { level = "allow", priority = 1 }
+inline_always = { level = "allow", priority = 1 }
+map_unwrap_or = { level = "allow", priority = 1 }
+match_bool = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+module_name_repetitions = { level = "allow", priority = 1 }
+similar_names = { level = "allow", priority = 1 }
+struct_excessive_bools = { level = "allow", priority = 1 }
+struct_field_names = { level = "allow", priority = 1 }
+unnecessary_wraps = { level = "allow", priority = 1 }
+
+perf = { level = "warn", priority = -1 }
+
+style = { level = "warn", priority = -1 }
+assertions_on_constants = { level = "allow", priority = 1 }
+module_inception = { level = "allow", priority = 1 }
+obfuscated_if_else = { level = "allow", priority = 1 }
+toplevel_ref_arg = { level = "allow", priority = 1 }
+
+suspicious = { level = "warn", priority = -1 }
+let_underscore_future = { level = "allow", priority = 1 }
+
+allow_attributes = "warn"
+as_conversions = "warn"
+as_pointer_underscore = "warn"
+as_underscore = "warn"
+assertions_on_result_states = "warn"
+cognitive_complexity = "warn"
+create_dir = "warn"
+dbg_macro = "warn"
+default_union_representation = "warn"
+deref_by_slicing = "warn"
+doc_include_without_cfg = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+excessive_nesting = "warn"
+exit = "warn"
+filetype_is_file = "warn"
+float_cmp_const = "warn"
+fn_to_numeric_cast_any = "warn"
+format_push_string = "warn"
+get_unwrap = "warn"
+if_then_some_else_none = "warn"
+impl_trait_in_params = "warn"
+infinite_loop = "warn"
+large_include_file = "warn"
+let_underscore_must_use = "warn"
+let_underscore_untyped = "warn"
+lossy_float_literal = "warn"
+map_with_unused_argument_over_ranges = "warn"
+mem_forget = "warn"
+missing_assert_message = "warn"
+mixed_read_write_in_expression = "warn"
+multiple_unsafe_ops_per_block = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+needless_raw_strings = "warn"
+non_zero_suggestions = "warn"
+pathbuf_init_then_push = "warn"
+pointer_format = "warn"
+precedence_bits = "warn"
+pub_without_shorthand = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+redundant_test_prefix = "warn"
+redundant_type_annotations = "warn"
+semicolon_outside_block = "warn"
+str_to_string = "warn"
+string_add = "warn"
+string_lit_chars_any = "warn"
+string_slice = "warn"
+suspicious_xor_used_as_pow = "warn"
+tests_outside_test_module = "warn"
+try_err = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unnecessary_self_imports = "warn"
+unneeded_field_pattern = "warn"
+unseparated_literal_suffix = "warn"
+unwrap_used = "warn"
+verbose_file_reads = "warn"

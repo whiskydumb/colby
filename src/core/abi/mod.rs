@@ -1,0 +1,639 @@
+//! The host/game boundary.
+//!
+//! The game module exports one C symbol returning a [`GameApi`] - a plain
+//! `#[repr(C)]` struct of function pointers - and the host calls through it.
+//! There is deliberately no symbol linkage between host and module: the unix
+//! answer is `RTLD_GLOBAL`, and that has no Windows equivalent.
+//!
+//! The other half of the contract is that **the module holds no state**. Every
+//! byte the game reads or writes lives in [`World`], which the host owns and
+//! keeps across reloads. A swap is then a function-pointer replacement with
+//! nothing to migrate.
+//!
+//! @note: `World` itself is not `#[repr(C)]`, and does not need to be. The
+//! boundary that has to have a fixed layout is the *call* - `GameApi` and the
+//! plain-data types reachable from `World` - and those all do. `World` is host
+//! Rust data reached through one pointer, and there is exactly one definition
+//! of it in the process because host and module share `colby_core.dll`. The
+//! runner refuses to start if that is not true, @ref
+//! [`mods::linkage`](crate::mods::linkage), and [`ABI_VERSION`] catches a
+//! module built against a different definition.
+
+use crate::glam::{Quat, Vec3};
+
+pub mod camera;
+pub mod console;
+pub mod cvar;
+pub mod entity;
+pub mod font;
+pub mod input;
+pub mod joint;
+pub mod material;
+pub mod mesh;
+pub mod physics;
+pub mod registry;
+pub mod state;
+pub mod texture;
+pub mod ui;
+
+pub use self::{
+	camera::Camera,
+	cvar::{Args, ConsoleFn, Cvars, Value},
+	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
+	font::{Font, FontData, FontId, Fonts, Glyph},
+	input::{Button, Input, Key},
+	joint::{Joint, JointId, JointKind, Joints, MAX_JOINTS},
+	material::{Material, MaterialId, Materials},
+	mesh::{Mesh, MeshData, MeshId, MeshVertex, Meshes},
+	physics::{
+		Bodies, Body, BodyId, BodyKind, MAX_BODIES, MAX_TOUCHES, Physics, Shape, ShapeKind,
+		Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
+	},
+	registry::{Entry, Registry},
+	state::GameState,
+	texture::{Texel, Texture, TextureData, TextureId, Textures},
+	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},
+};
+
+/// The revision of the types and signatures in this module.
+///
+/// The host refuses a module reporting a different value. Bump it whenever a
+/// signature or a layout below changes; forgetting to is a crash rather than an
+/// error message.
+pub const ABI_VERSION: u32 = 13;
+
+/// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
+pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
+
+/// Every entry point in [`GameApi`] has this signature.
+///
+/// The single argument is the host's [`World`]. Nothing else crosses, because
+/// nothing else needs to: the module reads its inputs and writes its outputs
+/// through that one pointer.
+///
+/// # Safety
+///
+/// `world` must point to a live, initialized [`World`] that no one else is
+/// touching for the duration of the call.
+pub type GameFn = unsafe extern "C-unwind" fn(world: *mut World);
+
+/// The function-pointer table a game module exports.
+///
+/// `C-unwind` rather than `C` is deliberate: a panic inside gameplay code
+/// should reach the host's `catch_unwind` and be reported, not abort the
+/// process. That only works because host and module share one panic runtime,
+/// which is what `-Cprefer-dynamic` buys.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GameApi {
+	/// The [`ABI_VERSION`] the module was compiled against.
+	pub abi_version: u32,
+
+	/// Called once each time the module is swapped in, before the first
+	/// `update`.
+	pub init: GameFn,
+
+	/// Called once per simulation step, at a constant rate whatever the frame
+	/// rate is doing. @ref [`World::dt`].
+	pub update: GameFn,
+
+	/// Called once before the module is swapped out or the host exits.
+	pub shutdown: GameFn,
+}
+
+/// The signature of the exported [`GAME_API_SYMBOL`].
+///
+/// # Safety
+///
+/// Only valid when resolved from a module built against this `ABI_VERSION`.
+pub type GameApiEntry = unsafe extern "C" fn() -> GameApi;
+
+/// All the state the game can see, owned by the host.
+///
+/// Host-written fields are inputs to the game; game-written fields are what the
+/// engine reads back out. Because this lives in the host it survives a module
+/// swap untouched, which is the whole reason the game can be replaced mid-frame
+/// without migrating anything.
+///
+/// Big enough that the host keeps it behind a `Box`.
+pub struct World {
+	/// Seconds the simulation has run for. Host-written.
+	///
+	/// Simulated seconds, not wall-clock ones: it advances by exactly
+	/// [`dt`](Self::dt) per step and stops advancing while the process is
+	/// stalled, so after a stall it is permanently behind the wall clock by
+	/// whatever the host dropped. That is the point - it is the clock the
+	/// simulation is on, and it is the same for a given number of steps on
+	/// every machine.
+	pub time: f32,
+
+	/// How long one simulation step is, in seconds. Host-written.
+	///
+	/// A constant, and the reason gameplay can integrate against it without
+	/// caring what the frame rate is doing. @ref
+	/// [`STEP_SECONDS`](crate::time::STEP_SECONDS).
+	pub dt: f32,
+
+	/// Simulation steps since the host started. Host-written.
+	///
+	/// Steps, not rendered frames: at 144 Hz there are more frames than these,
+	/// and during a stall there are fewer.
+	pub steps: u64,
+
+	/// How many times the game module has been swapped in. Host-written, and
+	/// the game's cue that it is looking at state an older build left behind.
+	pub reloads: u32,
+
+	/// The window's width divided by its height. Host-written; the renderer
+	/// uses it so that a shape does not stretch with the window.
+	pub aspect: f32,
+
+	/// Keyboard and mouse for this step. Host-written.
+	pub input: Input,
+
+	/// Where the renderer looks from. Game-written.
+	pub camera: Camera,
+
+	/// The window clear color, linear RGB. Game-written.
+	pub clear: Vec3,
+
+	/// The direction the light travels, in world space. Game-written.
+	///
+	/// Not normalized on the way in; the shader does that.
+	pub light: Vec3,
+
+	/// How lit a surface facing away from the light still is. Game-written.
+	pub ambient: Vec3,
+
+	/// What every dynamic body accelerates by, in units a second squared.
+	///
+	/// Game-written, like `light` and `ambient` and unlike everything else the
+	/// solver reads: it is a property of the world rather than of a body, so it
+	/// sits here rather than needing a call. The host's `phys.gravity` console
+	/// variable writes it too.
+	pub gravity: Vec3,
+
+	/// Whether something has asked the process to stop. Game-written, or
+	/// written by the `quit` command; the host reads it once a frame.
+	pub quit: bool,
+
+	/// How many pairs of bodies were touching at the end of the last step.
+	///
+	/// Host-written, like `steps`, and for the same kind of reason: it is the
+	/// engine reporting on itself so that a panel can be a view onto something
+	/// that exists rather than a reason to grow a mechanism.
+	pub contacts: u32,
+
+	/// Simulation steps the host owes over and above real time.
+	///
+	/// The console's single-step button: `sim.step 4` while paused puts four
+	/// here, and the host runs them and clears it. Nothing else should write
+	/// it, because time that did not pass is a thing to ask for deliberately.
+	pub owed_steps: u32,
+
+	/// Every entity in the world. Host-owned storage, reached by handle.
+	pub entities: Entities,
+
+	/// Every joint holding two bodies together, reached by handle.
+	///
+	/// Host-owned plain data beside the bodies, and for the same reasons. @ref
+	/// [`joint`](crate::abi::joint).
+	pub joints: Joints,
+
+	/// Every physics body, reached by handle.
+	///
+	/// Host-owned plain data, like the entities and unlike a resource
+	/// registry: a body is created and destroyed, so its handle is
+	/// generational. The solver reads and writes this table and owns none of
+	/// it, which is what keeps the authoritative transform somewhere the
+	/// editor can see and a saved scene can reach. @ref
+	/// [`physics`](crate::abi::physics).
+	pub bodies: Bodies,
+
+	/// Every mesh the renderer can draw, reached by handle.
+	///
+	/// Host-owned: the runner compiles what is under `assets/` and registers
+	/// each result here by name, so `meshes.find("meshes/crystal")` is how a
+	/// game gets hold of geometry it did not generate itself. Registering is
+	/// open to the game too, for geometry it builds at runtime.
+	pub meshes: Meshes,
+
+	/// Every texture the renderer can sample, reached by handle.
+	///
+	/// Filled the same way as `meshes`, from the same tree.
+	pub textures: Textures,
+
+	/// Every font the interface can draw with, reached by handle.
+	///
+	/// Filled the same way as `meshes` and from the same tree: the compiler
+	/// bakes a `.ttf` into metrics and a distance field, and nothing at runtime
+	/// links a font library. @ref [`font`](crate::abi::font).
+	pub fonts: Fonts,
+
+	/// Every material, reached by handle.
+	///
+	/// Unlike the other two this is mostly the *game's* table: a material is a
+	/// handful of numbers and a texture handle, so a game builds them inline
+	/// rather than importing them from anywhere.
+	pub materials: Materials,
+
+	/// Every console variable and command in the process.
+	///
+	/// Host-owned like the other tables, and open to the game the same way
+	/// materials are: registering a variable from `init` is how gameplay gets a
+	/// number someone can turn without a rebuild. @ref
+	/// [`cvar`](crate::abi::cvar) for what a reload does to them.
+	pub cvars: Cvars,
+
+	/// Every interface document, and what the game has put on screen.
+	///
+	/// Filled from the asset tree like the meshes are, and written by the game
+	/// the way the material table is. @ref [`ui`](crate::abi::ui).
+	pub ui: Ui,
+
+	/// The game's own state. The host allocates it and never looks inside.
+	pub state: GameState,
+
+	/// The two queries the host answers about [`bodies`](Self::bodies).
+	///
+	/// Private, like the interpolation fields and for a stronger reason: it is
+	/// the one thing on `World` the game must never write, because the
+	/// pointers in it are the host's. Reached through
+	/// [`trace_ray`](Self::trace_ray) and [`trace_box`](Self::trace_box), and
+	/// installed once by [`install_physics`](Self::install_physics).
+	physics: Physics,
+
+	/// The camera as it stood at the end of the previous step.
+	///
+	/// Private, unlike everything above: it is neither an input to the game nor
+	/// an output from it, only the other end of the blend the renderer asks for
+	/// through [`render_camera`](Self::render_camera).
+	camera_previous: Camera,
+
+	/// Whether the game has said the camera cut rather than moved.
+	camera_snap: bool,
+
+	/// How far the frame being drawn sits past the last simulated state.
+	interpolation: f32,
+}
+
+impl World {
+	/// A world with nothing in it.
+	#[must_use]
+	pub fn new() -> Self {
+		Self {
+			time: 0.0,
+			dt: crate::time::STEP_SECONDS,
+			steps: 0,
+			reloads: 0,
+			aspect: 1.0,
+			input: Input::default(),
+			camera: Camera::DEFAULT,
+			clear: Vec3::ZERO,
+			light: Vec3::new(-0.4, -1.0, -0.3),
+			ambient: Vec3::splat(0.25),
+			gravity: Vec3::new(0.0, -9.81, 0.0),
+			quit: false,
+			owed_steps: 0,
+			contacts: 0,
+			entities: Entities::new(),
+			bodies: Bodies::new(),
+			joints: Joints::new(),
+			meshes: Meshes::new(),
+			textures: Textures::new(),
+			fonts: Fonts::new(),
+			materials: Materials::new(),
+			cvars: Cvars::new(),
+			ui: Ui::new(),
+			state: GameState::new(),
+			physics: Physics::STUB,
+			camera_previous: Camera::DEFAULT,
+			camera_snap: false,
+			// one, so that a world nobody paces - a test, a screenshot - draws
+			// the state it was handed rather than a blend of it with whatever
+			// came before. The host overwrites this every frame.
+			interpolation: 1.0,
+		}
+	}
+
+	/// Moves the present into the past, ready for another step.
+	///
+	/// The host calls this before every simulation step, and once more after a
+	/// game module is swapped in - a reload is a discontinuity whatever the
+	/// game does about it, so nothing is drawn arriving from the pose the
+	/// previous build left behind.
+	pub fn advance(&mut self) {
+		self.entities.advance();
+		self.camera_previous = self.camera;
+		self.camera_snap = false;
+	}
+
+	/// Applies everything the step just finished asked not to be interpolated.
+	///
+	/// The host calls this after the game's `update`. @ref
+	/// [`Entities::settle`].
+	pub fn settle(&mut self) {
+		self.entities.settle();
+
+		// guarded, unlike `advance`. Settling every step unconditionally would
+		// leave `camera_previous` equal to `camera` at every render, which
+		// looks like nothing at all and is in fact the camera never being
+		// interpolated again.
+		if self.camera_snap {
+			self.camera_previous = self.camera;
+			self.camera_snap = false;
+		}
+	}
+
+	/// Declares that the camera cut rather than moved.
+	///
+	/// The camera is interpolated like everything else, so a game that jumps
+	/// it, on a reset or a cut to another view, has to say so, or the whole
+	/// picture slides into the new pose over the next frame. Takes effect at
+	/// the end of the step, so it can be called before or after the jump it
+	/// describes.
+	pub fn snap_camera(&mut self) { self.camera_snap = true; }
+
+	/// Sets how far the frame being drawn sits past the last simulated state.
+	///
+	/// The host's to call, once per frame, before it renders.
+	///
+	/// @param t - the fraction of a step, clamped into `0.0 ..= 1.0`
+	pub fn set_interpolation(&mut self, t: f32) { self.interpolation = t.clamp(0.0, 1.0); }
+
+	/// How far the frame being drawn sits past the last simulated state.
+	#[must_use]
+	pub const fn interpolation(&self) -> f32 { self.interpolation }
+
+	/// The camera this frame should be drawn through.
+	#[must_use]
+	pub fn render_camera(&self) -> Camera {
+		self.camera_previous
+			.lerp(self.camera, self.interpolation)
+	}
+
+	/// Where an entity should be drawn this frame.
+	///
+	/// @param id - the entity to place
+	/// @return the blended transform, or `None` if the handle is stale
+	#[must_use]
+	pub fn render_transform(&self, id: EntityId) -> Option<Transform> {
+		self.entities.interpolated(id, self.interpolation)
+	}
+
+	/// Hands the world the queries a solver can answer.
+	///
+	/// The host's to call, once, at startup. The pointers inside address the
+	/// executable rather than the game module, so nothing about a reload
+	/// disturbs them and there is no second call to make. @ref
+	/// [`physics`](crate::abi::physics).
+	///
+	/// @param physics - the table to install
+	pub const fn install_physics(&mut self, physics: Physics) { self.physics = physics; }
+
+	/// Traces a ray through the world.
+	///
+	/// @param info - where from, where to, and what to be blind to
+	/// @return what was in the way, or a miss
+	#[must_use]
+	pub fn trace_ray(&self, info: &TraceInfo) -> TraceResult {
+		self.physics.cast_ray(&self.bodies, info)
+	}
+
+	/// Sweeps an axis-aligned box through the world.
+	///
+	/// @param info - the sweep, whose `extents` are the box's half-extents
+	/// @return what was in the way, or a miss
+	#[must_use]
+	pub fn trace_box(&self, info: &TraceInfo) -> TraceResult {
+		self.physics.cast_shape(&self.bodies, info)
+	}
+
+	/// Creates a joint, remembering how the two bodies are turned right now.
+	///
+	/// The only way a weld or a hinge should be made: `rest` is the relative
+	/// rotation the joint holds them at, and this is the one place that can see
+	/// both bodies to work it out. @ref
+	/// [`Joint::rest`](crate::abi::Joint::rest).
+	///
+	/// @param joint - what to create; its `rest` is overwritten
+	/// @return the joint's handle, or [`JointId::NONE`] if the table is full
+	pub fn join(&mut self, mut joint: Joint) -> JointId {
+		let turned = |id| {
+			self.bodies
+				.get(id)
+				.map_or(Quat::IDENTITY, |body| body.transform.rotation)
+		};
+
+		joint.rest = turned(joint.second) * turned(joint.first).inverse();
+
+		self.joints.spawn(joint)
+	}
+
+	/// Creates a body that drives an entity, starting where the entity is.
+	///
+	/// The usual way to give something on screen a presence in the world. A
+	/// body with nothing to draw is [`Bodies::spawn`] instead.
+	///
+	/// @param entity - what the body drives
+	/// @param kind - what the solver may do with it
+	/// @param shape - what it is shaped like
+	/// @return the body's handle, or [`BodyId::NONE`] if the table is full or
+	/// the entity handle was stale
+	pub fn attach_body(&mut self, entity: EntityId, kind: BodyKind, shape: Shape) -> BodyId {
+		let Some(&transform) = self.entities.transform(entity) else {
+			return BodyId::NONE;
+		};
+
+		self.bodies
+			.spawn(Body::new(kind, shape, transform).driving(entity))
+	}
+
+	/// Moves a body and declares that it cut rather than traveled.
+	///
+	/// The entity is written here rather than at the next step, and snapped, so
+	/// that nothing is drawn sliding across the gap. Ordinary movement is a
+	/// write through [`Bodies::get_mut`] and wants none of this.
+	///
+	/// @param id - the body to move
+	/// @param transform - where it now is
+	/// @return `true` if the handle resolved
+	pub fn teleport_body(&mut self, id: BodyId, transform: Transform) -> bool {
+		let Some(body) = self.bodies.get_mut(id) else {
+			return false;
+		};
+
+		body.transform = transform;
+		let entity = body.entity;
+
+		if let Some(slot) = self.entities.transform_mut(entity) {
+			*slot = transform;
+			self.entities.snap(entity);
+		}
+
+		true
+	}
+}
+
+impl Default for World {
+	fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn game_api_is_a_table_of_pointers() {
+		assert_eq!(
+			size_of::<GameApi>(),
+			size_of::<u64>() * 4,
+			"a version word and three function pointers, padded to eight bytes"
+		);
+	}
+
+	#[test]
+	fn a_default_world_starts_opaque_black_and_empty() {
+		let world = World::new();
+
+		assert_eq!(world.clear, Vec3::ZERO, "nothing on screen until the game says so");
+		assert!(world.aspect > 0.0, "aspect is a divisor and must never start at zero");
+		assert!(world.light.length() > 0.0, "a zero light direction has no normal to take");
+		assert!(world.entities.is_empty(), "and nothing exists yet");
+		assert_eq!(world.state.layout(), 0, "nor has the game claimed its arena");
+	}
+
+	#[test]
+	fn a_default_world_can_already_draw_the_built_in_shapes() {
+		let world = World::new();
+
+		assert_eq!(
+			world.meshes.find(mesh::CUBE_NAME),
+			MeshId::CUBE,
+			"the primitives are seeded before anything asks for them"
+		);
+		assert_eq!(world.meshes.find(mesh::QUAD_NAME), MeshId::QUAD, "both of them");
+		assert_eq!(
+			world.meshes.find("meshes/crystal"),
+			MeshId::NONE,
+			"and nothing from disk until the host loads it"
+		);
+	}
+
+	#[test]
+	fn a_world_nobody_paces_draws_the_state_it_was_handed() {
+		let mut world = World::new();
+		let id = world.entities.spawn_at(Transform::at(Vec3::X));
+
+		assert!(
+			(world.interpolation() - 1.0).abs() < f32::EPSILON,
+			"a fresh world is at the end of its step"
+		);
+
+		world.advance();
+		if let Some(transform) = world.entities.transform_mut(id) {
+			transform.position = Vec3::new(5.0, 0.0, 0.0);
+		}
+
+		assert_eq!(
+			world.render_transform(id).map(|it| it.position),
+			Some(Vec3::new(5.0, 0.0, 0.0)),
+			"so a test or a screenshot sees exactly what it wrote"
+		);
+	}
+
+	#[test]
+	fn interpolation_is_clamped_however_it_is_set() {
+		let mut world = World::new();
+
+		world.set_interpolation(4.0);
+		assert!(
+			(world.interpolation() - 1.0).abs() < f32::EPSILON,
+			"past the end of the step is the end of it"
+		);
+
+		world.set_interpolation(-1.0);
+		assert!(world.interpolation().abs() < f32::EPSILON, "and before the start is the start");
+	}
+
+	#[test]
+	fn the_render_camera_sits_between_the_two_steps() {
+		let mut world = World::new();
+		world.camera.position = Vec3::new(0.0, 0.0, 10.0);
+		world.advance();
+		world.camera.position = Vec3::new(0.0, 0.0, 20.0);
+		world.set_interpolation(0.5);
+
+		assert!(
+			world
+				.render_camera()
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 0.0, 15.0), 1.0e-5),
+			"the camera is interpolated too, or everything on screen judders when it moves"
+		);
+	}
+
+	#[test]
+	fn a_camera_that_merely_moved_is_still_interpolated_after_the_step() {
+		let mut world = World::new();
+		world.camera.position = Vec3::new(0.0, 0.0, 10.0);
+		world.advance();
+
+		world.camera.position = Vec3::new(0.0, 0.0, 20.0);
+		// the ordinary case: the step ends, nothing was declared a cut.
+		world.settle();
+		world.set_interpolation(0.5);
+
+		assert!(
+			world
+				.render_camera()
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 0.0, 15.0), 1.0e-5),
+			"settling must not snap a camera that did not ask to be snapped, or the camera \
+			 stops interpolating entirely and judders against a scene that does not: got {}",
+			world.render_camera().position
+		);
+	}
+
+	#[test]
+	fn a_camera_that_cut_does_not_slide_into_place() {
+		let mut world = World::new();
+		world.camera.position = Vec3::new(0.0, 0.0, 10.0);
+		world.advance();
+
+		world.camera.position = Vec3::new(0.0, 0.0, 90.0);
+		world.snap_camera();
+		// ordinary movement after the cut, in the same step: the cut still
+		// holds, because it is applied at the end rather than where it is
+		// written.
+		world.camera.position.z += 1.0;
+		world.settle();
+		world.set_interpolation(0.5);
+
+		assert!(
+			world
+				.render_camera()
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 0.0, 91.0), 1.0e-5),
+			"a cut camera is drawn where it landed, got {}",
+			world.render_camera().position
+		);
+	}
+
+	#[test]
+	fn a_default_world_has_no_input_held() {
+		let world = World::new();
+
+		assert_eq!(world.input.keys, [0; input::KEY_WORDS], "nothing is down before a frame");
+		assert_eq!(world.input.buttons, 0, "nothing is down before a frame");
+	}
+
+	#[test]
+	fn the_exported_symbol_is_nul_terminated() {
+		assert_eq!(
+			GAME_API_SYMBOL.last(),
+			Some(&0),
+			"GetProcAddress takes a C string, not a Rust slice"
+		);
+	}
+}

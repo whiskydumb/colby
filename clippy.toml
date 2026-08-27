@@ -1,0 +1,16 @@
+msrv = "1.97"
+
+# size thresholds, in bytes
+stack-size-threshold = 131072
+future-size-threshold = 16384
+array-size-threshold = 4096
+enum-variant-size-threshold = 128
+large-error-threshold = 128
+
+# complexity thresholds
+too-many-lines-threshold = 100
+excessive-nesting-threshold = 4
+type-complexity-threshold = 200
+cognitive-complexity-threshold = 25
+
+allow-unwrap-in-tests = true

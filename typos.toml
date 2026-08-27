@@ -1,0 +1,9 @@
+[files]
+# @note: `target/` is here because this checkout is not a git repository yet, so
+# typos has no .gitignore to honour. Once it is one, this line can go.
+extend-exclude = ["Cargo.lock", "CHANGELOG.md", "target/"]
+
+[default]
+locale = "en-us"
+
+[default.extend-words]

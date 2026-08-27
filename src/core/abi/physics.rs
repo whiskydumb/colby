@@ -1,0 +1,1194 @@
+//! Bodies, and the two queries a game asks the world about them.
+//!
+//! Three decisions are written into the shape of this module, and each was
+//! taken against a plausible alternative.
+//!
+//! **The body table is plain data in the host, exactly like the entity
+//! table.** Not a handle into somebody else's world. The invariant the whole
+//! engine stands on is that every byte the game can see lives in
+//! [`World`](crate::abi::World) and survives a module swap untouched, and a
+//! physics library that owns the authoritative transform breaks it - the editor
+//! cannot inspect what it cannot reach, and a sandbox that wants to save a
+//! scene cannot serialize it. The way back from that is mirroring, and it is
+//! paid for in the obvious way: every entity's position, rotation and velocity
+//! written into the library's own world every tick and read back out again,
+//! which is how a pile of props ends up never properly sleeping.
+//!
+//! **The solver is not in this crate, and neither is anything that needs an
+//! acceleration structure.** `colby_core` must not depend on a physics library,
+//! and it does not depend on `colby_physics` either. What crosses is
+//! [`Physics`], a `#[repr(C)]` table of two function pointers the host fills in
+//! at startup, pointing across the boundary the other way from the table a
+//! game module exports. Two, because a query is the only part that needs more
+//! than the body table already says: a broadphase, and a baked collision mesh.
+//! Spawning a body, moving it, or making it kinematic are writes into plain
+//! data and need no pointer at all, which is why this table does not grow.
+//!
+//! **The table survives a reload because of which way the pointers point.**
+//! They address `colby.exe`, which is never unloaded, so a module swap does not
+//! touch them; the host installs them once and never again. Contrast
+//! [`cvar`](crate::abi::cvar), where a registered command points *into* the
+//! module's image and has to be forgotten before `FreeLibrary`. The direction
+//! is the whole of the difference, and it is worth knowing which one is being
+//! looked at before reasoning about either.
+//!
+//! A [`World`](crate::abi::World) nobody wired up holds [`Physics::STUB`],
+//! whose queries report a clean miss. That is the same discipline as
+//! [`MeshId::NONE`] and `PanelId::NONE`: a call through something that never
+//! resolved changes nothing rather than having to be checked at every call
+//! site.
+
+use core::ffi::c_void;
+
+use super::{entity::EntityId, mesh::MeshId};
+use crate::{
+	abi::Transform,
+	glam::{Mat3, Quat, Vec3},
+};
+
+/// How many bodies can exist at once.
+///
+/// Bounded for the reason the entity table is bounded: the gameplay crate is
+/// code that is *expected* to be wrong sometimes, and a reload that spawns a
+/// prop every step should run out of slots rather than out of memory.
+pub const MAX_BODIES: usize = 1024;
+
+/// How many bodies one query can be told to pretend are not there.
+///
+/// A fixed array rather than a pointer and a count: this ABI has no raw
+/// pointers in it anywhere except [`Physics`] itself, and that is a property
+/// worth more than the generality. Eight is what a sandbox needs: the prop in
+/// the hand, the thing it is welded to, and the player holding both.
+pub const MAX_IGNORED: usize = 8;
+
+/// Which of the three shapes a body is.
+///
+/// Three of them, because a box, a ball and a triangle soup cover everything a
+/// prop can be, and a fourth is a solver problem rather than a modeling one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ShapeKind {
+	/// A box, `extents` half-wide on each axis.
+	#[default]
+	Box,
+
+	/// A ball of `radius`.
+	Sphere,
+
+	/// The triangles of `mesh`.
+	Mesh,
+}
+
+/// What a body is shaped like.
+///
+/// One struct covering all three kinds, with the fields the kind does not use
+/// left alone. A shape crosses the boundary as plain data, and a tagged union
+/// that has to be read through an accessor buys nothing over four words that
+/// are sometimes zero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shape {
+	/// Which of the three this is.
+	pub kind: ShapeKind,
+
+	/// The radius of a [`ShapeKind::Sphere`].
+	pub radius: f32,
+
+	/// The half-extents of a [`ShapeKind::Box`].
+	pub extents: Vec3,
+
+	/// The geometry of a [`ShapeKind::Mesh`].
+	///
+	/// Read once, when the body is first seen by the solver, and baked into a
+	/// collision mesh of its own from then on. Recompiling the `.obj` therefore
+	/// changes the picture and **not** the collision until the body is created
+	/// again - deliberate, because a collision mesh is a physics resource with
+	/// its own preparation, not a second view onto a vertex buffer.
+	pub mesh: MeshId,
+}
+
+impl Shape {
+	/// A unit cube, one wide on every axis.
+	pub const UNIT: Self = Self::cuboid(Vec3::splat(0.5));
+
+	/// A ball.
+	///
+	/// @param radius - how far the surface is from the middle
+	#[must_use]
+	pub const fn ball(radius: f32) -> Self {
+		Self {
+			kind: ShapeKind::Sphere,
+			radius,
+			extents: Vec3::ZERO,
+			mesh: MeshId::NONE,
+		}
+	}
+
+	/// A box.
+	///
+	/// @param extents - **half**-extents, so a unit cube is `Vec3::splat(0.5)`
+	#[must_use]
+	pub const fn cuboid(extents: Vec3) -> Self {
+		Self {
+			kind: ShapeKind::Box,
+			radius: 0.0,
+			extents,
+			mesh: MeshId::NONE,
+		}
+	}
+
+	/// The triangles of a mesh, exactly as they are.
+	///
+	/// @param mesh - what to collide against
+	#[must_use]
+	pub const fn mesh(mesh: MeshId) -> Self {
+		Self {
+			kind: ShapeKind::Mesh,
+			radius: 0.0,
+			extents: Vec3::ZERO,
+			mesh,
+		}
+	}
+
+	/// A box around a mesh, from the bounds the mesh reports.
+	///
+	/// The usual way to give a prop collision: the geometry is convex enough
+	/// that its box is what a person would have typed, and a box is the shape
+	/// every query handles exactly.
+	///
+	/// @param min - the low corner of the mesh's bounds
+	/// @param max - the high corner
+	/// @return the box, and where its middle sits relative to the mesh's origin
+	#[must_use]
+	pub fn around(min: Vec3, max: Vec3) -> (Self, Vec3) {
+		let extents = ((max - min) * 0.5).max(Vec3::ZERO);
+
+		(Self::cuboid(extents), (min + max) * 0.5)
+	}
+
+	/// The half-extents of the smallest axis-aligned box holding this shape,
+	/// before any rotation.
+	///
+	/// A mesh reports nothing, because its size is not in this struct; the
+	/// solver knows it and this does not.
+	#[must_use]
+	pub fn local_extents(&self) -> Vec3 {
+		match self.kind {
+			| ShapeKind::Box => self.extents,
+			| ShapeKind::Sphere => Vec3::splat(self.radius),
+			| ShapeKind::Mesh => Vec3::ZERO,
+		}
+	}
+}
+
+impl Default for Shape {
+	fn default() -> Self { Self::UNIT }
+}
+
+/// What the solver is allowed to do with a body.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BodyKind {
+	/// Never moves. The world, and everything bolted to it.
+	#[default]
+	Static,
+
+	/// Moves only when something writes its transform. Pushes, is not pushed.
+	Kinematic,
+
+	/// Moved by the solver.
+	Dynamic,
+}
+
+/// A handle to a body.
+///
+/// Generational, unlike a resource handle and like [`EntityId`]. The registries
+/// never free a slot, because an asset lives as long as the process does; a
+/// body is destroyed and its slot reused, so a handle kept across that has to
+/// be detectable. A sandbox holding a prop that somebody else deleted must fail
+/// its lookup rather than pick up whoever moved in.
+///
+/// `Pod` for the reason [`EntityId`] is: a game keeps its handles in the arena,
+/// and a zeroed arena has to read back as [`BodyId::NONE`] rather than as
+/// something that could resolve. Zero is never a live generation, which is what
+/// makes that true.
+#[repr(C)]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	PartialEq,
+	Eq,
+	Hash,
+	crate::bytemuck::Pod,
+	crate::bytemuck::Zeroable,
+)]
+pub struct BodyId {
+	index: u32,
+	generation: u32,
+}
+
+impl BodyId {
+	/// A handle that refers to nothing, and always will.
+	pub const NONE: Self = Self { index: 0, generation: 0 };
+
+	/// Whether this handle could refer to anything at all.
+	///
+	/// A `true` here does not mean the body exists - only [`Bodies::alive`]
+	/// answers that.
+	#[must_use]
+	pub const fn is_some(self) -> bool { self.generation != 0 }
+
+	/// The slot this addresses, whatever lives there now.
+	///
+	/// The solver's, for keying its own per-body tables - a baked collision
+	/// mesh, later a contact cache. Paired with
+	/// [`generation`](Self::generation), which is how it notices the slot
+	/// changed hands.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "u32 to usize is lossless on every target this builds for, and try_from is 		          not available in a const fn"
+	)]
+	pub const fn slot(self) -> usize { self.index as usize }
+
+	/// Which occupant of that slot this handle names.
+	#[must_use]
+	pub const fn generation(self) -> u32 { self.generation }
+}
+
+/// One body: a shape, where it is, how it is moving, and what its surface is
+/// like.
+///
+/// Everything a solver needs and nothing it does not: the shape, the
+/// transform, the velocities, the mass and the surface. All of it is here
+/// because this table is the authority, and a solver that had to fetch a
+/// velocity from somewhere else would be mirroring again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Body {
+	/// What the solver may do with it.
+	pub kind: BodyKind,
+
+	/// What it is shaped like.
+	pub shape: Shape,
+
+	/// Where it is.
+	///
+	/// Which way this and the entity's transform are copied depends on `kind`,
+	/// and the rule is the one the word "kinematic" already means:
+	///
+	/// - **[`BodyKind::Dynamic`]** - the solver owns the transform, and the
+	///   entity is written *from* here at the end of every step.
+	/// - **[`BodyKind::Kinematic`] and [`BodyKind::Static`]** - gameplay owns
+	///   the transform, and this is written *from* the entity at the start of
+	///   every step, so a collider bolted to something the game moves follows
+	///   it without being told.
+	///
+	/// One consequence worth knowing: a game that moves an entity in `update`
+	/// and traces against it in the *same* `update` traces against where it was
+	/// a step ago, because the pull happens at the top of the next step. A game
+	/// that cares writes here as well, and this is authoritative immediately.
+	/// A body with no entity is always its own authority.
+	///
+	/// A jump rather than a slide wants
+	/// [`teleport_body`](crate::abi::World::teleport_body), which snaps the
+	/// entity so nothing is drawn crossing the gap.
+	pub transform: Transform,
+
+	/// How fast it is moving, in units a second. World space.
+	///
+	/// Written by the solver for a [`BodyKind::Dynamic`] body and read for
+	/// every other kind, so a moving platform pushes what stands on it. A game
+	/// may write it whenever it likes: that is what throwing something is.
+	pub velocity: Vec3,
+
+	/// How fast it is turning, in radians a second, about an axis that is the
+	/// vector's direction. World space.
+	pub angular: Vec3,
+
+	/// How heavy it is, in whatever unit the scene is consistent about.
+	///
+	/// Ignored unless the body is [`BodyKind::Dynamic`], where it must be
+	/// positive: a dynamic body of zero mass is a division waiting to happen,
+	/// and the solver treats one as [`Body::MASS`] rather than as immovable.
+	/// Immovable is what [`BodyKind::Static`] is for.
+	///
+	/// The inertia tensor is *not* here. It follows from this and the shape,
+	/// the solver works it out per step, and a cached one is a value that goes
+	/// stale the moment somebody changes either.
+	pub mass: f32,
+
+	/// How much of an impact comes back, from zero to one.
+	pub restitution: f32,
+
+	/// How hard it is to slide along.
+	pub friction: f32,
+
+	/// Whether the solver has stopped integrating this body.
+	///
+	/// Set by the solver when a dynamic body has been slow enough for long
+	/// enough, and cleared the moment anything touches it - a force, a
+	/// teleport, or another body arriving. Public because it is the question a
+	/// sandbox asks constantly ("is this pile settled"), and because a game
+	/// that writes `false` here is how you wake something up.
+	pub sleeping: bool,
+
+	/// The entity this body drives, or [`EntityId::NONE`].
+	///
+	/// Optional on purpose: a trigger volume, a clip brush and a query-only
+	/// collider are all bodies with nothing to draw.
+	pub entity: EntityId,
+}
+
+impl Body {
+	/// How much a body grips unless it says otherwise.
+	pub const FRICTION: f32 = 0.5;
+	/// How heavy a body is unless it says otherwise.
+	pub const MASS: f32 = 1.0;
+	/// How bouncy a body is unless it says otherwise.
+	pub const RESTITUTION: f32 = 0.2;
+
+	/// A body of a shape, at a transform, driving nothing.
+	///
+	/// @param kind - what the solver may do with it
+	/// @param shape - what it is shaped like
+	/// @param transform - where it is
+	#[must_use]
+	pub const fn new(kind: BodyKind, shape: Shape, transform: Transform) -> Self {
+		Self {
+			kind,
+			shape,
+			transform,
+			velocity: Vec3::ZERO,
+			angular: Vec3::ZERO,
+			mass: Self::MASS,
+			restitution: Self::RESTITUTION,
+			friction: Self::FRICTION,
+			sleeping: false,
+			entity: EntityId::NONE,
+		}
+	}
+
+	/// A body the solver moves.
+	///
+	/// @param shape - what it is shaped like
+	/// @param transform - where it starts
+	/// @param mass - how heavy it is
+	#[must_use]
+	pub const fn dynamic(shape: Shape, transform: Transform, mass: f32) -> Self {
+		let mut body = Self::new(BodyKind::Dynamic, shape, transform);
+		body.mass = mass;
+
+		body
+	}
+
+	/// The same body, thrown.
+	///
+	/// @param velocity - how fast, in units a second
+	/// @param angular - how fast it turns, in radians a second
+	#[must_use]
+	pub const fn moving(mut self, velocity: Vec3, angular: Vec3) -> Self {
+		self.velocity = velocity;
+		self.angular = angular;
+
+		self
+	}
+
+	/// Whether the solver integrates this body at all.
+	///
+	/// A mesh is never movable however it is declared. A triangle soup has no
+	/// inside, so it has no mass distribution and no inertia tensor, and Jolt
+	/// refuses the same combination for the same reason. Saying so here rather
+	/// than warning about it in the solver means every other piece of code can
+	/// ask one question instead of two.
+	#[must_use]
+	pub const fn movable(&self) -> bool {
+		matches!(self.kind, BodyKind::Dynamic) && !matches!(self.shape.kind, ShapeKind::Mesh)
+	}
+
+	/// One over the mass, or zero for anything the solver does not move.
+	///
+	/// The form every impulse in the solver actually wants, and the reason a
+	/// static body needs no special case anywhere: it is a body of infinite
+	/// mass, and infinite mass is zero here.
+	#[must_use]
+	pub fn inverse_mass(&self) -> f32 {
+		if !self.movable() {
+			return 0.0;
+		}
+
+		let mass = if self.mass > 0.0 { self.mass } else { Self::MASS };
+
+		1.0 / mass
+	}
+
+	/// The same body, driving an entity.
+	///
+	/// @param entity - what to write this body's transform into each step
+	#[must_use]
+	pub const fn driving(mut self, entity: EntityId) -> Self {
+		self.entity = entity;
+
+		self
+	}
+
+	/// The same body, with a surface.
+	///
+	/// @param restitution - how much of an impact comes back
+	/// @param friction - how hard it is to slide along
+	#[must_use]
+	pub const fn surfaced(mut self, restitution: f32, friction: f32) -> Self {
+		self.restitution = restitution;
+		self.friction = friction;
+
+		self
+	}
+
+	/// The smallest axis-aligned box in world space that holds this body.
+	///
+	/// A rotated box is bounded by the box around its rotated corners, which is
+	/// larger than the shape - that is what an axis-aligned bound is, and every
+	/// query that uses this treats it as a filter rather than as an answer.
+	///
+	/// @return `(min, max)`, or `None` for a mesh, whose size this struct does
+	/// not know
+	#[must_use]
+	pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
+		if self.shape.kind == ShapeKind::Mesh {
+			return None;
+		}
+
+		let extents = self.shape.local_extents() * self.transform.scale.abs();
+		let spread = rotated_extents(extents, self.transform.rotation);
+
+		Some((self.transform.position - spread, self.transform.position + spread))
+	}
+}
+
+impl Default for Body {
+	fn default() -> Self { Self::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY) }
+}
+
+/// The half-extents of the axis-aligned box holding a rotated box.
+///
+/// The absolute value of the rotation matrix applied to the extents, which is
+/// the standard trick and is exact.
+///
+/// @param extents - the box's half-extents before rotation
+/// @param rotation - how it is turned
+fn rotated_extents(extents: Vec3, rotation: Quat) -> Vec3 {
+	let matrix = Mat3::from_quat(rotation);
+
+	Vec3::new(
+		matrix.x_axis.abs().dot(extents.abs()),
+		matrix.y_axis.abs().dot(extents.abs()),
+		matrix.z_axis.abs().dot(extents.abs()),
+	)
+}
+
+/// How many bodies a step will report starting or stopping touching.
+///
+/// Bounded like everything else here. A step that produces more than this many
+/// is a step something has gone wrong in, and dropping the rest is better than
+/// a queue that grows until the process does.
+pub const MAX_TOUCHES: usize = 256;
+
+/// What happened between two bodies.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TouchKind {
+	/// They were not touching last step and are now.
+	#[default]
+	Began,
+
+	/// They were touching last step and are not now.
+	Ended,
+}
+
+/// One thing that happened between two bodies during a step.
+///
+/// A queue the step drains, exactly like the interface's events and for the
+/// same two reasons: a callback would be a function pointer with the game
+/// module's lifetime, and it would run gameplay code from inside the solver
+/// rather than from `update`. @ref [`ui`](crate::abi::ui).
+///
+/// What this is *for* is the half of physics that is not about pushing things
+/// apart: a trigger volume, a pressure plate, a sound when two props hit. Those
+/// want to know the moment something changed, which is the one thing a table
+/// read every step cannot tell you.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Touch {
+	/// One of the two bodies. Always the lower slot of the pair, so that a
+	/// game comparing against a handle it owns need only look at both fields
+	/// rather than at both orders.
+	pub first: BodyId,
+
+	/// The other.
+	pub second: BodyId,
+
+	/// Whether they have just started or just stopped.
+	pub kind: TouchKind,
+
+	/// Where they met, in world space. Meaningless for [`TouchKind::Ended`].
+	pub point: Vec3,
+
+	/// Which way the second was pushed. Meaningless for [`TouchKind::Ended`].
+	pub normal: Vec3,
+}
+
+impl Touch {
+	/// Whether this names a body, in either position.
+	///
+	/// @param body - the handle to look for
+	#[must_use]
+	pub fn names(&self, body: BodyId) -> bool { self.first == body || self.second == body }
+
+	/// The other body of the pair, given one of them.
+	///
+	/// @param body - the one that is known
+	/// @return the other, or [`BodyId::NONE`] if this touch does not name it
+	#[must_use]
+	pub fn other(&self, body: BodyId) -> BodyId {
+		if self.first == body {
+			return self.second;
+		}
+
+		if self.second == body {
+			return self.first;
+		}
+
+		BodyId::NONE
+	}
+}
+
+/// The host's body table.
+///
+/// The same storage discipline as [`Entities`](super::entity::Entities), minus
+/// the second transform: a body has no past, because what gets interpolated is
+/// the entity it drives and the host already does that.
+pub struct Bodies {
+	bodies: Vec<Body>,
+	generations: Vec<u32>,
+	alive: Vec<bool>,
+	free: Vec<u32>,
+	live: usize,
+	/// What started and stopped touching this step. Filled by the solver,
+	/// drained by the game, cleared beside the input edges.
+	touches: Vec<Touch>,
+}
+
+impl Bodies {
+	/// An empty table.
+	#[must_use]
+	pub const fn new() -> Self {
+		Self {
+			bodies: Vec::new(),
+			generations: Vec::new(),
+			alive: Vec::new(),
+			free: Vec::new(),
+			live: 0,
+			touches: Vec::new(),
+		}
+	}
+
+	/// What started and stopped touching during this step.
+	#[must_use]
+	pub fn touches(&self) -> &[Touch] { &self.touches }
+
+	/// Notes that two bodies started or stopped touching.
+	///
+	/// The solver's. Silently drops anything past [`MAX_TOUCHES`], because a
+	/// step that busy has a problem the queue is not going to fix.
+	///
+	/// @param touch - what happened
+	pub fn touched(&mut self, touch: Touch) {
+		if self.touches.len() < MAX_TOUCHES {
+			self.touches.push(touch);
+		}
+	}
+
+	/// Forgets the touches of the step that just ended.
+	///
+	/// The host's, called beside [`Input::end_step`](super::Input::end_step)
+	/// and [`Ui::end_step`](super::Ui::end_step) and for the same reason: two
+	/// steps in one frame must not see the same event twice.
+	pub fn end_step(&mut self) { self.touches.clear(); }
+
+	/// Creates a body.
+	///
+	/// @param body - what to create
+	/// @return its handle, or [`BodyId::NONE`] if the table is full
+	pub fn spawn(&mut self, body: Body) -> BodyId {
+		let Some(slot) = self.take_slot() else {
+			return BodyId::NONE;
+		};
+
+		let Ok(index) = u32::try_from(slot) else {
+			return BodyId::NONE;
+		};
+
+		self.generations[slot] = self.generations[slot].saturating_add(1);
+		self.alive[slot] = true;
+		self.bodies[slot] = body;
+		self.live += 1;
+
+		BodyId {
+			index,
+			generation: self.generations[slot],
+		}
+	}
+
+	/// Destroys a body.
+	///
+	/// @param id - the handle to destroy
+	/// @return `true` if it existed, `false` if the handle was stale
+	pub fn despawn(&mut self, id: BodyId) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.alive[slot] = false;
+		self.bodies[slot] = Body::default();
+		self.free.push(id.index);
+		self.live -= 1;
+
+		true
+	}
+
+	/// Destroys everything.
+	pub fn clear(&mut self) {
+		for slot in 0..self.alive.len() {
+			if !self.alive[slot] {
+				continue;
+			}
+
+			self.alive[slot] = false;
+			self.bodies[slot] = Body::default();
+			if let Ok(index) = u32::try_from(slot) {
+				self.free.push(index);
+			}
+		}
+
+		self.live = 0;
+	}
+
+	/// Whether a handle refers to a living body.
+	#[must_use]
+	pub fn alive(&self, id: BodyId) -> bool { self.slot(id).is_some() }
+
+	/// How many bodies exist.
+	#[must_use]
+	pub const fn len(&self) -> usize { self.live }
+
+	/// Whether there are none at all.
+	#[must_use]
+	pub const fn is_empty(&self) -> bool { self.live == 0 }
+
+	/// How many more bodies can be created.
+	#[must_use]
+	pub fn capacity_left(&self) -> usize { MAX_BODIES - self.alive.len() + self.free.len() }
+
+	/// A body.
+	#[must_use]
+	pub fn get(&self, id: BodyId) -> Option<&Body> {
+		self.slot(id).map(|slot| &self.bodies[slot])
+	}
+
+	/// A body, to change.
+	///
+	/// Writing `transform` here is a *move*, and @ref [`Body::transform`] for
+	/// which way it is then copied. A jump wants
+	/// [`teleport_body`](crate::abi::World::teleport_body) instead, which snaps
+	/// the entity as well.
+	pub fn get_mut(&mut self, id: BodyId) -> Option<&mut Body> {
+		self.slot(id).map(|slot| &mut self.bodies[slot])
+	}
+
+	/// Every living body, with its handle.
+	pub fn iter(&self) -> impl Iterator<Item = (BodyId, &Body)> {
+		self.bodies
+			.iter()
+			.enumerate()
+			.filter(|&(slot, _)| self.alive[slot])
+			.filter_map(|(slot, body)| {
+				let index = u32::try_from(slot).ok()?;
+
+				Some((
+					BodyId {
+						index,
+						generation: self.generations[slot],
+					},
+					body,
+				))
+			})
+	}
+
+	/// The generation living in a slot, whether or not it is occupied.
+	///
+	/// The solver's, for noticing that the body it cached something for is not
+	/// the body in that slot any more.
+	///
+	/// @param slot - an index below [`Bodies::slots`](Self::slots)
+	#[must_use]
+	pub fn generation(&self, slot: usize) -> u32 {
+		self.generations.get(slot).copied().unwrap_or(0)
+	}
+
+	/// How many slots the table has ever handed out.
+	#[must_use]
+	pub fn slots(&self) -> usize { self.bodies.len() }
+
+	/// The slot a handle addresses, if it is still the body it was.
+	fn slot(&self, id: BodyId) -> Option<usize> {
+		if !id.is_some() {
+			return None;
+		}
+
+		let slot = usize::try_from(id.index).ok()?;
+
+		(self.alive.get(slot) == Some(&true)
+			&& self.generations.get(slot) == Some(&id.generation))
+		.then_some(slot)
+	}
+
+	/// A free slot, reused or newly grown.
+	fn take_slot(&mut self) -> Option<usize> {
+		if let Some(index) = self.free.pop() {
+			return usize::try_from(index).ok();
+		}
+
+		if self.bodies.len() >= MAX_BODIES {
+			return None;
+		}
+
+		self.bodies.push(Body::default());
+		self.generations.push(0);
+		self.alive.push(false);
+
+		Some(self.bodies.len() - 1)
+	}
+}
+
+impl Default for Bodies {
+	fn default() -> Self { Self::new() }
+}
+
+/// What to ask the world about.
+///
+/// A start, an end, an optional box to sweep along it, and the handles to
+/// pretend are not there - @ref [`MAX_IGNORED`] for why that last one is a
+/// fixed array.
+///
+/// @note: `#[repr(C)]` and `Copy`, but **not** `Pod`: glam is built without
+/// bytemuck, so nothing holding a `Vec3` can be. It does not need to be - the
+/// arena is the only thing that requires `Pod`, and this never goes near it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TraceInfo {
+	/// Where the trace begins.
+	pub start: Vec3,
+
+	/// Where it would end if it hit nothing.
+	pub end: Vec3,
+
+	/// Whether this sweeps a box rather than a ray.
+	pub is_box: bool,
+
+	/// The half-extents of that box.
+	pub extents: Vec3,
+
+	/// Bodies to pretend are not there.
+	ignore: [BodyId; MAX_IGNORED],
+
+	/// How many of `ignore` are set.
+	ignored: u32,
+}
+
+impl TraceInfo {
+	/// A ray between two points.
+	///
+	/// @param start - where it begins
+	/// @param end - where it stops
+	#[must_use]
+	pub const fn ray(start: Vec3, end: Vec3) -> Self {
+		Self {
+			start,
+			end,
+			is_box: false,
+			extents: Vec3::ZERO,
+			ignore: [BodyId::NONE; MAX_IGNORED],
+			ignored: 0,
+		}
+	}
+
+	/// A ray from a point, in a direction, for a distance.
+	///
+	/// @param origin - where it begins
+	/// @param direction - which way it goes; normalized here, so it need not be
+	/// @param distance - how far it reaches
+	#[must_use]
+	pub fn along(origin: Vec3, direction: Vec3, distance: f32) -> Self {
+		Self::ray(origin, origin + direction.normalize_or_zero() * distance)
+	}
+
+	/// A box swept between two points.
+	///
+	/// The box is axis-aligned and stays that way for the whole sweep.
+	///
+	/// @param start - where its middle begins
+	/// @param end - where its middle stops
+	/// @param extents - its half-extents
+	#[must_use]
+	pub const fn swept(start: Vec3, end: Vec3, extents: Vec3) -> Self {
+		Self {
+			start,
+			end,
+			is_box: true,
+			extents,
+			ignore: [BodyId::NONE; MAX_IGNORED],
+			ignored: 0,
+		}
+	}
+
+	/// The same trace, blind to one more body.
+	///
+	/// Chainable. Past [`MAX_IGNORED`] the extra handles are dropped, because
+	/// the alternative - a trace that quietly hits the thing it was told to
+	/// ignore - is the same bug with a longer fuse and no place to report it.
+	///
+	/// @param body - what to pretend is not there
+	#[must_use]
+	pub fn ignoring(mut self, body: BodyId) -> Self {
+		let count = usize::try_from(self.ignored).unwrap_or(MAX_IGNORED);
+
+		if count < MAX_IGNORED {
+			self.ignore[count] = body;
+			self.ignored = self.ignored.saturating_add(1);
+		}
+
+		self
+	}
+
+	/// The bodies this trace is blind to.
+	#[must_use]
+	pub fn ignored(&self) -> &[BodyId] {
+		let count = usize::try_from(self.ignored).unwrap_or(0);
+
+		&self.ignore[..count.min(MAX_IGNORED)]
+	}
+
+	/// Whether this trace is blind to a body.
+	///
+	/// @param body - the handle to check
+	#[must_use]
+	pub fn ignores(&self, body: BodyId) -> bool { self.ignored().contains(&body) }
+
+	/// How far the trace reaches.
+	#[must_use]
+	pub fn distance(&self) -> f32 { self.start.distance(self.end) }
+}
+
+/// What the world said.
+///
+/// Everything a caller needs about what was hit, the body handle included:
+/// reporting only the entity would lose every body that drives none.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TraceResult {
+	/// Whether anything was in the way.
+	pub hit: bool,
+
+	/// Where the trace began.
+	pub start: Vec3,
+
+	/// Where it stopped: the point of contact, or `info.end` on a miss.
+	pub end: Vec3,
+
+	/// How far along the trace stopped, from zero to one. One on a miss.
+	pub fraction: f32,
+
+	/// The surface normal at the contact, pointing back along the trace.
+	///
+	/// [`Vec3::ZERO`] on a miss, rather than a sentinel that is itself a
+	/// direction and can therefore be mistaken for a real one.
+	pub normal: Vec3,
+
+	/// Whether the trace began inside something.
+	pub started_solid: bool,
+
+	/// Whether it ended inside something.
+	pub ended_solid: bool,
+
+	/// What it hit.
+	pub body: BodyId,
+
+	/// The entity that body drives, or [`EntityId::NONE`].
+	pub entity: EntityId,
+}
+
+impl TraceResult {
+	/// A trace that hit nothing, having gone the whole way.
+	///
+	/// @param start - where it began
+	/// @param end - where it stopped
+	#[must_use]
+	pub const fn miss(start: Vec3, end: Vec3) -> Self {
+		Self {
+			hit: false,
+			start,
+			end,
+			fraction: 1.0,
+			normal: Vec3::ZERO,
+			started_solid: false,
+			ended_solid: false,
+			body: BodyId::NONE,
+			entity: EntityId::NONE,
+		}
+	}
+}
+
+/// One entry point of [`Physics`].
+///
+/// # Safety
+///
+/// `context` must be the pointer the host installed alongside this function,
+/// `bodies` must point at a live [`Bodies`] nobody is mutating for the duration
+/// of the call, and `info` at a live [`TraceInfo`]. All three are guaranteed by
+/// [`trace_ray`](crate::abi::World::trace_ray) and
+/// [`trace_box`](crate::abi::World::trace_box), which are the only callers that
+/// should exist.
+pub type TraceFn = unsafe extern "C-unwind" fn(
+	context: *mut c_void,
+	bodies: *const Bodies,
+	info: *const TraceInfo,
+) -> TraceResult;
+
+/// Reports a clean miss. What [`Physics::STUB`] is made of.
+///
+/// # Safety
+///
+/// `info` must point at a live [`TraceInfo`].
+unsafe extern "C-unwind" fn nothing(
+	_context: *mut c_void,
+	_bodies: *const Bodies,
+	info: *const TraceInfo,
+) -> TraceResult {
+	// SAFETY: the caller guarantees a live TraceInfo, which is what every
+	// caller of a TraceFn has to guarantee anyway.
+	let info = unsafe { &*info };
+
+	TraceResult::miss(info.start, info.end)
+}
+
+/// The queries the host answers, as a table the game calls through.
+///
+/// Installed once, by the host, at startup - @ref the module docs for why that
+/// is enough to survive every reload that follows.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Physics {
+	/// Whatever the host needs to answer a query. Opaque here on purpose.
+	context: *mut c_void,
+
+	/// Traces a ray.
+	ray: TraceFn,
+
+	/// Sweeps a box.
+	shape: TraceFn,
+}
+
+impl Physics {
+	/// A table that reports a miss for everything.
+	///
+	/// What a [`World`](crate::abi::World) holds until a host installs a real
+	/// one, so that a unit test, an offscreen capture or a dedicated server
+	/// without a solver answers "nothing there" instead of dereferencing a
+	/// null.
+	pub const STUB: Self = Self {
+		context: core::ptr::null_mut(),
+		ray: nothing,
+		shape: nothing,
+	};
+
+	/// A table over a host's solver.
+	///
+	/// @param context - handed back to both functions on every call; it must
+	/// outlive every [`World`](crate::abi::World) this is installed into, and
+	/// must not move @param ray - answers a ray trace
+	/// @param shape - answers a swept-box trace
+	#[must_use]
+	pub const fn new(context: *mut c_void, ray: TraceFn, shape: TraceFn) -> Self {
+		Self { context, ray, shape }
+	}
+
+	/// Traces a ray.
+	#[must_use]
+	#[expect(
+		ffi_unwind_calls,
+		reason = "the table is deliberately C-unwind, for the reason GameApi is: host and 		          module share one panic runtime under -Cprefer-dynamic, so a panic inside a 		          query reaches the host's catch_unwind instead of aborting the process"
+	)]
+	pub fn cast_ray(&self, bodies: &Bodies, info: &TraceInfo) -> TraceResult {
+		// SAFETY: `context` is what the host installed beside `ray` and is
+		// alive for as long as this table is; `bodies` and `info` are live
+		// references borrowed for the duration of the call.
+		unsafe { (self.ray)(self.context, bodies, info) }
+	}
+
+	/// Sweeps a box.
+	#[must_use]
+	#[expect(ffi_unwind_calls, reason = "as `cast_ray`")]
+	pub fn cast_shape(&self, bodies: &Bodies, info: &TraceInfo) -> TraceResult {
+		// SAFETY: as `cast_ray`.
+		unsafe { (self.shape)(self.context, bodies, info) }
+	}
+}
+
+impl Default for Physics {
+	fn default() -> Self { Self::STUB }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::abi::World;
+
+	#[test]
+	fn a_stale_body_handle_does_not_pick_up_its_successor() {
+		let mut bodies = Bodies::new();
+		let first = bodies.spawn(Body::default());
+
+		assert!(bodies.despawn(first), "it was there");
+
+		let second = bodies.spawn(Body::default());
+
+		assert_eq!(second.index, first.index, "the slot really is reused");
+		assert!(bodies.get(first).is_none(), "and the old handle no longer resolves");
+		assert!(bodies.get(second).is_some(), "while the new one does");
+	}
+
+	#[test]
+	fn a_none_handle_resolves_to_nothing_even_in_an_empty_table() {
+		let bodies = Bodies::new();
+
+		assert!(!bodies.alive(BodyId::NONE), "zero is never a live generation");
+	}
+
+	#[test]
+	fn the_table_stops_rather_than_growing_without_end() {
+		let mut bodies = Bodies::new();
+
+		for _ in 0..MAX_BODIES {
+			assert!(bodies.spawn(Body::default()).is_some(), "up to the bound they all land");
+		}
+
+		assert_eq!(bodies.spawn(Body::default()), BodyId::NONE, "and past it none do");
+		assert_eq!(bodies.len(), MAX_BODIES, "with nothing lost on the way");
+	}
+
+	#[test]
+	fn iterating_yields_the_living_and_their_handles() {
+		let mut bodies = Bodies::new();
+		let first =
+			bodies.spawn(Body::new(BodyKind::Static, Shape::ball(1.0), Transform::IDENTITY));
+		let second = bodies.spawn(Body::default());
+		bodies.despawn(first);
+
+		let seen: Vec<BodyId> = bodies.iter().map(|(id, _)| id).collect();
+
+		assert_eq!(
+			seen,
+			vec![second],
+			"the despawned one is gone and the handle is the live one"
+		);
+	}
+
+	#[test]
+	fn a_rotated_box_is_bounded_by_something_larger_than_itself() {
+		let mut body = Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::new(1.0, 0.1, 1.0)),
+			Transform::IDENTITY,
+		);
+		let (low, high) = body.bounds().expect("a box has bounds");
+
+		assert!(high.abs_diff_eq(Vec3::new(1.0, 0.1, 1.0), 1.0e-5), "unrotated it is itself");
+		assert!(low.abs_diff_eq(-high, 1.0e-5), "and symmetric about the origin");
+
+		body.transform.rotation = Quat::from_rotation_z(core::f32::consts::FRAC_PI_2);
+		let (_, turned) = body.bounds().expect("still a box");
+
+		assert!(
+			turned.x < 0.2 && turned.y > 0.9,
+			"a quarter turn about z swaps the wide axis for the thin one, got {turned}"
+		);
+	}
+
+	#[test]
+	fn a_mesh_body_reports_no_bounds_because_this_struct_does_not_know_them() {
+		let body = Body::new(BodyKind::Static, Shape::mesh(MeshId::CUBE), Transform::IDENTITY);
+
+		assert!(body.bounds().is_none(), "the solver knows the size, and this does not");
+	}
+
+	#[test]
+	fn a_box_fitted_around_bounds_is_half_their_size_and_centered_on_them() {
+		let (shape, center) = Shape::around(Vec3::new(-1.0, 0.0, -2.0), Vec3::new(3.0, 4.0, 2.0));
+
+		assert!(
+			shape
+				.extents
+				.abs_diff_eq(Vec3::new(2.0, 2.0, 2.0), 1.0e-5),
+			"half the span"
+		);
+		assert!(center.abs_diff_eq(Vec3::new(1.0, 2.0, 0.0), 1.0e-5), "and the middle of it");
+	}
+
+	#[test]
+	fn an_ignore_list_fills_up_rather_than_overflowing() {
+		let mut info = TraceInfo::ray(Vec3::ZERO, Vec3::X);
+
+		for index in 1..=u32::try_from(MAX_IGNORED + 4).expect("a small count") {
+			info = info.ignoring(BodyId { index, generation: 1 });
+		}
+
+		assert_eq!(info.ignored().len(), MAX_IGNORED, "it stops at the bound");
+		assert!(
+			info.ignores(BodyId { index: 1, generation: 1 }),
+			"keeping the ones asked for first"
+		);
+	}
+
+	#[test]
+	fn a_trace_along_a_direction_reaches_exactly_that_far() {
+		let info = TraceInfo::along(Vec3::ZERO, Vec3::new(0.0, 0.0, -3.0), 10.0);
+
+		assert!((info.distance() - 10.0).abs() < 1.0e-4, "the direction is normalized for us");
+		assert!(
+			info.end
+				.abs_diff_eq(Vec3::new(0.0, 0.0, -10.0), 1.0e-4),
+			"and points the right way"
+		);
+	}
+
+	#[test]
+	fn a_world_nobody_wired_up_reports_a_clean_miss() {
+		let world = World::new();
+		let result = world.trace_ray(&TraceInfo::ray(Vec3::ZERO, Vec3::splat(100.0)));
+
+		assert!(!result.hit, "the stub answers rather than crashing");
+		assert!((result.fraction - 1.0).abs() < f32::EPSILON, "having gone the whole way");
+		assert_eq!(result.body, BodyId::NONE, "and hit nothing");
+	}
+
+	#[test]
+	fn the_trace_types_are_the_size_they_look() {
+		assert_eq!(
+			size_of::<Physics>(),
+			size_of::<usize>() * 3,
+			"a context and two function pointers, and nothing hiding in it"
+		);
+		assert_eq!(size_of::<BodyId>(), size_of::<u64>(), "two words, like an EntityId");
+	}
+}
