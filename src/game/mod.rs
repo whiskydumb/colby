@@ -104,6 +104,13 @@ const CENTER_FALLBACK: MeshId = MeshId::CUBE;
 /// The image the floor is made of.
 const FLOOR_TEXTURE: &str = "textures/tiles";
 
+/// The normal map over it, which is what makes the grout look sunk rather than
+/// painted on.
+///
+/// Compiled as numbers rather than as a color because its name ends in
+/// `_normal` - the whole of the rule is in `colby_asset::compile`.
+const FLOOR_NORMALS: &str = "textures/tiles_normal";
+
 /// The interface document the game puts on screen.
 ///
 /// An asset, like the crystal: `assets/ui/hud.html` compiles to this name, and
@@ -732,6 +739,7 @@ fn dress(world: &mut World) {
 	let crystal = world.meshes.find(CENTER_MESH);
 	let crystal = if crystal.is_some() { crystal } else { CENTER_FALLBACK };
 	let tiles = world.textures.find(FLOOR_TEXTURE);
+	let tile_normals = world.textures.find(FLOOR_NORMALS);
 
 	// materials are the game's own table, so they are declared here rather than
 	// imported from anywhere. Registering by name is idempotent: a reload finds
@@ -739,6 +747,7 @@ fn dress(world: &mut World) {
 	let stone = world.materials.insert(
 		"stone",
 		Material::textured(tiles)
+			.bumped(tile_normals)
 			.finished(0.0, 0.75)
 			.tiled(FLOOR_TILES),
 	);
