@@ -23,7 +23,7 @@ use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, GameApi, Joint, JointId,
 		Key, Length, Material, MeshId, PanelId, Renderable, Shape, TouchKind, TraceInfo,
-		Transform, Value, World,
+		Transform, Value, World, debug,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -139,13 +139,11 @@ const HOOK: Vec3 = Vec3::new(4.60, 3.20, 0.60);
 /// How long it is.
 const ROPE: f32 = 1.4;
 
-/// How thick the rope is drawn.
-///
-/// There is no line renderer in this engine, so the rope is a very thin cube
-/// stretched between its two ends - which is what a game would do anyway, and
-/// is the difference between a ball hanging from something and a ball
-/// mysteriously floating.
-const ROPE_THICKNESS: f32 = 0.035;
+/// How big the cross marking the rope's hook is, in world units.
+const HOOK_SIZE: f32 = 0.08;
+
+/// How far above whatever the pick ray found its label is written.
+const LABEL_LIFT: f32 = 0.55;
 
 /// How heavy a prop is.
 const PROP_MASS: f32 = 1.0;
@@ -237,9 +235,6 @@ struct State {
 	/// The rope one of them hangs from.
 	rope: JointId,
 
-	/// The thin box drawn along that rope.
-	rope_drawn: EntityId,
-
 	/// How many times a prop has started touching something.
 	///
 	/// Counted from the queue the solver fills, which is the only way to know
@@ -321,7 +316,6 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		for slot in &mut state.props {
 			*slot = world.entities.spawn();
 		}
-		state.rope_drawn = world.entities.spawn();
 
 		world.camera.target = Vec3::ZERO;
 	}
@@ -448,7 +442,33 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	place(world);
 	pick(world);
 	light_up(world);
+	label_pick(world);
 	count_landings(world);
+}
+
+/// Writes what the pick ray found above the thing it found.
+///
+/// The same sentence the panel already shows, put where the answer is rather
+/// than in a corner. It exists to drive the other half of the debug renderer -
+/// a label is the only thing in it that is not a segment - and because a
+/// readout beside the crosshair is what a person actually wants when the
+/// question is "which one of these is it".
+///
+/// @param world - the pick's result, and the table the label goes in
+fn label_pick(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	if !state.picked.is_some() {
+		return;
+	}
+
+	let (picked, text) = (state.picked, named(state));
+	let Some(&transform) = world.entities.transform(picked) else {
+		return;
+	};
+
+	world
+		.debug
+		.label(transform.position + Vec3::Y * LABEL_LIFT, &text, debug::WHITE);
 }
 
 /// Adds up what started touching this step.
@@ -754,11 +774,6 @@ fn dress(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let props = state.props;
 
-	let drawn = state.rope_drawn;
-	world
-		.entities
-		.set_renderable(drawn, Renderable::of(MeshId::CUBE, plastic, Vec3::splat(0.25)));
-
 	for (index, id) in props.into_iter().enumerate() {
 		let ball = PROP_DROPS[index].2;
 		let mesh = if ball { MeshId::SPHERE } else { MeshId::CUBE };
@@ -941,22 +956,19 @@ fn place(world: &mut World) {
 		transform.set_scale(CENTER_SCALE);
 	}
 
-	// the rope, stretched from its hook to whatever it is holding. Drawn from
-	// the *body* rather than the entity so that it is exactly where the solver
-	// put it rather than a step behind.
+	// the rope, drawn between its hook and whatever it is holding. Read from the
+	// *body* rather than the entity so that it is exactly where the solver put
+	// it rather than a step behind. This used to be a very thin cube with an
+	// entity of its own, because there was nothing else to draw a line with.
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (drawn, held) = (state.rope_drawn, state.prop_bodies[SWINGING]);
+	let held = state.prop_bodies[SWINGING];
 	let end = world
 		.bodies
 		.get(held)
 		.map_or(HOOK, |body| body.transform.position);
-	let along = end - HOOK;
 
-	if let Some(transform) = world.entities.transform_mut(drawn) {
-		transform.position = HOOK.midpoint(end);
-		transform.rotation = Quat::from_rotation_arc(Vec3::Y, along.normalize_or(Vec3::NEG_Y));
-		transform.scale = Vec3::new(ROPE_THICKNESS, along.length().max(0.01), ROPE_THICKNESS);
-	}
+	world.debug.line(HOOK, end, debug::YELLOW);
+	world.debug.point(HOOK, HOOK_SIZE, debug::YELLOW);
 
 	for (index, id) in ring.into_iter().enumerate() {
 		let Some(transform) = world.entities.transform_mut(id) else {
