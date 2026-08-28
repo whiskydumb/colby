@@ -96,6 +96,76 @@ mod tests {
 		)
 	}
 
+	/// Draws one label anchored at the origin over an empty scene.
+	///
+	/// No document at all, which is the point: a label is engine chrome and has
+	/// to reach the screen whether or not the game is showing an interface.
+	///
+	/// @return the pixels, or `None` when this machine has no GPU
+	fn shoot_label() -> Option<Image> {
+		let mut capture = Capture::new(SIZE.0, SIZE.1).expect("the adapter query works")?;
+
+		let mut world = Box::new(World::new());
+		world.clear = Vec3::ZERO;
+		world.fonts.insert("fonts/blocks", blocks());
+		world.ui.set_viewport(
+			Vec2::new(
+				f32::from(u16::try_from(SIZE.0).unwrap_or(0)),
+				f32::from(u16::try_from(SIZE.1).unwrap_or(0)),
+			),
+			1.0,
+		);
+
+		world.camera.position = Vec3::new(0.0, 0.0, 5.0);
+		world.camera.target = Vec3::ZERO;
+		world
+			.debug
+			.label(Vec3::ZERO, "ab", colby_core::abi::debug::WHITE);
+
+		let mut interface = Interface::new();
+		interface
+			.attach(capture.device(), Capture::format())
+			.expect("the interface pipeline builds");
+		interface.run(&world);
+		interface.prepare(capture.device(), capture.queue(), &world);
+
+		let overlay: &mut dyn Overlay = &mut interface;
+
+		Some(
+			capture
+				.shoot_with(&mut world, &mut [overlay])
+				.expect("the frame renders"),
+		)
+	}
+
+	/// Whether anything was drawn inside a rectangle of the picture.
+	fn ink(image: &Image, left: u32, top: u32, right: u32, bottom: u32) -> bool {
+		(top..bottom).any(|y| (left..right).any(|x| image.pixel(x, y)[0] > 60))
+	}
+
+	#[test]
+	fn a_label_anchored_in_the_world_is_drawn_over_the_scene() {
+		let Some(image) = shoot_label() else {
+			return;
+		};
+
+		let middle = SIZE.0 / 2;
+
+		assert!(
+			ink(&image, middle - 20, middle - 24, middle + 20, middle),
+			"the camera is aimed at the anchor and the words sit just above it"
+		);
+		assert!(
+			!ink(&image, 0, 0, 40, 40),
+			"and nothing was drawn in the corner, so this is the label rather than a full \
+			 screen of something"
+		);
+		assert!(
+			!ink(&image, middle - 20, middle + 8, middle + 20, middle + 40),
+			"nor below the anchor, which is where the thing being named would be"
+		);
+	}
+
 	#[test]
 	fn a_box_is_painted_where_the_layout_put_it_and_nowhere_else() {
 		let Some(image) = shoot(

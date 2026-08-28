@@ -53,6 +53,14 @@ pub(crate) fn show(context: &Context, world: &World, clock: &Clock, frames: u64)
 						),
 					);
 					row(ui, "contacts", &world.contacts.to_string());
+					// the dropped count is the only place the debug table's
+					// bound is visible at all: past it, lines stop being taken
+					// and the picture is quietly short of whatever was asked
+					// for last.
+					row(ui, "debug lines", &match world.debug.dropped() {
+						| 0 => world.debug.lines().len().to_string(),
+						| lost => format!("{} ({lost} dropped)", world.debug.lines().len()),
+					});
 					row(ui, "reloads", &world.reloads.to_string());
 				});
 

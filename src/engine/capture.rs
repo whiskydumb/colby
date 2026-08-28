@@ -995,4 +995,116 @@ f 1 4 5
 			"the quad is wound facing up, so looking down at it shows its front: {middle:?}"
 		);
 	}
+
+	/// Whether a green segment was drawn across the middle of the picture.
+	///
+	/// A short column rather than one pixel: a segment is one pixel wide, the
+	/// middle of a two-hundred-and-forty-row image is the boundary between two
+	/// of them, and which one a rasterizer picks is not something a test should
+	/// have an opinion about.
+	fn green_across_the_middle(image: &Image) -> bool {
+		let middle = SIZE.1 / 2;
+
+		(middle - 6..=middle + 6).any(|y| {
+			let pixel = image.pixel(SIZE.0 / 2, y);
+
+			dominant(pixel) == 1 && pixel[1] > 100
+		})
+	}
+
+	/// A world holding one debug segment along x, at a given depth.
+	fn with_a_line(at_z: f32, on_top: bool) -> World {
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(1.0);
+
+		let (from, to) = (Vec3::new(-3.0, 0.0, at_z), Vec3::new(3.0, 0.0, at_z));
+		let green = rgb(0.1, 0.9, 0.1);
+
+		if on_top {
+			world.debug.on_top().line(from, to, green);
+		} else {
+			world.debug.line(from, to, green);
+		}
+
+		world
+	}
+
+	#[test]
+	fn a_debug_segment_reaches_the_screen() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut world = with_a_line(0.0, false);
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert!(
+			green_across_the_middle(&image),
+			"a segment through the origin, drawn by a camera aimed at the origin, crosses the \
+			 middle of the picture"
+		);
+	}
+
+	#[test]
+	fn a_debug_segment_behind_something_is_hidden_by_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the segment is two units behind the origin and the cube spans one
+		// either side of it, so the cube is squarely in the way.
+		let mut world = with_a_line(-2.0, false);
+		let cube = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(2.0),
+		});
+		world
+			.entities
+			.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.1, 0.1)));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert!(
+			!green_across_the_middle(&image),
+			"the whole point of drawing inside the scene's pass is that the depth buffer applies"
+		);
+		assert_eq!(
+			dominant(image.pixel(SIZE.0 / 2, SIZE.1 / 2)),
+			0,
+			"and what is there instead is the cube"
+		);
+	}
+
+	#[test]
+	fn a_debug_segment_asked_for_on_top_ignores_what_is_in_front_of_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the same scene as the test above, with the one bit flipped.
+		let mut world = with_a_line(-2.0, true);
+		let cube = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(2.0),
+		});
+		world
+			.entities
+			.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.1, 0.1)));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert!(
+			green_across_the_middle(&image),
+			"a contact normal starts on the surface that made it, so half of the debug drawing \
+			 would be invisible without this"
+		);
+	}
 }

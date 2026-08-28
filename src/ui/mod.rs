@@ -42,6 +42,7 @@ use colby_engine::{
 pub mod draw;
 pub mod layout;
 pub mod paint;
+pub mod world_text;
 
 #[cfg(test)]
 mod pixels;
@@ -219,6 +220,11 @@ impl Interface {
 	pub fn run(&mut self, world: &World) {
 		layout::run(world, &mut self.placed);
 		draw::build(world, &self.placed, &mut self.list);
+
+		// after the documents, so that a label drawn to explain something is not
+		// behind the interface that is in the way. @ref [`world_text`].
+		world_text::build(world, &mut self.list);
+
 		self.viewport = world.ui.viewport().to_array();
 	}
 

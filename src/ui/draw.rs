@@ -11,7 +11,7 @@
 //! starts a new one.
 
 use colby_core::{
-	abi::{FontId, TextureId, World, ui::DocumentData},
+	abi::{FontData, FontId, TextureId, World, ui::DocumentData},
 	bytemuck::{Pod, Zeroable},
 	glam::Vec4,
 };
@@ -229,26 +229,11 @@ fn image(world: &World, box_of: &Placed, radius: f32, list: &mut DrawList) {
 	list.close();
 }
 
-/// Adds one glyph quad per drawn character of a run of text.
+/// Adds the glyphs of one box's run of text.
 fn text(world: &World, box_of: &Placed, list: &mut DrawList) {
 	if !box_of.font.is_some() {
 		return;
 	}
-
-	let font = world.fonts.data(box_of.font);
-	if font.atlas_width == 0 || font.atlas_height == 0 {
-		return;
-	}
-
-	let scale = font.scale(box_of.font_size);
-	let atlas = (texels(font.atlas_width), texels(font.atlas_height));
-	// how many layout pixels the whole `0 ..= 255` range of a distance byte
-	// covers at this size: the shader turns a sample back into a distance with
-	// it, and antialiases against that.
-	let range = font.spread * 2.0 * scale;
-	let color = foreground(box_of).0;
-
-	list.want(Binding::Font(box_of.font));
 
 	// wrapped at a hair over the box, not exactly at it: the box was sized by
 	// this same measurement and then rounded to whole pixels, and breaking a
@@ -256,19 +241,77 @@ fn text(world: &World, box_of: &Placed, list: &mut DrawList) {
 	// last word somewhere the layout did not reserve room for.
 	let wrap = Some(box_of.rect[2] + 1.0);
 
-	font.run(&box_of.text, box_of.font_size, wrap, |glyph, x, y| {
+	glyphs(list, &box_of.text, &Run {
+		font: world.fonts.data(box_of.font),
+		id: box_of.font,
+		size: box_of.font_size,
+		origin: [box_of.rect[0], box_of.rect[1]],
+		wrap,
+		color: foreground(box_of).0,
+	});
+}
+
+/// Where a run of text goes and what it is drawn with.
+///
+/// A struct rather than six arguments, and it is the same six every caller has:
+/// what to lay out against, where to put it and what color to make it.
+pub(crate) struct Run<'a> {
+	/// The metrics and the atlas to lay out against.
+	pub(crate) font: &'a FontData,
+
+	/// The handle the batch samples.
+	pub(crate) id: FontId,
+
+	/// The size to draw at, in layout pixels.
+	pub(crate) size: f32,
+
+	/// The top left of the run, in layout pixels.
+	pub(crate) origin: [f32; 2],
+
+	/// How wide to let a line get before breaking it.
+	pub(crate) wrap: Option<f32>,
+
+	/// Linear with straight alpha.
+	pub(crate) color: Vec4,
+}
+
+/// Adds one glyph quad per drawn character of a run of text.
+///
+/// Split out from [`text`] because a document is not the only thing with words
+/// in it: a label anchored in the world is the same glyphs at a point somebody
+/// else worked out. @ref [`world_text`](crate::world_text).
+///
+/// @param list - what to append to; a batch is opened and closed around the run
+/// @param text - the words
+/// @param run - where they go and what they are drawn with
+pub(crate) fn glyphs(list: &mut DrawList, text: &str, run: &Run<'_>) {
+	let font = run.font;
+	if font.atlas_width == 0 || font.atlas_height == 0 {
+		return;
+	}
+
+	let scale = font.scale(run.size);
+	let atlas = (texels(font.atlas_width), texels(font.atlas_height));
+	// how many layout pixels the whole `0 ..= 255` range of a distance byte
+	// covers at this size: the shader turns a sample back into a distance with
+	// it, and antialiases against that.
+	let range = font.spread * 2.0 * scale;
+
+	list.want(Binding::Font(run.id));
+
+	font.run(text, run.size, run.wrap, |glyph, x, y| {
 		let width = f32::from(glyph.atlas_width) * scale;
 		let height = f32::from(glyph.atlas_height) * scale;
 
 		list.quad(
-			[box_of.rect[0] + x, box_of.rect[1] + y, width, height],
+			[run.origin[0] + x, run.origin[1] + y, width, height],
 			[
 				f32::from(glyph.atlas_x) / atlas.0,
 				f32::from(glyph.atlas_y) / atlas.1,
 				f32::from(glyph.atlas_x + glyph.atlas_width) / atlas.0,
 				f32::from(glyph.atlas_y + glyph.atlas_height) / atlas.1,
 			],
-			color,
+			run.color,
 			range,
 			KIND_GLYPH,
 		);
@@ -283,7 +326,7 @@ fn texels(value: u32) -> f32 { f32::from(u16::try_from(value).unwrap_or(u16::MAX
 #[cfg(test)]
 mod tests {
 	use colby_core::abi::{
-		FontData, Glyph,
+		Glyph,
 		ui::{Node, PanelId, document::ROOT, style::Color},
 	};
 

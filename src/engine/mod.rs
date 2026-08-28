@@ -14,6 +14,7 @@
 
 pub mod capture;
 pub mod image;
+mod lines;
 pub mod overlay;
 pub mod renderer;
 pub mod scene;

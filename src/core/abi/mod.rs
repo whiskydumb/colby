@@ -24,6 +24,7 @@ use crate::glam::{Quat, Vec3};
 pub mod camera;
 pub mod console;
 pub mod cvar;
+pub mod debug;
 pub mod entity;
 pub mod font;
 pub mod input;
@@ -39,6 +40,7 @@ pub mod ui;
 pub use self::{
 	camera::Camera,
 	cvar::{Args, ConsoleFn, Cvars, Value},
+	debug::{Debug, Label, Line, Pen},
 	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
 	font::{Font, FontData, FontId, Fonts, Glyph},
 	input::{Button, Input, Key},
@@ -60,7 +62,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 13;
+pub const ABI_VERSION: u32 = 14;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -251,6 +253,14 @@ pub struct World {
 	/// the way the material table is. @ref [`ui`](crate::abi::ui).
 	pub ui: Ui,
 
+	/// Lines, shapes and words to draw over the world.
+	///
+	/// Host-owned plain data anyone with the world may write: the solver
+	/// outlines its own bodies, gameplay marks up whatever it is working on.
+	/// Swept at the top of each step rather than the bottom, because several
+	/// frames are drawn between two steps. @ref [`debug`](crate::abi::debug).
+	pub debug: Debug,
+
 	/// The game's own state. The host allocates it and never looks inside.
 	pub state: GameState,
 
@@ -305,6 +315,7 @@ impl World {
 			materials: Materials::new(),
 			cvars: Cvars::new(),
 			ui: Ui::new(),
+			debug: Debug::new(),
 			state: GameState::new(),
 			physics: Physics::STUB,
 			camera_previous: Camera::DEFAULT,

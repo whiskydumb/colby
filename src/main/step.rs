@@ -45,6 +45,13 @@ pub(crate) fn run(
 	world.dt = STEP_SECONDS;
 	world.steps = world.steps.saturating_add(1);
 
+	// the debug geometry is swept here, at the *top* of the step, and not at the
+	// bottom beside the input edges. Several frames are drawn between two steps
+	// and every one of them draws this table, so clearing it at the end of a
+	// step would erase exactly what those frames exist to show. @ref
+	// `colby_core::abi::debug`.
+	world.debug.begin_step(time);
+
 	// hand the accumulated input over, then clear the parts that describe one
 	// step only. A second step in the same frame therefore sees what is held
 	// and none of the edges, which is what keeps one click from being four.

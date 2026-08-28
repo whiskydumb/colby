@@ -45,7 +45,7 @@ use wgpu::{
 	VertexFormat, VertexState, VertexStepMode,
 };
 
-use crate::shader::Shader;
+use crate::{lines::Lines, shader::Shader};
 
 /// The depth format. Thirty-two bits is more than a scene this size needs and
 /// is supported everywhere, which is worth more right now than the memory.
@@ -139,6 +139,8 @@ pub struct Scene {
 	sampler: Sampler,
 	shader: Shader,
 	depth: TextureView,
+	/// The debug renderer, drawn into this scene's pass and its depth buffer.
+	lines: Lines,
 	/// One per registry slot, in the same order, filled on demand.
 	meshes: Vec<GpuMesh>,
 	textures: Vec<GpuTexture>,
@@ -243,6 +245,7 @@ impl Scene {
 			shader.source(),
 		)?;
 		let depth = depth_view(&device, width, height);
+		let lines = Lines::new(&device, format, &globals_layout)?;
 
 		let instances = device.create_buffer(&BufferDescriptor {
 			label: Some("placements"),
@@ -263,6 +266,7 @@ impl Scene {
 			sampler,
 			shader,
 			depth,
+			lines,
 			// nothing is uploaded until a frame says what the world holds: the
 			// registries belong to the host, and a scene built before the host
 			// has loaded its assets would only have to be rebuilt afterwards.
@@ -357,6 +361,11 @@ impl Scene {
 			pass.draw_indexed(0..mesh.index_count, 0, batch.first..batch.first + batch.count);
 		}
 
+		// last, into the same pass and therefore against the same depth buffer:
+		// whether a debug line is hidden by a wall is the most useful thing it
+		// has to say, and an overlay is handed the color target alone.
+		self.lines.draw(&mut pass, &self.bindings);
+
 		drop(pass);
 		self.queue.submit([encoder.finish()]);
 	}
@@ -391,6 +400,8 @@ impl Scene {
 		self.sync_meshes(&world.meshes);
 		self.sync_textures(&world.textures);
 		self.sync_materials(world);
+		self.lines
+			.upload(&self.device, &self.queue, world);
 
 		// asked for once and used twice on purpose. This is where the frame
 		// stops being the simulation's and becomes the picture's: the camera
