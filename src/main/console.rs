@@ -158,6 +158,36 @@ pub(crate) fn install(world: &mut World) {
 	world
 		.cvars
 		.command("phys.bodies", bodies, "report what the solver is carrying");
+
+	// the debug renderer. All off, because this is a tool and a window covered
+	// in wireframe is worse than no wireframe for every question except the one
+	// it answers. Not archived either: coming back to a session with the
+	// outlines still on is a surprise rather than a setting.
+	world.cvars.var(
+		colby_physics::debug::SHAPES,
+		Value::Bool(false),
+		"outline what every body is really shaped like",
+	);
+	world.cvars.var(
+		colby_physics::debug::CONTACTS,
+		Value::Bool(false),
+		"mark every contact the solver found and which way it pushes",
+	);
+	world.cvars.var(
+		colby_physics::debug::JOINTS,
+		Value::Bool(false),
+		"mark every joint and the two anchors it holds",
+	);
+	world.cvars.var(
+		colby_ui::world_text::TEXT_SIZE,
+		Value::Float(colby_ui::world_text::DEFAULT_TEXT_SIZE),
+		"how big a label anchored in the world is drawn, in layout pixels",
+	);
+	world.cvars.command(
+		"debug.clear",
+		clear_debug,
+		"throw away every debug line that has a lifetime",
+	);
 }
 
 /// Runs one line, containing anything it throws.
@@ -314,6 +344,23 @@ unsafe extern "C-unwind" fn quit(world: *mut World, _args: *const Args) {
 	let world = unsafe { &mut *world };
 
 	world.quit = true;
+}
+
+/// `debug.clear` - throws away lasting debug geometry.
+///
+/// Transient geometry is swept every step and needs no command; this is for the
+/// marks somebody asked to keep, which by definition nothing else will take
+/// away.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn clear_debug(world: *mut World, _args: *const Args) {
+	// SAFETY: as help.
+	let world = unsafe { &mut *world };
+
+	world.debug.clear();
+	info!("debug geometry cleared");
 }
 
 /// The solver's default pass count, as the number a console variable holds.

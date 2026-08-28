@@ -52,6 +52,7 @@ use colby_core::{
 
 mod contact;
 mod convex;
+pub mod debug;
 mod query;
 mod solve;
 
@@ -196,6 +197,11 @@ impl Simulation {
 
 		self.sweep(world);
 		Self::push(world);
+
+		// last, so that what is drawn is the world the *next* frame will show
+		// rather than the one the last frame did. Costs one console lookup per
+		// variable when it is off, which is what off should cost.
+		debug::draw(world, self);
 	}
 
 	/// How many pairs the narrow phase found on the last step.
@@ -204,6 +210,12 @@ impl Simulation {
 	/// pile behaves oddly.
 	#[must_use]
 	pub fn contacts(&self) -> usize { self.manifolds.len() }
+
+	/// What the narrow phase found on the last step.
+	///
+	/// The debug drawing's, which is the only thing that wants the points
+	/// themselves rather than how many there are.
+	pub(crate) fn manifolds(&self) -> &[Manifold] { &self.manifolds }
 
 	/// Queues what started and stopped touching since the last step.
 	///
