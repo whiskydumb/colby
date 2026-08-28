@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!   0  MeshHeader                        64 bytes
-//!  64  [MeshVertex; vertex_count]        32 bytes each
+//!  64  [MeshVertex; vertex_count]        48 bytes each
 //!   .  [u32;        index_count]          4 bytes each
 //! ```
 //!
@@ -44,7 +44,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYMSH";
 ///
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The extension a compiled mesh is written with.
 pub const EXTENSION: &str = "cmesh";
@@ -268,7 +268,10 @@ fn check(bytes: &[u8]) -> std::result::Result<MeshHeader, String> {
 	const {
 		assert!(size_of::<MeshHeader>() == HEADER_BYTES, "the header changed size");
 		assert!(HEADER_BYTES.is_multiple_of(ALIGNMENT), "the vertex block would lose alignment");
-		assert!(size_of::<MeshVertex>() == 32, "MeshVertex is no longer two vec3s and a vec2");
+		assert!(
+			size_of::<MeshVertex>() == 48,
+			"MeshVertex is no longer two vec3s, a vec2 and a vec4"
+		);
 	}
 
 	let head = bytes.get(..HEADER_BYTES).ok_or_else(|| {
@@ -488,7 +491,11 @@ mod tests {
 		assert_eq!(header.vertex_count, 24, "a cube's twenty-four vertices");
 		assert_eq!(header.index_count, 36, "and its thirty-six indices");
 		assert_eq!(header.vertex_offset, 64, "the vertex block follows the header");
-		assert_eq!(header.index_offset, 64 + 24 * 32, "and the index block follows that");
+		assert_eq!(
+			header.index_offset,
+			u32::try_from(HEADER_BYTES + 24 * size_of::<MeshVertex>()).expect("a cube is small"),
+			"and the index block follows that"
+		);
 	}
 
 	#[test]
@@ -506,8 +513,12 @@ mod tests {
 		let vertices = file.vertices().as_ptr().addr();
 		let indices = file.indices().as_ptr().addr();
 
-		assert_eq!(vertices, base + 64, "the vertices are the file's own bytes");
-		assert_eq!(indices, base + 64 + 24 * 32, "and so are the indices");
+		assert_eq!(vertices, base + HEADER_BYTES, "the vertices are the file's own bytes");
+		assert_eq!(
+			indices,
+			base + HEADER_BYTES + 24 * size_of::<MeshVertex>(),
+			"and so are the indices"
+		);
 		assert_eq!(vertices % align_of::<MeshVertex>(), 0, "aligned where they sit");
 		assert_eq!(indices % align_of::<u32>(), 0, "both of them");
 	}
@@ -553,12 +564,17 @@ mod tests {
 	#[test]
 	fn a_vertex_of_the_wrong_size_is_refused() {
 		let mut bytes = encoded();
-		bytes[16..20].copy_from_slice(&48_u32.to_le_bytes());
+		bytes[16..20].copy_from_slice(&64_u32.to_le_bytes());
 
 		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
-			.expect_err("forty-eight byte vertices are not these ones");
+			.expect_err("sixty-four byte vertices are not these ones");
 
-		assert!(error.to_string().contains("32-byte"), "and says what it wanted: {error}");
+		assert!(
+			error
+				.to_string()
+				.contains(&format!("{}-byte", size_of::<MeshVertex>())),
+			"and says what it wanted: {error}"
+		);
 	}
 
 	#[test]
@@ -578,7 +594,7 @@ mod tests {
 	#[test]
 	fn an_index_past_the_last_vertex_is_refused() {
 		let mut bytes = encoded();
-		let first_index = 64 + 24 * 32;
+		let first_index = HEADER_BYTES + 24 * size_of::<MeshVertex>();
 		bytes[first_index..first_index + 4].copy_from_slice(&999_u32.to_le_bytes());
 
 		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))

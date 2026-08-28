@@ -34,7 +34,7 @@ use std::{collections::HashMap, fs, path::Path, str::SplitWhitespace};
 
 use colby_core::{
 	Result,
-	abi::mesh::{MeshData, MeshVertex},
+	abi::mesh::{self, MeshData, MeshVertex},
 	err,
 	glam::{Vec2, Vec3},
 };
@@ -111,6 +111,12 @@ fn parse(text: &str) -> std::result::Result<MeshData, String> {
 			.line(line)
 			.map_err(|reason| format!("{number}: {reason}"))?;
 	}
+
+	// last, once every triangle is known: a tangent is a property of the way a
+	// face lies on the texture, so it cannot be worked out a corner at a time.
+	// OBJ has no way to declare one, and every file that will ever come through
+	// here is therefore missing them.
+	mesh::tangents(&mut builder.mesh);
 
 	Ok(builder.mesh)
 }
@@ -516,6 +522,37 @@ f 1/1 2/2 3/3
 		assert!(close(uvs[0], Vec2::new(0.25, 1.0)), "v = 0 is the bottom: {}", uvs[0]);
 		assert!(close(uvs[1], Vec2::new(1.0, 0.0)), "v = 1 is the top: {}", uvs[1]);
 		assert!(close(uvs[2], Vec2::new(0.5, 0.25)), "and between is flipped: {}", uvs[2]);
+	}
+
+	#[test]
+	fn an_imported_face_gets_the_tangent_its_texture_coordinates_imply() {
+		// a square lying in the xz plane, unwrapped so that u runs along +x.
+		// The file's v counts up from the bottom and the importer flips it, so
+		// v ends up running along +z here, which is the mirrored turn and is
+		// what the sign has to say.
+		let text = "v 0 0 0
+v 1 0 0
+v 1 0 1
+vt 0 1
+vt 1 1
+vt 1 0
+vn 0 1 0
+f 1/1/1 3/3/1 2/2/1
+";
+		let mesh = import(text).expect("it parses");
+
+		for vertex in &mesh.vertices {
+			assert!(
+				vertex.tangent_axis().abs_diff_eq(Vec3::X, 1.0e-5),
+				"u grows along +x, got {:?}",
+				vertex.tangent
+			);
+			assert!(
+				(vertex.tangent[3] + 1.0).abs() < 1.0e-6,
+				"and the frame turns the mirrored way, got {}",
+				vertex.tangent[3]
+			);
+		}
 	}
 
 	#[test]

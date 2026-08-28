@@ -7,10 +7,16 @@
 //! `.ctex` is already what the GPU wants, so nothing in the engine or the
 //! runner links this. The dependency lands where it costs least.
 //!
-//! Everything comes out as eight-bit RGBA in sRGB, whatever the file was.
-//! Palettes and low bit depths are expanded by the decoder; grayscale and
-//! missing alpha are expanded here, because the decoder will normalize a depth
-//! but will not invent a channel.
+//! Everything comes out as eight-bit RGBA, whatever the file was. Palettes and
+//! low bit depths are expanded by the decoder; grayscale and missing alpha are
+//! expanded here, because the decoder will normalize a depth but will not
+//! invent a channel.
+//!
+//! **What the bytes mean is not in the file.** A PNG carries no answer to "is
+//! this a color or a direction", and neither does anything the decoder returns,
+//! so the caller says - and the answer changes both the format the GPU is given
+//! and how the mip chain is built. @ref `crate::compile` for how the compiler
+//! decides.
 //!
 //! Sixteen-bit images are read down to eight. That is a real loss, and it is
 //! the right one until there is a texel layout that could hold them - @ref
@@ -33,26 +39,28 @@ pub const EXTENSION: &str = "png";
 /// Reads a PNG file into a texture and its mip chain.
 ///
 /// @param path - the `.png` to read
+/// @param texel - what the channels are to be taken as
 /// @return the texture, or why it could not be read
-pub fn import_file(path: &Path) -> Result<TextureData> {
+pub fn import_file(path: &Path, texel: Texel) -> Result<TextureData> {
 	let bytes =
 		fs::read(path).map_err(|error| err!(Asset("reading {}: {error}", path.display())))?;
 
-	import(&bytes).map_err(|error| err!(Asset("{}: {error}", path.display())))
+	import(&bytes, texel).map_err(|error| err!(Asset("{}: {error}", path.display())))
 }
 
 /// Reads PNG bytes into a texture and its mip chain.
 ///
 /// @param bytes - the whole file
+/// @param texel - what the channels are to be taken as
 /// @return the texture, or why it could not be read
-pub fn import(bytes: &[u8]) -> Result<TextureData> {
+pub fn import(bytes: &[u8], texel: Texel) -> Result<TextureData> {
 	let (width, height, rgba) = decode(bytes)?;
 
 	Ok(TextureData {
 		width,
 		height,
-		texel: Texel::Rgba8Srgb,
-		levels: build_chain(width, height, rgba)?,
+		texel,
+		levels: build_chain(width, height, rgba, texel)?,
 	})
 }
 
@@ -161,7 +169,7 @@ mod tests {
 
 	#[test]
 	fn a_png_with_no_alpha_channel_comes_out_with_one() {
-		let texture = import(&RGB_QUAD).expect("the quad decodes");
+		let texture = import(&RGB_QUAD, Texel::Rgba8Srgb).expect("the quad decodes");
 
 		assert_eq!((texture.width, texture.height), (2, 2), "two by two");
 		assert_eq!(texture.texel, Texel::Rgba8Srgb, "widened to four channels");
@@ -179,7 +187,7 @@ mod tests {
 
 	#[test]
 	fn a_grayscale_png_comes_out_with_three_color_channels() {
-		let texture = import(&GREY_QUAD).expect("the grey quad decodes");
+		let texture = import(&GREY_QUAD, Texel::Rgba8Srgb).expect("the grey quad decodes");
 
 		assert_eq!(
 			texture.levels[0],
@@ -195,7 +203,7 @@ mod tests {
 
 	#[test]
 	fn a_chain_is_built_on_the_way_in() {
-		let texture = import(&RGB_QUAD).expect("the quad decodes");
+		let texture = import(&RGB_QUAD, Texel::Rgba8Srgb).expect("the quad decodes");
 
 		assert_eq!(texture.levels.len(), 2, "two by two has a level below it");
 		assert!(texture.is_consistent(), "and every level is its right size");
@@ -204,7 +212,7 @@ mod tests {
 
 	#[test]
 	fn the_smallest_level_is_the_average_of_the_image() {
-		let texture = import(&GREY_QUAD).expect("the grey quad decodes");
+		let texture = import(&GREY_QUAD, Texel::Rgba8Srgb).expect("the grey quad decodes");
 		let average = texture.levels[1][0];
 
 		// half black, half white: mid grey in light, which is about 188 as an
@@ -214,14 +222,16 @@ mod tests {
 
 	#[test]
 	fn something_that_is_not_a_png_is_refused() {
-		let error = import(b"this is not a png").expect_err("nor will it become one");
+		let error =
+			import(b"this is not a png", Texel::Rgba8Srgb).expect_err("nor will it become one");
 
 		assert!(error.to_string().contains("png"), "and it says so: {error}");
 	}
 
 	#[test]
 	fn a_truncated_png_is_refused_rather_than_read_short() {
-		let error = import(&RGB_QUAD[..40]).expect_err("half a png is not a png");
+		let error =
+			import(&RGB_QUAD[..40], Texel::Rgba8Srgb).expect_err("half a png is not a png");
 
 		assert!(!error.to_string().is_empty(), "with a reason: {error}");
 	}
@@ -229,7 +239,7 @@ mod tests {
 	#[test]
 	fn a_file_that_does_not_exist_names_itself() {
 		let path = std::env::temp_dir().join("colby-no-such-texture.png");
-		let error = import_file(&path).expect_err("there is nothing to read");
+		let error = import_file(&path, Texel::Rgba8Srgb).expect_err("there is nothing to read");
 
 		assert!(
 			error

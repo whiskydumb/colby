@@ -234,16 +234,30 @@ pub fn version_of(path: &Path) -> Option<u32> {
 
 /// Builds a whole mip chain from one image.
 ///
-/// Each level is the box average of the one above it, taken in linear light.
-/// Odd sizes clamp rather than drop a row, which biases the last column very
-/// slightly and is invisible next to the alternative of losing it.
+/// Each level is the box average of the one above it. Odd sizes clamp rather
+/// than drop a row, which biases the last column very slightly and is invisible
+/// next to the alternative of losing it.
+///
+/// **What is averaged depends on the layout, and it is not a nicety.** A color
+/// is averaged in linear light, because averaging sRGB bytes directly makes
+/// every reduction darker than the image it came from - a floor that dims as it
+/// recedes. Anything else is averaged as it is stored, because its bytes are
+/// numbers and the transfer function would bend them: a normal map put through
+/// it comes back with every level tilted towards the flat direction.
+///
+/// A normal map's levels are not renormalized afterwards, on purpose. The
+/// shader normalizes what it reads anyway, so the only thing renormalizing
+/// would change is that the shortening a mip introduces would stop happening -
+/// and that shortening is what makes a bumpy surface read smoother from far
+/// away, which is what it should do.
 ///
 /// @param width - the image's width
 /// @param height - its height
-/// @param base - `width * height * 4` bytes of sRGB RGBA
+/// @param base - `width * height * 4` bytes of RGBA
+/// @param texel - which layout those bytes are in
 /// @return every level, largest first
-pub fn build_chain(width: u32, height: u32, base: Vec<u8>) -> Result<Vec<Vec<u8>>> {
-	let expected = level_bytes(width, height, 0, Texel::Rgba8Srgb)
+pub fn build_chain(width: u32, height: u32, base: Vec<u8>, texel: Texel) -> Result<Vec<Vec<u8>>> {
+	let expected = level_bytes(width, height, 0, texel)
 		.ok_or_else(|| err!(Asset("a texture of {width}x{height} does not fit in memory")))?;
 
 	if base.len() != expected {
@@ -264,21 +278,36 @@ pub fn build_chain(width: u32, height: u32, base: Vec<u8>) -> Result<Vec<Vec<u8>
 			break;
 		};
 
-		levels.push(halve(previous, from_width, from_height, to_width, to_height));
+		let source = Level {
+			bytes: previous,
+			width: from_width,
+			height: from_height,
+			texel,
+		};
+
+		levels.push(halve(&source, to_width, to_height));
 	}
 
 	Ok(levels)
 }
 
-/// Averages an image down to the next level, in linear light.
-fn halve(from: &[u8], from_width: u32, from_height: u32, width: u32, height: u32) -> Vec<u8> {
+/// One level of a chain, as the level below it reads it.
+struct Level<'a> {
+	bytes: &'a [u8],
+	width: u32,
+	height: u32,
+	texel: Texel,
+}
+
+/// Averages an image down to the next level.
+fn halve(source: &Level<'_>, width: u32, height: u32) -> Vec<u8> {
 	let mut out = Vec::with_capacity(
 		usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0) * 4,
 	);
 
 	for y in 0..height {
 		for x in 0..width {
-			out.extend(average(from, from_width, from_height, x, y));
+			out.extend(average(source, x, y));
 		}
 	}
 
@@ -289,27 +318,35 @@ fn halve(from: &[u8], from_width: u32, from_height: u32, width: u32, height: u32
 ///
 /// Clamped at the edges, so an odd size biases its last row or column very
 /// slightly rather than dropping it.
-fn average(from: &[u8], from_width: u32, from_height: u32, x: u32, y: u32) -> [u8; 4] {
+fn average(source: &Level<'_>, x: u32, y: u32) -> [u8; 4] {
+	let color = source.texel.is_color();
 	let mut sum = [0.0_f32; 4];
 
 	for (offset_x, offset_y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-		let source_x = (x * 2 + offset_x).min(from_width.saturating_sub(1));
-		let source_y = (y * 2 + offset_y).min(from_height.saturating_sub(1));
-		let texel = texel_at(from, from_width, source_x, source_y);
+		let source_x = (x * 2 + offset_x).min(source.width.saturating_sub(1));
+		let source_y = (y * 2 + offset_y).min(source.height.saturating_sub(1));
+		let texel = texel_at(source.bytes, source.width, source_x, source_y);
 
-		// the three color channels are sRGB and the alpha is not, so only the
-		// first three go through the transfer function.
+		// the three color channels of an sRGB image go through the transfer
+		// function and its alpha does not, because alpha was never a color. In
+		// a layout that is not a color at all, neither does anything else.
 		for (channel, total) in sum.iter_mut().enumerate().take(3) {
-			*total += to_linear(texel[channel]);
+			*total += if color {
+				to_linear(texel[channel])
+			} else {
+				f32::from(texel[channel]) / 255.0
+			};
 		}
 
 		sum[3] += f32::from(texel[3]) / 255.0;
 	}
 
+	let encode = |value: f32| if color { from_srgb(value) } else { quantize(value) };
+
 	[
-		from_srgb(sum[0] / 4.0),
-		from_srgb(sum[1] / 4.0),
-		from_srgb(sum[2] / 4.0),
+		encode(sum[0] / 4.0),
+		encode(sum[1] / 4.0),
+		encode(sum[2] / 4.0),
 		quantize(sum[3] / 4.0),
 	]
 }
@@ -513,7 +550,7 @@ mod tests {
 			width,
 			height,
 			texel: Texel::Rgba8Srgb,
-			levels: build_chain(width, height, filled(width, height, color))
+			levels: build_chain(width, height, filled(width, height, color), Texel::Rgba8Srgb)
 				.expect("the chain builds"),
 		}
 	}
@@ -569,7 +606,8 @@ mod tests {
 
 	#[test]
 	fn a_flat_image_averages_to_the_same_color_all_the_way_down() {
-		let levels = build_chain(8, 8, filled(8, 8, [128, 64, 32, 255])).expect("it builds");
+		let levels = build_chain(8, 8, filled(8, 8, [128, 64, 32, 255]), Texel::Rgba8Srgb)
+			.expect("it builds");
 
 		assert_eq!(levels.len(), 4, "a whole chain");
 
@@ -595,13 +633,31 @@ mod tests {
 			base.extend([value, value, value, 255]);
 		}
 
-		let levels = build_chain(2, 2, base).expect("it builds");
+		let levels = build_chain(2, 2, base, Texel::Rgba8Srgb).expect("it builds");
 		let average = levels[1][0];
 
 		assert!(
 			average.abs_diff(188) <= 2,
 			"a checkerboard averages to mid grey in light, got {average}"
 		);
+	}
+
+	#[test]
+	fn a_layout_that_is_not_a_color_averages_its_bytes_as_they_are() {
+		// the same checkerboard, declared as numbers. Half of nothing and half
+		// of everything is half, which is 128 - and putting it through the
+		// transfer function instead would answer 188, which as a normal map is
+		// every mip level leaning the same way.
+		let mut base = Vec::new();
+		for index in 0..4 {
+			let value = if index % 2 == 0 { 0 } else { 255 };
+			base.extend([value, value, value, 255]);
+		}
+
+		let levels = build_chain(2, 2, base, Texel::Rgba8Unorm).expect("it builds");
+		let average = levels[1][0];
+
+		assert!(average.abs_diff(128) <= 1, "numbers average as numbers, got {average}");
 	}
 
 	#[test]
@@ -622,7 +678,8 @@ mod tests {
 
 	#[test]
 	fn an_image_of_the_wrong_length_is_refused() {
-		let error = build_chain(8, 8, vec![0; 10]).expect_err("ten bytes is not an 8x8 image");
+		let error = build_chain(8, 8, vec![0; 10], Texel::Rgba8Srgb)
+			.expect_err("ten bytes is not an 8x8 image");
 
 		assert!(error.to_string().contains("256 bytes"), "and it says so: {error}");
 	}

@@ -375,6 +375,7 @@ impl Painter {
 		let bytes = u32::try_from(data.texel.bytes()).unwrap_or(4);
 		let format = match data.texel {
 			| Texel::Rgba8Srgb => TextureFormat::Rgba8UnormSrgb,
+			| Texel::Rgba8Unorm => TextureFormat::Rgba8Unorm,
 		};
 
 		let group = self.make_texture(

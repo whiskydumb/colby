@@ -21,7 +21,9 @@ use colby_core::{
 	Result,
 	abi::{
 		EntityId, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes, Texel, TextureData,
-		Textures, World, material::MaterialEntry, registry::Entry,
+		TextureId, Textures, World,
+		material::{MaterialEntry, Wrap},
+		registry::Entry,
 	},
 	bytemuck::{self, Pod, Zeroable},
 	err, error,
@@ -84,6 +86,22 @@ struct Placement {
 	tint: [f32; 4],
 	/// `[metallic, roughness, uv scale x, uv scale y]`.
 	surface: [f32; 4],
+	/// One over the square of each axis of the entity's scale; `w` is unused.
+	///
+	/// This is the whole of the normal matrix, and it is three floats rather
+	/// than a `mat3` because a [`Transform`](colby_core::abi::Transform) is a
+	/// translation, a rotation and a scale rather than an arbitrary matrix. For
+	/// `M = T * R * S` the matrix that carries normals is `(M^-1)^T = R *
+	/// S^-1`, and `mat3(M) = R * S`, so `R * S^-1 = mat3(M) * S^-2`. The
+	/// shader therefore multiplies the normal by this before the model matrix
+	/// and gets the exact answer for three multiplies and sixteen bytes,
+	/// instead of an inverse and a transpose per vertex or a second matrix per
+	/// instance.
+	///
+	/// An axis scaled to nothing has no reciprocal, so a zero is written as a
+	/// one: a flattened entity draws with the normals it had rather than with
+	/// infinities.
+	normal_scale: [f32; 4],
 }
 
 /// One mesh, uploaded.
@@ -105,16 +123,27 @@ struct GpuTexture {
 	revision: u32,
 }
 
+/// Which texture a material's bind group is holding a view of.
+///
+/// A slot and a revision rather than the view itself, because that is what
+/// staleness is measured in: the group holds a view of one particular texture,
+/// and re-uploading an image makes a new one that this group knows nothing
+/// about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Bound {
+	slot: u32,
+	revision: u32,
+}
+
 /// One material's bind group.
 ///
-/// Two revisions, because it can go stale for two unrelated reasons: the
-/// material itself changed, or the texture it names was re-uploaded and the
-/// view this group holds now points at a texture nobody else is using.
+/// Three things it can go stale for, all unrelated: the material itself
+/// changed, or either of the two textures it names was re-uploaded.
 struct GpuMaterial {
 	bindings: BindGroup,
 	material_revision: u32,
-	texture_slot: u32,
-	texture_revision: u32,
+	albedo: Bound,
+	normal: Bound,
 }
 
 /// A run of instances that share both a mesh and a material.
@@ -136,7 +165,8 @@ pub struct Scene {
 	format: TextureFormat,
 	globals_layout: BindGroupLayout,
 	material_layout: BindGroupLayout,
-	sampler: Sampler,
+	/// One per [`Wrap`], in its discriminant order.
+	samplers: [Sampler; 2],
 	shader: Shader,
 	depth: TextureView,
 	/// The debug renderer, drawn into this scene's pass and its depth buffer.
@@ -152,7 +182,7 @@ pub struct Scene {
 	batches: Vec<Batch>,
 	/// `(mesh slot, material slot, entity)`, sorted to find the runs. Sorting
 	/// sixteen-byte keys and looking the entities up again beats sorting the
-	/// ninety-six-byte placements.
+	/// hundred-and-twelve-byte placements.
 	order: Vec<(u32, u32, EntityId)>,
 }
 
@@ -211,6 +241,19 @@ impl Scene {
 					ty: BindingType::Sampler(SamplerBindingType::Filtering),
 					count: None,
 				},
+				// the normal map, sampled through the same sampler: it is the
+				// same surface under the same unwrap, so a second one could
+				// only ever disagree with the first.
+				BindGroupLayoutEntry {
+					binding: 2,
+					visibility: ShaderStages::FRAGMENT,
+					ty: BindingType::Texture {
+						sample_type: TextureSampleType::Float { filterable: true },
+						view_dimension: TextureViewDimension::D2,
+						multisampled: false,
+					},
+					count: None,
+				},
 			],
 		});
 
@@ -223,19 +266,12 @@ impl Scene {
 			}],
 		});
 
-		// one sampler for everything. Per-material sampling belongs in the
-		// material the day one wants to clamp rather than repeat; until then a
-		// second one would only be a second thing to keep in step.
-		let sampler = device.create_sampler(&SamplerDescriptor {
-			label: Some("material"),
-			address_mode_u: AddressMode::Repeat,
-			address_mode_v: AddressMode::Repeat,
-			address_mode_w: AddressMode::Repeat,
-			mag_filter: FilterMode::Linear,
-			min_filter: FilterMode::Linear,
-			mipmap_filter: MipmapFilterMode::Linear,
-			..SamplerDescriptor::default()
-		});
+		// one per wrap mode rather than one per material: a sampler is a small
+		// piece of fixed-function state with two settings anybody actually
+		// wants, so the table is two entries long and is built once. A material
+		// picks with an index. @ref [`Wrap`].
+		let samplers =
+			[build_sampler(&device, Wrap::Repeat), build_sampler(&device, Wrap::Clamp)];
 
 		let shader = Shader::new("shader.wgsl", include_str!("shader.wgsl"));
 		let pipeline = compile_pipeline(
@@ -263,7 +299,7 @@ impl Scene {
 			format,
 			globals_layout,
 			material_layout,
-			sampler,
+			samplers,
 			shader,
 			depth,
 			lines,
@@ -480,29 +516,28 @@ impl Scene {
 
 	/// The same, for the bind group each material needs.
 	///
-	/// Rebuilt when the material moved *or* when the texture it names did,
+	/// Rebuilt when the material moved *or* when either texture it names did,
 	/// because a bind group holds a view of one particular texture and
 	/// re-uploading an image makes a new one.
 	fn sync_materials(&mut self, world: &World) {
 		for (slot, entry) in world.materials.iter().enumerate() {
-			let texture_slot = entry.value().albedo.index();
-			let texture_revision = world
-				.textures
-				.get(entry.value().albedo)
-				.map_or(0, Entry::revision);
+			let bound = |id| Bound {
+				slot: TextureId::index(id),
+				revision: world.textures.get(id).map_or(0, Entry::revision),
+			};
 
+			let (albedo, normal) = (bound(entry.value().albedo), bound(entry.value().normal));
 			let current = self.materials.get(slot).is_some_and(|uploaded| {
 				uploaded.material_revision == entry.revision()
-					&& uploaded.texture_slot == texture_slot
-					&& uploaded.texture_revision == texture_revision
+					&& uploaded.albedo == albedo
+					&& uploaded.normal == normal
 			});
 
 			if current {
 				continue;
 			}
 
-			let Some(uploaded) = self.build_material(entry, texture_slot, texture_revision)
-			else {
+			let Some(uploaded) = self.build_material(entry, albedo, normal) else {
 				continue;
 			};
 
@@ -515,19 +550,34 @@ impl Scene {
 
 	/// Builds one material's bind group.
 	///
-	/// A material naming a texture that has not been uploaded falls back to
-	/// slot zero, which is the white texel - so a material pointing at nothing
-	/// draws its own color rather than failing to draw.
+	/// A material naming a texture that has not been uploaded falls back to the
+	/// texture the *handle it should have held* points at: slot zero for an
+	/// albedo, which is the white texel, and the flat normal map for a normal.
+	/// So a material pointing at nothing draws its own color on a surface that
+	/// is as flat as its geometry, rather than failing to draw.
 	fn build_material(
 		&self,
 		entry: &MaterialEntry,
-		texture_slot: u32,
-		texture_revision: u32,
+		albedo: Bound,
+		normal: Bound,
 	) -> Option<GpuMaterial> {
-		let view = usize::try_from(texture_slot)
-			.ok()
-			.and_then(|slot| self.textures.get(slot))
-			.or_else(|| self.textures.first())?;
+		let uploaded = |bound: Bound, fallback: u32| {
+			usize::try_from(bound.slot)
+				.ok()
+				.and_then(|slot| self.textures.get(slot))
+				.or_else(|| {
+					usize::try_from(fallback)
+						.ok()
+						.and_then(|slot| self.textures.get(slot))
+				})
+		};
+
+		let color = uploaded(albedo, TextureId::NONE.index())?;
+		let bumps = uploaded(normal, TextureId::FLAT_NORMAL.index())?;
+		let sampler = self
+			.samplers
+			.get(usize::try_from(entry.value().wrap.code()).unwrap_or(0))
+			.or_else(|| self.samplers.first())?;
 
 		let bindings = self
 			.device
@@ -537,11 +587,15 @@ impl Scene {
 				entries: &[
 					BindGroupEntry {
 						binding: 0,
-						resource: BindingResource::TextureView(&view.view),
+						resource: BindingResource::TextureView(&color.view),
 					},
 					BindGroupEntry {
 						binding: 1,
-						resource: BindingResource::Sampler(&self.sampler),
+						resource: BindingResource::Sampler(sampler),
+					},
+					BindGroupEntry {
+						binding: 2,
+						resource: BindingResource::TextureView(&bumps.view),
 					},
 				],
 			});
@@ -549,8 +603,8 @@ impl Scene {
 		Some(GpuMaterial {
 			bindings,
 			material_revision: entry.revision(),
-			texture_slot,
-			texture_revision,
+			albedo,
+			normal,
 		})
 	}
 
@@ -629,6 +683,9 @@ impl Scene {
 				surface.uv_scale.x,
 				surface.uv_scale.y,
 			],
+			normal_scale: normal_scale(transform.scale)
+				.extend(0.0)
+				.to_array(),
 		});
 
 		let (mesh, material) =
@@ -641,6 +698,51 @@ impl Scene {
 				.push(Batch { mesh, material, first: at, count: 1 }),
 		}
 	}
+}
+
+/// One sampler, for one wrap mode.
+///
+/// Anisotropy is sixteen, which is the highest every desktop backend supports
+/// and is what makes a tiled floor at a grazing angle look like a floor rather
+/// than like a smear. It needs all three filters to be linear, which they are.
+fn build_sampler(device: &Device, wrap: Wrap) -> Sampler {
+	let mode = match wrap {
+		| Wrap::Repeat => AddressMode::Repeat,
+		| Wrap::Clamp => AddressMode::ClampToEdge,
+	};
+
+	device.create_sampler(&SamplerDescriptor {
+		label: Some("material"),
+		address_mode_u: mode,
+		address_mode_v: mode,
+		address_mode_w: mode,
+		mag_filter: FilterMode::Linear,
+		min_filter: FilterMode::Linear,
+		mipmap_filter: MipmapFilterMode::Linear,
+		anisotropy_clamp: 16,
+		..SamplerDescriptor::default()
+	})
+}
+
+/// What a normal has to be multiplied by before the model matrix.
+///
+/// @ref [`Placement::normal_scale`] for why this is the whole normal matrix.
+/// An axis of zero would divide by nothing, so it is left at one - a normal
+/// that is merely wrong is a shading bug, and an infinite one is a triangle
+/// that disappears.
+///
+/// @param scale - the entity's scale along each axis
+/// @return one over the square of each, or one where that has no answer
+fn normal_scale(scale: Vec3) -> Vec3 {
+	let squared = scale * scale;
+
+	Vec3::select(
+		squared
+			.abs()
+			.cmpgt(Vec3::splat(f32::MIN_POSITIVE)),
+		squared.recip(),
+		Vec3::ONE,
+	)
 }
 
 /// Uploads one mesh's geometry.
@@ -736,6 +838,7 @@ fn upload_texture(
 const fn texel_format(texel: Texel) -> TextureFormat {
 	match texel {
 		| Texel::Rgba8Srgb => TextureFormat::Rgba8UnormSrgb,
+		| Texel::Rgba8Unorm => TextureFormat::Rgba8Unorm,
 	}
 }
 
@@ -930,7 +1033,7 @@ fn build_pipeline(
 /// @note: offsets written out rather than taken from a macro, so that a change
 /// to `MeshVertex` shows up here as a mismatch to fix instead of as garbled
 /// geometry. @ref [`strides`].
-const VERTEX_ATTRIBUTES: [VertexAttribute; 3] = [
+const VERTEX_ATTRIBUTES: [VertexAttribute; 4] = [
 	VertexAttribute {
 		format: VertexFormat::Float32x3,
 		offset: 0,
@@ -946,56 +1049,73 @@ const VERTEX_ATTRIBUTES: [VertexAttribute; 3] = [
 		offset: 24,
 		shader_location: 2,
 	},
+	VertexAttribute {
+		format: VertexFormat::Float32x4,
+		offset: 32,
+		shader_location: 3,
+	},
 ];
 
 /// What one [`Placement`] hands it, once per instance.
 ///
 /// The model matrix takes four of these because wgsl has no matrix vertex
 /// attribute; the shader puts it back together.
-const INSTANCE_ATTRIBUTES: [VertexAttribute; 6] = [
+///
+/// @note: locations continue where [`VERTEX_ATTRIBUTES`] stopped. A shader
+/// location is a property of the pipeline rather than of one buffer, so the two
+/// tables share a numbering and growing the vertex pushes the instance along.
+const INSTANCE_ATTRIBUTES: [VertexAttribute; 7] = [
 	VertexAttribute {
 		format: VertexFormat::Float32x4,
 		offset: 0,
-		shader_location: 3,
-	},
-	VertexAttribute {
-		format: VertexFormat::Float32x4,
-		offset: 16,
 		shader_location: 4,
 	},
 	VertexAttribute {
 		format: VertexFormat::Float32x4,
-		offset: 32,
+		offset: 16,
 		shader_location: 5,
 	},
 	VertexAttribute {
 		format: VertexFormat::Float32x4,
-		offset: 48,
+		offset: 32,
 		shader_location: 6,
 	},
 	VertexAttribute {
 		format: VertexFormat::Float32x4,
-		offset: 64,
+		offset: 48,
 		shader_location: 7,
 	},
 	VertexAttribute {
 		format: VertexFormat::Float32x4,
-		offset: 80,
+		offset: 64,
 		shader_location: 8,
+	},
+	VertexAttribute {
+		format: VertexFormat::Float32x4,
+		offset: 80,
+		shader_location: 9,
+	},
+	VertexAttribute {
+		format: VertexFormat::Float32x4,
+		offset: 96,
+		shader_location: 10,
 	},
 ];
 
 /// The vertex and instance strides, asserted to match the attributes above.
 const fn strides() -> (BufferAddress, BufferAddress) {
 	const {
-		assert!(size_of::<MeshVertex>() == 32, "MeshVertex is no longer two vec3s and a vec2");
+		assert!(
+			size_of::<MeshVertex>() == 48,
+			"MeshVertex is no longer two vec3s, a vec2 and a vec4"
+		);
 		assert!(align_of::<MeshVertex>() == 4, "MeshVertex gained padding");
-		assert!(size_of::<Placement>() == 96, "Placement is no longer a mat4 and two vec4s");
+		assert!(size_of::<Placement>() == 112, "Placement is no longer a mat4 and three vec4s");
 		assert!(align_of::<Placement>() == 4, "Placement gained padding");
 		assert!(size_of::<Globals>() == 112, "a uniform struct has to be a multiple of 16");
 	}
 
-	(32, 96)
+	(48, 112)
 }
 
 #[cfg(test)]
@@ -1006,12 +1126,12 @@ mod tests {
 	fn the_buffers_are_sized_for_what_goes_in_them() {
 		assert_eq!(
 			size_bytes::<MeshVertex>(24).expect("the size fits"),
-			24 * 32,
-			"a cube's worth of position, normal and texture coordinate"
+			24 * 48,
+			"a cube's worth of position, normal, texture coordinate and tangent"
 		);
 		assert_eq!(
 			size_bytes::<Placement>(MAX_ENTITIES).expect("the size fits"),
-			96 * BufferAddress::try_from(MAX_ENTITIES).expect("the count fits"),
+			112 * BufferAddress::try_from(MAX_ENTITIES).expect("the count fits"),
 			"one placement per entity the world can hold"
 		);
 	}

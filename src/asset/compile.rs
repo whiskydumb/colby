@@ -22,6 +22,15 @@
 //! drift into disagreeing about what exists. Nothing else in the output tree is
 //! touched.
 //!
+//! **One thing here is decided by a file's name rather than by its contents**,
+//! and it is the only such rule in the project: a `.png` whose stem ends in
+//! [`NORMAL_SUFFIX`] is compiled as numbers rather than as a color - @ref
+//! [`texel_of`]. A PNG has no field that could say so, and the alternative is a
+//! manifest beside every texture, which is a parser and a second staleness
+//! input for a question that has one answer per file and never changes. When
+//! materials become assets of their own the declaration moves there and this
+//! rule goes.
+//!
 //! This is a library first. `just assets` runs it through `colby_assetc`, and
 //! the runner calls [`compile_dir`] in-process on a timer - the same code, so
 //! the two cannot disagree about what a file compiles to.
@@ -32,7 +41,7 @@ use std::{
 	time::SystemTime,
 };
 
-use colby_core::{Error, Result, err, glam::Vec3};
+use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
 use crate::{document, font, format, html, obj, png, texture, ttf};
 
@@ -44,6 +53,12 @@ pub const SOURCE_DIR: &str = "assets";
 /// Under `target/` because they are derived: `cargo clean` should take them,
 /// and nothing should ever be tempted to edit one.
 pub const OUTPUT_DIR: [&str; 2] = ["target", "assets"];
+
+/// What a `.png` has to be called to be compiled as numbers rather than color.
+///
+/// Matched against the stem, so `tiles_normal.png` is one and `normal_map.png`
+/// is not.
+pub const NORMAL_SUFFIX: &str = "_normal";
 
 /// The source extensions the compiler knows.
 pub const SOURCE_EXTENSIONS: &[&str] =
@@ -281,6 +296,24 @@ pub fn asset_name(root: &Path, source: &Path) -> Result<String> {
 	Ok(name.join("/"))
 }
 
+/// What an image's channels are taken to mean.
+///
+/// The whole of the naming rule, in one place so that there is one place to
+/// look for it and one place to change it. A stem ending in [`NORMAL_SUFFIX`]
+/// is numbers; everything else is a color.
+///
+/// @param source - the `.png` being compiled
+/// @return the layout to store and to build the mip chain with
+#[must_use]
+pub fn texel_of(source: &Path) -> Texel {
+	let named = source
+		.file_stem()
+		.and_then(|stem| stem.to_str())
+		.is_some_and(|stem| stem.ends_with(NORMAL_SUFFIX));
+
+	if named { Texel::Rgba8Unorm } else { Texel::Rgba8Srgb }
+}
+
 /// Where a source compiles to.
 ///
 /// @param root - the source tree
@@ -324,7 +357,7 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 			(bytes, produced)
 		},
 		| Kind::Texture => {
-			let data = png::import_file(source)?;
+			let data = png::import_file(source, texel_of(source))?;
 			let bytes = texture::encode(&data)
 				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 			let produced = Produced::Texture {
@@ -698,6 +731,43 @@ f 4 1 5 8
 		0xFB, 0x60, 0x6C, 0x70, 0xF2, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
 		0x60, 0x82,
 	];
+
+	#[test]
+	fn what_an_image_holds_is_decided_by_the_end_of_its_name() {
+		let workspace = workspace("normals");
+		let textures = source_root(&workspace).join("textures");
+		fs::create_dir_all(&textures).expect("the directory");
+		fs::write(textures.join("wall.png"), RGB_QUAD).expect("the color is written");
+		fs::write(textures.join("wall_normal.png"), RGB_QUAD).expect("the normal is written");
+
+		let report = run(&workspace, false);
+
+		assert!(report.failed.is_empty(), "both compile");
+
+		let texel_of_output = |name: &str| {
+			let compiled = report
+				.compiled
+				.iter()
+				.find(|compiled| compiled.name == name)
+				.expect("the texture is in the report");
+
+			TextureFile::open(&compiled.output)
+				.expect("it reads back")
+				.header()
+				.texel
+		};
+
+		assert_eq!(
+			texel_of_output("textures/wall"),
+			Texel::Rgba8Srgb.code(),
+			"an ordinary name is a color"
+		);
+		assert_eq!(
+			texel_of_output("textures/wall_normal"),
+			Texel::Rgba8Unorm.code(),
+			"and one ending in the suffix is numbers"
+		);
+	}
 
 	#[test]
 	fn a_png_compiles_to_a_texture_beside_the_meshes() {

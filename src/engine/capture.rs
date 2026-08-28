@@ -838,7 +838,8 @@ f 1 4 5
 			width: 2,
 			height: 2,
 			texel: Texel::Rgba8Srgb,
-			levels: colby_asset::texture::build_chain(2, 2, base).expect("the chain builds"),
+			levels: colby_asset::texture::build_chain(2, 2, base, Texel::Rgba8Srgb)
+				.expect("the chain builds"),
 		}
 	}
 
@@ -1105,6 +1106,186 @@ f 1 4 5
 			green_across_the_middle(&image),
 			"a contact normal starts on the surface that made it, so half of the debug drawing \
 			 would be invisible without this"
+		);
+	}
+
+	/// How bright a pixel is, as the sum of its three color channels.
+	fn brightness(pixel: [u8; 4]) -> u32 {
+		u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2])
+	}
+
+	/// A two-texel normal map: the left texel leans towards `-x`, the right one
+	/// towards `+x`, both by about forty-five degrees.
+	///
+	/// One level and no chain, so that what reaches the sampler is what is
+	/// written here rather than an average of it.
+	fn leaning_normals() -> TextureData {
+		// tangent space, and the quad's tangent runs along +x. 37 and 217 are
+		// -0.707 and +0.707 folded into a byte; 128 is zero.
+		let base = vec![37, 128, 217, 255, 217, 128, 217, 255];
+
+		TextureData {
+			width: 2,
+			height: 1,
+			texel: Texel::Rgba8Unorm,
+			levels: vec![base],
+		}
+	}
+
+	#[test]
+	fn a_normal_map_turns_the_light_a_surface_catches() {
+		// square, for the reason the texture test is: the quad then fills the
+		// frame in both directions, and a sample a quarter of the way across
+		// lands on the middle of a texel rather than in the blend between two.
+		let Some(mut capture) = (match Capture::new(SQUARE, SQUARE) {
+			| Ok(capture) => capture,
+			| Err(error) => panic!("building the capture failed: {error}"),
+		}) else {
+			return;
+		};
+
+		let mut world = looking_world();
+		// down and towards -x, so a surface leaning into +x catches all of it
+		// and one leaning into -x catches none. A flat surface is between.
+		world.light = Vec3::new(-1.0, -1.0, 0.0).normalize();
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+
+		let normals = world
+			.textures
+			.insert("test/leaning", leaning_normals());
+		let material = world
+			.materials
+			.insert("test/leaning", Material::DEFAULT.bumped(normals));
+
+		let across = (world.camera.fov_y / 2.0).tan() * HEIGHT * 2.0;
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(MeshId::QUAD, material, Vec3::ONE));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		let (middle, quarter) = (SQUARE / 2, SQUARE / 4);
+		let (left, right) = (
+			brightness(image.pixel(quarter, middle)),
+			brightness(image.pixel(quarter * 3, middle)),
+		);
+
+		assert!(
+			right > left * 3,
+			"the half of the quad the map leans into the light is much brighter: {right} \
+			 against {left}"
+		);
+		assert!(left < 60, "and the half it leans away is nearly out of the light: {left}");
+	}
+
+	/// Two texels side by side, red then blue, with no chain under them.
+	fn halves() -> TextureData {
+		TextureData {
+			width: 2,
+			height: 1,
+			texel: Texel::Rgba8Srgb,
+			levels: vec![vec![0xFF, 0, 0, 0xFF, 0, 0, 0xFF, 0xFF]],
+		}
+	}
+
+	/// Renders a quad filling the frame, tiled twice, under one wrap mode.
+	///
+	/// @param clamp - whether the material holds its textures at their edges
+	/// @return the four colors an eighth, three eighths, five eighths and seven
+	/// eighths of the way across, or `None` when this machine has no GPU
+	fn tiled_twice(clamp: bool) -> Option<Vec<usize>> {
+		let mut capture = match Capture::new(SQUARE, SQUARE) {
+			| Ok(capture) => capture?,
+			| Err(error) => panic!("building the capture failed: {error}"),
+		};
+
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(1.0);
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+
+		let texture = world.textures.insert("test/halves", halves());
+		let plain = Material::textured(texture).tiled(2.0);
+		let material = world
+			.materials
+			.insert("test/halves", if clamp { plain.clamped() } else { plain });
+
+		let across = (world.camera.fov_y / 2.0).tan() * HEIGHT * 2.0;
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(MeshId::QUAD, material, Vec3::ONE));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		Some(
+			[1, 3, 5, 7]
+				.into_iter()
+				.map(|eighth| dominant(image.pixel(SQUARE * eighth / 8, SQUARE / 2)))
+				.collect(),
+		)
+	}
+
+	#[test]
+	fn a_material_says_whether_its_textures_tile_or_hold_their_edges() {
+		let (Some(repeated), Some(clamped)) = (tiled_twice(false), tiled_twice(true)) else {
+			return;
+		};
+
+		// tiled twice, so the second copy starts halfway across. Repeating puts
+		// the first texel back; clamping has run out of texture by then and
+		// holds the last one.
+		assert_eq!(repeated, vec![0, 2, 0, 2], "red, blue, red, blue");
+		assert_eq!(clamped, vec![0, 2, 2, 2], "red, blue, and then blue forever");
+	}
+
+	#[test]
+	fn a_stretched_entity_is_lit_by_the_normals_it_really_has() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// a sphere flattened almost to a disc and lit head on. The normals it
+		// really has point at the camera almost everywhere, so the disc is
+		// evenly lit out to its rim; the model matrix would carry them the
+		// other way, leaving everything but the very center dark.
+		let mut world = looking_world();
+		let ball = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(2.0, 2.0, 0.05),
+		});
+		world
+			.entities
+			.set_renderable(ball, Renderable::new(MeshId::SPHERE, rgb(0.9, 0.9, 0.9)));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		let (center_x, center_y) = (SIZE.0 / 2, SIZE.1 / 2);
+		// the disc is a unit across in world units and the frame is about 2.73
+		// half-heights, which puts its rim around forty-four pixels out.
+		let center = brightness(image.pixel(center_x, center_y));
+		let towards_the_rim = brightness(image.pixel(center_x + 30, center_y));
+
+		assert!(center > 200, "the middle of the disc is lit at all: {center}");
+		assert!(
+			towards_the_rim * 10 > center * 7,
+			"and so is two thirds of the way out, because a flattened sphere's normals still \
+			 face the camera: {towards_the_rim} against {center}"
 		);
 	}
 }

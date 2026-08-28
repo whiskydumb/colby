@@ -15,12 +15,16 @@ use crate::registry_handle;
 /// The name the always-present white texture is registered under.
 pub const WHITE_NAME: &str = "white";
 
+/// The name the always-present flat normal map is registered under.
+pub const FLAT_NORMAL_NAME: &str = "flat_normal";
+
 /// How a texel is laid out.
 ///
-/// One variant so far. It is an enum rather than an assumption because the
-/// asset format stores it, and the day block compression arrives the reader has
-/// to be able to say "this build does not know that layout" instead of reading
-/// four bytes per texel from a file that has one.
+/// Two variants, and the difference between them is not the bytes but what the
+/// bytes mean. It is an enum rather than an assumption because the asset format
+/// stores it, and the day block compression arrives the reader has to be able
+/// to say "this build does not know that layout" instead of reading four bytes
+/// per texel from a file that has one.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Texel {
@@ -30,6 +34,18 @@ pub enum Texel {
 	/// arithmetic correct without the shader doing anything about it.
 	#[default]
 	Rgba8Srgb = 0,
+
+	/// The same bytes, sampled as they are.
+	///
+	/// For an image whose channels are not a color: a normal map, a roughness
+	/// mask, anything the shader reads as a number. Putting one of those
+	/// through the sRGB curve bends every value it holds, which on a normal map
+	/// is a surface tilted the wrong way everywhere it is not flat.
+	///
+	/// It also changes how the mip chain is built - @ref
+	/// `colby_asset::texture::build_chain`. Averaging colors means averaging
+	/// the light they stand for; averaging numbers means averaging the numbers.
+	Rgba8Unorm = 1,
 }
 
 impl Texel {
@@ -37,9 +53,14 @@ impl Texel {
 	#[must_use]
 	pub const fn bytes(self) -> usize {
 		match self {
-			| Self::Rgba8Srgb => 4,
+			| Self::Rgba8Srgb | Self::Rgba8Unorm => 4,
 		}
 	}
+
+	/// Whether sampling this layout runs the values through a transfer
+	/// function.
+	#[must_use]
+	pub const fn is_color(self) -> bool { matches!(self, Self::Rgba8Srgb) }
 
 	/// The number the asset format stores.
 	#[must_use]
@@ -58,6 +79,7 @@ impl Texel {
 	pub const fn from_code(code: u32) -> Option<Self> {
 		match code {
 			| 0 => Some(Self::Rgba8Srgb),
+			| 1 => Some(Self::Rgba8Unorm),
 			| _ => None,
 		}
 	}
@@ -95,6 +117,28 @@ impl TextureData {
 			height: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: vec![vec![0xFF; 4]],
+		}
+	}
+
+	/// The one texel every material gets when it names no normal map.
+	///
+	/// A direction rather than a color, and the direction is straight out of
+	/// the surface: `(0.5, 0.5, 1.0)` is what `(0, 0, 1)` becomes once it is
+	/// folded into `0 ..= 1`. Its whole job is the white texel's - to make an
+	/// unmapped material a mapped one whose map says nothing, so that there is
+	/// no branch in the shader and no second pipeline.
+	///
+	/// A hundred and twenty-eight rather than a hundred and twenty-seven and a
+	/// half, because a byte cannot be a half. The shader normalizes what it
+	/// reads, so the four-thousandth of a unit that costs is gone by the time
+	/// anything uses it.
+	#[must_use]
+	pub fn flat_normal() -> Self {
+		Self {
+			width: 1,
+			height: 1,
+			texel: Texel::Rgba8Unorm,
+			levels: vec![vec![128, 128, 255, 255]],
 		}
 	}
 
@@ -182,6 +226,15 @@ registry_handle! {
 	TextureId
 }
 
+impl TextureId {
+	/// The flat normal map, which says every surface is as it looks.
+	///
+	/// Always registered, in the same slot in every world, for the same reason
+	/// the built-in meshes are: a material's default has to name something and
+	/// a handle is only meaningful next to its table.
+	pub const FLAT_NORMAL: Self = Self::new(2);
+}
+
 /// One entry of the texture registry.
 pub type Texture = Entry<TextureData>;
 
@@ -195,14 +248,15 @@ pub struct Textures {
 }
 
 impl Textures {
-	/// A registry holding the null texture and the white one, which are the
-	/// same texel under two names.
+	/// A registry holding the null texture, the white one - which are the same
+	/// texel under two names - and the flat normal map.
 	#[must_use]
 	pub fn new() -> Self {
 		let mut textures = Self {
 			entries: Registry::new(TextureData::white()),
 		};
 		textures.insert(WHITE_NAME, TextureData::white());
+		textures.insert(FLAT_NORMAL_NAME, TextureData::flat_normal());
 
 		textures
 	}
@@ -325,13 +379,47 @@ mod tests {
 	}
 
 	#[test]
-	fn a_new_registry_answers_to_white_and_to_nothing_else() {
+	fn a_new_registry_answers_to_the_built_in_names_and_to_nothing_else() {
 		let textures = Textures::new();
 
-		assert_eq!(textures.len(), 2, "the null texture and the white one");
+		assert_eq!(textures.len(), 3, "the null texture, the white one and the flat normal");
 		assert!(textures.find(WHITE_NAME).is_some(), "white is always there");
+		assert_eq!(
+			textures.find(FLAT_NORMAL_NAME),
+			TextureId::FLAT_NORMAL,
+			"and the flat normal is at the slot the constant names"
+		);
 		assert_eq!(textures.find("stone"), TextureId::NONE, "and nothing else is");
 		assert!(!TextureId::NONE.is_some(), "the null handle knows it is null");
+	}
+
+	#[test]
+	fn the_flat_normal_map_points_straight_out_of_the_surface() {
+		let textures = Textures::new();
+		let flat = textures
+			.get(TextureId::FLAT_NORMAL)
+			.expect("the slot is seeded");
+		let texel = flat
+			.value()
+			.levels
+			.first()
+			.expect("it has its one level");
+
+		assert_eq!(
+			flat.value().texel,
+			Texel::Rgba8Unorm,
+			"a direction is not a color, so nothing bends it on the way in"
+		);
+
+		let direction: Vec<f32> = texel
+			.iter()
+			.take(3)
+			.map(|channel| (f32::from(*channel) / 255.0).mul_add(2.0, -1.0))
+			.collect();
+
+		assert!(direction[0].abs() < 0.01, "no lean across, got {}", direction[0]);
+		assert!(direction[1].abs() < 0.01, "and none along, got {}", direction[1]);
+		assert!(direction[2] > 0.99, "and all of it outwards, got {}", direction[2]);
 	}
 
 	#[test]

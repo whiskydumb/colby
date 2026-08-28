@@ -737,6 +737,10 @@ mod tests {
 		Assets::at(source, output).sync(&mut world);
 
 		assert_eq!(world.meshes.len(), 4, "the built-in primitives and nothing else");
-		assert_eq!(world.textures.len(), 2, "and the null texture and the white one");
+		assert_eq!(
+			world.textures.len(),
+			3,
+			"and the null texture, the white one and the flat normal map"
+		);
 	}
 }

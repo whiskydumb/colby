@@ -41,11 +41,18 @@ const SPHERE_RINGS: usize = 16;
 /// How many segments of longitude it has.
 const SPHERE_SEGMENTS: usize = 24;
 
+/// How small a triangle's UV area has to be before it is treated as collapsed.
+///
+/// The area is in texture units squared, and a triangle covering a hundredth of
+/// a map on each side has an area around `1e-4`, so this is six orders of
+/// magnitude below anything an unwrap means. Below it the reciprocal is what
+/// the answer would be made of, and the answer is then noise.
+const DEGENERATE_UV: f32 = 1.0e-10;
+
 /// One vertex of a mesh, as the vertex stage reads it.
 ///
 /// No color: that comes per entity, so one cube mesh serves every cube in the
-/// world. No tangent yet - normal mapping is the next thing that will grow this
-/// struct, and growing it means the asset format's version goes up with it.
+/// world.
 ///
 /// @note: `#[repr(C)]` and `Pod` because this is exactly the layout the vertex
 /// buffer holds and exactly the layout the asset format stores. The three are
@@ -66,17 +73,41 @@ pub struct MeshVertex {
 	/// samples. OBJ measures `v` from the bottom, so the importer flips it -
 	/// @ref `colby_asset::obj`.
 	pub uv: [f32; 2],
+
+	/// The direction `u` grows in, in the mesh's own space, and a sign.
+	///
+	/// `xyz` is the unit tangent and `w` is `+1` or `-1`, so the third axis of
+	/// the frame is `cross(normal, tangent) * w`. Storing the sign rather than
+	/// the bitangent costs eight bytes less and is what every exchange format
+	/// settled on, for the same reason: the two are the same information unless
+	/// the frame is skewed, and a skewed frame is a broken unwrap rather than
+	/// something to carry.
+	///
+	/// Zero until [`tangents`] has been over the mesh. Everything that builds
+	/// geometry calls it, and a mesh read from a `.cmesh` was built by
+	/// something that did.
+	pub tangent: [f32; 4],
 }
 
 impl MeshVertex {
-	/// A vertex from its three attributes.
+	/// A vertex from its three attributes, with no tangent.
+	///
+	/// The tangent follows from the whole mesh rather than from one vertex, so
+	/// it is filled by [`tangents`] once every triangle is known.
 	#[must_use]
 	pub fn new(position: Vec3, normal: Vec3, uv: Vec2) -> Self {
 		Self {
 			position: position.to_array(),
 			normal: normal.to_array(),
 			uv: uv.to_array(),
+			tangent: [0.0; 4],
 		}
+	}
+
+	/// The tangent frame's first axis.
+	#[must_use]
+	pub fn tangent_axis(&self) -> Vec3 {
+		Vec3::new(self.tangent[0], self.tangent[1], self.tangent[2])
 	}
 }
 
@@ -135,6 +166,108 @@ impl MeshData {
 
 		self.indices.iter().all(|index| *index < count)
 	}
+}
+
+/// Fills in every vertex's tangent frame from the way the mesh is unwrapped.
+///
+/// A tangent is a property of the *triangle*, not of the vertex: it is the
+/// direction the texture's `u` axis points once the triangle is laid out in the
+/// mesh's own space. So every triangle is measured, each of its three vertices
+/// is given a share, and what a vertex ends up with is the sum over every
+/// triangle it belongs to. Vertices that a face does not share with its
+/// neighbors therefore get that face's own frame, and vertices that are shared
+/// get the average - which is exactly the split the normals already have, and
+/// for the same reason.
+///
+/// The result is made orthogonal to the vertex's normal before it is stored,
+/// because the shader builds the frame around the normal and a tangent leaning
+/// off it would tilt the whole thing.
+///
+/// Two ways this can have no answer, and both fall back rather than refuse:
+/// a triangle whose unwrap collapsed to a line contributes nothing, and a
+/// vertex left with nothing at all is given any frame perpendicular to its
+/// normal. A wrong tangent on a surface with no normal map costs nothing; a
+/// `NaN` costs the whole triangle.
+///
+/// @param mesh - read for its triangles, written for its tangents
+pub fn tangents(mesh: &mut MeshData) {
+	let mut along_u = vec![Vec3::ZERO; mesh.vertices.len()];
+	let mut along_v = vec![Vec3::ZERO; mesh.vertices.len()];
+
+	for triangle in mesh.indices.chunks_exact(3) {
+		spread(mesh, triangle, &mut along_u, &mut along_v);
+	}
+
+	for (index, vertex) in mesh.vertices.iter_mut().enumerate() {
+		let normal = Vec3::from_array(vertex.normal).normalize_or(Vec3::Y);
+		let axis = orthogonal(normal, along_u[index]);
+
+		// which way the third axis turns. The bitangent the unwrap implies is
+		// `along_v`; the one the shader will build is `cross(normal, axis)`.
+		// When they point apart the unwrap is mirrored, and the sign is how the
+		// shader is told.
+		let sign = if normal.cross(axis).dot(along_v[index]) < 0.0 {
+			-1.0
+		} else {
+			1.0
+		};
+
+		vertex.tangent = axis.extend(sign).to_array();
+	}
+}
+
+/// Adds one triangle's frame to each of its three vertices.
+///
+/// @param mesh - where the corners are read from
+/// @param triangle - three indices into its vertices
+/// @param along_u - the running sum of tangents, one per vertex
+/// @param along_v - the running sum of bitangents, one per vertex
+fn spread(mesh: &MeshData, triangle: &[u32], along_u: &mut [Vec3], along_v: &mut [Vec3]) {
+	let mut slots = [0_usize; 3];
+	for (slot, index) in slots.iter_mut().zip(triangle) {
+		match usize::try_from(*index) {
+			| Ok(at) if at < mesh.vertices.len() => *slot = at,
+			| _ => return,
+		}
+	}
+
+	let position = |slot: usize| Vec3::from_array(mesh.vertices[slots[slot]].position);
+	let texcoord = |slot: usize| Vec2::from_array(mesh.vertices[slots[slot]].uv);
+
+	let (edge_a, edge_b) = (position(1) - position(0), position(2) - position(0));
+	let (uv_a, uv_b) = (texcoord(1) - texcoord(0), texcoord(2) - texcoord(0));
+
+	// twice the signed area of the triangle as it lies on the texture. Zero
+	// when the unwrap put its three corners on one line, and there is then no
+	// direction for `u` to grow in.
+	let area = uv_a.x.mul_add(uv_b.y, -(uv_b.x * uv_a.y));
+	if area.abs() < DEGENERATE_UV {
+		return;
+	}
+
+	let scale = 1.0 / area;
+	let u = (edge_a * uv_b.y - edge_b * uv_a.y) * scale;
+	let v = (edge_b * uv_a.x - edge_a * uv_b.x) * scale;
+
+	if !(u.is_finite() && v.is_finite()) {
+		return;
+	}
+
+	for slot in slots {
+		along_u[slot] += u;
+		along_v[slot] += v;
+	}
+}
+
+/// The part of an accumulated tangent that is perpendicular to the normal.
+///
+/// @param normal - the vertex's own unit normal
+/// @param accumulated - the sum of every triangle's tangent at this vertex
+/// @return a unit vector across the normal, arbitrary if there was no sum
+fn orthogonal(normal: Vec3, accumulated: Vec3) -> Vec3 {
+	(accumulated - normal * normal.dot(accumulated))
+		.try_normalize()
+		.unwrap_or_else(|| normal.any_orthonormal_vector())
 }
 
 registry_handle! {
@@ -265,6 +398,8 @@ pub fn cube() -> MeshData {
 		push_face(&mut mesh, normal * 0.5, right * 0.5, up * 0.5, normal);
 	}
 
+	tangents(&mut mesh);
+
 	mesh
 }
 
@@ -273,6 +408,7 @@ pub fn cube() -> MeshData {
 pub fn quad() -> MeshData {
 	let mut mesh = MeshData::default();
 	push_face(&mut mesh, Vec3::ZERO, Vec3::X * 0.5, Vec3::NEG_Z * 0.5, Vec3::Y);
+	tangents(&mut mesh);
 
 	mesh
 }
@@ -313,12 +449,14 @@ pub fn sphere() -> MeshData {
 			let top = ring * stride + segment;
 			let bottom = top + stride;
 
-			for corner in [top, bottom, top + 1, top + 1, bottom, bottom + 1] {
+			for corner in [top, top + 1, bottom, top + 1, bottom + 1, bottom] {
 				mesh.indices
 					.push(u32::try_from(corner).unwrap_or(0));
 			}
 		}
 	}
+
+	tangents(&mut mesh);
 
 	mesh
 }
@@ -355,6 +493,19 @@ fn push_face(mesh: &mut MeshData, center: Vec3, right: Vec3, up: Vec3, normal: V
 mod tests {
 	use super::*;
 
+	/// Twice the area of a triangle, which is zero when it has no direction.
+	fn wound_area(mesh: &MeshData, triangle: usize) -> f32 {
+		let corner = |offset: usize| {
+			let index = usize::try_from(mesh.indices[triangle * 3 + offset]).unwrap_or(0);
+
+			Vec3::from_array(mesh.vertices[index].position)
+		};
+
+		(corner(1) - corner(0))
+			.cross(corner(2) - corner(0))
+			.length()
+	}
+
 	/// The normal a triangle's winding implies, by the right-hand rule.
 	fn wound_normal(mesh: &MeshData, triangle: usize) -> Vec3 {
 		let corner = |offset: usize| {
@@ -366,6 +517,239 @@ mod tests {
 		(corner(1) - corner(0))
 			.cross(corner(2) - corner(0))
 			.normalize()
+	}
+
+	/// A mesh of loose triangles from `(position, uv)` corners, all facing up.
+	fn loose(corners: &[(Vec3, Vec2)]) -> MeshData {
+		MeshData {
+			vertices: corners
+				.iter()
+				.map(|(position, uv)| MeshVertex::new(*position, Vec3::Y, *uv))
+				.collect(),
+			indices: (0..u32::try_from(corners.len()).expect("the fixture is small")).collect(),
+		}
+	}
+
+	#[test]
+	fn the_quad_tangent_points_the_way_its_u_axis_grows() {
+		let quad = quad();
+
+		for vertex in &quad.vertices {
+			assert!(
+				vertex.tangent_axis().abs_diff_eq(Vec3::X, 1.0e-5),
+				"the quad's u runs along +x, got {:?}",
+				vertex.tangent
+			);
+			assert!(
+				(vertex.tangent[3] + 1.0).abs() < 1.0e-6,
+				"and its v runs along +z, which is the mirrored turn: got {}",
+				vertex.tangent[3]
+			);
+		}
+	}
+
+	#[test]
+	fn every_cube_tangent_lies_flat_in_the_face_it_belongs_to() {
+		for vertex in cube().vertices {
+			let (normal, tangent) = (Vec3::from_array(vertex.normal), vertex.tangent_axis());
+
+			assert!(
+				(tangent.length() - 1.0).abs() < 1.0e-5,
+				"a tangent is a unit vector, got {}",
+				tangent.length()
+			);
+			assert!(
+				normal.dot(tangent).abs() < 1.0e-5,
+				"and lies across the normal, got {} against {normal}",
+				normal.dot(tangent)
+			);
+			assert!(
+				(vertex.tangent[3].abs() - 1.0).abs() < 1.0e-6,
+				"and the sign is a sign, got {}",
+				vertex.tangent[3]
+			);
+		}
+	}
+
+	#[test]
+	fn the_spheres_tangents_run_around_it_rather_than_over_it() {
+		let sphere = sphere();
+
+		for vertex in &sphere.vertices {
+			let normal = Vec3::from_array(vertex.normal);
+
+			// the poles are where a latitude-longitude unwrap has no answer:
+			// every segment of the top ring is the same point.
+			if normal.y.abs() > 0.99 {
+				continue;
+			}
+
+			let tangent = vertex.tangent_axis();
+			let around = Vec3::new(-normal.z, 0.0, normal.x).normalize();
+
+			assert!(
+				normal.dot(tangent).abs() < 1.0e-5,
+				"square with the normal, got {}",
+				normal.dot(tangent)
+			);
+			// @note: not tighter than this, and the slack is the seam. The
+			// first and last segment of a ring are the same point under two
+			// texture coordinates, so each is shared by the triangles on one
+			// side only and its averaged tangent sits half a segment - about
+			// seven degrees - around from where the analytic one is.
+			assert!(
+				tangent.dot(around) > 0.98,
+				"u runs around the equator rather than over the pole: got {tangent} against \
+				 {around}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_nearly_collapsed_triangle_does_not_shout_down_the_ones_beside_it() {
+		// two triangles sharing their first corner. The second is unwrapped
+		// onto a patch a ten-millionth across, which is not collapsed and is
+		// not meant either - a modeling tool that welded two texture
+		// coordinates produces exactly this. Its share of the tangent is
+		// divided by that patch's area, so without a floor under the divisor it
+		// arrives ten million times louder than its neighbor and the shared
+		// corner ends up believing it.
+		let tiny = 1.0e-7;
+		let mut mesh = MeshData {
+			vertices: vec![
+				MeshVertex::new(Vec3::ZERO, Vec3::Y, Vec2::ZERO),
+				MeshVertex::new(Vec3::X, Vec3::Y, Vec2::new(1.0, 0.0)),
+				MeshVertex::new(Vec3::Z, Vec3::Y, Vec2::new(0.0, 1.0)),
+				MeshVertex::new(Vec3::Z, Vec3::Y, Vec2::new(tiny, 0.0)),
+				MeshVertex::new(Vec3::X, Vec3::Y, Vec2::new(0.0, tiny)),
+			],
+			indices: vec![0, 1, 2, 0, 3, 4],
+		};
+
+		tangents(&mut mesh);
+
+		assert!(
+			mesh.vertices[0]
+				.tangent_axis()
+				.abs_diff_eq(Vec3::X, 1.0e-4),
+			"the shared corner keeps the frame the honest triangle gave it, got {:?}",
+			mesh.vertices[0].tangent
+		);
+	}
+
+	#[test]
+	fn a_coordinate_that_is_not_a_number_does_not_spread() {
+		// nothing in the engine writes one; a file can. What matters is that
+		// the corner it poisons is the only one, rather than every vertex the
+		// triangle touches and then every triangle they touch.
+		let mut mesh = loose(&[
+			(Vec3::ZERO, Vec2::ZERO),
+			(Vec3::X, Vec2::new(1.0, 0.0)),
+			(Vec3::Z, Vec2::new(0.0, 1.0)),
+			(Vec3::ZERO, Vec2::new(f32::NAN, 0.0)),
+			(Vec3::X, Vec2::new(1.0, 0.0)),
+			(Vec3::Z, Vec2::new(0.0, 1.0)),
+		]);
+		mesh.indices = vec![0, 1, 2, 3, 1, 2];
+
+		tangents(&mut mesh);
+
+		for vertex in &mesh.vertices {
+			assert!(
+				vertex.tangent_axis().is_finite(),
+				"every frame is a real direction, got {:?}",
+				vertex.tangent
+			);
+		}
+		assert!(
+			mesh.vertices[1]
+				.tangent_axis()
+				.abs_diff_eq(Vec3::X, 1.0e-5),
+			"and the corners the good triangle shares with the bad one are unharmed, got {:?}",
+			mesh.vertices[1].tangent
+		);
+	}
+
+	#[test]
+	fn a_mirrored_unwrap_turns_the_frame_the_other_way() {
+		let (a, b, c) = (Vec3::ZERO, Vec3::X, Vec3::Z);
+		let mut mesh = loose(&[
+			(a, Vec2::new(0.0, 0.0)),
+			(b, Vec2::new(1.0, 0.0)),
+			(c, Vec2::new(0.0, 1.0)),
+			(a, Vec2::new(1.0, 0.0)),
+			(b, Vec2::new(0.0, 0.0)),
+			(c, Vec2::new(1.0, 1.0)),
+		]);
+
+		tangents(&mut mesh);
+
+		assert!(
+			mesh.vertices[0]
+				.tangent_axis()
+				.abs_diff_eq(Vec3::X, 1.0e-5),
+			"the first triangle's u grows along +x, got {:?}",
+			mesh.vertices[0].tangent
+		);
+		assert!(
+			mesh.vertices[3]
+				.tangent_axis()
+				.abs_diff_eq(Vec3::NEG_X, 1.0e-5),
+			"the mirrored one's grows the other way, got {:?}",
+			mesh.vertices[3].tangent
+		);
+		assert!(
+			mesh.vertices[0].tangent[3] * mesh.vertices[3].tangent[3] < 0.0,
+			"and the two frames turn opposite ways, got {} and {}",
+			mesh.vertices[0].tangent[3],
+			mesh.vertices[3].tangent[3]
+		);
+	}
+
+	#[test]
+	fn a_mesh_with_no_unwrap_at_all_still_gets_a_usable_frame() {
+		let mut mesh =
+			loose(&[(Vec3::ZERO, Vec2::ZERO), (Vec3::X, Vec2::ZERO), (Vec3::Z, Vec2::ZERO)]);
+
+		tangents(&mut mesh);
+
+		for vertex in &mesh.vertices {
+			let tangent = vertex.tangent_axis();
+
+			assert!(tangent.is_finite(), "no dividing by a collapsed unwrap, got {tangent}");
+			assert!(
+				(tangent.length() - 1.0).abs() < 1.0e-5,
+				"still a unit vector, got {}",
+				tangent.length()
+			);
+			assert!(
+				Vec3::Y.dot(tangent).abs() < 1.0e-5,
+				"still across the normal, got {}",
+				Vec3::Y.dot(tangent)
+			);
+		}
+	}
+
+	#[test]
+	fn a_tangent_is_made_square_with_the_normal_it_is_stored_beside() {
+		// an unwrap that leans: u grows along x and also along y, while the
+		// normal insists the surface is flat. The stored frame has to follow
+		// the normal, because that is the axis the shader builds around.
+		let mut mesh = loose(&[
+			(Vec3::ZERO, Vec2::ZERO),
+			(Vec3::new(1.0, 1.0, 0.0), Vec2::new(1.0, 0.0)),
+			(Vec3::Z, Vec2::new(0.0, 1.0)),
+		]);
+
+		tangents(&mut mesh);
+
+		for vertex in &mesh.vertices {
+			assert!(
+				Vec3::Y.dot(vertex.tangent_axis()).abs() < 1.0e-5,
+				"the lean is projected out, got {:?}",
+				vertex.tangent
+			);
+		}
 	}
 
 	#[test]
@@ -391,6 +775,41 @@ mod tests {
 				"triangle {triangle} is wound {wound}, but its vertices claim {declared}"
 			);
 		}
+	}
+
+	#[test]
+	fn every_sphere_triangle_is_wound_to_face_outwards() {
+		let sphere = sphere();
+
+		let mut checked = 0;
+		for triangle in 0..sphere.triangles() {
+			// half of each pole band is degenerate by construction: a pole ring
+			// is one point repeated once per segment, so every triangle with two
+			// corners in it has no area to take a direction from. Forty-eight of
+			// the seven hundred and sixty-eight. The threshold has three orders
+			// of magnitude either side of it: the smallest real triangle here
+			// measures about 2.5e-3 and the slivers about 1e-9 - not zero,
+			// because the sine of a single-precision pi is not quite nothing, so
+			// the bottom pole is a ring of radius 4e-8 rather than a point.
+			if wound_area(&sphere, triangle) < 1.0e-6 {
+				continue;
+			}
+
+			let wound = wound_normal(&sphere, triangle);
+			let first = usize::try_from(sphere.indices[triangle * 3]).expect("the index fits");
+			let declared = Vec3::from_array(sphere.vertices[first].normal);
+
+			// the bands next to the poles are slivers, so their wound normal
+			// leans a fair way off the corner's own. What matters is which side
+			// of the surface it is on.
+			assert!(
+				wound.dot(declared) > 0.0,
+				"triangle {triangle} is wound {wound}, and its corner claims {declared}"
+			);
+			checked += 1;
+		}
+
+		assert_eq!(checked, 720, "and the rest of them really were checked");
 	}
 
 	#[test]

@@ -22,6 +22,33 @@ use crate::{
 /// The name the always-present default material is registered under.
 pub const DEFAULT_NAME: &str = "default";
 
+/// What a sampler does past the edge of a texture.
+///
+/// Two, because there are two answers anybody wants: a tiled surface repeats
+/// and a decal does not. Mirroring and a border color exist in every graphics
+/// API and neither has ever been the thing that was missing.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Wrap {
+	/// The texture tiles, which is what a floor wants.
+	#[default]
+	Repeat = 0,
+
+	/// The last row and column go on forever, which is what a decal or an
+	/// atlas wants: a repeating one bleeds the far edge into the near one.
+	Clamp = 1,
+}
+
+impl Wrap {
+	/// The number the renderer indexes its sampler table with.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "a fieldless repr(u32) enum casts to its own discriminant, which is exactly 		          the number being asked for"
+	)]
+	pub const fn code(self) -> u32 { self as u32 }
+}
+
 /// How rough an unspecified surface is.
 ///
 /// Not zero: a perfectly smooth dielectric is a mirror, which is a strange
@@ -53,6 +80,19 @@ pub struct Material {
 	/// happens to be white.
 	pub albedo: TextureId,
 
+	/// The normal map, or [`TextureId::FLAT_NORMAL`] for a surface that is as
+	/// flat as its geometry says.
+	///
+	/// The same trick the albedo plays, with a different constant: the default
+	/// is one texel meaning "straight out", so a material with no map goes
+	/// through the same shader as one with a map and comes out unchanged.
+	/// **Not `NONE`** - `NONE` is the white texel, and white read as a
+	/// direction is a diagonal.
+	///
+	/// The image has to have been compiled as numbers rather than as a color;
+	/// @ref `colby_asset::compile::NORMAL_SUFFIX` for how a file says so.
+	pub normal: TextureId,
+
 	/// How many times the texture repeats across the mesh's own `0..1`.
 	///
 	/// Here rather than in the mesh because it is a property of the *surface*:
@@ -60,6 +100,13 @@ pub struct Material {
 	/// what it is made of, and baking that into the geometry would mean a mesh
 	/// per material.
 	pub uv_scale: Vec2,
+
+	/// What happens past the edge of both of its textures.
+	///
+	/// One setting for the pair rather than one each: they are the same surface
+	/// under the same unwrap, and a normal map that tiled differently from the
+	/// color over it would be a bug with no use.
+	pub wrap: Wrap,
 }
 
 impl Material {
@@ -69,7 +116,9 @@ impl Material {
 		metallic: 0.0,
 		roughness: DEFAULT_ROUGHNESS,
 		albedo: TextureId::NONE,
+		normal: TextureId::FLAT_NORMAL,
 		uv_scale: Vec2::ONE,
+		wrap: Wrap::Repeat,
 	};
 
 	/// A material in a color, with nothing else set.
@@ -80,6 +129,27 @@ impl Material {
 	#[must_use]
 	pub const fn textured(albedo: TextureId) -> Self { Self { albedo, ..Self::DEFAULT } }
 
+	/// The same material, with a normal map over it.
+	///
+	/// [`TextureId::NONE`] means the flat map rather than the null texture,
+	/// which is the one place a handle is rewritten on the way in. The reason
+	/// is that `NONE` is the *white* texel and white read as a direction is a
+	/// diagonal, so a game that asked for a map the registry does not have yet
+	/// would get a surface lit from the wrong side rather than an unmapped one.
+	/// Everywhere else a missing handle costs nothing; here it costs the
+	/// picture.
+	#[must_use]
+	pub const fn bumped(self, normal: TextureId) -> Self {
+		Self {
+			normal: if normal.is_some() {
+				normal
+			} else {
+				TextureId::FLAT_NORMAL
+			},
+			..self
+		}
+	}
+
 	/// The same material, with its metallic and roughness set.
 	#[must_use]
 	pub const fn finished(self, metallic: f32, roughness: f32) -> Self {
@@ -89,6 +159,10 @@ impl Material {
 	/// The same material, with its texture repeated.
 	#[must_use]
 	pub const fn tiled(self, times: f32) -> Self { Self { uv_scale: Vec2::splat(times), ..self } }
+
+	/// The same material, with its textures held at their edges.
+	#[must_use]
+	pub const fn clamped(self) -> Self { Self { wrap: Wrap::Clamp, ..self } }
 }
 
 impl Default for Material {
@@ -201,6 +275,22 @@ mod tests {
 			"rough rather than a mirror, which is a strange default"
 		);
 		assert_eq!(material.uv_scale, Vec2::ONE, "and one tile across the mesh");
+	}
+
+	#[test]
+	fn asking_for_a_normal_map_that_is_not_there_leaves_the_surface_flat() {
+		let missing = Material::DEFAULT.bumped(TextureId::NONE);
+
+		assert_eq!(
+			missing.normal,
+			TextureId::FLAT_NORMAL,
+			"the null texture is white, and white read as a direction is a diagonal"
+		);
+		assert_eq!(
+			Material::DEFAULT.bumped(TextureId::new(7)).normal,
+			TextureId::new(7),
+			"and a handle that names something is left alone"
+		);
 	}
 
 	#[test]

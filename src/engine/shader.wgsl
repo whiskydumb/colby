@@ -8,6 +8,12 @@
 // light, no shadows, no image-based lighting - the ambient term stands in for
 // everything the scene does not simulate, which is why it is a color and not a
 // number.
+//
+// The normal a pixel is shaded with is the geometry's, turned by whatever the
+// normal map says. The frame that turn happens in is built per vertex from the
+// normal and the tangent the mesh carries, and its third axis is the cross of
+// the two times the tangent's sign - which is what makes a mirrored unwrap come
+// out the right way up.
 
 struct Globals {
     view_projection: mat4x4<f32>,
@@ -22,26 +28,36 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 
 @group(1) @binding(0) var albedo: texture_2d<f32>;
-@group(1) @binding(1) var albedo_sampler: sampler;
+@group(1) @binding(1) var surface_sampler: sampler;
+// Sampled as numbers rather than as a color: the compiler stores it in a linear
+// layout so that the GPU does not bend the directions on the way in.
+@group(1) @binding(2) var normal_map: texture_2d<f32>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     // Origin top left; the importer flips OBJ's bottom-up v on the way in.
     @location(2) uv: vec2<f32>,
+    // xyz is the direction u grows in; w is +1 or -1, and says which way the
+    // third axis of the frame turns.
+    @location(3) tangent: vec4<f32>,
 };
 
 struct InstanceInput {
     // A model matrix, one column per location. wgsl has no matrix vertex
     // attribute, so it arrives as four vectors and is put back together here.
-    @location(3) model_0: vec4<f32>,
-    @location(4) model_1: vec4<f32>,
-    @location(5) model_2: vec4<f32>,
-    @location(6) model_3: vec4<f32>,
+    @location(4) model_0: vec4<f32>,
+    @location(5) model_1: vec4<f32>,
+    @location(6) model_2: vec4<f32>,
+    @location(7) model_3: vec4<f32>,
     // The material's base color times the entity's own tint.
-    @location(7) tint: vec4<f32>,
+    @location(8) tint: vec4<f32>,
     // x is metallic, y is roughness, zw is how often the texture repeats.
-    @location(8) surface: vec4<f32>,
+    @location(9) surface: vec4<f32>,
+    // xyz is one over the square of the entity's scale, which is the whole of
+    // the normal matrix for a transform that is a translation, a rotation and a
+    // scale. w is unused.
+    @location(10) normal_scale: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -51,6 +67,8 @@ struct VertexOutput {
     @location(2) uv: vec2<f32>,
     @location(3) world_position: vec3<f32>,
     @location(4) surface: vec2<f32>,
+    // xyz is the tangent in world space; w carries the sign through unchanged.
+    @location(5) tangent: vec4<f32>,
 };
 
 @vertex
@@ -66,16 +84,55 @@ fn vertex_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
 
     var output: VertexOutput;
     output.clip_position = globals.view_projection * world_position;
-    // @note: the model matrix rather than its inverse transpose. That is only
-    // correct while scale is uniform, which is all anything spawns so far.
-    // Non-uniform scale will need the real normal matrix.
-    output.normal = (model * vec4<f32>(vertex.normal, 0.0)).xyz;
+    // the real normal matrix, and it costs three multiplies: for a model matrix
+    // that is T * R * S the matrix carrying normals is R * S^-1, and
+    // mat3(model) is R * S, so dividing by the square of the scale first leaves
+    // exactly R * S^-1. Under a uniform scale this is the old line times a
+    // constant, which normalize removes; under a stretched one it is the
+    // difference between lighting the surface and lighting a lie.
+    let normal = vertex.normal * instance.normal_scale.xyz;
+    output.normal = (model * vec4<f32>(normal, 0.0)).xyz;
+    // a tangent lies *in* the surface rather than across it, so it travels like
+    // a position does and takes the model matrix unmodified.
+    output.tangent = vec4<f32>(
+        (model * vec4<f32>(vertex.tangent.xyz, 0.0)).xyz,
+        vertex.tangent.w,
+    );
     output.tint = instance.tint.rgb;
     output.uv = vertex.uv * instance.surface.zw;
     output.world_position = world_position.xyz;
     output.surface = instance.surface.xy;
 
     return output;
+}
+
+// The shading normal: the geometry's, turned by the map.
+//
+// Gram-Schmidt again, because interpolating two frames across a triangle leaves
+// a tangent that is no longer square with the normal beside it. A material with
+// no map samples the flat texel, whose direction is straight out, and comes
+// back with the normal it started with - so mapped and unmapped go down the
+// same path, and the one branch below is about geometry rather than about
+// whether there is a map.
+fn shading_normal(input: VertexOutput) -> vec3<f32> {
+    let normal = normalize(input.normal);
+    let leaning = input.tangent.xyz;
+    let tangent = leaning - normal * dot(normal, leaning);
+
+    // a mesh whose unwrap collapsed has no tangent to speak of. The importer
+    // gives it any perpendicular direction rather than a zero, so this is the
+    // second line of the same defense and costs one comparison.
+    if dot(tangent, tangent) < 1.0e-12 {
+        return normal;
+    }
+
+    let along_u = normalize(tangent);
+    let along_v = cross(normal, along_u) * input.tangent.w;
+    let sampled = textureSample(normal_map, surface_sampler, input.uv).xyz * 2.0 - 1.0;
+
+    return normalize(
+        along_u * sampled.x + along_v * sampled.y + normal * sampled.z,
+    );
 }
 
 // How much of the surface's microfacets point along the half vector.
@@ -118,7 +175,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // the texture is sRGB, so this is already linear by the time it is a float.
     // A material with no image samples the one white texel and multiplies by
     // one, which is why there is no branch here.
-    let sampled = textureSample(albedo, albedo_sampler, input.uv);
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
     let base_color = input.tint * sampled.rgb;
 
     let metallic = clamp(input.surface.x, 0.0, 1.0);
@@ -126,7 +183,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // vanish, and the highlight becomes a single blinding pixel.
     let roughness = clamp(input.surface.y, 0.045, 1.0);
 
-    let normal = normalize(input.normal);
+    let normal = shading_normal(input);
     let towards_light = normalize(-globals.light.xyz);
     let towards_eye = normalize(globals.eye.xyz - input.world_position);
     let half_vector = normalize(towards_light + towards_eye);
