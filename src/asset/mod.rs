@@ -32,6 +32,7 @@ pub mod format;
 pub mod gltf;
 pub mod html;
 pub mod json;
+pub mod model;
 pub mod obj;
 pub mod png;
 pub mod sdf;
