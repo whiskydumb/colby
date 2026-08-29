@@ -12,3 +12,5 @@ Cargo.lock text linguist-generated=true
 *.jpg   binary
 *.ico   binary
 *.woff2 binary
+*.glb   binary
+*.bin   binary

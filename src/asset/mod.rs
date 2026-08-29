@@ -29,6 +29,7 @@ pub mod css;
 pub mod document;
 pub mod font;
 pub mod format;
+pub mod gltf;
 pub mod html;
 pub mod json;
 pub mod obj;
