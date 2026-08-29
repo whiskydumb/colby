@@ -21,10 +21,10 @@ use std::f32::consts::TAU;
 
 use colby_core::{
 	abi::{
-		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, GameApi, Joint, JointId,
+		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, JointId,
 		Key, Layers, Length, Material, MaterialId, MeshId, Motion, PanelId, Renderable,
-		SceneData, Shape, Solid, TouchKind, TraceInfo, Transform, Value, World, character, debug,
-		scene,
+		SceneData, SceneId, Shape, Solid, TouchKind, TraceInfo, Transform, Value, World,
+		character, debug, scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -213,28 +213,21 @@ const HUD: &str = "ui/hud";
 /// How many loose props the scene drops on the floor.
 const PROPS: usize = 5;
 
-/// Where each prop is let go from, how big it is, and whether it is a ball.
+/// The scene the props are written in.
+///
+/// Everything about them - where they are let go from, how big they are, what
+/// they are made of, which one hangs and how long its rope is - lives in
+/// `assets/scenes/props.scene` rather than in this file. Editing it moves them
+/// in the running window with no module reload, which is the whole reason this
+/// engine compiles assets on a timer.
 ///
 /// Three boxes over each other and two balls beside them: the boxes show that a
 /// stack settles and stays settled, and the balls show that it is a solver
-/// rather than a set of rules about boxes. They are let go from a height rather
-/// than placed at rest so that pressing space is worth doing.
-const PROP_DROPS: [(Vec3, f32, bool); PROPS] = [
-	(Vec3::new(4.20, 0.20, -0.90), 0.62, false),
-	(Vec3::new(4.20, 1.05, -0.90), 0.62, false),
-	(Vec3::new(4.20, 1.90, -0.90), 0.62, false),
-	(Vec3::new(5.60, 2.60, 0.60), 0.70, true),
-	(Vec3::new(5.40, 2.30, -1.50), 0.52, true),
-];
+/// rather than a set of rules about boxes.
+const PROPS_SCENE: &str = "scenes/props";
 
-/// Which prop hangs from a rope.
-const SWINGING: usize = 3;
-
-/// Where that rope is tied, in the world.
+/// Where the rope is tied when there is no scene to say.
 const HOOK: Vec3 = Vec3::new(4.60, 3.20, 0.60);
-
-/// How long it is.
-const ROPE: f32 = 1.4;
 
 /// How big the cross marking the rope's hook is, in world units.
 const HOOK_SIZE: f32 = 0.08;
@@ -393,6 +386,13 @@ struct State {
 	/// Their bodies.
 	prop_bodies: [BodyId; PROPS],
 
+	/// The scene they were laid out from.
+	props_scene: SceneId,
+
+	/// Which revision of it they are, so that editing the file lays them out
+	/// again and nothing else does.
+	props_revision: u32,
+
 	/// The rope one of them hangs from.
 	rope: JointId,
 
@@ -454,7 +454,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 12;
+const STATE_LAYOUT: u64 = 13;
 
 /// The module's single exported symbol.
 ///
@@ -507,9 +507,6 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		for slot in &mut state.ring {
 			*slot = world.entities.spawn();
 		}
-		for slot in &mut state.props {
-			*slot = world.entities.spawn();
-		}
 		for slot in &mut state.lamp {
 			*slot = world.entities.spawn();
 		}
@@ -548,13 +545,14 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	// picked up by this one.
 	dress(world);
 	place(world);
+	collide(world);
+
 	if fresh {
 		// only on a fresh arena: a reload should leave the pile exactly where
 		// the last build left it, which is the whole point of the state living
 		// in the host.
-		drop_props(world);
+		lay_props(world);
 	}
-	collide(world);
 
 	// showing a document is idempotent by name, so a reload finds the same
 	// panel with the same text still in it rather than stacking a second copy.
@@ -635,6 +633,7 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	world.camera.orbit(yaw, pitch, distance);
 
 	place(world);
+	relay_props(world);
 	pick(world);
 	duplicate(world, yaw);
 	light_up(world);
@@ -835,7 +834,7 @@ fn drop_one(world: &mut World, index: usize) {
 
 	world
 		.entities
-		.set_renderable(entity, Renderable::of(mesh, material, prop_color(index % PROPS)));
+		.set_renderable(entity, Renderable::of(mesh, material, prop_color(index % PROPS, ball)));
 
 	let shape = if ball { Shape::ball(0.5) } else { Shape::UNIT };
 	let body = world.attach_body(entity, BodyKind::Dynamic, shape);
@@ -1058,7 +1057,18 @@ fn pick(world: &mut World) {
 fn light_up(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let (center, ring, picked) = (state.center, state.ring, state.picked);
-	let props = state.props;
+	let (props, scene) = (state.props, state.props_scene);
+
+	// the props' own colors are the scene's rather than a formula's, so they
+	// are read back out of it here. A highlight multiplies whatever the file
+	// wrote.
+	let mut base = [Vec3::ONE; PROPS];
+	for (slot, thing) in base
+		.iter_mut()
+		.zip(&world.scenes.data(scene).things)
+	{
+		*slot = thing.color;
+	}
 
 	let lit = |id: EntityId, color: Vec3| {
 		if id == picked && id.is_some() {
@@ -1080,7 +1090,7 @@ fn light_up(world: &mut World) {
 
 	for (index, id) in props.into_iter().enumerate() {
 		if let Some(renderable) = world.entities.renderable_mut(id) {
-			renderable.color = lit(id, prop_color(index));
+			renderable.color = lit(id, base[index]);
 		}
 	}
 }
@@ -1198,7 +1208,7 @@ fn recenter(world: &mut World) {
 	world.camera.orbit(yaw, pitch, distance);
 
 	place(world);
-	drop_props(world);
+	lay_props(world);
 
 	// a cut rather than a move: the ring's angle, the camera's target and its
 	// orbit all jumped at once, and the host would otherwise draw every one of
@@ -1347,11 +1357,12 @@ fn dress(world: &mut World) {
 	let quartz = world
 		.materials
 		.insert("quartz", Material::colored(CENTER_COLOR).finished(0.0, 0.12));
-	// the ring alternates between the two ends of the model, so both are on
-	// screen at once and the difference is visible rather than described.
 	let plastic = world
 		.materials
 		.insert("plastic", Material::DEFAULT.finished(0.0, 0.5));
+	// the ring alternates between plastic and this one; the props in
+	// `scenes/props` name it too, which is why every material a scene can name
+	// is registered here before anything is laid out. @ref [`lay_props`].
 	let metal = world
 		.materials
 		.insert("metal", Material::DEFAULT.finished(1.0, 0.25));
@@ -1372,71 +1383,109 @@ fn dress(world: &mut World) {
 	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (props, player) = (state.props, state.player);
+	let player = state.player;
 
+	// the props are not here: what they are made of is written in their scene.
 	world
 		.entities
 		.set_renderable(player, Renderable::of(MeshId::CUBE, plastic, PLAYER_COLOR));
 
-	for (index, id) in props.into_iter().enumerate() {
-		let ball = PROP_DROPS[index].2;
-		let mesh = if ball { MeshId::SPHERE } else { MeshId::CUBE };
-		// not `quartz`: that material carries the crystal's own color, and a
-		// material's color multiplies the entity's tint rather than being
-		// replaced by it, so a blue ball made of quartz comes out olive.
-		let material = if ball { metal } else { plastic };
-
-		world
-			.entities
-			.set_renderable(id, Renderable::of(mesh, material, prop_color(index)));
-	}
-
 	stand_model(world);
 }
 
-/// A color for the `index`th prop.
+/// A color for the `index`th thing the spawn menu drops.
 ///
-/// Deliberately not [`hue`]: the ring walks the whole circle and the props
-/// should read as a separate set of things rather than as more of it.
-fn prop_color(index: usize) -> Vec3 {
+/// Deliberately not [`hue`]: the ring walks the whole circle and what the menu
+/// drops should read as a separate set of things rather than as more of it.
+/// The five props the scene lays out carry their own colors and do not come
+/// through here.
+///
+/// @param index - which of a run of them this is
+/// @param ball - whether it is round, which is worth telling apart at a glance
+fn prop_color(index: usize, ball: bool) -> Vec3 {
 	let shade = turn(index, PROPS).mul_add(0.4, 0.55);
 
-	if PROP_DROPS[index].2 {
+	if ball {
 		return Vec3::new(0.35, shade, 0.85);
 	}
 
 	Vec3::new(shade, 0.45, 0.35)
 }
 
-/// Puts every prop back where it is let go from, at rest.
+/// Lays the props out from their scene, throwing away whatever was there.
 ///
-/// The transform is written through the *body* as well as through the entity,
-/// and the velocity is cleared: a prop that is teleported without having its
-/// velocity taken away arrives at the top of its drop still traveling at
-/// whatever speed it hit the floor with.
-fn drop_props(world: &mut World) {
+/// Everything about them is in the file, so putting them back where they were
+/// let go from is not a teleport with the velocity cleared: it is reading the
+/// file again. That is also what makes the reset button and editing the file
+/// the same operation.
+///
+/// @param world - the tables to clear and fill
+fn lay_props(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	state.landings = 0;
-	let (props, bodies) = (state.props, state.prop_bodies);
+	let (props, bodies, rope) = (state.props, state.prop_bodies, state.rope);
 
-	for (index, id) in props.into_iter().enumerate() {
-		let (position, size, _) = PROP_DROPS[index];
-		let mut transform = Transform::at(position);
-		transform.set_scale(size);
-
-		if let Some(slot) = world.entities.transform_mut(id) {
-			*slot = transform;
-		}
-
-		world.entities.snap(id);
-
-		if let Some(body) = world.bodies.get_mut(bodies[index]) {
-			body.transform = transform;
-			body.velocity = Vec3::ZERO;
-			body.angular = Vec3::ZERO;
-			body.sleeping = false;
-		}
+	world.joints.despawn(rope);
+	for (entity, body) in props.into_iter().zip(bodies) {
+		world.bodies.despawn(body);
+		world.entities.despawn(entity);
 	}
+
+	let scene = world.scenes.find(PROPS_SCENE);
+	let revision = world.scenes.get(scene).map_or(0, Entry::revision);
+	// cloned first: the table is read through `world` and the instantiate writes
+	// through it, and a description is a few hundred bytes.
+	let data = world.scenes.data(scene).clone();
+	let put = scene::instantiate(world, &data, Vec3::ZERO);
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.props_scene = scene;
+	state.props_revision = revision;
+	state.rope = put.joint(0);
+	for (slot, id) in state.props.iter_mut().zip(put.entities()) {
+		*slot = id;
+	}
+	for (slot, id) in state.prop_bodies.iter_mut().zip(put.bodies()) {
+		*slot = id;
+	}
+
+	info!(
+		scene = PROPS_SCENE,
+		revision,
+		entities = put.entities().count(),
+		"props laid out"
+	);
+}
+
+/// Lays them out again when their file has changed.
+///
+/// The whole of what a game has to do to hot-reload a scene: the host
+/// recompiles the file, the registry entry is rewritten under the same name
+/// and its revision moves, and this notices. Nothing is watched, nothing is
+/// subscribed to, and a reload of the *module* does not do it - which is the
+/// point, because the pile should stay where it was left.
+///
+/// @param world - the scene to read and the tables to fill
+fn relay_props(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (scene, was) = (state.props_scene, state.props_revision);
+
+	// re-resolved when it is nothing, for the reason the panels are: a file
+	// that did not exist when the game started is a file somebody may be about
+	// to write, and a name resolves to nothing until it does.
+	if !scene.is_some() {
+		if world.scenes.find(PROPS_SCENE).is_some() {
+			lay_props(world);
+		}
+
+		return;
+	}
+
+	if world.scenes.get(scene).map_or(0, Entry::revision) == was {
+		return;
+	}
+
+	lay_props(world);
 }
 
 /// Puts a body on some layers, once it exists.
@@ -1467,15 +1516,11 @@ fn layer(world: &mut World, body: BodyId, layers: Layers) {
 /// [`Body::transform`](colby_core::abi::Body::transform).
 fn collide(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (center, ring, props) = (state.center, state.ring, state.props);
+	let (center, ring) = (state.center, state.ring);
 	let player = state.player;
 	let old = [state.floor_body, state.center_body, state.trigger, state.player_body];
 
-	for id in old
-		.into_iter()
-		.chain(state.ring_bodies)
-		.chain(state.prop_bodies)
-	{
+	for id in old.into_iter().chain(state.ring_bodies) {
 		world.bodies.despawn(id);
 	}
 
@@ -1516,34 +1561,6 @@ fn collide(world: &mut World) {
 		layer(world, *slot, WORLD_LAYERS);
 	}
 
-	// the props are the only bodies in the scene the *solver* owns. Everything
-	// above follows an entity the game animates; these five do the opposite,
-	// and the entity follows them.
-	let mut prop_bodies = [BodyId::NONE; PROPS];
-	for (index, slot) in prop_bodies.iter_mut().enumerate() {
-		let shape = if PROP_DROPS[index].2 {
-			Shape::ball(0.5)
-		} else {
-			Shape::UNIT
-		};
-
-		*slot = world.attach_body(props[index], BodyKind::Dynamic, shape);
-
-		if let Some(body) = world.bodies.get_mut(*slot) {
-			body.mass = PROP_MASS;
-			body.restitution = PROP_BOUNCE;
-			body.friction = PROP_GRIP;
-			body.layers = PROP_LAYERS;
-		}
-	}
-
-	// one of the balls hangs rather than lies. A rope is the cheapest thing that
-	// shows a joint working: it is obvious from across the room whether it is
-	// holding, and obvious the moment it is not.
-	world.joints.clear();
-	let rope =
-		world.join(Joint::rope(prop_bodies[SWINGING], BodyId::NONE, (Vec3::ZERO, HOOK), ROPE));
-
 	// kinematic rather than dynamic: the controller decides where the player
 	// goes, and the solver's job is only to push props out from under it. A
 	// dynamic one would be a box the player argues with.
@@ -1556,8 +1573,6 @@ fn collide(world: &mut World) {
 	state.floor_body = floor_body;
 	state.center_body = center_body;
 	state.ring_bodies = ring_bodies;
-	state.prop_bodies = prop_bodies;
-	state.rope = rope;
 	state.trigger = trigger;
 	// what the ray found is per-load and not worth carrying across one: the
 	// bodies it named are the ones just despawned. Clearing it also means the
@@ -1606,15 +1621,22 @@ fn place(world: &mut World) {
 	// *body* rather than the entity so that it is exactly where the solver put
 	// it rather than a step behind. This used to be a very thin cube with an
 	// entity of its own, because there was nothing else to draw a line with.
+	// read out of the joint rather than out of a constant, so that moving the
+	// hook in the scene moves the line drawn to it. Read from the *body* rather
+	// than the entity so the far end is where the solver put it rather than a
+	// step behind.
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let held = state.prop_bodies[SWINGING];
+	let (held, hook) = world
+		.joints
+		.get(state.rope)
+		.map_or((BodyId::NONE, HOOK), |joint| (joint.first, joint.second_anchor));
 	let end = world
 		.bodies
 		.get(held)
-		.map_or(HOOK, |body| body.transform.position);
+		.map_or(hook, |body| body.transform.position);
 
-	world.debug.line(HOOK, end, debug::YELLOW);
-	world.debug.point(HOOK, HOOK_SIZE, debug::YELLOW);
+	world.debug.line(hook, end, debug::YELLOW);
+	world.debug.point(hook, HOOK_SIZE, debug::YELLOW);
 
 	for (index, id) in ring.into_iter().enumerate() {
 		let Some(transform) = world.entities.transform_mut(id) else {
