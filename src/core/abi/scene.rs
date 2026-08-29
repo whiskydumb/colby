@@ -38,8 +38,8 @@
 use crate::{
 	Result,
 	abi::{
-		Body, BodyId, BodyKind, Camera, EntityId, Joint, JointId, JointKind, Layers, MaterialId,
-		Renderable, Shape, ShapeKind, Transform, World, state::STATE_BYTES,
+		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
+		MaterialId, Registry, Renderable, Shape, ShapeKind, Transform, World, state::STATE_BYTES,
 	},
 	err,
 	glam::{Quat, Vec3},
@@ -504,6 +504,97 @@ fn form(world: &World, shape: &Shape) -> Form {
 			.map_or_else(String::new, |entry| entry.name().to_owned()),
 	}
 }
+
+crate::registry_handle! {
+	/// A handle to a scene the host has loaded.
+	///
+	/// Not generational, like every other resource handle and unlike the ones
+	/// into the world's own tables: a scene is compiled from a file and lives
+	/// as long as the process, and recompiling one rewrites the entry the
+	/// handle already points at. @ref [`registry`](crate::abi::registry).
+	SceneId
+}
+
+/// One loaded scene: what it is called, what is in it, and how many times it
+/// has been recompiled.
+pub type Scene = Entry<SceneData>;
+
+/// Every scene the host has loaded, by name.
+///
+/// Filled from `assets/` like the meshes are, and read by a game that wants to
+/// put one into the world - either replacing what is there with
+/// [`restore`](crate::abi::scene::restore) or creating a copy of it beside
+/// what is there with [`instantiate`].
+#[derive(Debug)]
+pub struct Scenes {
+	entries: Registry<SceneData>,
+}
+
+impl Scenes {
+	/// A table holding nothing but its null entry.
+	#[must_use]
+	pub fn new() -> Self {
+		Self {
+			entries: Registry::new(SceneData::default()),
+		}
+	}
+
+	/// Looks a scene up by name.
+	///
+	/// @param name - the asset name, `scenes/props` for
+	/// `assets/scenes/props.scene` @return its handle, or [`SceneId::NONE`] if
+	/// nothing answers to that name
+	#[must_use]
+	pub fn find(&self, name: &str) -> SceneId { SceneId::new(self.entries.find(name)) }
+
+	/// Registers a scene under a name, replacing whatever was there.
+	///
+	/// @param name - what the game will ask for
+	/// @param data - the description
+	/// @return the handle, the same one as last time if the name is known
+	pub fn insert(&mut self, name: &str, data: SceneData) -> SceneId {
+		SceneId::new(self.entries.insert(name, data))
+	}
+
+	/// One scene, by handle.
+	#[must_use]
+	pub fn get(&self, id: SceneId) -> Option<&Scene> { self.entries.entry(id.index()) }
+
+	/// What is in a scene, by handle.
+	///
+	/// The usual way in, because what a game does with a scene is hand it to a
+	/// loader. An unknown handle answers with a description of nothing, which
+	/// creates nothing and replaces nothing.
+	#[must_use]
+	pub fn data(&self, id: SceneId) -> &SceneData { self.get(id).map_or(&EMPTY, Entry::value) }
+
+	/// How many scenes there are, counting the null one.
+	#[must_use]
+	pub fn len(&self) -> usize { self.entries.len() }
+
+	/// Always `false`: the null entry always exists.
+	#[must_use]
+	pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+
+	/// Every scene, in slot order, starting with the null one.
+	pub fn iter(&self) -> impl Iterator<Item = &Scene> { self.entries.iter() }
+}
+
+impl Default for Scenes {
+	fn default() -> Self { Self::new() }
+}
+
+/// What an unknown handle reads as.
+static EMPTY: SceneData = SceneData {
+	stage: Stage::DEFAULT,
+	things: Vec::new(),
+	solids: Vec::new(),
+	links: Vec::new(),
+	thing_generations: Vec::new(),
+	solid_generations: Vec::new(),
+	link_generations: Vec::new(),
+	arena: None,
+};
 
 /// What a restore put back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

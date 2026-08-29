@@ -57,7 +57,10 @@ pub use self::{
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
 	},
 	registry::{Entry, Registry},
-	scene::{Arena, Form, Link, Remap, Restored, SceneData, Solid, Stage, Thing},
+	scene::{
+		Arena, Form, Link, Remap, Restored, Scene, SceneData, SceneId, Scenes, Solid, Stage,
+		Thing,
+	},
 	state::GameState,
 	texture::{Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},
@@ -68,7 +71,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 22;
+pub const ABI_VERSION: u32 = 23;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -238,6 +241,14 @@ pub struct World {
 	/// links a font library. @ref [`font`](crate::abi::font).
 	pub fonts: Fonts,
 
+	/// Every scene the host has loaded, reached by handle.
+	///
+	/// Filled the same way as `meshes`, from the same tree: an
+	/// `assets/scenes/props.scene` compiles into a `.cscene` and lands here
+	/// under `scenes/props`. What a game does with one is hand it to a loader
+	/// - @ref [`scene`](crate::abi::scene) for the two of them.
+	pub scenes: Scenes,
+
 	/// Every model the host has loaded, reached by handle.
 	///
 	/// Filled the same way as `meshes`, from the same tree, and holding none
@@ -327,6 +338,7 @@ impl World {
 			textures: Textures::new(),
 			fonts: Fonts::new(),
 			models: Models::new(),
+			scenes: Scenes::new(),
 			materials: Materials::new(),
 			cvars: Cvars::new(),
 			ui: Ui::new(),

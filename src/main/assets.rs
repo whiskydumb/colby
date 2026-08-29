@@ -27,12 +27,12 @@ use std::{
 
 use colby_asset::{
 	MeshFile, TextureFile, compile, compile::Kind, document::DocumentFile, font::FontFile,
-	model::ModelFile,
+	model::ModelFile, scene::SceneFile,
 };
 use colby_core::{
 	abi::{
 		DocumentData, FontData, Material, MaterialId, MeshData, MeshId, ModelData, Placement,
-		TextureData, TextureId, World,
+		SceneData, TextureData, TextureId, World,
 	},
 	debug, info, warn,
 };
@@ -219,6 +219,7 @@ impl Assets {
 			| Kind::Font => load_font(world, path, &name),
 			| Kind::Document => load_document(world, path, &name),
 			| Kind::Model => load_model(world, path, &name),
+			| Kind::Scene => load_scene(world, path, &name),
 		}
 	}
 
@@ -246,6 +247,7 @@ impl Assets {
 				| Kind::Font => drop(world.fonts.insert(&name, FontData::empty())),
 				| Kind::Document => drop(world.ui.insert(&name, DocumentData::empty())),
 				| Kind::Model => drop(world.models.insert(&name, ModelData::default())),
+				| Kind::Scene => drop(world.scenes.insert(&name, SceneData::default())),
 			}
 
 			info!(name, ?kind, "asset unloaded; its file is gone");
@@ -391,6 +393,42 @@ fn load_document(world: &mut World, path: &Path, name: &str) {
 	let id = world.ui.insert(name, data);
 
 	info!(name, slot = id.index(), nodes, rules, "document loaded");
+}
+
+/// Reads one `.cscene` into the world's scene table.
+///
+/// The one loader that resolves nothing. Every other asset arrives with its
+/// references turned into handles here, because a mesh is drawn and a texture
+/// is sampled and both need one now. A scene is neither: it is a description
+/// somebody hands to a loader later, and what its names resolve to depends on
+/// the world it is being put into rather than on this one. So the description
+/// is stored as it was written, names and all.
+fn load_scene(world: &mut World, path: &Path, name: &str) {
+	let data = match SceneFile::open(path) {
+		| Ok(file) => file.to_scene_data(),
+		| Err(error) => {
+			warn!(%error, "the scene on disk could not be read");
+
+			return;
+		},
+	};
+
+	let existing = world.scenes.find(name);
+	if existing.is_some()
+		&& world
+			.scenes
+			.get(existing)
+			.is_some_and(|scene| *scene.value() == data)
+	{
+		// as the other loaders: an unchanged scene is not worth a revision,
+		// and a game watching one for changes should not see one.
+		return;
+	}
+
+	let (entities, bodies, joints) = (data.things.len(), data.solids.len(), data.links.len());
+	let id = world.scenes.insert(name, data);
+
+	info!(name, slot = id.index(), entities, bodies, joints, "scene loaded");
 }
 
 /// Reads one `.cmodel` into the world's model table, and its materials into
@@ -1120,5 +1158,89 @@ mod tests {
 
 		assert_eq!(world.models.find("models/lamp"), id, "the handle still resolves");
 		assert!(world.models.placements(id).is_empty(), "and it stands nothing");
+	}
+	#[test]
+	fn a_scene_source_reaches_the_table_with_everything_in_it() {
+		let (source, output) = trees("scene");
+		put(
+			&source,
+			"scenes/room.scene",
+			r#"{
+				"entities": [ { "name": "crate", "at": [0, 4, 0], "mesh": "cube" } ],
+				"bodies": [ { "entity": "crate", "kind": "dynamic" } ]
+			}"#,
+		);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source, output);
+		assets.sync(&mut world);
+
+		let id = world.scenes.find("scenes/room");
+
+		assert!(id.is_some(), "the scene is in the table");
+
+		let data = world.scenes.data(id);
+
+		assert_eq!(data.things.len(), 1, "with its entity");
+		assert_eq!(data.solids.len(), 1, "and its body");
+		assert_eq!(
+			data.things[0].mesh, "cube",
+			"and the names are still names: what they resolve to is the business of whichever 			 world it is put into"
+		);
+	}
+
+	#[test]
+	fn editing_a_scene_reloads_it_without_moving_its_handle() {
+		let (source, output) = trees("scene-edit");
+		put(&source, "scenes/room.scene", r#"{ "entities": [ {} ] }"#);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+		assets.sync(&mut world);
+
+		let id = world.scenes.find("scenes/room");
+		let first = world
+			.scenes
+			.get(id)
+			.expect("it is there")
+			.revision();
+
+		sleep(POLL_INTERVAL + Duration::from_millis(40));
+		put(&source, "scenes/room.scene", r#"{ "entities": [ {}, {} ] }"#);
+		assets.poll(&mut world);
+
+		assert_eq!(world.scenes.find("scenes/room"), id, "the handle is the one it was");
+		assert_eq!(world.scenes.data(id).things.len(), 2, "and it holds what the file now says");
+		assert_ne!(
+			world
+				.scenes
+				.get(id)
+				.expect("still there")
+				.revision(),
+			first,
+			"with a revision that moved, which is what anything watching it reads"
+		);
+	}
+
+	#[test]
+	fn deleting_a_scene_leaves_it_empty_rather_than_broken() {
+		let (source, output) = trees("scene-gone");
+		put(&source, "scenes/room.scene", r#"{ "entities": [ {} ] }"#);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+		assets.sync(&mut world);
+
+		let id = world.scenes.find("scenes/room");
+
+		assert_eq!(world.scenes.data(id).things.len(), 1, "it was there");
+
+		fs::remove_file(source.join("scenes/room.scene")).expect("and is now gone");
+		assets.sync(&mut world);
+
+		assert!(
+			world.scenes.data(id).things.is_empty(),
+			"the handle still resolves and describes nothing, which creates nothing"
+		);
 	}
 }

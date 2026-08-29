@@ -43,7 +43,9 @@ use std::{
 
 use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
-use crate::{document, font, format, gltf, html, jpeg, model, obj, png, texture, ttf};
+use crate::{
+	document, font, format, gltf, html, jpeg, level, model, obj, png, scene, texture, ttf,
+};
 
 /// The directory under a workspace that holds editable sources.
 pub const SOURCE_DIR: &str = "assets";
@@ -70,6 +72,7 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
 	html::EXTENSION,
 	gltf::EXTENSION,
 	gltf::BINARY_EXTENSION,
+	level::EXTENSION,
 ];
 
 /// The extensions it writes.
@@ -79,6 +82,7 @@ pub const OUTPUT_EXTENSIONS: &[&str] = &[
 	font::EXTENSION,
 	document::EXTENSION,
 	model::EXTENSION,
+	scene::EXTENSION,
 ];
 
 /// Which of colby's formats a source compiles into.
@@ -105,6 +109,13 @@ pub enum Kind {
 	/// directory named after it, loaded by exactly the code that loads a
 	/// mesh anybody made by hand.
 	Model,
+
+	/// A `.scene` becomes a `.cscene`, the same file a save is.
+	///
+	/// The only output the engine also writes for itself, and the reason the
+	/// format is one rather than two: a level and a saved game are the same
+	/// list of things standing in the same places.
+	Scene,
 }
 
 impl Kind {
@@ -122,6 +133,7 @@ impl Kind {
 			| ttf::EXTENSION => Some(Self::Font),
 			| html::EXTENSION => Some(Self::Document),
 			| gltf::EXTENSION | gltf::BINARY_EXTENSION => Some(Self::Model),
+			| level::EXTENSION => Some(Self::Scene),
 			| _ => None,
 		}
 	}
@@ -135,6 +147,7 @@ impl Kind {
 			| Self::Font => font::EXTENSION,
 			| Self::Document => document::EXTENSION,
 			| Self::Model => model::EXTENSION,
+			| Self::Scene => scene::EXTENSION,
 		}
 	}
 
@@ -152,6 +165,7 @@ impl Kind {
 			| font::EXTENSION => Some(Self::Font),
 			| document::EXTENSION => Some(Self::Document),
 			| model::EXTENSION => Some(Self::Model),
+			| scene::EXTENSION => Some(Self::Scene),
 			| _ => None,
 		}
 	}
@@ -165,6 +179,7 @@ impl Kind {
 			| Self::Font => font::version_of(path),
 			| Self::Document => document::version_of(path),
 			| Self::Model => model::version_of(path),
+			| Self::Scene => scene::version_of(path),
 		}
 	}
 
@@ -177,6 +192,7 @@ impl Kind {
 			| Self::Font => font::FORMAT_VERSION,
 			| Self::Document => document::FORMAT_VERSION,
 			| Self::Model => model::FORMAT_VERSION,
+			| Self::Scene => scene::FORMAT_VERSION,
 		}
 	}
 }
@@ -219,6 +235,18 @@ pub enum Produced {
 
 		/// How many style rules apply to them.
 		rules: usize,
+	},
+
+	/// A world: what stands where, what collides and what is held together.
+	Scene {
+		/// How many entities stand in it.
+		entities: usize,
+
+		/// How many bodies.
+		bodies: usize,
+
+		/// How many joints.
+		joints: usize,
 	},
 
 	/// A whole model: what it is made of and where each piece stands.
@@ -444,6 +472,19 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 			};
 
 			(document::encode(&text), produced)
+		},
+		| Kind::Scene => {
+			let data = level::import(&fs::read_to_string(source)?)
+				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+			let bytes = scene::encode(&data)
+				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+			let produced = Produced::Scene {
+				entities: data.things.len(),
+				bodies: data.solids.len(),
+				joints: data.links.len(),
+			};
+
+			(bytes, produced)
 		},
 		| Kind::Model => {
 			let (bytes, produced, said) = compile_model(source, output, root)?;
@@ -848,6 +889,87 @@ f 4 1 5 8
 			.expect("the tree compiles")
 	}
 
+	/// A scene source with an entity, a body under it and a rope holding it.
+	const SCENE: &str = r#"{
+		"entities": [ { "name": "crate", "at": [0, 4, 0], "mesh": "cube" } ],
+		"bodies": [ { "name": "crate", "entity": "crate", "kind": "dynamic" } ],
+		"joints": [ { "first": "crate", "anchors": [[0, 0, 0], [0, 8, 0]], "length": 3 } ]
+	}"#;
+
+	#[test]
+	fn a_scene_source_compiles_into_a_scene_file() {
+		let workspace = workspace("scene");
+		put(&workspace, "scenes/room.scene", SCENE);
+
+		let report = run(&workspace, false);
+		let compiled = report
+			.compiled
+			.iter()
+			.find(|it| it.name == "scenes/room")
+			.expect("it compiled");
+
+		assert!(
+			matches!(compiled.produced, Produced::Scene { entities: 1, bodies: 1, joints: 1 }),
+			"the report says what is in it, got {:?}",
+			compiled.produced
+		);
+
+		let file = scene::SceneFile::open(&compiled.output).expect("and it reads back");
+		let data = file.to_scene_data();
+
+		assert_eq!(data.things[0].mesh, "cube", "the entity names its mesh");
+		assert_eq!(data.solids[0].thing, 0, "the body points at it by index");
+		assert_eq!(data.links[0].first, 0, "and so does the rope");
+	}
+
+	#[test]
+	fn a_scene_that_will_not_read_is_reported_rather_than_written() {
+		let workspace = workspace("scene-broken");
+		put(
+			&workspace,
+			"scenes/broken.scene",
+			r#"{ "entities": [ { "whereabouts": [1] } ] }"#,
+		);
+
+		let report = run(&workspace, false);
+		let failed = report.failed.first().expect("it failed");
+
+		assert!(
+			failed.source.ends_with("broken.scene")
+				&& failed.error.to_string().contains("whereabouts"),
+			"the file and the field are both named: {}",
+			failed.error
+		);
+		assert!(
+			!output_root(&workspace)
+				.join("scenes/broken.cscene")
+				.exists(),
+			"and nothing was written"
+		);
+	}
+
+	#[test]
+	fn a_scene_written_by_another_version_is_recompiled() {
+		let workspace = workspace("scene-stale");
+		put(&workspace, "scenes/room.scene", SCENE);
+		run(&workspace, false);
+
+		let output = output_root(&workspace).join("scenes/room.cscene");
+		let mut bytes = fs::read(&output).expect("it was written");
+		bytes[8] = 99;
+		fs::write(&output, &bytes).expect("and is now from the future");
+
+		let report = run(&workspace, false);
+
+		assert!(
+			report
+				.compiled
+				.iter()
+				.any(|it| it.name == "scenes/room"),
+			"a version this build does not read is stale however new the file is"
+		);
+	}
+
 	#[test]
 	fn a_name_is_the_relative_path_without_its_extension() {
 		let root = Path::new("C:/w/assets");
@@ -1241,6 +1363,16 @@ f 4 1 5 8
 					assert!(
 						!file.stands().is_empty(),
 						"{} compiled to a model with nothing standing anywhere",
+						compiled.name
+					);
+				},
+				| Some(Kind::Scene) => {
+					let file =
+						scene::SceneFile::open(&compiled.output).expect("the scene reads back");
+
+					assert!(
+						!file.stood().is_empty() || !file.bulk().is_empty(),
+						"{} compiled to a scene with nothing in it at all",
 						compiled.name
 					);
 				},
