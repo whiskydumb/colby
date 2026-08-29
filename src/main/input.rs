@@ -72,6 +72,8 @@ const KEYS: &[(KeyCode, Key)] = &[
 	(KeyCode::Tab, Key::Tab),
 	(KeyCode::Backspace, Key::Backspace),
 	(KeyCode::Delete, Key::Delete),
+	(KeyCode::Home, Key::Home),
+	(KeyCode::End, Key::End),
 	(KeyCode::ShiftLeft, Key::Shift),
 	(KeyCode::ShiftRight, Key::Shift),
 	(KeyCode::ControlLeft, Key::Control),
@@ -115,9 +117,18 @@ const KEYS: &[(KeyCode, Key)] = &[
 pub(crate) fn apply(input: &mut Input, event: &WindowEvent) {
 	match *event {
 		| WindowEvent::KeyboardInput {
-			event: KeyEvent { physical_key, state, .. },
+			event: KeyEvent { physical_key, state, ref text, .. },
 			..
 		} => {
+			// what the window says was typed, which is the only thing that knows
+			// the layout, the modifiers and whatever input method is in front of
+			// them. Only on the way down: a key coming back up types nothing.
+			if state == ElementState::Pressed
+				&& let Some(typed) = text.as_deref()
+			{
+				input.type_text(typed);
+			}
+
 			// @note: `repeat` is deliberately not filtered. A held key already
 			// reads as held, and set_key only raises the pressed edge on a
 			// transition, so a repeat is a no-op either way.

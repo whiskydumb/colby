@@ -383,6 +383,18 @@ mod tests {
 		}
 	}
 
+	/// One step's input with the wheel turned.
+	///
+	/// A statement rather than `..Default::default()`: `Input` keeps the
+	/// typed-text buffer private, and the struct-update spelling needs every
+	/// field to be visible.
+	fn wheeled(lines: f32) -> Input {
+		let mut input = Input::default();
+		input.wheel = lines;
+
+		input
+	}
+
 	/// A world showing one document, laid out in a window of a given size.
 	fn showing(html: &str, size: Vec2) -> (World, PanelId) {
 		let mut world = World::new();
@@ -599,8 +611,7 @@ mod tests {
 		let (mut world, panel) = showing(TALL, Vec2::new(800.0, 600.0));
 		let mut interface = Interface::new();
 		// away from the person, which pulls the contents up.
-		let input = Input { wheel: -2.0, ..Input::default() };
-		world.input = input;
+		world.input = wheeled(-2.0);
 
 		world.ui.set_pointer(Vec2::new(400.0, 300.0));
 		interface.update(&mut world);
@@ -662,8 +673,7 @@ mod tests {
 		assert!(box_of(&world, "inner").scrollable > 0.0, "and so can the inner one");
 
 		let mut interface = Interface::new();
-		let input = Input { wheel: -1.0, ..Input::default() };
-		world.input = input;
+		world.input = wheeled(-1.0);
 
 		// well inside the inner box: the row splits its two hundred between the
 		// list and the filler, so the list ends at a hundred and a pointer there

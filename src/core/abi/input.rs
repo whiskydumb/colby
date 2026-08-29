@@ -19,6 +19,14 @@
 //! that moved forty pixels moved forty pixels however many steps the frame
 //! happened to run.
 
+/// How many bytes of typed text one step can carry.
+///
+/// Sixty-four, which is a sixtieth of a second of typing at any speed a person
+/// reaches and about three of the longest thing an input method hands over at
+/// once. What does not fit is dropped whole rather than cut, because half of a
+/// character is not a character.
+pub const TYPED_BYTES: usize = 64;
+
 /// How many `u64` words the key bitsets need.
 ///
 /// @ref [`Key::COUNT`], which must not exceed `KEY_WORDS * 64`.
@@ -84,6 +92,8 @@ pub enum Key {
 	Tab,
 	Backspace,
 	Delete,
+	Home,
+	End,
 
 	Shift,
 	Control,
@@ -118,7 +128,7 @@ pub enum Key {
 
 impl Key {
 	/// How many keys are defined.
-	pub const COUNT: usize = 73;
+	pub const COUNT: usize = 75;
 
 	/// This key's bit position in the [`Input`] bitsets.
 	#[must_use]
@@ -198,6 +208,25 @@ pub struct Input {
 
 	/// Whether the window has keyboard focus.
 	pub focused: bool,
+
+	/// What was typed this step, as UTF-8. Read through
+	/// [`typed`](Self::typed).
+	///
+	/// A fixed array rather than a pointer and a length, for the reason
+	/// [`TraceInfo`](crate::abi::TraceInfo)'s ignore list is one: this ABI has
+	/// no raw pointers in it outside the query table, and that is worth more
+	/// than being able to type a paragraph in one step.
+	///
+	/// **Text, not keys.** A control character never lands here - Enter, Tab,
+	/// Backspace and the arrows are in the key table, where a shortcut can ask
+	/// about them without also being typed into a field. What is here is what a
+	/// person meant to write, with their own layout, their own modifiers and
+	/// their own input method already applied, which is the one thing a bitset
+	/// of physical keys cannot say.
+	typed: [u8; TYPED_BYTES],
+
+	/// How many of `typed` are used.
+	typed_len: u32,
 }
 
 impl Input {
@@ -349,6 +378,49 @@ impl Input {
 		self.buttons_released = 0;
 		self.cursor_delta = [0.0, 0.0];
 		self.wheel = 0.0;
+		self.typed_len = 0;
+	}
+
+	/// What was typed this step.
+	///
+	/// Empty on almost every step, which is what makes reading it cheap enough
+	/// to do unconditionally.
+	#[must_use]
+	pub fn typed(&self) -> &str {
+		let len = usize::try_from(self.typed_len)
+			.unwrap_or(0)
+			.min(TYPED_BYTES);
+
+		// valid by construction: only whole strings go in, and only when they
+		// fit. The fallback is not reachable and is here so that a corrupted
+		// arena reads as nothing typed rather than as a panic.
+		core::str::from_utf8(&self.typed[..len]).unwrap_or("")
+	}
+
+	/// Adds what a person typed.
+	///
+	/// The host's, once per key event that carries text. Control characters are
+	/// dropped, and so is anything that does not fit whole - @ref
+	/// [`typed`](Self::typed) for both rules.
+	///
+	/// @param text - what the window reported, in the layout the person is
+	/// using
+	pub fn type_text(&mut self, text: &str) {
+		for character in text.chars().filter(|it| !it.is_control()) {
+			let used = usize::try_from(self.typed_len)
+				.unwrap_or(TYPED_BYTES)
+				.min(TYPED_BYTES);
+			let wanted = character.len_utf8();
+
+			if used + wanted > TYPED_BYTES {
+				return;
+			}
+
+			character.encode_utf8(&mut self.typed[used..used + wanted]);
+			self.typed_len = self
+				.typed_len
+				.saturating_add(u32::try_from(wanted).unwrap_or(0));
+		}
 	}
 
 	/// Recomputes the clip-space cursor from the pixel cursor and the viewport.
@@ -378,6 +450,8 @@ impl Default for Input {
 			keys_pressed: [0; KEY_WORDS],
 			keys_released: [0; KEY_WORDS],
 			focused: true,
+			typed: [0; TYPED_BYTES],
+			typed_len: 0,
 		}
 	}
 }
@@ -409,6 +483,58 @@ fn pixels(value: f64) -> f32 { value as f32 }
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn what_was_typed_comes_back_as_it_went_in() {
+		let mut input = Input::default();
+
+		assert_eq!(input.typed(), "", "nothing has been typed yet");
+
+		input.type_text("ab");
+		input.type_text("c");
+
+		assert_eq!(input.typed(), "abc", "and one step's worth is one string");
+	}
+
+	#[test]
+	fn a_control_character_is_a_key_rather_than_something_typed() {
+		let mut input = Input::default();
+
+		// what a window hands over for Enter, Tab and Backspace. They are in
+		// the key table, and a field that took them as text would end up with
+		// a tab inside it every time somebody moved on.
+		input.type_text("a\r\n\tb\u{8}");
+
+		assert_eq!(input.typed(), "ab", "only what a person meant to write");
+	}
+
+	#[test]
+	fn typing_more_than_fits_drops_it_whole_rather_than_cutting_it() {
+		let mut input = Input::default();
+		let long = "x".repeat(TYPED_BYTES - 1);
+
+		input.type_text(&long);
+		// two bytes wide, and one byte of room left.
+		input.type_text("\u{444}");
+		input.type_text("y");
+
+		assert_eq!(input.typed().len(), TYPED_BYTES, "the last one that fits still goes in");
+		assert!(
+			input.typed().ends_with('y'),
+			"and the one that did not fit left nothing behind, got {:?}",
+			input.typed()
+		);
+	}
+
+	#[test]
+	fn a_step_forgets_what_the_last_one_typed() {
+		let mut input = Input::default();
+
+		input.type_text("hello");
+		input.end_step();
+
+		assert_eq!(input.typed(), "", "typing is an edge, like a key press");
+	}
 
 	#[test]
 	fn every_key_fits_in_the_bitset() {
