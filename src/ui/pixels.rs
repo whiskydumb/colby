@@ -71,6 +71,27 @@ mod tests {
 	/// @param offset - how far down, in layout pixels; clamped by the layout
 	/// @return the pixels, or `None` when this machine has no GPU
 	fn shoot_scrolled(source: &str, node: &str, offset: f32) -> Option<Image> {
+		shoot_with(source, node, offset, "", 0)
+	}
+
+	/// The same, with one field focused and its caret placed.
+	///
+	/// @param source - the document
+	/// @param node - the `id` of the field
+	/// @param caret - where the caret goes, as a byte offset into the value
+	/// @return the pixels, or `None` when this machine has no GPU
+	fn shoot_focused(source: &str, node: &str, caret: u32) -> Option<Image> {
+		shoot_with(source, "", 0.0, node, caret)
+	}
+
+	/// Renders a document with a box scrolled and a field focused.
+	fn shoot_with(
+		source: &str,
+		scrolled: &str,
+		offset: f32,
+		focused: &str,
+		caret: u32,
+	) -> Option<Image> {
 		let mut capture = Capture::new(SIZE.0, SIZE.1).expect("the adapter query works")?;
 
 		let mut world = Box::new(World::new());
@@ -87,7 +108,8 @@ mod tests {
 		let parsed = html::parse(source, &[]).expect("the document reads");
 		world.ui.insert("ui/test", parsed.document);
 		let panel = world.ui.show("ui/test");
-		world.ui.set_scroll(panel, node, offset);
+		world.ui.set_scroll(panel, scrolled, offset);
+		world.ui.set_focus(panel, focused, caret);
 
 		let mut interface = Interface::new();
 		interface
@@ -197,6 +219,24 @@ mod tests {
 	                         top: 0; width: 100px; height: 80px; overflow: scroll; } #inner { \
 	                         width: 100px; height: 200px; }</style><div id=\"list\"><div \
 	                         id=\"inner\"></div></div>";
+
+	#[test]
+	fn a_focused_field_draws_a_caret_where_the_typing_will_land() {
+		let source = "<style>body { padding: 0; font-family: \"fonts/blocks\"; font-size: \n		              10px; color: #ffffff; } #f { position: absolute; left: 0; top: 0; \n		              width: 200px; height: 20px; }</style><input id=\"f\" value=\"abcd\">";
+
+		let Some(start) = shoot_focused(source, "f", 0) else {
+			return;
+		};
+		let Some(end) = shoot_focused(source, "f", 4) else {
+			return;
+		};
+
+		// the test font is ten wide a letter, so four letters is forty across.
+		// The words themselves start at zero, so the only thing that can be ink
+		// past them is the caret.
+		assert!(ink(&end, 40, 2, 44, 18), "at the end it sits after the words");
+		assert!(!ink(&start, 40, 2, 44, 18), "and at the start it does not");
+	}
 
 	#[test]
 	fn a_box_that_can_scroll_says_so_with_a_bar() {

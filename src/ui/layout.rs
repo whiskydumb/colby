@@ -112,8 +112,17 @@ pub struct Placed {
 	/// How opaque it is, its ancestors' opacity included.
 	pub opacity: f32,
 
-	/// The words it draws, if it is a run of text.
+	/// The words it draws, if it is a run of text or a field.
 	pub text: String,
+
+	/// Whether the keyboard is going to this box.
+	///
+	/// Only ever true of a field, and of at most one per panel.
+	pub focused: bool,
+
+	/// Where the caret sits in it, as a byte offset into `text`. Meaningless
+	/// unless `focused`.
+	pub caret: u32,
 
 	/// The texture it draws, if it is an image.
 	pub image: String,
@@ -295,9 +304,17 @@ fn place(
 
 		scrolls.push(scroll);
 
+		let named_here = document
+			.node(node.document_node)
+			.map(|it| it.id.as_str())
+			.unwrap_or_default();
+		let focused = !named_here.is_empty() && named_here == panel.focused();
+
 		into.push(Placed {
 			panel: id,
 			node: node.document_node,
+			focused,
+			caret: if focused { panel.caret() } else { 0 },
 			rect,
 			clip: inherited,
 			clip_radius: inherited_radius,
@@ -382,7 +399,11 @@ fn build(
 		taffy_style.align_self = Some(AlignItems::FLEX_START);
 	}
 
-	let taffy = if node.is_text() {
+	// a field is measured like a run of text, so an unsized one is as wide as
+	// what is in it. A stylesheet almost always gives it a width instead, and
+	// an empty one with no width is nothing wide - which is honest rather than
+	// helpful, and is why every field in a document has a size.
+	let taffy = if node.has_words() {
 		tree.new_leaf_with_context(taffy_style, Measure {
 			text: text.clone(),
 			font,
@@ -404,7 +425,7 @@ fn build(
 		font,
 		font_size,
 		opacity,
-		text: if node.is_text() { text } else { String::new() },
+		text: if node.has_words() { text } else { String::new() },
 		image: node.source.clone(),
 		style: style.clone(),
 	});

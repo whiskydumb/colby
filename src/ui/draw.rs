@@ -62,6 +62,13 @@ pub struct Vertex {
 	pub clip_radius: f32,
 }
 
+/// How wide the caret is, in layout pixels.
+///
+/// A constant rather than a share of the font size: a caret is a thing the eye
+/// finds rather than a letter, and one that got thicker with the text would be
+/// a smudge at a heading's size.
+const CARET_WIDTH: f32 = 1.5;
+
 /// How wide the bar down the side of a scrolling box is, in layout pixels.
 const BAR_WIDTH: f32 = 5.0;
 
@@ -256,8 +263,12 @@ pub fn build(world: &World, placed: &[Placed], list: &mut DrawList) {
 			image(world, box_of, radius, list);
 		}
 
-		if node.is_text() && !box_of.text.is_empty() {
+		if node.has_words() && !box_of.text.is_empty() {
 			text(world, box_of, list);
+		}
+
+		if box_of.focused {
+			caret(world, box_of, list);
 		}
 
 		if box_of.scrollable > 0.0 {
@@ -265,6 +276,46 @@ pub fn build(world: &World, placed: &[Placed], list: &mut DrawList) {
 		}
 	}
 
+	list.close();
+}
+
+/// Adds the upright line that says where typing will land.
+///
+/// Measured through the same function that laid the words out, over the part of
+/// the value before the caret - which is why the caret is a byte offset rather
+/// than a character count: it is an index into the string, and every other
+/// answer would need converting before it could be used.
+fn caret(world: &World, box_of: &Placed, list: &mut DrawList) {
+	if !box_of.font.is_some() {
+		return;
+	}
+
+	let font = world.fonts.data(box_of.font);
+	let at = usize::try_from(box_of.caret)
+		.unwrap_or(0)
+		.min(box_of.text.len());
+	let Some(before) = box_of.text.get(..at) else {
+		// the offset landed inside a character, which nothing here should be
+		// able to produce. Drawing no caret is better than drawing a wrong one.
+		return;
+	};
+
+	let along = font.measure(before, box_of.font_size, None).x;
+
+	list.want(Binding::Blank);
+	list.quad(
+		[
+			box_of.rect[0] + along,
+			box_of.rect[1],
+			CARET_WIDTH,
+			box_of.font_size.max(CARET_WIDTH),
+		],
+		[0.0, 0.0, 1.0, 1.0],
+		foreground(box_of).0,
+		0.0,
+		KIND_RECT,
+		clip_of(box_of),
+	);
 	list.close();
 }
 
@@ -500,6 +551,8 @@ mod tests {
 			clip_radius: 0.0,
 			scroll: 0.0,
 			scrollable: 0.0,
+			focused: false,
+			caret: 0,
 			style: colby_core::abi::ui::Style::root(),
 			font: FontId::NONE,
 			font_size: 10.0,

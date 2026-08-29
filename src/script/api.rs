@@ -114,6 +114,17 @@ where
 		},
 	)?;
 
+	// the one thing a script can read back, and the field is why: a handler on
+	// a search box that cannot see what was typed into it is a handler that
+	// can do nothing. Everything else here still writes and never reads - what
+	// a script may see is its own panel and nothing beyond it.
+	let text_of = scope.create_function(move |_, node: String| {
+		let panel = running.borrow().panel;
+		let found = world.borrow().ui.text(panel, &node).to_owned();
+
+		Ok(found)
+	})?;
+
 	let set_text = scope.create_function(move |_, (node, text): (String, String)| {
 		let panel = running.borrow().panel;
 		world
@@ -172,6 +183,7 @@ where
 	})?;
 
 	tables.ui.set("on", on)?;
+	tables.ui.set("text", text_of)?;
 	tables.ui.set("set_text", set_text)?;
 	tables.ui.set("set_classes", set_classes)?;
 	tables.ui.set("set_style", set_style)?;

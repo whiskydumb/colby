@@ -361,6 +361,11 @@ impl Builder {
 			| "class" => value.clone_into(&mut node.classes),
 			| "style" => node.inline = css::declarations(value, &mut self.warnings),
 			| "src" if tag == Node::IMAGE => value.clone_into(&mut node.source),
+			// the *default* value, the way the attribute is in a browser: what
+			// the field says once somebody has typed in it lives in the panel's
+			// bindings, and the document goes on saying what it always said.
+			// @ref [`Bind`](colby_core::abi::ui::Bind).
+			| "value" if tag == Node::INPUT => value.clone_into(&mut node.text),
 			| "href" | "rel" | "type" if tag == "link" => {},
 			| _ => self.warnings.push(format!(
 				"line {}: `<{tag}>` has a `{key}` attribute, which colby does not read",

@@ -28,8 +28,11 @@
 use colby_core::{
 	Result,
 	abi::{
-		Button, World,
-		ui::{Event, EventKind, PanelId, document::NONE},
+		Button, Input, Key, World,
+		ui::{
+			Event, EventKind, PanelId,
+			document::{NONE, Node},
+		},
 	},
 	glam::Vec2,
 	trace,
@@ -52,6 +55,83 @@ pub use self::{
 	layout::Placed,
 	paint::Painter,
 };
+
+/// The nearest character boundary at or before a byte offset.
+///
+/// @param value - the string the offset is into
+/// @param at - the offset, which may be past the end or inside a character
+fn boundary(value: &str, at: usize) -> usize {
+	let mut at = at.min(value.len());
+
+	// zero is always a boundary, so this stops.
+	while !value.is_char_boundary(at) {
+		at -= 1;
+	}
+
+	at
+}
+
+/// One step's typing and editing, applied to a value and a caret.
+///
+/// A free function because it is all of the interesting part and none of it
+/// needs a world: a string, a place in it, and what the keyboard did.
+///
+/// @param input - this step's keys and text
+/// @param value - the field's contents, edited in place
+/// @param caret - a byte offset into it, moved in place
+fn edit(input: &Input, value: &mut String, caret: &mut usize) {
+	// snapped first, because the value can have been replaced under the caret:
+	// a game calling `set_text` on the field somebody is typing in leaves an
+	// offset that means nothing, and half of a character is not a place.
+	*caret = boundary(value, *caret);
+
+	let typed = input.typed();
+	if !typed.is_empty() {
+		value.insert_str(*caret, typed);
+		*caret += typed.len();
+	}
+
+	if input.pressed(Key::Backspace)
+		&& let Some(before) = value
+			.get(..*caret)
+			.and_then(|it| it.chars().next_back())
+	{
+		*caret -= before.len_utf8();
+		value.remove(*caret);
+	}
+
+	if input.pressed(Key::Delete)
+		&& value
+			.get(*caret..)
+			.is_some_and(|it| it.chars().next().is_some())
+	{
+		value.remove(*caret);
+	}
+
+	if input.pressed(Key::Left)
+		&& let Some(before) = value
+			.get(..*caret)
+			.and_then(|it| it.chars().next_back())
+	{
+		*caret -= before.len_utf8();
+	}
+
+	if input.pressed(Key::Right)
+		&& let Some(after) = value
+			.get(*caret..)
+			.and_then(|it| it.chars().next())
+	{
+		*caret += after.len_utf8();
+	}
+
+	if input.pressed(Key::Home) {
+		*caret = 0;
+	}
+
+	if input.pressed(Key::End) {
+		*caret = value.len();
+	}
+}
 
 /// How far one line of the wheel scrolls, in layout pixels.
 ///
@@ -127,8 +207,123 @@ impl Interface {
 		}
 
 		Self::wheel(world, &self.placed);
+		Self::focus(world, &self.placed, hit);
+		Self::keyboard(world, &self.placed);
 		Self::buttons(world, hit);
 	}
+
+	/// Sends the keyboard wherever the last press put it.
+	///
+	/// A press on a field focuses it and puts the caret at the end; a press on
+	/// anything else takes the focus away. Tab moves to the next field in the
+	/// document and shift-tab to the previous, wrapping at both ends.
+	///
+	/// @param world - the input to read and the panel to write
+	/// @param placed - this step's layout, for which boxes are fields
+	/// @param hit - what the pointer is over, if anything
+	fn focus(world: &mut World, placed: &[Placed], hit: Option<(PanelId, u32)>) {
+		let input = world.input;
+
+		if input.button_pressed(Button::Left) {
+			let onto = hit
+				.filter(|&(panel, node)| Self::is_field(world, panel, node))
+				.and_then(|(panel, node)| {
+					Self::name_of(world, panel, node).map(|name| (panel, name))
+				});
+
+			for panel in Self::panels(world) {
+				let named = match &onto {
+					| Some((over, name)) if *over == panel => name.clone(),
+					| _ => String::new(),
+				};
+				let caret = u32::try_from(world.ui.text(panel, &named).len()).unwrap_or(0);
+
+				world.ui.set_focus(panel, &named, caret);
+			}
+		}
+
+		if !input.pressed(Key::Tab) {
+			return;
+		}
+
+		let back = input.held(Key::Shift);
+
+		for panel in Self::panels(world) {
+			let fields: Vec<String> = placed
+				.iter()
+				.filter(|it| it.panel == panel)
+				.filter(|it| Self::is_field(world, panel, it.node))
+				.filter_map(|it| Self::name_of(world, panel, it.node))
+				.collect();
+
+			if fields.is_empty() {
+				continue;
+			}
+
+			let here = fields
+				.iter()
+				.position(|name| name == world.ui.focused(panel));
+			let next = match (here, back) {
+				| (Some(0) | None, true) => fields.len() - 1,
+				| (Some(index), true) => index - 1,
+				| (Some(index), false) => (index + 1) % fields.len(),
+				| (None, false) => 0,
+			};
+			let Some(name) = fields.get(next).cloned() else {
+				continue;
+			};
+			let caret = u32::try_from(world.ui.text(panel, &name).len()).unwrap_or(0);
+
+			world.ui.set_focus(panel, &name, caret);
+		}
+	}
+
+	/// Applies this step's typing and editing keys to whatever has the focus.
+	///
+	/// Text goes in at the caret and the editing keys move or delete around it.
+	/// Both halves come from [`Input`](colby_core::abi::Input) and they are
+	/// deliberately separate there: a control character never arrives as text,
+	/// so nothing here has to tell a tab from a Tab.
+	///
+	/// @param world - the input to read, and the value and caret to write
+	/// @param placed - this step's layout, for the panels that are on screen
+	fn keyboard(world: &mut World, placed: &[Placed]) {
+		for panel in Self::panels(world) {
+			let name = world.ui.focused(panel).to_owned();
+			if name.is_empty()
+				|| !placed
+					.iter()
+					.any(|it| it.panel == panel && it.focused)
+			{
+				continue;
+			}
+
+			let mut value = world.ui.text(panel, &name).to_owned();
+			let mut caret = usize::try_from(world.ui.caret(panel))
+				.unwrap_or(0)
+				.min(value.len());
+
+			edit(&world.input, &mut value, &mut caret);
+
+			world.ui.set_text(panel, &name, &value);
+			world
+				.ui
+				.set_focus(panel, &name, u32::try_from(caret).unwrap_or(0));
+		}
+	}
+
+	/// Whether a node is a field the keyboard can go to.
+	fn is_field(world: &World, panel: PanelId, node: u32) -> bool {
+		world
+			.ui
+			.panel(panel)
+			.and_then(|panel| world.ui.document(panel.document()))
+			.and_then(|document| document.value().node(node).map(Node::is_input))
+			.unwrap_or(false)
+	}
+
+	/// Every panel, as handles that outlive the borrow.
+	fn panels(world: &World) -> Vec<PanelId> { world.ui.panels().map(|(id, _)| id).collect() }
 
 	/// Turns this step's wheel into a scroll on whatever is under the pointer.
 	///
@@ -349,7 +544,7 @@ impl Overlay for Interface {
 #[cfg(test)]
 mod tests {
 	use colby_core::abi::{
-		FontData, Glyph, Input,
+		FontData, Glyph,
 		ui::{Length, style::Color},
 	};
 
@@ -691,6 +886,193 @@ mod tests {
 			"and the one holding it stayed where it was, got {}",
 			world.ui.scroll(panel, "outer")
 		);
+	}
+
+	/// One step's input with something typed into it.
+	///
+	/// A statement rather than `..Default::default()`, for the reason
+	/// [`wheeled`] is one.
+	fn typing(text: &str) -> Input {
+		let mut input = Input::default();
+		input.type_text(text);
+
+		input
+	}
+
+	/// Two fields side by side, both named.
+	const FIELDS: &str = "<style>body { padding: 0; } #one { position: absolute; left: 0; top: \
+	                      0; width: 100px; height: 20px; } #two { position: absolute; left: 0; \
+	                      top: 40px; width: 100px; height: 20px; }</style><input id=\"one\" \
+	                      value=\"ab\"><input id=\"two\">";
+
+	#[test]
+	fn a_field_says_what_the_document_said_until_somebody_changes_it() {
+		let (mut world, panel) = showing(FIELDS, Vec2::new(800.0, 600.0));
+
+		assert_eq!(world.ui.text(panel, "one"), "ab", "the value attribute is the default");
+
+		world.ui.set_text(panel, "one", "cd");
+
+		assert_eq!(world.ui.text(panel, "one"), "cd", "and the game writing it wins");
+	}
+
+	#[test]
+	fn pressing_a_field_sends_the_keyboard_to_it_and_pressing_away_takes_it_back() {
+		let (mut world, panel) = showing(FIELDS, Vec2::new(800.0, 600.0));
+		let mut interface = Interface::new();
+		let mut input = Input::default();
+
+		world.ui.set_pointer(Vec2::new(50.0, 10.0));
+		input.set_button(Button::Left, true);
+		world.input = input;
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.focused(panel), "one", "the press landed on the first field");
+		assert_eq!(world.ui.caret(panel), 2, "with the caret after what was already in it");
+
+		// let go, then press again somewhere else: the focus follows a press
+		// rather than a held button, so a second one has to be a second edge.
+		input.end_step();
+		input.set_button(Button::Left, false);
+		world.input = input;
+		interface.update(&mut world);
+
+		input.end_step();
+		input.set_button(Button::Left, true);
+		world.ui.set_pointer(Vec2::new(400.0, 400.0));
+		world.input = input;
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.focused(panel), "", "and a press on nothing takes it away again");
+	}
+
+	#[test]
+	fn tab_walks_the_fields_and_comes_back_round() {
+		let (mut world, panel) = showing(FIELDS, Vec2::new(800.0, 600.0));
+		let mut interface = Interface::new();
+		let mut input = Input::default();
+
+		input.set_key(Key::Tab, true);
+		world.input = input;
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.focused(panel), "one", "nothing was focused, so it starts at one");
+
+		// released and pressed again, because Tab moving the focus is an edge.
+		input.end_step();
+		input.set_key(Key::Tab, false);
+		world.input = input;
+		interface.update(&mut world);
+
+		input.end_step();
+		input.set_key(Key::Tab, true);
+		world.input = input;
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.focused(panel), "two", "and then the next one");
+	}
+
+	#[test]
+	fn what_is_typed_lands_in_the_focused_field_at_the_caret() {
+		let (mut world, panel) = showing(FIELDS, Vec2::new(800.0, 600.0));
+		let mut interface = Interface::new();
+
+		world.ui.set_focus(panel, "one", 1);
+		world.input = typing("XY");
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.text(panel, "one"), "aXYb", "typed between the two letters");
+		assert_eq!(world.ui.caret(panel), 3, "and the caret came with it");
+	}
+
+	#[test]
+	fn nothing_is_typed_into_a_panel_with_nothing_focused() {
+		let (mut world, panel) = showing(FIELDS, Vec2::new(800.0, 600.0));
+		let mut interface = Interface::new();
+
+		world.input = typing("XY");
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.text(panel, "one"), "ab", "the keyboard had nowhere to go");
+	}
+
+	#[test]
+	fn a_field_that_is_not_on_screen_takes_nothing() {
+		// what a document recompiled without the field somebody was typing in
+		// leaves behind: a focus naming a box that no longer exists. Writing
+		// into it would bind text to a node nothing draws, and quietly keep
+		// doing it for as long as the keyboard was pointed there.
+		let (mut world, panel) = showing(FIELDS, Vec2::new(800.0, 600.0));
+		let mut interface = Interface::new();
+
+		world.ui.set_focus(panel, "ghost", 0);
+		world.input = typing("XY");
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.text(panel, "ghost"), "", "nothing was written anywhere");
+	}
+
+	#[test]
+	fn backspace_takes_a_whole_character_and_not_a_byte() {
+		let (mut world, panel) = showing(FIELDS, Vec2::new(800.0, 600.0));
+		let mut interface = Interface::new();
+		let mut input = Input::default();
+
+		world.ui.set_focus(panel, "one", 0);
+		// two bytes each, so a field that counted bytes would leave half of one
+		// behind and stop being a string at all.
+		world.input = typing("\u{444}\u{44b}");
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.text(panel, "one"), "\u{444}\u{44b}ab", "both went in");
+
+		input.set_key(Key::Backspace, true);
+		world.input = input;
+		interface.update(&mut world);
+
+		assert_eq!(world.ui.text(panel, "one"), "\u{444}ab", "and one whole one came out");
+		assert_eq!(world.ui.caret(panel), 2, "leaving the caret after the other");
+	}
+
+	#[test]
+	fn the_caret_walks_by_characters_and_stops_at_both_ends() {
+		let mut value = "a\u{444}b".to_owned();
+		let mut caret = 0;
+		let mut input = Input::default();
+
+		input.set_key(Key::Left, true);
+		edit(&input, &mut value, &mut caret);
+		assert_eq!(caret, 0, "there is nowhere to the left of the start");
+
+		input = Input::default();
+		input.set_key(Key::Right, true);
+		edit(&input, &mut value, &mut caret);
+		assert_eq!(caret, 1, "one ASCII letter is one byte");
+		edit(&input, &mut value, &mut caret);
+		assert_eq!(caret, 3, "and one Cyrillic one is two");
+
+		input = Input::default();
+		input.set_key(Key::End, true);
+		edit(&input, &mut value, &mut caret);
+		assert_eq!(caret, 4, "the end is the end");
+		edit(&input, &mut value, &mut caret);
+		assert_eq!(caret, 4, "and stays there");
+	}
+
+	#[test]
+	fn a_caret_left_inside_a_character_is_moved_off_it() {
+		// what a game writing over the field somebody is typing in leaves
+		// behind. Editing from there has to be impossible rather than merely
+		// unlikely: `String::remove` panics on an offset like this one.
+		let mut value = "\u{444}b".to_owned();
+		let mut caret = 1;
+		let mut input = Input::default();
+
+		input.set_key(Key::Delete, true);
+		edit(&input, &mut value, &mut caret);
+
+		assert_eq!(value, "b", "the whole character went, from the boundary before it");
+		assert_eq!(caret, 0, "and the caret is somewhere that means something");
 	}
 
 	#[test]

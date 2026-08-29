@@ -153,6 +153,16 @@ pub struct Panel {
 	hovered: u32,
 	/// The node a button went down on, or [`document::NONE`]. Host-written.
 	pressed: u32,
+	/// The `id` of the field the keyboard is going to, or empty. Host-written.
+	///
+	/// By `id` rather than by index, for the reason a scroll offset is: a
+	/// document recompiled under a running process renumbers its boxes, and
+	/// somebody halfway through typing is exactly who should not lose their
+	/// place for it.
+	focused: String,
+	/// Where the caret sits in the focused field, as a byte offset into its
+	/// value. Host-written, and meaningless when nothing is focused.
+	caret: u32,
 }
 
 impl Panel {
@@ -199,6 +209,14 @@ impl Panel {
 			.and_then(|bind| bind.text.as_deref())
 			.unwrap_or(&node.text)
 	}
+
+	/// The `id` of the field the keyboard is going to, or empty.
+	#[must_use]
+	pub fn focused(&self) -> &str { &self.focused }
+
+	/// Where the caret sits in that field, as a byte offset.
+	#[must_use]
+	pub const fn caret(&self) -> u32 { self.caret }
 
 	/// How far a node has been scrolled, or zero if it never has been.
 	///
@@ -297,6 +315,8 @@ impl Ui {
 				scrolls: Vec::new(),
 				hovered: document::NONE,
 				pressed: document::NONE,
+				focused: String::new(),
+				caret: 0,
 			}],
 			events: Vec::new(),
 			pointer: Vec2::new(-1.0, -1.0),
@@ -343,6 +363,8 @@ impl Ui {
 			scrolls: Vec::new(),
 			hovered: document::NONE,
 			pressed: document::NONE,
+			focused: String::new(),
+			caret: 0,
 		});
 
 		PanelId::new(u32::try_from(self.panels.len() - 1).unwrap_or(0))
@@ -527,6 +549,62 @@ impl Ui {
 		if let Some(panel) = self.panel_mut(panel) {
 			panel.set_scroll(node, offset);
 		}
+	}
+
+	/// The `id` of the field the keyboard is going to in a panel.
+	#[must_use]
+	pub fn focused(&self, panel: PanelId) -> &str { self.panel(panel).map_or("", Panel::focused) }
+
+	/// Where the caret sits in that field, as a byte offset into its value.
+	#[must_use]
+	pub fn caret(&self, panel: PanelId) -> u32 { self.panel(panel).map_or(0, Panel::caret) }
+
+	/// Sends the keyboard to a field, or to nothing.
+	///
+	/// The host's, and a game's when it wants a search box ready to type in
+	/// without a click first.
+	///
+	/// @param panel - which document
+	/// @param node - the `id` of the field, or empty to focus nothing
+	/// @param caret - where to put the caret, as a byte offset into the value
+	pub fn set_focus(&mut self, panel: PanelId, node: &str, caret: u32) {
+		if let Some(panel) = self.panel_mut(panel) {
+			// copied rather than borrowed, for the reason a bind's name is.
+			node.clone_into(&mut panel.focused);
+			panel.caret = caret;
+		}
+	}
+
+	/// What a node says now.
+	///
+	/// What the game last wrote, or what somebody has typed into it, or failing
+	/// both what the document says - which is one question with one answer, and
+	/// the same one a browser gives for an input's `value`. The document is the
+	/// default underneath rather than a separate thing to ask about.
+	///
+	/// @param panel - which document
+	/// @param node - the `id` of the box
+	#[must_use]
+	pub fn text(&self, panel: PanelId, node: &str) -> &str {
+		let Some(found) = self.panel(panel) else {
+			return "";
+		};
+
+		if let Some(bound) = found
+			.bind(node)
+			.and_then(|bind| bind.text.as_deref())
+		{
+			return bound;
+		}
+
+		self.document(found.document())
+			.map(Entry::value)
+			.and_then(|document| {
+				let index = document.find(node)?;
+
+				document.node(index)
+			})
+			.map_or("", |node| node.text.as_str())
 	}
 
 	/// Records which node a button is being held on.

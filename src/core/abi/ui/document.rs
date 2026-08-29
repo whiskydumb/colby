@@ -52,6 +52,8 @@ pub struct Node {
 impl Node {
 	/// The tag an image has.
 	pub const IMAGE: &'static str = "img";
+	/// The tag a field somebody can type into has.
+	pub const INPUT: &'static str = "input";
 	/// The tag a run of text has.
 	pub const TEXT: &'static str = "";
 
@@ -62,6 +64,20 @@ impl Node {
 	/// Whether this node draws a picture.
 	#[must_use]
 	pub fn is_image(&self) -> bool { self.tag == Self::IMAGE }
+
+	/// Whether this node is a field somebody can type into.
+	///
+	/// Unlike every other box, its words are its own rather than a child's:
+	/// what it holds is a value rather than content, so there is nothing for a
+	/// run of text under it to be. That is also what makes
+	/// [`Ui::set_text`](super::Ui::set_text) fill it in and
+	/// [`Ui::text`](super::Ui::text) read it back, with no rule of its own.
+	#[must_use]
+	pub fn is_input(&self) -> bool { self.tag == Self::INPUT }
+
+	/// Whether this node draws words of its own.
+	#[must_use]
+	pub fn has_words(&self) -> bool { self.is_text() || self.is_input() }
 }
 
 /// What a rule matches: a tag, a class, an identifier, and whether the pointer

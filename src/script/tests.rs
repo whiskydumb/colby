@@ -81,6 +81,28 @@ fn a_click_reaches_the_handler_that_asked_for_it() {
 }
 
 #[test]
+fn a_handler_can_read_a_field_back_and_not_only_write_to_it() {
+	// the one read in the whole surface, and a search box is why: a handler
+	// that cannot see what somebody typed has nothing to search for.
+	let (mut world, panel) = showing(
+		r#"ui.on("hold", "click", function() ui.set_text("hold", ui.text("hold") .. "!") end)"#,
+	);
+	let mut scripts = Scripts::new().expect("the interpreter starts");
+
+	scripts.update(&mut world);
+	world.ui.set_text(panel, "hold", "typed");
+
+	happened(&mut world, panel, "hold", EventKind::Click);
+	scripts.update(&mut world);
+
+	assert_eq!(
+		written(&world, panel, "hold").as_deref(),
+		Some("typed!"),
+		"the handler read what was there and wrote it back with a mark on it"
+	);
+}
+
+#[test]
 fn a_handler_answers_only_the_kind_it_registered() {
 	let (mut world, panel) =
 		showing(r#"ui.on("hold", "click", function() ui.set_text("hold", "clicked") end)"#);
