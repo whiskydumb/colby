@@ -35,7 +35,7 @@ use colby_core::{
 	glam::Vec3,
 };
 
-use crate::bytes::{ALIGNMENT, AlignedBytes};
+use crate::bytes::{ALIGNMENT, AlignedBytes, span};
 
 /// The eight bytes every `.cmesh` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYMSH";
@@ -412,18 +412,6 @@ fn check_indices(bytes: &[u8], header: &MeshHeader) -> std::result::Result<(), S
 	}
 
 	Ok(())
-}
-
-/// The byte range `count` values of `T` occupy starting at `offset`.
-///
-/// @return the range, or `None` if the arithmetic does not fit
-fn span<T>(offset: u32, count: u32) -> Option<std::ops::Range<usize>> {
-	let offset = usize::try_from(offset).ok()?;
-	let length = usize::try_from(count)
-		.ok()?
-		.checked_mul(size_of::<T>())?;
-
-	Some(offset..offset.checked_add(length)?)
 }
 
 /// The size of `T` as the header stores it.

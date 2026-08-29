@@ -53,7 +53,7 @@ use colby_core::{
 	glam::{Quat, Vec3},
 };
 
-use crate::bytes::{ALIGNMENT, AlignedBytes};
+use crate::bytes::{AlignedBytes, fits, span};
 
 /// The eight bytes every `.cscene` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYSCN";
@@ -983,16 +983,6 @@ fn count(value: usize) -> Result<u32> {
 /// The width of a record, as the header stores it.
 fn width<T>() -> Result<u32> { count(size_of::<T>()) }
 
-/// Where a block is, when it is anywhere sensible.
-fn span<T>(offset: u32, count: u32) -> Option<std::ops::Range<usize>> {
-	let start = usize::try_from(offset).ok()?;
-	let length = usize::try_from(count)
-		.ok()?
-		.checked_mul(size_of::<T>())?;
-
-	Some(start..start.checked_add(length)?)
-}
-
 /// Every way a `.cscene` can be wrong, checked once.
 fn check(bytes: &[u8]) -> std::result::Result<SceneHeader, String> {
 	let head = bytes.get(..HEADER_BYTES).ok_or_else(|| {
@@ -1064,39 +1054,20 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 		.and_then(|it| it.checked_add(header.tie_slots))
 		.ok_or_else(|| "this scene claims more slots than a count holds".to_owned())?;
 
-	fits::<Setting>(bytes, header.setting_offset, 1, "settings")?;
-	fits::<Stood>(bytes, header.stood_offset, header.stood_count, "entities")?;
-	fits::<Bulk>(bytes, header.bulk_offset, header.bulk_count, "bodies")?;
-	fits::<Tie>(bytes, header.tie_offset, header.tie_count, "joints")?;
-	fits::<u32>(bytes, header.generations_offset, total, "generations")?;
-	fits::<u8>(bytes, header.names_offset, header.names_length, "names")?;
+	fits::<Setting>(bytes, HEADER_BYTES, (header.setting_offset, 1), "settings")?;
+	fits::<Stood>(bytes, HEADER_BYTES, (header.stood_offset, header.stood_count), "entities")?;
+	fits::<Bulk>(bytes, HEADER_BYTES, (header.bulk_offset, header.bulk_count), "bodies")?;
+	fits::<Tie>(bytes, HEADER_BYTES, (header.tie_offset, header.tie_count), "joints")?;
+	fits::<u32>(bytes, HEADER_BYTES, (header.generations_offset, total), "generations")?;
+	fits::<u8>(bytes, HEADER_BYTES, (header.names_offset, header.names_length), "names")?;
 
 	if header.flags & FLAG_ARENA != 0 {
-		fits::<u8>(bytes, header.arena_offset, header.arena_length, "game state")?;
-	}
-
-	Ok(())
-}
-
-/// Whether one block is inside the file it claims to be in.
-fn fits<T>(bytes: &[u8], offset: u32, count: u32, what: &str) -> std::result::Result<(), String> {
-	let range = span::<T>(offset, count)
-		.ok_or_else(|| format!("the {what} are past the end of memory"))?;
-
-	if range.start < HEADER_BYTES || range.end > bytes.len() {
-		return Err(format!(
-			"the {what} run from {} to {} and the file is {} bytes",
-			range.start,
-			range.end,
-			bytes.len()
-		));
-	}
-
-	if !range
-		.start
-		.is_multiple_of(align_of::<T>().min(ALIGNMENT))
-	{
-		return Err(format!("the {what} do not start on a boundary they can be read from"));
+		fits::<u8>(
+			bytes,
+			HEADER_BYTES,
+			(header.arena_offset, header.arena_length),
+			"game state",
+		)?;
 	}
 
 	Ok(())

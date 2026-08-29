@@ -13,7 +13,7 @@
 //! reinterpretation it would refuse on a plain `Vec<u8>` only because that one
 //! cannot promise anything.
 
-use std::{fs::File, io::Read, path::Path};
+use std::{fs::File, io::Read, ops::Range, path::Path};
 
 use colby_core::{
 	Result,
@@ -111,6 +111,81 @@ impl AlignedBytes {
 	}
 }
 
+/// Where a block of `T` sits in a file, when it sits anywhere sensible.
+///
+/// Shared by every format here that stores an offset and a count rather than
+/// implying them, which is all of them: what a header says is arithmetic on
+/// numbers a file supplied, and doing it in `usize` without checking is how a
+/// corrupt file becomes a panic.
+///
+/// @note: on a sixty-four bit target the checked arithmetic here cannot
+/// actually fail - a `u32` offset plus four thousand million records of any
+/// reasonable size is nowhere near what a `usize` holds - so `None` is
+/// unreachable and untested on the machine this is built on. It is not
+/// decoration: on a thirty-two bit one the same numbers wrap, and the caller's
+/// bounds check would then be comparing a range that came out backwards.
+///
+/// @param offset - where the block starts, as the header stores it
+/// @param count - how many records, as the header stores it
+/// @return the byte range, or nothing when the arithmetic does not fit
+#[must_use]
+pub fn span<T>(offset: u32, count: u32) -> Option<Range<usize>> {
+	let start = usize::try_from(offset).ok()?;
+	let length = usize::try_from(count)
+		.ok()?
+		.checked_mul(size_of::<T>())?;
+
+	Some(start..start.checked_add(length)?)
+}
+
+/// Whether one block is inside the file it claims to be in, and readable
+/// where it claims to be.
+///
+/// Three questions in one, and all three have to be asked before anything is
+/// cast: the arithmetic has to fit, the range has to be inside the file and
+/// clear of the header, and the start has to be on a boundary a `&[T]` may
+/// begin at. @ref [`ALIGNMENT`], which is what every buffer here promises and
+/// therefore the most a block can be asked to be.
+///
+/// @param bytes - the whole file
+/// @param head - how many bytes the format's header is
+/// @param block - where it starts and how many records, as the header stores
+/// them
+/// @param what - what to call the block in the message, in the plural
+/// @return nothing, or why the block cannot be read
+///
+/// # Errors
+///
+/// If the block is not wholly inside the file, overlaps the header, or starts
+/// somewhere a `&[T]` cannot.
+pub fn fits<T>(
+	bytes: &[u8],
+	head: usize,
+	block: (u32, u32),
+	what: &str,
+) -> std::result::Result<(), String> {
+	let range = span::<T>(block.0, block.1)
+		.ok_or_else(|| format!("the {what} are past the end of memory"))?;
+
+	if range.start < head || range.end > bytes.len() {
+		return Err(format!(
+			"the {what} run from {} to {} and the file is {} bytes",
+			range.start,
+			range.end,
+			bytes.len()
+		));
+	}
+
+	if !range
+		.start
+		.is_multiple_of(align_of::<T>().min(ALIGNMENT))
+	{
+		return Err(format!("the {what} do not start on a boundary they can be read from"));
+	}
+
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -171,6 +246,57 @@ mod tests {
 				.to_string()
 				.contains("colby-no-such-file.bin"),
 			"the message says which file: {error}"
+		);
+	}
+	/// A four-byte record, so a misaligned start is a thing that can happen.
+	#[repr(C)]
+	#[derive(Clone, Copy, Pod, Zeroable)]
+	#[bytemuck(crate = "::colby_core::bytemuck")]
+	struct Word(u32);
+
+	#[test]
+	fn a_block_inside_the_file_and_clear_of_the_header_reads() {
+		let file = [0_u8; 64];
+
+		assert!(fits::<Word>(&file, 16, (16, 12), "words").is_ok(), "sixteen to sixty-four");
+		assert!(fits::<Word>(&file, 16, (16, 0), "words").is_ok(), "and an empty block is fine");
+	}
+
+	#[test]
+	fn a_block_overlapping_the_header_is_refused() {
+		let file = [0_u8; 64];
+		let refused = fits::<Word>(&file, 16, (12, 4), "words").expect_err("it starts too early");
+
+		assert!(refused.contains("words"), "the message names the block: {refused}");
+	}
+
+	#[test]
+	fn a_block_past_the_end_of_the_file_is_refused() {
+		let file = [0_u8; 64];
+		let refused = fits::<Word>(&file, 16, (48, 8), "words").expect_err("it runs off the end");
+
+		assert!(refused.contains("the file is 64 bytes"), "and says how long it is: {refused}");
+	}
+
+	#[test]
+	fn a_block_that_could_not_be_cast_where_it_starts_is_refused() {
+		let file = [0_u8; 64];
+		let refused = fits::<Word>(&file, 16, (18, 4), "words").expect_err("eighteen is odd");
+
+		assert!(refused.contains("boundary"), "the reason is the boundary: {refused}");
+	}
+
+	#[test]
+	fn a_count_nothing_could_address_is_refused_rather_than_wrapping() {
+		let file = [0_u8; 64];
+		let refused = fits::<Word>(&file, 16, (16, u32::MAX), "words")
+			.expect_err("four thousand million records are not in a sixty-four byte file");
+
+		assert!(refused.contains("the file is 64 bytes"), "and it says so: {refused}");
+		assert_eq!(
+			span::<Word>(16, u32::MAX).map(|it| it.end),
+			Some(16 + 4 * 0xFFFF_FFFF),
+			"the arithmetic itself is exact here, which is what the bounds check then catches"
 		);
 	}
 }
