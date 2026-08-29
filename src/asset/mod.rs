@@ -36,6 +36,7 @@ pub mod json;
 pub mod model;
 pub mod obj;
 pub mod png;
+pub mod scene;
 pub mod sdf;
 pub mod texture;
 pub mod ttf;
@@ -44,5 +45,6 @@ pub use self::{
 	bytes::AlignedBytes,
 	compile::{Report, compile_dir, compile_file, output_root, source_root},
 	format::{FORMAT_VERSION, MAGIC, MeshFile, MeshHeader, encode},
+	scene::{SceneFile, SceneHeader},
 	texture::{TextureFile, TextureHeader},
 };
