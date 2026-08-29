@@ -2046,6 +2046,50 @@ mod tests {
 	}
 
 	#[test]
+	fn a_box_riding_something_that_rises_keeps_its_place_on_it() {
+		// found by walking around the demo: a box standing on one of the ring
+		// cubes, which bob, climbed away from it at two thousandths a step.
+		// A support that moves up pushes the box into itself, the sweep then
+		// starts solid, and the skin the slide adds to get out of it was being
+		// added a second time by the probe underneath. A flat, still floor
+		// never starts solid, which is why standing on one looked fine.
+		let (mut world, mut simulation) = wired();
+		let lift = world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::new(4.0, 0.5, 4.0)),
+			Transform::at(Vec3::new(0.0, -0.5, 0.0)),
+		));
+		simulation.step(&mut world);
+
+		let mut place = (Vec3::new(0.0, 0.5, 0.0), Vec3::ZERO);
+		let mut gaps: Vec<f32> = Vec::new();
+
+		for _ in 0..120 {
+			// three thousandths a step, which is faster than the two the fault
+			// added and slow enough to be a thing a platform would really do.
+			let top = if let Some(body) = world.bodies.get_mut(lift) {
+				body.transform.position.y += 0.003;
+				body.transform.position.y + 0.5
+			} else {
+				return;
+			};
+
+			let moved = walk(&world, &mut place, character::STEP);
+			gaps.push(moved.position.y - 0.5 - top);
+		}
+
+		let last = gaps.split_off(60);
+		let early = gaps.iter().copied().fold(f32::MIN, f32::max);
+		let late = last.iter().copied().fold(f32::MIN, f32::max);
+
+		assert!(
+			(late - early).abs() < 0.005,
+			"it rides the platform rather than climbing it: {early} at the start against \n			 \
+			 {late} a second later"
+		);
+	}
+
+	#[test]
 	fn a_box_climbs_a_lip_no_taller_than_its_step() {
 		let (mut world, mut simulation) = wired();
 		ground(&mut world);

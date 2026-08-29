@@ -59,7 +59,10 @@ const MAX_SLIDES: usize = 4;
 
 /// How far below itself a box looks for ground, in units.
 ///
-/// Also how far it is pulled down onto ground it finds. Walking off the top of
+/// And how far *above* itself the looking starts, so that a support which
+/// has risen into the box since the last step is still a surface to come to
+/// rest on rather than a thing the box is inside of. Also how far it is
+/// pulled down onto ground it finds. Walking off the top of
 /// a stair without this leaves the box airborne for a step and arriving at the
 /// next one falling, which reads as a bounce down every staircase.
 const PROBE: f32 = 0.06;
@@ -382,7 +385,15 @@ fn climb(world: &World, motion: &Motion, flat: Vec3) -> Option<Vec3> {
 /// @param position - where the box's middle is
 /// @return what is underneath and where the box sits on it
 fn probe(world: &World, motion: &Motion, position: Vec3) -> Ground {
-	let result = cast(world, motion, position, position - Vec3::Y * PROBE);
+	// from a probe's height above where the box is, not from where it is. A
+	// support that rose into the box between one step and the next leaves it
+	// overlapping, and a sweep that begins inside something has nothing to
+	// report but the place it began - so the box would either be lifted by a
+	// blind skin every step until it climbed away, or left where it was until
+	// the platform swallowed it. Starting clear of the surface asks the
+	// question that has a real answer: where does the box come to rest.
+	let above = position + Vec3::Y * PROBE;
+	let result = cast(world, motion, above, position - Vec3::Y * PROBE);
 
 	if !result.hit || result.normal.y < motion.ground {
 		return Ground {
@@ -394,7 +405,14 @@ fn probe(world: &World, motion: &Motion, position: Vec3) -> Ground {
 	}
 
 	Ground {
-		position: result.end + Vec3::Y * SKIN,
+		// left where it is if even a probe's height up is inside something,
+		// which is a box buried rather than a box standing: pushing out of
+		// things is the slide's, and it has already had its turn.
+		position: if result.started_solid {
+			position
+		} else {
+			result.end + Vec3::Y * SKIN
+		},
 		grounded: true,
 		normal: result.normal,
 		body: result.body,
