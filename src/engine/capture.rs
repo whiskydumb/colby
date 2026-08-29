@@ -284,11 +284,12 @@ pub const fn rgb(red: f32, green: f32, blue: f32) -> Vec3 { Vec3::new(red, green
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{Material, MeshId, Renderable, Texel, TextureData, Transform},
+		abi::{Material, MeshId, Renderable, Texel, TextureData, Transform, cvar::Value},
 		glam::Quat,
 	};
 
 	use super::*;
+	use crate::shadow;
 
 	/// How big the test captures are. Small enough to be quick, large enough
 	/// that a sample well inside a shape is unambiguous.
@@ -802,9 +803,11 @@ f 1 4 5
 		// the real shader with one line changed: every fragment comes out blue,
 		// whatever the entity asked for. Decisive, and it proves the swap
 		// reached the GPU rather than merely being accepted.
-		let source = include_str!("shader.wgsl").replace(
-			"return vec4<f32>(direct + indirect, 1.0);",
-			"return vec4<f32>(0.0, 0.0, 1.0, 1.0);",
+		let source = include_str!("shader.wgsl")
+			.replace("return vec4<f32>(color, 1.0);", "return vec4<f32>(0.0, 0.0, 1.0, 1.0);");
+		assert!(
+			source.contains("0.0, 0.0, 1.0, 1.0"),
+			"the line this test edits is still in the shader"
 		);
 
 		capture
@@ -1249,6 +1252,215 @@ f 1 4 5
 		// holds the last one.
 		assert_eq!(repeated, vec![0, 2, 0, 2], "red, blue, red, blue");
 		assert_eq!(clamped, vec![0, 2, 2, 2], "red, blue, and then blue forever");
+	}
+
+	/// A world with a floor and a light coming in at an angle, so that what a
+	/// prop casts lands beside it rather than under it.
+	///
+	/// A little ambient rather than none: it is what makes "in shadow" a
+	/// different reading from "nothing was drawn here", which is the one
+	/// mistake a test like this can make.
+	fn shadowed_world() -> World {
+		let mut world = World::new();
+		world.clear = rgb(0.0, 0.0, 0.2);
+		world.ambient = Vec3::splat(0.12);
+		world.light = Vec3::new(1.0, -1.0, 0.0).normalize();
+
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(120.0, 1.0, 120.0),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::new(MeshId::QUAD, Vec3::ONE));
+
+		world
+	}
+
+	/// Where a point in the world lands in the picture.
+	///
+	/// Through the same matrix the renderer uses, so a test never has to
+	/// re-derive a projection and then be wrong about it. Call it after
+	/// shooting, because that is when `aspect` is the capture's.
+	///
+	/// @param world - whose camera and aspect to project through
+	/// @param point - where in the world
+	/// @param size - the capture's width and height
+	fn on_screen(world: &World, point: Vec3, size: (u32, u32)) -> (u32, u32) {
+		let ndc = world
+			.render_camera()
+			.view_projection(world.aspect)
+			.project_point3(point);
+
+		let across = f32::from(u16::try_from(size.0).unwrap_or(u16::MAX));
+		let down = f32::from(u16::try_from(size.1).unwrap_or(u16::MAX));
+
+		(
+			pixel(ndc.x.mul_add(0.5, 0.5) * across, across),
+			pixel(ndc.y.mul_add(-0.5, 0.5) * down, down),
+		)
+	}
+
+	/// One axis of a projected point as a pixel inside the picture.
+	///
+	/// Clamped rather than trusted: a point behind the camera projects to
+	/// something that is not a pixel at all, and a test that asks for one
+	/// should be told about it by the color it reads rather than by an
+	/// arithmetic panic in the middle of a render.
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_possible_truncation,
+		clippy::cast_sign_loss,
+		reason = "held inside zero and the picture's own size on the line above the cast, which 		          is the check the cast itself would not do"
+	)]
+	fn pixel(value: f32, limit: f32) -> u32 { value.clamp(0.0, limit - 1.0).round() as u32 }
+
+	/// Where a straight ray of light from a point lands on the floor at `y =
+	/// 0`.
+	fn beneath(world: &World, caster: Vec3) -> Vec3 {
+		let direction = world.light.normalize();
+
+		caster - direction * (caster.y / direction.y)
+	}
+
+	#[test]
+	fn a_prop_above_a_floor_casts_a_shadow_onto_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut world = shadowed_world();
+		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+		world.camera.target = Vec3::ZERO;
+
+		let at = Vec3::new(0.0, 3.0, 0.0);
+		let cube = world.entities.spawn_at(Transform {
+			position: at,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(1.4),
+		});
+		world
+			.entities
+			.set_renderable(cube, Renderable::new(MeshId::CUBE, Vec3::ONE));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		let shaded = on_screen(&world, beneath(&world, at), SIZE);
+		let beside = on_screen(&world, beneath(&world, at) + Vec3::new(0.0, 0.0, 3.5), SIZE);
+
+		let dark = brightness(image.pixel(shaded.0, shaded.1));
+		let lit = brightness(image.pixel(beside.0, beside.1));
+
+		assert!(
+			dark * 2 < lit,
+			"the floor under the prop at {shaded:?} reads {dark} against {lit} beside it"
+		);
+		assert!(
+			dark > 20,
+			"and it is in shadow rather than missing: what is left there is the ambient, got \
+			 {dark}"
+		);
+
+		// the same frame with the console variable off. Written into the world
+		// by hand, which is what a pixel test can do and `--shot` cannot.
+		world
+			.cvars
+			.var(shadow::ENABLED, Value::Bool(false), "off for this frame");
+
+		let unshadowed = capture
+			.shoot(&mut world)
+			.expect("the second capture renders");
+		let without = brightness(unshadowed.pixel(shaded.0, shaded.1));
+
+		assert!(
+			without * 10 > lit * 9,
+			"with the cascades off that spot is as lit as the floor beside it: {without} \
+			 against {lit}"
+		);
+	}
+
+	#[test]
+	fn a_prop_far_down_the_view_is_shadowed_by_a_further_cascade() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// down the floor rather than across it, so that what is on screen
+		// spans more than one cascade instead of sitting inside the first.
+		let mut world = shadowed_world();
+		world.camera.position = Vec3::new(0.0, 2.5, 6.0);
+		world.camera.target = Vec3::new(0.0, 0.0, -30.0);
+
+		let near = Vec3::new(-2.0, 2.0, -4.0);
+		let far = Vec3::new(-6.0, 5.0, -34.0);
+
+		for (at, size) in [(near, 1.6), (far, 4.0)] {
+			let prop = world.entities.spawn_at(Transform {
+				position: at,
+				rotation: Quat::IDENTITY,
+				scale: Vec3::splat(size),
+			});
+			world
+				.entities
+				.set_renderable(prop, Renderable::new(MeshId::CUBE, Vec3::ONE));
+		}
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		// the two casters are in different cascades: the near one is inside the
+		// first cut and the far one is past the third.
+		let cascades = shadow::fit(
+			&world.render_camera(),
+			world.aspect,
+			world.light,
+			shadow::DEFAULT_DISTANCE,
+		);
+		let depth = |point: Vec3| {
+			let camera = world.render_camera();
+
+			(point - camera.position).dot((camera.target - camera.position).normalize())
+		};
+
+		// the same rule the fragment applies: the first cut a depth fits under.
+		let slice_of = |point: Vec3| {
+			cascades
+				.splits
+				.iter()
+				.position(|split| depth(point) <= *split)
+				.unwrap_or(shadow::CASCADES)
+		};
+
+		assert!(
+			slice_of(near) < slice_of(far),
+			"the two casters are meant to be in different cascades, and they are both in {} 			 \
+			 at depths {} and {}",
+			slice_of(near),
+			depth(near),
+			depth(far)
+		);
+		assert!(
+			slice_of(far) < shadow::CASCADES,
+			"and the further one is still inside the shadow distance, at {}",
+			depth(far)
+		);
+
+		for (at, name) in [(near, "near"), (far, "far")] {
+			let shaded = on_screen(&world, beneath(&world, at), SIZE);
+			let beside = on_screen(&world, beneath(&world, at) + Vec3::new(0.0, 0.0, 4.0), SIZE);
+
+			let dark = brightness(image.pixel(shaded.0, shaded.1));
+			let lit = brightness(image.pixel(beside.0, beside.1));
+
+			assert!(
+				dark * 2 < lit,
+				"the {name} prop's shadow at {shaded:?} reads {dark} against {lit} beside it"
+			);
+		}
 	}
 
 	#[test]

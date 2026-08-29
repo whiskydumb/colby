@@ -17,6 +17,8 @@
 //! [`World::render_camera`], which place it between the last two simulated
 //! states. That is the whole of the renderer's part in the fixed timestep.
 
+use core::mem::offset_of;
+
 use colby_core::{
 	Result,
 	abi::{
@@ -34,20 +36,25 @@ use wgpu::{
 	AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
 	BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, BlendState,
 	Buffer, BufferAddress, BufferBindingType, BufferDescriptor, BufferUsages, Color,
-	ColorTargetState, ColorWrites, CommandEncoderDescriptor, CompareFunction, DepthBiasState,
-	DepthStencilState, Device, ErrorFilter, Extent3d, Face, FilterMode, FragmentState, FrontFace,
-	IndexFormat, LoadOp, MipmapFilterMode, MultisampleState, Operations, Origin3d,
-	PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState,
-	PrimitiveTopology, Queue, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
-	RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType,
-	SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, StoreOp,
+	ColorTargetState, ColorWrites, CommandEncoder, CommandEncoderDescriptor, CompareFunction,
+	DepthBiasState, DepthStencilState, Device, ErrorFilter, Extent3d, Face, FilterMode,
+	FragmentState, FrontFace, IndexFormat, LoadOp, MipmapFilterMode, MultisampleState,
+	Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode,
+	PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment,
+	RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
+	RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
+	ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, StoreOp,
 	TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
 	TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
 	TextureViewDescriptor, TextureViewDimension, VertexAttribute, VertexBufferLayout,
 	VertexFormat, VertexState, VertexStepMode,
 };
 
-use crate::{lines::Lines, shader::Shader};
+use crate::{
+	lines::Lines,
+	shader::Shader,
+	shadow::{self, CASCADES, Cascades, Maps},
+};
 
 /// The depth format. Thirty-two bits is more than a scene this size needs and
 /// is supported everywhere, which is worth more right now than the memory.
@@ -68,6 +75,18 @@ struct Globals {
 	/// xyz is where the camera is; w is unused. Needed by anything that depends
 	/// on the viewing angle, which is all of the specular term.
 	eye: [f32; 4],
+	/// xyz is the direction it looks in; w is unused. A fragment projects
+	/// itself onto this to get its own view depth, which is what picks a
+	/// cascade - the same quantity the slices were cut on.
+	forward: [f32; 4],
+	/// World space into each cascade's clip space, nearest slice first.
+	light_view_projection: [[[f32; 4]; 4]; CASCADES],
+	/// The view depth each cascade stops at.
+	splits: [f32; CASCADES],
+	/// How many world units one texel of each cascade covers.
+	cascade_texels: [f32; CASCADES],
+	/// `[one texel in map coordinates, unused, shadows on, tint by cascade]`.
+	shadow: [f32; 4],
 }
 
 /// One entity, flattened into what the vertex stage reads.
@@ -169,6 +188,12 @@ pub struct Scene {
 	samplers: [Sampler; 2],
 	shader: Shader,
 	depth: TextureView,
+	/// The depth array the light writes and the scene samples.
+	shadows: Maps,
+	/// This frame's light matrices, fitted in `upload` and drawn in `render`.
+	cascades: Cascades,
+	/// Whether the console left the shadow passes switched on this frame.
+	shadowing: bool,
 	/// The debug renderer, drawn into this scene's pass and its depth buffer.
 	lines: Lines,
 	/// One per registry slot, in the same order, filled on demand.
@@ -273,11 +298,15 @@ impl Scene {
 		let samplers =
 			[build_sampler(&device, Wrap::Repeat), build_sampler(&device, Wrap::Clamp)];
 
+		// before the pipeline, because the pipeline's third group is the one
+		// the maps are read through.
+		let shadows = Maps::new(&device)?;
+
 		let shader = Shader::new("shader.wgsl", include_str!("shader.wgsl"));
 		let pipeline = compile_pipeline(
 			&device,
 			format,
-			&[&globals_layout, &material_layout],
+			&[&globals_layout, &material_layout, shadows.sample_layout()],
 			shader.source(),
 		)?;
 		let depth = depth_view(&device, width, height);
@@ -302,6 +331,9 @@ impl Scene {
 			samplers,
 			shader,
 			depth,
+			shadows,
+			cascades: Cascades::NONE,
+			shadowing: false,
 			lines,
 			// nothing is uploaded until a frame says what the world holds: the
 			// registries belong to the host, and a scene built before the host
@@ -335,7 +367,7 @@ impl Scene {
 		self.pipeline = compile_pipeline(
 			&self.device,
 			self.format,
-			&[&self.globals_layout, &self.material_layout],
+			&[&self.globals_layout, &self.material_layout, self.shadows.sample_layout()],
 			source,
 		)?;
 
@@ -353,6 +385,16 @@ impl Scene {
 		let mut encoder = self
 			.device
 			.create_command_encoder(&CommandEncoderDescriptor { label: Some("frame") });
+
+		// first, and once per cascade: the scene's own pass samples what these
+		// wrote, so they have to be recorded ahead of it. Skipped entirely when
+		// the console has turned shadows off, which leaves the maps holding
+		// whatever was in them and is safe because nothing then reads them.
+		if self.shadowing {
+			for slice in 0..CASCADES {
+				self.cast(&mut encoder, slice);
+			}
+		}
 
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
 			label: Some("scene"),
@@ -382,6 +424,7 @@ impl Scene {
 
 		pass.set_pipeline(&self.pipeline);
 		pass.set_bind_group(0, &self.bindings, &[]);
+		pass.set_bind_group(2, self.shadows.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
 
 		for batch in &self.batches {
@@ -404,6 +447,53 @@ impl Scene {
 
 		drop(pass);
 		self.queue.submit([encoder.finish()]);
+	}
+
+	/// Records one cascade's depth pass.
+	///
+	/// The same batches the scene draws, through a pipeline with no fragment
+	/// stage and no color target, so the whole pass is geometry against depth.
+	/// The material is not bound at all: nothing here is transparent and
+	/// nothing is alpha tested, so what a surface looks like cannot change
+	/// whether it casts.
+	///
+	/// @param encoder - what to record into
+	/// @param slice - which cascade, nearest first
+	fn cast(&self, encoder: &mut CommandEncoder, slice: usize) {
+		let (Some(layer), Some(slot)) = (self.shadows.layer(slice), self.shadows.slot(slice))
+		else {
+			return;
+		};
+
+		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+			label: Some("shadow"),
+			color_attachments: &[],
+			depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+				view: layer,
+				depth_ops: Some(Operations {
+					load: LoadOp::Clear(1.0),
+					store: StoreOp::Store,
+				}),
+				stencil_ops: None,
+			}),
+			timestamp_writes: None,
+			occlusion_query_set: None,
+			multiview_mask: None,
+		});
+
+		pass.set_pipeline(self.shadows.pipeline());
+		pass.set_bind_group(0, slot, &[]);
+		pass.set_vertex_buffer(1, self.instances.slice(..));
+
+		for batch in &self.batches {
+			let Some(mesh) = self.meshes.get(batch.mesh) else {
+				continue;
+			};
+
+			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
+			pass.draw_indexed(0..mesh.index_count, 0, batch.first..batch.first + batch.count);
+		}
 	}
 
 	/// The device this scene was built on.
@@ -447,6 +537,29 @@ impl Scene {
 		// from a camera that is not the one looking at it.
 		let camera = world.render_camera();
 
+		// the same camera the picture is drawn from, so the cascades cannot be
+		// fitted to a pose the frame does not use. Off is off all the way to
+		// the shader: nothing is drawn into the maps and nothing samples them.
+		self.shadowing = world.cvars.bool(shadow::ENABLED).unwrap_or(true);
+		self.cascades = if self.shadowing {
+			let distance = world
+				.cvars
+				.float(shadow::DISTANCE)
+				.unwrap_or(shadow::DEFAULT_DISTANCE);
+
+			shadow::fit(&camera, world.aspect, world.light, distance)
+		} else {
+			Cascades::NONE
+		};
+
+		let mut light_view_projection = [[[0.0; 4]; 4]; CASCADES];
+		for (slot, matrix) in light_view_projection
+			.iter_mut()
+			.zip(self.cascades.matrices)
+		{
+			*slot = matrix.to_cols_array_2d();
+		}
+
 		self.queue.write_buffer(
 			&self.globals,
 			0,
@@ -457,8 +570,29 @@ impl Scene {
 				light: world.light.extend(0.0).to_array(),
 				ambient: world.ambient.extend(0.0).to_array(),
 				eye: camera.position.extend(1.0).to_array(),
+				forward: (camera.target - camera.position)
+					.normalize_or(Vec3::NEG_Z)
+					.extend(0.0)
+					.to_array(),
+				light_view_projection,
+				splits: self.cascades.splits,
+				cascade_texels: self.cascades.texels,
+				shadow: [
+					1.0 / shadow::resolution(),
+					0.0,
+					if self.shadowing { 1.0 } else { 0.0 },
+					if world.cvars.bool(shadow::TINT).unwrap_or(false) {
+						1.0
+					} else {
+						0.0
+					},
+				],
 			}),
 		);
+
+		if self.shadowing {
+			self.shadows.upload(&self.queue, &self.cascades);
+		}
 
 		self.group(world);
 
@@ -1033,7 +1167,7 @@ fn build_pipeline(
 /// @note: offsets written out rather than taken from a macro, so that a change
 /// to `MeshVertex` shows up here as a mismatch to fix instead of as garbled
 /// geometry. @ref [`strides`].
-const VERTEX_ATTRIBUTES: [VertexAttribute; 4] = [
+pub(crate) const VERTEX_ATTRIBUTES: [VertexAttribute; 4] = [
 	VertexAttribute {
 		format: VertexFormat::Float32x3,
 		offset: 0,
@@ -1064,7 +1198,7 @@ const VERTEX_ATTRIBUTES: [VertexAttribute; 4] = [
 /// @note: locations continue where [`VERTEX_ATTRIBUTES`] stopped. A shader
 /// location is a property of the pipeline rather than of one buffer, so the two
 /// tables share a numbering and growing the vertex pushes the instance along.
-const INSTANCE_ATTRIBUTES: [VertexAttribute; 7] = [
+pub(crate) const INSTANCE_ATTRIBUTES: [VertexAttribute; 7] = [
 	VertexAttribute {
 		format: VertexFormat::Float32x4,
 		offset: 0,
@@ -1103,7 +1237,7 @@ const INSTANCE_ATTRIBUTES: [VertexAttribute; 7] = [
 ];
 
 /// The vertex and instance strides, asserted to match the attributes above.
-const fn strides() -> (BufferAddress, BufferAddress) {
+pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 	const {
 		assert!(
 			size_of::<MeshVertex>() == 48,
@@ -1112,7 +1246,16 @@ const fn strides() -> (BufferAddress, BufferAddress) {
 		assert!(align_of::<MeshVertex>() == 4, "MeshVertex gained padding");
 		assert!(size_of::<Placement>() == 112, "Placement is no longer a mat4 and three vec4s");
 		assert!(align_of::<Placement>() == 4, "Placement gained padding");
-		assert!(size_of::<Globals>() == 112, "a uniform struct has to be a multiple of 16");
+		assert!(size_of::<Globals>() == 432, "a uniform struct has to be a multiple of 16");
+		assert!(size_of::<Globals>().is_multiple_of(16), "and this one is not");
+		// lines.wgsl declares only the first field of this struct and reads
+		// only that, which a uniform binding allows: what it needs is for the
+		// field to stay first, and this is where that is checked.
+		assert!(
+			offset_of!(Globals, view_projection) == 0,
+			"lines.wgsl reads the camera out of the head of this struct"
+		);
+		assert!(CASCADES == 4, "the shader indexes four cascades by name");
 	}
 
 	(48, 112)

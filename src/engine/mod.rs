@@ -19,6 +19,7 @@ pub mod overlay;
 pub mod renderer;
 pub mod scene;
 pub mod shader;
+pub mod shadow;
 
 pub use ::wgpu;
 pub use ::winit;

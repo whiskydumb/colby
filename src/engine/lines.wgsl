@@ -2,14 +2,14 @@
 //
 // It shares group 0 with the scene, so the same uniform buffer and the same
 // bind group serve both and the camera cannot disagree between them. Only
-// `view_projection` is read; the rest of the struct is declared so the layout
-// matches what the scene wrote.
+// `view_projection` is read, and a uniform binding may be larger than the
+// struct reading it, so the rest of the scene's Globals is deliberately not
+// repeated here - four light matrices this file never looks at would be four
+// more things to keep in step. What has to hold is that `view_projection` stays
+// first, and `scene::strides` asserts exactly that.
 
 struct Globals {
     view_projection: mat4x4<f32>,
-    light: vec4<f32>,
-    ambient: vec4<f32>,
-    eye: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;

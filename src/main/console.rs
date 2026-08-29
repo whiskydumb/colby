@@ -178,6 +178,24 @@ pub(crate) fn install(world: &mut World) {
 		Value::Bool(false),
 		"mark every joint and the two anchors it holds",
 	);
+	// shadows, and these are on by default because they are a feature rather
+	// than a tool: what the variable is for is turning them off on a machine
+	// that cannot afford them. The cascade tint is the exception and is a tool.
+	world.cvars.var(
+		colby_engine::shadow::ENABLED,
+		Value::Bool(true),
+		"cast shadows from the one directional light",
+	);
+	world.cvars.var(
+		colby_engine::shadow::DISTANCE,
+		Value::Float(colby_engine::shadow::DEFAULT_DISTANCE),
+		"how far from the camera anything is shadowed at all, in units",
+	);
+	world.cvars.var(
+		colby_engine::shadow::TINT,
+		Value::Bool(false),
+		"color every pixel by the shadow cascade it read",
+	);
 	world.cvars.var(
 		colby_ui::world_text::TEXT_SIZE,
 		Value::Float(colby_ui::world_text::DEFAULT_TEXT_SIZE),

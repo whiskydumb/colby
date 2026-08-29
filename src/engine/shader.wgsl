@@ -23,6 +23,17 @@ struct Globals {
     ambient: vec4<f32>,
     // xyz is where the camera is; w is unused.
     eye: vec4<f32>,
+    // xyz is the direction it looks in; w is unused.
+    forward: vec4<f32>,
+    // World space into each cascade's clip space, nearest slice first.
+    light_view_projection: array<mat4x4<f32>, 4>,
+    // The view depth each cascade stops at, in world units.
+    splits: vec4<f32>,
+    // How many world units one texel of each cascade covers.
+    cascade_texels: vec4<f32>,
+    // x is one texel in map coordinates, y is unused, z is whether shadows are
+    // on at all, w is whether to color every pixel by the cascade it read.
+    shadow: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -32,6 +43,13 @@ struct Globals {
 // Sampled as numbers rather than as a color: the compiler stores it in a linear
 // layout so that the GPU does not bend the directions on the way in.
 @group(1) @binding(2) var normal_map: texture_2d<f32>;
+
+// One layer per cascade. The comparison sampler answers "is this point behind
+// what the light saw" rather than handing back a depth, and blends the answers
+// rather than the depths - which is why one tap is already soft and why
+// averaging depths here would be meaningless.
+@group(2) @binding(0) var shadow_maps: texture_depth_2d_array;
+@group(2) @binding(1) var shadow_sampler: sampler_comparison;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -135,6 +153,92 @@ fn shading_normal(input: VertexOutput) -> vec3<f32> {
     );
 }
 
+// Which cascade covers a point, by the same measure the slices were cut on.
+//
+// Unrolled rather than looped, and reading the splits by name rather than by a
+// running index, because a vector indexed with a value only known at run time
+// is a thing some backends would rather not do. Four is not a number worth a
+// loop anyway.
+//
+// Returns 4 for a point past the shadow distance, which is not a cascade and is
+// how the caller learns there is nothing to sample.
+fn cascade_of(view_depth: f32) -> i32 {
+    if (view_depth > globals.splits.w) {
+        return 4;
+    }
+
+    var slice = 3;
+    if (view_depth <= globals.splits.z) { slice = 2; }
+    if (view_depth <= globals.splits.y) { slice = 1; }
+    if (view_depth <= globals.splits.x) { slice = 0; }
+
+    return slice;
+}
+
+// How many world units one texel of a cascade covers. Unrolled for the reason
+// above.
+fn cascade_texel(slice: i32) -> f32 {
+    if (slice <= 0) { return globals.cascade_texels.x; }
+    if (slice == 1) { return globals.cascade_texels.y; }
+    if (slice == 2) { return globals.cascade_texels.z; }
+
+    return globals.cascade_texels.w;
+}
+
+// How much of the light reaches a point: one is lit, zero is fully in shadow.
+//
+// The sample is pushed along the surface's own normal before it is projected,
+// by more of a texel the further the surface leans away from the light. That is
+// what stops a lit surface striping itself: one shadow texel covers more and
+// more depth as the surface turns edge on, so the point being tested has to be
+// lifted out of its own texel by about as much.
+fn shadowing(world_position: vec3<f32>, normal: vec3<f32>, lean: f32, slice: i32) -> f32 {
+    if (globals.shadow.z < 0.5 || slice >= 4) {
+        return 1.0;
+    }
+
+    let push = cascade_texel(slice) * mix(2.0, 4.0, clamp(lean, 0.0, 1.0));
+    let clip = globals.light_view_projection[slice] * vec4<f32>(world_position + normal * push, 1.0);
+    let ndc = clip.xyz / clip.w;
+
+    // in front of the light's near plane, which nothing in the world should be:
+    // the box is pulled back behind every caster. Past the far plane is a point
+    // the cascade does not reach, and both answer the same way.
+    if (ndc.z <= 0.0 || ndc.z >= 1.0) {
+        return 1.0;
+    }
+
+    // clip space counts y upwards and a texture counts it down.
+    let at = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let step = globals.shadow.x;
+
+    var lit = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let offset = vec2<f32>(f32(x), f32(y)) * step;
+            lit += textureSampleCompareLevel(
+                shadow_maps,
+                shadow_sampler,
+                at + offset,
+                slice,
+                ndc.z,
+            );
+        }
+    }
+
+    return lit / 9.0;
+}
+
+// A color per cascade, for the console variable that paints them.
+fn cascade_color(slice: i32) -> vec3<f32> {
+    if (slice <= 0) { return vec3<f32>(1.0, 0.55, 0.55); }
+    if (slice == 1) { return vec3<f32>(0.55, 1.0, 0.55); }
+    if (slice == 2) { return vec3<f32>(0.55, 0.7, 1.0); }
+    if (slice == 3) { return vec3<f32>(1.0, 0.95, 0.55); }
+
+    return vec3<f32>(1.0);
+}
+
 // How much of the surface's microfacets point along the half vector.
 // Trowbridge-Reitz, which everyone calls GGX.
 fn distribution_ggx(normal_dot_half: f32, roughness: f32) -> f32 {
@@ -203,8 +307,16 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         * distribution_ggx(normal_dot_half, roughness)
         * visibility_smith(normal_dot_view, normal_dot_light, roughness);
 
+    // how much of the one light this point can see. It multiplies the direct
+    // term and nothing else: what a shadow takes away is the light's own
+    // contribution, and the ambient below stands in for everything that reaches
+    // a surface by some other route.
+    let view_depth = dot(input.world_position - globals.eye.xyz, globals.forward.xyz);
+    let slice = cascade_of(view_depth);
+    let reaching = shadowing(input.world_position, normal, 1.0 - normal_dot_light, slice);
+
     let diffuse = (vec3<f32>(1.0) - fresnel) * diffuse_color / 3.14159265;
-    let direct = (diffuse + specular) * normal_dot_light * 3.14159265;
+    let direct = (diffuse + specular) * normal_dot_light * 3.14159265 * reaching;
 
     // everything this renderer does not simulate, in one term, standing in for
     // an environment there is no map of.
@@ -216,6 +328,11 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // every renderer uses before it has one.
     let ambient_specular = fresnel_ambient(normal_dot_view, f0, roughness);
     let indirect = globals.ambient.rgb * (diffuse_color + ambient_specular);
+    let color = direct + indirect;
 
-    return vec4<f32>(direct + indirect, 1.0);
+    if (globals.shadow.w > 0.5) {
+        return vec4<f32>(color * cascade_color(slice), 1.0);
+    }
+
+    return vec4<f32>(color, 1.0);
 }
