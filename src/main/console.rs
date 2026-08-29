@@ -206,6 +206,15 @@ pub(crate) fn install(world: &mut World) {
 		clear_debug,
 		"throw away every debug line that has a lifetime",
 	);
+
+	world
+		.cvars
+		.command("scene.save", save_scene, "write the world into saves/<name>.cscene");
+	world.cvars.command(
+		"scene.load",
+		load_scene,
+		"put saves/<name>.cscene back, replacing this world",
+	);
 }
 
 /// Runs one line, containing anything it throws.
@@ -379,6 +388,34 @@ unsafe extern "C-unwind" fn clear_debug(world: *mut World, _args: *const Args) {
 
 	world.debug.clear();
 	info!("debug geometry cleared");
+}
+
+/// `scene.save <name>` - writes the world out.
+///
+/// Both of these leave a note rather than doing the work: a load has to happen
+/// between frames and needs the solver, which a command cannot reach. @ref
+/// [`crate::saves`] for why that is the shape rather than an accident.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn save_scene(_world: *mut World, args: *const Args) {
+	// SAFETY: as help.
+	let args = unsafe { &*args };
+
+	crate::saves::ask(crate::saves::Request::Save(args.rest()));
+}
+
+/// `scene.load <name>` - puts a saved world back.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn load_scene(_world: *mut World, args: *const Args) {
+	// SAFETY: as help.
+	let args = unsafe { &*args };
+
+	crate::saves::ask(crate::saves::Request::Load(args.rest()));
 }
 
 /// The solver's default pass count, as the number a console variable holds.

@@ -323,6 +323,13 @@ impl App {
 			console.poll(&mut self.world);
 		}
 
+		// and whatever a command asked to be done with a scene, immediately
+		// after it was typed and before any step runs: a load replaces every
+		// table in the world, and doing that halfway through one would leave
+		// the rest of the step running against a world its first half never
+		// saw. @ref `crate::saves`.
+		crate::saves::serve(&mut self.world, &mut self.simulation);
+
 		// whatever the console asked for on top of real time. Taken rather than
 		// read: an owed step is owed once. Clamped because the field is a public
 		// one, and a game that writes four billion into it should cost a wrong

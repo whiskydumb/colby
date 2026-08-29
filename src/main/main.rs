@@ -17,6 +17,7 @@ mod assets;
 mod console;
 mod game;
 mod input;
+mod saves;
 mod shot;
 mod step;
 #[cfg(feature = "hot_reload")]
