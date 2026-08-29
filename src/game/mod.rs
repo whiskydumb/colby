@@ -22,8 +22,8 @@ use std::f32::consts::TAU;
 use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, GameApi, Joint, JointId,
-		Key, Length, Material, MaterialId, MeshId, Motion, PanelId, Renderable, Shape, TouchKind,
-		TraceInfo, Transform, Value, World, character, debug,
+		Key, Layers, Length, Material, MaterialId, MeshId, Motion, PanelId, Renderable, Shape,
+		TouchKind, TraceInfo, Transform, Value, World, character, debug,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -238,6 +238,41 @@ const ROPE: f32 = 1.4;
 /// How big the cross marking the rope's hook is, in world units.
 const HOOK_SIZE: f32 = 0.08;
 
+/// The layer the floor, the crystal and the ring are on.
+///
+/// Layers are numbers here rather than names in a manifest, and a game naming
+/// its own is the whole of the mechanism: the engine holds two bitmasks per
+/// body and has no opinion about what any bit means.
+const LAYER_WORLD: u32 = 0;
+
+/// The layer everything the solver throws about is on.
+const LAYER_PROP: u32 = 1;
+
+/// The layer the player's box is on.
+const LAYER_PLAYER: u32 = 2;
+
+/// The layer the trigger volume is on.
+const LAYER_TRIGGER: u32 = 3;
+
+/// What the scenery is: on the world layer, in the way of everything.
+const WORLD_LAYERS: Layers = Layers::single(LAYER_WORLD);
+
+/// What a prop is.
+const PROP_LAYERS: Layers = Layers::single(LAYER_PROP);
+
+/// What the player is, and what it walks into.
+///
+/// Everything except the trigger, which it would pass through anyway - a
+/// sensor pushes nothing - but saying so here is what makes the trigger's own
+/// mask readable as a decision rather than as a coincidence.
+const PLAYER_LAYERS: Layers = Layers::new(
+	Layers::bit(LAYER_PLAYER),
+	Layers::bit(LAYER_WORLD) | Layers::bit(LAYER_PROP) | Layers::bit(LAYER_PLAYER),
+);
+
+/// What the trigger is: interested in props and in nothing else.
+const TRIGGER_LAYERS: Layers = Layers::new(Layers::bit(LAYER_TRIGGER), Layers::bit(LAYER_PROP));
+
 /// Where the trigger volume sits, in the world.
 ///
 /// Over the corner the props are dropped into rather than somewhere tidy, so
@@ -247,13 +282,14 @@ const TRIGGER_CENTER: Vec3 = Vec3::new(4.80, 0.45, -0.35);
 
 /// Its half-extents.
 ///
-/// Every face of it is placed against something, because a trigger has no way
-/// to say what it is interested in: there are no collision layers, so what is
-/// inside it is everything that is inside it. It clears the floor slab
-/// underneath, stops short of the ring the cubes turn on, holds the whole
-/// stack, and ends below the ball that hangs - which is what makes the count
-/// four out of five rather than five out of five.
-const TRIGGER_EXTENTS: Vec3 = Vec3::new(1.50, 0.85, 1.30);
+/// Sized to the corner the props are dropped into rather than around what it
+/// must not touch: it is on [`TRIGGER_LAYERS`], which is interested in props
+/// alone, so the floor slab it now reaches through and the ring it now reaches
+/// into are not in its list. It still ends below the ball that hangs, which is
+/// what makes the count four out of five rather than five out of five - and
+/// that is a fact about where the ball is rather than about the geometry
+/// underneath.
+const TRIGGER_EXTENTS: Vec3 = Vec3::new(1.75, 1.05, 1.55);
 
 /// How far above whatever the pick ray found its label is written.
 const LABEL_LIFT: f32 = 0.55;
@@ -706,6 +742,7 @@ fn drop_one(world: &mut World, index: usize) {
 		solid.mass = PROP_MASS;
 		solid.restitution = PROP_BOUNCE;
 		solid.friction = PROP_GRIP;
+		solid.layers = PROP_LAYERS;
 	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
@@ -760,7 +797,9 @@ fn walk(world: &mut World, yaw: f32) {
 
 	velocity.y = world.gravity.y.mul_add(dt, velocity.y);
 
-	let motion = Motion::new(placed.position, velocity, PLAYER_EXTENTS, dt).ignoring(body);
+	let motion = Motion::new(placed.position, velocity, PLAYER_EXTENTS, dt)
+		.ignoring(body)
+		.layered(PLAYER_LAYERS);
 	let moved = character::move_and_slide(world, &motion);
 
 	// the entity first, because the body is kinematic and is written from it at
@@ -1298,6 +1337,21 @@ fn drop_props(world: &mut World) {
 	}
 }
 
+/// Puts a body on some layers, once it exists.
+///
+/// `attach_body` hands back a handle rather than a body, so this is the second
+/// half of every one of these calls. A handle that no longer resolves is
+/// nothing to complain about here: the caller has just made it.
+///
+/// @param world - the body table
+/// @param body - what to move
+/// @param layers - which layers it is on and which it interacts with
+fn layer(world: &mut World, body: BodyId, layers: Layers) {
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.layers = layers;
+	}
+}
+
 /// Gives every entity of the scene a body to be traced against.
 ///
 /// Rebuilt on every load rather than only on a fresh arena, and that is not
@@ -1334,12 +1388,12 @@ fn collide(world: &mut World) {
 	// hung under the quad rather than attached to it, @ref [`FLOOR_THICKNESS`].
 	let mut slab = Transform::at(Vec3::new(0.0, FLOOR_Y - FLOOR_THICKNESS, 0.0));
 	slab.scale = Vec3::new(FLOOR_SIZE, 1.0, FLOOR_SIZE);
-	let floor_body = world.bodies.spawn(Body::new(
-		BodyKind::Static,
-		Shape::cuboid(Vec3::new(0.5, FLOOR_THICKNESS, 0.5)),
-		slab,
-	));
+	let floor_body = world.bodies.spawn(
+		Body::new(BodyKind::Static, Shape::cuboid(Vec3::new(0.5, FLOOR_THICKNESS, 0.5)), slab)
+			.layered(WORLD_LAYERS),
+	);
 	let center_body = world.attach_body(center, BodyKind::Static, Shape::mesh(crystal));
+	layer(world, center_body, WORLD_LAYERS);
 
 	// a volume that notices and pushes nothing. Static and driving no entity:
 	// there is nothing to draw it as and nothing to move it, and the whole of
@@ -1350,12 +1404,14 @@ fn collide(world: &mut World) {
 			Shape::cuboid(TRIGGER_EXTENTS),
 			Transform::at(TRIGGER_CENTER),
 		)
-		.sensing(),
+		.sensing()
+		.layered(TRIGGER_LAYERS),
 	);
 
 	let mut ring_bodies = [BodyId::NONE; RING];
 	for (slot, id) in ring_bodies.iter_mut().zip(ring) {
 		*slot = world.attach_body(id, BodyKind::Static, Shape::UNIT);
+		layer(world, *slot, WORLD_LAYERS);
 	}
 
 	// the props are the only bodies in the scene the *solver* owns. Everything
@@ -1375,6 +1431,7 @@ fn collide(world: &mut World) {
 			body.mass = PROP_MASS;
 			body.restitution = PROP_BOUNCE;
 			body.friction = PROP_GRIP;
+			body.layers = PROP_LAYERS;
 		}
 	}
 
@@ -1390,6 +1447,7 @@ fn collide(world: &mut World) {
 	// dynamic one would be a box the player argues with.
 	let player_body =
 		world.attach_body(player, BodyKind::Kinematic, Shape::cuboid(Vec3::splat(0.5)));
+	layer(world, player_body, PLAYER_LAYERS);
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	state.player_body = player_body;
