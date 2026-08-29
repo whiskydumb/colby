@@ -42,6 +42,10 @@ use colby_core::{Result, err};
 
 use crate::json::{self, Value};
 
+mod geometry;
+
+pub use self::geometry::{Model, Piece, Placement, import};
+
 /// The extension of a glTF written as JSON with its buffers beside it.
 pub const EXTENSION: &str = "gltf";
 
