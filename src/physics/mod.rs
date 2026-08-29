@@ -215,6 +215,47 @@ impl Simulation {
 		debug::draw(world, self);
 	}
 
+	/// Drops everything a step derived, so the next one starts from the body
+	/// table and nothing else.
+	///
+	/// **Whoever restores a world owes this call.** Putting a saved world back
+	/// replaces every table in [`World`] and touches nothing here, and what is
+	/// here is not small: a collision mesh baked for whoever used to be in a
+	/// slot, where every body stood at the top of a step that belonged to
+	/// another world, which pairs were touching so that the next step can say
+	/// what began and ended, and the impulses the solver means to start from.
+	/// A step run against all that is a step mixing two worlds.
+	///
+	/// `colby_core` cannot make this happen - it does not depend on this crate
+	/// and the query table is deliberately two functions - so it is the host's
+	/// to call, immediately after
+	/// [`scene::restore`](colby_core::abi::scene::restore).
+	///
+	/// The rule for what is here: a field is dropped if a step **reads** it
+	/// before rebuilding it, and left alone if the step that reads it clears
+	/// it first. `live`, `was`, `generations` and both manifold lists are all
+	/// the second kind, and a line for them would be a line that cannot be
+	/// wrong and therefore cannot be checked.
+	///
+	/// What this does **not** buy is a step that continues the saved world
+	/// exactly. The impulses and the resting times are gone, so a restored
+	/// pile settles again from nothing rather than from where it was. What it
+	/// buys is the property prediction actually needs: the same world put back
+	/// twice steps the same way both times, whatever either host was doing
+	/// before.
+	pub fn forget(&mut self) {
+		self.colliders.clear();
+		self.previous.clear();
+		self.solver.forget();
+	}
+
+	/// The pairs that were touching at the end of the last step.
+	///
+	/// What the next step's began-and-ended queue is the difference against,
+	/// and one of the things [`forget`](Self::forget) drops.
+	#[must_use]
+	pub fn pairs(&self) -> usize { self.previous.len() }
+
 	/// How many pairs the narrow phase found on the last step.
 	///
 	/// The number a statistics panel wants, and the one to look at first when a
@@ -661,6 +702,7 @@ mod tests {
 	use colby_core::{
 		abi::{
 			Body, BodyKind, EntityId, Joint, Layers, MeshId, Motion, Moved, Transform, character,
+			scene,
 		},
 		glam::{Quat, Vec2},
 		time::STEP_SECONDS,
@@ -2651,6 +2693,187 @@ mod tests {
 		assert!(
 			reached(Layers::ALL.interacting(Layers::bit(0))) < -1.0,
 			"and one that does not walks straight through"
+		);
+	}
+	/// A floor, a mesh body and a pile of boxes leaning by a given amount -
+	/// one of each thing the solver keeps something derived about.
+	fn piled(world: &mut World, height: usize, lean: f32) {
+		ground(world);
+		world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::mesh(MeshId::CUBE),
+			Transform::at(Vec3::new(6.0, 0.5, 0.0)),
+		));
+
+		for level in 0..height {
+			let step = f32::from(u8::try_from(level).unwrap_or(0));
+
+			world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(lean * step, 0.5 + step, 0.0)),
+				1.0,
+			));
+		}
+	}
+
+	#[test]
+	fn a_restored_world_steps_the_same_way_whatever_the_solver_did_before() {
+		// twenty steps rather than a settled pile, and that is the whole
+		// difference between a test with teeth and one without: a pile that
+		// has come to rest converges to the same place whatever it was seeded
+		// with, so the two paths agree even when one of them is wrong. Caught
+		// mid-settle they do not. Measured rather than guessed - a grid of
+		// nine capture points against six run lengths, and everything from
+		// forty steps on agreed no matter what the solver remembered.
+		let scene = {
+			let (mut world, mut simulation) = wired();
+			piled(&mut world, 4, 0.04);
+			settle(&mut world, &mut simulation, 20);
+
+			scene::capture(&world)
+		};
+
+		// a solver that has never run.
+		let fresh = {
+			let (mut world, mut simulation) = wired();
+			scene::restore(&mut world, &scene).expect("no game has claimed the arena");
+			simulation.forget();
+			settle(&mut world, &mut simulation, 16);
+
+			scene::capture(&world)
+		};
+
+		// and one that has spent four hundred steps on another world in the
+		// same slots, so every handle the cache is keyed by is a handle this
+		// world uses: impulses remembered, resting times run out, pairs
+		// touching, a collision mesh baked.
+		let reused = {
+			let (mut world, mut simulation) = wired();
+			piled(&mut world, 4, -0.11);
+			settle(&mut world, &mut simulation, 400);
+			scene::restore(&mut world, &scene).expect("no game has claimed the arena");
+			simulation.forget();
+			settle(&mut world, &mut simulation, 16);
+
+			scene::capture(&world)
+		};
+
+		assert_eq!(
+			fresh, reused,
+			"the same world put back twice steps the same way both times, which is the whole of \
+			 what prediction stands on"
+		);
+	}
+
+	#[test]
+	fn a_slot_that_kept_its_generation_does_not_keep_the_collision_mesh_baked_for_it() {
+		// the sharpest of the four things a step derives. A collision mesh is
+		// cached per slot and thrown away when the generation in that slot
+		// moves - which after a restore it has not, because a restore puts the
+		// generations back exactly. So the one thing that says the bake is
+		// stale is that somebody said so.
+		let shelf = |mesh: MeshId| {
+			let (mut world, simulation) = wired();
+			ground(&mut world);
+			world
+				.bodies
+				.spawn(Body::new(BodyKind::Static, Shape::mesh(mesh), Transform {
+					position: Vec3::new(0.0, 2.0, 0.0),
+					rotation: Quat::IDENTITY,
+					scale: Vec3::new(8.0, 1.0, 8.0),
+				}));
+			world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 6.0, 0.0)),
+				1.0,
+			));
+
+			(world, simulation)
+		};
+
+		// a solid box eight wide, whose top face is at two and a half. Captured
+		// with the falling box still in the air on purpose: a settled one comes
+		// back asleep, and a sleeping body is not integrated at all, so it
+		// would report the height it was saved at whatever it was standing on.
+		let scene = {
+			let (mut world, mut simulation) = shelf(MeshId::CUBE);
+			settle(&mut world, &mut simulation, 1);
+
+			scene::capture(&world)
+		};
+
+		// and a flat plate at exactly two, in the same slot and on the same
+		// generation, with its own bake half a unit lower.
+		let (mut world, mut simulation) = shelf(MeshId::QUAD);
+		settle(&mut world, &mut simulation, 120);
+
+		let on_plate = resting(&world);
+
+		scene::restore(&mut world, &scene).expect("no game has claimed the arena");
+		simulation.forget();
+		settle(&mut world, &mut simulation, 120);
+
+		let on_box = resting(&world);
+
+		assert!(
+			(on_plate - 2.5).abs() < 0.05,
+			"the plate holds the box at two and a half, got {on_plate}"
+		);
+		assert!(
+			(on_box - 3.0).abs() < 0.05,
+			"and the restored world's solid box holds it at three, got {on_box}"
+		);
+	}
+
+	/// Where the one dynamic body in a world has come to rest.
+	fn resting(world: &World) -> f32 {
+		world
+			.bodies
+			.iter()
+			.find(|(_, body)| body.movable())
+			.map_or(f32::NAN, |(_, body)| body.transform.position.y)
+	}
+
+	#[test]
+	fn a_restore_does_not_report_the_end_of_a_touch_from_another_world() {
+		// the pairs that were touching are kept so that the next step can say
+		// what began and what ended. Kept across a restore they say something
+		// ended that never happened here, about two bodies that are not the
+		// two they name.
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+		world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.0, 0.5, 0.0)),
+			1.0,
+		));
+		settle(&mut world, &mut simulation, 30);
+
+		assert!(
+			simulation.pairs() > 0,
+			"the box really is resting on the floor before the restore"
+		);
+
+		// the same two slots, with the box well clear of the floor.
+		let scene = {
+			let (mut apart, _) = wired();
+			ground(&mut apart);
+			apart.bodies.spawn(Body::new(
+				BodyKind::Static,
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 20.0, 0.0)),
+			));
+
+			scene::capture(&apart)
+		};
+
+		scene::restore(&mut world, &scene).expect("no game has claimed the arena");
+		simulation.forget();
+		simulation.step(&mut world);
+
+		assert!(
+			world.bodies.touches().is_empty(),
+			"nothing began or ended, because nothing here was ever touching"
 		);
 	}
 }

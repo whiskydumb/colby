@@ -267,6 +267,30 @@ impl Solver {
 		}
 	}
 
+	/// Drops what this solver knows that outlives a step.
+	///
+	/// Exactly two things do. `resting` is how long each body has been still,
+	/// and it is what decides when an island sleeps - a pile put back into a
+	/// solver that had been watching another one go still would fall asleep
+	/// the moment it arrived. `cache` is last step's impulses, and a step
+	/// seeded from a world that is no longer here starts out pushing for
+	/// reasons of its own.
+	///
+	/// Every other field is cleared and refilled by the step that reads it, so
+	/// there is deliberately nothing about them here: a line that cannot be
+	/// wrong is a line nobody can check.
+	///
+	/// @note: of the two, only `resting` has a test behind it. Keeping the
+	/// impulse cache across a restore was tried at seven capture points
+	/// against ten run lengths and changed nothing measurable, because it
+	/// holds one step's worth and the next step overwrites it. It is cleared
+	/// anyway, because it is *read* before it is rebuilt and being seeded from
+	/// a world that is gone is wrong whether or not this scene shows it.
+	pub(crate) fn forget(&mut self) {
+		self.resting.clear();
+		self.cache.clear();
+	}
+
 	/// Advances every dynamic body by one step.
 	///
 	/// @param bodies - the table, read and written
