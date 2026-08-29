@@ -140,6 +140,49 @@ const FLOOR_NORMALS: &str = "textures/tiles_normal";
 /// nodes below are addressed by their `id` attribute for the same reason a mesh
 /// is addressed by name - recompiling the document renumbers its boxes, and a
 /// handle into them would go stale exactly when somebody is editing it.
+/// The document the spawn menu is written in.
+const MENU: &str = "ui/spawn";
+
+/// How many rows that document has.
+///
+/// The document's, not the game's: a document is what the file says and nothing
+/// at run time can add a box to it, so a menu with more to offer than this
+/// shows the first twelve of it. Growing a list from data is a mechanism this
+/// engine does not have yet.
+const ROWS: usize = 12;
+
+/// What the menu offers: a label, whether it is a ball, and how big.
+///
+/// Two shapes at six sizes rather than a catalogue, because the list is here to
+/// exercise the interface rather than to be a sandbox's inventory. Typing
+/// `ball` cuts it to six and `0.9` to two, which is what a search box is for.
+const SPAWNABLE: [(&str, bool, f32); ROWS] = [
+	("cube 0.30", false, 0.30),
+	("cube 0.45", false, 0.45),
+	("cube 0.60", false, 0.60),
+	("cube 0.75", false, 0.75),
+	("cube 0.90", false, 0.90),
+	("cube 1.05", false, 1.05),
+	("ball 0.30", true, 0.30),
+	("ball 0.45", true, 0.45),
+	("ball 0.60", true, 0.60),
+	("ball 0.75", true, 0.75),
+	("ball 0.90", true, 0.90),
+	("ball 1.05", true, 1.05),
+];
+
+/// How many things the menu will drop before it starts again at the oldest.
+///
+/// Bounded like every table in the engine, and small because the point is a
+/// menu rather than a pile.
+const SPAWNED: usize = 8;
+
+/// How far in front of the player a dropped thing appears, in units.
+const DROP_REACH: f32 = 1.6;
+
+/// How far above the player's middle.
+const DROP_LIFT: f32 = 0.9;
+
 const HUD: &str = "ui/hud";
 
 /// How many loose props the scene drops on the floor.
@@ -295,6 +338,19 @@ struct State {
 	/// `bool` because [`Pod`] wants every bit pattern to be a valid value.
 	player_grounded: u32,
 
+	/// The panel the spawn menu is shown in.
+	menu: PanelId,
+
+	/// What the menu has dropped, oldest first.
+	dropped: [EntityId; SPAWNED],
+
+	/// Their bodies.
+	dropped_bodies: [BodyId; SPAWNED],
+
+	/// How many of those slots have ever been used, so the next one is
+	/// `dropped_next % SPAWNED` and the oldest is the one it lands on.
+	dropped_next: u32,
+
 	/// How many times a prop has started touching something.
 	///
 	/// Counted from the queue the solver fills, which is the only way to know
@@ -320,7 +376,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 10;
+const STATE_LAYOUT: u64 = 11;
 
 /// The module's single exported symbol.
 ///
@@ -502,7 +558,127 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	light_up(world);
 	label_pick(world);
 	trigger(world);
+	menu(world);
 	count_landings(world);
+}
+
+/// Shows the spawn menu, filters it by what is in the search box, and drops
+/// whatever was clicked.
+///
+/// The whole of the interface's fourth step as a game sees it: a list longer
+/// than the box holding it, a field the keyboard goes to, and a class put on
+/// the rows the search has ruled out. Nothing here knows about clipping or
+/// scrolling - both are the stylesheet's - which is the property that makes
+/// them worth having in the engine rather than in the game.
+///
+/// @param world - the panel to fill and the bodies to add to
+fn menu(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let mut panel = state.menu;
+
+	// re-resolved when it is nothing, for the reason the hud is.
+	if !panel.is_some() {
+		panel = world.ui.show(MENU);
+		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+		state.menu = panel;
+	}
+
+	if !panel.is_some() {
+		return;
+	}
+
+	let wanted = world.ui.text(panel, "search").to_lowercase();
+	let mut shown = 0;
+	let mut clicked = None;
+
+	for (index, &(label, ..)) in SPAWNABLE.iter().enumerate() {
+		let name = format!("item{index}");
+		let matches = wanted.is_empty() || label.contains(&wanted);
+
+		if matches {
+			shown += 1;
+		}
+
+		if matches && world.ui.clicked(panel, &name) {
+			clicked = Some(index);
+		}
+
+		world.ui.set_text(panel, &name, label);
+		// the class the stylesheet turns into `display: none`, which takes the
+		// row out of the layout rather than merely hiding it - so the list is
+		// exactly as tall as what is left and the bar says the truth.
+		world
+			.ui
+			.set_classes(panel, &name, if matches { "entry" } else { "entry gone" });
+	}
+
+	if let Some(index) = clicked {
+		drop_one(world, index);
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let count = state
+		.dropped_next
+		.min(u32::try_from(SPAWNED).unwrap_or(0));
+
+	world
+		.ui
+		.set_text(panel, "shown", &format!("{shown}/{ROWS}"));
+	world
+		.ui
+		.set_text(panel, "dropped", &format!("{count} out"));
+}
+
+/// Drops one of the menu's entries in front of the player.
+///
+/// The oldest is reused once [`SPAWNED`] of them exist, entity and body
+/// together: a body whose entity was despawned is still traced against, so the
+/// two lifetimes are kept in step by hand. @ref `colby-known-gaps`.
+///
+/// @param world - the entities and bodies to add to
+/// @param index - which row of [`SPAWNABLE`] was clicked
+fn drop_one(world: &mut World, index: usize) {
+	let Some(&(_, ball, size)) = SPAWNABLE.get(index) else {
+		return;
+	};
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (player, yaw, next) = (state.player, state.yaw, state.dropped_next);
+	let slot = usize::try_from(next).unwrap_or(0) % SPAWNED;
+	let (old_entity, old_body) = (state.dropped[slot], state.dropped_bodies[slot]);
+
+	let Some(&standing) = world.entities.transform(player) else {
+		return;
+	};
+
+	world.bodies.despawn(old_body);
+	world.entities.despawn(old_entity);
+
+	let ahead = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+	let mut place = Transform::at(standing.position + ahead * DROP_REACH + Vec3::Y * DROP_LIFT);
+	place.set_scale(size);
+
+	let entity = world.entities.spawn_at(place);
+	let mesh = if ball { MeshId::SPHERE } else { MeshId::CUBE };
+	let material = world.materials.find("plastic");
+
+	world
+		.entities
+		.set_renderable(entity, Renderable::of(mesh, material, prop_color(index % PROPS)));
+
+	let shape = if ball { Shape::ball(0.5) } else { Shape::UNIT };
+	let body = world.attach_body(entity, BodyKind::Dynamic, shape);
+
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.mass = PROP_MASS;
+		solid.restitution = PROP_BOUNCE;
+		solid.friction = PROP_GRIP;
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.dropped[slot] = entity;
+	state.dropped_bodies[slot] = body;
+	state.dropped_next = next.saturating_add(1);
 }
 
 /// Walks the player one step and writes where it ended up.
@@ -822,7 +998,16 @@ fn recenter(world: &mut World) {
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let (player, body) = (state.player, state.player_body);
+	let (dropped, dropped_bodies) = (state.dropped, state.dropped_bodies);
 	state.player_grounded = 0;
+	state.dropped = [EntityId::NONE; SPAWNED];
+	state.dropped_bodies = [BodyId::NONE; SPAWNED];
+	state.dropped_next = 0;
+
+	for (entity, solid) in dropped.into_iter().zip(dropped_bodies) {
+		world.bodies.despawn(solid);
+		world.entities.despawn(entity);
+	}
 
 	if let Some(transform) = world.entities.transform_mut(player) {
 		transform.position = PLAYER_START;

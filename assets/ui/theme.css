@@ -84,3 +84,49 @@ body {
 	height: 26px;
 	border-radius: 6px;
 }
+
+/* the spawn menu. It exists to exercise the four things a menu needs and a
+ * readout cannot show: a list taller than the box holding it, the bar that says
+ * so, a field the keyboard goes to, and a cut that follows a corner radius. */
+.menu {
+	position: absolute;
+	right: 20px;
+	top: 20px;
+	width: 250px;
+}
+
+.search {
+	background-color: #262d3a;
+	border-radius: 6px;
+	padding: 8px 10px;
+	height: 32px;
+}
+
+/* `flex-shrink` is zero on the entries rather than here: a column of things
+ * that may shrink fits any number of them into any height, and a list that
+ * always fits is a list that never scrolls. */
+.list {
+	flex-direction: column;
+	height: 170px;
+	overflow: scroll;
+	gap: 6px;
+	background-color: #0b0e14aa;
+	border-radius: 8px;
+	padding: 8px;
+}
+
+.entry {
+	background-color: #262d3a;
+	border-radius: 6px;
+	padding: 6px 10px;
+	flex-shrink: 0;
+}
+
+.entry:hover {
+	background-color: #3b4757;
+}
+
+/* what the game puts on an entry the search has ruled out. */
+.gone {
+	display: none;
+}

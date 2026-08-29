@@ -263,12 +263,21 @@ pub fn build(world: &World, placed: &[Placed], list: &mut DrawList) {
 			image(world, box_of, radius, list);
 		}
 
+		// a field draws its own words, so nothing has positioned them inside its
+		// padding the way the layout positions a child. Every other box's words
+		// are a child and are already where they belong.
+		let inset = if node.is_input() {
+			padding_of(box_of)
+		} else {
+			[0.0, 0.0]
+		};
+
 		if node.has_words() && !box_of.text.is_empty() {
-			text(world, box_of, list);
+			text(world, box_of, inset, list);
 		}
 
 		if box_of.focused {
-			caret(world, box_of, list);
+			caret(world, box_of, inset, list);
 		}
 
 		if box_of.scrollable > 0.0 {
@@ -279,13 +288,27 @@ pub fn build(world: &World, placed: &[Placed], list: &mut DrawList) {
 	list.close();
 }
 
+/// The left and top padding of a box, in layout pixels.
+///
+/// A percentage resolves against the box's own width, which is what CSS says
+/// for padding on both axes.
+fn padding_of(box_of: &Placed) -> [f32; 2] {
+	let resolve = |length: Option<colby_core::abi::ui::Length>| {
+		length
+			.and_then(|it| it.resolve(box_of.rect[2]))
+			.unwrap_or(0.0)
+	};
+
+	[resolve(box_of.style.padding.left), resolve(box_of.style.padding.top)]
+}
+
 /// Adds the upright line that says where typing will land.
 ///
 /// Measured through the same function that laid the words out, over the part of
 /// the value before the caret - which is why the caret is a byte offset rather
 /// than a character count: it is an index into the string, and every other
 /// answer would need converting before it could be used.
-fn caret(world: &World, box_of: &Placed, list: &mut DrawList) {
+fn caret(world: &World, box_of: &Placed, inset: [f32; 2], list: &mut DrawList) {
 	if !box_of.font.is_some() {
 		return;
 	}
@@ -305,8 +328,8 @@ fn caret(world: &World, box_of: &Placed, list: &mut DrawList) {
 	list.want(Binding::Blank);
 	list.quad(
 		[
-			box_of.rect[0] + along,
-			box_of.rect[1],
+			box_of.rect[0] + inset[0] + along,
+			box_of.rect[1] + inset[1],
 			CARET_WIDTH,
 			box_of.font_size.max(CARET_WIDTH),
 		],
@@ -381,7 +404,7 @@ fn image(world: &World, box_of: &Placed, radius: f32, list: &mut DrawList) {
 }
 
 /// Adds the glyphs of one box's run of text.
-fn text(world: &World, box_of: &Placed, list: &mut DrawList) {
+fn text(world: &World, box_of: &Placed, inset: [f32; 2], list: &mut DrawList) {
 	if !box_of.font.is_some() {
 		return;
 	}
@@ -396,7 +419,7 @@ fn text(world: &World, box_of: &Placed, list: &mut DrawList) {
 		font: world.fonts.data(box_of.font),
 		id: box_of.font,
 		size: box_of.font_size,
-		origin: [box_of.rect[0], box_of.rect[1]],
+		origin: [box_of.rect[0] + inset[0], box_of.rect[1] + inset[1]],
 		wrap,
 		color: foreground(box_of).0,
 		clip: clip_of(box_of),
