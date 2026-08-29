@@ -62,6 +62,24 @@ pub struct Vertex {
 	pub clip_radius: f32,
 }
 
+/// How wide the bar down the side of a scrolling box is, in layout pixels.
+const BAR_WIDTH: f32 = 5.0;
+
+/// How far in from the edge it sits.
+const BAR_INSET: f32 = 2.0;
+
+/// The shortest it is ever drawn, so that a very long list still has something
+/// to look at rather than a dot.
+const BAR_MIN: f32 = 18.0;
+
+/// How much of the box's own text color it is painted in.
+///
+/// The text color rather than a property of its own, which is one fewer thing
+/// for a stylesheet to have to say and reads correctly on both a light panel
+/// and a dark one. A `scrollbar-color` is what replaces this the day somebody
+/// wants two different ones.
+const BAR_ALPHA: f32 = 0.45;
+
 /// A rounded rectangle, painted flat.
 pub const KIND_RECT: f32 = 0.0;
 
@@ -241,8 +259,54 @@ pub fn build(world: &World, placed: &[Placed], list: &mut DrawList) {
 		if node.is_text() && !box_of.text.is_empty() {
 			text(world, box_of, list);
 		}
+
+		if box_of.scrollable > 0.0 {
+			bar(box_of, list);
+		}
 	}
 
+	list.close();
+}
+
+/// Adds the bar down the side of a box that can be scrolled.
+///
+/// Drawn over the contents rather than beside them, which is why the layout
+/// reserves no room for it: a box that got narrower the moment something
+/// overflowed it would reflow its own contents and could oscillate.
+///
+/// Its length is the share of the contents that is on screen and its position
+/// is how far down that share is, which is the whole of what a bar says.
+fn bar(box_of: &Placed, list: &mut DrawList) {
+	let height = box_of.rect[3];
+	let content = height + box_of.scrollable;
+
+	if content <= 0.0 || height <= 0.0 {
+		return;
+	}
+
+	let thumb = (height * height / content)
+		.max(BAR_MIN)
+		.min(height);
+	let travel = (height - thumb).max(0.0);
+	let along = travel * (box_of.scroll / box_of.scrollable).clamp(0.0, 1.0);
+
+	let mut color = foreground(box_of).0;
+	color.w *= BAR_ALPHA;
+
+	list.want(Binding::Blank);
+	list.quad(
+		[
+			box_of.rect[0] + box_of.rect[2] - BAR_WIDTH - BAR_INSET,
+			box_of.rect[1] + along,
+			BAR_WIDTH,
+			thumb,
+		],
+		[0.0, 0.0, 1.0, 1.0],
+		color,
+		BAR_WIDTH / 2.0,
+		KIND_RECT,
+		clip_of(box_of),
+	);
 	list.close();
 }
 
@@ -434,6 +498,8 @@ mod tests {
 			rect,
 			clip: crate::layout::UNCLIPPED,
 			clip_radius: 0.0,
+			scroll: 0.0,
+			scrollable: 0.0,
 			style: colby_core::abi::ui::Style::root(),
 			font: FontId::NONE,
 			font_size: 10.0,

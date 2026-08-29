@@ -24,7 +24,7 @@ use colby_core::{
 		ui::{
 			DocumentData, Node, PanelId,
 			document::{NONE, ROOT},
-			style::{Align, Color, Direction, Justify, Length, Position, Style, Wrap},
+			style::{Align, Color, Direction, Justify, Length, Overflow, Position, Style, Wrap},
 		},
 	},
 	glam::Vec2,
@@ -34,7 +34,8 @@ use taffy::{
 	TaffyTree, compute_leaf_layout,
 	prelude::{FlexDirection, FlexWrap, JustifyContent},
 	style::{
-		AlignItems, Display as TaffyDisplay, Position as TaffyPosition, Style as TaffyStyle,
+		AlignItems, Display as TaffyDisplay, Overflow as TaffyOverflow,
+		Position as TaffyPosition, Style as TaffyStyle,
 	},
 };
 
@@ -88,6 +89,16 @@ pub struct Placed {
 	/// rectangle, which is exact everywhere except within a corner radius of
 	/// its own corners.
 	pub clip_radius: f32,
+
+	/// How far its contents were moved up, in layout pixels.
+	///
+	/// What the panel was holding for this node, clamped to what there actually
+	/// is to scroll. Zero for every box that is not a scroll container.
+	pub scroll: f32,
+
+	/// How far its contents could be moved up: the height of what is inside
+	/// less the height of the box, or zero when everything fits.
+	pub scrollable: f32,
 
 	/// Everything the cascade decided about it.
 	pub style: Style,
@@ -230,20 +241,25 @@ fn place(
 	// enough for both.
 	let mut origins: Vec<Vec2> = Vec::with_capacity(building.len());
 	let mut clips: Vec<([f32; 4], f32)> = Vec::with_capacity(building.len());
+	let mut scrolls: Vec<f32> = Vec::with_capacity(building.len());
 
 	for node in &building {
 		let Ok(layout) = tree.layout(node.taffy) else {
 			origins.push(Vec2::ZERO);
 			clips.push((UNCLIPPED, 0.0));
+			scrolls.push(0.0);
 
 			continue;
 		};
 
+		// a scrolling parent moves everything under it, and only by its own
+		// offset: the one it sits in has already moved it by theirs.
+		let lifted = scrolls.get(node.parent).copied().unwrap_or(0.0);
 		let parent = origins
 			.get(node.parent)
 			.copied()
 			.unwrap_or(Vec2::ZERO);
-		let origin = parent + Vec2::new(layout.location.x, layout.location.y);
+		let origin = parent + Vec2::new(layout.location.x, layout.location.y - lifted);
 		origins.push(origin);
 
 		let rect = [origin.x, origin.y, layout.size.width, layout.size.height];
@@ -262,12 +278,31 @@ fn place(
 			(inherited, inherited_radius)
 		});
 
+		// what there is to scroll, and how far it has been. taffy measures the
+		// first from the reachable extent of the content; the second is what
+		// the panel was holding, which is clamped here rather than where it was
+		// written because this is the only place that knows the first.
+		let reachable = layout.scrollable_overflow_rect.bottom;
+		let scrollable = if node.style.overflow.unwrap_or_default() == Overflow::Scroll {
+			(reachable - rect[3]).max(0.0)
+		} else {
+			0.0
+		};
+		let scroll = document
+			.node(node.document_node)
+			.map_or(0.0, |it| panel.scroll(&it.id))
+			.clamp(0.0, scrollable);
+
+		scrolls.push(scroll);
+
 		into.push(Placed {
 			panel: id,
 			node: node.document_node,
 			rect,
 			clip: inherited,
 			clip_radius: inherited_radius,
+			scroll,
+			scrollable,
 			style: node.style.clone(),
 			font: node.font,
 			font_size: node.font_size,
@@ -448,6 +483,15 @@ fn is_hovered(document: &DocumentData, hovered: u32, index: u32) -> bool {
 }
 
 /// Turns one computed style into the taffy one.
+fn taffy_overflow(style: &Style) -> TaffyOverflow {
+	match style.overflow.unwrap_or_default() {
+		| Overflow::Visible => TaffyOverflow::Visible,
+		| Overflow::Hidden => TaffyOverflow::Hidden,
+		| Overflow::Scroll => TaffyOverflow::Scroll,
+	}
+}
+
+/// One style as taffy wants it.
 fn convert(style: &Style) -> TaffyStyle {
 	TaffyStyle {
 		display: TaffyDisplay::Flex,
@@ -484,6 +528,17 @@ fn convert(style: &Style) -> TaffyStyle {
 			| Some(Wrap::Wrap) => FlexWrap::Wrap,
 			| _ => FlexWrap::NoWrap,
 		},
+		// what makes a box measure what is inside it rather than let it out
+		// into the parent's own scroll region. One value for both axes, as the
+		// property is.
+		overflow: taffy::Point {
+			x: taffy_overflow(style),
+			y: taffy_overflow(style),
+		},
+		// none reserved: the bar is drawn over the contents rather than beside
+		// them, which is what saves a scroll container from being narrower
+		// than the same box with nothing in it.
+		scrollbar_width: 0.0,
 		flex_grow: style.grow.unwrap_or(0.0),
 		flex_shrink: style.shrink.unwrap_or(1.0),
 		flex_basis: dimension(style.basis),

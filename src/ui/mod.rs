@@ -53,6 +53,13 @@ pub use self::{
 	paint::Painter,
 };
 
+/// How far one line of the wheel scrolls, in layout pixels.
+///
+/// A constant rather than something a stylesheet says, because it is a
+/// property of the wheel rather than of the box: two lists side by side
+/// should move by the same amount for the same flick.
+const SCROLL_LINE: f32 = 40.0;
+
 /// The whole interface: what is on screen, and what it takes to draw it.
 #[derive(Default)]
 pub struct Interface {
@@ -119,7 +126,49 @@ impl Interface {
 			world.ui.set_hovered(*panel, hovered);
 		}
 
+		Self::wheel(world, &self.placed);
 		Self::buttons(world, hit);
+	}
+
+	/// Turns this step's wheel into a scroll on whatever is under the pointer.
+	///
+	/// The innermost box that can scroll and has the pointer in it, which is
+	/// the last one in draw order that answers both - a child is always drawn
+	/// after the box holding it. A box that paints nothing still takes the
+	/// wheel, unlike a click, because the thing being scrolled is usually a
+	/// transparent container around what a person can actually see.
+	///
+	/// @param world - the input to read and the panel to write
+	/// @param placed - this step's layout, for what can scroll and how far
+	fn wheel(world: &mut World, placed: &[Placed]) {
+		let lines = world.input.wheel;
+		if lines.abs() < f32::EPSILON {
+			return;
+		}
+
+		let pointer = world.ui.pointer();
+		let Some(box_of) = placed
+			.iter()
+			.rev()
+			.find(|placed| placed.scrollable > 0.0 && placed.contains(pointer))
+		else {
+			return;
+		};
+
+		let Some(name) = Self::name_of(world, box_of.panel, box_of.node) else {
+			// a box with no `id` has nowhere to keep an offset, so it cannot
+			// scroll however much its contents overflow. @ref
+			// [`Scroll`](colby_core::abi::ui::Scroll).
+			return;
+		};
+
+		// away from the person moves the contents down, which is a smaller
+		// offset: the offset is how far the contents have been pulled *up*.
+		let moved = lines.mul_add(-SCROLL_LINE, world.ui.scroll(box_of.panel, &name));
+
+		world
+			.ui
+			.set_scroll(box_of.panel, &name, moved.clamp(0.0, box_of.scrollable));
 	}
 
 	/// Turns this step's button edges into events.
@@ -457,6 +506,181 @@ mod tests {
 			.map_or(NONE, colby_core::abi::ui::Panel::hovered);
 
 		assert_eq!(hovered, 2, "the inner box, not the one it is inside");
+	}
+
+	/// A short box with something far too tall inside it.
+	///
+	/// Eighty pixels of window on two hundred of contents, so there are a
+	/// hundred and twenty to scroll.
+	const TALL: &str = "<style>body { padding: 0; } #list { position: absolute; left: 0; top: \
+	                    0; width: 100px; height: 80px; overflow: scroll; } #inner { width: \
+	                    100px; height: 200px; background: red; }</style><div id=\"list\"><div \
+	                    id=\"inner\"></div></div>";
+
+	/// The laid-out box with an `id`, out of a fresh layout.
+	fn box_of(world: &World, id: &str) -> Placed {
+		let mut placed = Vec::new();
+		layout::run(world, &mut placed);
+
+		let document = world
+			.ui
+			.panel(world.ui.panels().next().expect("a panel").0)
+			.and_then(|panel| world.ui.document(panel.document()))
+			.expect("a document");
+
+		placed
+			.into_iter()
+			.find(|placed| {
+				document
+					.value()
+					.node(placed.node)
+					.is_some_and(|node| node.id == id)
+			})
+			.expect("the box is in the layout")
+	}
+
+	#[test]
+	fn a_box_that_scrolls_measures_what_it_cannot_show() {
+		let (world, _) = showing(TALL, Vec2::new(800.0, 600.0));
+
+		assert!(
+			(box_of(&world, "list").scrollable - 120.0).abs() < 0.5,
+			"two hundred of contents in eighty of box, got {}",
+			box_of(&world, "list").scrollable
+		);
+	}
+
+	#[test]
+	fn a_box_that_only_hides_measures_nothing_to_scroll() {
+		let (world, _) = showing(
+			&TALL.replace("overflow: scroll", "overflow: hidden"),
+			Vec2::new(800.0, 600.0),
+		);
+
+		assert!(
+			box_of(&world, "list").scrollable <= 0.0,
+			"cutting something off is not the same as offering to move it"
+		);
+	}
+
+	#[test]
+	fn a_scroll_moves_what_is_inside_and_leaves_the_box_alone() {
+		let (mut world, panel) = showing(TALL, Vec2::new(800.0, 600.0));
+
+		let still = box_of(&world, "inner").rect[1];
+		world.ui.set_scroll(panel, "list", 40.0);
+		let moved = box_of(&world, "inner").rect[1];
+
+		assert!(
+			(still - moved - 40.0).abs() < 0.5,
+			"the contents went up by exactly what was asked, {still} to {moved}"
+		);
+		assert!(
+			(box_of(&world, "list").rect[1] - 0.0).abs() < 0.5,
+			"and the box holding them did not move at all"
+		);
+	}
+
+	#[test]
+	fn a_scroll_stops_at_the_end_of_what_is_inside() {
+		let (mut world, panel) = showing(TALL, Vec2::new(800.0, 600.0));
+
+		world.ui.set_scroll(panel, "list", 4000.0);
+
+		assert!(
+			(box_of(&world, "list").scroll - 120.0).abs() < 0.5,
+			"asking for four thousand gets the hundred and twenty there are, got {}",
+			box_of(&world, "list").scroll
+		);
+	}
+
+	#[test]
+	fn the_wheel_scrolls_whatever_is_under_the_pointer() {
+		let (mut world, panel) = showing(TALL, Vec2::new(800.0, 600.0));
+		let mut interface = Interface::new();
+		// away from the person, which pulls the contents up.
+		let input = Input { wheel: -2.0, ..Input::default() };
+		world.input = input;
+
+		world.ui.set_pointer(Vec2::new(400.0, 300.0));
+		interface.update(&mut world);
+
+		assert!(
+			world.ui.scroll(panel, "list") <= 0.0,
+			"the pointer is nowhere near the list, so the list did not move"
+		);
+
+		world.ui.set_pointer(Vec2::new(50.0, 40.0));
+		interface.update(&mut world);
+
+		assert!(
+			2.0_f32
+				.mul_add(-SCROLL_LINE, world.ui.scroll(panel, "list"))
+				.abs() < 0.5,
+			"and over it, two lines of wheel are two lines of scroll, got {}",
+			world.ui.scroll(panel, "list")
+		);
+	}
+
+	#[test]
+	fn a_scroll_container_shrinks_to_its_share_rather_than_to_its_contents() {
+		// a flex item's automatic minimum size is normally the size of what is
+		// inside it, which is what makes a row refuse to be narrower than its
+		// widest child. A box that holds its own contents is exempt, and this
+		// is the one place that rule shows: without it the list is five hundred
+		// wide inside a row of a hundred.
+		let (world, _) = showing(
+			"<style>body { padding: 0; } #row { position: absolute; left: 0; top: 0; width: \
+			 100px; height: 40px; } #list { flex-grow: 1; height: 40px; overflow: scroll; } \
+			 #inner { width: 500px; height: 20px; }</style><div id=\"row\"><div \
+			 id=\"list\"><div id=\"inner\"></div></div></div>",
+			Vec2::new(800.0, 600.0),
+		);
+
+		assert!(
+			(box_of(&world, "list").rect[2] - 100.0).abs() < 0.5,
+			"the list takes the row's width, got {}",
+			box_of(&world, "list").rect[2]
+		);
+	}
+
+	#[test]
+	fn the_wheel_finds_the_innermost_thing_that_can_scroll() {
+		// both of these can scroll and the pointer is in both. The one that
+		// should move is the one nearest the pointer, which is the last of the
+		// two in draw order: a child is always drawn after the box holding it.
+		let (mut world, panel) = showing(
+			"<style>body { padding: 0; } #outer { position: absolute; left: 0; top: 0; width: \
+			 200px; height: 100px; overflow: scroll; } #inner { width: 200px; height: 80px; \
+			 overflow: scroll; } #deep { width: 200px; height: 400px; } #filler { width: 200px; \
+			 height: 200px; }</style><div id=\"outer\"><div id=\"inner\"><div \
+			 id=\"deep\"></div></div><div id=\"filler\"></div></div>",
+			Vec2::new(800.0, 600.0),
+		);
+
+		assert!(box_of(&world, "outer").scrollable > 0.0, "the outer one can move");
+		assert!(box_of(&world, "inner").scrollable > 0.0, "and so can the inner one");
+
+		let mut interface = Interface::new();
+		let input = Input { wheel: -1.0, ..Input::default() };
+		world.input = input;
+
+		// well inside the inner box: the row splits its two hundred between the
+		// list and the filler, so the list ends at a hundred and a pointer there
+		// is already in its neighbor.
+		world.ui.set_pointer(Vec2::new(50.0, 40.0));
+		interface.update(&mut world);
+
+		assert!(
+			(world.ui.scroll(panel, "inner") - SCROLL_LINE).abs() < 0.5,
+			"the inner one moved, got {}",
+			world.ui.scroll(panel, "inner")
+		);
+		assert!(
+			world.ui.scroll(panel, "outer") <= 0.0,
+			"and the one holding it stayed where it was, got {}",
+			world.ui.scroll(panel, "outer")
+		);
 	}
 
 	#[test]

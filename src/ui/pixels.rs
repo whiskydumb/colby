@@ -62,7 +62,15 @@ mod tests {
 	///
 	/// @param html - the document, `<style>` and all
 	/// @return the pixels, or `None` when this machine has no GPU
-	fn shoot(source: &str) -> Option<Image> {
+	fn shoot(source: &str) -> Option<Image> { shoot_scrolled(source, "", 0.0) }
+
+	/// The same, with one box scrolled first.
+	///
+	/// @param source - the document
+	/// @param node - the `id` to scroll, or empty to scroll nothing
+	/// @param offset - how far down, in layout pixels; clamped by the layout
+	/// @return the pixels, or `None` when this machine has no GPU
+	fn shoot_scrolled(source: &str, node: &str, offset: f32) -> Option<Image> {
 		let mut capture = Capture::new(SIZE.0, SIZE.1).expect("the adapter query works")?;
 
 		let mut world = Box::new(World::new());
@@ -78,7 +86,8 @@ mod tests {
 
 		let parsed = html::parse(source, &[]).expect("the document reads");
 		world.ui.insert("ui/test", parsed.document);
-		world.ui.show("ui/test");
+		let panel = world.ui.show("ui/test");
+		world.ui.set_scroll(panel, node, offset);
 
 		let mut interface = Interface::new();
 		interface
@@ -177,6 +186,46 @@ mod tests {
 			 position: absolute; left: 0; top: 0; width: 200px; height: 200px; background: \
 			 #ff0000; }}</style><div id=\"p\"><div id=\"c\"></div></div>"
 		)
+	}
+
+	/// A hundred by eighty of window over two hundred of nothing in particular.
+	///
+	/// The contents are transparent on purpose: the only thing with any ink in
+	/// it is the bar, so a test can ask about the bar without picking it out of
+	/// what it is drawn over.
+	const SCROLLING: &str = "<style>body { padding: 0; } #list { position: absolute; left: 0; \
+	                         top: 0; width: 100px; height: 80px; overflow: scroll; } #inner { \
+	                         width: 100px; height: 200px; }</style><div id=\"list\"><div \
+	                         id=\"inner\"></div></div>";
+
+	#[test]
+	fn a_box_that_can_scroll_says_so_with_a_bar() {
+		let Some(top) = shoot_scrolled(SCROLLING, "list", 0.0) else {
+			return;
+		};
+		let Some(bottom) = shoot_scrolled(SCROLLING, "list", 4000.0) else {
+			return;
+		};
+
+		// eighty of two hundred is a bar of thirty-two, at the right edge,
+		// traveling forty-eight from top to bottom.
+		assert!(ink(&top, 93, 4, 99, 28), "unscrolled, the bar is at the top");
+		assert!(!ink(&top, 93, 52, 99, 76), "and not at the bottom");
+
+		assert!(ink(&bottom, 93, 52, 99, 76), "scrolled to the end, it is at the bottom");
+		assert!(!ink(&bottom, 93, 4, 99, 28), "and no longer at the top");
+	}
+
+	#[test]
+	fn a_box_with_room_for_everything_draws_no_bar_at_all() {
+		let Some(image) = shoot(&SCROLLING.replace("height: 200px", "height: 20px")) else {
+			return;
+		};
+
+		assert!(
+			!ink(&image, 93, 0, 99, 80),
+			"nothing overflows, so there is nothing to say and no bar saying it"
+		);
 	}
 
 	#[test]

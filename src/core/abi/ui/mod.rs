@@ -115,12 +115,39 @@ pub struct Bind {
 	pub style: Style,
 }
 
+/// How far one box has been scrolled.
+///
+/// Keyed by `id` like a [`Bind`] and kept beside them rather than among them,
+/// for two reasons. Every field of a `Bind` is an `Option` meaning "the game
+/// said nothing about this", and a scroll of zero is a value rather than an
+/// absence. And a bind is what the *game* wrote while this is what a *person*
+/// did, which is a difference worth being able to see in a debugger.
+///
+/// Keyed by `id` rather than by node index because it has to survive the
+/// document being recompiled under a running process - which is the one thing
+/// this engine exists to do, and the moment somebody is most likely to be
+/// looking at a scrolled list. A box with no `id` cannot keep a scroll
+/// position, exactly as it cannot be given text.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Scroll {
+	/// The `id` of the node this is about.
+	pub node: String,
+
+	/// How far down its contents have been moved, in layout pixels.
+	///
+	/// Never negative, and never past the end of what is inside: the layout
+	/// measures both every step and clamps this to what it found.
+	pub offset: f32,
+}
+
 /// One document on screen.
 #[derive(Clone, Debug)]
 pub struct Panel {
 	document: DocumentId,
 	shown: bool,
 	binds: Vec<Bind>,
+	/// How far each scrollable node has been scrolled. Host-written.
+	scrolls: Vec<Scroll>,
 	/// The node the pointer is over, or [`document::NONE`]. Host-written, once
 	/// a frame, from the layout.
 	hovered: u32,
@@ -173,6 +200,51 @@ impl Panel {
 			.unwrap_or(&node.text)
 	}
 
+	/// How far a node has been scrolled, or zero if it never has been.
+	///
+	/// @param node - the `id` to look for
+	#[must_use]
+	pub fn scroll(&self, node: &str) -> f32 {
+		if node.is_empty() {
+			return 0.0;
+		}
+
+		self.scrolls
+			.iter()
+			.find(|scroll| scroll.node == node)
+			.map_or(0.0, |scroll| scroll.offset)
+	}
+
+	/// Moves a node's contents, making an entry if there is none.
+	///
+	/// The host's. Nothing here knows how far is too far - that is the
+	/// layout's, which measures what is inside the box every step.
+	///
+	/// @param node - the `id` to move; an empty one is ignored, because there
+	/// would be nothing to find the entry by again
+	/// @param offset - how far down, in layout pixels
+	pub fn set_scroll(&mut self, node: &str, offset: f32) {
+		if node.is_empty() {
+			return;
+		}
+
+		if let Some(scroll) = self
+			.scrolls
+			.iter_mut()
+			.find(|scroll| scroll.node == node)
+		{
+			scroll.offset = offset;
+
+			return;
+		}
+
+		self.scrolls.push(Scroll {
+			// copied rather than borrowed, for the reason a bind's name is.
+			node: node.to_owned(),
+			offset,
+		});
+	}
+
 	/// What the game has bound to a node, making an entry if there is none.
 	fn bind_mut(&mut self, node: &str) -> &mut Bind {
 		let known = self
@@ -222,6 +294,7 @@ impl Ui {
 				document: DocumentId::NONE,
 				shown: false,
 				binds: Vec::new(),
+				scrolls: Vec::new(),
 				hovered: document::NONE,
 				pressed: document::NONE,
 			}],
@@ -267,6 +340,7 @@ impl Ui {
 			document,
 			shown: true,
 			binds: Vec::new(),
+			scrolls: Vec::new(),
 			hovered: document::NONE,
 			pressed: document::NONE,
 		});
@@ -431,6 +505,27 @@ impl Ui {
 	pub fn set_hovered(&mut self, panel: PanelId, node: u32) {
 		if let Some(panel) = self.panel_mut(panel) {
 			panel.hovered = node;
+		}
+	}
+
+	/// How far a node of a panel has been scrolled.
+	///
+	/// @param panel - which document
+	/// @param node - the `id` of the box
+	#[must_use]
+	pub fn scroll(&self, panel: PanelId, node: &str) -> f32 {
+		self.panel(panel)
+			.map_or(0.0, |panel| panel.scroll(node))
+	}
+
+	/// Moves a node's contents.
+	///
+	/// @param panel - which document
+	/// @param node - the `id` of the box
+	/// @param offset - how far down, in layout pixels
+	pub fn set_scroll(&mut self, panel: PanelId, node: &str, offset: f32) {
+		if let Some(panel) = self.panel_mut(panel) {
+			panel.set_scroll(node, offset);
 		}
 	}
 
