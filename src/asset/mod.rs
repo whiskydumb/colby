@@ -30,6 +30,7 @@ pub mod document;
 pub mod font;
 pub mod format;
 pub mod html;
+pub mod json;
 pub mod obj;
 pub mod png;
 pub mod sdf;
