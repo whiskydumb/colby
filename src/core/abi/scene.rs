@@ -38,7 +38,7 @@
 use crate::{
 	Result,
 	abi::{
-		Body, BodyId, BodyKind, Camera, EntityId, Joint, JointKind, Layers, MaterialId,
+		Body, BodyId, BodyKind, Camera, EntityId, Joint, JointId, JointKind, Layers, MaterialId,
 		Renderable, Shape, ShapeKind, Transform, World, state::STATE_BYTES,
 	},
 	err,
@@ -758,6 +758,239 @@ fn stage_world(world: &mut World, stage: Stage) {
 
 	world.snap_camera();
 	world.entities.snap_all();
+}
+
+/// What a scene turned into when it was created beside something else.
+///
+/// A restore needs nothing like this, because the whole point of one is that
+/// the handles are the handles they were. An instantiate is the opposite: it
+/// creates, so every handle is new, and the file's own way of naming things -
+/// an index into it, or a name somebody typed - is the only thing that can
+/// still be pointed at afterwards. This is the translation, and it is what
+/// [`instantiate`] hands back instead of writing into an arena it cannot read.
+#[derive(Clone, Debug, Default)]
+pub struct Remap {
+	/// Each entity's name and what it became, in the file's order.
+	things: Vec<(String, EntityId)>,
+
+	/// The same for bodies.
+	solids: Vec<(String, BodyId)>,
+
+	/// And for joints.
+	links: Vec<(String, JointId)>,
+}
+
+impl Remap {
+	/// What the entity at a place in the file became.
+	///
+	/// @param index - its place in [`SceneData::things`]
+	/// @return the handle, or [`EntityId::NONE`] for an index that is not one
+	/// or an entity the world had no room for
+	#[must_use]
+	pub fn entity(&self, index: u32) -> EntityId {
+		handle(&self.things, index).unwrap_or(EntityId::NONE)
+	}
+
+	/// What the body at a place in the file became.
+	#[must_use]
+	pub fn body(&self, index: u32) -> BodyId {
+		handle(&self.solids, index).unwrap_or(BodyId::NONE)
+	}
+
+	/// What the joint at a place in the file became.
+	#[must_use]
+	pub fn joint(&self, index: u32) -> JointId {
+		handle(&self.links, index).unwrap_or(JointId::NONE)
+	}
+
+	/// What the entity somebody called this became.
+	///
+	/// The way an authored scene is read: a person writing one names the floor
+	/// `floor` and the game asks for it by that. An empty name never matches,
+	/// because a record naming nothing is not a record called "".
+	///
+	/// @param name - what the file calls it
+	#[must_use]
+	pub fn entity_named(&self, name: &str) -> EntityId {
+		named(&self.things, name).unwrap_or(EntityId::NONE)
+	}
+
+	/// What the body somebody called this became.
+	#[must_use]
+	pub fn body_named(&self, name: &str) -> BodyId {
+		named(&self.solids, name).unwrap_or(BodyId::NONE)
+	}
+
+	/// What the joint somebody called this became.
+	#[must_use]
+	pub fn joint_named(&self, name: &str) -> JointId {
+		named(&self.links, name).unwrap_or(JointId::NONE)
+	}
+
+	/// Every entity that was created, in the file's order.
+	pub fn entities(&self) -> impl Iterator<Item = EntityId> {
+		self.things.iter().map(|(_, id)| *id)
+	}
+
+	/// Every body that was created.
+	pub fn bodies(&self) -> impl Iterator<Item = BodyId> { self.solids.iter().map(|(_, id)| *id) }
+
+	/// Every joint that was created.
+	pub fn joints(&self) -> impl Iterator<Item = JointId> { self.links.iter().map(|(_, id)| *id) }
+}
+
+/// One handle out of a list of named ones, by its place in the file.
+fn handle<T: Copy>(list: &[(String, T)], index: u32) -> Option<T> {
+	if index == NO_INDEX {
+		return None;
+	}
+
+	list.get(usize::try_from(index).ok()?)
+		.map(|(_, id)| *id)
+}
+
+/// One handle out of a remap's list, by name.
+fn named<T: Copy>(list: &[(String, T)], name: &str) -> Option<T> {
+	if name.is_empty() {
+		return None;
+	}
+
+	list.iter()
+		.find(|(written, _)| written == name)
+		.map(|(_, id)| *id)
+}
+
+/// Creates everything a scene describes, beside whatever is already there.
+///
+/// The other loader, and the one a dupe, a prefab and a level laid into a
+/// running game all go through. Nothing existing is disturbed: the tables grow,
+/// the slots and generations in the description are ignored because they belong
+/// to a world this is not, and the world's own settings are left where they
+/// are - pasting a prop is not a reason to move somebody's camera.
+///
+/// **The arena is not touched, and it cannot be.** A restore puts the game's
+/// bytes back because the handles in them still resolve; here every handle is
+/// new, and nothing outside the game knows where in those four thousand bytes
+/// a handle even is. So this hands back a [`Remap`] instead, and the game
+/// writes down whatever it cares about itself. That is the same rule model
+/// placements follow: what a description becomes is a loop the game writes.
+///
+/// A body arrives awake whatever the description says. Sleeping is a claim
+/// about how long something has been still, and a body that was created a
+/// moment ago has not been still for any length of time - the solver would
+/// have to be told the same thing separately, and a dupe pasted in mid-air
+/// hanging there is the shape of getting it wrong.
+///
+/// @param world - the world to add to
+/// @param scene - what to create
+/// @param at - added to every position, so a copy lands beside its original
+/// rather than inside it; [`Vec3::ZERO`] puts everything exactly where the
+/// description says
+/// @return what each record became
+pub fn instantiate(world: &mut World, scene: &SceneData, at: Vec3) -> Remap {
+	let things: Vec<(String, EntityId)> = scene
+		.things
+		.iter()
+		.map(|thing| (thing.name.clone(), spawn_thing(world, thing, at)))
+		.collect();
+
+	let solids: Vec<(String, BodyId)> = scene
+		.solids
+		.iter()
+		.map(|solid| (solid.name.clone(), spawn_solid(world, solid, &things, at)))
+		.collect();
+
+	let links: Vec<(String, JointId)> = scene
+		.links
+		.iter()
+		.map(|link| (link.name.clone(), spawn_link(world, link, &solids, at)))
+		.collect();
+
+	Remap { things, solids, links }
+}
+
+/// Creates one entity.
+fn spawn_thing(world: &mut World, thing: &Thing, at: Vec3) -> EntityId {
+	let mut transform = thing.transform;
+	transform.position += at;
+
+	let id = world.entities.spawn_at(transform);
+	if !id.is_some() {
+		return id;
+	}
+
+	world.entities.set_renderable(id, Renderable {
+		mesh: world.meshes.find(&thing.mesh),
+		material: material(world, &thing.material),
+		color: thing.color,
+	});
+
+	id
+}
+
+/// Creates one body, pointing at whatever its entity became.
+fn spawn_solid(
+	world: &mut World,
+	solid: &Solid,
+	things: &[(String, EntityId)],
+	at: Vec3,
+) -> BodyId {
+	let mut transform = solid.transform;
+	transform.position += at;
+
+	let mut body = Body::new(solid.kind, shape(world, &solid.shape), transform);
+	body.velocity = solid.velocity;
+	body.angular = solid.angular;
+	body.mass = solid.mass;
+	body.restitution = solid.restitution;
+	body.friction = solid.friction;
+	body.sensor = solid.sensor;
+	body.layers = solid.layers;
+	body.entity = handle(things, solid.thing).unwrap_or(EntityId::NONE);
+
+	world.bodies.spawn(body)
+}
+
+/// Creates one joint, if both the bodies it names are there.
+///
+/// A joint whose second body is nothing is a joint pinned to a point in the
+/// world, which is a real thing to be. A joint whose second body *failed* is
+/// not, and it would be indistinguishable from the first if it were created
+/// anyway - so it is refused instead, which is loud in the only way this can
+/// be: the joint is missing rather than holding the wrong thing.
+fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: Vec3) -> JointId {
+	let first = handle(solids, link.first);
+	let second = handle(solids, link.second);
+
+	if (link.first != NO_INDEX && first.is_none())
+		|| (link.second != NO_INDEX && second.is_none())
+	{
+		return JointId::NONE;
+	}
+
+	// only a joint pinned to the world has an anchor in world space, and only
+	// that one moves with the paste.
+	let anchored = if link.second == NO_INDEX {
+		link.second_anchor + at
+	} else {
+		link.second_anchor
+	};
+
+	world.joints.spawn(Joint {
+		kind: link.kind,
+		first: first.unwrap_or(BodyId::NONE),
+		second: second.unwrap_or(BodyId::NONE),
+		first_anchor: link.first_anchor,
+		second_anchor: anchored,
+		axis: link.axis,
+		length: link.length,
+		// the description's own, not one worked out here: a weld holds the
+		// angle it was *made* at, and the two bodies have just been created at
+		// whatever angle they were written down at, so the answer is already in
+		// the file. @ref `World::join`, which is the other case.
+		rest: link.rest,
+		give: link.give,
+	})
 }
 
 #[cfg(test)]
@@ -1537,5 +1770,275 @@ mod tests {
 			other.meshes.find("meshes/crystal"),
 			"and it collides against the geometry it named"
 		);
+	}
+	#[test]
+	fn instantiating_adds_to_a_world_rather_than_replacing_it() {
+		let scene = capture(&peopled());
+		let mut busy = furnished();
+		let standing = busy
+			.entities
+			.spawn_at(Transform::at(Vec3::splat(-5.0)));
+
+		let put = instantiate(&mut busy, &scene, Vec3::ZERO);
+
+		assert_eq!(busy.entities.len(), 3, "one that was here and two that arrived");
+		assert!(busy.entities.alive(standing), "what was here is untouched");
+		assert_eq!(put.entities().count(), 2, "and the remap says what arrived");
+	}
+
+	#[test]
+	fn every_handle_a_copy_gets_is_a_new_one() {
+		// into the world it came from, which is the only place the question
+		// means anything: a handle is an index into one world's tables, so two
+		// worlds that both started empty hand out the same numbers and
+		// comparing across them proves nothing at all.
+		let mut world = peopled();
+		let scene = capture(&world);
+		let held: Vec<EntityId> = world.entities.iter().map(|(id, ..)| id).collect();
+
+		let first = instantiate(&mut world, &scene, Vec3::X * 20.0);
+		let again = instantiate(&mut world, &scene, Vec3::X * 40.0);
+
+		for id in held {
+			assert!(
+				!first.entities().any(|it| it == id),
+				"a copy is not the thing it was copied from"
+			);
+		}
+
+		let overlap = first
+			.entities()
+			.any(|one| again.entities().any(|two| one == two));
+
+		assert!(!overlap, "and two copies are not each other");
+		assert_eq!(world.entities.len(), 6, "the originals and both copies");
+	}
+
+	#[test]
+	fn a_copy_lands_where_it_was_asked_to() {
+		let scene = capture(&peopled());
+		let mut world = furnished();
+		let put = instantiate(&mut world, &scene, Vec3::new(0.0, 10.0, 0.0));
+
+		let moved = put.entity(0);
+		let placed = world
+			.entities
+			.transform(moved)
+			.expect("it landed")
+			.position;
+
+		assert_eq!(
+			placed,
+			scene.things[0].transform.position + Vec3::new(0.0, 10.0, 0.0),
+			"every position is offset by what the paste asked for"
+		);
+
+		let body = put.body(0);
+		let solid = world.bodies.get(body).expect("it landed");
+
+		assert_eq!(
+			solid.transform.position,
+			scene.solids[0].transform.position + Vec3::new(0.0, 10.0, 0.0),
+			"the bodies too, or a copy would be standing beside its own collision"
+		);
+	}
+
+	#[test]
+	fn a_body_points_at_the_entity_that_arrived_with_it() {
+		let scene = capture(&peopled());
+		let mut world = furnished();
+		// something already in the table, so the indices in the file are not
+		// the slots the copies land in and a lookup that used them would be
+		// pointing at whoever was here.
+		world.entities.spawn();
+
+		let put = instantiate(&mut world, &scene, Vec3::ZERO);
+		let body = world
+			.bodies
+			.get(put.body(0))
+			.expect("the body landed");
+
+		assert_eq!(
+			body.entity,
+			put.entity(scene.solids[0].thing),
+			"the body drives the copy of the entity it drove"
+		);
+		assert!(world.entities.alive(body.entity), "which is a living one");
+	}
+
+	#[test]
+	fn a_joint_holds_the_copies_rather_than_the_originals() {
+		let mut world = peopled();
+		let scene = capture(&world);
+		let original = world
+			.bodies
+			.iter()
+			.map(|(id, _)| id)
+			.next()
+			.expect("one body");
+
+		let put = instantiate(&mut world, &scene, Vec3::X * 20.0);
+		let joint = world
+			.joints
+			.get(put.joint(0))
+			.expect("the joint landed");
+
+		assert_eq!(joint.first, put.body(0), "it holds the copy");
+		assert_ne!(joint.first, original, "and not the body it was copied from");
+		assert_eq!(world.joints.len(), 2, "the original rope is still there beside it");
+	}
+
+	#[test]
+	fn a_joint_pinned_to_the_world_takes_its_anchor_with_it() {
+		let scene = capture(&peopled());
+		let mut world = furnished();
+		let put = instantiate(&mut world, &scene, Vec3::new(3.0, 0.0, 0.0));
+		let joint = world
+			.joints
+			.get(put.joint(0))
+			.expect("the joint landed");
+
+		assert_eq!(joint.second, BodyId::NONE, "it is pinned to a point rather than a body");
+		assert_eq!(
+			joint.second_anchor,
+			scene.links[0].second_anchor + Vec3::new(3.0, 0.0, 0.0),
+			"and the point moved with the copy, or the rope would reach back to the original"
+		);
+	}
+
+	#[test]
+	fn an_anchor_on_a_body_is_left_alone() {
+		// a local anchor is in its body's own space, so moving the copy moves
+		// it already. Adding the offset again would put it a paste away from
+		// the thing it is attached to.
+		let scene = SceneData {
+			solids: vec![lone_solid(), lone_solid()],
+			links: vec![Link {
+				kind: JointKind::Weld,
+				first: 0,
+				second: 1,
+				first_anchor: Vec3::Y,
+				second_anchor: -Vec3::Y,
+				rest: Quat::IDENTITY,
+				..Link::default()
+			}],
+			..SceneData::default()
+		};
+
+		let mut world = World::new();
+		let put = instantiate(&mut world, &scene, Vec3::splat(50.0));
+		let joint = world
+			.joints
+			.get(put.joint(0))
+			.expect("the joint landed");
+
+		assert_eq!(joint.first_anchor, Vec3::Y, "the first anchor is untouched");
+		assert_eq!(joint.second_anchor, -Vec3::Y, "and so is the second, being a body's own");
+	}
+
+	#[test]
+	fn a_joint_whose_body_did_not_arrive_is_not_created_at_all() {
+		// a second body of nothing means "pinned to a point in the world", so a
+		// joint that lost its second body and was created anyway would be
+		// indistinguishable from one that never had it.
+		let scene = SceneData {
+			solids: vec![lone_solid()],
+			links: vec![Link {
+				kind: JointKind::Rope,
+				first: 0,
+				second: 7,
+				length: 1.0,
+				..Link::default()
+			}],
+			..SceneData::default()
+		};
+
+		let mut world = World::new();
+		let put = instantiate(&mut world, &scene, Vec3::ZERO);
+
+		assert!(!put.joint(0).is_some(), "the joint was refused");
+		assert!(world.joints.is_empty(), "and nothing was created");
+	}
+
+	#[test]
+	fn a_copy_arrives_awake_whatever_the_description_says() {
+		let scene = SceneData {
+			solids: vec![Solid { sleeping: true, ..lone_solid() }],
+			..SceneData::default()
+		};
+
+		let mut world = World::new();
+		let put = instantiate(&mut world, &scene, Vec3::ZERO);
+		let body = world.bodies.get(put.body(0)).expect("it landed");
+
+		assert!(
+			!body.sleeping,
+			"a body created a moment ago has not been still for any length of time"
+		);
+	}
+
+	#[test]
+	fn instantiating_leaves_the_arena_and_the_settings_alone() {
+		#[repr(C)]
+		#[derive(Clone, Copy, crate::bytemuck::Pod, crate::bytemuck::Zeroable)]
+		struct Held {
+			count: u32,
+			pad: u32,
+		}
+
+		let mut source = peopled();
+		source.state.get::<Held>(5).0.count = 9;
+		let scene = capture(&source);
+
+		let mut running = furnished();
+		running.state.get::<Held>(5).0.count = 1;
+		running.camera.position = Vec3::splat(-3.0);
+		running.gravity = Vec3::ZERO;
+
+		instantiate(&mut running, &scene, Vec3::ZERO);
+
+		assert_eq!(running.state.get::<Held>(5).0.count, 1, "the game's own bytes are its own");
+		assert_eq!(running.camera.position, Vec3::splat(-3.0), "pasting moves nobody's camera");
+		assert_eq!(running.gravity, Vec3::ZERO, "and changes nothing about the world");
+	}
+
+	#[test]
+	fn a_remap_answers_by_name_as_well_as_by_place() {
+		let scene = SceneData {
+			things: vec![
+				Thing {
+					name: "floor".to_owned(),
+					..Thing::default()
+				},
+				Thing { name: String::new(), ..Thing::default() },
+			],
+			..SceneData::default()
+		};
+
+		let mut world = World::new();
+		let put = instantiate(&mut world, &scene, Vec3::ZERO);
+
+		assert_eq!(put.entity_named("floor"), put.entity(0), "a name finds what it named");
+		assert!(!put.entity_named("nothing").is_some(), "and a name nobody used finds nothing");
+		assert!(
+			!put.entity_named("").is_some(),
+			"the empty name is not a name, it is the absence of one"
+		);
+	}
+
+	/// A body with nothing attached, for a description written by hand.
+	fn lone_solid() -> Solid {
+		Solid {
+			kind: BodyKind::Dynamic,
+			shape: Form {
+				kind: ShapeKind::Box,
+				extents: Vec3::splat(0.5),
+				..Form::default()
+			},
+			mass: 1.0,
+			layers: Layers::DEFAULT,
+			thing: NO_INDEX,
+			..Solid::default()
+		}
 	}
 }
