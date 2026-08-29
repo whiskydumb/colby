@@ -94,11 +94,25 @@ impl Manifold {
 /// that is a few hundred nanoseconds for the scenes this engine has; the day it
 /// is not, a grid goes here and nothing above it changes.
 ///
+/// What a sensor makes goes in a second list rather than being marked in the
+/// first. Two lists because the solver must never be handed one, and a flag it
+/// had to check would be a flag somewhere in it could be forgotten; and
+/// separate lists rather than a partition of one, because reordering the
+/// solver's input would change the order it visits pairs in, which is a
+/// property a Gauss-Seidel sweep can feel.
+///
 /// @param bodies - the table
 /// @param simulation - the baked collision meshes
-/// @param into - cleared and filled with what was found
-pub(crate) fn find(bodies: &Bodies, simulation: &Simulation, into: &mut Vec<Manifold>) {
+/// @param into - cleared and filled with what the solver has to separate
+/// @param sensed - cleared and filled with what a sensor merely noticed
+pub(crate) fn find(
+	bodies: &Bodies,
+	simulation: &Simulation,
+	into: &mut Vec<Manifold>,
+	sensed: &mut Vec<Manifold>,
+) {
 	into.clear();
+	sensed.clear();
 
 	let handles: Vec<(BodyId, Body)> = bodies
 		.iter()
@@ -107,9 +121,22 @@ pub(crate) fn find(bodies: &Bodies, simulation: &Simulation, into: &mut Vec<Mani
 
 	for (index, &(first, ref one)) in handles.iter().enumerate() {
 		for &(second, ref other) in &handles[index + 1..] {
+			// two sensors have nothing to tell each other. Neither pushes, so
+			// neither has anything to notice, and a world full of trigger
+			// volumes would otherwise test every one against every other.
+			if !one.solid() && !other.solid() {
+				continue;
+			}
+
+			let sensing = !one.solid() || !other.solid();
+
 			// two bodies neither of which the solver moves can never need
-			// separating, however much they overlap.
-			if !one.movable() && !other.movable() {
+			// separating, however much they overlap. A sensor is exempt rather
+			// than overlooked: what it produces is an event and not a
+			// separation, and a static body really does move here - it is
+			// written from the entity it is bolted to at the top of every step,
+			// so a trigger a moving prop is carried through has to be asked.
+			if !sensing && !one.movable() && !other.movable() {
 				continue;
 			}
 
@@ -117,7 +144,9 @@ pub(crate) fn find(bodies: &Bodies, simulation: &Simulation, into: &mut Vec<Mani
 				continue;
 			}
 
-			pair(simulation, (first, one), (second, other), into);
+			let list = if sensing { &mut *sensed } else { &mut *into };
+
+			pair(simulation, (first, one), (second, other), list);
 		}
 	}
 }
@@ -209,7 +238,7 @@ fn mesh(
 /// @param corners - the triangle, in world space
 /// @param low - the box's low corner
 /// @param high - its high corner
-fn apart(corners: [Vec3; 3], low: Vec3, high: Vec3) -> bool {
+pub(crate) fn apart(corners: [Vec3; 3], low: Vec3, high: Vec3) -> bool {
 	let mut least = corners[0];
 	let mut most = corners[0];
 
@@ -329,14 +358,14 @@ fn surface_of(first: &Body, second: &Body) -> (f32, f32) {
 }
 
 /// Where a ball is.
-fn center(body: &Body) -> Vec3 { body.transform.position }
+pub(crate) fn center(body: &Body) -> Vec3 { body.transform.position }
 
 /// How big a ball is in world space.
 ///
 /// The largest axis of the scale, so a ball under a non-uniform one is the
 /// sphere around the ellipsoid rather than the ellipsoid. A ray is exact about
 /// this and the solver is not; @ref `colby-known-gaps`.
-fn radius(body: &Body) -> f32 {
+pub(crate) fn radius(body: &Body) -> f32 {
 	body.shape.radius.abs() * body.transform.scale.abs().max_element()
 }
 

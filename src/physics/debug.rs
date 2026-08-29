@@ -137,6 +137,13 @@ fn draw_shapes(table: &mut debug::Debug, world: &World, simulation: &Simulation)
 /// something wakes it, and a pile that will not settle looks identical to one
 /// that has until the colors say otherwise.
 fn shape_color(body: &Body) -> Vec3 {
+	// before the kind, because what matters about a sensor on screen is that
+	// nothing will ever be pushed out of it - which is exactly what an outline
+	// in one of the ordinary colors would hide.
+	if !body.solid() {
+		return debug::MAGENTA;
+	}
+
 	match body.kind {
 		| BodyKind::Static => debug::GRAY,
 		| BodyKind::Kinematic => debug::CYAN,
@@ -292,19 +299,21 @@ mod tests {
 	}
 
 	#[test]
-	fn the_four_states_a_body_can_be_in_are_four_colors() {
+	fn every_state_a_body_can_be_in_has_a_color_of_its_own() {
 		let awake = Body::dynamic(Shape::UNIT, Transform::IDENTITY, 1.0);
 		let mut asleep = awake;
 		asleep.sleeping = true;
 
 		let stationary = Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY);
 		let driven = Body::new(BodyKind::Kinematic, Shape::UNIT, Transform::IDENTITY);
+		let volume = stationary.sensing();
 
 		let colors = [
 			shape_color(&awake),
 			shape_color(&asleep),
 			shape_color(&stationary),
 			shape_color(&driven),
+			shape_color(&volume),
 		];
 
 		for (index, color) in colors.iter().enumerate() {
@@ -312,7 +321,8 @@ mod tests {
 				assert!(
 					!color.abs_diff_eq(*other, 1.0e-3),
 					"a pile that has settled and one that has not must not look the same, nor a \
-					 wall and a moving platform: {color} against {other}"
+					 wall and a moving platform, nor either of those and a volume nothing is \n					 \
+					 pushed out of: {color} against {other}"
 				);
 			}
 		}

@@ -43,8 +43,8 @@ use std::collections::HashSet;
 
 use colby_core::{
 	abi::{
-		Bodies, BodyId, Entry, MeshData, Physics, Shape, ShapeKind, Touch, TouchKind, TraceInfo,
-		TraceResult, World,
+		Bodies, BodyId, Entry, MeshData, Overlap, Physics, Shape, ShapeKind, Touch, TouchKind,
+		TraceInfo, TraceResult, World,
 	},
 	glam::Vec3,
 	trace,
@@ -119,11 +119,18 @@ pub struct Simulation {
 	/// wants and what reading a table every step cannot tell it.
 	previous: HashSet<(BodyId, BodyId)>,
 
-	/// What the narrow phase found this step.
+	/// What the narrow phase found this step, for the solver to separate.
 	///
 	/// Kept between steps for its allocation only; it is cleared and refilled
 	/// every time. There is no contact cache yet - @ref the crate docs.
 	manifolds: Vec<Manifold>,
+
+	/// What a sensor overlapped this step.
+	///
+	/// The same list kept apart, because the solver must never see one: a
+	/// sensor produces an event and never an impulse. @ref
+	/// [`contact::find`].
+	sensed: Vec<Manifold>,
 
 	/// The sequential-impulse solver and its per-body scratch.
 	solver: Solver,
@@ -140,6 +147,7 @@ impl Simulation {
 			was: Vec::new(),
 			previous: HashSet::new(),
 			manifolds: Vec::new(),
+			sensed: Vec::new(),
 			solver: Solver::new(),
 		}
 	}
@@ -180,8 +188,9 @@ impl Simulation {
 		// on it. The allocation survives the round trip, which is the only
 		// reason the list is a field at all.
 		let mut manifolds = core::mem::take(&mut self.manifolds);
-		contact::find(&world.bodies, self, &mut manifolds);
-		self.report(world, &manifolds);
+		let mut sensed = core::mem::take(&mut self.sensed);
+		contact::find(&world.bodies, self, &mut manifolds, &mut sensed);
+		self.report(world, &manifolds, &sensed);
 		self.remember_where(&world.bodies);
 
 		let dt = world.dt.max(MINIMUM_STEP);
@@ -193,7 +202,9 @@ impl Simulation {
 		self.solver
 			.run(&mut world.bodies, &world.joints, &manifolds, world.gravity, dt, passes);
 		self.manifolds = manifolds;
-		world.contacts = u32::try_from(self.manifolds.len()).unwrap_or(u32::MAX);
+		self.sensed = sensed;
+		world.contacts =
+			u32::try_from(self.manifolds.len() + self.sensed.len()).unwrap_or(u32::MAX);
 
 		self.sweep(world);
 		Self::push(world);
@@ -217,31 +228,52 @@ impl Simulation {
 	/// themselves rather than how many there are.
 	pub(crate) fn manifolds(&self) -> &[Manifold] { &self.manifolds }
 
-	/// Queues what started and stopped touching since the last step.
+	/// Queues what started and stopped touching since the last step, and
+	/// rebuilds the list of what is inside a sensor.
 	///
-	/// @param world - the body table, whose queue is written
-	/// @param manifolds - what the narrow phase just found
-	fn report(&mut self, world: &mut World, manifolds: &[Manifold]) {
+	/// Edges and state, from the same pass over the same pairs. Neither can be
+	/// had from the other: an edge cannot be recovered from a list read every
+	/// step, and a list kept by adding and removing edges goes wrong the first
+	/// time something is destroyed while it is inside.
+	///
+	/// @param world - the body table, whose queue and overlap list are written
+	/// @param manifolds - what the narrow phase found for the solver
+	/// @param sensed - what it found for the sensors
+	fn report(&mut self, world: &mut World, manifolds: &[Manifold], sensed: &[Manifold]) {
 		let mut now: HashSet<(BodyId, BodyId)> = HashSet::new();
 
-		for manifold in manifolds {
+		world.bodies.forget_overlaps();
+
+		for manifold in manifolds.iter().chain(sensed) {
 			if manifold.count == 0 {
 				continue;
 			}
 
 			let pair = ordered(manifold.first, manifold.second);
 
-			if now.insert(pair) && !self.previous.contains(&pair) {
-				let point = manifold.points()[0];
-
-				world.bodies.touched(Touch {
-					first: pair.0,
-					second: pair.1,
-					kind: TouchKind::Began,
-					point: point.position,
-					normal: manifold.normal,
-				});
+			// a mesh makes one manifold per triangle, so everything below this
+			// happens once for a pair rather than once for a manifold.
+			if !now.insert(pair) {
+				continue;
 			}
+
+			if let Some(overlap) = overlapping(&world.bodies, pair) {
+				world.bodies.overlapped(overlap);
+			}
+
+			if self.previous.contains(&pair) {
+				continue;
+			}
+
+			let point = manifold.points()[0];
+
+			world.bodies.touched(Touch {
+				first: pair.0,
+				second: pair.1,
+				kind: TouchKind::Began,
+				point: point.position,
+				normal: manifold.normal,
+			});
 		}
 
 		for &pair in &self.previous {
@@ -255,19 +287,23 @@ impl Simulation {
 					.get(id)
 					.is_some_and(|body| body.sleeping)
 			};
-			let alive = world.bodies.alive(pair.0) && world.bodies.alive(pair.1);
+			let alive = (world.bodies.alive(pair.0), world.bodies.alive(pair.1));
 
 			// a pair that has gone to sleep is still touching; the narrow phase
 			// simply stopped asking. Reporting that as having parted would make
 			// every settled pile announce its own collapse.
-			if alive && asleep(pair.0) && asleep(pair.1) {
+			if alive.0 && alive.1 && asleep(pair.0) && asleep(pair.1) {
 				now.insert(pair);
 
 				continue;
 			}
 
-			if !alive {
-				// one of them is gone. There is nobody left to tell.
+			// both gone, and there is nobody left to tell. One gone is the case
+			// that matters, and it is reported: the survivor is often a trigger
+			// volume whose contents were deleted under it, and a count it never
+			// hears about is wrong for the rest of the process. The dead handle
+			// goes out as it was, because that is what the game will recognize.
+			if !alive.0 && !alive.1 {
 				continue;
 			}
 
@@ -311,7 +347,10 @@ impl Simulation {
 		let mut pulled: Vec<(BodyId, Vec3)> = Vec::new();
 
 		for (id, body) in world.bodies.iter() {
-			if !body.movable() || body.sleeping {
+			// a sensor is meant to pass through things, so pulling it back out
+			// of the first one it crossed would be the bug this exists to stop,
+			// applied to the one body that wants it.
+			if !body.movable() || body.sleeping || !body.solid() {
 				continue;
 			}
 
@@ -477,6 +516,26 @@ fn asked_for(asked: f32) -> usize {
 		.unwrap_or(VELOCITY_PASSES)
 }
 
+/// Which of a pair is the sensor, and what is inside it.
+///
+/// `None` unless one of them is one, which is every ordinary contact.
+///
+/// @param bodies - the table, to look both handles up in
+/// @param pair - the two handles, in slot order
+fn overlapping(bodies: &Bodies, pair: (BodyId, BodyId)) -> Option<Overlap> {
+	let first = bodies.get(pair.0)?;
+
+	if !first.solid() {
+		return Some(Overlap { sensor: pair.0, body: pair.1 });
+	}
+
+	if !bodies.get(pair.1)?.solid() {
+		return Some(Overlap { sensor: pair.1, body: pair.0 });
+	}
+
+	None
+}
+
 /// A pair of handles in a fixed order, so that one pair is one key.
 fn ordered(first: BodyId, second: BodyId) -> (BodyId, BodyId) {
 	if first.slot() <= second.slot() {
@@ -598,8 +657,9 @@ unsafe fn borrow<'a>(
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{Body, BodyKind, EntityId, Joint, MeshId, Transform},
+		abi::{Body, BodyKind, EntityId, Joint, MeshId, Motion, Moved, Transform, character},
 		glam::{Quat, Vec2},
+		time::STEP_SECONDS,
 	};
 
 	use super::*;
@@ -966,6 +1026,211 @@ mod tests {
 
 		assert!(world.bodies.get(lower).expect("alive").sleeping, "the pile really did settle");
 		assert_eq!(ended, 0, "and going quiet is not the same as coming apart");
+	}
+
+	#[test]
+	fn a_prop_falls_through_a_sensor_and_says_so() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+		let volume = world.bodies.spawn(
+			Body::new(
+				BodyKind::Static,
+				Shape::cuboid(Vec3::new(1.0, 0.5, 1.0)),
+				Transform::at(Vec3::new(0.0, 2.0, 0.0)),
+			)
+			.sensing(),
+		);
+		let prop = world.bodies.spawn(Body::dynamic(
+			Shape::ball(0.25),
+			Transform::at(Vec3::new(0.0, 4.0, 0.0)),
+			1.0,
+		));
+
+		let mut began = 0;
+		let mut ended = 0;
+
+		for _ in 0..240 {
+			simulation.step(&mut world);
+
+			for touch in world
+				.bodies
+				.touches()
+				.iter()
+				.filter(|touch| touch.names(volume))
+			{
+				match touch.kind {
+					| TouchKind::Began => began += 1,
+					| TouchKind::Ended => ended += 1,
+				}
+			}
+
+			world.bodies.end_step();
+		}
+
+		assert_eq!((began, ended), (1, 1), "it went in once and came out once");
+		assert!(
+			placed(&world, prop).y < 0.4,
+			"and it is on the floor rather than resting on the trigger, at {}",
+			placed(&world, prop).y
+		);
+		assert!(
+			world.bodies.overlaps().is_empty(),
+			"and the overlap list is what is true now rather than what ever was"
+		);
+	}
+
+	#[test]
+	fn a_sensor_wrapped_around_a_pile_leaves_it_exactly_where_it_was() {
+		let settled = |sensor: bool| {
+			let (mut world, mut simulation) = wired();
+			ground(&mut world);
+			let lower = world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 0.5, 0.0)),
+				1.0,
+			));
+			world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 1.5, 0.0)),
+				1.0,
+			));
+
+			if sensor {
+				world.bodies.spawn(
+					Body::new(
+						BodyKind::Static,
+						Shape::cuboid(Vec3::splat(3.0)),
+						Transform::at(Vec3::new(0.0, 1.0, 0.0)),
+					)
+					.sensing(),
+				);
+			}
+
+			settle(&mut world, &mut simulation, 200);
+
+			placed(&world, lower)
+		};
+
+		assert!(
+			settled(true).abs_diff_eq(settled(false), 0.0),
+			"a trigger wrapped around a pile is not a thing the pile can feel, and the 			 \
+			 tolerance here is zero on purpose"
+		);
+	}
+
+	#[test]
+	fn a_sensor_is_not_there_as_far_as_a_trace_is_concerned() {
+		let (mut world, _simulation) = wired();
+		let volume = world
+			.bodies
+			.spawn(Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY).sensing());
+		let aim = TraceInfo::ray(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -5.0));
+		let sweep = TraceInfo::swept(
+			Vec3::new(0.0, 0.0, 5.0),
+			Vec3::new(0.0, 0.0, -5.0),
+			Vec3::splat(0.1),
+		);
+
+		assert!(!world.trace_ray(&aim).hit, "a ray goes straight through it");
+		assert!(!world.trace_box(&sweep).hit, "and so does a swept box");
+
+		world
+			.bodies
+			.get_mut(volume)
+			.expect("alive")
+			.sensor = false;
+
+		assert!(world.trace_ray(&aim).hit, "the same box, made solid, stops the ray");
+		assert!(world.trace_box(&sweep).hit, "and the sweep");
+	}
+
+	#[test]
+	fn a_static_body_carried_through_a_static_sensor_is_noticed() {
+		let (mut world, mut simulation) = wired();
+		let volume = world
+			.bodies
+			.spawn(Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY).sensing());
+		let carried = world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::UNIT,
+			Transform::at(Vec3::new(4.0, 0.0, 0.0)),
+		));
+
+		simulation.step(&mut world);
+		world.bodies.end_step();
+
+		assert_eq!(world.bodies.inside(volume).count(), 0, "nothing is in it yet");
+
+		world
+			.bodies
+			.get_mut(carried)
+			.expect("alive")
+			.transform
+			.position = Vec3::ZERO;
+		simulation.step(&mut world);
+
+		assert_eq!(
+			world.bodies.inside(volume).next(),
+			Some(carried),
+			"two bodies the solver never moves still meet when a game moves one"
+		);
+		assert!(
+			world
+				.bodies
+				.touches()
+				.iter()
+				.any(|touch| touch.kind == TouchKind::Began && touch.names(volume)),
+			"and the arrival is an edge as well as a state"
+		);
+	}
+
+	#[test]
+	fn a_trigger_hears_about_a_prop_deleted_inside_it() {
+		let (mut world, mut simulation) = wired();
+		let volume = world.bodies.spawn(
+			Body::new(BodyKind::Static, Shape::cuboid(Vec3::splat(1.0)), Transform::IDENTITY)
+				.sensing(),
+		);
+		let prop = world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::ball(0.25),
+			Transform::IDENTITY,
+		));
+
+		simulation.step(&mut world);
+
+		assert_eq!(world.bodies.inside(volume).next(), Some(prop), "it is in there");
+
+		world.bodies.end_step();
+		world.bodies.despawn(prop);
+		simulation.step(&mut world);
+
+		assert!(
+			world
+				.bodies
+				.touches()
+				.iter()
+				.any(|touch| touch.kind == TouchKind::Ended && touch.names(volume)),
+			"a prop deleted inside a trigger still leaves it"
+		);
+		assert_eq!(world.bodies.inside(volume).count(), 0, "and the list agrees");
+	}
+
+	#[test]
+	fn two_sensors_have_nothing_to_say_about_each_other() {
+		let (mut world, mut simulation) = wired();
+		let first = world
+			.bodies
+			.spawn(Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY).sensing());
+		let second = world
+			.bodies
+			.spawn(Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY).sensing());
+
+		simulation.step(&mut world);
+
+		assert!(world.bodies.touches().is_empty(), "neither pushes, so neither notices");
+		assert_eq!(world.bodies.inside(first).count(), 0, "and neither holds the other");
+		assert_eq!(world.bodies.inside(second).count(), 0, "in either order");
 	}
 
 	#[test]
@@ -1597,6 +1862,399 @@ mod tests {
 			"its middle stops a quarter short of the face, got {}",
 			sweep.end.z
 		);
+	}
+
+	/// A unit cube turned an eighth of a turn about y.
+	///
+	/// The shape every sweep test below is aimed past: its bounds are a seventh
+	/// wider than it is, and everything in that margin is a place the old
+	/// bounds-only sweep reported contact and there was none.
+	fn turned() -> Transform {
+		let mut transform = Transform::IDENTITY;
+		transform.rotation = Quat::from_rotation_y(core::f32::consts::FRAC_PI_4);
+
+		transform
+	}
+
+	#[test]
+	fn a_swept_box_stops_at_a_turned_box_and_not_at_its_bounds() {
+		let (mut world, mut simulation) = wired();
+		world
+			.bodies
+			.spawn(Body::new(BodyKind::Static, Shape::UNIT, turned()));
+		simulation.step(&mut world);
+
+		let sweep = world.trace_box(&TraceInfo::swept(
+			Vec3::new(0.68, 0.0, 4.0),
+			Vec3::new(0.68, 0.0, -4.0),
+			Vec3::splat(0.05),
+		));
+
+		// the turned cube is a diamond in xz whose near edge is x + z = 0.7071,
+		// and the cast box reaches it with its low corner at x = 0.63. So the
+		// face it stops on is z = 0.0771 and its middle is a half-extent short
+		// of that. The bounds would have said 0.757, which is where the corner
+		// of a box that is not there would be.
+		assert!(sweep.hit, "it does run into it");
+		assert!(
+			(sweep.end.z - 0.127).abs() < 0.01,
+			"it stops where the face is and not where the bounds are, got {}",
+			sweep.end.z
+		);
+	}
+
+	#[test]
+	fn a_cube_answers_a_sweep_the_same_as_its_own_triangles() {
+		let swept = |shape: Shape| {
+			let (mut world, mut simulation) = wired();
+			world
+				.bodies
+				.spawn(Body::new(BodyKind::Static, shape, turned()));
+			simulation.step(&mut world);
+
+			world.trace_box(&TraceInfo::swept(
+				Vec3::new(0.68, 0.0, 4.0),
+				Vec3::new(0.68, 0.0, -4.0),
+				Vec3::splat(0.05),
+			))
+		};
+
+		let solid = swept(Shape::UNIT);
+		let soup = swept(Shape::mesh(MeshId::CUBE));
+
+		assert!(solid.hit && soup.hit, "both are in the way");
+		assert!(
+			(solid.fraction - soup.fraction).abs() < 0.01,
+			"the same cube declared two ways stops the same sweep in the same place, got {} \
+			 against {}",
+			solid.fraction,
+			soup.fraction
+		);
+	}
+
+	#[test]
+	fn a_swept_box_misses_the_corner_of_a_balls_bounds() {
+		let (mut world, mut simulation) = wired();
+		world
+			.bodies
+			.spawn(Body::new(BodyKind::Static, Shape::ball(0.5), Transform::IDENTITY));
+		simulation.step(&mut world);
+
+		// a hair inside the ball's bounding box on two axes at once, which puts
+		// the nearest corner of the cast box 0.69 from the middle of a ball of
+		// half that radius. A box is not a ball, and this is the whole of the
+		// difference.
+		let sweep = world.trace_box(&TraceInfo::swept(
+			Vec3::new(0.51, 0.51, 4.0),
+			Vec3::new(0.51, 0.51, -4.0),
+			Vec3::splat(0.02),
+		));
+
+		assert!(!sweep.hit, "it goes past the corner, stopping at {}", sweep.end);
+		assert!((sweep.fraction - 1.0).abs() < f32::EPSILON, "having gone the whole way");
+	}
+
+	/// Half-extents of the box every controller test moves.
+	///
+	/// Half a unit tall and a quarter wide, which is a person shape without
+	/// being a person: the point is that it is a box and the arithmetic knows
+	/// it.
+	const WALKER: Vec3 = Vec3::new(0.25, 0.5, 0.25);
+
+	/// One step of moving a box, with gravity applied the way a game would.
+	///
+	/// @param world - the bodies to move through
+	/// @param place - where it is and how fast, updated in place
+	/// @param step - how tall a lip it may climb
+	fn walk(world: &World, place: &mut (Vec3, Vec3), step: f32) -> Moved {
+		place.1.y = 9.81_f32.mul_add(-STEP_SECONDS, place.1.y);
+
+		let motion = Motion::new(place.0, place.1, WALKER, STEP_SECONDS).stepping(step);
+		let moved = character::move_and_slide(world, &motion);
+
+		*place = (moved.position, moved.velocity);
+
+		moved
+	}
+
+	#[test]
+	fn a_box_walking_into_a_wall_slides_along_it() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+		world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::new(0.1, 2.0, 5.0)),
+			Transform::at(Vec3::new(2.0, 1.0, 0.0)),
+		));
+		simulation.step(&mut world);
+
+		let motion = Motion::new(
+			Vec3::new(1.5, 0.5, 0.0),
+			Vec3::new(30.0, 0.0, 30.0),
+			WALKER,
+			STEP_SECONDS,
+		);
+		let moved = character::move_and_slide(&world, &motion);
+
+		// the wall's face is at x = 1.9 and the box is a quarter wide, so it can
+		// get to 1.65 and no further. What it was going to spend crossing the
+		// wall it spends going along it instead, which is the whole of sliding:
+		// the half unit of z happens in full.
+		assert_eq!(moved.slides, 1, "it met one surface");
+		assert!(
+			(moved.position.x - 1.65).abs() < 0.02,
+			"and stopped against it, at {}",
+			moved.position.x
+		);
+		assert!(
+			(moved.position.z - 0.5).abs() < 0.02,
+			"having gone the whole way along it, got {}",
+			moved.position.z
+		);
+		assert!(
+			moved.velocity.x.abs() < 1.0e-3,
+			"the speed into the wall is gone, not stored up, got {}",
+			moved.velocity.x
+		);
+		assert!((moved.velocity.z - 30.0).abs() < 1.0e-3, "and the speed along it is untouched");
+	}
+
+	#[test]
+	fn a_box_standing_on_the_floor_does_not_drift() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+		simulation.step(&mut world);
+
+		let mut place = (Vec3::new(0.0, 0.5, 0.0), Vec3::ZERO);
+		let mut lowest = f32::INFINITY;
+		let mut highest = f32::NEG_INFINITY;
+
+		for _ in 0..180 {
+			let moved = walk(&world, &mut place, character::STEP);
+
+			assert!(moved.grounded, "it is on the floor and stays on it");
+			lowest = lowest.min(moved.position.y);
+			highest = highest.max(moved.position.y);
+		}
+
+		// three seconds of standing still. A skin gap that were added rather than
+		// converged to would be four centimeters of climb by now.
+		assert!(
+			highest - lowest < 0.01,
+			"it neither sinks nor creeps upwards: {lowest} to {highest}"
+		);
+	}
+
+	#[test]
+	fn a_box_climbs_a_lip_no_taller_than_its_step() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+		world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::new(0.5, 0.1, 2.0)),
+			Transform::at(Vec3::new(2.0, 0.1, 0.0)),
+		));
+		simulation.step(&mut world);
+
+		let mut place = (Vec3::new(1.0, 0.5, 0.0), Vec3::ZERO);
+		let mut climbed = false;
+		let mut highest = f32::NEG_INFINITY;
+
+		// far enough to go up one side of the lip and off the other, which is
+		// two answers for the price of one: it climbed, and it came down again
+		// rather than walking through the air where the lip used to be.
+		for _ in 0..40 {
+			place.1.x = 5.0;
+			let moved = walk(&world, &mut place, character::STEP);
+			climbed |= moved.stepped;
+			highest = highest.max(moved.position.y);
+		}
+
+		assert!(climbed, "it stepped up at some point");
+		assert!(
+			(highest - 0.7).abs() < 0.02,
+			"getting as high as the top of the lip and no higher, reached {highest}"
+		);
+		assert!(place.0.x > 2.5, "and carried on past the far edge, at {}", place.0.x);
+		assert!((place.0.y - 0.5).abs() < 0.02, "back down on the floor, at {}", place.0.y);
+	}
+
+	#[test]
+	fn a_box_stops_at_a_lip_taller_than_its_step() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+		world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::new(0.5, 0.3, 2.0)),
+			Transform::at(Vec3::new(2.0, 0.3, 0.0)),
+		));
+		simulation.step(&mut world);
+
+		let mut place = (Vec3::new(1.0, 0.5, 0.0), Vec3::ZERO);
+
+		for _ in 0..40 {
+			place.1.x = 5.0;
+			let moved = walk(&world, &mut place, character::STEP);
+
+			assert!(!moved.stepped, "a lip that tall is a wall");
+		}
+
+		assert!(
+			(place.0.x - 1.25).abs() < 0.05,
+			"it is up against the face and no further, at {}",
+			place.0.x
+		);
+		assert!((place.0.y - 0.5).abs() < 0.02, "and still on the floor, at {}", place.0.y);
+	}
+
+	#[test]
+	fn a_box_does_not_step_onto_something_too_steep_to_stand_on() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+
+		// a wedge low enough to step over - its highest point is a little over
+		// three tenths against a step of thirty-five hundredths - and turned so
+		// that the face a box would come down on is sixty degrees from flat.
+		// Short enough to climb and too steep to stand on is exactly the pair
+		// the check inside the climb exists for.
+		let mut wedge = Transform::at(Vec3::new(2.0, 0.1, 0.0));
+		wedge.rotation = Quat::from_rotation_z(core::f32::consts::FRAC_PI_3);
+		world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::new(0.15, 0.15, 2.0)),
+			wedge,
+		));
+		simulation.step(&mut world);
+
+		let mut place = (Vec3::new(1.0, 0.5, 0.0), Vec3::ZERO);
+
+		for _ in 0..40 {
+			place.1.x = 5.0;
+			let moved = walk(&world, &mut place, character::STEP);
+
+			assert!(!moved.stepped, "a step is for standing on, and that face is not");
+		}
+
+		assert!(
+			place.0.x < 1.7,
+			"so it is stopped against the wedge rather than up on it, at {}",
+			place.0.x
+		);
+		assert!((place.0.y - 0.5).abs() < 0.02, "and still on the floor, at {}", place.0.y);
+	}
+
+	#[test]
+	fn a_box_in_mid_air_does_not_climb_the_wall_it_runs_into() {
+		let (mut world, mut simulation) = wired();
+		// no floor at all, so the box is falling for the whole run.
+		world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::new(0.5, 0.1, 2.0)),
+			Transform::at(Vec3::new(2.0, 0.1, 0.0)),
+		));
+		simulation.step(&mut world);
+
+		let mut place = (Vec3::new(1.0, 0.5, 0.0), Vec3::ZERO);
+
+		for _ in 0..40 {
+			place.1.x = 5.0;
+			let moved = walk(&world, &mut place, character::STEP);
+
+			assert!(
+				!moved.stepped,
+				"a lip climbed in mid-air is a box walking up the outside of a wall"
+			);
+		}
+
+		assert!(
+			place.0.y < 0.0,
+			"it went past the lip rather than onto it, ending at {}",
+			place.0.y
+		);
+	}
+
+	#[test]
+	fn a_box_knows_what_it_is_standing_on_and_when_it_is_not() {
+		let (mut world, mut simulation) = wired();
+		let floor = ground(&mut world);
+		simulation.step(&mut world);
+
+		let standing = character::move_and_slide(
+			&world,
+			&Motion::new(Vec3::new(0.0, 0.5, 0.0), Vec3::ZERO, WALKER, STEP_SECONDS),
+		);
+		let falling = character::move_and_slide(
+			&world,
+			&Motion::new(Vec3::new(0.0, 4.0, 0.0), Vec3::ZERO, WALKER, STEP_SECONDS),
+		);
+
+		assert!(standing.grounded, "there is a floor under it");
+		assert_eq!(standing.ground_body, floor, "and it is the one that was made");
+		assert!(
+			standing
+				.ground_normal
+				.abs_diff_eq(Vec3::Y, 1.0e-3),
+			"lying flat, got {}",
+			standing.ground_normal
+		);
+
+		assert!(!falling.grounded, "four units up there is nothing");
+		assert_eq!(falling.ground_body, BodyId::NONE, "and nothing to name");
+	}
+
+	#[test]
+	fn a_limit_no_surface_can_meet_leaves_a_box_in_the_air() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+		simulation.step(&mut world);
+
+		let strict = character::move_and_slide(
+			&world,
+			&Motion::new(Vec3::new(0.0, 0.5, 0.0), Vec3::ZERO, WALKER, STEP_SECONDS)
+				.standing(1.01),
+		);
+
+		assert!(
+			!strict.grounded,
+			"a limit past straight up is a limit nothing meets, and the floor is right there"
+		);
+	}
+
+	#[test]
+	fn a_slope_is_ground_only_when_it_is_flat_enough() {
+		let landed = |degrees: f32| {
+			let (mut world, mut simulation) = wired();
+			let tilt = degrees.to_radians();
+			let mut ramp = Transform::IDENTITY;
+			ramp.rotation = Quat::from_rotation_z(tilt);
+
+			world.bodies.spawn(Body::new(
+				BodyKind::Static,
+				Shape::cuboid(Vec3::splat(4.0)),
+				ramp,
+			));
+			simulation.step(&mut world);
+
+			// straight above the middle of the ramp's top face, which is not above
+			// the middle of the ramp: the face slides sideways as the ramp turns,
+			// and dropping over the origin instead means a steep enough ramp is
+			// missed entirely rather than stood on. Only far enough up to land
+			// gently, too, because a fast landing slides far enough to reach the
+			// end face, whose normal is flat enough to stand on and would be
+			// answering a different question.
+			let face = Vec3::new(-4.0 * tilt.sin(), 4.0 * tilt.cos(), 0.0);
+			let mut place = (face + Vec3::Y * (WALKER.y + 0.6), Vec3::ZERO);
+			let mut ever = false;
+
+			for _ in 0..40 {
+				ever |= walk(&world, &mut place, character::STEP).grounded;
+			}
+
+			ever
+		};
+
+		assert!(landed(30.0), "half the limit is something to stand on");
+		assert!(!landed(60.0), "and half again past it is not");
 	}
 
 	#[test]
