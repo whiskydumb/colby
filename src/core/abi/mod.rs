@@ -35,6 +35,7 @@ pub mod mesh;
 pub mod model;
 pub mod physics;
 pub mod registry;
+pub mod scene;
 pub mod state;
 pub mod texture;
 pub mod ui;
@@ -56,6 +57,7 @@ pub use self::{
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
 	},
 	registry::{Entry, Registry},
+	scene::{Arena, Form, Link, SceneData, Solid, Stage, Thing},
 	state::GameState,
 	texture::{Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},

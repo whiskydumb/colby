@@ -53,6 +53,23 @@ impl EntityId {
 	/// [`Entities::alive`] answers that.
 	#[must_use]
 	pub const fn is_some(self) -> bool { self.generation != 0 }
+
+	/// The slot this addresses, whatever lives there now.
+	///
+	/// Paired with [`generation`](Self::generation), and the pair is what
+	/// writing a handle down and reading it back needs: a scene records both
+	/// and hands them to [`Entities::restore`], which puts every entity in the
+	/// slot it was in.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "u32 to usize is lossless on every target this builds for, and try_from is not 		          available in a const fn"
+	)]
+	pub const fn slot(self) -> usize { self.index as usize }
+
+	/// Which occupant of that slot this handle names.
+	#[must_use]
+	pub const fn generation(self) -> u32 { self.generation }
 }
 
 impl Default for EntityId {
@@ -462,6 +479,23 @@ impl Entities {
 
 				Some((id, &self.transforms[slot], &self.renderables[slot]))
 			})
+	}
+
+	/// How many slots the table has ever handed out.
+	///
+	/// Not the same as [`len`](Self::len), which counts what is alive. This is
+	/// the length of the arrays, and it is what a scene has to write down: a
+	/// dead slot still carries the generation that makes a handle to it stale.
+	#[must_use]
+	pub fn slots(&self) -> usize { self.alive.len() }
+
+	/// Which occupant of a slot the table is on.
+	///
+	/// @param slot - the array index, not a handle
+	/// @return the generation, or zero for a slot that has never been used
+	#[must_use]
+	pub fn generation(&self, slot: usize) -> u32 {
+		self.generations.get(slot).copied().unwrap_or(0)
 	}
 
 	/// The array slot a handle refers to, if it is still the one it was given.

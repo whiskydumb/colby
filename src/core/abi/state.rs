@@ -85,6 +85,16 @@ impl GameState {
 	#[must_use]
 	pub const fn layout(&self) -> u64 { self.layout }
 
+	/// The whole arena as bytes, whatever they currently mean.
+	///
+	/// For writing the arena down and reading it back, and for nothing else:
+	/// the host still never looks *inside*, it only copies. A saved world that
+	/// left this out would come back with every entity standing where it was
+	/// and a game holding handles to none of them, because the handles a game
+	/// keeps are in here.
+	#[must_use]
+	pub const fn raw(&self) -> &[u8; STATE_BYTES] { &self.bytes }
+
 	/// Forgets everything, so the next [`get`](Self::get) reports itself fresh.
 	pub fn reset(&mut self) {
 		self.bytes = [0; STATE_BYTES];

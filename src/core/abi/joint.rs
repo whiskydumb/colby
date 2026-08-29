@@ -264,6 +264,19 @@ impl Joints {
 	#[must_use]
 	pub fn alive(&self, id: JointId) -> bool { self.slot(id).is_some() }
 
+	/// How many slots the table has ever handed out.
+	#[must_use]
+	pub fn slots(&self) -> usize { self.alive.len() }
+
+	/// Which occupant of a slot the table is on.
+	///
+	/// @param slot - the array index, not a handle
+	/// @return the generation, or zero for a slot that has never been used
+	#[must_use]
+	pub fn generation(&self, slot: usize) -> u32 {
+		self.generations.get(slot).copied().unwrap_or(0)
+	}
+
 	/// Destroys everything.
 	pub fn clear(&mut self) {
 		for slot in 0..self.alive.len() {
