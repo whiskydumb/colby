@@ -22,8 +22,9 @@ use std::f32::consts::TAU;
 use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, GameApi, Joint, JointId,
-		Key, Layers, Length, Material, MaterialId, MeshId, Motion, PanelId, Renderable, Shape,
-		TouchKind, TraceInfo, Transform, Value, World, character, debug,
+		Key, Layers, Length, Material, MaterialId, MeshId, Motion, PanelId, Renderable,
+		SceneData, Shape, Solid, TouchKind, TraceInfo, Transform, Value, World, character, debug,
+		scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -302,6 +303,17 @@ const PROP_BOUNCE: f32 = 0.22;
 
 /// How hard a prop is to slide.
 const PROP_GRIP: f32 = 0.62;
+
+/// How far to one side of the original a copy is stood, in units.
+///
+/// A little more than a prop is wide, so a copy lands clear of what it was
+/// copied from rather than inside it - two bodies created overlapping is the
+/// one thing a solver has no good answer to.
+const DUPE_SIDEWAYS: f32 = 1.15;
+
+/// How far above it, so a copy of something resting on the floor is not
+/// created half inside the floor.
+const DUPE_LIFT: f32 = 0.35;
 
 /// How far the pick ray reaches, in world units.
 ///
@@ -624,11 +636,101 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 
 	place(world);
 	pick(world);
+	duplicate(world, yaw);
 	light_up(world);
 	label_pick(world);
 	trigger(world);
 	menu(world);
 	count_landings(world);
+}
+
+/// Copies whatever the cursor is on and stands the copy beside it.
+///
+/// The sandbox's duplicator, at the size one prop makes it. What it
+/// demonstrates is that a scene is a *value*: the whole world is described,
+/// two records are kept out of it, and those two are created again. Nothing
+/// here transcribes a body field by field, which is the difference between a
+/// dupe and a second spawn function that has to be kept in step with the first
+/// one forever.
+///
+/// The copy goes into the same ring the spawn menu drops into, so a room does
+/// not fill up with copies and the panel's count is the feedback.
+///
+/// @param world - the picked body, and the tables the copy is added to
+/// @param yaw - which way the camera is looking, so the copy appears to one
+/// side of the original rather than behind it
+fn duplicate(world: &mut World, yaw: f32) {
+	if !world.input.pressed(Key::F) {
+		return;
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (entity, body, next) = (state.picked, state.picked_body, state.dropped_next);
+
+	// only something the solver owns. Copying the floor, or the crystal the
+	// ring turns around, is a request nobody meant to make - and the copy
+	// would be a static body standing in mid-air.
+	if !world.bodies.get(body).is_some_and(Body::movable) || !world.entities.alive(entity) {
+		return;
+	}
+
+	let Some(scene) = cut_out(world, body) else {
+		return;
+	};
+
+	// the oldest of the ring goes, exactly as a spawn does, and before the copy
+	// is made rather than after: the slot the copy lands in is then the one
+	// that has just been freed, which is what keeps the ring a ring.
+	let slot = usize::try_from(next).unwrap_or(0) % SPAWNED;
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (old_entity, old_body) = (state.dropped[slot], state.dropped_bodies[slot]);
+	world.bodies.despawn(old_body);
+	world.entities.despawn(old_entity);
+
+	let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+	let put = scene::instantiate(world, &scene, right * DUPE_SIDEWAYS + Vec3::Y * DUPE_LIFT);
+	let (copied, copied_body) = (put.entity(0), put.body(0));
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.dropped[slot] = copied;
+	state.dropped_bodies[slot] = copied_body;
+	state.dropped_next = next.saturating_add(1);
+
+	trace!(of = body.slot(), into = copied_body.slot(), "duplicated");
+}
+
+/// Describes the world and keeps only one body and what it drives.
+///
+/// The two records are lifted out whole, so everything a body carries - its
+/// shape, its surface, its layers, the mesh its collision is baked from - comes
+/// along without this function naming any of it. The indices are the only thing
+/// that has to be rewritten, because they addressed a description with
+/// two dozen things in it and now address one with two.
+///
+/// @param world - the world to describe
+/// @param body - the body to keep
+/// @return a scene of one prop, or nothing if the body drives no entity
+fn cut_out(world: &World, body: BodyId) -> Option<SceneData> {
+	let whole = scene::capture(world);
+	let slot = u32::try_from(body.slot()).ok()?;
+	let solid = whole
+		.solids
+		.iter()
+		.find(|solid| solid.slot == slot)?;
+	let thing = whole
+		.things
+		.get(usize::try_from(solid.thing).ok()?)?;
+
+	Some(SceneData {
+		things: vec![thing.clone()],
+		solids: vec![Solid {
+			// the first and only entity of the new description, whatever
+			// number it had in the old one.
+			thing: 0,
+			..solid.clone()
+		}],
+		..SceneData::default()
+	})
 }
 
 /// Shows the spawn menu, filters it by what is in the search box, and drops
