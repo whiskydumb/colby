@@ -22,12 +22,12 @@ use std::f32::consts::TAU;
 use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, GameApi, Joint, JointId,
-		Key, Length, Material, MeshId, Motion, PanelId, Renderable, Shape, TouchKind, TraceInfo,
-		Transform, Value, World, character, debug,
+		Key, Length, Material, MaterialId, MeshId, Motion, PanelId, Renderable, Shape, TouchKind,
+		TraceInfo, Transform, Value, World, character, debug,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
-	info, mod_ctor, mod_dtor, trace,
+	info, mod_ctor, mod_dtor, trace, warn,
 };
 
 mod_ctor! {}
@@ -132,6 +132,30 @@ const FLOOR_TEXTURE: &str = "textures/tiles";
 /// Compiled as numbers rather than as a color because its name ends in
 /// `_normal` - the whole of the rule is in `colby_asset::compile`.
 const FLOOR_NORMALS: &str = "textures/tiles_normal";
+
+/// The model the scene stands in the far corner.
+///
+/// A whole file's worth of geometry, materials and pictures reached by one
+/// name - which is what step five of the roadmap was for. What the game does
+/// with it is the loop below and nothing else.
+const LAMP_MODEL: &str = "models/lamp";
+
+/// Where the model stands, and how big.
+///
+/// A placement is in the *model's* own space, so putting one in a scene is
+/// the game's arithmetic: this one only moves and scales, and a model that
+/// had to be turned as well would compose the rotations here.
+const LAMP_AT: Vec3 = Vec3::new(1.3, 0.0, 4.6);
+
+/// How much of the model's own size it is drawn at.
+const LAMP_SCALE: f32 = 1.6;
+
+/// How many of a model's pieces the demo has room for.
+///
+/// The arena is a fixed layout, so a game reserves slots rather than growing
+/// with whatever the artist exported. A model with more pieces than this
+/// stands the first few and says so.
+const LAMP_PIECES: usize = 8;
 
 /// The interface document the game puts on screen.
 ///
@@ -366,6 +390,12 @@ struct State {
 	/// How far away it was, in units.
 	picked_distance: f32,
 
+	/// One entity per piece of the model in the corner.
+	///
+	/// Spawned once and never moved, so it is the one thing in this scene the
+	/// editor can drag and have it stay put.
+	lamp: [EntityId; LAMP_PIECES],
+
 	/// Whether the `hold` button is holding the ring still. Not a `bool`
 	/// because [`Pod`] wants every bit pattern to be a valid value.
 	holding: u32,
@@ -376,7 +406,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 11;
+const STATE_LAYOUT: u64 = 12;
 
 /// The module's single exported symbol.
 ///
@@ -430,6 +460,9 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 			*slot = world.entities.spawn();
 		}
 		for slot in &mut state.props {
+			*slot = world.entities.spawn();
+		}
+		for slot in &mut state.lamp {
 			*slot = world.entities.spawn();
 		}
 		// spawned where it stands and at the size it is, because nothing writes
@@ -1082,6 +1115,66 @@ unsafe extern "C-unwind" fn shutdown(world: *mut World) {
 	info!(steps = world.steps, entities = world.entities.len(), "game shutdown");
 }
 
+/// Stands the model in the corner of the scene.
+///
+/// The whole of what a game does with a model, and it is deliberately a loop
+/// rather than a call into the engine: a placement is geometry, a material and
+/// a transform in the model's own space, and what to *make* of one - an entity,
+/// a body, a prop somebody can pick up - is the game's to decide. This one
+/// makes entities and nothing else.
+///
+/// Read on every load rather than only a fresh one, like everything else in
+/// [`dress`]: a model recompiled since the last swap should be picked up by
+/// this one, and the handles it hands out are the same either way.
+fn stand_model(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let slots = state.lamp;
+	let id = world.models.find(LAMP_MODEL);
+	let standing = world.models.placements(id).len();
+
+	// copied out because placing them writes the entity table, which is not
+	// something that can be done while the model is borrowed.
+	let pieces: Vec<(MeshId, MaterialId, Transform)> = world
+		.models
+		.placements(id)
+		.iter()
+		.take(LAMP_PIECES)
+		.map(|placement| (placement.mesh, placement.material, placement.transform))
+		.collect();
+
+	if standing > LAMP_PIECES {
+		warn!(
+			model = LAMP_MODEL,
+			standing,
+			room = LAMP_PIECES,
+			"the model has more pieces than the scene reserved room for"
+		);
+	}
+
+	for (slot, (mesh, material, transform)) in slots.into_iter().zip(&pieces) {
+		let mut stance = *transform;
+		stance.position = LAMP_AT + transform.position * LAMP_SCALE;
+		stance.scale *= LAMP_SCALE;
+
+		if let Some(placed) = world.entities.transform_mut(slot) {
+			*placed = stance;
+		}
+
+		world.entities.snap(slot);
+		world
+			.entities
+			.set_renderable(slot, Renderable::of(*mesh, *material, Vec3::ONE));
+	}
+
+	// a model that shrank, or one that failed to load at all, leaves slots
+	// behind. An entity drawing nothing is the honest picture of that.
+	for slot in slots.into_iter().skip(pieces.len()) {
+		world
+			.entities
+			.set_renderable(slot, Renderable::NOTHING);
+	}
+}
+
 /// Gives every entity of the scene its shape and color.
 ///
 /// Cheap enough to run on every load rather than only on a fresh arena, which
@@ -1156,6 +1249,8 @@ fn dress(world: &mut World) {
 			.entities
 			.set_renderable(id, Renderable::of(mesh, material, prop_color(index)));
 	}
+
+	stand_model(world);
 }
 
 /// A color for the `index`th prop.
