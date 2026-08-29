@@ -22,8 +22,8 @@ use std::f32::consts::TAU;
 use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, GameApi, Joint, JointId,
-		Key, Length, Material, MeshId, PanelId, Renderable, Shape, TouchKind, TraceInfo,
-		Transform, Value, World, debug,
+		Key, Length, Material, MeshId, Motion, PanelId, Renderable, Shape, TouchKind, TraceInfo,
+		Transform, Value, World, character, debug,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -62,8 +62,27 @@ const FLOOR_Y: f32 = -0.5;
 /// How big the shape in the middle is drawn.
 const CENTER_SCALE: f32 = 0.9;
 
-/// How fast the camera's target slides under the keyboard, in units per second.
-const PAN_RATE: f32 = 4.0;
+/// Where the player stands when the scene is put back.
+const PLAYER_START: Vec3 = Vec3::new(1.4, 0.4, 1.4);
+
+/// Half-extents of the player's box.
+///
+/// Person-shaped rather than a person: a unit tall and under half a unit
+/// across. There is no capsule to be, @ref
+/// [`character`](colby_core::abi::character).
+const PLAYER_EXTENTS: Vec3 = Vec3::new(0.22, 0.5, 0.22);
+
+/// How fast the player walks, in units a second.
+const PLAYER_SPEED: f32 = 4.5;
+
+/// How hard the player jumps, in units a second.
+///
+/// About two thirds of a unit of height under the world's own gravity, which
+/// is enough to clear a prop and not enough to reach the crystal.
+const PLAYER_JUMP: f32 = 4.2;
+
+/// How far above the player's middle the camera looks.
+const EYE_LIFT: f32 = 0.4;
 
 /// How much one line of scroll changes the camera's distance.
 const ZOOM_STEP: f32 = 0.6;
@@ -82,6 +101,9 @@ const START_ORBIT: (f32, f32, f32) = (0.6, 0.5, 9.0);
 /// Close to white: the image already carries the color, and a tint is for
 /// nudging it rather than replacing it.
 const FLOOR_COLOR: Vec3 = Vec3::new(0.82, 0.84, 0.88);
+
+/// The color of the box the player is.
+const PLAYER_COLOR: Vec3 = Vec3::new(0.30, 0.85, 0.55);
 
 /// What the shape in the middle is colored.
 const CENTER_COLOR: Vec3 = Vec3::new(0.95, 0.76, 0.20);
@@ -148,6 +170,23 @@ const ROPE: f32 = 1.4;
 
 /// How big the cross marking the rope's hook is, in world units.
 const HOOK_SIZE: f32 = 0.08;
+
+/// Where the trigger volume sits, in the world.
+///
+/// Over the corner the props are dropped into rather than somewhere tidy, so
+/// that a screenshot taken at any moment has something in it. A volume nothing
+/// ever enters demonstrates nothing.
+const TRIGGER_CENTER: Vec3 = Vec3::new(4.80, 0.45, -0.35);
+
+/// Its half-extents.
+///
+/// Every face of it is placed against something, because a trigger has no way
+/// to say what it is interested in: there are no collision layers, so what is
+/// inside it is everything that is inside it. It clears the floor slab
+/// underneath, stops short of the ring the cubes turn on, holds the whole
+/// stack, and ends below the ball that hangs - which is what makes the count
+/// four out of five rather than five out of five.
+const TRIGGER_EXTENTS: Vec3 = Vec3::new(1.50, 0.85, 1.30);
 
 /// How far above whatever the pick ray found its label is written.
 const LABEL_LIFT: f32 = 0.55;
@@ -242,6 +281,20 @@ struct State {
 	/// The rope one of them hangs from.
 	rope: JointId,
 
+	/// The volume that notices what is in it and pushes nothing.
+	trigger: BodyId,
+
+	/// The box the player walks around as.
+	player: EntityId,
+
+	/// Its body, which is kinematic: the game moves it and the solver pushes
+	/// props out of its way rather than the other way round.
+	player_body: BodyId,
+
+	/// Whether it was standing on something at the end of the last step. Not a
+	/// `bool` because [`Pod`] wants every bit pattern to be a valid value.
+	player_grounded: u32,
+
 	/// How many times a prop has started touching something.
 	///
 	/// Counted from the queue the solver fills, which is the only way to know
@@ -267,7 +320,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 8;
+const STATE_LAYOUT: u64 = 10;
 
 /// The module's single exported symbol.
 ///
@@ -323,8 +376,14 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		for slot in &mut state.props {
 			*slot = world.entities.spawn();
 		}
+		// spawned where it stands and at the size it is, because nothing writes
+		// the player's transform afterwards except the controller, which only
+		// ever moves it. `place` deliberately leaves it alone.
+		let mut stance = Transform::at(PLAYER_START);
+		stance.scale = PLAYER_EXTENTS * 2.0;
+		state.player = world.entities.spawn_at(stance);
 
-		world.camera.target = Vec3::ZERO;
+		world.camera.target = PLAYER_START + Vec3::Y * EYE_LIFT;
 	}
 
 	// registered on every load, like the materials below: registering is
@@ -386,15 +445,6 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	let input = world.input;
 	let dt = world.dt;
 
-	// space and `game.reset` are one thing and one piece of code. A console
-	// that could do something the keyboard cannot, or the other way round, is
-	// two implementations of the same feature waiting to disagree.
-	if input.pressed(Key::Space) {
-		recenter(world);
-
-		return;
-	}
-
 	// the ring's speed comes from the console variable, falling back to the
 	// constant that is its default. This is the only line that changes when a
 	// number becomes something a person can turn while watching it.
@@ -433,16 +483,17 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 
 	let (yaw, pitch, distance) = (state.yaw, state.pitch, state.distance);
 
-	// two sets of movement keys, summed and clamped, so holding both does not
-	// pan twice as fast. Panning follows where the camera is looking rather
-	// than the world axes, so that "left" means left on screen.
-	let sideways =
-		(input.axis(Key::A, Key::D) + input.axis(Key::Left, Key::Right)).clamp(-1.0, 1.0);
-	let forwards = (input.axis(Key::S, Key::W) + input.axis(Key::Down, Key::Up)).clamp(-1.0, 1.0);
-	let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
-	let ahead = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+	walk(world, yaw);
 
-	world.camera.target += (right * sideways + ahead * forwards) * (PAN_RATE * dt);
+	// the camera watches the player rather than panning on its own. The same
+	// keys cannot mean two things, and the reason to have a controller at all
+	// is that a sandbox is somewhere you are rather than something you look at.
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let standing = state.player;
+
+	if let Some(&transform) = world.entities.transform(standing) {
+		world.camera.target = transform.position + Vec3::Y * EYE_LIFT;
+	}
 
 	world.camera.orbit(yaw, pitch, distance);
 
@@ -450,7 +501,106 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	pick(world);
 	light_up(world);
 	label_pick(world);
+	trigger(world);
 	count_landings(world);
+}
+
+/// Walks the player one step and writes where it ended up.
+///
+/// The whole of what gameplay owns about a character: which way the keys point,
+/// how fast that is, what a jump is worth, and how gravity gets into the
+/// velocity. Everything geometric - what it runs into, what it slides along,
+/// what it may climb, whether there is ground - is
+/// [`character::move_and_slide`], and this never learns any of it.
+///
+/// @param world - read for input and bodies, written for the player's place
+/// @param yaw - which way the camera is looking, so that "forward" is forward
+fn walk(world: &mut World, yaw: f32) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (player, body) = (state.player, state.player_body);
+	let grounded = state.player_grounded != 0;
+
+	let Some(&placed) = world.entities.transform(player) else {
+		return;
+	};
+
+	let (input, dt) = (world.input, world.dt);
+
+	// two sets of movement keys, summed and clamped, so holding both does not
+	// walk twice as fast. They point where the camera is looking rather than
+	// along the world axes, so that "left" means left on screen.
+	let sideways =
+		(input.axis(Key::A, Key::D) + input.axis(Key::Left, Key::Right)).clamp(-1.0, 1.0);
+	let forwards = (input.axis(Key::S, Key::W) + input.axis(Key::Down, Key::Up)).clamp(-1.0, 1.0);
+	let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+	let ahead = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+	let wish = (right * sideways + ahead * forwards).normalize_or_zero() * PLAYER_SPEED;
+
+	let falling = world
+		.bodies
+		.get(body)
+		.map_or(0.0, |body| body.velocity.y);
+	let mut velocity = Vec3::new(wish.x, falling, wish.z);
+
+	// standing on something is what makes a jump possible and is also what
+	// stops the fall accumulating: without the second line a player who has
+	// stood still for a minute steps off a lip at terminal velocity.
+	if grounded {
+		velocity.y = if input.pressed(Key::Space) { PLAYER_JUMP } else { 0.0 };
+	}
+
+	velocity.y = world.gravity.y.mul_add(dt, velocity.y);
+
+	let motion = Motion::new(placed.position, velocity, PLAYER_EXTENTS, dt).ignoring(body);
+	let moved = character::move_and_slide(world, &motion);
+
+	// the entity first, because the body is kinematic and is written from it at
+	// the top of the next step - and then the body as well, so that a trace
+	// taken later in this same update sees where the player is rather than
+	// where it was. @ref [`Body::transform`](colby_core::abi::Body::transform).
+	if let Some(transform) = world.entities.transform_mut(player) {
+		transform.position = moved.position;
+	}
+
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.transform.position = moved.position;
+		solid.velocity = moved.velocity;
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.player_grounded = u32::from(moved.grounded);
+}
+
+/// Outlines the trigger volume and writes what is in it above it.
+///
+/// Drawn by the game rather than left to `phys.draw_shapes`, for the reason
+/// the rope is drawn: a screenshot has no console to turn anything on with,
+/// and a trigger nobody can see is indistinguishable from one that is not
+/// working. Magenta because that is the color the solver's own drawing gives a
+/// sensor, and two names for one thing is how a picture stops meaning
+/// anything.
+///
+/// @param world - the overlap list to read and the table the lines go in
+fn trigger(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let volume = state.trigger;
+
+	if !volume.is_some() {
+		return;
+	}
+
+	let inside = world.bodies.inside(volume).count();
+	let lifted = TRIGGER_CENTER + Vec3::new(0.0, TRIGGER_EXTENTS.y + LABEL_LIFT, 0.0);
+	let text = if inside == 0 {
+		"trigger: empty".to_owned()
+	} else {
+		format!("trigger: {inside}")
+	};
+
+	world
+		.debug
+		.cuboid(TRIGGER_CENTER, TRIGGER_EXTENTS, Quat::IDENTITY, debug::MAGENTA);
+	world.debug.label(lifted, &text, debug::MAGENTA);
 }
 
 /// Writes what the pick ray found above the thing it found.
@@ -617,6 +767,8 @@ fn interface(world: &mut World, spin_rate: f32) {
 	let spin = state.spin;
 	let hit = named(state);
 	let props = state.props;
+	let volume = state.trigger;
+	let grounded = state.player_grounded != 0;
 	let (time, entities) = (world.time, world.entities.len());
 	let landings = state.landings;
 	let joints = world.joints.len();
@@ -626,6 +778,8 @@ fn interface(world: &mut World, spin_rate: f32) {
 		.filter(|&&id| resting(world, id))
 		.count();
 	let contacts = world.contacts;
+	let inside = world.bodies.inside(volume).count();
+	let footing = if grounded { "on the ground" } else { "in the air" };
 
 	world
 		.ui
@@ -643,6 +797,10 @@ fn interface(world: &mut World, spin_rate: f32) {
 	world
 		.ui
 		.set_text(hud, "joints", &format!("{joints} held, {landings} landings"));
+	world
+		.ui
+		.set_text(hud, "trigger", &format!("{inside} inside"));
+	world.ui.set_text(hud, "player", footing);
 
 	// the one thing a class cannot say: how full the bar is. A stylesheet
 	// decides what the bar looks like and the game decides how long it is.
@@ -662,8 +820,22 @@ fn recenter(world: &mut World) {
 	state.spin = 0.0;
 	(state.yaw, state.pitch, state.distance) = START_ORBIT;
 
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (player, body) = (state.player, state.player_body);
+	state.player_grounded = 0;
+
+	if let Some(transform) = world.entities.transform_mut(player) {
+		transform.position = PLAYER_START;
+		transform.scale = PLAYER_EXTENTS * 2.0;
+	}
+
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.transform.position = PLAYER_START;
+		solid.velocity = Vec3::ZERO;
+	}
+
 	let (yaw, pitch, distance) = START_ORBIT;
-	world.camera.target = Vec3::ZERO;
+	world.camera.target = PLAYER_START + Vec3::Y * EYE_LIFT;
 	world.camera.orbit(yaw, pitch, distance);
 
 	place(world);
@@ -781,7 +953,11 @@ fn dress(world: &mut World) {
 	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let props = state.props;
+	let (props, player) = (state.props, state.player);
+
+	world
+		.entities
+		.set_renderable(player, Renderable::of(MeshId::CUBE, plastic, PLAYER_COLOR));
 
 	for (index, id) in props.into_iter().enumerate() {
 		let ball = PROP_DROPS[index].2;
@@ -856,7 +1032,8 @@ fn drop_props(world: &mut World) {
 fn collide(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let (center, ring, props) = (state.center, state.ring, state.props);
-	let old = [state.floor_body, state.center_body];
+	let player = state.player;
+	let old = [state.floor_body, state.center_body, state.trigger, state.player_body];
 
 	for id in old
 		.into_iter()
@@ -883,6 +1060,18 @@ fn collide(world: &mut World) {
 		slab,
 	));
 	let center_body = world.attach_body(center, BodyKind::Static, Shape::mesh(crystal));
+
+	// a volume that notices and pushes nothing. Static and driving no entity:
+	// there is nothing to draw it as and nothing to move it, and the whole of
+	// what it is for is the list of what is inside it.
+	let trigger = world.bodies.spawn(
+		Body::new(
+			BodyKind::Static,
+			Shape::cuboid(TRIGGER_EXTENTS),
+			Transform::at(TRIGGER_CENTER),
+		)
+		.sensing(),
+	);
 
 	let mut ring_bodies = [BodyId::NONE; RING];
 	for (slot, id) in ring_bodies.iter_mut().zip(ring) {
@@ -916,12 +1105,20 @@ fn collide(world: &mut World) {
 	let rope =
 		world.join(Joint::rope(prop_bodies[SWINGING], BodyId::NONE, (Vec3::ZERO, HOOK), ROPE));
 
+	// kinematic rather than dynamic: the controller decides where the player
+	// goes, and the solver's job is only to push props out from under it. A
+	// dynamic one would be a box the player argues with.
+	let player_body =
+		world.attach_body(player, BodyKind::Kinematic, Shape::cuboid(Vec3::splat(0.5)));
+
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.player_body = player_body;
 	state.floor_body = floor_body;
 	state.center_body = center_body;
 	state.ring_bodies = ring_bodies;
 	state.prop_bodies = prop_bodies;
 	state.rope = rope;
+	state.trigger = trigger;
 	// what the ray found is per-load and not worth carrying across one: the
 	// bodies it named are the ones just despawned. Clearing it also means the
 	// first trace of every load says so in the log, which is what makes a live
@@ -1023,6 +1220,10 @@ fn named(state: &State) -> String {
 
 	if state.picked == state.center {
 		return format!("crystal @ {distance:.1}");
+	}
+
+	if state.picked == state.player {
+		return format!("player @ {distance:.1}");
 	}
 
 	if let Some(index) = state
