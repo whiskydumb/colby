@@ -27,9 +27,13 @@ use std::{
 
 use colby_asset::{
 	MeshFile, TextureFile, compile, compile::Kind, document::DocumentFile, font::FontFile,
+	model::ModelFile,
 };
 use colby_core::{
-	abi::{DocumentData, FontData, MeshData, TextureData, World},
+	abi::{
+		DocumentData, FontData, Material, MaterialId, MeshData, MeshId, ModelData, Placement,
+		TextureData, TextureId, World,
+	},
 	debug, info, warn,
 };
 
@@ -214,11 +218,7 @@ impl Assets {
 			| Kind::Texture => load_texture(world, path, &name),
 			| Kind::Font => load_font(world, path, &name),
 			| Kind::Document => load_document(world, path, &name),
-			// @note: a model is written and nothing reads it yet. The table it
-			// registers into is the next thing to land; until then the file on
-			// disk is inert and its meshes and pictures load as the assets they
-			// already are.
-			| Kind::Model => {},
+			| Kind::Model => load_model(world, path, &name),
 		}
 	}
 
@@ -245,7 +245,7 @@ impl Assets {
 				| Kind::Texture => drop(world.textures.insert(&name, TextureData::white())),
 				| Kind::Font => drop(world.fonts.insert(&name, FontData::empty())),
 				| Kind::Document => drop(world.ui.insert(&name, DocumentData::empty())),
-				| Kind::Model => {},
+				| Kind::Model => drop(world.models.insert(&name, ModelData::default())),
 			}
 
 			info!(name, ?kind, "asset unloaded; its file is gone");
@@ -393,6 +393,115 @@ fn load_document(world: &mut World, path: &Path, name: &str) {
 	info!(name, slot = id.index(), nodes, rules, "document loaded");
 }
 
+/// Reads one `.cmodel` into the world's model table, and its materials into
+/// the material table.
+///
+/// **A placement's handles are resolved once and never again, so a name that
+/// is not loaded yet is *reserved* rather than left as nothing.** An empty
+/// entry claims the slot and the real asset overwrites it later; the handle
+/// the placement already carries is right either way, because a registry entry
+/// keeps its slot for the life of the process.
+///
+/// As it happens the walk usually reaches a model's meshes first - a path
+/// sorts by component, and `models/lamp` comes before `models/lamp.cmodel`.
+/// That is luck rather than a rule, and it is not the kind worth depending on:
+/// a mesh that arrives after its model would otherwise leave the model
+/// standing on nothing forever, because nothing re-resolves a placement.
+///
+/// A model's materials land in `World::materials` beside the game's own. They
+/// are named inside the model's own path, so nothing a game declares can
+/// collide with one.
+fn load_model(world: &mut World, path: &Path, name: &str) {
+	let data = match ModelFile::open(path) {
+		| Ok(file) => file.to_model_data(),
+		| Err(error) => {
+			warn!(%error, "the model on disk could not be read");
+
+			return;
+		},
+	};
+
+	for material in &data.materials {
+		let albedo = reserve_texture(world, &material.albedo);
+		let normal = reserve_texture(world, &material.normal);
+
+		// `bumped` is what turns a material with no map into one holding the
+		// flat one, which is the ABI's own rewrite and not this loader's.
+		world.materials.insert(&material.name, Material {
+			base_color: material.base_color,
+			wrap: material.wrap,
+			..Material::textured(albedo)
+				.bumped(normal)
+				.finished(material.metallic, material.roughness)
+		});
+	}
+
+	let placements = data
+		.placements
+		.iter()
+		.map(|placement| Placement {
+			name: placement.name.clone(),
+			mesh: reserve_mesh(world, &placement.mesh),
+			material: if placement.material.is_empty() {
+				MaterialId::DEFAULT
+			} else {
+				world.materials.find(&placement.material)
+			},
+			transform: placement.transform,
+		})
+		.collect();
+	let loaded = ModelData { placements };
+	let existing = world.models.find(name);
+
+	if existing.is_some()
+		&& world
+			.models
+			.get(existing)
+			.is_some_and(|model| *model.value() == loaded)
+	{
+		// as the other four: a model that stands what it already stood does not
+		// need registering again, and its revision is what anything watching it
+		// would otherwise see move for nothing.
+		return;
+	}
+
+	let standing = loaded.placements.len();
+	let materials = data.materials.len();
+	let id = world.models.insert(name, loaded);
+
+	info!(name, slot = id.index(), standing, materials, "model loaded");
+}
+
+/// The handle of a mesh a model names, claiming the slot when it is not loaded.
+fn reserve_mesh(world: &mut World, name: &str) -> MeshId {
+	if name.is_empty() {
+		return MeshId::NONE;
+	}
+
+	let found = world.meshes.find(name);
+
+	if found.is_some() {
+		return found;
+	}
+
+	world.meshes.insert(name, MeshData::default())
+}
+
+/// The same for a picture. An empty name is what a material with none wrote.
+fn reserve_texture(world: &mut World, name: &str) -> TextureId {
+	if name.is_empty() {
+		return TextureId::NONE;
+	}
+
+	let found = world.textures.find(name);
+
+	if found.is_some() {
+		return found;
+	}
+
+	world.textures.insert(name, TextureData::white())
+}
+
 /// A file's modification time.
 fn mtime(path: &Path) -> std::io::Result<SystemTime> { path.metadata()?.modified() }
 
@@ -400,7 +509,7 @@ fn mtime(path: &Path) -> std::io::Result<SystemTime> { path.metadata()?.modified
 mod tests {
 	use std::{fs, thread::sleep};
 
-	use colby_core::abi::{Mesh, MeshId, Texture, TextureId};
+	use colby_core::abi::{Mesh, Model, Texture};
 
 	use super::*;
 
@@ -748,5 +857,268 @@ mod tests {
 			3,
 			"and the null texture, the white one and the flat normal map"
 		);
+	}
+
+	/// A scene an exporter wrote, with its pictures inside it.
+	const MODEL: &[u8] = include_bytes!("../asset/gltf/fixtures/model.glb");
+
+	/// The world after a fixture tree holding one model has been compiled and
+	/// loaded.
+	fn with_model(name: &str) -> (World, PathBuf) {
+		let (source, output) = trees(name);
+
+		put_bytes(&source, "models/lamp.glb", MODEL);
+
+		let mut world = World::new();
+
+		Assets::at(source.clone(), output).sync(&mut world);
+
+		(world, source)
+	}
+
+	#[test]
+	fn a_model_reaches_the_table_with_everything_it_stands() {
+		let (world, _) = with_model("model-load");
+		let id = world.models.find("models/lamp");
+
+		assert!(id.is_some(), "the model reached the registry");
+		assert_eq!(world.models.placements(id).len(), 5, "five pieces stand somewhere");
+
+		let named: Vec<&str> = world
+			.models
+			.placements(id)
+			.iter()
+			.map(|placement| placement.name.as_str())
+			.collect();
+
+		assert_eq!(named, vec!["column", "arm", "arm_mirror", "panel_0", "panel_1"]);
+	}
+
+	#[test]
+	fn every_handle_a_placement_holds_answers_with_the_asset_it_named() {
+		// the claim the reserving exists for: a model is walked before anything
+		// under its own directory, so a naive loader would resolve every one of
+		// these to nothing.
+		let (world, _) = with_model("model-handles");
+		let id = world.models.find("models/lamp");
+
+		for placement in world.models.placements(id) {
+			assert!(placement.mesh.is_some(), "{} stands on nothing", placement.name);
+			assert!(
+				world
+					.meshes
+					.get(placement.mesh)
+					.is_some_and(|mesh| mesh.value().triangles() > 0),
+				"{} stands on a mesh that draws nothing",
+				placement.name
+			);
+			assert!(placement.material.is_some(), "{} is made of nothing", placement.name);
+			assert_ne!(
+				placement.material,
+				MaterialId::DEFAULT,
+				"{} fell back to the default rather than what the file said",
+				placement.name
+			);
+		}
+	}
+
+	#[test]
+	fn a_model_loaded_before_its_meshes_still_ends_up_standing_on_them() {
+		// what the reserving buys, and the only way to see it: nothing
+		// re-resolves a placement, so a mesh that arrived after its model would
+		// otherwise leave it standing on nothing for the life of the process.
+		let (source, output) = trees("model-order");
+
+		put_bytes(&source, "models/lamp.glb", MODEL);
+
+		let mut world = World::new();
+
+		Assets::at(source, output.clone()).sync(&mut world);
+
+		// a world that has seen the model and none of its meshes
+		let mut fresh = World::new();
+
+		load_model(&mut fresh, &output.join("models").join("lamp.cmodel"), "models/lamp");
+
+		let id = fresh.models.find("models/lamp");
+		let column = fresh
+			.models
+			.placements(id)
+			.iter()
+			.find(|placement| placement.name == "column")
+			.expect("the column stands somewhere")
+			.mesh;
+
+		assert!(column.is_some(), "a slot was claimed for a mesh nobody has loaded");
+		assert_eq!(
+			fresh
+				.meshes
+				.get(column)
+				.map(|mesh| mesh.value().triangles()),
+			Some(0),
+			"and it draws nothing until one arrives"
+		);
+
+		load_mesh(
+			&mut fresh,
+			&output
+				.join("models")
+				.join("lamp")
+				.join("column.cmesh"),
+			"models/lamp/column",
+		);
+
+		assert!(
+			fresh
+				.meshes
+				.get(column)
+				.is_some_and(|mesh| mesh.value().triangles() > 0),
+			"and the handle the model handed out answers with it"
+		);
+
+		// the same for a picture, which a material holds the same way a
+		// placement holds a mesh.
+		let albedo = fresh
+			.materials
+			.get(fresh.materials.find("models/lamp/stone"))
+			.expect("the material is there")
+			.albedo;
+
+		assert!(albedo.is_some(), "a slot was claimed for a picture nobody has loaded");
+		assert_eq!(
+			fresh
+				.textures
+				.get(albedo)
+				.map(|texture| texture.value().width),
+			Some(1),
+			"and it is one white texel until one arrives"
+		);
+
+		load_texture(
+			&mut fresh,
+			&output
+				.join("models")
+				.join("lamp")
+				.join("tiles.ctex"),
+			"models/lamp/tiles",
+		);
+
+		assert_eq!(
+			fresh
+				.textures
+				.get(albedo)
+				.map(|texture| texture.value().width),
+			Some(32),
+			"and the handle the material handed out answers with it"
+		);
+	}
+
+	#[test]
+	fn a_models_materials_land_beside_the_games_own() {
+		let (world, _) = with_model("model-materials");
+		let stone = world.materials.find("models/lamp/stone");
+
+		assert!(stone.is_some(), "named inside the model's own path");
+
+		let value = *world
+			.materials
+			.get(stone)
+			.expect("the material is there");
+		let albedo = world.textures.find("models/lamp/tiles");
+
+		assert_eq!(value.albedo, albedo, "wearing the picture the model carried");
+		assert_eq!(
+			world
+				.textures
+				.get(albedo)
+				.map(|texture| texture.value().width),
+			Some(32),
+			"and the picture is the one that was in the file, not the slot it reserved"
+		);
+		assert_ne!(value.normal, TextureId::FLAT_NORMAL, "and a real map");
+	}
+
+	#[test]
+	fn a_model_that_changes_moves_its_own_revision_and_nothing_elses() {
+		let (source, output) = trees("model-reload");
+
+		put_bytes(&source, "models/lamp.glb", MODEL);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source, output);
+
+		assets.sync(&mut world);
+
+		let id = world.models.find("models/lamp");
+		let before = world
+			.models
+			.get(id)
+			.map(Model::revision)
+			.unwrap_or_default();
+
+		sleep(POLL_INTERVAL + Duration::from_millis(30));
+		assets.sync(&mut world);
+
+		assert_eq!(
+			world.models.get(id).map(Model::revision),
+			Some(before),
+			"a model that stands what it stood is not registered again"
+		);
+	}
+
+	#[test]
+	fn rewriting_a_model_with_the_same_bytes_does_not_move_its_revision() {
+		// an editor saving a file it did not change, which is the only way to
+		// reach the comparison inside the loader: the modification time moves
+		// and the contents do not.
+		let (source, output) = trees("model-rewrite");
+
+		put_bytes(&source, "models/lamp.glb", MODEL);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+
+		assets.sync(&mut world);
+
+		let id = world.models.find("models/lamp");
+		let before = world
+			.models
+			.get(id)
+			.map(Model::revision)
+			.unwrap_or_default();
+
+		sleep(POLL_INTERVAL + Duration::from_millis(30));
+		put_bytes(&source, "models/lamp.glb", MODEL);
+		assets.sync(&mut world);
+
+		assert_eq!(
+			world.models.get(id).map(Model::revision),
+			Some(before),
+			"the same model does not need registering again"
+		);
+		assert_eq!(world.models.placements(id).len(), 5, "and it still stands what it stood");
+	}
+
+	#[test]
+	fn deleting_a_model_leaves_it_standing_nothing() {
+		let (source, output) = trees("model-delete");
+
+		put_bytes(&source, "models/lamp.glb", MODEL);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+
+		assets.sync(&mut world);
+
+		let id = world.models.find("models/lamp");
+
+		assert!(!world.models.placements(id).is_empty());
+
+		fs::remove_file(source.join("models").join("lamp.glb")).expect("the model is deleted");
+		sleep(POLL_INTERVAL + Duration::from_millis(30));
+		assets.sync(&mut world);
+
+		assert_eq!(world.models.find("models/lamp"), id, "the handle still resolves");
+		assert!(world.models.placements(id).is_empty(), "and it stands nothing");
 	}
 }

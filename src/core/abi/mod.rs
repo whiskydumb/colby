@@ -32,6 +32,7 @@ pub mod input;
 pub mod joint;
 pub mod material;
 pub mod mesh;
+pub mod model;
 pub mod physics;
 pub mod registry;
 pub mod state;
@@ -49,6 +50,7 @@ pub use self::{
 	joint::{Joint, JointId, JointKind, Joints, MAX_JOINTS},
 	material::{Material, MaterialId, Materials},
 	mesh::{Mesh, MeshData, MeshId, MeshVertex, Meshes},
+	model::{Model, ModelData, ModelId, Models, Placement},
 	physics::{
 		Bodies, Body, BodyId, BodyKind, MAX_BODIES, MAX_OVERLAPS, MAX_TOUCHES, Overlap, Physics,
 		Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
@@ -64,7 +66,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 20;
+pub const ABI_VERSION: u32 = 21;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -234,6 +236,14 @@ pub struct World {
 	/// links a font library. @ref [`font`](crate::abi::font).
 	pub fonts: Fonts,
 
+	/// Every model the host has loaded, reached by handle.
+	///
+	/// Filled the same way as `meshes`, from the same tree, and holding none
+	/// of the geometry: a model is a list of what stands where, and what
+	/// stands there is a mesh in the table above this one. @ref
+	/// [`model`](crate::abi::model).
+	pub models: Models,
+
 	/// Every material, reached by handle.
 	///
 	/// Unlike the other two this is mostly the *game's* table: a material is a
@@ -314,6 +324,7 @@ impl World {
 			meshes: Meshes::new(),
 			textures: Textures::new(),
 			fonts: Fonts::new(),
+			models: Models::new(),
 			materials: Materials::new(),
 			cvars: Cvars::new(),
 			ui: Ui::new(),
