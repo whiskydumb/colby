@@ -214,6 +214,11 @@ impl Assets {
 			| Kind::Texture => load_texture(world, path, &name),
 			| Kind::Font => load_font(world, path, &name),
 			| Kind::Document => load_document(world, path, &name),
+			// @note: a model is written and nothing reads it yet. The table it
+			// registers into is the next thing to land; until then the file on
+			// disk is inert and its meshes and pictures load as the assets they
+			// already are.
+			| Kind::Model => {},
 		}
 	}
 
@@ -240,6 +245,7 @@ impl Assets {
 				| Kind::Texture => drop(world.textures.insert(&name, TextureData::white())),
 				| Kind::Font => drop(world.fonts.insert(&name, FontData::empty())),
 				| Kind::Document => drop(world.ui.insert(&name, DocumentData::empty())),
+				| Kind::Model => {},
 			}
 
 			info!(name, ?kind, "asset unloaded; its file is gone");

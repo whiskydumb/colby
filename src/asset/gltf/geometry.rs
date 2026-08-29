@@ -342,7 +342,7 @@ impl Build<'_> {
 		}
 
 		if primitives(self.file, mesh).len() > 1 {
-			base = format!("{base}.{primitive}");
+			base = format!("{base}_{primitive}");
 		}
 
 		super::unique(&mut self.named, &base)
@@ -424,7 +424,7 @@ impl Build<'_> {
 			}
 
 			if several {
-				base = format!("{base}.{primitive}");
+				base = format!("{base}_{primitive}");
 			}
 
 			out.push(Placement {
@@ -448,7 +448,7 @@ impl Build<'_> {
 		}
 
 		let name =
-			super::unique(&mut self.named, &format!("{}.mirrored", self.meshes[upright].name));
+			super::unique(&mut self.named, &format!("{}_mirrored", self.meshes[upright].name));
 		let index = self.meshes.len();
 
 		self.meshes.push(Piece {
@@ -728,7 +728,7 @@ mod tests {
 
 		// the panel wore two materials, so it is two; the arm is instanced
 		// twice and one of those is mirrored, so it is two as well.
-		assert_eq!(names, vec!["arm", "column", "panel.0", "panel.1", "arm.mirrored"]);
+		assert_eq!(names, vec!["arm", "column", "panel_0", "panel_1", "arm_mirrored"]);
 	}
 
 	#[test]
@@ -740,7 +740,7 @@ mod tests {
 			.map(|placement| placement.name.as_str())
 			.collect();
 
-		assert_eq!(names, vec!["column", "arm", "arm_mirror", "panel.0", "panel.1"]);
+		assert_eq!(names, vec!["column", "arm", "arm_mirror", "panel_0", "panel_1"]);
 	}
 
 	#[test]
@@ -756,7 +756,7 @@ mod tests {
 			("column", Vec3::new(0.0, 1.5, 0.0)),
 			("arm", Vec3::new(1.0, 0.5, 0.0)),
 			("arm_mirror", Vec3::new(-1.0, 0.5, 0.0)),
-			("panel.0", Vec3::new(0.0, 0.0, -2.0)),
+			("panel_0", Vec3::new(0.0, 0.0, -2.0)),
 		] {
 			let stood = stands(&model, name).position;
 
@@ -773,7 +773,7 @@ mod tests {
 	fn a_mirrored_placement_draws_a_copy_wound_the_other_way() {
 		let model = exported();
 		let upright = piece(&model, "arm");
-		let turned = piece(&model, "arm.mirrored");
+		let turned = piece(&model, "arm_mirrored");
 
 		let places = |piece: &Piece| -> Vec<[f32; 3]> {
 			piece
@@ -802,7 +802,7 @@ mod tests {
 		let turned = model
 			.meshes
 			.iter()
-			.position(|piece| piece.name == "arm.mirrored")
+			.position(|piece| piece.name == "arm_mirrored")
 			.expect("the copy was made");
 		let upright = model
 			.meshes
@@ -833,7 +833,7 @@ mod tests {
 	fn a_mirror_turns_the_tangent_frame_over_with_the_winding() {
 		let model = exported();
 		let upright = piece(&model, "arm");
-		let turned = piece(&model, "arm.mirrored");
+		let turned = piece(&model, "arm_mirrored");
 
 		for (was, now) in upright
 			.data
@@ -986,7 +986,7 @@ mod tests {
 			.map(|piece| piece.name.as_str())
 			.collect();
 
-		assert_eq!(names, vec!["front_wall", "front_wall.1", "mesh2"]);
+		assert_eq!(names, vec!["front_wall", "front_wall_1", "mesh2"]);
 	}
 
 	#[test]

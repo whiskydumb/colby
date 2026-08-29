@@ -178,5 +178,8 @@ fn describe(produced: Produced) -> String {
 		| Produced::Font { glyphs, width, height } =>
 			format!("{glyphs:>6} glyphs in a {width} x {height} atlas"),
 		| Produced::Document { nodes, rules } => format!("{nodes:>6} boxes {rules:>6} rules"),
+		| Produced::Model { meshes, textures, materials, placements } => format!(
+			"{meshes:>6} meshes {textures} pictures {materials} materials {placements} standing"
+		),
 	}
 }

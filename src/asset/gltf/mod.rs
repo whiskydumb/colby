@@ -541,6 +541,72 @@ fn number(entry: &Value, name: &str) -> usize {
 ///
 /// @param bytes - the whole file
 /// @return the JSON chunk and the binary chunk, if there is one
+/// Every file a document names beside itself: its buffers and its pictures.
+///
+/// What the compiler asks so that editing a `.bin` or a `.png` a model links
+/// to rebuilds the model, the same way editing a stylesheet rebuilds every
+/// document that links it. Only the document is read, and for a `.glb` only
+/// the chunk that holds it, because this runs on every pass over an asset
+/// tree and a model may be very large.
+///
+/// Anything unreadable answers with nothing, which makes the output stale by
+/// the check above rather than by an error nobody can act on.
+///
+/// @param source - the `.gltf` or `.glb`
+/// @param root - the source tree, which a reference may not leave
+/// @return the files it names, in the order it named them
+#[must_use]
+pub fn linked(source: &Path, root: &Path) -> Vec<PathBuf> {
+	let Some(text) = document_of(source) else {
+		return Vec::new();
+	};
+	let Ok(document) = json::parse(&text) else {
+		return Vec::new();
+	};
+	let Some(directory) = source.parent() else {
+		return Vec::new();
+	};
+
+	["buffers", "images"]
+		.iter()
+		.flat_map(|table| {
+			document
+				.get(table)
+				.map_or(&[][..], Value::as_array)
+		})
+		.filter_map(|entry| entry.get("uri").and_then(Value::as_str))
+		.filter(|uri| !uri.starts_with(DATA_PREFIX))
+		.filter_map(|uri| {
+			let path = lexical(&directory.join(unescape(uri)?));
+
+			path.starts_with(root).then_some(path)
+		})
+		.collect()
+}
+
+/// The JSON of a glTF, without reading any more of the file than that.
+fn document_of(source: &Path) -> Option<String> {
+	use std::io::Read as _;
+
+	let mut file = std::fs::File::open(source).ok()?;
+	let mut head = [0_u8; 20];
+
+	if file.read_exact(&mut head).is_err() || head.get(..4) != Some(&BINARY_MAGIC[..]) {
+		return std::fs::read_to_string(source).ok();
+	}
+
+	if read_u32(&head, 16) != JSON_CHUNK {
+		return None;
+	}
+
+	let length = usize::try_from(read_u32(&head, 12)).ok()?;
+	let mut body = vec![0_u8; length];
+
+	file.read_exact(&mut body).ok()?;
+
+	String::from_utf8(body).ok()
+}
+
 /// The two chunks a `.glb` is made of: its document, and its buffer when it
 /// carries one.
 type Chunks<'a> = (&'a [u8], Option<&'a [u8]>);
@@ -798,11 +864,15 @@ fn sextet(byte: u8) -> Option<u32> {
 
 /// A name from a file, as something that can be part of an asset's name.
 ///
-/// Lowercase, and everything outside letters, digits, a dash, an underscore and
-/// a dot becomes an underscore. Leading and trailing separators go, so a name
-/// that was only punctuation comes back empty and the caller numbers it
-/// instead. Nothing here may produce a `.` or a `..`, because these end up as
-/// pieces of a path.
+/// Lowercase, and everything outside letters, digits, a dash and an underscore
+/// becomes an underscore. Leading and trailing separators go, so a name that
+/// was only punctuation comes back empty and the caller numbers it instead.
+///
+/// **A dot is not kept, and that is not tidiness.** These names become the
+/// stems of files, and an asset name is worked out by taking the extension
+/// off one - so a mesh called `panel.0` is a file called `panel.0.cmesh`, and
+/// every path helper that asks what its extension is answers `0`. Keeping no
+/// dots at all means the last one in a path is always the extension.
 fn tidy(name: &str) -> String {
 	let mut out = String::with_capacity(name.len());
 
@@ -814,8 +884,7 @@ fn tidy(name: &str) -> String {
 		});
 	}
 
-	out.trim_matches(['_', '.', '-'].as_slice())
-		.to_owned()
+	out.trim_matches(['_', '-'].as_slice()).to_owned()
 }
 
 /// A name nothing else in the list has, remembered.
@@ -824,7 +893,7 @@ fn unique(taken: &mut Vec<String>, wanted: &str) -> String {
 	let mut attempt = 1;
 
 	while taken.contains(&name) {
-		name = format!("{wanted}.{attempt}");
+		name = format!("{wanted}_{attempt}");
 		attempt += 1;
 	}
 

@@ -43,7 +43,7 @@ use std::{
 
 use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
-use crate::{document, font, format, html, obj, png, texture, ttf};
+use crate::{document, font, format, gltf, html, model, obj, png, texture, ttf};
 
 /// The directory under a workspace that holds editable sources.
 pub const SOURCE_DIR: &str = "assets";
@@ -61,12 +61,23 @@ pub const OUTPUT_DIR: [&str; 2] = ["target", "assets"];
 pub const NORMAL_SUFFIX: &str = "_normal";
 
 /// The source extensions the compiler knows.
-pub const SOURCE_EXTENSIONS: &[&str] =
-	&[obj::EXTENSION, png::EXTENSION, ttf::EXTENSION, html::EXTENSION];
+pub const SOURCE_EXTENSIONS: &[&str] = &[
+	obj::EXTENSION,
+	png::EXTENSION,
+	ttf::EXTENSION,
+	html::EXTENSION,
+	gltf::EXTENSION,
+	gltf::BINARY_EXTENSION,
+];
 
 /// The extensions it writes.
-pub const OUTPUT_EXTENSIONS: &[&str] =
-	&[format::EXTENSION, texture::EXTENSION, font::EXTENSION, document::EXTENSION];
+pub const OUTPUT_EXTENSIONS: &[&str] = &[
+	format::EXTENSION,
+	texture::EXTENSION,
+	font::EXTENSION,
+	document::EXTENSION,
+	model::EXTENSION,
+];
 
 /// Which of colby's formats a source compiles into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +93,16 @@ pub enum Kind {
 
 	/// A `.html` becomes a `.cdoc`, with everything it links to folded in.
 	Document,
+
+	/// A `.gltf` or a `.glb` becomes a `.cmodel`, with its meshes and its
+	/// pictures written beside it as assets of their own.
+	///
+	/// The only kind that writes more than one file. What a model *is* here
+	/// is what its meshes are made of and where each piece stands; the
+	/// geometry and the pixels are `.cmesh` and `.ctex` files under a
+	/// directory named after it, loaded by exactly the code that loads a
+	/// mesh anybody made by hand.
+	Model,
 }
 
 impl Kind {
@@ -98,6 +119,7 @@ impl Kind {
 			| png::EXTENSION => Some(Self::Texture),
 			| ttf::EXTENSION => Some(Self::Font),
 			| html::EXTENSION => Some(Self::Document),
+			| gltf::EXTENSION | gltf::BINARY_EXTENSION => Some(Self::Model),
 			| _ => None,
 		}
 	}
@@ -110,6 +132,7 @@ impl Kind {
 			| Self::Texture => texture::EXTENSION,
 			| Self::Font => font::EXTENSION,
 			| Self::Document => document::EXTENSION,
+			| Self::Model => model::EXTENSION,
 		}
 	}
 
@@ -126,6 +149,7 @@ impl Kind {
 			| texture::EXTENSION => Some(Self::Texture),
 			| font::EXTENSION => Some(Self::Font),
 			| document::EXTENSION => Some(Self::Document),
+			| model::EXTENSION => Some(Self::Model),
 			| _ => None,
 		}
 	}
@@ -138,6 +162,7 @@ impl Kind {
 			| Self::Texture => texture::version_of(path),
 			| Self::Font => font::version_of(path),
 			| Self::Document => document::version_of(path),
+			| Self::Model => model::version_of(path),
 		}
 	}
 
@@ -149,6 +174,7 @@ impl Kind {
 			| Self::Texture => texture::FORMAT_VERSION,
 			| Self::Font => font::FORMAT_VERSION,
 			| Self::Document => document::FORMAT_VERSION,
+			| Self::Model => model::FORMAT_VERSION,
 		}
 	}
 }
@@ -191,6 +217,21 @@ pub enum Produced {
 
 		/// How many style rules apply to them.
 		rules: usize,
+	},
+
+	/// A whole model: what it is made of and where each piece stands.
+	Model {
+		/// How many meshes were written beside it.
+		meshes: usize,
+
+		/// How many pictures had to be taken out of it.
+		textures: usize,
+
+		/// How many materials it declares.
+		materials: usize,
+
+		/// How many pieces of it stand somewhere.
+		placements: usize,
 	},
 
 	/// Letters.
@@ -398,6 +439,13 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 
 			(document::encode(&text), produced)
 		},
+		| Kind::Model => {
+			let (bytes, produced, said) = compile_model(source, output, root)?;
+
+			warnings = said;
+
+			(bytes, produced)
+		},
 	};
 
 	if let Some(parent) = output.parent() {
@@ -413,6 +461,122 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 		produced,
 		warnings,
 	})
+}
+
+/// Compiles one model, and everything it is made of, into a directory of its
+/// own.
+///
+/// The only compile that writes more than one file. A model's meshes and its
+/// extracted pictures are assets in their own right - the loader that reads
+/// them is the one that reads a mesh anybody made by hand - so they go beside
+/// the `.cmodel` under a directory named after it, and the `.cmodel` names
+/// them the way the registry will.
+///
+/// **The directory is emptied first.** Everything in it was derived from this
+/// one source, so a mesh the model no longer has should not survive an edit
+/// that removed it. That is also what lets the pruning above keep the whole
+/// directory without knowing what is supposed to be in it.
+///
+/// @param source - the `.gltf` or `.glb`
+/// @param output - where the `.cmodel` goes; its stem names the directory
+/// @param root - the source tree, which nothing it names may leave
+/// @return the file to write, what is in it, and what could not be used
+fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
+	let file = gltf::Gltf::open(source, root)?;
+	let imported = gltf::import(&file)?;
+	let stem = asset_name(root, source)?;
+	let directory = output.with_extension("");
+
+	drop(fs::remove_dir_all(&directory));
+	fs::create_dir_all(&directory)?;
+
+	for piece in &imported.meshes {
+		let bytes = format::encode(&piece.data)
+			.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+
+		fs::write(beside(&directory, &piece.name, format::EXTENSION), bytes)?;
+	}
+
+	for picture in &imported.textures {
+		let bytes = texture::encode(&picture.data)
+			.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+
+		fs::write(beside(&directory, &picture.name, texture::EXTENSION), bytes)?;
+	}
+
+	let data = model::ModelData {
+		materials: imported
+			.materials
+			.iter()
+			.map(|surface| model::Material {
+				name: format!("{stem}/{}", surface.name),
+				albedo: picture_name(surface.albedo.as_ref(), &stem, &imported, root),
+				normal: picture_name(surface.normal.as_ref(), &stem, &imported, root),
+				base_color: surface.base_color,
+				metallic: surface.metallic,
+				roughness: surface.roughness,
+				wrap: surface.wrap,
+			})
+			.collect(),
+		placements: imported
+			.placements
+			.iter()
+			.filter_map(|placement| {
+				let piece = imported.meshes.get(placement.mesh)?;
+
+				Some(model::Placement {
+					name: placement.name.clone(),
+					mesh: format!("{stem}/{}", piece.name),
+					material: piece
+						.material
+						.and_then(|index| imported.materials.get(index))
+						.map(|surface| format!("{stem}/{}", surface.name))
+						.unwrap_or_default(),
+					transform: placement.transform,
+				})
+			})
+			.collect(),
+	};
+	let produced = Produced::Model {
+		meshes: imported.meshes.len(),
+		textures: imported.textures.len(),
+		materials: data.materials.len(),
+		placements: data.placements.len(),
+	};
+	let bytes =
+		model::encode(&data).map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+
+	Ok((bytes, produced, imported.warnings))
+}
+
+/// What one compile hands back: the file, what is in it, and what it dropped.
+type Written = (Vec<u8>, Produced, Vec<String>);
+
+/// Where one of a model's own assets is written.
+fn beside(directory: &Path, name: &str, extension: &str) -> PathBuf {
+	directory.join(format!("{name}.{extension}"))
+}
+
+/// The asset name of one of a material's pictures.
+///
+/// A picture taken out of the model is registered under the model's own name;
+/// one that is a file of its own is registered under whatever the compiler
+/// calls that file, because it is on the same walk and will be compiled by it.
+fn picture_name(
+	picture: Option<&gltf::Picture>,
+	stem: &str,
+	imported: &gltf::Model,
+	root: &Path,
+) -> String {
+	match picture {
+		| Some(gltf::Picture::Inside(index)) => imported
+			.textures
+			.get(*index)
+			.map(|taken| format!("{stem}/{}", taken.name))
+			.unwrap_or_default(),
+		| Some(gltf::Picture::Beside(path)) => asset_name(root, path).unwrap_or_default(),
+		| None => String::new(),
+	}
 }
 
 /// Compiles a whole source tree.
@@ -548,22 +712,25 @@ fn is_stale(source: &Path, output: &Path, root: &Path) -> bool {
 
 /// Everything besides the source itself that an output was built out of.
 ///
-/// A compiler's associated files, and colby has one case of them with two
-/// halves: the stylesheets a document links to and the scripts it links to.
-/// Both are folded into the `.cdoc`, so both make it stale.
+/// A compiler's associated files, and colby has two cases of them. A document
+/// links stylesheets and scripts, and both are folded into the `.cdoc`. A
+/// model links buffers and pictures, and although those are not folded in,
+/// what is written out of the model is built from them.
 fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
-	if kind != Kind::Document {
-		return Vec::new();
+	match kind {
+		| Kind::Document => {
+			let Ok(text) = fs::read_to_string(source) else {
+				return Vec::new();
+			};
+
+			let mut inputs = document::stylesheets(source, &text, root);
+			inputs.extend(document::scripts(source, &text, root));
+
+			inputs
+		},
+		| Kind::Model => gltf::linked(source, root),
+		| _ => Vec::new(),
 	}
-
-	let Ok(text) = fs::read_to_string(source) else {
-		return Vec::new();
-	};
-
-	let mut inputs = document::stylesheets(source, &text, root);
-	inputs.extend(document::scripts(source, &text, root));
-
-	inputs
 }
 
 /// A file's modification time.
@@ -571,15 +738,30 @@ fn mtime(path: &Path) -> Result<SystemTime> { Ok(fs::metadata(path)?.modified()?
 
 /// Deletes outputs whose source is gone.
 ///
-/// Only `.cmesh` files are considered, and only ones the run did not want, so
-/// nothing else that happens to live in the output tree is at risk.
+/// Only colby's own compiled formats are considered, and only ones the run did
+/// not want, so nothing else that happens to live in the output tree is at
+/// risk.
 fn prune(out: &Path, wanted: &[PathBuf], report: &mut Report) {
 	let Ok(existing) = outputs(out) else {
 		return;
 	};
 
+	// everything under a model's own directory was derived from the model, and
+	// the model rewrites the whole directory when it is compiled. So the rule
+	// here is about the model rather than about its parts, and nothing has to
+	// read a `.cmodel` to find out what is supposed to be beside it.
+	let models: Vec<PathBuf> = wanted
+		.iter()
+		.filter(|path| Kind::of_output(path) == Some(Kind::Model))
+		.map(|path| path.with_extension(""))
+		.collect();
+
 	for path in existing {
-		if wanted.contains(&path) {
+		if wanted.contains(&path)
+			|| models
+				.iter()
+				.any(|inside| path.starts_with(inside))
+		{
 			continue;
 		}
 
@@ -1030,6 +1212,16 @@ f 4 1 5 8
 						compiled.name
 					);
 				},
+				| Some(Kind::Model) => {
+					let file =
+						model::ModelFile::open(&compiled.output).expect("the model reads back");
+
+					assert!(
+						!file.stands().is_empty(),
+						"{} compiled to a model with nothing standing anywhere",
+						compiled.name
+					);
+				},
 				| Some(Kind::Document) => {
 					let file =
 						DocumentFile::open(&compiled.output).expect("the document reads back");
@@ -1050,5 +1242,328 @@ f 4 1 5 8
 				| None => panic!("{} compiled to something unrecognized", compiled.name),
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod model_tests {
+	use std::{thread::sleep, time::Duration};
+
+	use super::{
+		super::{format::MeshFile, model::ModelFile, texture::TextureFile},
+		*,
+	};
+
+	/// A scene an exporter wrote, with its pictures inside it.
+	const PACKED: &[u8] = include_bytes!("gltf/fixtures/model.glb");
+
+	/// The same scene written as a document, and the three files it names.
+	const LOOSE: &[u8] = include_bytes!("gltf/fixtures/model.gltf");
+
+	/// Its buffer.
+	const BUFFER: &[u8] = include_bytes!("gltf/fixtures/model.bin");
+
+	/// Its color picture.
+	const COLOR: &[u8] = include_bytes!("gltf/fixtures/tiles.png");
+
+	/// Its normal map.
+	const BUMP: &[u8] = include_bytes!("gltf/fixtures/tiles_normal.png");
+
+	/// A directory nobody else is using, with a source tree in it.
+	fn workspace(name: &str) -> PathBuf {
+		let dir = std::env::temp_dir()
+			.join("colby-model-compile-tests")
+			.join(name);
+
+		drop(fs::remove_dir_all(&dir));
+		fs::create_dir_all(source_root(&dir).join("models")).expect("the fixture is made");
+
+		dir
+	}
+
+	/// Writes a source file into a fixture workspace.
+	fn put(workspace: &Path, relative: &str, bytes: &[u8]) -> PathBuf {
+		let path = source_root(workspace).join(relative);
+
+		if let Some(parent) = path.parent() {
+			fs::create_dir_all(parent).expect("the directory is made");
+		}
+
+		fs::write(&path, bytes).expect("the source is written");
+
+		path
+	}
+
+	/// Compiles a fixture workspace.
+	fn run(workspace: &Path, force: bool) -> Report {
+		compile_dir(&source_root(workspace), &output_root(workspace), force)
+			.expect("the tree compiles")
+	}
+
+	/// Where an asset name lands in an output tree.
+	fn at(out: &Path, name: &str, extension: &str) -> PathBuf {
+		name.split('/')
+			.fold(out.to_path_buf(), |path, part| path.join(part))
+			.with_extension(extension)
+	}
+
+	/// The model a fixture workspace compiled.
+	fn compiled(dir: &Path) -> model::ModelData {
+		ModelFile::open(
+			&output_root(dir)
+				.join("models")
+				.join("lamp.cmodel"),
+		)
+		.expect("the model reads")
+		.to_model_data()
+	}
+
+	#[test]
+	fn a_model_writes_its_meshes_and_its_pictures_beside_itself() {
+		let dir = workspace("packed");
+
+		put(&dir, "models/lamp.glb", PACKED);
+
+		let report = run(&dir, false);
+		let out = output_root(&dir);
+
+		assert!(report.failed.is_empty(), "{:?}", report.failed);
+		assert_eq!(report.compiled.len(), 1, "one source, one entry in the report");
+		assert!(out.join("models").join("lamp.cmodel").is_file());
+
+		let mut written: Vec<String> = fs::read_dir(out.join("models").join("lamp"))
+			.expect("the directory is there")
+			.filter_map(|entry| {
+				Some(
+					entry
+						.ok()?
+						.file_name()
+						.to_string_lossy()
+						.into_owned(),
+				)
+			})
+			.collect();
+
+		written.sort();
+
+		assert_eq!(written, vec![
+			"arm.cmesh",
+			"arm_mirrored.cmesh",
+			"column.cmesh",
+			"panel_0.cmesh",
+			"panel_1.cmesh",
+			"tiles.ctex",
+			"tiles_normal.ctex",
+		]);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn everything_a_model_names_is_on_disk_under_exactly_that_name() {
+		// the whole contract between this format and this compiler: a `.cmodel`
+		// names its meshes and its pictures the way the registry will, so the
+		// loader has nothing to do but look them up.
+		let dir = workspace("names");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		run(&dir, false);
+
+		let out = output_root(&dir);
+		let data = compiled(&dir);
+
+		assert!(!data.placements.is_empty(), "and there is something to check");
+
+		for placement in &data.placements {
+			assert!(
+				MeshFile::open(&at(&out, &placement.mesh, format::EXTENSION)).is_ok(),
+				"{} names {} and there is no mesh there",
+				placement.name,
+				placement.mesh
+			);
+		}
+
+		let pictures = data
+			.materials
+			.iter()
+			.flat_map(|material| {
+				[(&material.name, &material.albedo), (&material.name, &material.normal)]
+			})
+			.filter(|(_, named)| !named.is_empty());
+
+		for (owner, named) in pictures {
+			assert!(
+				TextureFile::open(&at(&out, named, texture::EXTENSION)).is_ok(),
+				"{owner} names {named} and there is no picture there"
+			);
+		}
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_material_keeps_what_it_was_made_of_and_what_stands_on_it() {
+		let dir = workspace("materials");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		run(&dir, false);
+
+		let data = compiled(&dir);
+		let names: Vec<&str> = data
+			.materials
+			.iter()
+			.map(|material| material.name.as_str())
+			.collect();
+
+		assert_eq!(names, vec!["models/lamp/brass", "models/lamp/stone"]);
+		assert_eq!(data.materials[1].albedo, "models/lamp/tiles");
+		assert_eq!(data.materials[1].normal, "models/lamp/tiles_normal");
+
+		let column = data
+			.placements
+			.iter()
+			.find(|placement| placement.name == "column")
+			.expect("the column stands somewhere");
+
+		assert_eq!(column.mesh, "models/lamp/column");
+		assert_eq!(column.material, "models/lamp/stone");
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_picture_beside_the_document_is_named_as_the_asset_it_already_is() {
+		let dir = workspace("loose");
+
+		put(&dir, "models/lamp.gltf", LOOSE);
+		put(&dir, "models/model.bin", BUFFER);
+		put(&dir, "models/tiles.png", COLOR);
+		put(&dir, "models/tiles_normal.png", BUMP);
+
+		let report = run(&dir, false);
+		let out = output_root(&dir);
+
+		assert!(report.failed.is_empty(), "{:?}", report.failed);
+		assert_eq!(
+			compiled(&dir).materials[1].albedo,
+			"models/tiles",
+			"the loose file's own name, not one under the model"
+		);
+		assert!(
+			!out.join("models")
+				.join("lamp")
+				.join("tiles.ctex")
+				.is_file(),
+			"nothing was taken out of the document"
+		);
+		assert!(
+			out.join("models").join("tiles.ctex").is_file(),
+			"because the compiler found it on the same walk"
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn editing_a_file_a_model_names_rebuilds_the_model() {
+		let dir = workspace("linked");
+
+		put(&dir, "models/lamp.gltf", LOOSE);
+		put(&dir, "models/model.bin", BUFFER);
+		put(&dir, "models/tiles.png", COLOR);
+
+		let bump = put(&dir, "models/tiles_normal.png", BUMP);
+
+		assert_eq!(run(&dir, false).compiled.len(), 3, "a model and its two pictures");
+		assert!(run(&dir, false).is_quiet(), "and nothing is stale a moment later");
+
+		sleep(Duration::from_millis(20));
+		fs::write(&bump, BUMP).expect("the picture is touched");
+
+		let report = run(&dir, false);
+		let mut names: Vec<String> = report
+			.compiled
+			.iter()
+			.map(|compiled| compiled.name.clone())
+			.collect();
+
+		names.sort();
+
+		assert_eq!(
+			names,
+			vec!["models/lamp".to_owned(), "models/tiles_normal".to_owned()],
+			"the picture and the model that names it"
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_model_that_loses_a_piece_does_not_leave_it_behind() {
+		let dir = workspace("shrink");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		run(&dir, false);
+
+		let stale = output_root(&dir)
+			.join("models")
+			.join("lamp")
+			.join("ghost.cmesh");
+
+		fs::write(&stale, [0_u8; 4]).expect("something else is left in there");
+		run(&dir, true);
+
+		assert!(!stale.is_file(), "the directory belongs to the model and is rewritten whole");
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_models_own_files_are_not_swept_away_as_orphans() {
+		let dir = workspace("keep");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		run(&dir, false);
+
+		let report = run(&dir, false);
+
+		assert!(report.removed.is_empty(), "nothing was pruned: {:?}", report.removed);
+		assert!(
+			output_root(&dir)
+				.join("models")
+				.join("lamp")
+				.join("column.cmesh")
+				.is_file()
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn deleting_a_model_takes_everything_that_came_out_of_it() {
+		let dir = workspace("delete");
+		let source = put(&dir, "models/lamp.glb", PACKED);
+
+		run(&dir, false);
+		fs::remove_file(&source).expect("the model is deleted");
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.removed.len(), 8, "the model and the seven files under it");
+		assert!(
+			!output_root(&dir)
+				.join("models")
+				.join("lamp")
+				.join("column.cmesh")
+				.is_file()
+		);
+		assert!(
+			!output_root(&dir)
+				.join("models")
+				.join("lamp.cmodel")
+				.is_file()
+		);
+
+		drop(fs::remove_dir_all(&dir));
 	}
 }
