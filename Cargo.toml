@@ -105,6 +105,20 @@ version = "0.12"
 default-features = false
 features = ["lua54", "vendored"]
 
+# @note: the fourth dependency taken purely for the asset compiler, and the
+# argument is exactly png's. The specification for glTF allows JPEG and PNG
+# equally, so a model in the wild carries either, and refusing one of them
+# means half the files an artist hands over arrive without their textures.
+# One lock-file entry with no transitives of its own, decoding offline into a
+# `.ctex` the GPU takes as it is, so nothing on a frame's path links it.
+# Writing a baseline JPEG decoder by hand is a Huffman table, an inverse
+# cosine transform and a chroma upsampler - the same class of reproducing
+# somebody else's work that argued for taking `png` rather than writing
+# inflate. @ref the pre-commit audit list.
+[workspace.dependencies.jpeg-decoder]
+version = "0.3"
+default-features = false
+
 [workspace.dependencies.png]
 version = "0.18"
 default-features = false

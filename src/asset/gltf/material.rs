@@ -44,7 +44,7 @@ use colby_core::{
 };
 
 use super::Gltf;
-use crate::{compile, json::Value, png};
+use crate::{compile, jpeg, json::Value, png};
 
 /// What a sampler means by each of its two wrap modes.
 const REPEAT: u32 = 10497;
@@ -55,8 +55,11 @@ const CLAMP: u32 = 33071;
 /// The mode it does not have.
 const MIRROR: u32 = 33648;
 
-/// The only picture format colby decodes.
+/// What a picture written as a PNG says it is.
 const PNG: &str = "image/png";
+
+/// And the other one the specification allows.
+const JPEG: &str = "image/jpeg";
 
 /// Every material a file declares, and what came out with them.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -290,14 +293,19 @@ impl Reading<'_> {
 			.and_then(Value::as_str)
 			.unwrap_or(PNG);
 
-		if kind != PNG {
+		if kind != PNG && kind != JPEG {
 			self.note(&format!("holds a {kind} picture, which colby does not decode"));
 
 			return None;
 		}
 
 		let bytes = self.bytes(entry)?;
-		let data = match png::import(&bytes, texel) {
+		let read = if kind == JPEG {
+			jpeg::import(&bytes, texel)
+		} else {
+			png::import(&bytes, texel)
+		};
+		let data = match read {
 			| Ok(data) => data,
 			| Err(error) => {
 				self.note(&format!("holds a picture that will not decode: {error}"));
@@ -487,6 +495,12 @@ mod tests {
 
 	/// A thirty-two square checker, written by a tool that is not this one.
 	const PICTURE: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAARElEQVR42mOoKM77jw+f2LceL6ZUP8OoA0YdMOqAAXcArS0gpH/UAaMOGHXAwDtgtCQcdcCoA0YdMFoSjjpg1AEj3gEAp+wYptPc9nMAAAAASUVORK5CYII=";
+
+	/// The same checker written the other way the specification allows.
+	const PHOTO: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/2wBDAQMDAwQDBAgEBAgQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBD/wAARCAAgACADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDn6+yKK+N68/8Aj+Vjs+AK+yKK+N6P4/lYPgCvsiivjej+P5WD4Ar7Ior43o/j+Vg+A//Z";
+
+	/// How many bytes that is once it is decoded.
+	const PHOTO_BYTES: usize = 675;
 
 	/// The scene an exporter wrote, with its pictures inside it.
 	fn packed() -> Coats {
@@ -721,14 +735,14 @@ mod tests {
 	fn a_picture_of_a_kind_colby_cannot_decode_is_named_and_left_out() {
 		let coats = document(
 			"\"textures\": [ { \"source\": 1 } ], \"images\": [ { \"bufferView\": 0, \
-			 \"mimeType\": \"image/png\" }, { \"bufferView\": 0, \"mimeType\": \"image/jpeg\" } \
+			 \"mimeType\": \"image/png\" }, { \"bufferView\": 0, \"mimeType\": \"image/webp\" } \
 			 ], \"materials\": [ { \"pbrMetallicRoughness\": { \"baseColorTexture\": { \
 			 \"index\": 0 } } } ]",
 		);
 
 		assert_eq!(coats.surfaces[0].albedo, None);
 		assert!(coats.pictures.is_empty());
-		assert!(complained(&coats, "image/jpeg"), "got {:?}", coats.warnings);
+		assert!(complained(&coats, "image/webp"), "got {:?}", coats.warnings);
 	}
 
 	#[test]
@@ -751,5 +765,29 @@ mod tests {
 			"the arm is made of the first material the file declares"
 		);
 		assert_eq!(model.meshes[1].material, Some(1), "and the column of the second");
+	}
+
+	#[test]
+	fn a_picture_inside_a_model_may_be_a_jpeg() {
+		// the specification allows either, so a model handed over by somebody
+		// else carries whichever their tool wrote.
+		let text = format!(
+			"{{ \"asset\": {{ \"version\": \"2.0\" }}, \"buffers\": [ {{ \"byteLength\": \
+			 {PHOTO_BYTES}, \"uri\": \"data:application/octet-stream;base64,{PHOTO}\" }} ], \
+			 \"bufferViews\": [ {{ \"buffer\": 0, \"byteLength\": {PHOTO_BYTES} }} ], \
+			 \"images\": [ {{ \"name\": \"wall\", \"bufferView\": 0, \"mimeType\": \
+			 \"image/jpeg\" }} ], \"textures\": [ {{ \"source\": 0 }} ], \"materials\": [ {{ \
+			 \"pbrMetallicRoughness\": {{ \"baseColorTexture\": {{ \"index\": 0 }} }} }} ] }}"
+		);
+		let file = Gltf::read(text.as_bytes(), Path::new("model.gltf"), Path::new(""))
+			.expect("the document reads");
+		let coats = read(&file);
+
+		assert_eq!(coats.warnings, Vec::<String>::new(), "nothing was dropped");
+		assert_eq!(coats.pictures.len(), 1);
+		assert_eq!(coats.pictures[0].name, "wall");
+		assert_eq!(coats.pictures[0].data.width, 32);
+		assert_eq!(coats.pictures[0].data.texel, Texel::Rgba8Srgb);
+		assert_eq!(coats.surfaces[0].albedo, Some(Picture::Inside(0)));
 	}
 }

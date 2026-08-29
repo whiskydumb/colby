@@ -43,7 +43,7 @@ use std::{
 
 use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
-use crate::{document, font, format, gltf, html, model, obj, png, texture, ttf};
+use crate::{document, font, format, gltf, html, jpeg, model, obj, png, texture, ttf};
 
 /// The directory under a workspace that holds editable sources.
 pub const SOURCE_DIR: &str = "assets";
@@ -64,6 +64,8 @@ pub const NORMAL_SUFFIX: &str = "_normal";
 pub const SOURCE_EXTENSIONS: &[&str] = &[
 	obj::EXTENSION,
 	png::EXTENSION,
+	jpeg::EXTENSION,
+	jpeg::LONG_EXTENSION,
 	ttf::EXTENSION,
 	html::EXTENSION,
 	gltf::EXTENSION,
@@ -116,7 +118,7 @@ impl Kind {
 
 		match extension.as_str() {
 			| obj::EXTENSION => Some(Self::Mesh),
-			| png::EXTENSION => Some(Self::Texture),
+			| png::EXTENSION | jpeg::EXTENSION | jpeg::LONG_EXTENSION => Some(Self::Texture),
 			| ttf::EXTENSION => Some(Self::Font),
 			| html::EXTENSION => Some(Self::Document),
 			| gltf::EXTENSION | gltf::BINARY_EXTENSION => Some(Self::Model),
@@ -398,7 +400,11 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 			(bytes, produced)
 		},
 		| Kind::Texture => {
-			let data = png::import_file(source, texel_of(source))?;
+			let data = if has_extension(source, &[png::EXTENSION]) {
+				png::import_file(source, texel_of(source))?
+			} else {
+				jpeg::import_file(source, texel_of(source))?
+			};
 			let bytes = texture::encode(&data)
 				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 			let produced = Produced::Texture {
@@ -601,6 +607,22 @@ pub fn compile_dir(root: &Path, out: &Path, force: bool) -> Result<Report> {
 
 	for source in sources(root)? {
 		let output = output_path(root, out, &source)?;
+
+		// two pictures under one name would quietly overwrite each other, and a
+		// second extension for one kind is what made that reachable.
+		if wanted.contains(&output) {
+			report.failed.push(Failure {
+				error: err!(Asset(
+					"another source already compiles to {}; two files cannot share one asset \
+					 name",
+					output.display()
+				)),
+				source,
+			});
+
+			continue;
+		}
+
 		wanted.push(output.clone());
 
 		if !force && !is_stale(&source, &output, root) {
@@ -1269,6 +1291,10 @@ mod model_tests {
 	/// Its normal map.
 	const BUMP: &[u8] = include_bytes!("gltf/fixtures/tiles_normal.png");
 
+	/// The same checker as a jpeg, which the specification allows a model to
+	/// name just as readily.
+	const PHOTO: &[u8] = include_bytes!("gltf/fixtures/tiles.jpg");
+
 	/// A directory nobody else is using, with a source tree in it.
 	fn workspace(name: &str) -> PathBuf {
 		let dir = std::env::temp_dir()
@@ -1562,6 +1588,56 @@ mod model_tests {
 				.join("models")
 				.join("lamp.cmodel")
 				.is_file()
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_jpeg_compiles_into_a_texture_like_any_other_picture() {
+		let dir = workspace("photo");
+
+		put(&dir, "textures/wall.jpg", PHOTO);
+
+		let report = run(&dir, false);
+
+		assert!(report.failed.is_empty(), "{:?}", report.failed);
+		assert_eq!(report.compiled[0].name, "textures/wall");
+
+		let file = TextureFile::open(
+			&output_root(&dir)
+				.join("textures")
+				.join("wall.ctex"),
+		)
+		.expect("the texture reads back");
+
+		assert_eq!(file.header().width, 32);
+		assert!(file.header().levels > 1, "and it arrives with a chain");
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn two_pictures_under_one_name_are_refused_rather_than_one_overwriting_the_other() {
+		// a second extension for one kind is what made this reachable: a `.png`
+		// and a `.jpg` beside each other compile to the same `.ctex`, and which
+		// of them won would depend on the order of a directory listing.
+		let dir = workspace("collide");
+
+		put(&dir, "textures/wall.png", COLOR);
+		put(&dir, "textures/wall.jpg", PHOTO);
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.compiled.len(), 1, "one of them compiled");
+		assert_eq!(report.failed.len(), 1, "and the other said why it did not");
+		assert!(
+			report.failed[0]
+				.error
+				.to_string()
+				.contains("cannot share one asset name"),
+			"got {}",
+			report.failed[0].error
 		);
 
 		drop(fs::remove_dir_all(&dir));
