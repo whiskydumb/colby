@@ -22,6 +22,7 @@
 use crate::glam::{Quat, Vec3};
 
 pub mod camera;
+pub mod character;
 pub mod console;
 pub mod cvar;
 pub mod debug;
@@ -39,6 +40,7 @@ pub mod ui;
 
 pub use self::{
 	camera::Camera,
+	character::{Motion, Moved},
 	cvar::{Args, ConsoleFn, Cvars, Value},
 	debug::{Debug, Label, Line, Pen},
 	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
@@ -48,8 +50,8 @@ pub use self::{
 	material::{Material, MaterialId, Materials},
 	mesh::{Mesh, MeshData, MeshId, MeshVertex, Meshes},
 	physics::{
-		Bodies, Body, BodyId, BodyKind, MAX_BODIES, MAX_TOUCHES, Physics, Shape, ShapeKind,
-		Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
+		Bodies, Body, BodyId, BodyKind, MAX_BODIES, MAX_OVERLAPS, MAX_TOUCHES, Overlap, Physics,
+		Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
 	},
 	registry::{Entry, Registry},
 	state::GameState,
@@ -62,7 +64,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 16;
+pub const ABI_VERSION: u32 = 17;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";

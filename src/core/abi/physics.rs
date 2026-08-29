@@ -325,6 +325,22 @@ pub struct Body {
 	/// How hard it is to slide along.
 	pub friction: f32,
 
+	/// Whether this body notices what it overlaps instead of pushing it.
+	///
+	/// A sensor takes part in the narrow phase and in nothing after it. The
+	/// pairs it makes are reported through [`Bodies::touches`] and
+	/// [`Bodies::overlaps`] and are never handed to the solver, so a trigger
+	/// volume knows what is inside it and moves nothing. Traces skip it too,
+	/// because a pick ray stopping at an invisible box is the same bug seen
+	/// from the other side.
+	///
+	/// Orthogonal to [`kind`](Self::kind) on purpose. Who owns the transform
+	/// and whether it pushes are two questions, and a sensor is worth having
+	/// as all three kinds: bolted to the world, carried by a door, or thrown.
+	/// A [`BodyKind::Dynamic`] one does fall forever, because nothing is left
+	/// to stop it.
+	pub sensor: bool,
+
 	/// Whether the solver has stopped integrating this body.
 	///
 	/// Set by the solver when a dynamic body has been slow enough for long
@@ -365,6 +381,7 @@ impl Body {
 			mass: Self::MASS,
 			restitution: Self::RESTITUTION,
 			friction: Self::FRICTION,
+			sensor: false,
 			sleeping: false,
 			entity: EntityId::NONE,
 		}
@@ -444,6 +461,24 @@ impl Body {
 
 		self
 	}
+
+	/// The same body, noticing rather than pushing.
+	///
+	/// @ref [`sensor`](Self::sensor) for what that costs and what it buys.
+	#[must_use]
+	pub const fn sensing(mut self) -> Self {
+		self.sensor = true;
+
+		self
+	}
+
+	/// Whether this body pushes what it overlaps.
+	///
+	/// The question every piece of the solver asks, written once so that the
+	/// negation is not spelled out at each of them. @ref
+	/// [`movable`](Self::movable), which is the other half of the same shape.
+	#[must_use]
+	pub const fn solid(&self) -> bool { !self.sensor }
 
 	/// The smallest axis-aligned box in world space that holds this body.
 	///
@@ -563,6 +598,37 @@ impl Touch {
 	}
 }
 
+/// How many sensor overlaps a step will report.
+///
+/// Bounded like the touch queue beside it, and for the same reason. What is
+/// dropped past this is counted by nothing, because a step with more than two
+/// hundred and fifty-six things inside its triggers has a problem a longer
+/// list is not going to fix.
+pub const MAX_OVERLAPS: usize = 256;
+
+/// One body inside one sensor, for the whole of a step.
+///
+/// The state a trigger volume wants, as against the edges
+/// [`Touch`] carries. Both exist because neither can be had from the other:
+/// edges cannot be recovered from a list read every step, and the list cannot
+/// be rebuilt from edges without the game keeping notes - notes that go wrong
+/// in exactly the place it is hardest to notice, which is a prop despawned
+/// while it was inside. Here the list is rebuilt from what is actually
+/// overlapping, every step, so nothing can drift.
+///
+/// Exactly one of the two is a sensor: two sensors are never tested against
+/// each other, because two things that push nothing have nothing to say about
+/// meeting.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Overlap {
+	/// The sensor.
+	pub sensor: BodyId,
+
+	/// What is inside it.
+	pub body: BodyId,
+}
+
 /// The host's body table.
 ///
 /// The same storage discipline as [`Entities`](super::entity::Entities), minus
@@ -577,6 +643,9 @@ pub struct Bodies {
 	/// What started and stopped touching this step. Filled by the solver,
 	/// drained by the game, cleared beside the input edges.
 	touches: Vec<Touch>,
+	/// What is inside a sensor right now. Filled by the solver, read by the
+	/// game, and rebuilt rather than cleared - @ref [`Overlap`].
+	overlaps: Vec<Overlap>,
 }
 
 impl Bodies {
@@ -590,6 +659,7 @@ impl Bodies {
 			free: Vec::new(),
 			live: 0,
 			touches: Vec::new(),
+			overlaps: Vec::new(),
 		}
 	}
 
@@ -615,6 +685,45 @@ impl Bodies {
 	/// and [`Ui::end_step`](super::Ui::end_step) and for the same reason: two
 	/// steps in one frame must not see the same event twice.
 	pub fn end_step(&mut self) { self.touches.clear(); }
+
+	/// Every body inside a sensor, as of the top of this step.
+	///
+	/// Raw, so a handle here may name a body destroyed since the step began.
+	/// [`inside`](Self::inside) is the form that cannot.
+	#[must_use]
+	pub fn overlaps(&self) -> &[Overlap] { &self.overlaps }
+
+	/// What is inside one sensor, skipping anything that has since died.
+	///
+	/// @param sensor - the volume to look in
+	pub fn inside(&self, sensor: BodyId) -> impl Iterator<Item = BodyId> {
+		self.overlaps
+			.iter()
+			.filter(move |overlap| overlap.sensor == sensor)
+			.map(|overlap| overlap.body)
+			.filter(|&body| self.alive(body))
+	}
+
+	/// Notes that a body is inside a sensor.
+	///
+	/// The solver's. Silently drops anything past [`MAX_OVERLAPS`].
+	///
+	/// @param overlap - the sensor and what is in it
+	pub fn overlapped(&mut self, overlap: Overlap) {
+		if self.overlaps.len() < MAX_OVERLAPS {
+			self.overlaps.push(overlap);
+		}
+	}
+
+	/// Forgets every overlap, so the solver can say what is true now.
+	///
+	/// The solver's, called at the top of a step rather than at the bottom
+	/// beside [`end_step`](Self::end_step). That is the difference between a
+	/// state and an edge: an edge is consumed once and must not be seen twice,
+	/// while a state has to survive until something knows better. Clearing this
+	/// where the touches are cleared would leave a game reading an empty list
+	/// on every frame that is not a step.
+	pub fn forget_overlaps(&mut self) { self.overlaps.clear(); }
 
 	/// Creates a body.
 	///
@@ -1190,5 +1299,90 @@ mod tests {
 			"a context and two function pointers, and nothing hiding in it"
 		);
 		assert_eq!(size_of::<BodyId>(), size_of::<u64>(), "two words, like an EntityId");
+	}
+
+	#[test]
+	fn a_body_pushes_what_it_meets_unless_it_is_told_not_to() {
+		let solid = Body::default();
+		let sensor = Body::default().sensing();
+
+		assert!(solid.solid(), "a body is solid unless it says otherwise");
+		assert!(!sensor.solid(), "and a sensor says otherwise");
+		assert!(!solid.sensor, "which is one flag and not a kind");
+	}
+
+	#[test]
+	fn a_sensor_is_still_whatever_kind_it_was() {
+		let body = Body::dynamic(Shape::UNIT, Transform::IDENTITY, 1.0).sensing();
+
+		assert!(body.movable(), "the solver still integrates it, so it falls");
+		assert!(!body.solid(), "and it still pushes nothing on the way down");
+		assert_eq!(body.kind, BodyKind::Dynamic, "the two questions are separate");
+	}
+
+	#[test]
+	fn what_is_inside_a_sensor_skips_what_has_died_since() {
+		let mut bodies = Bodies::new();
+		let sensor = bodies.spawn(Body::default().sensing());
+		let standing = bodies.spawn(Body::default());
+		let leaving = bodies.spawn(Body::default());
+
+		bodies.overlapped(Overlap { sensor, body: standing });
+		bodies.overlapped(Overlap { sensor, body: leaving });
+		bodies.despawn(leaving);
+
+		let found: Vec<BodyId> = bodies.inside(sensor).collect();
+
+		assert_eq!(found, vec![standing], "the dead handle is not reported");
+		assert_eq!(bodies.overlaps().len(), 2, "while the raw list still holds both");
+	}
+
+	#[test]
+	fn inside_answers_about_the_sensor_it_was_asked_about() {
+		let mut bodies = Bodies::new();
+		let first = bodies.spawn(Body::default().sensing());
+		let second = bodies.spawn(Body::default().sensing());
+		let prop = bodies.spawn(Body::default());
+
+		bodies.overlapped(Overlap { sensor: first, body: prop });
+
+		assert_eq!(bodies.inside(first).count(), 1, "the one it is in");
+		assert_eq!(bodies.inside(second).count(), 0, "and not the one beside it");
+	}
+
+	#[test]
+	fn the_overlap_list_stops_rather_than_growing_without_end() {
+		let mut bodies = Bodies::new();
+		let sensor = bodies.spawn(Body::default().sensing());
+
+		for _ in 0..MAX_OVERLAPS + 8 {
+			bodies.overlapped(Overlap { sensor, body: BodyId::NONE });
+		}
+
+		assert_eq!(bodies.overlaps().len(), MAX_OVERLAPS, "it stops at the bound");
+	}
+
+	#[test]
+	fn overlaps_outlive_the_step_edges_beside_them() {
+		let mut bodies = Bodies::new();
+		let sensor = bodies.spawn(Body::default().sensing());
+		let prop = bodies.spawn(Body::default());
+
+		bodies.overlapped(Overlap { sensor, body: prop });
+		bodies.touched(Touch {
+			first: sensor,
+			second: prop,
+			kind: TouchKind::Began,
+			point: Vec3::ZERO,
+			normal: Vec3::Y,
+		});
+		bodies.end_step();
+
+		assert!(bodies.touches().is_empty(), "an edge is consumed once");
+		assert_eq!(bodies.overlaps().len(), 1, "and a state is not");
+
+		bodies.forget_overlaps();
+
+		assert!(bodies.overlaps().is_empty(), "until the solver says what is true now");
 	}
 }
