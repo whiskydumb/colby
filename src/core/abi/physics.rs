@@ -953,6 +953,74 @@ impl Bodies {
 			})
 	}
 
+	/// Rebuilds the whole table from a description, slot for slot.
+	///
+	/// The same contract
+	/// [`Entities::restore`](super::entity::Entities::restore) has, and for
+	/// the same reason: a body handle a game kept in its arena is only worth
+	/// restoring if it lands back on the same body. The touch and
+	/// overlap queues are emptied with it, because both describe a world that
+	/// is no longer here.
+	///
+	/// @param generations - the generation of every slot, dead ones included;
+	/// its length is how many slots the table ends up with, capped at
+	/// [`MAX_BODIES`]
+	/// @param entries - `(slot, body)` for each living body
+	/// @return one handle per entry, in order, [`BodyId::NONE`] for any whose
+	/// slot the table could not hold
+	pub fn restore(&mut self, generations: &[u32], entries: &[(usize, Body)]) -> Vec<BodyId> {
+		let slots = generations.len().min(MAX_BODIES);
+
+		self.bodies.clear();
+		self.bodies.resize(slots, Body::default());
+		self.generations.clear();
+		self.generations
+			.extend_from_slice(&generations[..slots]);
+		self.alive.clear();
+		self.alive.resize(slots, false);
+		self.free.clear();
+		self.touches.clear();
+		self.overlaps.clear();
+		self.live = 0;
+
+		let mut handles = Vec::with_capacity(entries.len());
+		for (slot, body) in entries {
+			handles.push(self.put(*slot, *body));
+		}
+
+		for slot in 0..slots {
+			if !self.alive[slot]
+				&& let Ok(index) = u32::try_from(slot)
+			{
+				self.free.push(index);
+			}
+		}
+
+		handles
+	}
+
+	/// Puts one body back into a slot a [`restore`](Self::restore) has just
+	/// sized the table for.
+	fn put(&mut self, slot: usize, body: Body) -> BodyId {
+		let (Ok(index), Some(alive)) = (u32::try_from(slot), self.alive.get_mut(slot)) else {
+			return BodyId::NONE;
+		};
+
+		if *alive {
+			return BodyId::NONE;
+		}
+
+		*alive = true;
+		self.bodies[slot] = body;
+		self.generations[slot] = self.generations[slot].max(1);
+		self.live += 1;
+
+		BodyId {
+			index,
+			generation: self.generations[slot],
+		}
+	}
+
 	/// The generation living in a slot, whether or not it is occupied.
 	///
 	/// The solver's, for noticing that the body it cached something for is not

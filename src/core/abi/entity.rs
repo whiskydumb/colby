@@ -481,6 +481,102 @@ impl Entities {
 			})
 	}
 
+	/// Rebuilds the whole table from a description, slot for slot.
+	///
+	/// The other half of writing a world down: a handle only means anything if
+	/// it lands back in the slot and the generation it came from, so this
+	/// replaces the table rather than adding to it. Everything alive before is
+	/// gone, and every handle to it is stale afterwards unless the description
+	/// happens to name the same slot and generation - which is exactly what a
+	/// saved world does and exactly what a different one does not.
+	///
+	/// The free list is *not* part of the description and is rebuilt here from
+	/// whichever slots nothing occupies, in ascending order - so the next
+	/// spawn takes the highest empty slot rather than whichever died most
+	/// recently, the list being a stack. The order things died in is not
+	/// recoverable and is not worth writing down: the only thing that depends
+	/// on it is which slot the next spawn takes, and what matters there is
+	/// that two hosts reading one description derive the same answer.
+	///
+	/// Both halves of every transform are set to the same value, so nothing is
+	/// drawn traveling out of the world that was here before.
+	///
+	/// @param generations - the generation of every slot, dead ones included;
+	/// its length is how many slots the table ends up with, capped at
+	/// [`MAX_ENTITIES`]
+	/// @param entries - `(slot, transform, renderable)` for each living entity
+	/// @return one handle per entry, in order, [`EntityId::NONE`] for any whose
+	/// slot the table could not hold
+	pub fn restore(
+		&mut self,
+		generations: &[u32],
+		entries: &[(usize, Transform, Renderable)],
+	) -> Vec<EntityId> {
+		let slots = generations.len().min(MAX_ENTITIES);
+
+		self.transforms.clear();
+		self.transforms.resize(slots, Transform::IDENTITY);
+		self.previous.clear();
+		self.previous.resize(slots, Transform::IDENTITY);
+		self.renderables.clear();
+		self.renderables
+			.resize(slots, Renderable::NOTHING);
+		self.generations.clear();
+		self.generations
+			.extend_from_slice(&generations[..slots]);
+		self.alive.clear();
+		self.alive.resize(slots, false);
+		self.free.clear();
+		self.pending.clear();
+		self.pending_all = false;
+		self.live = 0;
+
+		let mut handles = Vec::with_capacity(entries.len());
+		for &(slot, transform, renderable) in entries {
+			handles.push(self.put(slot, transform, renderable));
+		}
+
+		for slot in 0..slots {
+			if !self.alive[slot]
+				&& let Ok(index) = u32::try_from(slot)
+			{
+				self.free.push(index);
+			}
+		}
+
+		handles
+	}
+
+	/// Puts one entity back into a slot a [`restore`](Self::restore) has just
+	/// sized the table for.
+	///
+	/// A generation of zero is lifted to one: zero is what
+	/// [`EntityId::NONE`] holds, so a slot carrying it would hand out a handle
+	/// that refers to nothing.
+	fn put(&mut self, slot: usize, transform: Transform, renderable: Renderable) -> EntityId {
+		let (Ok(index), Some(alive)) = (u32::try_from(slot), self.alive.get_mut(slot)) else {
+			return EntityId::NONE;
+		};
+
+		if *alive {
+			// two entries claiming one slot. The first one keeps it, because
+			// the alternative is a handle handed out twice.
+			return EntityId::NONE;
+		}
+
+		*alive = true;
+		self.transforms[slot] = transform;
+		self.previous[slot] = transform;
+		self.renderables[slot] = renderable;
+		self.generations[slot] = self.generations[slot].max(1);
+		self.live += 1;
+
+		EntityId {
+			index,
+			generation: self.generations[slot],
+		}
+	}
+
 	/// How many slots the table has ever handed out.
 	///
 	/// Not the same as [`len`](Self::len), which counts what is alive. This is

@@ -36,11 +36,14 @@
 //! queues. @ref `colby-known-gaps` for what that costs.
 
 use crate::{
+	Result,
 	abi::{
-		BodyId, BodyKind, Camera, JointKind, Layers, Shape, ShapeKind, Transform, World,
-		state::STATE_BYTES,
+		Body, BodyId, BodyKind, Camera, EntityId, Joint, JointKind, Layers, MaterialId,
+		Renderable, Shape, ShapeKind, Transform, World, state::STATE_BYTES,
 	},
+	err,
 	glam::{Quat, Vec3},
+	warn,
 };
 
 /// What a record holds instead of an index when it names nothing.
@@ -128,6 +131,14 @@ pub struct Thing {
 	pub color: Vec3,
 }
 
+impl Thing {
+	/// The slot it occupied and the generation it held there.
+	///
+	/// What a restore keys the table's rebuilt generation array on.
+	#[must_use]
+	pub const fn key(&self) -> (u32, u32) { (self.slot, self.generation) }
+}
+
 /// A shape with its mesh named rather than handled.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Form {
@@ -196,6 +207,14 @@ pub struct Solid {
 	pub thing: u32,
 }
 
+impl Solid {
+	/// The slot it occupied and the generation it held there.
+	///
+	/// What a restore keys the table's rebuilt generation array on.
+	#[must_use]
+	pub const fn key(&self) -> (u32, u32) { (self.slot, self.generation) }
+}
+
 /// One joint, naming the two bodies it holds by their place in the file.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Link {
@@ -234,6 +253,14 @@ pub struct Link {
 
 	/// How much of the pull is given up each step.
 	pub give: f32,
+}
+
+impl Link {
+	/// The slot it occupied and the generation it held there.
+	///
+	/// What a restore keys the table's rebuilt generation array on.
+	#[must_use]
+	pub const fn key(&self) -> (u32, u32) { (self.slot, self.generation) }
 }
 
 /// The game's own bytes, and the layout number they were written under.
@@ -478,10 +505,265 @@ fn form(world: &World, shape: &Shape) -> Form {
 	}
 }
 
+/// What a restore put back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Restored {
+	/// How many entities landed in a slot.
+	pub things: usize,
+
+	/// How many bodies did.
+	pub solids: usize,
+
+	/// How many joints did.
+	pub links: usize,
+
+	/// Whether the game's own arena was put back.
+	pub arena: bool,
+}
+
+/// Puts a described world back exactly as it was.
+///
+/// Everything alive is replaced rather than added to, and every table is
+/// rebuilt slot for slot and generation for generation - which is what makes
+/// the handles a game kept in its arena resolve to the same entities
+/// afterwards. That property is the whole reason this exists, and it is why
+/// there is a second loader for the case where a copy rather than the original
+/// is wanted.
+///
+/// **The caller has one obligation, and nothing here can discharge it: drop
+/// whatever a solver derived.** Warm-start impulses, baked collision meshes
+/// and the set of pairs that were touching all live outside [`World`], and a
+/// step run against them after a restore is a step mixing this world with the
+/// one that was here before. `colby_core` cannot reach the solver, so this is
+/// the host's to do, immediately after this call.
+///
+/// The arena is refused rather than forced when its layout number and the
+/// running game's disagree: half a loaded world - entities standing where they
+/// were and a game holding handles to none of them - is worse than a load that
+/// did not happen. A description carrying no arena at all is not a mismatch;
+/// there is simply nothing to put.
+///
+/// @param world - the world to replace
+/// @param scene - what to put in it
+/// @return what landed
+///
+/// # Errors
+///
+/// If the description's arena was written under a different layout number than
+/// the running game claimed. Nothing is changed in that case.
+pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
+	agreed(world, scene)?;
+
+	let generations = slots(&scene.thing_generations, scene.things.iter().map(Thing::key));
+	let entries = placed(world, scene);
+	let things = world.entities.restore(&generations, &entries);
+
+	let generations = slots(&scene.solid_generations, scene.solids.iter().map(Solid::key));
+	let entries = solid_bodies(world, scene, &things);
+	let solids = world.bodies.restore(&generations, &entries);
+
+	let generations = slots(&scene.link_generations, scene.links.iter().map(Link::key));
+	let entries = link_joints(scene, &solids);
+	let links = world.joints.restore(&generations, &entries);
+
+	if let Some(arena) = scene.arena.as_ref() {
+		world.state.put_raw(&arena.bytes, arena.layout);
+	}
+
+	stage_world(world, scene.stage);
+
+	Ok(Restored {
+		things: things.iter().filter(|id| id.is_some()).count(),
+		solids: solids.iter().filter(|id| id.is_some()).count(),
+		links: links.iter().filter(|id| id.is_some()).count(),
+		arena: scene.arena.is_some(),
+	})
+}
+
+/// Whether the description's arena is one this build can read.
+///
+/// @param world - the world whose game has claimed a layout number
+/// @param scene - the description
+///
+/// # Errors
+///
+/// If both sides claim a layout and the two disagree.
+fn agreed(world: &World, scene: &SceneData) -> Result<()> {
+	let claimed = world.state.layout();
+	let Some(arena) = scene.arena.as_ref() else {
+		return Ok(());
+	};
+
+	// a zero on either side is "nobody has claimed this", which agrees with
+	// everything: a world whose game has not run yet, or a description written
+	// before one did.
+	if arena.layout == 0 || claimed == 0 || arena.layout == claimed {
+		return Ok(());
+	}
+
+	Err(err!(Asset(
+		"the scene's game state is layout {} and this build claims {claimed}",
+		arena.layout
+	)))
+}
+
+/// The generation of every slot a table should end up with.
+///
+/// The written array is the whole picture, dead slots included; each living
+/// record then overwrites its own slot, because the record is what the
+/// generation is actually about and the array is a second copy of the same
+/// fact. A record past the end of the array grows it, which is what lets a
+/// description somebody wrote by hand carry no array at all.
+///
+/// @param written - the array the description carried, possibly empty
+/// @param records - the slot and generation of each living record
+fn slots<I: Iterator<Item = (u32, u32)>>(written: &[u32], records: I) -> Vec<u32> {
+	let mut generations = written.to_vec();
+
+	for (slot, generation) in records {
+		let Ok(slot) = usize::try_from(slot) else {
+			continue;
+		};
+
+		if slot >= generations.len() {
+			generations.resize(slot.saturating_add(1), 0);
+		}
+
+		generations[slot] = generation;
+	}
+
+	generations
+}
+
+/// Every entity, with its named assets looked up.
+fn placed(world: &World, scene: &SceneData) -> Vec<(usize, Transform, Renderable)> {
+	scene
+		.things
+		.iter()
+		.map(|thing| {
+			let renderable = Renderable {
+				mesh: world.meshes.find(&thing.mesh),
+				material: material(world, &thing.material),
+				color: thing.color,
+			};
+
+			(usize::try_from(thing.slot).unwrap_or(usize::MAX), thing.transform, renderable)
+		})
+		.collect()
+}
+
+/// Every body, with its shape's mesh and its entity looked up.
+fn solid_bodies(world: &World, scene: &SceneData, things: &[EntityId]) -> Vec<(usize, Body)> {
+	scene
+		.solids
+		.iter()
+		.map(|solid| {
+			let mut body = Body::new(solid.kind, shape(world, &solid.shape), solid.transform);
+			body.velocity = solid.velocity;
+			body.angular = solid.angular;
+			body.mass = solid.mass;
+			body.restitution = solid.restitution;
+			body.friction = solid.friction;
+			body.sensor = solid.sensor;
+			body.sleeping = solid.sleeping;
+			body.layers = solid.layers;
+			body.entity = at(things, solid.thing).unwrap_or(EntityId::NONE);
+
+			(usize::try_from(solid.slot).unwrap_or(usize::MAX), body)
+		})
+		.collect()
+}
+
+/// Every joint, with both of its bodies looked up.
+fn link_joints(scene: &SceneData, solids: &[BodyId]) -> Vec<(usize, Joint)> {
+	scene
+		.links
+		.iter()
+		.map(|link| {
+			let joint = Joint {
+				kind: link.kind,
+				first: at(solids, link.first).unwrap_or(BodyId::NONE),
+				second: at(solids, link.second).unwrap_or(BodyId::NONE),
+				first_anchor: link.first_anchor,
+				second_anchor: link.second_anchor,
+				axis: link.axis,
+				length: link.length,
+				rest: link.rest,
+				give: link.give,
+			};
+
+			(usize::try_from(link.slot).unwrap_or(usize::MAX), joint)
+		})
+		.collect()
+}
+
+/// One handle out of the list a table restore handed back.
+///
+/// @param handles - what the restore returned, one per record
+/// @param index - what a record wrote down, or [`NO_INDEX`]
+fn at<T: Copy>(handles: &[T], index: u32) -> Option<T> {
+	if index == NO_INDEX {
+		return None;
+	}
+
+	handles.get(usize::try_from(index).ok()?).copied()
+}
+
+/// A material by name, falling back to the default rather than to nothing.
+///
+/// The two branches produce the same handle and differ only in whether
+/// anything is said about it, which is the point: a name nothing answers to is
+/// worth a line in the log, and an entity that simply never chose a material
+/// is not. Without the first branch every unnamed entity in a hand-written
+/// scene would warn, which is how a warning stops being read.
+fn material(world: &World, name: &str) -> MaterialId {
+	if name.is_empty() {
+		return MaterialId::DEFAULT;
+	}
+
+	let found = world.materials.find(name);
+	if !found.is_some() {
+		warn!(name, "a scene names a material nothing answers to");
+
+		return MaterialId::DEFAULT;
+	}
+
+	found
+}
+
+/// A shape with its named mesh looked up.
+fn shape(world: &World, form: &Form) -> Shape {
+	Shape {
+		kind: form.kind,
+		radius: form.radius,
+		extents: form.extents,
+		mesh: world.meshes.find(&form.mesh),
+	}
+}
+
+/// Writes the world's own settings and declares the whole thing a cut.
+///
+/// A load is the largest discontinuity there is, so nothing is drawn
+/// traveling from where it used to be: every transform's past was written to
+/// match its present by the table restores, and the camera says so here.
+fn stage_world(world: &mut World, stage: Stage) {
+	world.camera = stage.camera;
+	world.clear = stage.clear;
+	world.light = stage.light;
+	world.ambient = stage.ambient;
+	world.gravity = stage.gravity;
+	world.time = stage.time;
+	world.steps = stage.steps;
+	world.contacts = 0;
+
+	world.snap_camera();
+	world.entities.snap_all();
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::abi::{Body, Joint, Material, MeshData, Renderable, mesh};
+	use crate::abi::{MAX_ENTITIES, Material, MeshData, mesh};
 
 	/// A world with a mesh, a material and one entity standing on a body.
 	fn furnished() -> World {
@@ -698,6 +980,562 @@ mod tests {
 		assert!(
 			(scene.stage.time - 12.5).abs() < f32::EPSILON,
 			"and the clock gameplay integrates against"
+		);
+	}
+	/// A world with two entities, a body under one of them and a rope holding
+	/// it - one of each thing the description carries.
+	fn peopled() -> World {
+		let mut world = furnished();
+		let mesh = world.meshes.find("meshes/crystal");
+		let material = world.materials.find("brass");
+
+		let first = world.entities.spawn_at(Transform::at(Vec3::X));
+		world
+			.entities
+			.set_renderable(first, Renderable::of(mesh, material, Vec3::Y));
+
+		let second = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(0.0, 4.0, 0.0)));
+		let body = world.bodies.spawn(
+			Body::dynamic(Shape::ball(0.5), Transform::at(Vec3::new(0.0, 4.0, 0.0)), 3.0)
+				.driving(second)
+				.layered(Layers::single(2)),
+		);
+		world.join(Joint::rope(body, BodyId::NONE, (Vec3::ZERO, Vec3::Y * 6.0), 2.0));
+		world.camera.position = Vec3::new(4.0, 5.0, 6.0);
+		world.time = 3.25;
+
+		world
+	}
+
+	#[test]
+	fn a_world_put_back_captures_the_same_way_it_did_before() {
+		let world = peopled();
+		let scene = capture(&world);
+
+		let mut empty = furnished();
+		let report = restore(&mut empty, &scene).expect("the layouts agree");
+
+		assert_eq!((report.things, report.solids, report.links), (2, 1, 1), "all of it landed");
+		assert_eq!(
+			capture(&empty),
+			scene,
+			"and describing it again describes exactly what was read"
+		);
+	}
+
+	#[test]
+	fn a_handle_kept_across_a_restore_still_names_the_same_entity() {
+		let world = peopled();
+		let held = world
+			.entities
+			.iter()
+			.map(|(id, ..)| id)
+			.last()
+			.expect("two entities");
+		let scene = capture(&world);
+
+		let mut empty = furnished();
+		restore(&mut empty, &scene).expect("the layouts agree");
+
+		assert!(empty.entities.alive(held), "the handle resolves in the restored world");
+		assert_eq!(
+			empty
+				.entities
+				.transform(held)
+				.map(|placed| placed.position),
+			Some(Vec3::new(0.0, 4.0, 0.0)),
+			"and it is the entity it was, not whoever took the slot"
+		);
+	}
+
+	#[test]
+	fn a_handle_that_was_already_stale_is_still_stale_afterwards() {
+		let mut world = World::new();
+		let doomed = world.entities.spawn();
+		world.entities.spawn();
+		world.entities.despawn(doomed);
+
+		let scene = capture(&world);
+		let mut empty = World::new();
+		restore(&mut empty, &scene).expect("no arena to disagree about");
+
+		assert!(!empty.entities.alive(doomed), "a dead slot comes back dead");
+
+		// and taking the slot again does not resurrect it: the generation the
+		// dead slot carried is what the description wrote down.
+		let taken = empty.entities.spawn();
+
+		assert_ne!(taken, doomed, "the new occupant is not the old handle");
+		assert!(!empty.entities.alive(doomed), "which the old handle can still tell");
+	}
+
+	#[test]
+	fn the_arena_comes_back_with_the_handles_a_game_kept_in_it() {
+		#[repr(C)]
+		#[derive(Clone, Copy, crate::bytemuck::Pod, crate::bytemuck::Zeroable)]
+		struct Held {
+			player: EntityId,
+			pad: [u32; 2],
+		}
+
+		let mut world = World::new();
+		let player = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(7.0, 0.0, 0.0)));
+		world.state.get::<Held>(3).0.player = player;
+
+		let scene = capture(&world);
+		let mut empty = World::new();
+		let report = restore(&mut empty, &scene).expect("nobody has claimed the arena");
+
+		assert!(report.arena, "the arena is part of what a restore puts back");
+
+		let (held, fresh) = empty.state.get::<Held>(3);
+
+		assert!(!fresh, "the layout number came back with the bytes");
+		assert_eq!(
+			empty
+				.entities
+				.transform(held.player)
+				.map(|placed| placed.position),
+			Some(Vec3::new(7.0, 0.0, 0.0)),
+			"and the handle inside it points at the entity it always did"
+		);
+	}
+
+	#[test]
+	fn a_scene_written_under_another_layout_is_refused_rather_than_forced() {
+		#[repr(C)]
+		#[derive(Clone, Copy, crate::bytemuck::Pod, crate::bytemuck::Zeroable)]
+		struct Held {
+			count: u32,
+			pad: u32,
+		}
+
+		let mut world = World::new();
+		world.entities.spawn();
+		world.state.get::<Held>(4).0.count = 1;
+		let scene = capture(&world);
+
+		let mut newer = World::new();
+		newer.state.get::<Held>(9).0.count = 2;
+		let refused = restore(&mut newer, &scene);
+
+		assert!(refused.is_err(), "the two builds do not agree about the arena");
+		assert!(
+			newer.entities.is_empty(),
+			"and nothing was loaded, because half a world is worse than none"
+		);
+		assert_eq!(newer.state.get::<Held>(9).0.count, 2, "the running game keeps its own bytes");
+	}
+
+	#[test]
+	fn an_unclaimed_arena_on_either_side_is_not_a_disagreement() {
+		#[repr(C)]
+		#[derive(Clone, Copy, crate::bytemuck::Pod, crate::bytemuck::Zeroable)]
+		struct Held {
+			count: u32,
+			pad: u32,
+		}
+
+		let mut world = World::new();
+		world.state.get::<Held>(4).0.count = 1;
+		let claimed = capture(&world);
+
+		let mut fresh = World::new();
+
+		assert!(
+			restore(&mut fresh, &claimed).is_ok(),
+			"a world whose game has not claimed the arena takes whatever it is given"
+		);
+
+		let unclaimed = capture(&World::new());
+		let mut running = World::new();
+		running.state.get::<Held>(4).0.count = 5;
+
+		assert!(
+			restore(&mut running, &unclaimed).is_ok(),
+			"and a description written before any game ran disagrees with nobody"
+		);
+	}
+
+	#[test]
+	fn a_restore_replaces_the_world_rather_than_adding_to_it() {
+		let scene = capture(&peopled());
+		let mut crowded = furnished();
+		for _ in 0..5 {
+			crowded.entities.spawn();
+		}
+		crowded
+			.bodies
+			.spawn(Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY));
+
+		restore(&mut crowded, &scene).expect("the layouts agree");
+
+		assert_eq!(crowded.entities.len(), 2, "what was here is gone");
+		assert_eq!(crowded.bodies.len(), 1, "in every table");
+	}
+
+	#[test]
+	fn assets_are_found_by_name_however_this_world_happens_to_be_ordered() {
+		let source = peopled();
+		let scene = capture(&source);
+
+		// the same assets behind one that the other world never had, so the
+		// crystal lands on a different handle than the description was written
+		// from. That is the whole reason a name is what gets written down.
+		let mut other = World::new();
+		other
+			.meshes
+			.insert("meshes/decoy", MeshData::default());
+		other
+			.meshes
+			.insert("meshes/crystal", MeshData::default());
+		other
+			.materials
+			.insert("brass", Material::colored(Vec3::ONE));
+
+		assert_ne!(
+			other.meshes.find("meshes/crystal"),
+			source.meshes.find("meshes/crystal"),
+			"the two worlds really do disagree about the handle"
+		);
+
+		restore(&mut other, &scene).expect("no arena to disagree about");
+
+		let drawn: Vec<String> = other
+			.entities
+			.iter()
+			.filter_map(|(_, _, renderable)| other.meshes.get(renderable.mesh))
+			.map(|entry| entry.name().to_owned())
+			.collect();
+
+		assert!(
+			drawn.contains(&"meshes/crystal".to_owned()),
+			"and the entity draws the mesh it named all the same, got {drawn:?}"
+		);
+	}
+
+	#[test]
+	fn a_name_this_world_does_not_have_falls_back_rather_than_failing() {
+		let mut scene = capture(&peopled());
+		scene.things[0].mesh = "meshes/gone".to_owned();
+		scene.things[0].material = "vanished".to_owned();
+
+		let mut bare = World::new();
+		restore(&mut bare, &scene).expect("no arena to disagree about");
+
+		let (_, _, renderable) = bare
+			.entities
+			.iter()
+			.next()
+			.expect("it still exists");
+
+		assert_eq!(renderable.mesh, crate::abi::MeshId::NONE, "the missing mesh draws nothing");
+		assert_eq!(
+			renderable.material,
+			MaterialId::DEFAULT,
+			"and the missing material is the default one"
+		);
+	}
+
+	#[test]
+	fn a_body_and_a_joint_come_back_holding_the_restored_handles() {
+		let scene = capture(&peopled());
+		let mut empty = furnished();
+		restore(&mut empty, &scene).expect("the layouts agree");
+
+		let (body_id, body) = empty.bodies.iter().next().expect("one body");
+
+		assert!(empty.entities.alive(body.entity), "the body drives a living entity");
+		assert_eq!(
+			empty
+				.entities
+				.transform(body.entity)
+				.map(|placed| placed.position),
+			Some(Vec3::new(0.0, 4.0, 0.0)),
+			"and it is the one it drove before"
+		);
+		assert_eq!(body.layers, Layers::single(2), "its layers come with it");
+
+		let (_, joint) = empty.joints.iter().next().expect("one joint");
+
+		assert_eq!(joint.first, body_id, "the rope holds the restored body");
+		assert_eq!(joint.second, BodyId::NONE, "and a point in the world, as it did");
+	}
+
+	#[test]
+	fn the_free_list_comes_back_in_slot_order_rather_than_in_the_order_things_died() {
+		let mut world = World::new();
+		for _ in 0..4 {
+			world.entities.spawn();
+		}
+
+		let holes: Vec<_> = world.entities.iter().map(|(id, ..)| id).collect();
+		world.entities.despawn(holes[2]);
+		world.entities.despawn(holes[0]);
+
+		let scene = capture(&world);
+		let mut empty = World::new();
+		restore(&mut empty, &scene).expect("no arena to disagree about");
+
+		// the free list is a stack, so the *last* slot pushed is the first one
+		// taken - which after a restore is the highest empty one rather than
+		// whichever died most recently. The number matters less than that two
+		// hosts reading one description derive the same one.
+		assert_eq!(empty.entities.spawn().slot(), 2, "the higher hole is filled first");
+		assert_eq!(empty.entities.spawn().slot(), 0, "and then the lower one");
+	}
+
+	#[test]
+	fn nothing_is_drawn_traveling_out_of_the_world_that_was_here_before() {
+		let scene = capture(&peopled());
+		let mut elsewhere = furnished();
+		elsewhere
+			.entities
+			.spawn_at(Transform::at(Vec3::splat(-40.0)));
+
+		restore(&mut elsewhere, &scene).expect("the layouts agree");
+
+		// zero is the start of a step, where the renderer draws each entity's
+		// *past*. A restore that wrote only the present would draw everything
+		// at the origin for one frame and then have it snap into place.
+		elsewhere.set_interpolation(0.0);
+
+		let mut seen = 0;
+		for (id, placed, _) in elsewhere.entities.iter() {
+			let drawn = elsewhere
+				.render_transform(id)
+				.expect("it is alive");
+
+			assert!(
+				drawn.position.abs_diff_eq(placed.position, 1.0e-6),
+				"a restored entity is drawn where it is at every point of a step, got {} for 				 {}",
+				drawn.position,
+				placed.position
+			);
+
+			seen += 1;
+		}
+
+		assert_eq!(seen, 2, "and both of them were looked at");
+	}
+
+	#[test]
+	fn a_slot_past_what_the_table_can_hold_is_dropped_rather_than_panicking() {
+		let mut scene = capture(&peopled());
+		scene.things[0].slot = u32::try_from(MAX_ENTITIES).unwrap() + 4;
+		scene.thing_generations = vec![1; 2];
+
+		let mut empty = furnished();
+		let report = restore(&mut empty, &scene).expect("the layouts agree");
+
+		assert_eq!(report.things, 1, "one of the two would not fit");
+		assert_eq!(empty.entities.len(), 1, "and the table holds exactly what landed");
+	}
+	#[test]
+	fn a_material_nobody_named_is_the_default_one() {
+		// the hand-authored case: a capture always writes a name, because the
+		// default material is a real entry called "default", but a scene
+		// somebody typed may leave it out.
+		let mut scene = SceneData::default();
+		scene.things.push(Thing {
+			slot: 0,
+			generation: 1,
+			transform: Transform::IDENTITY,
+			color: Vec3::ONE,
+			..Thing::default()
+		});
+
+		let mut world = World::new();
+		restore(&mut world, &scene).expect("no arena at all");
+
+		let (_, _, renderable) = world.entities.iter().next().expect("it landed");
+
+		assert_eq!(
+			renderable.material,
+			MaterialId::DEFAULT,
+			"an unnamed material is the default one and not the null one"
+		);
+	}
+
+	#[test]
+	fn a_restore_empties_the_queues_that_describe_the_world_it_replaced() {
+		let scene = capture(&peopled());
+		let mut busy = furnished();
+		let one =
+			busy.bodies
+				.spawn(Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY));
+		let two = busy
+			.bodies
+			.spawn(Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY).sensing());
+		busy.bodies.touched(crate::abi::Touch {
+			first: one,
+			second: two,
+			kind: crate::abi::TouchKind::Began,
+			point: Vec3::ZERO,
+			normal: Vec3::Y,
+		});
+		busy.bodies
+			.overlapped(crate::abi::Overlap { sensor: two, body: one });
+
+		restore(&mut busy, &scene).expect("the layouts agree");
+
+		assert!(busy.bodies.touches().is_empty(), "a landing in another world is not news here");
+		assert!(
+			busy.bodies.overlaps().is_empty(),
+			"and neither is what was inside a trigger that no longer exists"
+		);
+	}
+
+	#[test]
+	fn two_records_claiming_one_slot_do_not_both_get_it() {
+		let mut scene = SceneData {
+			thing_generations: vec![1],
+			..SceneData::default()
+		};
+		for _ in 0..2 {
+			scene.things.push(Thing {
+				slot: 0,
+				generation: 1,
+				transform: Transform::IDENTITY,
+				..Thing::default()
+			});
+		}
+
+		let mut world = World::new();
+		let report = restore(&mut world, &scene).expect("no arena at all");
+
+		assert_eq!(report.things, 1, "the first one keeps the slot");
+		assert_eq!(
+			world.entities.len(),
+			1,
+			"because the alternative is one handle handed out twice"
+		);
+	}
+
+	#[test]
+	fn a_restore_forgets_the_holes_the_world_it_replaced_had() {
+		let mut scene = SceneData {
+			thing_generations: vec![1, 1, 1],
+			..SceneData::default()
+		};
+		for slot in 0..3 {
+			scene.things.push(Thing {
+				slot,
+				generation: 1,
+				transform: Transform::IDENTITY,
+				..Thing::default()
+			});
+		}
+
+		// a world whose own table is full of holes, so a free list that
+		// survived the restore would hand out a slot something already stands
+		// in.
+		let mut holed = World::new();
+		let doomed = [
+			holed.entities.spawn(),
+			holed.entities.spawn(),
+			holed.entities.spawn(),
+			holed.entities.spawn(),
+		];
+		for id in doomed {
+			holed.entities.despawn(id);
+		}
+
+		restore(&mut holed, &scene).expect("no arena at all");
+
+		assert_eq!(holed.entities.len(), 3, "three entities landed");
+
+		let next = holed.entities.spawn();
+
+		assert_eq!(next.slot(), 3, "and the next slot is past them rather than under one");
+		assert_eq!(holed.entities.len(), 4, "so nothing was overwritten");
+	}
+
+	#[test]
+	fn a_record_that_carries_no_generation_at_all_still_lands_usable() {
+		// the hand-written case again: nobody typing a scene writes a
+		// generation, and zero is what a handle to nothing carries, so a slot
+		// left holding it would hand out a handle that refers to nothing.
+		let mut scene = SceneData::default();
+		scene.things.push(Thing {
+			slot: 0,
+			generation: 0,
+			transform: Transform::at(Vec3::Z),
+			..Thing::default()
+		});
+
+		let mut world = World::new();
+		restore(&mut world, &scene).expect("no arena at all");
+
+		let (id, ..) = world.entities.iter().next().expect("it landed");
+
+		assert!(id.is_some(), "the handle refers to something");
+		assert!(world.entities.alive(id), "and the table agrees that it does");
+	}
+
+	#[test]
+	fn a_written_generation_is_what_the_slot_comes_back_on() {
+		// a description with no generation array at all - which is what an
+		// authored scene is - so the records are the only place the answer can
+		// come from.
+		let mut scene = SceneData::default();
+		scene.things.push(Thing {
+			slot: 0,
+			generation: 7,
+			transform: Transform::IDENTITY,
+			..Thing::default()
+		});
+
+		let mut world = World::new();
+		restore(&mut world, &scene).expect("no arena at all");
+
+		assert_eq!(
+			world.entities.generation(0),
+			7,
+			"the slot is on the occupant the description named, not the first one"
+		);
+
+		let (id, ..) = world.entities.iter().next().expect("it landed");
+
+		assert_eq!(id.generation(), 7, "and the handle handed out says so");
+	}
+
+	#[test]
+	fn a_mesh_shaped_body_finds_its_geometry_by_name_too() {
+		let mut source = furnished();
+		let crystal = source.meshes.find("meshes/crystal");
+		source.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::mesh(crystal),
+			Transform::IDENTITY,
+		));
+		let scene = capture(&source);
+
+		// the same mesh behind one this world has and that one did not, so the
+		// handle differs.
+		let mut other = World::new();
+		other
+			.meshes
+			.insert("meshes/decoy", MeshData::default());
+		other
+			.meshes
+			.insert("meshes/crystal", MeshData::default());
+
+		assert_ne!(other.meshes.find("meshes/crystal"), crystal, "the handles really differ");
+
+		restore(&mut other, &scene).expect("no arena to disagree about");
+
+		let (_, body) = other.bodies.iter().next().expect("one body");
+
+		assert_eq!(body.shape.kind, ShapeKind::Mesh, "it is still a mesh shape");
+		assert_eq!(
+			body.shape.mesh,
+			other.meshes.find("meshes/crystal"),
+			"and it collides against the geometry it named"
 		);
 	}
 }

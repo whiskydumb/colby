@@ -264,6 +264,71 @@ impl Joints {
 	#[must_use]
 	pub fn alive(&self, id: JointId) -> bool { self.slot(id).is_some() }
 
+	/// Rebuilds the whole table from a description, slot for slot.
+	///
+	/// The same contract the entity and body tables have. Nothing checks that
+	/// the bodies a restored joint names exist: the solver already skips a
+	/// joint whose handles do not resolve, and a description that names a body
+	/// it did not also describe is a broken description rather than a case to
+	/// paper over.
+	///
+	/// @param generations - the generation of every slot, dead ones included;
+	/// its length is how many slots the table ends up with, capped at
+	/// [`MAX_JOINTS`]
+	/// @param entries - `(slot, joint)` for each living joint
+	/// @return one handle per entry, in order, [`JointId::NONE`] for any whose
+	/// slot the table could not hold
+	pub fn restore(&mut self, generations: &[u32], entries: &[(usize, Joint)]) -> Vec<JointId> {
+		let slots = generations.len().min(MAX_JOINTS);
+
+		self.joints.clear();
+		self.joints.resize(slots, Joint::default());
+		self.generations.clear();
+		self.generations
+			.extend_from_slice(&generations[..slots]);
+		self.alive.clear();
+		self.alive.resize(slots, false);
+		self.free.clear();
+		self.live = 0;
+
+		let mut handles = Vec::with_capacity(entries.len());
+		for (slot, joint) in entries {
+			handles.push(self.put(*slot, *joint));
+		}
+
+		for slot in 0..slots {
+			if !self.alive[slot]
+				&& let Ok(index) = u32::try_from(slot)
+			{
+				self.free.push(index);
+			}
+		}
+
+		handles
+	}
+
+	/// Puts one joint back into a slot a [`restore`](Self::restore) has just
+	/// sized the table for.
+	fn put(&mut self, slot: usize, joint: Joint) -> JointId {
+		let (Ok(index), Some(alive)) = (u32::try_from(slot), self.alive.get_mut(slot)) else {
+			return JointId::NONE;
+		};
+
+		if *alive {
+			return JointId::NONE;
+		}
+
+		*alive = true;
+		self.joints[slot] = joint;
+		self.generations[slot] = self.generations[slot].max(1);
+		self.live += 1;
+
+		JointId {
+			index,
+			generation: self.generations[slot],
+		}
+	}
+
 	/// How many slots the table has ever handed out.
 	#[must_use]
 	pub fn slots(&self) -> usize { self.alive.len() }

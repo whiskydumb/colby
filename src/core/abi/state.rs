@@ -95,6 +95,30 @@ impl GameState {
 	#[must_use]
 	pub const fn raw(&self) -> &[u8; STATE_BYTES] { &self.bytes }
 
+	/// Puts bytes back into the arena, with the number they were written
+	/// under.
+	///
+	/// The other half of [`raw`](Self::raw), and it is deliberately blunt: it
+	/// copies and stamps, and asks nothing about what the bytes mean. What
+	/// keeps it honest is the layout number - a build whose own number has
+	/// moved on will find these bytes stamped with the old one and zero them
+	/// on the next [`get`](Self::get), reporting itself fresh, which is
+	/// already what happens when a game changes its state struct.
+	///
+	/// A short slice leaves the rest of the arena zeroed; a long one is
+	/// truncated. Neither is unsound, for the reason the whole arena is not:
+	/// every bit pattern is a valid `T`.
+	///
+	/// @param bytes - what to copy in
+	/// @param layout - the number to stamp them with, zero for unclaimed
+	pub fn put_raw(&mut self, bytes: &[u8], layout: u64) {
+		let taken = bytes.len().min(STATE_BYTES);
+
+		self.bytes = [0; STATE_BYTES];
+		self.bytes[..taken].copy_from_slice(&bytes[..taken]);
+		self.layout = layout;
+	}
+
 	/// Forgets everything, so the next [`get`](Self::get) reports itself fresh.
 	pub fn reset(&mut self) {
 		self.bytes = [0; STATE_BYTES];
