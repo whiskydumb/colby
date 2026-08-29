@@ -101,13 +101,21 @@ pub(crate) fn take(path: &Path) -> Result {
 	let mut scripts = Scripts::new()?;
 
 	let mut interface = Interface::new();
-	world.ui.set_viewport(
-		colby_core::glam::Vec2::new(
-			f32::from(u16::try_from(SIZE.0).unwrap_or(u16::MAX)),
-			f32::from(u16::try_from(SIZE.1).unwrap_or(u16::MAX)),
-		),
-		1.0,
+	let viewport = colby_core::glam::Vec2::new(
+		f32::from(u16::try_from(SIZE.0).unwrap_or(u16::MAX)),
+		f32::from(u16::try_from(SIZE.1).unwrap_or(u16::MAX)),
 	);
+	world.ui.set_viewport(viewport, 1.0);
+
+	// beside the viewport and before the steps, exactly as the window path
+	// does it. `shoot_with` sets this as well, and too late to be the only
+	// place: it sets it on the way into the scene pass, which is after the
+	// overlays have been prepared - and a debug label is projected during
+	// prepare, so one would be placed through whatever aspect the world was
+	// still holding. That is a stretch of exactly the window's own ratio, and
+	// it is invisible at the middle of the screen, which is where the only
+	// label this ever had happened to sit.
+	world.aspect = viewport.x / viewport.y;
 	interface.attach(capture.device(), Capture::format())?;
 
 	for number in 1..=STEPS {
