@@ -166,6 +166,91 @@ mod tests {
 		);
 	}
 
+	/// A small box holding one much larger red one.
+	///
+	/// @param overflow - what the outer box does with what does not fit
+	/// @param radius - how round the outer box is
+	fn nested(overflow: &str, radius: &str) -> String {
+		format!(
+			"<style>body {{ padding: 0; }} #p {{ position: absolute; left: 40px; top: 40px; \
+			 width: 80px; height: 80px; overflow: {overflow}; border-radius: {radius}; }} #c {{ \
+			 position: absolute; left: 0; top: 0; width: 200px; height: 200px; background: \
+			 #ff0000; }}</style><div id=\"p\"><div id=\"c\"></div></div>"
+		)
+	}
+
+	#[test]
+	fn a_box_cuts_off_what_does_not_fit_inside_it() {
+		let Some(image) = shoot(&nested("hidden", "0")) else {
+			return;
+		};
+
+		// the outer box is 80 wide at (40, 40) and the inner one is 200, so
+		// everything past 120 is the part that has to be gone.
+		assert!(ink(&image, 50, 50, 110, 110), "what fits is drawn");
+		assert!(
+			!ink(&image, 130, 130, 230, 230),
+			"and what does not is not, diagonally past the corner"
+		);
+		assert!(
+			!ink(&image, 130, 50, 230, 110),
+			"nor along the rows the box does occupy, which is the case a test of the corner \
+			 alone would pass without clipping either axis"
+		);
+	}
+
+	#[test]
+	fn the_same_box_left_visible_lets_all_of_it_out() {
+		let Some(image) = shoot(&nested("visible", "0")) else {
+			return;
+		};
+
+		assert!(
+			ink(&image, 130, 130, 230, 230),
+			"nothing was asked for, so nothing is cut off - which is what says the test above \
+			 measures clipping rather than a layout that never overflowed"
+		);
+	}
+
+	#[test]
+	fn a_clip_is_every_clipping_box_above_it_and_not_the_nearest_one() {
+		// the middle box is *wider* than the one holding it, so a clip that
+		// took only the nearest one would let the red out to two hundred.
+		let Some(image) = shoot(
+			"<style>body { padding: 0; } #p { position: absolute; left: 40px; top: 40px; \n			 \
+			 width: 80px; height: 80px; overflow: hidden; } #m { position: absolute; left: \n			 \
+			 0; top: 0; width: 200px; height: 200px; overflow: hidden; } #c { position: \n			 \
+			 absolute; left: 0; top: 0; width: 400px; height: 400px; background: #ff0000; \n			 \
+			 }</style><div id=\"p\"><div id=\"m\"><div id=\"c\"></div></div></div>",
+		) else {
+			return;
+		};
+
+		assert!(ink(&image, 50, 50, 110, 110), "the outermost box still shows what fits");
+		assert!(
+			!ink(&image, 130, 130, 230, 230),
+			"and the one it holds does not get to overrule it by being bigger"
+		);
+	}
+
+	#[test]
+	fn a_round_box_cuts_on_its_curve_and_not_on_its_corner() {
+		let Some(image) = shoot(&nested("hidden", "40px")) else {
+			return;
+		};
+
+		// eighty wide and forty round is a circle at (80, 80).
+		assert!(ink(&image, 70, 70, 90, 90), "the middle of the circle is filled");
+		assert!(
+			!ink(&image, 41, 41, 50, 50),
+			"and its corner is empty, which a scissor rectangle could not have managed"
+		);
+		assert!(
+			ink(&image, 70, 42, 90, 50),
+			"while the top of the curve, between the corners, is still inside"
+		);
+	}
+
 	#[test]
 	fn a_box_is_painted_where_the_layout_put_it_and_nowhere_else() {
 		let Some(image) = shoot(

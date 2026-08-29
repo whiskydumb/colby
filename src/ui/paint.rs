@@ -598,7 +598,7 @@ fn vertex_stride() -> u64 { u64::try_from(size_of::<Vertex>()).unwrap_or(56) }
 /// @note: offsets written out rather than taken from a macro, so that a change
 /// to `Vertex` shows up here as a mismatch to fix instead of as a picture made
 /// of garbage.
-const VERTEX_ATTRIBUTES: [VertexAttribute; 7] = [
+const VERTEX_ATTRIBUTES: [VertexAttribute; 9] = [
 	VertexAttribute {
 		format: VertexFormat::Float32x2,
 		offset: 0,
@@ -634,6 +634,16 @@ const VERTEX_ATTRIBUTES: [VertexAttribute; 7] = [
 		offset: 52,
 		shader_location: 6,
 	},
+	VertexAttribute {
+		format: VertexFormat::Float32x4,
+		offset: 56,
+		shader_location: 7,
+	},
+	VertexAttribute {
+		format: VertexFormat::Float32,
+		offset: 72,
+		shader_location: 8,
+	},
 ];
 
 #[cfg(test)]
@@ -642,7 +652,11 @@ mod tests {
 
 	#[test]
 	fn the_vertex_layout_matches_the_struct_it_describes() {
-		assert_eq!(vertex_stride(), 56, "two, two, two, two, four floats and two more");
+		assert_eq!(
+			vertex_stride(),
+			76,
+			"two, two, two, two, four, two, then four for the clip and one for its radius"
+		);
 
 		let last = VERTEX_ATTRIBUTES
 			.last()

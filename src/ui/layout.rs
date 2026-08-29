@@ -38,6 +38,27 @@ use taffy::{
 	},
 };
 
+/// A clip rectangle that cuts nothing off.
+///
+/// A rectangle rather than an absent one, because the shader wants four numbers
+/// either way and a branch per pixel is worse than a comparison that is always
+/// false. Far enough out that no layout reaches it, near enough in that the
+/// arithmetic stays exact in single precision.
+pub const UNCLIPPED: [f32; 4] = [-1.0e6, -1.0e6, 1.0e6, 1.0e6];
+
+/// The two rectangles overlapped.
+///
+/// @param one - left, top, right, bottom
+/// @param other - the same
+fn overlap(one: [f32; 4], other: [f32; 4]) -> [f32; 4] {
+	[
+		one[0].max(other[0]),
+		one[1].max(other[1]),
+		one[2].min(other[2]),
+		one[3].min(other[3]),
+	]
+}
+
 /// One box, laid out, in layout pixels with the origin at the top left.
 #[derive(Clone, Debug)]
 pub struct Placed {
@@ -49,6 +70,24 @@ pub struct Placed {
 
 	/// Where it is: x, y, width, height.
 	pub rect: [f32; 4],
+
+	/// What every clipping ancestor between it and the root leaves of it:
+	/// left, top, right, bottom.
+	///
+	/// A box's own `overflow` is **not** in here - it applies to what is inside
+	/// the box rather than to the box, which is the same rule CSS has and the
+	/// reason a panel with rounded corners can still paint its own background
+	/// out to them.
+	pub clip: [f32; 4],
+
+	/// How round the corners of that rectangle are.
+	///
+	/// The innermost clipping ancestor's, and only that one's. Two rounded
+	/// clips nested inside each other are not a rounded rectangle between them,
+	/// and one is what a vertex can carry; the outer one is kept as its square
+	/// rectangle, which is exact everywhere except within a corner radius of
+	/// its own corners.
+	pub clip_radius: f32,
 
 	/// Everything the cascade decided about it.
 	pub style: Style,
@@ -186,13 +225,16 @@ fn place(
 		return;
 	}
 
-	// absolute positions, accumulated in creation order. A node's parent is
-	// always earlier in the list than it is, so one pass is enough.
+	// absolute positions and clip rectangles, accumulated in creation order. A
+	// node's parent is always earlier in the list than it is, so one pass is
+	// enough for both.
 	let mut origins: Vec<Vec2> = Vec::with_capacity(building.len());
+	let mut clips: Vec<([f32; 4], f32)> = Vec::with_capacity(building.len());
 
 	for node in &building {
 		let Ok(layout) = tree.layout(node.taffy) else {
 			origins.push(Vec2::ZERO);
+			clips.push((UNCLIPPED, 0.0));
 
 			continue;
 		};
@@ -204,10 +246,28 @@ fn place(
 		let origin = parent + Vec2::new(layout.location.x, layout.location.y);
 		origins.push(origin);
 
+		let rect = [origin.x, origin.y, layout.size.width, layout.size.height];
+		let (inherited, inherited_radius) = clips
+			.get(node.parent)
+			.copied()
+			.unwrap_or((UNCLIPPED, 0.0));
+
+		// what this node hands its children: its own box cut out of whatever
+		// it was handed, if it clips at all.
+		clips.push(if node.style.overflow.unwrap_or_default().clips() {
+			let own = [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]];
+
+			(overlap(inherited, own), DocumentData::radius(&node.style, rect[2].min(rect[3])))
+		} else {
+			(inherited, inherited_radius)
+		});
+
 		into.push(Placed {
 			panel: id,
 			node: node.document_node,
-			rect: [origin.x, origin.y, layout.size.width, layout.size.height],
+			rect,
+			clip: inherited,
+			clip_radius: inherited_radius,
 			style: node.style.clone(),
 			font: node.font,
 			font_size: node.font_size,

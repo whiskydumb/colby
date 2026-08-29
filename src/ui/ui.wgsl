@@ -12,6 +12,13 @@
 // Both of the shapes are antialiased against the screen-space derivative of
 // their own distance rather than against a fixed width, which is what makes one
 // baked atlas legible at every font size a stylesheet asks for.
+//
+// Every quad also carries what is left of it after `overflow: hidden` on any
+// box above it. Cutting here rather than with a scissor rectangle keeps a
+// document at one draw call per texture instead of one per clipping box as
+// well, and it is what makes clipping able to follow a corner radius: the
+// distance function a rounded rectangle is already drawn with is the same one
+// the cut is measured against.
 
 struct Screen {
 	// the layout area, in layout pixels. Positions are in the same units, so a
@@ -36,6 +43,10 @@ struct VertexIn {
 	// range of a distance byte covers for a glyph.
 	@location(5) radius: f32,
 	@location(6) kind: f32,
+	// what is left of this quad after clipping: left, top, right, bottom, in
+	// layout pixels, and how round that rectangle's corners are.
+	@location(7) clip: vec4<f32>,
+	@location(8) clip_radius: f32,
 }
 
 struct VertexOut {
@@ -46,6 +57,12 @@ struct VertexOut {
 	@location(3) color: vec4<f32>,
 	@location(4) radius: f32,
 	@location(5) @interpolate(flat) kind: u32,
+	// where this pixel is in layout pixels, which is the space the clip
+	// rectangle is in. `@builtin(position)` is in physical pixels and would be
+	// the wrong one on a scaled display.
+	@location(6) at: vec2<f32>,
+	@location(7) @interpolate(flat) clip_rect: vec4<f32>,
+	@location(8) @interpolate(flat) clip_radius: f32,
 }
 
 @vertex
@@ -63,6 +80,9 @@ fn vs_main(in: VertexIn) -> VertexOut {
 	out.color = in.color;
 	out.radius = in.radius;
 	out.kind = u32(in.kind + 0.5);
+	out.at = in.position;
+	out.clip_rect = in.clip;
+	out.clip_radius = in.clip_radius;
 
 	return out;
 }
@@ -80,6 +100,19 @@ fn rounded_distance(local: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 
 // One pixel's worth of the value, for antialiasing. Guarded because fwidth is
 // zero on a degenerate quad, and dividing by it would put NaN on screen.
 fn edge_width(value: f32) -> f32 { return max(fwidth(value), 0.0001); }
+
+// How much of this pixel survives the clip rectangle, from zero to one. The
+// same rounded distance the shapes use, measured from the middle of the
+// rectangle that is doing the cutting rather than from the middle of the quad
+// being cut.
+fn clip_coverage(at: vec2<f32>, rect: vec4<f32>, radius: f32) -> f32 {
+	let half_size = max((rect.zw - rect.xy) * 0.5, vec2<f32>(0.0, 0.0));
+	let middle = (rect.xy + rect.zw) * 0.5;
+	let corner = min(radius, min(half_size.x, half_size.y));
+	let distance = rounded_distance(at - middle, half_size, corner);
+
+	return clamp(0.5 - distance / edge_width(distance), 0.0, 1.0);
+}
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
@@ -104,6 +137,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 		let distance = rounded_distance(in.local, in.half_size, in.radius);
 		alpha = alpha * clamp(0.5 - distance / edge_width(distance), 0.0, 1.0);
 	}
+
+	alpha = alpha * clip_coverage(in.at, in.clip_rect, in.clip_radius);
 
 	if alpha <= 0.0 {
 		discard;

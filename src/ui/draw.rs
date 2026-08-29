@@ -20,9 +20,13 @@ use crate::layout::{Placed, background, foreground};
 
 /// One corner of one quad.
 ///
-/// Fat, at fifty-six bytes. An interface is thousands of these rather than
+/// Fat, at seventy-six bytes. An interface is thousands of these rather than
 /// millions, and the alternative - a uniform per box, or a pipeline per kind -
-/// costs a draw call per box instead of a few floats per corner.
+/// costs a draw call per box instead of a few floats per corner. The clip
+/// rectangle is here for the same reason and is the case that makes the trade
+/// pay: cutting with a scissor rectangle instead would split a document into
+/// one draw call per clipping box on top of the one per texture, and it could
+/// not follow a corner radius at all.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
@@ -48,6 +52,14 @@ pub struct Vertex {
 
 	/// Which of the three kinds this is. @ref `ui.wgsl`.
 	pub kind: f32,
+
+	/// What is left of it after every clipping ancestor: left, top, right,
+	/// bottom, in layout pixels. @ref
+	/// [`UNCLIPPED`](crate::layout::UNCLIPPED).
+	pub clip: [f32; 4],
+
+	/// How round the corners of that rectangle are.
+	pub clip_radius: f32,
 }
 
 /// A rounded rectangle, painted flat.
@@ -112,7 +124,15 @@ impl DrawList {
 	}
 
 	/// Adds one quad to the open batch.
-	fn quad(&mut self, rect: [f32; 4], uv: [f32; 4], color: Vec4, radius: f32, kind: f32) {
+	fn quad(
+		&mut self,
+		rect: [f32; 4],
+		uv: [f32; 4],
+		color: Vec4,
+		radius: f32,
+		kind: f32,
+		clip: ([f32; 4], f32),
+	) {
 		let (x, y, width, height) = (rect[0], rect[1], rect[2], rect[3]);
 		if width <= 0.0 || height <= 0.0 || color.w <= 0.0 {
 			return;
@@ -136,6 +156,8 @@ impl DrawList {
 				color: color.to_array(),
 				radius,
 				kind,
+				clip: clip.0,
+				clip_radius: clip.1,
 			});
 		}
 
@@ -202,7 +224,14 @@ pub fn build(world: &World, placed: &[Placed], list: &mut DrawList) {
 
 		list.want(Binding::Blank);
 		let radius = DocumentData::radius(&box_of.style, box_of.rect[2].min(box_of.rect[3]));
-		list.quad(box_of.rect, [0.0, 0.0, 1.0, 1.0], background(box_of).0, radius, KIND_RECT);
+		list.quad(
+			box_of.rect,
+			[0.0, 0.0, 1.0, 1.0],
+			background(box_of).0,
+			radius,
+			KIND_RECT,
+			clip_of(box_of),
+		);
 		list.close();
 
 		if node.is_image() && !box_of.image.is_empty() {
@@ -225,7 +254,14 @@ fn image(world: &World, box_of: &Placed, radius: f32, list: &mut DrawList) {
 	}
 
 	list.want(Binding::Image(id));
-	list.quad(box_of.rect, [0.0, 0.0, 1.0, 1.0], foreground(box_of).0, radius, KIND_IMAGE);
+	list.quad(
+		box_of.rect,
+		[0.0, 0.0, 1.0, 1.0],
+		foreground(box_of).0,
+		radius,
+		KIND_IMAGE,
+		clip_of(box_of),
+	);
 	list.close();
 }
 
@@ -248,8 +284,12 @@ fn text(world: &World, box_of: &Placed, list: &mut DrawList) {
 		origin: [box_of.rect[0], box_of.rect[1]],
 		wrap,
 		color: foreground(box_of).0,
+		clip: clip_of(box_of),
 	});
 }
+
+/// The clip rectangle a box is drawn under, as the pair a quad wants.
+fn clip_of(box_of: &Placed) -> ([f32; 4], f32) { (box_of.clip, box_of.clip_radius) }
 
 /// Where a run of text goes and what it is drawn with.
 ///
@@ -273,6 +313,11 @@ pub(crate) struct Run<'a> {
 
 	/// Linear with straight alpha.
 	pub(crate) color: Vec4,
+
+	/// What is left of the run after clipping, and how round that is. @ref
+	/// [`UNCLIPPED`](crate::layout::UNCLIPPED) for a run that is not clipped at
+	/// all, which is what a label anchored in the world uses.
+	pub(crate) clip: ([f32; 4], f32),
 }
 
 /// Adds one glyph quad per drawn character of a run of text.
@@ -314,6 +359,7 @@ pub(crate) fn glyphs(list: &mut DrawList, text: &str, run: &Run<'_>) {
 			run.color,
 			range,
 			KIND_GLYPH,
+			run.clip,
 		);
 	});
 
@@ -386,6 +432,8 @@ mod tests {
 			panel,
 			node,
 			rect,
+			clip: crate::layout::UNCLIPPED,
+			clip_radius: 0.0,
 			style: colby_core::abi::ui::Style::root(),
 			font: FontId::NONE,
 			font_size: 10.0,

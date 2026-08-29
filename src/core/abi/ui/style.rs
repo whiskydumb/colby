@@ -175,6 +175,36 @@ pub enum Align {
 	Stretch,
 }
 
+/// What a box does with what does not fit inside it.
+///
+/// One property rather than CSS's `overflow-x` and `overflow-y`, and clipping
+/// on one axis clips on both. Two axes would want two clip rectangles that are
+/// not a rectangle between them, and the case that wants only one - a row of
+/// words that may run wide and must not run tall - is better served by wrapping
+/// than by letting it escape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Overflow {
+	/// It draws outside its box, as far as it likes.
+	#[default]
+	Visible,
+
+	/// It is cut off at the edge of the box.
+	Hidden,
+
+	/// It is cut off, and the box can be scrolled to see the rest.
+	Scroll,
+}
+
+impl Overflow {
+	/// Whether this cuts anything off.
+	///
+	/// [`Scroll`](Self::Scroll) clips exactly as [`Hidden`](Self::Hidden) does;
+	/// what it adds is a way to move what is behind the cut, and nothing about
+	/// the cut itself.
+	#[must_use]
+	pub const fn clips(self) -> bool { !matches!(self, Self::Visible) }
+}
+
 /// Four numbers around a box.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Edges {
@@ -242,6 +272,9 @@ pub struct Style {
 
 	/// Where children sit across the other one.
 	pub align: Option<Align>,
+
+	/// What it does with what does not fit inside it.
+	pub overflow: Option<Overflow>,
 
 	/// This box's share of its parent's spare room.
 	pub grow: Option<f32>,
@@ -317,6 +350,7 @@ impl Style {
 			wrap: Some(Wrap::NoWrap),
 			justify: Some(Justify::Start),
 			align: Some(Align::Stretch),
+			overflow: Some(Overflow::Visible),
 			grow: Some(0.0),
 			shrink: Some(1.0),
 			basis: Some(Length::Auto),
@@ -351,6 +385,7 @@ impl Style {
 		self.wrap = other.wrap.or(self.wrap);
 		self.justify = other.justify.or(self.justify);
 		self.align = other.align.or(self.align);
+		self.overflow = other.overflow.or(self.overflow);
 		self.grow = other.grow.or(self.grow);
 		self.shrink = other.shrink.or(self.shrink);
 		self.basis = other.basis.or(self.basis);

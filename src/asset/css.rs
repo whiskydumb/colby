@@ -29,7 +29,9 @@
 
 use colby_core::abi::ui::{
 	Rule, Selector,
-	style::{Align, Color, Direction, Display, Edges, Justify, Length, Position, Style, Wrap},
+	style::{
+		Align, Color, Direction, Display, Edges, Justify, Length, Overflow, Position, Style, Wrap,
+	},
 };
 
 /// What a stylesheet turned into.
@@ -183,6 +185,12 @@ fn flex_property(style: &mut Style, property: &str, value: &str) -> bool {
 			| "flex-end" | "end" => style.align = Some(Align::End),
 			| "center" => style.align = Some(Align::Center),
 			| "stretch" => style.align = Some(Align::Stretch),
+			| _ => return false,
+		},
+		| "overflow" | "overflow-x" | "overflow-y" => match value {
+			| "visible" => style.overflow = Some(Overflow::Visible),
+			| "hidden" | "clip" => style.overflow = Some(Overflow::Hidden),
+			| "scroll" | "auto" => style.overflow = Some(Overflow::Scroll),
 			| _ => return false,
 		},
 		| "flex-grow" => style.grow = number(value),

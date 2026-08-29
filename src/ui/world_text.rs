@@ -95,6 +95,9 @@ pub(crate) fn build(world: &World, list: &mut DrawList) {
 			origin: [measured.x.mul_add(-0.5, at.x), at.y - measured.y],
 			wrap: None,
 			color: label.color.extend(1.0),
+			// never, on purpose: a label is engine chrome anchored in the world,
+			// and the box it would be cut by belongs to somebody else's document.
+			clip: (crate::layout::UNCLIPPED, 0.0),
 		});
 	}
 }
