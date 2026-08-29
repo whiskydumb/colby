@@ -144,6 +144,14 @@ pub(crate) fn find(
 				continue;
 			}
 
+			// and last, the filter a game set up on purpose. Last because it is
+			// the only one of the four that is somebody's decision rather than an
+			// arrangement of the world, so a pair skipped here is skipped for a
+			// reason that can be read out of the two bodies.
+			if !one.layers.meets(other.layers) {
+				continue;
+			}
+
 			let list = if sensing { &mut *sensed } else { &mut *into };
 
 			pair(simulation, (first, one), (second, other), list);

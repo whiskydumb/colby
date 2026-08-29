@@ -37,7 +37,7 @@
 
 use super::{
 	entity::Transform,
-	physics::{BodyId, MAX_IGNORED, TraceInfo, TraceResult},
+	physics::{BodyId, Layers, MAX_IGNORED, TraceInfo, TraceResult},
 };
 use crate::{abi::World, glam::Vec3};
 
@@ -115,6 +115,13 @@ pub struct Motion {
 	/// if it is underneath.
 	pub ground: f32,
 
+	/// Which layers the box is on, and which it collides with.
+	///
+	/// Handed straight to every sweep this move makes, so a character that
+	/// walks through a layer says so once here rather than at each of them.
+	/// [`Layers::ALL`] unless it says otherwise.
+	pub layers: Layers,
+
 	/// Bodies the move is blind to. Its own, at least.
 	ignore: [BodyId; MAX_IGNORED],
 
@@ -138,6 +145,7 @@ impl Motion {
 			dt,
 			step: STEP,
 			ground: GROUND,
+			layers: Layers::ALL,
 			ignore: [BodyId::NONE; MAX_IGNORED],
 			ignored: 0,
 		}
@@ -159,6 +167,16 @@ impl Motion {
 	#[must_use]
 	pub const fn standing(mut self, cosine: f32) -> Self {
 		self.ground = cosine;
+
+		self
+	}
+
+	/// The same move, on other layers.
+	///
+	/// @param layers - which layers the box is on and which it collides with
+	#[must_use]
+	pub const fn layered(mut self, layers: Layers) -> Self {
+		self.layers = layers;
 
 		self
 	}
@@ -426,7 +444,7 @@ fn probe(world: &World, motion: &Motion, position: Vec3) -> Ground {
 /// @param from - where the box's middle starts
 /// @param to - where it would end
 fn cast(world: &World, motion: &Motion, from: Vec3, to: Vec3) -> TraceResult {
-	let mut info = TraceInfo::swept(from, to, motion.extents);
+	let mut info = TraceInfo::swept(from, to, motion.extents).layered(motion.layers);
 
 	for &body in motion.ignored() {
 		info = info.ignoring(body);

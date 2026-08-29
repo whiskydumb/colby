@@ -345,6 +345,13 @@ fn nearest(
 			continue;
 		}
 
+		// the same symmetric rule the narrow phase uses, and it has to be the
+		// same one: a sweep that reports clear where the solver reports contact
+		// leaves whatever was sweeping with no stable place to stand.
+		if !info.layers.meets(body.layers) {
+			continue;
+		}
+
 		let Some(hit) = test(id, body) else {
 			continue;
 		};

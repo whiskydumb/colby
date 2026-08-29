@@ -61,6 +61,99 @@ pub const MAX_BODIES: usize = 1024;
 /// the hand, the thing it is welded to, and the player holding both.
 pub const MAX_IGNORED: usize = 8;
 
+/// Which layers a thing is on, and which of them it interacts with.
+///
+/// Two bitmasks rather than one number, because "what am I" and "what do I
+/// care about" are different questions and a single layer number can only
+/// answer the first. A prop is on the prop layer and interacts with
+/// everything; a trigger looking for players is on the trigger layer and
+/// interacts with the player layer alone.
+///
+/// **The rule is symmetric: both sides have to agree.** A meets B only when
+/// A's layer is in B's mask *and* B's layer is in A's mask. The alternative -
+/// either side being enough - produces a pair that one body pushes and the
+/// other passes through, which is a contradiction rather than a filter.
+///
+/// Bit `n` is layer `n`, and [`bit`](Self::bit) is how to name one without
+/// writing a shift that is undefined past thirty-one.
+#[repr(C)]
+#[derive(
+	Clone, Copy, Debug, PartialEq, Eq, Hash, crate::bytemuck::Pod, crate::bytemuck::Zeroable,
+)]
+pub struct Layers {
+	/// The layers this is on. Usually one bit.
+	pub layer: u32,
+
+	/// The layers it interacts with.
+	pub mask: u32,
+}
+
+impl Layers {
+	/// On every layer, interacting with every layer.
+	///
+	/// What a query is unless it says otherwise: a trace has no layer of its
+	/// own to be filtered by, so it claims all of them and nobody's mask
+	/// excludes it.
+	pub const ALL: Self = Self { layer: u32::MAX, mask: u32::MAX };
+	/// On layer zero, interacting with every layer.
+	///
+	/// What a body is unless it says otherwise, and what every body in a world
+	/// that has never heard of layers is. Note this is deliberately *not*
+	/// [`ALL`](Self::ALL): a body on every layer at once cannot be filtered out
+	/// by narrowing a mask, which is the one thing masks are for.
+	pub const DEFAULT: Self = Self { layer: 1, mask: u32::MAX };
+	/// On nothing, interacting with nothing.
+	///
+	/// What a zeroed [`Layers`] reads as, which is why the zero value is inert
+	/// rather than universal: a handle read out of a freshly zeroed arena
+	/// should do nothing, not everything.
+	pub const NONE: Self = Self { layer: 0, mask: 0 };
+
+	/// The bit that stands for one layer.
+	///
+	/// Wraps rather than overflowing, because a shift past thirty-one is
+	/// undefined and a constant somebody typed is not worth a panic.
+	///
+	/// @param index - which layer, `0 ..= 31`
+	#[must_use]
+	pub const fn bit(index: u32) -> u32 { 1_u32 << (index % u32::BITS) }
+
+	/// On one layer, interacting with every layer.
+	///
+	/// @param index - which layer, `0 ..= 31`
+	#[must_use]
+	pub const fn single(index: u32) -> Self { Self { layer: Self::bit(index), mask: u32::MAX } }
+
+	/// On some layers, interacting with some layers.
+	///
+	/// @param layer - the bits it is on
+	/// @param mask - the bits it interacts with
+	#[must_use]
+	pub const fn new(layer: u32, mask: u32) -> Self { Self { layer, mask } }
+
+	/// The same layers, interacting with something else.
+	///
+	/// @param mask - the bits to interact with
+	#[must_use]
+	pub const fn interacting(mut self, mask: u32) -> Self {
+		self.mask = mask;
+
+		self
+	}
+
+	/// Whether these two have anything to say to each other.
+	///
+	/// @param other - the layers on the far side
+	#[must_use]
+	pub const fn meets(self, other: Self) -> bool {
+		self.layer & other.mask != 0 && other.layer & self.mask != 0
+	}
+}
+
+impl Default for Layers {
+	fn default() -> Self { Self::DEFAULT }
+}
+
 /// Which of the three shapes a body is.
 ///
 /// Three of them, because a box, a ball and a triangle soup cover everything a
@@ -341,6 +434,19 @@ pub struct Body {
 	/// to stop it.
 	pub sensor: bool,
 
+	/// Which layers it is on, and which it interacts with.
+	///
+	/// Read by everything that puts two bodies together - the narrow phase, the
+	/// sweep that stops a fast body passing through a thin one, and both
+	/// traces. A body whose layers do not meet another's is not merely unpushed
+	/// by it: the pair is never formed, so there is no touch event and no
+	/// overlap either, which is what a trigger volume that only notices players
+	/// needs.
+	///
+	/// [`Layers::DEFAULT`] is layer zero interacting with everything, so a body
+	/// that says nothing behaves exactly as it did before layers existed.
+	pub layers: Layers,
+
 	/// Whether the solver has stopped integrating this body.
 	///
 	/// Set by the solver when a dynamic body has been slow enough for long
@@ -382,6 +488,7 @@ impl Body {
 			restitution: Self::RESTITUTION,
 			friction: Self::FRICTION,
 			sensor: false,
+			layers: Layers::DEFAULT,
 			sleeping: false,
 			entity: EntityId::NONE,
 		}
@@ -468,6 +575,18 @@ impl Body {
 	#[must_use]
 	pub const fn sensing(mut self) -> Self {
 		self.sensor = true;
+
+		self
+	}
+
+	/// The same body, on other layers.
+	///
+	/// Chainable, like the rest of these.
+	///
+	/// @param layers - which layers it is on and which it interacts with
+	#[must_use]
+	pub const fn layered(mut self, layers: Layers) -> Self {
+		self.layers = layers;
 
 		self
 	}
@@ -908,6 +1027,16 @@ pub struct TraceInfo {
 	/// The half-extents of that box.
 	pub extents: Vec3,
 
+	/// Which layers this trace is on, and which it can hit.
+	///
+	/// [`Layers::ALL`] unless it says otherwise, which is on every layer and
+	/// interacting with every layer - so a trace that never mentions this
+	/// reaches exactly what it always did. A trace narrowed to one layer skips
+	/// every body outside it, and a body whose own mask excludes the trace's
+	/// layer skips the trace, because the rule is the symmetric one @ref
+	/// [`Layers::meets`].
+	pub layers: Layers,
+
 	/// Bodies to pretend are not there.
 	ignore: [BodyId; MAX_IGNORED],
 
@@ -927,6 +1056,7 @@ impl TraceInfo {
 			end,
 			is_box: false,
 			extents: Vec3::ZERO,
+			layers: Layers::ALL,
 			ignore: [BodyId::NONE; MAX_IGNORED],
 			ignored: 0,
 		}
@@ -956,9 +1086,25 @@ impl TraceInfo {
 			end,
 			is_box: true,
 			extents,
+			layers: Layers::ALL,
 			ignore: [BodyId::NONE; MAX_IGNORED],
 			ignored: 0,
 		}
+	}
+
+	/// The same trace, on other layers.
+	///
+	/// Chainable, like [`ignoring`](Self::ignoring), and the two filters are
+	/// different tools: an ignore list names the handful of bodies this one
+	/// call must not see, and layers say what kind of thing the trace is about
+	/// at all.
+	///
+	/// @param layers - which layers it is on and which it can hit
+	#[must_use]
+	pub const fn layered(mut self, layers: Layers) -> Self {
+		self.layers = layers;
+
+		self
 	}
 
 	/// The same trace, blind to one more body.
@@ -1384,5 +1530,67 @@ mod tests {
 		bodies.forget_overlaps();
 
 		assert!(bodies.overlaps().is_empty(), "until the solver says what is true now");
+	}
+	#[test]
+	fn a_layer_bit_wraps_rather_than_shifting_off_the_end() {
+		assert_eq!(Layers::bit(0), 1, "layer zero is the low bit");
+		assert_eq!(Layers::bit(31), 1 << 31, "and thirty-one is the high one");
+		assert_eq!(Layers::bit(32), 1, "past that it wraps rather than being undefined");
+	}
+
+	#[test]
+	fn two_bodies_that_say_nothing_about_layers_still_meet() {
+		assert!(
+			Layers::DEFAULT.meets(Layers::DEFAULT),
+			"or every world written before layers existed would come apart"
+		);
+		assert!(Layers::ALL.meets(Layers::DEFAULT), "and a trace reaches them all");
+	}
+
+	#[test]
+	fn narrowing_one_side_alone_is_enough_to_separate_a_pair() {
+		let prop = Layers::single(0);
+		let ghost = Layers::single(1).interacting(Layers::bit(1));
+
+		assert!(!ghost.meets(prop), "the one that narrowed does not want the other");
+		assert!(
+			!prop.meets(ghost),
+			"and the one that did not is refused all the same, because the rule is symmetric"
+		);
+	}
+
+	#[test]
+	fn layers_that_overlap_in_both_directions_meet() {
+		let player = Layers::new(Layers::bit(0), Layers::bit(1) | Layers::bit(2));
+		let wall = Layers::new(Layers::bit(1), Layers::bit(0));
+
+		assert!(player.meets(wall), "each is in the other's mask");
+		assert!(wall.meets(player), "in both orders");
+	}
+
+	#[test]
+	fn a_zeroed_layers_is_inert_rather_than_universal() {
+		assert!(!Layers::NONE.meets(Layers::ALL), "it is on no layer anything can see");
+		assert!(!Layers::ALL.meets(Layers::NONE), "in either order");
+		assert!(!Layers::NONE.meets(Layers::NONE), "and not even with itself");
+	}
+
+	#[test]
+	fn a_body_is_on_layer_zero_and_a_trace_is_on_all_of_them() {
+		assert_eq!(
+			Body::default().layers,
+			Layers::DEFAULT,
+			"a body that says nothing behaves as it did before layers existed"
+		);
+		assert_eq!(
+			TraceInfo::ray(Vec3::ZERO, Vec3::X).layers,
+			Layers::ALL,
+			"and so does a trace"
+		);
+		assert_eq!(
+			TraceInfo::swept(Vec3::ZERO, Vec3::X, Vec3::ONE).layers,
+			Layers::ALL,
+			"of either kind"
+		);
 	}
 }

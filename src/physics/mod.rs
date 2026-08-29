@@ -366,7 +366,9 @@ impl Simulation {
 				continue;
 			}
 
-			let info = TraceInfo::swept(was, body.transform.position, extents).ignoring(id);
+			let info = TraceInfo::swept(was, body.transform.position, extents)
+				.ignoring(id)
+				.layered(body.layers);
 			let result = query::swept(&world.bodies, self, &info);
 
 			if !result.hit || result.started_solid {
@@ -657,7 +659,9 @@ unsafe fn borrow<'a>(
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{Body, BodyKind, EntityId, Joint, MeshId, Motion, Moved, Transform, character},
+		abi::{
+			Body, BodyKind, EntityId, Joint, Layers, MeshId, Motion, Moved, Transform, character,
+		},
 		glam::{Quat, Vec2},
 		time::STEP_SECONDS,
 	};
@@ -2433,5 +2437,220 @@ mod tests {
 
 		assert_eq!(result.body, body, "a trigger volume has no entity and is still there");
 		assert_eq!(result.entity, EntityId::NONE, "and reports none");
+	}
+	#[test]
+	fn a_body_falls_through_ground_it_does_not_share_a_layer_with() {
+		let dropped = |layers: Layers| {
+			let (mut world, mut simulation) = wired();
+			let floor = ground(&mut world);
+			world.bodies.get_mut(floor).expect("alive").layers = Layers::single(1);
+
+			let falling = world.bodies.spawn(
+				Body::dynamic(Shape::UNIT, Transform::at(Vec3::new(0.0, 3.0, 0.0)), 1.0)
+					.layered(layers),
+			);
+
+			settle(&mut world, &mut simulation, 120);
+
+			placed(&world, falling).y
+		};
+
+		assert!(dropped(Layers::ALL) > 0.4, "a body that meets the floor's layer stands on it");
+		assert!(
+			dropped(Layers::single(0).interacting(Layers::bit(0))) < -2.0,
+			"and one that does not is still falling"
+		);
+	}
+
+	#[test]
+	fn narrowing_only_the_floor_is_enough_to_fall_through_it() {
+		// the same drop from the other side. Nothing about the falling body
+		// changes, which is what makes this a test of the symmetric rule rather
+		// than a second copy of the one above.
+		let (mut world, mut simulation) = wired();
+		let floor = ground(&mut world);
+		world.bodies.get_mut(floor).expect("alive").layers =
+			Layers::single(1).interacting(Layers::bit(1));
+
+		let falling = world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.0, 3.0, 0.0)),
+			1.0,
+		));
+
+		settle(&mut world, &mut simulation, 120);
+
+		assert!(
+			placed(&world, falling).y < -2.0,
+			"the floor wants nothing from layer zero, so nothing on it lands"
+		);
+	}
+
+	#[test]
+	fn a_sensor_notices_only_what_it_shares_a_layer_with() {
+		let (mut world, mut simulation) = wired();
+		let volume = world.bodies.spawn(
+			Body::new(BodyKind::Static, Shape::cuboid(Vec3::splat(2.0)), Transform::IDENTITY)
+				.sensing()
+				.layered(Layers::new(Layers::bit(2), Layers::bit(1))),
+		);
+		let watched = world.bodies.spawn(
+			Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY)
+				.layered(Layers::single(1)),
+		);
+
+		world.bodies.spawn(
+			Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY)
+				.layered(Layers::single(3)),
+		);
+
+		settle(&mut world, &mut simulation, 1);
+
+		let inside: Vec<BodyId> = world.bodies.inside(volume).collect();
+
+		assert_eq!(
+			inside,
+			vec![watched],
+			"both boxes are in the volume and only the one on its mask is reported"
+		);
+	}
+
+	#[test]
+	fn a_ray_narrowed_to_a_layer_passes_through_everything_else() {
+		let (mut world, _simulation) = wired();
+		let near = world.bodies.spawn(
+			Body::new(BodyKind::Static, Shape::UNIT, Transform::at(Vec3::new(0.0, 0.0, 2.0)))
+				.layered(Layers::single(1)),
+		);
+		let far = world.bodies.spawn(
+			Body::new(BodyKind::Static, Shape::UNIT, Transform::at(Vec3::new(0.0, 0.0, -2.0)))
+				.layered(Layers::single(2)),
+		);
+		let aim = TraceInfo::ray(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -5.0));
+
+		assert_eq!(
+			world.trace_ray(&aim).body,
+			near,
+			"a trace that says nothing stops at the first thing in the way"
+		);
+		assert_eq!(
+			world
+				.trace_ray(&aim.layered(Layers::ALL.interacting(Layers::bit(2))))
+				.body,
+			far,
+			"and one narrowed to the far one's layer goes straight through the near one"
+		);
+	}
+
+	#[test]
+	fn a_swept_box_is_filtered_by_the_same_rule_a_ray_is() {
+		let (mut world, _simulation) = wired();
+		world.bodies.spawn(
+			Body::new(BodyKind::Static, Shape::UNIT, Transform::at(Vec3::new(0.0, 0.0, 2.0)))
+				.layered(Layers::single(1)),
+		);
+
+		let sweep = TraceInfo::swept(
+			Vec3::new(0.0, 0.0, 5.0),
+			Vec3::new(0.0, 0.0, -5.0),
+			Vec3::splat(0.1),
+		);
+
+		assert!(world.trace_box(&sweep).hit, "the box is in the way");
+		assert!(
+			!world
+				.trace_box(&sweep.layered(Layers::ALL.interacting(Layers::bit(3))))
+				.hit,
+			"and a sweep that wants layer three alone never sees it"
+		);
+	}
+
+	#[test]
+	fn a_body_a_trace_cannot_hit_can_still_be_hit_by_another() {
+		// the filter is per trace and not a property the body carries around,
+		// which is the difference between a layer and hiding a body.
+		let (mut world, _simulation) = wired();
+		world.bodies.spawn(
+			Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY)
+				.layered(Layers::single(4)),
+		);
+
+		let aim = TraceInfo::ray(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -5.0));
+
+		assert!(
+			!world
+				.trace_ray(&aim.layered(Layers::ALL.interacting(Layers::bit(0))))
+				.hit,
+			"one trace misses it"
+		);
+		assert!(world.trace_ray(&aim).hit, "and the next one, unnarrowed, does not");
+	}
+
+	#[test]
+	fn a_fast_body_is_not_pulled_back_out_of_something_it_does_not_meet() {
+		// the sweep that stops a fast body tunneling has to honor layers too,
+		// or a bullet on its own layer is stopped in mid-air by a wall it is
+		// supposed to pass through - and it would be stopped without a contact,
+		// which is the confusing half of getting this wrong.
+		let crossed = |layers: Layers| {
+			let (mut world, mut simulation) = wired();
+			world.bodies.spawn(
+				Body::new(
+					BodyKind::Static,
+					Shape::cuboid(Vec3::new(4.0, 4.0, 0.05)),
+					Transform::IDENTITY,
+				)
+				.layered(Layers::single(1)),
+			);
+
+			let pellet = world.bodies.spawn(
+				Body::dynamic(Shape::ball(0.05), Transform::at(Vec3::new(0.0, 0.0, 2.0)), 0.1)
+					.moving(Vec3::new(0.0, 0.0, -240.0), Vec3::ZERO)
+					.layered(layers),
+			);
+
+			settle(&mut world, &mut simulation, 2);
+
+			placed(&world, pellet).z
+		};
+
+		assert!(crossed(Layers::ALL) > -0.5, "a pellet that meets the pane is stopped at it");
+		assert!(
+			crossed(Layers::single(0).interacting(Layers::bit(0))) < -3.0,
+			"and one that does not is well past it"
+		);
+	}
+
+	#[test]
+	fn a_character_walks_through_a_wall_it_does_not_share_a_layer_with() {
+		let reached = |layers: Layers| {
+			let (mut world, _simulation) = wired();
+			ground(&mut world);
+			world.bodies.spawn(
+				Body::new(
+					BodyKind::Static,
+					Shape::cuboid(Vec3::new(2.0, 2.0, 0.2)),
+					Transform::at(Vec3::new(0.0, 1.0, 0.0)),
+				)
+				.layered(Layers::single(1)),
+			);
+
+			let mut at = Vec3::new(0.0, 0.5, 2.0);
+			for _ in 0..90 {
+				let motion =
+					Motion::new(at, Vec3::new(0.0, 0.0, -4.0), Vec3::splat(0.25), STEP_SECONDS)
+						.layered(layers);
+
+				at = character::move_and_slide(&world, &motion).position;
+			}
+
+			at.z
+		};
+
+		assert!(reached(Layers::ALL) > 0.0, "a box that meets the wall stops in front of it");
+		assert!(
+			reached(Layers::ALL.interacting(Layers::bit(0))) < -1.0,
+			"and one that does not walks straight through"
+		);
 	}
 }
