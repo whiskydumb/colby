@@ -48,7 +48,7 @@ use colby_core::{
 	glam::{Mat4, Quat, Vec2, Vec3},
 };
 
-use super::Gltf;
+use super::{Extracted, Gltf, Surface};
 use crate::json::Value;
 
 /// The drawing mode colby reads. Everything else is skipped with a warning.
@@ -68,6 +68,14 @@ pub struct Model {
 
 	/// Where each of them stands, in world space.
 	pub placements: Vec<Placement>,
+
+	/// Every material the file declares, in its own order, which is what a
+	/// [`Piece::material`] indexes.
+	pub materials: Vec<Surface>,
+
+	/// Pictures that were stored inside the file and have to be written out
+	/// beside its meshes, because nothing else will.
+	pub textures: Vec<Extracted>,
 
 	/// What the file said that could not be used. Not a failure: the rest of it
 	/// imported, and this is the one moment anybody is told.
@@ -121,11 +129,17 @@ pub fn import(file: &Gltf) -> Result<Model> {
 
 	build.pieces()?;
 	let placements = build.walk();
+	let mut coats = super::material::read(file);
+	let mut warnings = build.warnings;
+
+	warnings.append(&mut coats.warnings);
 
 	Ok(Model {
 		meshes: build.meshes,
 		placements,
-		warnings: build.warnings,
+		materials: coats.surfaces,
+		textures: coats.pictures,
+		warnings,
 	})
 }
 
@@ -321,7 +335,7 @@ impl Build<'_> {
 			.and_then(|entry| entry.get("name"))
 			.and_then(Value::as_str)
 			.unwrap_or("");
-		let mut base = tidy(written);
+		let mut base = super::tidy(written);
 
 		if base.is_empty() {
 			base = format!("{UNNAMED}{mesh}");
@@ -331,7 +345,7 @@ impl Build<'_> {
 			base = format!("{base}.{primitive}");
 		}
 
-		unique(&mut self.named, &base)
+		super::unique(&mut self.named, &base)
 	}
 
 	/// Walks the scene, working out where every piece stands.
@@ -403,7 +417,7 @@ impl Build<'_> {
 			let Some(piece) = self.piece_for(mesh, primitive, turned) else {
 				continue;
 			};
-			let mut base = tidy(written);
+			let mut base = super::tidy(written);
 
 			if base.is_empty() {
 				base = format!("node{index}");
@@ -414,7 +428,7 @@ impl Build<'_> {
 			}
 
 			out.push(Placement {
-				name: unique(&mut self.placed, &base),
+				name: super::unique(&mut self.placed, &base),
 				mesh: piece,
 				transform,
 			});
@@ -433,7 +447,8 @@ impl Build<'_> {
 			return Some(already);
 		}
 
-		let name = unique(&mut self.named, &format!("{}.mirrored", self.meshes[upright].name));
+		let name =
+			super::unique(&mut self.named, &format!("{}.mirrored", self.meshes[upright].name));
 		let index = self.meshes.len();
 
 		self.meshes.push(Piece {
@@ -635,43 +650,6 @@ fn turn_around(data: &MeshData) -> MeshData {
 	}
 
 	copy
-}
-
-/// A name from a file, as something that can be part of an asset's name.
-///
-/// Lowercase, and everything outside letters, digits, a dash, an underscore and
-/// a dot becomes an underscore. Leading and trailing separators go, so a name
-/// that was only punctuation comes back empty and the caller numbers it
-/// instead. Nothing here may produce a `.` or a `..`, because these end up as
-/// pieces of a path.
-fn tidy(name: &str) -> String {
-	let mut out = String::with_capacity(name.len());
-
-	for letter in name.chars() {
-		out.push(match letter {
-			| 'a'..='z' | '0'..='9' | '-' | '_' | '.' => letter,
-			| 'A'..='Z' => letter.to_ascii_lowercase(),
-			| _ => '_',
-		});
-	}
-
-	out.trim_matches(['_', '.', '-'].as_slice())
-		.to_owned()
-}
-
-/// A name nothing else in the list has, remembered.
-fn unique(taken: &mut Vec<String>, wanted: &str) -> String {
-	let mut name = wanted.to_owned();
-	let mut attempt = 1;
-
-	while taken.contains(&name) {
-		name = format!("{wanted}.{attempt}");
-		attempt += 1;
-	}
-
-	taken.push(name.clone());
-
-	name
 }
 
 /// The primitives of one mesh.

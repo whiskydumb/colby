@@ -43,8 +43,12 @@ use colby_core::{Result, err};
 use crate::json::{self, Value};
 
 mod geometry;
+mod material;
 
-pub use self::geometry::{Model, Piece, Placement, import};
+pub use self::{
+	geometry::{Model, Piece, Placement, import},
+	material::{Extracted, Picture, Surface},
+};
 
 /// The extension of a glTF written as JSON with its buffers beside it.
 pub const EXTENSION: &str = "gltf";
@@ -74,6 +78,8 @@ const DATA_PREFIX: &str = "data:";
 pub struct Gltf {
 	document: Value,
 	buffers: Vec<Vec<u8>>,
+	source: PathBuf,
+	root: PathBuf,
 }
 
 impl Gltf {
@@ -117,7 +123,12 @@ impl Gltf {
 
 		let buffers = load_buffers(&document, binary, source, root)?;
 
-		Ok(Self { document, buffers })
+		Ok(Self {
+			document,
+			buffers,
+			source: source.to_path_buf(),
+			root: root.to_path_buf(),
+		})
 	}
 
 	/// The document, for walking what this module does not interpret.
@@ -133,6 +144,62 @@ impl Gltf {
 		self.document
 			.get(name)
 			.map_or(&[], Value::as_array)
+	}
+
+	/// A file this document names, resolved beside it and checked.
+	///
+	/// The same rule the buffers follow, exposed because a material names
+	/// pictures the same way and the check that they stay inside the asset
+	/// tree should have one implementation.
+	///
+	/// @param uri - the address as the document wrote it, escapes and all
+	/// @return where it is, or nothing when it is not somewhere allowed
+	#[must_use]
+	pub fn beside(&self, uri: &str) -> Option<PathBuf> {
+		let named = unescape(uri)?;
+		let path = lexical(&self.source.parent()?.join(named));
+
+		path.starts_with(&self.root).then_some(path)
+	}
+
+	/// The source tree this file was read from inside.
+	#[must_use]
+	pub fn root(&self) -> &Path { &self.root }
+
+	/// One buffer view's bytes, for something stored whole rather than as
+	/// numbers.
+	///
+	/// An accessor is how a document points at *values*; this is how it
+	/// points at a picture, which is a file that happens to live inside
+	/// another one.
+	///
+	/// @param view - its index in the document's `bufferViews`
+	/// @return the bytes, or why they could not be reached
+	pub fn view(&self, view: usize) -> Result<&[u8]> {
+		let entry = self
+			.table("bufferViews")
+			.get(view)
+			.ok_or_else(|| err!(Asset("there is no buffer view {view}")))?;
+		let index = entry
+			.get("buffer")
+			.and_then(Value::as_usize)
+			.ok_or_else(|| {
+				err!(Asset("buffer view {view} does not say which buffer it is in"))
+			})?;
+		let bytes = self.buffers.get(index).ok_or_else(|| {
+			err!(Asset("buffer view {view} names buffer {index}, which is not there"))
+		})?;
+		let start = number(entry, "byteOffset");
+		let length = entry
+			.get("byteLength")
+			.and_then(Value::as_usize)
+			.ok_or_else(|| err!(Asset("buffer view {view} does not say how long it is")))?;
+
+		bytes
+			.get(start..start.saturating_add(length))
+			.ok_or_else(|| {
+				err!(Asset("buffer view {view} reaches past the end of buffer {index}"))
+			})
 	}
 
 	/// One accessor's values, widened to floats.
@@ -729,6 +796,43 @@ fn sextet(byte: u8) -> Option<u32> {
 	}
 }
 
+/// A name from a file, as something that can be part of an asset's name.
+///
+/// Lowercase, and everything outside letters, digits, a dash, an underscore and
+/// a dot becomes an underscore. Leading and trailing separators go, so a name
+/// that was only punctuation comes back empty and the caller numbers it
+/// instead. Nothing here may produce a `.` or a `..`, because these end up as
+/// pieces of a path.
+fn tidy(name: &str) -> String {
+	let mut out = String::with_capacity(name.len());
+
+	for letter in name.chars() {
+		out.push(match letter {
+			| 'a'..='z' | '0'..='9' | '-' | '_' | '.' => letter,
+			| 'A'..='Z' => letter.to_ascii_lowercase(),
+			| _ => '_',
+		});
+	}
+
+	out.trim_matches(['_', '.', '-'].as_slice())
+		.to_owned()
+}
+
+/// A name nothing else in the list has, remembered.
+fn unique(taken: &mut Vec<String>, wanted: &str) -> String {
+	let mut name = wanted.to_owned();
+	let mut attempt = 1;
+
+	while taken.contains(&name) {
+		name = format!("{wanted}.{attempt}");
+		attempt += 1;
+	}
+
+	taken.push(name.clone());
+
+	name
+}
+
 /// One byte, or zero where there is none.
 fn read_u8(bytes: &[u8], at: usize) -> u8 { bytes.get(at).copied().unwrap_or(0) }
 
@@ -784,7 +888,9 @@ mod tests {
 	/// - `panel`, one object wearing two materials, which the exporter splits
 	///   into two primitives.
 	///
-	/// UVs on all of them, so `TEXCOORD_0` is there. Rebuilding it is a
+	/// UVs on all of them, and the column's material wears both kinds of
+	/// picture, a color and a normal map, so a real exporter's way of writing
+	/// images is read rather than guessed at. Rebuilding it is a
 	/// half-hour with those five sentences and Blender; nothing asserts on an
 	/// exact byte, and whichever version wrote it is in `asset.generator`.
 	const BINARY: &[u8] = include_bytes!("fixtures/model.glb");
@@ -795,6 +901,16 @@ mod tests {
 	/// Two containers rather than one because they are two different paths
 	/// through the reader, and only one of them can be tested at a time.
 	const TEXT: &[u8] = include_bytes!("fixtures/model.gltf");
+
+	/// The two pictures the separate export leaves beside the document.
+	///
+	/// Named so that the loose-file rule and the material agree about which
+	/// one holds directions, which is what a warning exists to notice when
+	/// they do not.
+	const COLOR: &[u8] = include_bytes!("fixtures/tiles.png");
+
+	/// The other one.
+	const BUMP: &[u8] = include_bytes!("fixtures/tiles_normal.png");
 
 	/// That buffer.
 	const BESIDE: &[u8] = include_bytes!("fixtures/model.bin");
@@ -971,6 +1087,9 @@ mod tests {
 
 		fs::write(&source, TEXT).expect("the document is written");
 		fs::write(dir.join("models").join("model.bin"), BESIDE).expect("the buffer is written");
+		fs::write(dir.join("models").join("tiles.png"), COLOR).expect("the color is written");
+		fs::write(dir.join("models").join("tiles_normal.png"), BUMP)
+			.expect("the normal map is written");
 
 		let text = Gltf::open(&source, &dir).expect("the document reads");
 		let file = binary();

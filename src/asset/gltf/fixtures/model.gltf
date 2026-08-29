@@ -100,13 +100,13 @@
 		{
 			"doubleSided":true,
 			"name":"stone",
+			"normalTexture":{
+				"index":0
+			},
 			"pbrMetallicRoughness":{
-				"baseColorFactor":[
-					0.6000000238418579,
-					0.6000000238418579,
-					0.6200000047683716,
-					1
-				],
+				"baseColorTexture":{
+					"index":1
+				},
 				"metallicFactor":0,
 				"roughnessFactor":0.5
 			}
@@ -163,6 +163,28 @@
 					"material":0
 				}
 			]
+		}
+	],
+	"textures":[
+		{
+			"sampler":0,
+			"source":0
+		},
+		{
+			"sampler":0,
+			"source":1
+		}
+	],
+	"images":[
+		{
+			"mimeType":"image/png",
+			"name":"tiles_normal",
+			"uri":"tiles_normal.png"
+		},
+		{
+			"mimeType":"image/png",
+			"name":"tiles",
+			"uri":"tiles.png"
 		}
 	],
 	"accessors":[
@@ -399,6 +421,12 @@
 			"byteLength":24,
 			"byteOffset":2420,
 			"target":34963
+		}
+	],
+	"samplers":[
+		{
+			"magFilter":9729,
+			"minFilter":9987
 		}
 	],
 	"buffers":[
