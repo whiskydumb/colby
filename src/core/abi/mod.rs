@@ -37,6 +37,7 @@ pub mod names;
 pub mod physics;
 pub mod registry;
 pub mod scene;
+pub mod skeleton;
 pub mod state;
 pub mod texture;
 pub mod ui;
@@ -63,6 +64,7 @@ pub use self::{
 		Arena, Form, Link, Remap, Restored, Scene, SceneData, SceneId, Scenes, Solid, Stage,
 		Thing,
 	},
+	skeleton::{Bone, MAX_BONES, NO_PARENT, Skeleton, SkeletonData, SkeletonId, Skeletons},
 	state::GameState,
 	texture::{Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},
@@ -73,7 +75,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 27;
+pub const ABI_VERSION: u32 = 28;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -274,6 +276,14 @@ pub struct World {
 	/// [`model`](crate::abi::model).
 	pub models: Models,
 
+	/// Every skeleton the host has loaded, reached by handle.
+	///
+	/// Filled the same way as `meshes`, from the same tree, and holding no
+	/// geometry either: a skeleton is the bones a skinned mesh is moved by,
+	/// and the mesh naming them is in the table above this one. @ref
+	/// [`skeleton`](crate::abi::skeleton).
+	pub skeletons: Skeletons,
+
 	/// Every material, reached by handle.
 	///
 	/// Unlike the other two this is mostly the *game's* table: a material is a
@@ -356,6 +366,7 @@ impl World {
 			textures: Textures::new(),
 			fonts: Fonts::new(),
 			models: Models::new(),
+			skeletons: Skeletons::new(),
 			scenes: Scenes::new(),
 			materials: Materials::new(),
 			cvars: Cvars::new(),
