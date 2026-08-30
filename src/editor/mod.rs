@@ -8,10 +8,14 @@
 //!
 //! Three windows, and each is a view onto something that already existed rather
 //! than a new system: the console shows the table and the log the *previous*
-//! step built, the statistics show the clock and the world, and the inspector
-//! shows the entity table. That is the whole design brief for an editor here -
-//! if a panel needs the engine to grow a new mechanism to feed it, the panel is
-//! wrong.
+//! step built, the statistics show the clock and the world, and the scene tree
+//! shows the three tables a world is made of. That is the whole design brief
+//! for an editor here - if a panel needs the engine to grow a new mechanism to
+//! feed it, the panel is wrong.
+//!
+//! What can be checked by running it rather than by looking at it lives in
+//! [`select`], deliberately: a module with no egui in it is a module with
+//! tests.
 //!
 //! @note: the game's own interface will not be this. egui is for tools; a game
 //! draws its interface with HTML/CSS over taffy, which is a separate subsystem
@@ -29,8 +33,9 @@ use wgpu::{
 use winit::{event::WindowEvent, window::Window};
 
 mod console;
-mod entities;
+mod select;
 mod stats;
+mod tree;
 
 /// The variable that decides whether the editor is on screen.
 ///
@@ -49,7 +54,7 @@ pub struct Editor {
 	textures: egui::TexturesDelta,
 	points: f32,
 	console: console::Console,
-	entities: entities::Inspector,
+	tree: tree::Tree,
 }
 
 impl Editor {
@@ -84,7 +89,7 @@ impl Editor {
 			textures: egui::TexturesDelta::default(),
 			points: 1.0,
 			console: console::Console::default(),
-			entities: entities::Inspector::default(),
+			tree: tree::Tree::default(),
 		}
 	}
 
@@ -140,7 +145,7 @@ impl Editor {
 	pub fn run(&mut self, window: &Window, world: &mut World, clock: &Clock, frames: u64) {
 		let input = self.state.take_egui_input(window);
 		let console = &mut self.console;
-		let entities = &mut self.entities;
+		let tree = &mut self.tree;
 
 		// cloned before the run rather than reached through the `Ui` egui hands
 		// the closure: a `Context` is a handle, cloning it is a refcount, and
@@ -150,7 +155,7 @@ impl Editor {
 		let output = self.context.run_ui(input, |_ui| {
 			stats::show(&context, world, clock, frames);
 			console.show(&context, world);
-			entities.show(&context, world);
+			tree.show(&context, world);
 		});
 
 		self.state
