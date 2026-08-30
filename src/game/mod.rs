@@ -20,9 +20,9 @@
 use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, Joint,
-		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Pose, PoseId,
+		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, Node, PanelId, Pose, PoseId,
 		Renderable, SceneData, SceneId, Shape, ShapeKind, SkeletonId, Stage, TouchKind,
-		TraceInfo, Transform, World, character, console, debug, scene,
+		TraceInfo, Transform, Tree, World, character, console, debug, scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -159,7 +159,37 @@ const LAMP_SCALE: f32 = 1.6;
 const CHARACTER_MODEL: &str = "models/citizen";
 
 /// Where it stands.
-const CHARACTER_AT: Vec3 = Vec3::new(0.2, 0.0, -8.2);
+const CHARACTER_AT: Vec3 = Vec3::new(-1.2, 0.0, -9.4);
+
+/// The clip it stands in when it is standing still.
+const CHARACTER_IDLE: &str = "models/citizen/idle";
+
+/// The clip it walks with.
+const CHARACTER_WALK: &str = "models/citizen/walk";
+
+/// How far either side of where it stands the character paces.
+const PACE_REACH: f32 = 2.6;
+
+/// How fast it goes round that beat, in radians a second.
+///
+/// The two together are what the speed comes out as: the fastest it walks is
+/// the reach times this, which wants to be about what the walk cycle's own
+/// stride covers in a second or the feet skate. There is no root motion in
+/// this engine, so matching the two is by eye and by hand.
+const PACE_RATE: f32 = 0.5;
+
+/// Which way the model faces when it is walking the way it started.
+const PACE_FACING: f32 = std::f32::consts::FRAC_PI_2;
+
+/// The speed at which the walk is mixed in whole, in units a second.
+const WALK_SPEED: f32 = 1.4;
+
+/// The slowest the walk cycle's own clock runs, as a fraction of real time.
+///
+/// Not zero, so a character standing at the end of its beat is still breathing
+/// through a cycle rather than frozen mid-stride under an idle that has all
+/// the weight.
+const WALK_FLOOR: f32 = 0.1;
 
 /// How many pieces of it the demo has room for.
 ///
@@ -577,6 +607,21 @@ struct State {
 	/// One entity per piece of the character standing beside the map.
 	character: [EntityId; CHARACTER_PIECES],
 
+	/// How far round its beat the character has paced, in seconds.
+	pacing: f32,
+
+	/// How far into the walk cycle it is, on a clock that runs at its speed.
+	walk_phase: f32,
+
+	/// How far into the idle, on a clock that runs at real time.
+	idle_phase: f32,
+
+	/// Which clip `game.anim` pinned, or [`PINNED_NONE`].
+	pinned: u32,
+
+	/// What weight `game.blend` pinned, or [`BLEND_FREE`].
+	blend_pinned: f32,
+
 	/// The bones every one of those pieces is moved by.
 	///
 	/// One pose for the whole character rather than one per piece, which is
@@ -591,7 +636,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 17;
+const STATE_LAYOUT: u64 = 18;
 
 /// The module's single exported symbol.
 ///
@@ -609,69 +654,28 @@ pub extern "C" fn colby_game_api() -> GameApi {
 	}
 }
 
-/// Runs once each time this module is swapped in.
+/// Puts every command this module offers into the console table.
 ///
-/// # Safety
-///
-/// `world` must point to a live [`World`] owned by the host.
-unsafe extern "C-unwind" fn init(world: *mut World) {
-	// SAFETY: the host guarantees a live, exclusively borrowed World for the
-	// duration of the call; see GameFn.
-	let world = unsafe { &mut *world };
-
-	world.light = Vec3::new(-0.5, -1.0, -0.35);
-	world.ambient = Vec3::splat(0.22);
-	world.clear = Vec3::new(0.04, 0.05, 0.07);
-	world.camera.fov_y = 0.9;
-
-	// @note: a reload finds the arena and the entities exactly as the previous
-	// build left them, so there is nothing to rebuild on the way back in. The
-	// scene is built only when the arena reports itself fresh, which happens on
-	// the first load and whenever STATE_LAYOUT moves.
-	let (state, fresh) = world.state.get::<State>(STATE_LAYOUT);
-	if fresh {
-		(state.yaw, state.pitch, state.distance) = START_ORBIT;
-		// said rather than relied on: a fresh arena is zeroed, and zero happens
-		// to be both guns' and the first tool's number.
-		state.gun = PHYSGUN;
-		state.tool = WELD;
-
-		// the arena was reset, so the handles it held are gone. Anything the
-		// old build spawned would be orphaned; clear the table and start over.
-		world.entities.clear();
-		// and the bodies with them: a body naming an entity that no longer
-		// exists drives nothing, and would still be traced against.
-		world.bodies.clear();
-		for slot in &mut state.lamp {
-			*slot = world.entities.spawn();
-		}
-
-		for slot in &mut state.character {
-			*slot = world.entities.spawn();
-		}
-
-		// the pose table is the host's and survives a reload, but the handle
-		// into it was in the arena that was just zeroed - so whatever was
-		// there is orphaned and a new one is made. Emptying the table first is
-		// the same argument the entities above are cleared for.
-		world.poses.clear();
-		state.character_pose = PoseId::NONE;
-		// spawned where it stands and at the size it is, because nothing writes
-		// the player's transform afterwards except the controller, which only
-		// ever moves it. `place` deliberately leaves it alone.
-		let mut stance = Transform::at(PLAYER_START);
-		stance.scale = PLAYER_EXTENTS * 2.0;
-		state.player = world.entities.spawn_at(stance);
-
-		world.camera.target = PLAYER_START + Vec3::Y * EYE_LIFT;
-	}
-
+/// Its own function because `init` is otherwise a hundred and one lines of
+/// which twenty are this, and because the whole block is one subject: what a
+/// person can type at the game.
+fn register_commands(world: &mut World) {
 	// registered on every load, like the materials below: registering is
 	// idempotent, a value somebody typed in the console survives it, and an
 	// untouched one follows whatever the constant now says. The command has to
 	// be registered again whatever happens, because the host drops it before
 	// unloading this library - its address is in here. @ref
 	// [`cvar`](colby_core::abi::cvar).
+	world.cvars.command(
+		"game.anim",
+		pick_anim,
+		"play one of the character's clips by name, or `off` to go by speed",
+	);
+	world.cvars.command(
+		"game.blend",
+		pin_blend,
+		"pin how much of the walk is mixed into the character, or nothing to go by speed",
+	);
 	world.cvars.command(
 		"game.reset",
 		reset,
@@ -725,6 +729,69 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		keep_one,
 		"keep what is held or aimed at as a prop called <name>, joints and all",
 	);
+}
+
+/// Runs once each time this module is swapped in.
+///
+/// # Safety
+///
+/// `world` must point to a live [`World`] owned by the host.
+unsafe extern "C-unwind" fn init(world: *mut World) {
+	// SAFETY: the host guarantees a live, exclusively borrowed World for the
+	// duration of the call; see GameFn.
+	let world = unsafe { &mut *world };
+
+	world.light = Vec3::new(-0.5, -1.0, -0.35);
+	world.ambient = Vec3::splat(0.22);
+	world.clear = Vec3::new(0.04, 0.05, 0.07);
+	world.camera.fov_y = 0.9;
+
+	// @note: a reload finds the arena and the entities exactly as the previous
+	// build left them, so there is nothing to rebuild on the way back in. The
+	// scene is built only when the arena reports itself fresh, which happens on
+	// the first load and whenever STATE_LAYOUT moves.
+	let (state, fresh) = world.state.get::<State>(STATE_LAYOUT);
+	if fresh {
+		(state.yaw, state.pitch, state.distance) = START_ORBIT;
+		// said rather than relied on: a fresh arena is zeroed, and zero happens
+		// to be both guns' and the first tool's number.
+		state.gun = PHYSGUN;
+		state.tool = WELD;
+		// nobody has pinned the blend, and a fresh arena is zeroed, which is
+		// a weight rather than the absence of one.
+		state.blend_pinned = BLEND_FREE;
+
+		// the arena was reset, so the handles it held are gone. Anything the
+		// old build spawned would be orphaned; clear the table and start over.
+		world.entities.clear();
+		// and the bodies with them: a body naming an entity that no longer
+		// exists drives nothing, and would still be traced against.
+		world.bodies.clear();
+		for slot in &mut state.lamp {
+			*slot = world.entities.spawn();
+		}
+
+		for slot in &mut state.character {
+			*slot = world.entities.spawn();
+		}
+
+		// the pose table is the host's and survives a reload, but the handle
+		// into it was in the arena that was just zeroed - so whatever was
+		// there is orphaned and a new one is made. Emptying the table first is
+		// the same argument the entities above are cleared for.
+		world.poses.clear();
+		state.character_pose = PoseId::NONE;
+		// spawned where it stands and at the size it is, because nothing writes
+		// the player's transform afterwards except the controller, which only
+		// ever moves it. `place` deliberately leaves it alone.
+		let mut stance = Transform::at(PLAYER_START);
+		stance.scale = PLAYER_EXTENTS * 2.0;
+		state.player = world.entities.spawn_at(stance);
+
+		world.camera.target = PLAYER_START + Vec3::Y * EYE_LIFT;
+	}
+
+	register_commands(world);
 
 	// on every load, not only a fresh one: the mesh a name resolves to is the
 	// host's business, and an asset that appeared since the last swap should be
@@ -767,6 +834,12 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	let input = world.input;
 
 	interface(world);
+
+	// the character paces whatever is going on: it is scenery that walks, and
+	// the speed it is going is what mixes its two clips.
+	let speed = pace_character(world);
+
+	animate_character(world, speed);
 
 	// a click that landed on the interface is not also a click on the world.
 	// The host applies the same rule between the editor and the game; this is
@@ -2500,6 +2573,176 @@ unsafe extern "C-unwind" fn shutdown(world: *mut World) {
 	let world = unsafe { &mut *world };
 
 	info!(steps = world.steps, entities = world.entities.len(), "game shutdown");
+}
+
+/// Which of the character's clips a person pinned from the console.
+///
+/// Zero is nobody's, which is the character animating itself off how fast it
+/// is walking. Plain numbers rather than a handle because this lives in the
+/// arena, which is bytes.
+const PINNED_NONE: u32 = 0;
+
+/// `game.anim idle`.
+const PINNED_IDLE: u32 = 1;
+
+/// `game.anim walk`.
+const PINNED_WALK: u32 = 2;
+
+/// What [`State::blend_pinned`] holds when nobody has pinned it.
+///
+/// A number outside `0 ..= 1` rather than a second field saying whether the
+/// first one means anything, which is the same rule the snap deferral follows:
+/// two fields that can disagree, and one of them would have to win.
+const BLEND_FREE: f32 = -1.0;
+
+/// Paces the character back and forth, and says how fast it is going.
+///
+/// A sine rather than a line with a turn at each end, and the reason is what
+/// this is for: the speed is the *derivative*, so it is nothing at the two
+/// ends and most in the middle, and the blend it drives sweeps the whole way
+/// between standing and walking every beat. A character shuttling at a
+/// constant speed would show a blend pinned at one and prove nothing.
+///
+/// It moves no body and asks nothing of the solver: the character is scenery
+/// with no collision, which is a limit named in the notes rather than a thing
+/// this hides. And it does not snap, so what the renderer draws between two
+/// steps is the walk rather than sixty stills of it.
+///
+/// @param world - the world to move it in
+/// @return how fast it is going, in units a second
+fn pace_character(world: &mut World) -> f32 {
+	let step = world.dt;
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+	state.pacing += step;
+
+	let angle = state.pacing * PACE_RATE;
+	let along = PACE_REACH * angle.sin();
+	let travel = PACE_REACH * PACE_RATE * angle.cos();
+	let slots = state.character;
+	let facing = if travel >= 0.0 {
+		PACE_FACING
+	} else {
+		PACE_FACING + std::f32::consts::PI
+	};
+	let stance = Transform {
+		position: CHARACTER_AT + Vec3::X * along,
+		rotation: Quat::from_rotation_y(facing),
+		scale: Vec3::ONE,
+	};
+
+	for slot in slots {
+		if let Some(placed) = world.entities.transform_mut(slot) {
+			*placed = stance;
+		}
+	}
+
+	travel.abs()
+}
+
+/// Mixes the character's idle and its walk by how fast it is going.
+///
+/// The whole of what a blend tree costs a game: two leaves and a blend, built
+/// out of numbers this step worked out, handed to the host and thrown away.
+/// Nothing is authored and nothing survives the call.
+///
+/// **The walk's clock runs at the speed the character is going.** Otherwise a
+/// character creeping along windmills its legs at full rate and only the
+/// weight comes down, which reads as a walk played quietly rather than as
+/// somebody walking slowly. The idle's clock is real time, because breathing
+/// does not slow down.
+///
+/// @param world - the world the pose lives in
+/// @param speed - how fast the character is going, from [`pace_character`]
+fn animate_character(world: &mut World, speed: f32) {
+	let step = world.dt;
+	let idle = world.clips.find(CHARACTER_IDLE);
+	let walk = world.clips.find(CHARACTER_WALK);
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let wanted = (speed / WALK_SPEED).clamp(0.0, 1.0);
+	let weight = if state.blend_pinned < 0.0 {
+		wanted
+	} else {
+		state.blend_pinned
+	};
+
+	state.idle_phase += step;
+	state.walk_phase = step.mul_add(wanted.max(WALK_FLOOR), state.walk_phase);
+
+	let pose = state.character_pose;
+	let mut tree = Tree::new();
+	let taking = match state.pinned {
+		| PINNED_IDLE => Some((idle, state.idle_phase)),
+		| PINNED_WALK => Some((walk, state.walk_phase)),
+		| _ => None,
+	};
+
+	if let Some((clip, time)) = taking {
+		tree.push(Node::Clip { clip, time, looping: true });
+	} else {
+		let standing = tree.push(Node::Clip {
+			clip: idle,
+			time: state.idle_phase,
+			looping: true,
+		});
+		let walking = tree.push(Node::Clip {
+			clip: walk,
+			time: state.walk_phase,
+			looping: true,
+		});
+
+		tree.push(Node::Blend { first: standing, second: walking, weight });
+	}
+
+	world.animate(pose, &tree);
+}
+
+/// `game.anim` - play one of the character's clips rather than mixing them.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn pick_anim(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let named = unsafe { &*args }.rest();
+	let wanted = match named.trim() {
+		| "idle" => PINNED_IDLE,
+		| "walk" => PINNED_WALK,
+		| "" | "off" | "speed" => PINNED_NONE,
+		| other => {
+			info!(asked = other, offered = "idle, walk, off", "no such clip");
+
+			return;
+		},
+	};
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.pinned = wanted;
+
+	info!(playing = named.trim(), "the character is animated by hand");
+}
+
+/// `game.blend` - pin how much of the walk is mixed in.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn pin_blend(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let args = unsafe { &*args };
+	let asked = args.float(0);
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+	state.blend_pinned = asked.map_or(BLEND_FREE, |weight| weight.clamp(0.0, 1.0));
+
+	if state.blend_pinned < 0.0 {
+		info!("the blend follows how fast the character is walking again");
+	} else {
+		info!(weight = state.blend_pinned, "the blend is pinned");
+	}
 }
 
 /// Stands the character beside the map, in the shape it was modeled in.
