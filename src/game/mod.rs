@@ -21,8 +21,8 @@ use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, Joint,
 		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Renderable,
-		SceneData, SceneId, Shape, ShapeKind, Solid, TouchKind, TraceInfo, Transform, World,
-		character, debug, scene,
+		SceneData, SceneId, Shape, ShapeKind, TouchKind, TraceInfo, Transform, World, character,
+		debug, scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -801,38 +801,27 @@ fn duplicate(world: &mut World, yaw: f32) {
 	trace!(of = body.slot(), into = put.body(0).slot(), "duplicated");
 }
 
-/// Describes the world and keeps only one body and what it drives.
+/// Describes the world and cuts one body and what it drives out of it.
 ///
-/// The two records are lifted out whole, so everything a body carries - its
-/// shape, its surface, its layers, the mesh its collision is baked from - comes
-/// along without this function naming any of it. The indices are the only thing
-/// that has to be rewritten, because they addressed a description with
-/// two dozen things in it and now address one with two.
+/// Two lines of arithmetic and one call, because the cutting is
+/// [`SceneData::subset`] and lives in the engine: what a description *is* is
+/// the engine's business even though what it *becomes* is the game's, and the
+/// editor wants the same call to export a selection as a prefab. What is left
+/// here is finding which entry of the description a handle is, which is the one
+/// question a game can answer and a description cannot.
 ///
 /// @param world - the world to describe
 /// @param body - the body to keep
-/// @return a scene of one prop, or nothing if the body drives no entity
+/// @return a scene of one prop, or nothing if the handle is in no description
 fn cut_out(world: &World, body: BodyId) -> Option<SceneData> {
 	let whole = scene::capture(world);
 	let slot = u32::try_from(body.slot()).ok()?;
-	let solid = whole
+	let at = whole
 		.solids
 		.iter()
-		.find(|solid| solid.slot == slot)?;
-	let thing = whole
-		.things
-		.get(usize::try_from(solid.thing).ok()?)?;
+		.position(|solid| solid.slot == slot)?;
 
-	Some(SceneData {
-		things: vec![thing.clone()],
-		solids: vec![Solid {
-			// the first and only entity of the new description, whatever
-			// number it had in the old one.
-			thing: 0,
-			..solid.clone()
-		}],
-		..SceneData::default()
-	})
+	Some(whole.subset(&[u32::try_from(at).ok()?]))
 }
 
 /// Every prop the tree holds, in a fixed order.

@@ -375,6 +375,213 @@ impl SceneData {
 	pub fn is_empty(&self) -> bool {
 		self.things.is_empty() && self.solids.is_empty() && self.links.is_empty()
 	}
+
+	/// Which bodies are held to this one, directly or through others.
+	///
+	/// The joints are a graph and this is its connected component: a body, what
+	/// is welded to it, what is welded to *that*, and so on. Everything a
+	/// sandbox calls a contraption is one of these, and the reason it is here
+	/// rather than in a game is that the question is about a description rather
+	/// than about a world. The editor asks it to work out what "the thing I
+	/// clicked" is; the duplicator asks it to work out what to copy; neither
+	/// needs a `World` to answer it and neither should have to write it.
+	///
+	/// **A joint pinned to the world joins nothing to anything.** Its second
+	/// end is [`NO_INDEX`] rather than a body, so a prop bolted to a wall is
+	/// its own component and is not dragged along by whatever else is bolted to
+	/// the same wall.
+	///
+	/// @param seed - which of [`solids`](Self::solids) to start from
+	/// @return every index in its component, in order, seed included; empty if
+	/// the seed is not an index into this description
+	#[must_use]
+	pub fn connected(&self, seed: u32) -> Vec<u32> {
+		let Ok(count) = u32::try_from(self.solids.len()) else {
+			return Vec::new();
+		};
+
+		if seed >= count {
+			return Vec::new();
+		}
+
+		let mut found = vec![seed];
+		let mut walked = 0;
+
+		// breadth first over the joints, which for a contraption of a few dozen
+		// parts is cheaper than building an adjacency list to walk it with.
+		while walked < found.len() {
+			let here = found[walked];
+			walked += 1;
+
+			let mut reached: Vec<u32> = self
+				.links
+				.iter()
+				.filter_map(|link| across(link, here))
+				.filter(|&far| far < count && !found.contains(&far))
+				.collect();
+			// two joints between the same pair would otherwise add it twice
+			reached.sort_unstable();
+			reached.dedup();
+
+			found.extend(reached);
+		}
+
+		found.sort_unstable();
+
+		found
+	}
+
+	/// A description of exactly these bodies, what they drive and what holds
+	/// them together.
+	///
+	/// The other half of cutting a piece out. What comes back is a `SceneData`
+	/// like any other, so [`instantiate`] pastes it beside what is already
+	/// there and `level::export` writes it down as a file - which is what makes
+	/// a duplicate and a saved contraption the same operation rather than two.
+	///
+	/// Three things are decided here and each could have gone the other way:
+	///
+	/// - **the stage comes along.** A piece cut out of a world under a
+	///   particular gravity is a piece that was settled under it, and dropping
+	///   that would make a saved contraption behave differently from the one
+	///   that was saved. [`instantiate`] ignores it; a restore does not.
+	/// - **the arena does not.** It is the game's own bytes and the handles in
+	///   them name things that are not here. Same rule a paste already follows.
+	/// - **a joint pinned to the world comes along**, because it is a property
+	///   of the body it holds rather than of the pair. A paste offsets its
+	///   anchor with everything else, so a copy of a prop bolted to a wall is
+	///   bolted to the matching point beside it.
+	///
+	/// @param solids - which of [`solids`](Self::solids) to keep; anything out
+	/// of range or named twice is ignored
+	/// @return a description of them alone
+	#[must_use]
+	pub fn subset(&self, solids: &[u32]) -> Self {
+		let mut keeping: Vec<u32> = Vec::new();
+		for &index in solids {
+			if usize::try_from(index).is_ok_and(|it| it < self.solids.len())
+				&& !keeping.contains(&index)
+			{
+				keeping.push(index);
+			}
+		}
+
+		// old index to new, for both tables. Sized by the description rather
+		// than by what is kept, so a lookup is an index into it directly.
+		let mut solid_of = vec![NO_INDEX; self.solids.len()];
+		let mut thing_of = vec![NO_INDEX; self.things.len()];
+		let (mut things, mut kept) = (Vec::new(), Vec::new());
+
+		for &index in &keeping {
+			let Some(solid) = self
+				.solids
+				.get(usize::try_from(index).unwrap_or(usize::MAX))
+			else {
+				continue;
+			};
+
+			solid_of[usize::try_from(index).unwrap_or(0)] = count(kept.len());
+			let mut copy = solid.clone();
+			copy.slot = count(kept.len());
+			copy.generation = 1;
+			// the entity it drives, if it has not already come along behind
+			// another body. Two bodies naming one entity is legal and is what a
+			// prop with a second collider would be.
+			copy.thing = drag_along(&self.things, solid.thing, &mut thing_of, &mut things);
+
+			kept.push(copy);
+		}
+
+		let mut links = Vec::new();
+		for link in &self.links {
+			let first = at_new(&solid_of, link.first);
+			let second = at_new(&solid_of, link.second);
+
+			// both ends, or one end and the world. A joint whose far end was
+			// left behind is dropped: half a joint holds nothing and a paste
+			// would refuse it anyway.
+			if first == NO_INDEX || (link.second != NO_INDEX && second == NO_INDEX) {
+				continue;
+			}
+
+			let mut copy = link.clone();
+			copy.slot = count(links.len());
+			copy.generation = 1;
+			copy.first = first;
+			copy.second = second;
+			links.push(copy);
+		}
+
+		Self {
+			stage: self.stage,
+			thing_generations: vec![1; things.len()],
+			solid_generations: vec![1; kept.len()],
+			link_generations: vec![1; links.len()],
+			things,
+			solids: kept,
+			links,
+			// never: the bytes name handles that are not in here. @ref the doc
+			// above, and the same rule `instantiate` follows.
+			arena: None,
+		}
+	}
+}
+
+/// A length as an index, or [`NO_INDEX`] if it will not fit in one.
+fn count(len: usize) -> u32 { u32::try_from(len).unwrap_or(NO_INDEX) }
+
+/// The body at the far end of a joint from this one, if there is one.
+///
+/// Nothing when the joint does not name this body at all, and nothing when the
+/// far end is the world: a wall is not a member of anything.
+///
+/// @param link - the joint
+/// @param here - the body being walked from
+fn across(link: &Link, here: u32) -> Option<u32> {
+	match (link.first, link.second) {
+		| (first, second) if first == here && second != NO_INDEX => Some(second),
+		| (first, second) if second == here && first != NO_INDEX => Some(first),
+		| _ => None,
+	}
+}
+
+/// Brings a body's entity into a piece, or finds where it already went.
+///
+/// Two bodies naming one entity is legal - it is what a prop with a second
+/// collider would be - so this is idempotent per entity rather than per body.
+///
+/// @param things - the entities of the description being cut from
+/// @param at - which of them the body drives, or [`NO_INDEX`]
+/// @param moved - old index to new, written
+/// @param kept - the piece's own entities, appended to
+/// @return where the entity now is, or [`NO_INDEX`] if the body drives nothing
+fn drag_along(things: &[Thing], at: u32, moved: &mut [u32], kept: &mut Vec<Thing>) -> u32 {
+	let Ok(at) = usize::try_from(at) else {
+		return NO_INDEX;
+	};
+
+	let Some(thing) = things.get(at) else {
+		return NO_INDEX;
+	};
+
+	if moved[at] == NO_INDEX {
+		moved[at] = count(kept.len());
+		let mut copy = thing.clone();
+		copy.slot = count(kept.len());
+		copy.generation = 1;
+		kept.push(copy);
+	}
+
+	moved[at]
+}
+
+/// What an old index became, or [`NO_INDEX`] for the world and for anything
+/// left behind.
+fn at_new(table: &[u32], index: u32) -> u32 {
+	usize::try_from(index)
+		.ok()
+		.and_then(|it| table.get(it).copied())
+		.unwrap_or(NO_INDEX)
 }
 
 /// Writes down everything about a world that a world is made of.
@@ -1668,6 +1875,271 @@ mod tests {
 
 		assert_eq!(joint.first, body_id, "the rope holds the restored body");
 		assert_eq!(joint.second, BodyId::NONE, "and a point in the world, as it did");
+	}
+
+	/// A description of `count` bodies, each driving an entity of its own.
+	///
+	/// No world anywhere: what is being tested is arithmetic over plain data,
+	/// and building it by hand is what says so.
+	fn parts(count: u32) -> SceneData {
+		let mut scene = SceneData::default();
+
+		for index in 0..count {
+			scene.things.push(Thing {
+				name: format!("thing {index}"),
+				slot: index,
+				generation: 1,
+				transform: Transform::at(Vec3::X * f32::from(u16::try_from(index).unwrap_or(0))),
+				..Thing::default()
+			});
+			scene.solids.push(Solid {
+				name: format!("part {index}"),
+				slot: index,
+				generation: 1,
+				kind: BodyKind::Dynamic,
+				thing: index,
+				..Solid::default()
+			});
+		}
+
+		let count = usize::try_from(count).unwrap_or(0);
+		scene.thing_generations = vec![1; count];
+		scene.solid_generations = vec![1; count];
+
+		scene
+	}
+
+	/// A joint between two of them, or between one and the world.
+	fn holding(first: u32, second: u32) -> Link {
+		Link {
+			name: format!("held {first} to {second}"),
+			kind: JointKind::Weld,
+			first,
+			second,
+			..Link::default()
+		}
+	}
+
+	#[test]
+	fn a_body_nothing_holds_is_a_piece_on_its_own() {
+		let scene = parts(3);
+
+		assert_eq!(scene.connected(1), vec![1], "itself and nothing else");
+	}
+
+	#[test]
+	fn a_chain_of_joints_is_one_piece_from_either_end() {
+		let mut scene = parts(4);
+		scene.links.push(holding(0, 1));
+		scene.links.push(holding(1, 2));
+		scene.link_generations = vec![1; 2];
+
+		assert_eq!(scene.connected(0), vec![0, 1, 2], "from the near end");
+		assert_eq!(scene.connected(2), vec![0, 1, 2], "and from the far one");
+		assert_eq!(scene.connected(3), vec![3], "while the loose one stays loose");
+	}
+
+	#[test]
+	fn a_joint_pinned_to_the_world_holds_nothing_to_anything() {
+		// two props bolted to the same wall are two pieces, not one. The wall
+		// is not a body and cannot be a member of anything.
+		let mut scene = parts(2);
+		scene.links.push(holding(0, NO_INDEX));
+		scene.links.push(holding(1, NO_INDEX));
+		scene.link_generations = vec![1; 2];
+
+		assert_eq!(scene.connected(0), vec![0], "each is its own piece");
+		assert_eq!(scene.connected(1), vec![1], "however many are bolted beside it");
+	}
+
+	#[test]
+	fn the_far_end_of_a_joint_is_a_body_or_it_is_nothing() {
+		// `across` on its own, because in `connected` the bound check catches
+		// the world index too - `NO_INDEX` is the largest a `u32` gets - and
+		// two guards that cover each other are two guards neither of which is
+		// proved. This one is about what a joint *means*; the bound below is
+		// about a description somebody wrote wrong.
+		assert_eq!(across(&holding(0, 1), 0), Some(1), "from the near end");
+		assert_eq!(across(&holding(0, 1), 1), Some(0), "and from the far one");
+		assert_eq!(across(&holding(0, 1), 2), None, "a joint that does not name it at all");
+		assert_eq!(across(&holding(0, NO_INDEX), 0), None, "and the world is not a body");
+		assert_eq!(across(&holding(NO_INDEX, 1), 1), None, "whichever end it is written on");
+	}
+
+	#[test]
+	fn a_joint_naming_a_body_that_is_not_there_reaches_nothing() {
+		// the other half of the pair above: a description somebody wrote by
+		// hand, or one whose bodies were cut away under it.
+		let mut scene = parts(2);
+		scene.links.push(holding(0, 7));
+		scene.link_generations = vec![1; 1];
+
+		assert_eq!(scene.connected(0), vec![0], "an index past the end is not a member");
+	}
+
+	#[test]
+	fn two_bodies_driving_one_entity_bring_one_entity() {
+		// legal, and what a prop with a second collider is. The copy has to be
+		// made once and pointed at twice, or the piece has two of everything it
+		// draws.
+		let mut scene = parts(2);
+		scene.solids[1].thing = 0;
+
+		let piece = scene.subset(&[0, 1]);
+
+		assert_eq!(piece.solids.len(), 2, "both bodies");
+		assert_eq!(piece.things.len(), 1, "and one entity between them");
+		assert_eq!(
+			piece
+				.solids
+				.iter()
+				.map(|it| it.thing)
+				.collect::<Vec<_>>(),
+			vec![0, 0],
+			"which both of them drive"
+		);
+	}
+
+	#[test]
+	fn a_seed_that_is_not_an_index_names_no_piece_at_all() {
+		let scene = parts(2);
+
+		assert!(scene.connected(9).is_empty(), "past the end");
+		assert!(SceneData::default().connected(0).is_empty(), "and in an empty description");
+	}
+
+	#[test]
+	fn a_piece_cut_out_carries_what_it_drives_and_what_holds_it() {
+		let mut scene = parts(4);
+		scene.links.push(holding(1, 2));
+		// and one pinned to the world, which joins nothing to anything but is
+		// still a property of the body it holds
+		scene.links.push(holding(1, NO_INDEX));
+		scene.link_generations = vec![1; 2];
+
+		let piece = scene.subset(&scene.connected(1));
+
+		assert_eq!(piece.solids.len(), 2, "the two that are held together");
+		assert_eq!(piece.things.len(), 2, "and the entity each of them drives");
+		assert_eq!(
+			piece.solids[0].name, "part 1",
+			"named as they were, because a name is not an index"
+		);
+		assert_eq!(
+			piece.links.len(),
+			2,
+			"the joint inside the piece and the one pinning it to the world"
+		);
+		assert!(
+			piece
+				.links
+				.iter()
+				.all(|link| link.first != NO_INDEX && link.first < 2),
+			"and both are renumbered into the piece's own list"
+		);
+	}
+
+	#[test]
+	fn a_joint_whose_far_end_was_left_behind_is_left_behind_with_it() {
+		let mut scene = parts(3);
+		scene.links.push(holding(0, 2));
+		scene.link_generations = vec![1; 1];
+
+		// asked for a body whose joint reaches something not in the list. Half
+		// a joint holds nothing, and a paste would refuse it anyway.
+		let piece = scene.subset(&[0]);
+
+		assert_eq!(piece.solids.len(), 1, "the one that was asked for");
+		assert!(piece.links.is_empty(), "and no joint reaching out of it");
+	}
+
+	#[test]
+	fn a_piece_is_renumbered_into_a_description_of_its_own() {
+		let scene = parts(5);
+		let piece = scene.subset(&[3, 1]);
+
+		assert_eq!(piece.solids.len(), 2, "two of the five");
+		assert_eq!(
+			piece
+				.solids
+				.iter()
+				.map(|it| it.slot)
+				.collect::<Vec<_>>(),
+			vec![0, 1],
+			"in slots of their own, in the order they were asked for"
+		);
+		assert_eq!(
+			piece
+				.solids
+				.iter()
+				.map(|it| it.thing)
+				.collect::<Vec<_>>(),
+			vec![0, 1],
+			"each pointing at its own entity's new place"
+		);
+		assert_eq!(
+			piece
+				.things
+				.iter()
+				.map(|it| it.name.clone())
+				.collect::<Vec<_>>(),
+			vec!["thing 3".to_owned(), "thing 1".to_owned()],
+			"and the entities are the ones those bodies drove"
+		);
+		assert_eq!(piece.solid_generations, vec![1, 1], "with a generation each");
+	}
+
+	#[test]
+	fn a_piece_keeps_the_world_it_came_out_of_and_not_the_game_that_was_playing() {
+		let mut scene = parts(2);
+		scene.stage.gravity = Vec3::new(0.0, -3.0, 0.0);
+		scene.arena = Some(Arena { layout: 7, bytes: vec![9; STATE_BYTES] });
+
+		let piece = scene.subset(&[0]);
+
+		assert_eq!(
+			piece.stage.gravity,
+			Vec3::new(0.0, -3.0, 0.0),
+			"a piece settled under one gravity was settled under it"
+		);
+		assert!(
+			piece.arena.is_none(),
+			"and the game's own bytes name handles that are not in here"
+		);
+	}
+
+	#[test]
+	fn an_index_asked_for_twice_or_out_of_range_is_ignored() {
+		let scene = parts(3);
+
+		assert_eq!(scene.subset(&[1, 1, 1]).solids.len(), 1, "named three times, kept once");
+		assert_eq!(scene.subset(&[0, 44]).solids.len(), 1, "and one of the two exists");
+		assert!(scene.subset(&[]).is_empty(), "nothing asked for is nothing cut out");
+	}
+
+	#[test]
+	fn a_piece_pasted_back_is_the_piece_and_nothing_else() {
+		// the whole point, and the only test here with a world in it: what
+		// comes out of `subset` is a `SceneData` like any other, so the loader
+		// that already exists puts it back with no new code anywhere.
+		let mut world = peopled();
+		let whole = capture(&world);
+		let held = whole
+			.solids
+			.iter()
+			.position(|solid| solid.thing != NO_INDEX)
+			.expect("a body driving something");
+		let piece = whole.subset(&whole.connected(u32::try_from(held).unwrap_or(0)));
+
+		let before = world.bodies.len();
+		let put = instantiate(&mut world, &piece, Vec3::Y * 10.0);
+
+		assert_eq!(
+			world.bodies.len(),
+			before + piece.solids.len(),
+			"exactly the piece arrived beside what was already there"
+		);
+		assert!(put.body(0).is_some(), "with handles of its own");
 	}
 
 	#[test]
