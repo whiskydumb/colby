@@ -22,8 +22,8 @@ use core::mem::offset_of;
 use colby_core::{
 	Result,
 	abi::{
-		EntityId, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes, Texel, TextureData,
-		TextureId, Textures, World,
+		EntityId, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes, SkinVertex, Texel,
+		TextureData, TextureId, Textures, World,
 		material::{MaterialEntry, Wrap},
 		registry::Entry,
 	},
@@ -54,6 +54,7 @@ use crate::{
 	lines::Lines,
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, Maps},
+	skin::Joints,
 };
 
 /// The depth format. Thirty-two bits is more than a scene this size needs and
@@ -121,6 +122,14 @@ struct Placement {
 	/// one: a flattened entity draws with the normals it had rather than with
 	/// infinities.
 	normal_scale: [f32; 4],
+
+	/// `[where this instance's joint matrices start, how many, 0, 0]`.
+	///
+	/// Read by the skinned pipeline and by nothing else; the static one
+	/// declares the attribute and never looks at it, which a pipeline allows.
+	/// Zero and zero is a thing bones do not move - @ref
+	/// [`NO_JOINTS`](crate::skin::NO_JOINTS).
+	skin: [u32; 4],
 }
 
 /// One mesh, uploaded.
@@ -132,6 +141,8 @@ struct Placement {
 struct GpuMesh {
 	vertices: Buffer,
 	indices: Buffer,
+	/// The bones and weights, for a mesh that has them.
+	skin: Option<Buffer>,
 	index_count: u32,
 	revision: u32,
 }
@@ -171,6 +182,12 @@ struct Batch {
 	material: usize,
 	first: u32,
 	count: u32,
+	/// Whether bones move this mesh, which decides which pipeline draws it.
+	///
+	/// A property of the mesh rather than of the instance, so a batch is
+	/// never half one and half the other: the geometry either carries a skin
+	/// block or it does not.
+	skinned: bool,
 }
 
 /// A device, a pipeline, the resources uploaded so far, and a frame's buffers.
@@ -196,6 +213,10 @@ pub struct Scene {
 	shadowing: bool,
 	/// The debug renderer, drawn into this scene's pass and its depth buffer.
 	lines: Lines,
+	/// The same pipeline over a third vertex buffer, for geometry bones move.
+	skinned: RenderPipeline,
+	/// This frame's joint matrices, and where each pose's run is in them.
+	joints: Joints,
 	/// One per registry slot, in the same order, filled on demand.
 	meshes: Vec<GpuMesh>,
 	textures: Vec<GpuTexture>,
@@ -247,40 +268,7 @@ impl Scene {
 			}],
 		});
 
-		let material_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-			label: Some("material"),
-			entries: &[
-				BindGroupLayoutEntry {
-					binding: 0,
-					visibility: ShaderStages::FRAGMENT,
-					ty: BindingType::Texture {
-						sample_type: TextureSampleType::Float { filterable: true },
-						view_dimension: TextureViewDimension::D2,
-						multisampled: false,
-					},
-					count: None,
-				},
-				BindGroupLayoutEntry {
-					binding: 1,
-					visibility: ShaderStages::FRAGMENT,
-					ty: BindingType::Sampler(SamplerBindingType::Filtering),
-					count: None,
-				},
-				// the normal map, sampled through the same sampler: it is the
-				// same surface under the same unwrap, so a second one could
-				// only ever disagree with the first.
-				BindGroupLayoutEntry {
-					binding: 2,
-					visibility: ShaderStages::FRAGMENT,
-					ty: BindingType::Texture {
-						sample_type: TextureSampleType::Float { filterable: true },
-						view_dimension: TextureViewDimension::D2,
-						multisampled: false,
-					},
-					count: None,
-				},
-			],
-		});
+		let material_layout = material_layout(&device);
 
 		let bindings = device.create_bind_group(&BindGroupDescriptor {
 			label: Some("globals"),
@@ -298,17 +286,16 @@ impl Scene {
 		let samplers =
 			[build_sampler(&device, Wrap::Repeat), build_sampler(&device, Wrap::Clamp)];
 
-		// before the pipeline, because the pipeline's third group is the one
-		// the maps are read through.
-		let shadows = Maps::new(&device)?;
-
+		// before the maps and before the pipelines: the depth pass reads the
+		// joints as its second group and the scene reads them as its fourth,
+		// so the layout has to exist before either is built.
+		let joints = Joints::new(&device)?;
+		let shadows = Maps::new(&device, joints.layout())?;
 		let shader = Shader::new("shader.wgsl", include_str!("shader.wgsl"));
-		let pipeline = compile_pipeline(
-			&device,
-			format,
-			&[&globals_layout, &material_layout, shadows.sample_layout()],
-			shader.source(),
-		)?;
+		let groups =
+			[&globals_layout, &material_layout, shadows.sample_layout(), joints.layout()];
+		let pipeline = compile_pipeline(&device, format, &groups, shader.source(), false)?;
+		let skinned = compile_pipeline(&device, format, &groups, shader.source(), true)?;
 		let depth = depth_view(&device, width, height);
 		let lines = Lines::new(&device, format, &globals_layout)?;
 
@@ -335,6 +322,8 @@ impl Scene {
 			cascades: Cascades::NONE,
 			shadowing: false,
 			lines,
+			skinned,
+			joints,
 			// nothing is uploaded until a frame says what the world holds: the
 			// registries belong to the host, and a scene built before the host
 			// has loaded its assets would only have to be rebuilt afterwards.
@@ -364,12 +353,19 @@ impl Scene {
 	/// @param source - the whole WGSL
 	/// @return the compiler's complaint, if it had one
 	pub fn set_shader(&mut self, source: &str) -> Result {
-		self.pipeline = compile_pipeline(
-			&self.device,
-			self.format,
-			&[&self.globals_layout, &self.material_layout, self.shadows.sample_layout()],
-			source,
-		)?;
+		let groups = [
+			&self.globals_layout,
+			&self.material_layout,
+			self.shadows.sample_layout(),
+			self.joints.layout(),
+		];
+		// both, and neither is assigned until both have compiled: half a
+		// reload is a world where the crates moved and the characters did not.
+		let pipeline = compile_pipeline(&self.device, self.format, &groups, source, false)?;
+		let skinned = compile_pipeline(&self.device, self.format, &groups, source, true)?;
+
+		self.pipeline = pipeline;
+		self.skinned = skinned;
 
 		Ok(())
 	}
@@ -422,10 +418,15 @@ impl Scene {
 			multiview_mask: None,
 		});
 
-		pass.set_pipeline(&self.pipeline);
 		pass.set_bind_group(0, &self.bindings, &[]);
 		pass.set_bind_group(2, self.shadows.bindings(), &[]);
+		pass.set_bind_group(3, self.joints.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
+
+		// swapped when a batch wants the other one rather than once per batch.
+		// The order is by mesh and material, so a world of crates with one
+		// character in it changes pipeline twice however many crates there are.
+		let mut bound = None;
 
 		for batch in &self.batches {
 			let (Some(mesh), Some(material)) =
@@ -433,6 +434,15 @@ impl Scene {
 			else {
 				continue;
 			};
+
+			if bound != Some(batch.skinned) {
+				pass.set_pipeline(self.drawing(batch.skinned));
+				bound = Some(batch.skinned);
+			}
+
+			if let Some(skin) = mesh.skin.as_ref() {
+				pass.set_vertex_buffer(2, skin.slice(..));
+			}
 
 			pass.set_bind_group(1, &material.bindings, &[]);
 			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
@@ -447,6 +457,20 @@ impl Scene {
 
 		drop(pass);
 		self.queue.submit([encoder.finish()]);
+	}
+
+	/// Which pipeline draws a batch into the picture.
+	const fn drawing(&self, skinned: bool) -> &RenderPipeline {
+		if skinned { &self.skinned } else { &self.pipeline }
+	}
+
+	/// Which one draws it into a cascade.
+	const fn casting(&self, skinned: bool) -> &RenderPipeline {
+		if skinned {
+			self.shadows.skinned()
+		} else {
+			self.shadows.pipeline()
+		}
 	}
 
 	/// Records one cascade's depth pass.
@@ -481,14 +505,28 @@ impl Scene {
 			multiview_mask: None,
 		});
 
-		pass.set_pipeline(self.shadows.pipeline());
 		pass.set_bind_group(0, slot, &[]);
+		pass.set_bind_group(1, self.joints.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
+
+		// the same swap the scene pass makes, and it has to be made here too:
+		// a character whose shadow were cast from its bind pose would stand in
+		// one attitude and be shadowed in another.
+		let mut bound = None;
 
 		for batch in &self.batches {
 			let Some(mesh) = self.meshes.get(batch.mesh) else {
 				continue;
 			};
+
+			if bound != Some(batch.skinned) {
+				pass.set_pipeline(self.casting(batch.skinned));
+				bound = Some(batch.skinned);
+			}
+
+			if let Some(skin) = mesh.skin.as_ref() {
+				pass.set_vertex_buffer(2, skin.slice(..));
+			}
 
 			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
 			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
@@ -602,6 +640,7 @@ impl Scene {
 
 		self.queue
 			.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.placements));
+		self.joints.upload(&self.queue);
 	}
 
 	/// Brings the uploaded meshes level with the world's registry.
@@ -775,6 +814,8 @@ impl Scene {
 
 		self.placements.clear();
 		self.batches.clear();
+		self.joints.begin(world);
+
 		for index in 0..self.order.len() {
 			self.place(world, index);
 		}
@@ -820,18 +861,77 @@ impl Scene {
 			normal_scale: normal_scale(transform.scale)
 				.extend(0.0)
 				.to_array(),
+			// the first entity of the frame to name a pose is what gathers it;
+			// the second finds the same run rather than a second copy of it.
+			skin: self.joints.take(world, renderable.pose),
 		});
 
 		let (mesh, material) =
 			(usize::try_from(mesh).unwrap_or(0), usize::try_from(material).unwrap_or(0));
+		// asked of the uploaded geometry rather than of the entity: what
+		// decides the pipeline is whether there are bones and weights to read,
+		// and an entity naming a pose over a mesh that has none is drawn as
+		// the shape it is.
+		let skinned = self
+			.meshes
+			.get(mesh)
+			.is_some_and(|uploaded| uploaded.skin.is_some());
 
 		match self.batches.last_mut() {
 			| Some(batch) if batch.mesh == mesh && batch.material == material => batch.count += 1,
-			| _ => self
-				.batches
-				.push(Batch { mesh, material, first: at, count: 1 }),
+			| _ => self.batches.push(Batch {
+				mesh,
+				material,
+				first: at,
+				count: 1,
+				skinned,
+			}),
 		}
 	}
+}
+
+/// The layout every material's group is built against.
+///
+/// Lifted out of the constructor rather than written inline: a builder that
+/// creates two layouts, two pipelines, a depth buffer and three tables is a
+/// hundred lines of nothing, and this is the half of it with no logic at all.
+///
+/// @param device - the device to build against
+fn material_layout(device: &Device) -> BindGroupLayout {
+	device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+		label: Some("material"),
+		entries: &[
+			BindGroupLayoutEntry {
+				binding: 0,
+				visibility: ShaderStages::FRAGMENT,
+				ty: BindingType::Texture {
+					sample_type: TextureSampleType::Float { filterable: true },
+					view_dimension: TextureViewDimension::D2,
+					multisampled: false,
+				},
+				count: None,
+			},
+			BindGroupLayoutEntry {
+				binding: 1,
+				visibility: ShaderStages::FRAGMENT,
+				ty: BindingType::Sampler(SamplerBindingType::Filtering),
+				count: None,
+			},
+			// the normal map, sampled through the same sampler: it is the
+			// same surface under the same unwrap, so a second one could
+			// only ever disagree with the first.
+			BindGroupLayoutEntry {
+				binding: 2,
+				visibility: ShaderStages::FRAGMENT,
+				ty: BindingType::Texture {
+					sample_type: TextureSampleType::Float { filterable: true },
+					view_dimension: TextureViewDimension::D2,
+					multisampled: false,
+				},
+				count: None,
+			},
+		],
+	})
 }
 
 /// One sampler, for one wrap mode.
@@ -896,6 +996,19 @@ fn upload_mesh(device: &Device, queue: &Queue, data: &MeshData, revision: u32) -
 			bytemuck::cast_slice(&data.indices),
 			BufferUsages::INDEX,
 		),
+		// nothing at all rather than an empty buffer for a mesh nothing bends,
+		// which is almost all of them: the buffer is what decides which
+		// pipeline draws the mesh, so its absence has to be the same claim as
+		// the absence of the block it came from.
+		skin: data.is_skinned().then(|| {
+			create_buffer(
+				device,
+				queue,
+				"mesh skin",
+				bytemuck::cast_slice(&data.skin),
+				BufferUsages::VERTEX,
+			)
+		}),
 		index_count: u32::try_from(data.indices.len()).unwrap_or(0),
 		revision,
 	}
@@ -1064,14 +1177,16 @@ fn clear_color(world: &World) -> Color {
 /// @param format - the color format the fragment stage writes
 /// @param layouts - the bind group layouts, in group order
 /// @param source - the whole WGSL
+/// @param skinned - whether to build the variant that reads bones
 fn compile_pipeline(
 	device: &Device,
 	format: TextureFormat,
 	layouts: &[&BindGroupLayout],
 	source: &str,
+	skinned: bool,
 ) -> Result<RenderPipeline> {
 	let scope = device.push_error_scope(ErrorFilter::Validation);
-	let pipeline = build_pipeline(device, format, layouts, source);
+	let pipeline = build_pipeline(device, format, layouts, source, skinned);
 
 	match pollster::block_on(scope.pop()) {
 		| Some(complaint) => Err(err!(Graphics("{complaint}"))),
@@ -1085,11 +1200,13 @@ fn compile_pipeline(
 /// @param format - the color format the fragment stage writes
 /// @param layouts - the bind group layouts, in group order
 /// @param source - the whole WGSL
+/// @param skinned - whether to bind a third vertex buffer and read bones
 fn build_pipeline(
 	device: &Device,
 	format: TextureFormat,
 	layouts: &[&BindGroupLayout],
 	source: &str,
+	skinned: bool,
 ) -> RenderPipeline {
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
 		label: Some("scene"),
@@ -1116,15 +1233,27 @@ fn build_pipeline(
 		step_mode: VertexStepMode::Instance,
 		attributes: &INSTANCE_ATTRIBUTES,
 	};
+	let skin = VertexBufferLayout {
+		array_stride: skin_stride(),
+		step_mode: VertexStepMode::Vertex,
+		attributes: &SKIN_ATTRIBUTES,
+	};
+	// the third buffer only where it is read. Declaring it on both would mean
+	// binding one for every crate in the world, and there is nothing to bind.
+	let buffers: &[Option<VertexBufferLayout<'_>>] = if skinned {
+		&[Some(vertices), Some(instances), Some(skin)]
+	} else {
+		&[Some(vertices), Some(instances)]
+	};
 
 	device.create_render_pipeline(&RenderPipelineDescriptor {
-		label: Some("scene"),
+		label: Some(if skinned { "scene skinned" } else { "scene" }),
 		layout: Some(&layout),
 		vertex: VertexState {
 			module: &shader,
-			entry_point: Some("vertex_main"),
+			entry_point: Some(if skinned { "vertex_skinned" } else { "vertex_main" }),
 			compilation_options: PipelineCompilationOptions::default(),
-			buffers: &[Some(vertices), Some(instances)],
+			buffers,
 		},
 		primitive: PrimitiveState {
 			topology: PrimitiveTopology::TriangleList,
@@ -1198,7 +1327,7 @@ pub(crate) const VERTEX_ATTRIBUTES: [VertexAttribute; 4] = [
 /// @note: locations continue where [`VERTEX_ATTRIBUTES`] stopped. A shader
 /// location is a property of the pipeline rather than of one buffer, so the two
 /// tables share a numbering and growing the vertex pushes the instance along.
-pub(crate) const INSTANCE_ATTRIBUTES: [VertexAttribute; 7] = [
+pub(crate) const INSTANCE_ATTRIBUTES: [VertexAttribute; 8] = [
 	VertexAttribute {
 		format: VertexFormat::Float32x4,
 		offset: 0,
@@ -1234,7 +1363,46 @@ pub(crate) const INSTANCE_ATTRIBUTES: [VertexAttribute; 7] = [
 		offset: 96,
 		shader_location: 10,
 	},
+	VertexAttribute {
+		format: VertexFormat::Uint32x4,
+		offset: 112,
+		shader_location: 11,
+	},
 ];
+
+/// What one [`SkinVertex`] hands it, for a mesh bones move.
+///
+/// A third buffer rather than four more fields on the vertex: almost no mesh
+/// is skinned, and a world of crates would pay twelve bytes a vertex for
+/// something none of them reads. @ref
+/// [`SkinVertex`](colby_core::abi::SkinVertex).
+pub(crate) const SKIN_ATTRIBUTES: [VertexAttribute; 2] = [
+	VertexAttribute {
+		format: VertexFormat::Uint16x4,
+		offset: 0,
+		shader_location: 12,
+	},
+	// normalized on the way in, so the shader reads four fractions rather
+	// than four numbers out of 255.
+	VertexAttribute {
+		format: VertexFormat::Unorm8x4,
+		offset: 8,
+		shader_location: 13,
+	},
+];
+
+/// The stride of the skin buffer, asserted against the attributes above.
+pub(crate) const fn skin_stride() -> BufferAddress {
+	const {
+		assert!(
+			size_of::<SkinVertex>() == 12,
+			"SkinVertex is no longer four shorts and four bytes"
+		);
+		assert!(align_of::<SkinVertex>() == 2, "SkinVertex gained padding");
+	}
+
+	12
+}
 
 /// The vertex and instance strides, asserted to match the attributes above.
 pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
@@ -1244,7 +1412,10 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 			"MeshVertex is no longer two vec3s, a vec2 and a vec4"
 		);
 		assert!(align_of::<MeshVertex>() == 4, "MeshVertex gained padding");
-		assert!(size_of::<Placement>() == 112, "Placement is no longer a mat4 and three vec4s");
+		assert!(
+			size_of::<Placement>() == 128,
+			"Placement is no longer a mat4, three vec4s and four words"
+		);
 		assert!(align_of::<Placement>() == 4, "Placement gained padding");
 		assert!(size_of::<Globals>() == 432, "a uniform struct has to be a multiple of 16");
 		assert!(size_of::<Globals>().is_multiple_of(16), "and this one is not");
@@ -1258,7 +1429,7 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 		assert!(CASCADES == 4, "the shader indexes four cascades by name");
 	}
 
-	(48, 112)
+	(48, 128)
 }
 
 #[cfg(test)]
@@ -1274,8 +1445,13 @@ mod tests {
 		);
 		assert_eq!(
 			size_bytes::<Placement>(MAX_ENTITIES).expect("the size fits"),
-			112 * BufferAddress::try_from(MAX_ENTITIES).expect("the count fits"),
+			128 * BufferAddress::try_from(MAX_ENTITIES).expect("the count fits"),
 			"one placement per entity the world can hold"
+		);
+		assert_eq!(
+			skin_stride(),
+			BufferAddress::try_from(size_of::<SkinVertex>()).expect("a vertex is small"),
+			"and the third buffer is read at the width the block was written in"
 		);
 	}
 

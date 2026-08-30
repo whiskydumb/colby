@@ -76,7 +76,57 @@ struct InstanceInput {
     // the normal matrix for a transform that is a translation, a rotation and a
     // scale. w is unused.
     @location(10) normal_scale: vec4<f32>,
+    // x is where this instance's joint matrices start in the buffer below and
+    // y is how many there are. Zero and zero is a thing bones do not move; the
+    // static entry point never reads it.
+    @location(11) skin: vec4<u32>,
 };
+
+// One matrix per bone of every posed character in the frame, back to back.
+//
+// One buffer rather than a block per character, because a block per character
+// is a bind group per character and that is the batching thrown away. An
+// instance carries the offset of its own run instead.
+@group(3) @binding(0) var<storage, read> joints: array<mat4x4<f32>>;
+
+struct SkinInput {
+    // Which bones move this vertex, as indices into its own run.
+    @location(12) bones: vec4<u32>,
+    // How much each pulls. Normalized on the way in, so these are fractions
+    // rather than the bytes the file holds, and they add to one.
+    @location(13) weights: vec4<f32>,
+};
+
+// The one matrix that carries a vertex from the shape it was modeled in to
+// where its bones have put it.
+//
+// The four are added rather than picked between: a vertex on a shoulder is
+// partly the arm's and partly the chest's, and the weighted sum of the two
+// matrices is what makes the surface between them bend instead of tear.
+//
+// The bone index is clamped rather than trusted. The importer already refuses
+// one past the end of its own skeleton, so this is about the run: an index
+// that walked off it would read the next character's bones and fling the
+// vertex across the map.
+fn skinning(skin: SkinInput, at: u32, count: u32) -> mat4x4<f32> {
+    if count == 0u {
+        return mat4x4<f32>(
+            vec4<f32>(1.0, 0.0, 0.0, 0.0),
+            vec4<f32>(0.0, 1.0, 0.0, 0.0),
+            vec4<f32>(0.0, 0.0, 1.0, 0.0),
+            vec4<f32>(0.0, 0.0, 0.0, 1.0),
+        );
+    }
+
+    let last = count - 1u;
+
+    // unrolled because a vec4 may not be indexed by a value only known at run
+    // time, which is four lines rather than a loop and a temporary array.
+    return joints[at + min(skin.bones.x, last)] * skin.weights.x
+        + joints[at + min(skin.bones.y, last)] * skin.weights.y
+        + joints[at + min(skin.bones.z, last)] * skin.weights.z
+        + joints[at + min(skin.bones.w, last)] * skin.weights.w;
+}
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -91,13 +141,34 @@ struct VertexOutput {
 
 @vertex
 fn vertex_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
-    let model = mat4x4<f32>(
+    return place(vertex, instance, model_of(instance));
+}
+
+// The same for geometry bones move: the vertex is carried into its pose first
+// and everything after that is identical.
+//
+// A separate entry point rather than a branch, because the two read different
+// vertex buffers and a pipeline's buffers are fixed when it is built. What is
+// not duplicated is anything below this line.
+@vertex
+fn vertex_skinned(vertex: VertexInput, instance: InstanceInput, skin: SkinInput) -> VertexOutput {
+    let posed = skinning(skin, instance.skin.x, instance.skin.y);
+
+    return place(vertex, instance, model_of(instance) * posed);
+}
+
+// An instance's four columns, put back together.
+fn model_of(instance: InstanceInput) -> mat4x4<f32> {
+    return mat4x4<f32>(
         instance.model_0,
         instance.model_1,
         instance.model_2,
         instance.model_3,
     );
+}
 
+// Everything both entry points do once the model matrix is settled.
+fn place(vertex: VertexInput, instance: InstanceInput, model: mat4x4<f32>) -> VertexOutput {
     let world_position = model * vec4<f32>(vertex.position, 1.0);
 
     var output: VertexOutput;

@@ -284,12 +284,21 @@ pub const fn rgb(red: f32, green: f32, blue: f32) -> Vec3 { Vec3::new(red, green
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{Material, MeshId, Renderable, Texel, TextureData, Transform, cvar::Value},
-		glam::Quat,
+		abi::{
+			Material, MeshData, MeshId, Pose, PoseId, Renderable, SkinVertex, Texel, TextureData,
+			Transform,
+			cvar::Value,
+			mesh,
+			skeleton::{Bone, SkeletonData},
+		},
+		glam::{Mat4, Quat},
 	};
 
 	use super::*;
-	use crate::shadow;
+	use crate::{
+		shadow,
+		skin::{self, Joints},
+	};
 
 	/// How big the test captures are. Small enough to be quick, large enough
 	/// that a sample well inside a shape is unambiguous.
@@ -488,6 +497,386 @@ mod tests {
 		}
 
 		first.map(|first| first.midpoint(last))
+	}
+
+	/// The highest row of the picture that has anything but the background in
+	/// it, counting down from the top.
+	///
+	/// The same idea [`shape_center`] is and for the same reason: it says
+	/// where what was drawn reaches without anybody working out a projection.
+	fn top_row(image: &Image, background: [u8; 4]) -> Option<u32> {
+		(0..image.height)
+			.find(|row| (0..image.width).any(|x| distance(image.pixel(x, *row), background) > 20))
+	}
+
+	/// A bar of two cubes, the left one hung rigidly off bone zero and the
+	/// right one pulled by whatever the caller says.
+	///
+	/// **Neither cube's center is the joint they turn about**, which the first
+	/// two versions of this got wrong twice: a cube turned a quarter of a turn
+	/// about its own center lands exactly on itself, so a picture of one
+	/// cannot change whatever the shader does. The bone is at `x = 1`, the
+	/// cubes are at `x = 0` and `x = 2`, and the right one is therefore in
+	/// three different places depending on which bones pull it and how hard.
+	///
+	/// @param far - how much the right cube is pulled by bone zero and by
+	/// bone one
+	fn bar(far: [u8; 4]) -> MeshData {
+		let mut data = MeshData::default();
+		let pulls = [SkinVertex::rigid(0), SkinVertex { bones: [0, 1, 0, 0], weights: far }];
+
+		for (along, pull) in [0.0_f32, 2.0].into_iter().zip(pulls) {
+			let mut piece = mesh::cube();
+			let base = u32::try_from(data.vertices.len()).expect("the bar is small");
+
+			for vertex in &mut piece.vertices {
+				vertex.position[0] += along;
+			}
+
+			data.indices
+				.extend(piece.indices.iter().map(|index| index + base));
+			data.skin
+				.extend(std::iter::repeat_n(pull, piece.vertices.len()));
+			data.vertices.extend(piece.vertices);
+		}
+
+		data
+	}
+
+	/// Two bones: one at the origin and one a unit along `x` from it, with the
+	/// inverse binds worked out from the rests the way an importer does.
+	fn elbow() -> SkeletonData {
+		SkeletonData {
+			bones: vec![
+				Bone {
+					name: "root".to_owned(),
+					..Bone::default()
+				},
+				Bone {
+					name: "arm".to_owned(),
+					parent: 0,
+					inverse_bind: Mat4::from_translation(Vec3::NEG_X),
+					rest: Transform::at(Vec3::X),
+				},
+			],
+		}
+	}
+
+	/// What the fixture's geometry is registered under.
+	const BAR: &str = "bar";
+
+	/// A world holding that bar, moved by that skeleton.
+	///
+	/// @param posed - whether to give it a pose at all
+	/// @return the world, and the pose if there is one
+	fn armed(posed: bool) -> (World, PoseId, MeshId) { armed_with(posed, [0, 255, 0, 0]) }
+
+	/// The same, saying what pulls the right-hand cube.
+	fn armed_with(posed: bool, far: [u8; 4]) -> (World, PoseId, MeshId) {
+		let mut world = looking_world();
+		let mesh = world.meshes.insert(BAR, bar(far));
+		let skeleton = world.skeletons.insert("rig", elbow());
+		let pose = if posed {
+			world
+				.poses
+				.spawn(Pose::resting(skeleton, world.skeletons.bones(skeleton)))
+		} else {
+			PoseId::NONE
+		};
+		// a unit left and a step back, so the three-unit bar sits across the
+		// middle with room above it to swing into.
+		let id = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(-1.0, -0.5, 0.0)));
+
+		world
+			.entities
+			.set_renderable(id, Renderable::new(mesh, rgb(0.9, 0.7, 0.2)).posed(pose));
+
+		(world, pose, mesh)
+	}
+
+	#[test]
+	fn a_pose_two_entities_share_is_gathered_once_and_not_twice() {
+		let Some(capture) = capture() else {
+			return;
+		};
+
+		// the claim a picture cannot show: two entities of one character - a
+		// model of two materials is exactly that - read one run of matrices.
+		// Gathering per entity instead would draw the same thing and ask the
+		// buffer for four times what it holds.
+		let (world, pose, _) = armed(true);
+		let mut joints =
+			Joints::new(capture.scene.device()).expect("the joint buffer is described");
+
+		joints.begin(&world);
+
+		let first = joints.take(&world, pose);
+		let second = joints.take(&world, pose);
+
+		assert_ne!(first, skin::NO_JOINTS, "there is a run to share");
+		assert_eq!(first, second, "and the second asker is told about the same one");
+		assert_eq!(
+			joints.len(),
+			2,
+			"which is two bones gathered once rather than two bones gathered twice"
+		);
+	}
+
+	#[test]
+	fn a_pose_that_is_gone_is_no_run_at_all() {
+		let Some(capture) = capture() else {
+			return;
+		};
+
+		let (mut world, pose, _) = armed(true);
+		let mut joints =
+			Joints::new(capture.scene.device()).expect("the joint buffer is described");
+
+		world.poses.despawn(pose);
+		joints.begin(&world);
+
+		assert_eq!(
+			joints.take(&world, pose),
+			skin::NO_JOINTS,
+			"a stale handle draws the shape it was modeled in rather than somebody else's pose"
+		);
+		assert_eq!(joints.len(), 0, "and nothing was gathered for it");
+	}
+
+	#[test]
+	fn a_bone_that_turns_bends_the_geometry_hanging_off_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let (mut world, pose, _) = armed(true);
+		let straight = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let background = straight.pixel(1, 1);
+		let before = top_row(&straight, background).expect("the bar is in the picture");
+
+		// a quarter turn about z at the elbow, which swings the right-hand
+		// cube up and over the joint.
+		world.advance();
+		world
+			.poses
+			.get_mut(pose)
+			.expect("the pose is there")
+			.set(1, Transform {
+				rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+				..Transform::at(Vec3::X)
+			});
+		world.poses.snap_all();
+		world.settle();
+
+		let bent = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let after = top_row(&bent, background).expect("the bar is still in the picture");
+
+		assert!(
+			after + 20 < before,
+			"the half hanging off the turned bone should reach higher up the picture, and the \
+			 top went from row {before} to row {after}"
+		);
+	}
+
+	#[test]
+	fn a_vertex_two_bones_share_lands_where_neither_alone_would_put_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// one world and one bent pose, with the geometry swapped under it
+		// three times: the right-hand cube pulled by all of bone zero, by all
+		// of bone one, and by half of each. If the shader picked a bone rather
+		// than adding the four, the third would be a copy of one of the first
+		// two.
+		//
+		// @note: one world rather than three, and it matters. What tells a
+		// capture a mesh changed is its registry slot's revision, and three
+		// fresh worlds would each put their bar in slot one at revision zero -
+		// so all three would be drawn with whichever arrived first. Rewriting
+		// the entry under one name is the engine's own reload path and moves
+		// the revision, which is exactly what has to happen.
+		let (mut world, pose, _) = armed(true);
+
+		world.advance();
+		world
+			.poses
+			.get_mut(pose)
+			.expect("the pose is there")
+			.set(1, Transform {
+				rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+				..Transform::at(Vec3::X)
+			});
+		world.poses.snap_all();
+		world.settle();
+
+		let mut shots = Vec::new();
+
+		for far in [[255_u8, 0, 0, 0], [0, 255, 0, 0], [128, 127, 0, 0]] {
+			world.meshes.insert(BAR, bar(far));
+			shots.push(
+				capture
+					.shoot(&mut world)
+					.expect("the capture renders"),
+			);
+		}
+
+		assert_ne!(
+			shots[0].pixels, shots[1].pixels,
+			"the two bones really do put that cube in different places"
+		);
+		assert_ne!(
+			shots[2].pixels, shots[0].pixels,
+			"half of each is not all of the first, which is what picking rather than adding \
+			 would have drawn"
+		);
+		assert_ne!(shots[2].pixels, shots[1].pixels, "and it is not all of the second either");
+	}
+
+	#[test]
+	fn a_vertex_naming_a_bone_past_its_own_run_reads_the_last_one_instead() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// nothing upstream can quite rule this out: a mesh's block is checked
+		// against the widest skeleton any file may have rather than against
+		// the two-bone one moving it here, so an index of five reaches this
+		// far. Clamped, it draws the last bone of its own run; trusted, it
+		// reads whatever sits five matrices along - the next character's
+		// shoulder, or nothing at all.
+		let (mut world, pose, _) = armed(true);
+
+		world.advance();
+		world
+			.poses
+			.get_mut(pose)
+			.expect("the pose is there")
+			.set(1, Transform {
+				rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+				..Transform::at(Vec3::X)
+			});
+		world.poses.snap_all();
+		world.settle();
+
+		let mut shots = Vec::new();
+
+		for named in [1_u16, 5] {
+			let mut geometry = bar([0, 255, 0, 0]);
+
+			for vertex in geometry
+				.skin
+				.iter_mut()
+				.filter(|vertex| vertex.bones[1] == 1)
+			{
+				vertex.bones[1] = named;
+			}
+
+			world.meshes.insert(BAR, geometry);
+			shots.push(
+				capture
+					.shoot(&mut world)
+					.expect("the capture renders"),
+			);
+		}
+
+		assert_eq!(
+			shots[0].pixels, shots[1].pixels,
+			"an index past the end of the run is the end of the run, not a reach into the buffer"
+		);
+	}
+
+	#[test]
+	fn one_bent_character_does_not_bend_the_one_beside_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// two bars, each with a pose of its own, and only the second is bent.
+		// If a run were addressed by anything but its own offset - the
+		// distance to the end of the buffer, say - the still one would read
+		// the bent one's matrices and move with it.
+		let (mut world, _, mesh) = armed(true);
+		let skeleton = world.skeletons.find("rig");
+		let second = world
+			.poses
+			.spawn(Pose::resting(skeleton, world.skeletons.bones(skeleton)));
+		let id = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(-1.0, 1.5, 0.0)));
+
+		world
+			.entities
+			.set_renderable(id, Renderable::new(mesh, rgb(0.2, 0.8, 0.9)).posed(second));
+
+		let before = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		world.advance();
+		world
+			.poses
+			.get_mut(second)
+			.expect("the second pose is there")
+			.set(1, Transform {
+				rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+				..Transform::at(Vec3::X)
+			});
+		world.poses.snap_all();
+		world.settle();
+
+		let after = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let background = before.pixel(1, 1);
+		// the still bar is the lower one and stops around two fifths down; the
+		// bent one starts above that and only ever swings further up. So every
+		// row below this belongs to the bar nobody touched, and measuring the
+		// lot of them beats picking one and arguing about which.
+		let below = SIZE.1 * 5 / 12;
+		let same = (below..SIZE.1).all(|row| {
+			(0..SIZE.0).all(|column| before.pixel(column, row) == after.pixel(column, row))
+		});
+		let anything = (below..SIZE.1).any(|row| {
+			(0..SIZE.0).any(|column| distance(before.pixel(column, row), background) > 20)
+		});
+
+		assert_ne!(before.pixels, after.pixels, "the bent one really did move");
+		assert!(anything, "there is a bar down there to be sure about");
+		assert!(same, "and bending one pose left the geometry of the other exactly where it was");
+	}
+
+	#[test]
+	fn a_resting_pose_draws_the_shape_the_mesh_was_modeled_in() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the same geometry twice: once moved by a pose every bone of which is
+		// where its skeleton left it, and once by no pose at all. A resting
+		// pose is the identity per bone, so the two are the same picture - and
+		// if they are not, the inverse binds are being applied in the wrong
+		// order or against the wrong bone.
+		let (mut posed, ..) = armed(true);
+		let (mut bare, ..) = armed(false);
+		let with = capture
+			.shoot(&mut posed)
+			.expect("the capture renders");
+		let without = capture
+			.shoot(&mut bare)
+			.expect("and so does the other");
+
+		assert_eq!(with.pixels, without.pixels, "a resting pose moves nothing");
+		assert!(
+			top_row(&with, with.pixel(1, 1)).is_some(),
+			"and there is something in the picture for that to be true of"
+		);
 	}
 
 	#[test]
@@ -965,7 +1354,8 @@ f 1 4 5
 		// never reached the instance data these would be the same pixel.
 		assert!(
 			distance(dielectric, metallic) > 20,
-			"the same color made of two things looks like two things: {dielectric:?} against 			 {metallic:?}"
+			"the same color made of two things looks like two things: {dielectric:?} against \
+			 {metallic:?}"
 		);
 	}
 
@@ -1437,8 +1827,8 @@ f 1 4 5
 
 		assert!(
 			slice_of(near) < slice_of(far),
-			"the two casters are meant to be in different cascades, and they are both in {} 			 \
-			 at depths {} and {}",
+			"the two casters are meant to be in different cascades, and they are both in {} at \
+			 depths {} and {}",
 			slice_of(near),
 			depth(near),
 			depth(far)

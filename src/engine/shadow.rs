@@ -50,7 +50,9 @@ use wgpu::{
 	VertexBufferLayout, VertexState, VertexStepMode,
 };
 
-use crate::scene::{DEPTH_FORMAT, INSTANCE_ATTRIBUTES, VERTEX_ATTRIBUTES, strides};
+use crate::scene::{
+	DEPTH_FORMAT, INSTANCE_ATTRIBUTES, SKIN_ATTRIBUTES, VERTEX_ATTRIBUTES, skin_stride, strides,
+};
 
 /// How many slices the shadow distance is cut into.
 ///
@@ -311,14 +313,19 @@ pub(crate) struct Maps {
 	sample_layout: BindGroupLayout,
 
 	pipeline: RenderPipeline,
+
+	/// The same over a third vertex buffer, for geometry bones move.
+	skinned: RenderPipeline,
 }
 
 impl Maps {
-	/// Builds the array, the pipeline and every group.
+	/// Builds the array, both pipelines and every group.
 	///
 	/// @param device - the device to build against
+	/// @param joints - the layout of the frame's joint matrices, which the
+	/// skinned pipeline reads as its second group
 	/// @return the maps, or the compiler's complaint about the depth shader
-	pub(crate) fn new(device: &Device) -> Result<Self> {
+	pub(crate) fn new(device: &Device, joints: &BindGroupLayout) -> Result<Self> {
 		let cascade_layout = cascade_layout(device);
 		let sample_layout = sample_layout(device);
 		let texture = device.create_texture(&TextureDescriptor {
@@ -409,7 +416,8 @@ impl Maps {
 			.collect();
 
 		let scope = device.push_error_scope(ErrorFilter::Validation);
-		let pipeline = build_pipeline(device, &cascade_layout);
+		let pipeline = build_pipeline(device, &cascade_layout, joints, false);
+		let skinned = build_pipeline(device, &cascade_layout, joints, true);
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
 			return Err(err!(Graphics("the shadow pipeline: {complaint}")));
@@ -422,6 +430,7 @@ impl Maps {
 			sampled,
 			sample_layout,
 			pipeline,
+			skinned,
 		})
 	}
 
@@ -433,6 +442,9 @@ impl Maps {
 
 	/// The depth-only pipeline every cascade's pass runs.
 	pub(crate) const fn pipeline(&self) -> &RenderPipeline { &self.pipeline }
+
+	/// The same for geometry bones move.
+	pub(crate) const fn skinned(&self) -> &RenderPipeline { &self.skinned }
 
 	/// One cascade's layer, to draw into.
 	pub(crate) fn layer(&self, slice: usize) -> Option<&TextureView> { self.layers.get(slice) }
@@ -504,39 +516,57 @@ fn sample_layout(device: &Device) -> BindGroupLayout {
 ///
 /// @param device - the device to build against
 /// @param layout - the group holding one cascade's matrix
-fn build_pipeline(device: &Device, layout: &BindGroupLayout) -> RenderPipeline {
+/// @param joints - the group holding the frame's joint matrices
+/// @param skinned - whether to build the variant that reads bones
+fn build_pipeline(
+	device: &Device,
+	layout: &BindGroupLayout,
+	joints: &BindGroupLayout,
+	skinned: bool,
+) -> RenderPipeline {
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
 		label: Some("shadow"),
 		source: ShaderSource::Wgsl(include_str!("shadow.wgsl").into()),
 	});
 
+	// the joints are declared on both, so that one bind group serves both
+	// passes and nothing has to be unbound between two batches.
 	let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
 		label: Some("shadow"),
-		bind_group_layouts: &[Some(layout)],
+		bind_group_layouts: &[Some(layout), Some(joints)],
 		immediate_size: 0,
 	});
 
 	let (vertex_stride, instance_stride) = strides();
+	let vertices = VertexBufferLayout {
+		array_stride: vertex_stride,
+		step_mode: VertexStepMode::Vertex,
+		attributes: &VERTEX_ATTRIBUTES,
+	};
+	let instances = VertexBufferLayout {
+		array_stride: instance_stride,
+		step_mode: VertexStepMode::Instance,
+		attributes: &INSTANCE_ATTRIBUTES,
+	};
+	let skin = VertexBufferLayout {
+		array_stride: skin_stride(),
+		step_mode: VertexStepMode::Vertex,
+		attributes: &SKIN_ATTRIBUTES,
+	};
+	let buffers: &[Option<VertexBufferLayout<'_>>] = if skinned {
+		&[Some(vertices), Some(instances), Some(skin)]
+	} else {
+		&[Some(vertices), Some(instances)]
+	};
 
 	device.create_render_pipeline(&RenderPipelineDescriptor {
-		label: Some("shadow"),
+		label: Some(if skinned { "shadow skinned" } else { "shadow" }),
 		layout: Some(&pipeline_layout),
 		vertex: VertexState {
 			module: &shader,
-			entry_point: Some("vertex_main"),
+			entry_point: Some(if skinned { "vertex_skinned" } else { "vertex_main" }),
 			compilation_options: PipelineCompilationOptions::default(),
-			buffers: &[
-				Some(VertexBufferLayout {
-					array_stride: vertex_stride,
-					step_mode: VertexStepMode::Vertex,
-					attributes: &VERTEX_ATTRIBUTES,
-				}),
-				Some(VertexBufferLayout {
-					array_stride: instance_stride,
-					step_mode: VertexStepMode::Instance,
-					attributes: &INSTANCE_ATTRIBUTES,
-				}),
-			],
+			buffers,
 		},
 		primitive: PrimitiveState {
 			topology: PrimitiveTopology::TriangleList,

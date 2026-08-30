@@ -20,6 +20,7 @@ pub mod renderer;
 pub mod scene;
 pub mod shader;
 pub mod shadow;
+mod skin;
 
 pub use ::wgpu;
 pub use ::winit;
