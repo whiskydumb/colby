@@ -21,6 +21,7 @@
 
 use crate::glam::{Mat4, Quat, Vec3};
 
+pub mod anim;
 pub mod camera;
 pub mod character;
 pub mod console;
@@ -44,6 +45,7 @@ pub mod texture;
 pub mod ui;
 
 pub use self::{
+	anim::{Channel, ClipData, Interpolation, MAX_KEYS, MAX_TRACKS, Track},
 	camera::Camera,
 	character::{Motion, Moved},
 	cvar::{Args, ConsoleFn, Cvars, Value},

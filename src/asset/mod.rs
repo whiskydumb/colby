@@ -23,6 +23,7 @@
 //!
 //! Nothing here depends on wgpu, so the compiler builds and runs without a GPU.
 
+pub mod anim;
 pub mod bytes;
 pub mod compile;
 pub mod css;

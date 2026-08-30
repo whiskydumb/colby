@@ -181,12 +181,13 @@ fn describe(produced: Produced) -> String {
 		| Produced::Model {
 			meshes,
 			skeletons,
+			clips,
 			textures,
 			materials,
 			placements,
 		} => format!(
-			"{meshes:>6} meshes {skeletons} skeletons {textures} pictures {materials} materials \
-			 {placements} standing"
+			"{meshes:>6} meshes {skeletons} skeletons {clips} clips {textures} pictures \
+			 {materials} materials {placements} standing"
 		),
 		| Produced::Scene { entities, bodies, joints } =>
 			format!("{entities:>6} entities {bodies} bodies {joints} joints"),

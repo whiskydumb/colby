@@ -231,6 +231,10 @@ impl Assets {
 			| Kind::Model => load_model(world, path, &name),
 			| Kind::Scene => load_scene(world, path, &name),
 			| Kind::Skeleton => load_skeleton(world, path, &name),
+			// a clip reaches the world through the pose that plays it, and
+			// nothing plays one yet. It is compiled and left on disk until
+			// something does.
+			| Kind::Clip => (),
 		}
 	}
 
@@ -264,6 +268,7 @@ impl Assets {
 						.skeletons
 						.insert(&name, SkeletonData::default()),
 				),
+				| Kind::Clip => (),
 			}
 
 			info!(name, ?kind, "asset unloaded; its file is gone");

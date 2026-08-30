@@ -44,8 +44,8 @@ use std::{
 use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
 use crate::{
-	document, font, format, gltf, html, jpeg, level, model, obj, png, scene, skeleton, texture,
-	ttf,
+	anim, document, font, format, gltf, html, jpeg, level, model, obj, png, scene, skeleton,
+	texture, ttf,
 };
 
 /// The directory under a workspace that holds editable sources.
@@ -85,6 +85,7 @@ pub const OUTPUT_EXTENSIONS: &[&str] = &[
 	model::EXTENSION,
 	scene::EXTENSION,
 	skeleton::EXTENSION,
+	anim::EXTENSION,
 ];
 
 /// Which of colby's formats a source compiles into.
@@ -127,6 +128,13 @@ pub enum Kind {
 	/// to make the model that wrote it stale - @ref [`beside_is_stale`] - and
 	/// that check works by asking an output which format it is in.
 	Skeleton,
+
+	/// A `.canim`, which **no source compiles into** either.
+	///
+	/// The second kind with no source of its own, and for the same reason a
+	/// skeleton has none: a clip comes out of a model beside its meshes. @ref
+	/// [`Self::Skeleton`].
+	Clip,
 }
 
 impl Kind {
@@ -160,6 +168,7 @@ impl Kind {
 			| Self::Model => model::EXTENSION,
 			| Self::Scene => scene::EXTENSION,
 			| Self::Skeleton => skeleton::EXTENSION,
+			| Self::Clip => anim::EXTENSION,
 		}
 	}
 
@@ -179,6 +188,7 @@ impl Kind {
 			| model::EXTENSION => Some(Self::Model),
 			| scene::EXTENSION => Some(Self::Scene),
 			| skeleton::EXTENSION => Some(Self::Skeleton),
+			| anim::EXTENSION => Some(Self::Clip),
 			| _ => None,
 		}
 	}
@@ -194,6 +204,7 @@ impl Kind {
 			| Self::Model => model::version_of(path),
 			| Self::Scene => scene::version_of(path),
 			| Self::Skeleton => skeleton::version_of(path),
+			| Self::Clip => anim::version_of(path),
 		}
 	}
 
@@ -208,6 +219,7 @@ impl Kind {
 			| Self::Model => model::FORMAT_VERSION,
 			| Self::Scene => scene::FORMAT_VERSION,
 			| Self::Skeleton => skeleton::FORMAT_VERSION,
+			| Self::Clip => anim::FORMAT_VERSION,
 		}
 	}
 }
@@ -271,6 +283,9 @@ pub enum Produced {
 
 		/// How many skeletons were, for the meshes bones move.
 		skeletons: usize,
+
+		/// How many clips were, for the skeletons to be moved by.
+		clips: usize,
 
 		/// How many pictures had to be taken out of it.
 		textures: usize,
@@ -514,10 +529,10 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 		// unreachable through `Kind::of`, which is the only way a source
 		// becomes a kind, and named rather than caught by a wildcard so that
 		// the next kind added has to say what it compiles from.
-		| Kind::Skeleton =>
+		| Kind::Skeleton | Kind::Clip =>
 			return Err(err!(Asset(
-				"{}: a skeleton is only ever written beside a model, never compiled from a \
-				 source of its own",
+				"{}: a skeleton and a clip are only ever written beside a model, never compiled \
+				 from a source of their own",
 				source.display()
 			))),
 	};
@@ -591,6 +606,18 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 		fs::write(beside(&directory, &rig.name, skeleton::EXTENSION), bytes)?;
 	}
 
+	// and the same for a clip that moves nothing colby knows a name for.
+	for moves in imported
+		.clips
+		.iter()
+		.filter(|moves| !moves.data.is_empty())
+	{
+		let bytes = anim::encode(&moves.data)
+			.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+
+		fs::write(beside(&directory, &moves.name, anim::EXTENSION), bytes)?;
+	}
+
 	let data = model::ModelData {
 		materials: imported
 			.materials
@@ -635,6 +662,11 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 			.skins
 			.iter()
 			.filter(|rig| !rig.data.is_empty())
+			.count(),
+		clips: imported
+			.clips
+			.iter()
+			.filter(|moves| !moves.data.is_empty())
 			.count(),
 		textures: imported.textures.len(),
 		materials: data.materials.len(),
@@ -1473,8 +1505,8 @@ f 4 1 5 8
 						compiled.warnings
 					);
 				},
-				| Some(Kind::Skeleton) => panic!(
-					"{} compiled straight into a skeleton, and only a model writes one",
+				| Some(Kind::Skeleton | Kind::Clip) => panic!(
+					"{} compiled straight into a skeleton or a clip, and only a model writes one",
 					compiled.name
 				),
 				| None => panic!("{} compiled to something unrecognized", compiled.name),

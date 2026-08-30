@@ -42,11 +42,13 @@ use colby_core::{Result, err};
 
 use crate::json::{self, Value};
 
+mod clip;
 mod geometry;
 mod material;
 mod skin;
 
 pub use self::{
+	clip::{Clip, Clips},
 	geometry::{Model, Piece, Placement, import},
 	material::{Extracted, Picture, Surface},
 	skin::{Skin, Skins},

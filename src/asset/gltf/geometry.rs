@@ -48,7 +48,7 @@ use colby_core::{
 	glam::{Mat4, Quat, Vec2, Vec3},
 };
 
-use super::{Extracted, Gltf, Skin, Surface, skin};
+use super::{Clip, Extracted, Gltf, Skin, Surface, clip, skin};
 use crate::json::Value;
 
 /// The drawing mode colby reads. Everything else is skipped with a warning.
@@ -81,6 +81,13 @@ pub struct Model {
 	/// [`Placement::skeleton`] indexes. One that could not be read is here
 	/// with no bones in it and is named by nothing.
 	pub skins: Vec<Skin>,
+
+	/// Every animation the file declares, in its own order.
+	///
+	/// A clip names the bones it moves with text and names no skeleton at
+	/// all, so nothing indexes this: it is written out beside the skins and
+	/// found later by name.
+	pub clips: Vec<Clip>,
 
 	/// What the file said that could not be used. Not a failure: the rest of it
 	/// imported, and this is the one moment anybody is told.
@@ -150,12 +157,20 @@ pub fn import(file: &Gltf) -> Result<Model> {
 
 	warnings.append(&mut coats.warnings);
 
+	// after the skins and not before them: a clip's tracks are named by
+	// whatever the skins decided each joint is called, so there is nothing to
+	// name them against until that has happened.
+	let mut moves = clip::read(file, &build.skins);
+
+	warnings.append(&mut moves.warnings);
+
 	Ok(Model {
 		meshes: build.meshes,
 		placements,
 		materials: coats.surfaces,
 		textures: coats.pictures,
 		skins: build.skins,
+		clips: moves.clips,
 		warnings,
 	})
 }
