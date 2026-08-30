@@ -20,7 +20,7 @@
 //! here is the drawing, and it is checked by looking at it.
 
 use colby_core::{
-	abi::{Body, BodyId, BodyKind, EntityId, JointId, JointKind, ShapeKind, World},
+	abi::{Body, BodyId, BodyKind, EntityId, JointId, JointKind, ShapeKind, World, console},
 	glam::{EulerRot, Quat, Vec3},
 };
 use egui::{Context, DragValue, Grid, ScrollArea, Window};
@@ -56,6 +56,13 @@ pub(crate) struct Tree {
 
 	/// The living joint handles, refilled every frame.
 	joints: Vec<JointId>,
+
+	/// What the world would be called if it were written out now.
+	///
+	/// Kept here rather than read from anywhere, because there is nowhere to
+	/// read it from: a world does not know which file it came from. Naming the
+	/// file is part of writing it, exactly as it is at a console.
+	filed: String,
 }
 
 impl Tree {
@@ -95,7 +102,33 @@ impl Tree {
 				detail(ui, world, selection.at());
 				ui.separator();
 				ui.label(format!("gizmo: {} - w move, e turn, r size", tool.word()));
+				self.filing(ui, world);
 			});
+	}
+
+	/// The row that writes the world back out as something a person can read.
+	///
+	/// Through the console rather than by calling into the runner: the editor
+	/// is a crate that draws panels and the file is the runner's business, and
+	/// a console line is the one way across that already exists and already
+	/// works from a script, a config file and a document's own program.
+	fn filing(&mut self, ui: &mut egui::Ui, world: &mut World) {
+		if self.filed.is_empty() {
+			self.filed.push_str("edited");
+		}
+
+		ui.horizontal(|ui| {
+			ui.label("write to");
+			ui.add(
+				egui::TextEdit::singleline(&mut self.filed)
+					.desired_width(120.0)
+					.hint_text("name"),
+			);
+
+			if ui.button("assets/scenes").clicked() {
+				console::run(world, &format!("scene.write {}", self.filed));
+			}
+		});
 	}
 
 	/// Refills the three lists of what is alive.

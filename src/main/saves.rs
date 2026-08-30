@@ -1,11 +1,24 @@
-//! Writing a world to a file and reading one back, from the console.
+//! Writing a world down and reading one back, from the console.
 //!
-//! The first thing colby writes for itself. Every other file in the tree is
-//! *compiled* - a source goes in, a `.cmesh` or a `.ctex` comes out, and the
+//! **Two files, and the difference between them is the whole of this module.**
+//!
+//! A **save** is `saves/<name>.cscene`: the world exactly as it stood, arena
+//! and generations and all, meant to be put back. Every other file in the tree
+//! is *compiled* - a source goes in, a `.cmesh` or a `.ctex` comes out, and the
 //! output is derived and lives under `target/`. A save is neither: there is no
 //! source, nothing derives it, and `cargo clean` must not take it. So it lives
-//! beside `cvars.cfg` in the workspace, in `saves/`, for the same reason that
-//! one does.
+//! beside `cvars.cfg` in the workspace, for the same reason that one does.
+//!
+//! A **scene source** is `assets/scenes/<name>.scene`: the world as text
+//! somebody can read, diff and edit, which the compiler then turns into an
+//! ordinary asset. It is the opposite kind of file - it belongs in the
+//! repository, it is the input rather than the output, and writing one is how
+//! the editor hands its work back to a person rather than to the engine.
+//!
+//! Writing a source closes the loop the whole scene format was built for: the
+//! editor writes it, the asset watcher notices, the compiler produces the
+//! `.cscene` beside every other asset, and the world it describes is in
+//! `World::scenes` a quarter of a second later - with no reload of anything.
 //!
 //! **A load cannot happen inside the command that asked for it, and that is
 //! the whole shape of this module.** Putting a world back replaces every table
@@ -21,13 +34,13 @@
 
 use std::{
 	fs,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::{Mutex, MutexGuard},
 };
 
 #[cfg(test)]
 use colby_asset::AlignedBytes;
-use colby_asset::scene as file;
+use colby_asset::{level, scene as file};
 use colby_core::{
 	Result,
 	abi::{World, scene},
@@ -37,6 +50,12 @@ use colby_physics::Simulation;
 
 /// The directory saves live in, under the workspace.
 pub(crate) const DIRECTORY: &str = "saves";
+
+/// The directory scene sources live in, under the asset tree.
+///
+/// Not a choice this module makes: it is where the compiler already looks, and
+/// a source written anywhere else would be a file nothing compiles.
+pub(crate) const SOURCES: &str = "scenes";
 
 /// What a console command has asked the host to do, waiting for a frame.
 ///
@@ -52,6 +71,9 @@ pub(crate) enum Request {
 
 	/// Read a world back in from one.
 	Load(String),
+
+	/// Write the world out as a source somebody can edit.
+	Write(String),
 }
 
 /// Leaves a note for the frame loop.
@@ -75,6 +97,7 @@ pub(crate) fn serve(world: &mut World, simulation: &mut Simulation) {
 	let outcome = match &request {
 		| Request::Save(name) => save(world, name),
 		| Request::Load(name) => load(world, simulation, name),
+		| Request::Write(name) => write(world, name),
 	};
 
 	if let Err(failure) = outcome {
@@ -144,12 +167,111 @@ fn load(world: &mut World, simulation: &mut Simulation, name: &str) -> Result {
 	Ok(())
 }
 
+/// Writes the world out as a source somebody can edit.
+///
+/// The other direction of the editor's work: everything a person moved with a
+/// pointer, back as text they can read and a version control system can merge.
+/// What lands on disk is an *input* - the asset watcher picks it up on its next
+/// poll, the compiler turns it into a `.cscene`, and the world it describes is
+/// in the registry a moment later.
+///
+/// It overwrites without asking, which is what saving means everywhere else;
+/// the log says whether a file was made or replaced, and a source lives in the
+/// repository, which is where the previous one still is.
+///
+/// @param world - what to write
+/// @param name - what to call it, without an extension
+///
+/// # Errors
+///
+/// If the name is not a plain file name, if the world holds a number JSON
+/// cannot write, or if the directory or the file cannot be written.
+fn write(world: &World, name: &str) -> Result {
+	let path = source(name)?;
+	let existed = path.exists();
+	let bytes = written(world, &path)?;
+
+	info!(
+		path = %path.display(),
+		bytes,
+		entities = world.entities.len(),
+		bodies = world.bodies.len(),
+		replaced = existed,
+		"scene written as a source"
+	);
+
+	Ok(())
+}
+
+/// The same, given the file rather than the name.
+///
+/// Split out for the reason the asset loop's own `at` is: a function that takes
+/// a path can be run against a temporary directory, and one that works a path
+/// out of the environment cannot be run twice at once.
+///
+/// @note: this is also the only one of the two a test may call. The named form
+/// writes into the asset tree, which is the repository - and a test that calls
+/// it to check that a bad name is *refused* writes a file into it the moment
+/// somebody mutates the check it is testing. Found exactly that way.
+///
+/// @param world - what to write
+/// @param path - where to put it
+/// @return how many bytes were written
+///
+/// # Errors
+///
+/// If the world holds a number JSON cannot write, or the directory or the file
+/// cannot be written.
+fn written(world: &World, path: &Path) -> Result<usize> {
+	let text = level::export(&scene::capture(world))?;
+
+	if let Some(directory) = path.parent() {
+		fs::create_dir_all(directory)?;
+	}
+
+	fs::write(path, text.as_bytes())?;
+
+	Ok(text.len())
+}
+
+/// Where a scene source by that name is.
+///
+/// Under the asset tree rather than the workspace, and under whichever tree
+/// `COLBY_ASSETS` names if it names one - so a source written here is a source
+/// the watcher is watching, on every machine and in every test.
+///
+/// @param name - what a command was given
+///
+/// # Errors
+///
+/// As [`path`], and for the same reasons.
+fn source(name: &str) -> Result<PathBuf> {
+	Ok(crate::assets::source_root()
+		.join(SOURCES)
+		.join(plain(name)?)
+		.with_extension(level::EXTENSION))
+}
+
 /// Where a save by that name is.
 ///
-/// One flat directory and no subdirectories: a name is a file name, so a
-/// separator or a parent in it is refused rather than quietly resolved. A
-/// console is a place people type quickly, and `scene.save ../../something` is
-/// not a thing to find out about afterwards.
+/// @param name - what a command was given
+///
+/// # Errors
+///
+/// As [`plain`].
+fn path(name: &str) -> Result<PathBuf> {
+	Ok(crate::workspace()
+		.join(DIRECTORY)
+		.join(plain(name)?)
+		.with_extension(file::EXTENSION))
+}
+
+/// A name a file may actually be called, out of what somebody typed.
+///
+/// One flat directory and no subdirectories, whichever of the two a name is
+/// for: a name is a file name, so a separator or a parent in it is refused
+/// rather than quietly resolved. A console is a place people type quickly, and
+/// `scene.save ../../something` is not a thing to find out about afterwards.
 ///
 /// A dot is refused with them, which is the rule the compiled formats already
 /// follow for the same reason: the last dot in a path here is the extension,
@@ -161,21 +283,18 @@ fn load(world: &mut World, simulation: &mut Simulation, name: &str) -> Result {
 /// # Errors
 ///
 /// If the name is empty or is anything other than a plain file name.
-fn path(name: &str) -> Result<PathBuf> {
+fn plain(name: &str) -> Result<&str> {
 	let trimmed = name.trim();
 
 	if trimmed.is_empty() {
-		return Err(err!(Asset("a save needs a name")));
+		return Err(err!(Asset("a scene needs a name")));
 	}
 
 	if trimmed.contains(['/', '\\', ':', '.']) {
-		return Err(err!(Asset("{trimmed} is not a name a save can have")));
+		return Err(err!(Asset("{trimmed} is not a name a scene can have")));
 	}
 
-	Ok(crate::workspace()
-		.join(DIRECTORY)
-		.join(trimmed)
-		.with_extension(file::EXTENSION))
+	Ok(trimmed)
 }
 
 /// The pending note, whichever thread is asking.
@@ -202,6 +321,8 @@ fn read(name: &str) -> Result<colby_core::abi::SceneData> {
 
 #[cfg(test)]
 mod tests {
+	use std::env;
+
 	use colby_core::{
 		abi::{Body, Shape, Transform},
 		glam::Vec3,
@@ -229,10 +350,88 @@ mod tests {
 	fn a_name_that_is_not_a_file_name_is_refused() {
 		for name in ["", "   ", "..", "../escape", "sub/one", "c:\\here", "version.2"] {
 			assert!(path(name).is_err(), "{name} is not a name a save can have");
+			assert!(source(name).is_err(), "nor one a source can, which is one rule");
 		}
 
 		assert!(path("quicksave").is_ok(), "and a plain one is");
 		assert!(path(" quicksave ").is_ok(), "with the spaces around it taken off");
+		assert!(source(" quicksave ").is_ok(), "either side of the same rule");
+	}
+
+	#[test]
+	fn a_source_lands_where_the_compiler_is_already_looking() {
+		let path = source("edited").expect("a plain name");
+
+		assert_eq!(
+			path.extension().and_then(std::ffi::OsStr::to_str),
+			Some(level::EXTENSION),
+			"the extension a source has"
+		);
+		assert_eq!(
+			path.parent().and_then(Path::file_name),
+			Some(std::ffi::OsStr::new(SOURCES)),
+			"in the directory scenes are compiled from"
+		);
+		assert!(
+			path.starts_with(crate::assets::source_root()),
+			"under the tree the watcher is watching: {}",
+			path.display()
+		);
+	}
+
+	#[test]
+	fn a_world_written_as_a_source_is_the_world() {
+		let (world, _simulation) = peopled();
+		let inside = env::temp_dir()
+			.join("colby_test_written")
+			.join("scenes");
+		let path = inside.join("edited.scene");
+
+		// a previous run of this left the directory behind, and a test that
+		// only passes on a machine that has run it before is not a test of
+		// anything. What is under test includes making the directory.
+		drop(fs::remove_dir_all(&inside));
+
+		let bytes = written(&world, &path).expect("it is written");
+		let text = fs::read_to_string(&path).expect("and read back");
+
+		assert_eq!(bytes, text.len(), "what was reported is what landed");
+
+		let read = level::import(&text).expect("what was written is a scene source");
+
+		assert_eq!(read.things.len(), world.entities.len(), "every entity is in it");
+		assert_eq!(read.solids.len(), world.bodies.len(), "and every body");
+		assert_eq!(
+			read.things[0].transform.position,
+			Vec3::new(3.0, 4.0, 5.0),
+			"where the world had it"
+		);
+		assert_eq!(read.solids[0].thing, 0, "and the body still drives it");
+
+		drop(fs::remove_dir_all(&inside));
+	}
+
+	#[test]
+	fn a_source_written_twice_replaces_the_first_rather_than_adding_to_it() {
+		let (world, _simulation) = peopled();
+		let inside = env::temp_dir()
+			.join("colby_test_replaced")
+			.join("scenes");
+		let path = inside.join("edited.scene");
+		drop(fs::remove_dir_all(&inside));
+
+		assert!(!path.exists(), "there is nothing there to start with");
+		written(&world, &path).expect("it is written");
+		assert!(path.exists(), "and now there is");
+
+		let once = fs::read_to_string(&path).expect("read back");
+		written(&world, &path).expect("and written over");
+		let twice = fs::read_to_string(&path).expect("read back again");
+
+		assert_eq!(once, twice, "the same world writes the same file");
+		assert!(level::import(&twice).is_ok(), "and what is there is still one scene");
+
+		drop(fs::remove_dir_all(&inside));
 	}
 
 	#[test]
@@ -245,7 +444,7 @@ mod tests {
 			"the extension is the format's"
 		);
 		assert_eq!(
-			path.parent().and_then(std::path::Path::file_name),
+			path.parent().and_then(Path::file_name),
 			Some(std::ffi::OsStr::new(DIRECTORY)),
 			"and it is under the saves directory"
 		);

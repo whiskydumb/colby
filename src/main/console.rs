@@ -216,6 +216,11 @@ pub(crate) fn install(world: &mut World) {
 		.cvars
 		.command("scene.save", save_scene, "write the world into saves/<name>.cscene");
 	world.cvars.command(
+		"scene.write",
+		write_scene,
+		"write the world into assets/scenes/<name>.scene, which the compiler picks up",
+	);
+	world.cvars.command(
 		"scene.load",
 		load_scene,
 		"put saves/<name>.cscene back, replacing this world",
@@ -409,6 +414,22 @@ unsafe extern "C-unwind" fn save_scene(_world: *mut World, args: *const Args) {
 	let args = unsafe { &*args };
 
 	crate::saves::ask(crate::saves::Request::Save(args.rest()));
+}
+
+/// `scene.write <name>` - writes the world out as a source somebody can edit.
+///
+/// The other end of the editor's work, and the one that goes back into the
+/// repository rather than beside it. @ref [`crate::saves`] for the difference
+/// between the two files this and `scene.save` produce.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn write_scene(_world: *mut World, args: *const Args) {
+	// SAFETY: as help.
+	let args = unsafe { &*args };
+
+	crate::saves::ask(crate::saves::Request::Write(args.rest()));
 }
 
 /// `scene.load <name>` - puts a saved world back.

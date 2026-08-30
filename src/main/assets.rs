@@ -52,6 +52,17 @@ const SOURCE_VAR: &str = "COLBY_ASSETS";
 /// assets beside the executable instead of under `target`.
 const OUTPUT_VAR: &str = "COLBY_ASSETS_OUT";
 
+/// The tree sources are read from.
+///
+/// A function rather than a value worked out in one place, because two things
+/// now need the answer: this loop, which watches it, and the editor, which
+/// writes a scene source into it. A source written under a different root from
+/// the one being watched is a file nothing would ever compile.
+pub(crate) fn source_root() -> PathBuf {
+	std::env::var_os(SOURCE_VAR)
+		.map_or_else(|| compile::source_root(&crate::workspace()), PathBuf::from)
+}
+
 /// One compiled asset the world is currently holding.
 struct Loaded {
 	name: String,
@@ -77,8 +88,7 @@ impl Assets {
 	///
 	/// @param workspace - the checkout the runner was built from
 	pub(crate) fn new(workspace: &Path) -> Self {
-		let source = std::env::var_os(SOURCE_VAR)
-			.map_or_else(|| compile::source_root(workspace), PathBuf::from);
+		let source = source_root();
 		let output = std::env::var_os(OUTPUT_VAR)
 			.map_or_else(|| compile::output_root(workspace), PathBuf::from);
 
