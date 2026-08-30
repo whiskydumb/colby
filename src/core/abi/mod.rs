@@ -19,7 +19,7 @@
 //! [`mods::linkage`](crate::mods::linkage), and [`ABI_VERSION`] catches a
 //! module built against a different definition.
 
-use crate::glam::{Quat, Vec3};
+use crate::glam::{Mat4, Quat, Vec3};
 
 pub mod camera;
 pub mod character;
@@ -35,6 +35,7 @@ pub mod mesh;
 pub mod model;
 pub mod names;
 pub mod physics;
+pub mod pose;
 pub mod registry;
 pub mod scene;
 pub mod skeleton;
@@ -59,10 +60,11 @@ pub use self::{
 		Bodies, Body, BodyId, BodyKind, Layers, MAX_BODIES, MAX_OVERLAPS, MAX_TOUCHES, Overlap,
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
 	},
+	pose::{MAX_POSES, Pose, PoseId, Poses},
 	registry::{Entry, Registry},
 	scene::{
-		Arena, Form, Link, Remap, Restored, Scene, SceneData, SceneId, Scenes, Solid, Stage,
-		Thing,
+		Arena, Form, Link, Posed, Remap, Restored, Scene, SceneData, SceneId, Scenes, Solid,
+		Stage, Thing,
 	},
 	skeleton::{Bone, MAX_BONES, NO_PARENT, Skeleton, SkeletonData, SkeletonId, Skeletons},
 	state::GameState,
@@ -75,7 +77,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 30;
+pub const ABI_VERSION: u32 = 31;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -284,6 +286,15 @@ pub struct World {
 	/// [`skeleton`](crate::abi::skeleton).
 	pub skeletons: Skeletons,
 
+	/// Where every posed skeleton's bones are, reached by handle.
+	///
+	/// Not an asset: a skeleton is read from a file and shared, a pose is one
+	/// character's own state and is written every step. A
+	/// [`Renderable`](Self::entities) names one, and two entities may name the
+	/// same - a model of two materials is two entities moved by one set of
+	/// bones. @ref [`pose`](crate::abi::pose).
+	pub poses: Poses,
+
 	/// Every material, reached by handle.
 	///
 	/// Unlike the other two this is mostly the *game's* table: a material is a
@@ -367,6 +378,7 @@ impl World {
 			fonts: Fonts::new(),
 			models: Models::new(),
 			skeletons: Skeletons::new(),
+			poses: Poses::new(),
 			scenes: Scenes::new(),
 			materials: Materials::new(),
 			cvars: Cvars::new(),
@@ -391,6 +403,7 @@ impl World {
 	/// previous build left behind.
 	pub fn advance(&mut self) {
 		self.entities.advance();
+		self.poses.advance();
 		self.camera_previous = self.camera;
 		self.camera_snap = false;
 	}
@@ -401,6 +414,7 @@ impl World {
 	/// [`Entities::settle`].
 	pub fn settle(&mut self) {
 		self.entities.settle();
+		self.poses.settle();
 
 		// guarded, unlike `advance`. Settling every step unconditionally would
 		// leave `camera_previous` equal to `camera` at every render, which
@@ -446,6 +460,27 @@ impl World {
 	#[must_use]
 	pub fn render_transform(&self, id: EntityId) -> Option<Transform> {
 		self.entities.interpolated(id, self.interpolation)
+	}
+
+	/// The matrices a pose hands the vertex stage this frame, appended.
+	///
+	/// The same idea [`render_transform`](Self::render_transform) is, for the
+	/// same reason: bones move once a step and are drawn many times between
+	/// two, so what a frame wants is somewhere between the pose's past and its
+	/// present. The skeleton is looked up here rather than by the caller,
+	/// because a pose already names it and two places knowing the pairing is
+	/// one too many.
+	///
+	/// @param id - the pose to resolve
+	/// @param out - the buffer to append to
+	/// @return how many matrices were appended
+	pub fn render_skinning(&self, id: PoseId, out: &mut Vec<Mat4>) -> usize {
+		let Some(pose) = self.poses.get(id) else {
+			return 0;
+		};
+
+		self.poses
+			.skinning(id, self.skeletons.bones(pose.skeleton), self.interpolation, out)
 	}
 
 	/// Hands the world the queries a solver can answer.

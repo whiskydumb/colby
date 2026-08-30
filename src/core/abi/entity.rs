@@ -18,7 +18,7 @@
 //! goes on writing one transform per step and knowing nothing about the rate
 //! the picture is drawn at.
 
-use super::{material::MaterialId, mesh::MeshId, names::Names};
+use super::{material::MaterialId, mesh::MeshId, names::Names, pose::PoseId};
 use crate::{
 	bytemuck::{Pod, Zeroable},
 	glam::{Mat4, Quat, Vec3},
@@ -172,6 +172,18 @@ pub struct Renderable {
 
 	/// This entity's own tint, linear RGB, each channel in `0.0 ..= 1.0`.
 	pub color: Vec3,
+
+	/// The bones that move it, or [`PoseId::NONE`] for a shape nothing bends.
+	///
+	/// Almost every entity in a world holds nothing here: a crate and a wall
+	/// are drawn from their own transform and one mesh. A character names a
+	/// pose, and the mesh it names then has to carry a skin block - the two
+	/// halves of the same claim, and a mesh with one and no pose is drawn in
+	/// the shape it was modeled in.
+	///
+	/// Two entities may name the same pose, and one model of two materials
+	/// does exactly that. @ref [`pose`](super::pose).
+	pub pose: PoseId,
 }
 
 impl Renderable {
@@ -180,6 +192,7 @@ impl Renderable {
 		mesh: MeshId::NONE,
 		material: MaterialId::DEFAULT,
 		color: Vec3::ONE,
+		pose: PoseId::NONE,
 	};
 
 	/// A shape in a color, made of the default material.
@@ -189,14 +202,26 @@ impl Renderable {
 			mesh,
 			material: MaterialId::DEFAULT,
 			color,
+			pose: PoseId::NONE,
 		}
 	}
 
 	/// The same, made of something in particular.
 	#[must_use]
 	pub const fn of(mesh: MeshId, material: MaterialId, color: Vec3) -> Self {
-		Self { mesh, material, color }
+		Self {
+			mesh,
+			material,
+			color,
+			pose: PoseId::NONE,
+		}
 	}
+
+	/// The same, moved by a pose.
+	///
+	/// @param pose - the bones that bend it
+	#[must_use]
+	pub const fn posed(self, pose: PoseId) -> Self { Self { pose, ..self } }
 }
 
 impl Default for Renderable {

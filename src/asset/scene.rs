@@ -14,7 +14,9 @@
 //!    .  [Stood; stood_count]              72 bytes each
 //!    .  [Bulk;  bulk_count]              132 bytes each
 //!    .  [Tie;   tie_count]                84 bytes each
-//!    .  [u32; stood_slots + bulk_slots + tie_slots]
+//!    .  [Bent;  bent_count]                24 bytes each
+//!    .  [Local; locals_count]              40 bytes each
+//!    .  [u32; stood_slots + bulk_slots + tie_slots + bent_slots]
 //!    .  the game's own arena, if there is one
 //!    .  the string blob, NUL-separated UTF-8
 //! ```
@@ -45,7 +47,7 @@ use colby_core::{
 	Result,
 	abi::{
 		BodyKind, Camera, JointKind, Layers, ShapeKind, Transform,
-		scene::{Arena, Form, Link, SceneData, Solid, Stage, Thing},
+		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
 	},
 	bytemuck::{self, Pod, Zeroable},
@@ -63,7 +65,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// Bump it whenever the header or any block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it
 /// agreed.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -120,6 +122,9 @@ pub struct SceneHeader {
 	/// Bytes per joint record. Must be `size_of::<Tie>()`.
 	pub tie_stride: u32,
 
+	/// Bytes per pose record. Must be `size_of::<Bent>()`.
+	pub bent_stride: u32,
+
 	/// Where the settings record starts, in bytes from the start of the file.
 	pub setting_offset: u32,
 
@@ -132,6 +137,12 @@ pub struct SceneHeader {
 	/// Where the joint block starts.
 	pub tie_offset: u32,
 
+	/// Where the pose block starts.
+	pub bent_offset: u32,
+
+	/// Where the block of bones every pose points into starts.
+	pub locals_offset: u32,
+
 	/// How many entities were alive.
 	pub stood_count: u32,
 
@@ -141,6 +152,12 @@ pub struct SceneHeader {
 	/// How many joints were.
 	pub tie_count: u32,
 
+	/// How many poses were.
+	pub bent_count: u32,
+
+	/// How many bones there are altogether, over every pose.
+	pub locals_count: u32,
+
 	/// How many slots the entity table had ever handed out.
 	pub stood_slots: u32,
 
@@ -149,6 +166,9 @@ pub struct SceneHeader {
 
 	/// The same for the joint table.
 	pub tie_slots: u32,
+
+	/// The same for the pose table.
+	pub bent_slots: u32,
 
 	/// Where the generations start: the three tables' arrays, back to back, in
 	/// the order the three counts above are in.
@@ -174,7 +194,7 @@ pub struct SceneHeader {
 
 	/// Spare, so the header is a round hundred and twenty-eight bytes and
 	/// every block after it inherits the buffer's alignment.
-	pub reserved: [u32; 7],
+	pub reserved: [u32; 1],
 }
 
 // the blocks after the header inherit the buffer's alignment only because the
@@ -263,6 +283,54 @@ pub struct Stood {
 
 	/// Its own tint, linear RGB.
 	pub color: [f32; 3],
+
+	/// Which pose moves it, as an index into the pose block, or
+	/// [`NO_INDEX`](colby_core::abi::scene::NO_INDEX).
+	pub pose: u32,
+}
+
+/// One posed skeleton, as the file holds it.
+///
+/// Its bones are not here: they vary in number and a record may not, so they
+/// are a run in one block at the end, exactly as a name is a run in the string
+/// blob. Two poses of one skeleton are two runs; two characters standing the
+/// same way is a coincidence rather than a fact worth writing down once.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Bent {
+	/// Offset into the blob of what it is called, or zero.
+	pub name: u32,
+
+	/// The slot it occupied.
+	pub slot: u32,
+
+	/// Which occupant of that slot it was.
+	pub generation: u32,
+
+	/// Offset into the blob of its skeleton's asset name, or zero.
+	pub skeleton: u32,
+
+	/// Where its bones start, as an index into the block of them.
+	pub first: u32,
+
+	/// How many bones it has.
+	pub count: u32,
+}
+
+/// One bone of one pose, relative to its parent.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Local {
+	/// Where it is.
+	pub position: [f32; 3],
+
+	/// How it is turned, xyzw.
+	pub rotation: [f32; 4],
+
+	/// How big it is along each axis.
+	pub scale: [f32; 3],
 }
 
 /// The bit in [`Bulk::flags`] that says a body notices rather than pushes.
@@ -457,14 +525,25 @@ impl SceneFile {
 	#[must_use]
 	pub fn tie(&self) -> &[Tie] { self.block(self.header.tie_offset, self.header.tie_count) }
 
-	/// The three generation arrays, back to back.
+	/// The pose block.
+	#[must_use]
+	pub fn bent(&self) -> &[Bent] { self.block(self.header.bent_offset, self.header.bent_count) }
+
+	/// Every pose's bones, back to back; a record says where its own start.
+	#[must_use]
+	pub fn locals(&self) -> &[Local] {
+		self.block(self.header.locals_offset, self.header.locals_count)
+	}
+
+	/// The four generation arrays, back to back.
 	#[must_use]
 	pub fn generations(&self) -> &[u32] {
 		let total = self
 			.header
 			.stood_slots
 			.saturating_add(self.header.bulk_slots)
-			.saturating_add(self.header.tie_slots);
+			.saturating_add(self.header.tie_slots)
+			.saturating_add(self.header.bent_slots);
 
 		self.block(self.header.generations_offset, total)
 	}
@@ -523,6 +602,8 @@ impl SceneFile {
 		let stood = usize::try_from(self.header.stood_slots).unwrap_or(0);
 		let bulk = usize::try_from(self.header.bulk_slots).unwrap_or(0);
 		let tie = usize::try_from(self.header.tie_slots).unwrap_or(0);
+		let bent = usize::try_from(self.header.bent_slots).unwrap_or(0);
+		let after_ties = stood.saturating_add(bulk).saturating_add(tie);
 
 		SceneData {
 			stage: stage_of(self.setting()),
@@ -550,7 +631,16 @@ impl SceneFile {
 				.unwrap_or_default()
 				.to_vec(),
 			link_generations: generations
-				.get(stood.saturating_add(bulk)..stood.saturating_add(bulk).saturating_add(tie))
+				.get(stood.saturating_add(bulk)..after_ties)
+				.unwrap_or_default()
+				.to_vec(),
+			posed: self
+				.bent()
+				.iter()
+				.map(|it| self.pose(it))
+				.collect(),
+			pose_generations: generations
+				.get(after_ties..after_ties.saturating_add(bent))
 				.unwrap_or_default()
 				.to_vec(),
 			arena: self.arena(),
@@ -567,6 +657,33 @@ impl SceneFile {
 			mesh: self.name(stood.mesh).to_owned(),
 			material: self.name(stood.material).to_owned(),
 			color: Vec3::from_array(stood.color),
+			pose: stood.pose,
+		}
+	}
+
+	/// One pose record, with its run of bones read out.
+	///
+	/// A run that reaches past the block is read as far as it goes rather than
+	/// refused: the check that sized the block has already run, so what is
+	/// left is a record disagreeing with it, and a character with half its
+	/// bones is a better answer than a load that did not happen.
+	fn pose(&self, bent: &Bent) -> Posed {
+		let first = usize::try_from(bent.first).unwrap_or(usize::MAX);
+		let count = usize::try_from(bent.count).unwrap_or(0);
+		let run = self
+			.locals()
+			.get(first..first.saturating_add(count))
+			.unwrap_or_default();
+
+		Posed {
+			name: self.name(bent.name).to_owned(),
+			slot: bent.slot,
+			generation: bent.generation,
+			skeleton: self.name(bent.skeleton).to_owned(),
+			locals: run
+				.iter()
+				.map(|local| transform_of(local.position, local.rotation, local.scale))
+				.collect(),
 		}
 	}
 
@@ -668,6 +785,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 			rotation: thing.transform.rotation.to_array(),
 			scale: thing.transform.scale.to_array(),
 			color: thing.color.to_array(),
+			pose: thing.pose,
 		})
 		.collect();
 	let bulk: Vec<Bulk> = data
@@ -681,12 +799,28 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		.map(|link| tie_of(link, &mut names))
 		.collect();
 
+	let mut locals: Vec<Local> = Vec::new();
+	let bent: Vec<Bent> = data
+		.posed
+		.iter()
+		.map(|posed| bent_of(posed, &mut names, &mut locals))
+		.collect();
+
 	let mut generations = data.thing_generations.clone();
 	generations.extend_from_slice(&data.solid_generations);
 	generations.extend_from_slice(&data.link_generations);
+	generations.extend_from_slice(&data.pose_generations);
 
-	let places = Places::of(&stood, &bulk, &tie, &generations, data.arena.as_ref());
-	let header = head(data, &places, (&stood, &bulk, &tie), names.blob.len())?;
+	let places =
+		Places::of(&stood, &bulk, &tie, &bent, &locals, &generations, data.arena.as_ref());
+	let blocks = Blocks {
+		stood: &stood,
+		bulk: &bulk,
+		tie: &tie,
+		bent: &bent,
+		locals: &locals,
+	};
+	let header = head(data, &places, &blocks, names.blob.len())?;
 
 	let mut out = Vec::with_capacity(places.names + names.blob.len());
 	out.extend_from_slice(bytemuck::bytes_of(&header));
@@ -694,6 +828,8 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::cast_slice(&stood));
 	out.extend_from_slice(bytemuck::cast_slice(&bulk));
 	out.extend_from_slice(bytemuck::cast_slice(&tie));
+	out.extend_from_slice(bytemuck::cast_slice(&bent));
+	out.extend_from_slice(bytemuck::cast_slice(&locals));
 	out.extend_from_slice(bytemuck::cast_slice(&generations));
 	if let Some(arena) = data.arena.as_ref() {
 		out.extend_from_slice(&arena.bytes);
@@ -710,6 +846,8 @@ struct Places {
 	stood: usize,
 	bulk: usize,
 	tie: usize,
+	bent: usize,
+	locals: usize,
 	generations: usize,
 	arena: usize,
 	names: usize,
@@ -721,6 +859,8 @@ impl Places {
 		stood: &[Stood],
 		bulk: &[Bulk],
 		tie: &[Tie],
+		bent: &[Bent],
+		locals: &[Local],
 		generations: &[u32],
 		arena: Option<&Arena>,
 	) -> Self {
@@ -728,7 +868,9 @@ impl Places {
 		let stood_at = setting + size_of::<Setting>();
 		let bulk_at = stood_at + size_of_val(stood);
 		let tie_at = bulk_at + size_of_val(bulk);
-		let generations_at = tie_at + size_of_val(tie);
+		let bent_at = tie_at + size_of_val(tie);
+		let locals_at = bent_at + size_of_val(bent);
+		let generations_at = locals_at + size_of_val(locals);
 		let arena_at = generations_at + size_of_val(generations);
 		let names_at = arena_at + arena.map_or(0, |it| it.bytes.len());
 
@@ -737,6 +879,8 @@ impl Places {
 			stood: stood_at,
 			bulk: bulk_at,
 			tie: tie_at,
+			bent: bent_at,
+			locals: locals_at,
 			generations: generations_at,
 			arena: arena_at,
 			names: names_at,
@@ -744,14 +888,23 @@ impl Places {
 	}
 }
 
+/// Every record block, handed to the header filler as one argument.
+struct Blocks<'a> {
+	stood: &'a [Stood],
+	bulk: &'a [Bulk],
+	tie: &'a [Tie],
+	bent: &'a [Bent],
+	locals: &'a [Local],
+}
+
 /// The header, filled from what has already been laid out.
 fn head(
 	data: &SceneData,
 	places: &Places,
-	blocks: (&[Stood], &[Bulk], &[Tie]),
+	blocks: &Blocks<'_>,
 	names: usize,
 ) -> Result<SceneHeader> {
-	let (stood, bulk, tie) = blocks;
+	let Blocks { stood, bulk, tie, bent, locals } = *blocks;
 	let layout = data.arena.as_ref().map_or(0, |it| it.layout);
 
 	Ok(SceneHeader {
@@ -762,16 +915,22 @@ fn head(
 		stood_stride: width::<Stood>()?,
 		bulk_stride: width::<Bulk>()?,
 		tie_stride: width::<Tie>()?,
+		bent_stride: width::<Bent>()?,
 		setting_offset: count(places.setting)?,
 		stood_offset: count(places.stood)?,
 		bulk_offset: count(places.bulk)?,
 		tie_offset: count(places.tie)?,
+		bent_offset: count(places.bent)?,
+		locals_offset: count(places.locals)?,
 		stood_count: count(stood.len())?,
 		bulk_count: count(bulk.len())?,
 		tie_count: count(tie.len())?,
+		bent_count: count(bent.len())?,
+		locals_count: count(locals.len())?,
 		stood_slots: count(data.thing_generations.len())?,
 		bulk_slots: count(data.solid_generations.len())?,
 		tie_slots: count(data.link_generations.len())?,
+		bent_slots: count(data.pose_generations.len())?,
 		generations_offset: count(places.generations)?,
 		arena_layout_low: u32::try_from(layout & u64::from(u32::MAX)).unwrap_or(0),
 		arena_layout_high: u32::try_from(layout >> u32::BITS).unwrap_or(0),
@@ -779,8 +938,28 @@ fn head(
 		arena_length: count(data.arena.as_ref().map_or(0, |it| it.bytes.len()))?,
 		names_offset: count(places.names)?,
 		names_length: count(names)?,
-		reserved: [0; 7],
+		reserved: [0; 1],
 	})
+}
+
+/// One pose, as the file holds it, with its bones appended to the run block.
+fn bent_of(posed: &Posed, names: &mut Names, locals: &mut Vec<Local>) -> Bent {
+	let first = u32::try_from(locals.len()).unwrap_or(0);
+
+	locals.extend(posed.locals.iter().map(|local| Local {
+		position: local.position.to_array(),
+		rotation: local.rotation.to_array(),
+		scale: local.scale.to_array(),
+	}));
+
+	Bent {
+		name: names.put(&posed.name),
+		slot: posed.slot,
+		generation: posed.generation,
+		skeleton: names.put(&posed.skeleton),
+		first,
+		count: u32::try_from(posed.locals.len()).unwrap_or(0),
+	}
 }
 
 /// One body, as the file holds it.
@@ -1053,6 +1232,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 		(header.stood_stride, size_of::<Stood>(), "entities"),
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
+		(header.bent_stride, size_of::<Bent>(), "poses"),
 	];
 
 	for (written, expected, what) in widths {
@@ -1083,12 +1263,15 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 		.stood_slots
 		.checked_add(header.bulk_slots)
 		.and_then(|it| it.checked_add(header.tie_slots))
+		.and_then(|it| it.checked_add(header.bent_slots))
 		.ok_or_else(|| "this scene claims more slots than a count holds".to_owned())?;
 
 	fits::<Setting>(bytes, HEADER_BYTES, (header.setting_offset, 1), "settings")?;
 	fits::<Stood>(bytes, HEADER_BYTES, (header.stood_offset, header.stood_count), "entities")?;
 	fits::<Bulk>(bytes, HEADER_BYTES, (header.bulk_offset, header.bulk_count), "bodies")?;
 	fits::<Tie>(bytes, HEADER_BYTES, (header.tie_offset, header.tie_count), "joints")?;
+	fits::<Bent>(bytes, HEADER_BYTES, (header.bent_offset, header.bent_count), "poses")?;
+	fits::<Local>(bytes, HEADER_BYTES, (header.locals_offset, header.locals_count), "bones")?;
 	fits::<u32>(bytes, HEADER_BYTES, (header.generations_offset, total), "generations")?;
 	fits::<u8>(bytes, HEADER_BYTES, (header.names_offset, header.names_length), "names")?;
 
@@ -1106,6 +1289,8 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 
 #[cfg(test)]
 mod tests {
+	use std::mem::offset_of;
+
 	use colby_core::abi::{
 		Body, BodyId, Joint, Material, MeshData, Renderable, Shape, World, scene,
 	};
@@ -1126,6 +1311,7 @@ mod tests {
 				mesh: "meshes/crystal".to_owned(),
 				material: "brass".to_owned(),
 				color: Vec3::new(0.8, 0.7, 0.6),
+				pose: 0,
 			},
 			Thing {
 				name: String::new(),
@@ -1139,6 +1325,7 @@ mod tests {
 				mesh: "meshes/crystal".to_owned(),
 				material: String::new(),
 				color: Vec3::ONE,
+				pose: scene::NO_INDEX,
 			},
 		]
 	}
@@ -1202,6 +1389,21 @@ mod tests {
 		SceneData {
 			things: sample_things(),
 			solids: sample_solids(),
+			posed: vec![Posed {
+				name: "hero".to_owned(),
+				slot: 1,
+				generation: 4,
+				skeleton: "models/hero/rig".to_owned(),
+				// two bones, neither of them at rest, so a round trip that
+				// dropped the run block or read it at the wrong offset comes
+				// back wrong rather than plausible
+				locals: vec![Transform::at(Vec3::new(1.0, 2.0, 3.0)), Transform {
+					position: Vec3::NEG_X,
+					rotation: Quat::from_xyzw(TURN, 0.0, 0.0, TURN),
+					scale: Vec3::splat(2.0),
+				}],
+			}],
+			pose_generations: vec![0, 4],
 			stage: Stage {
 				camera: Camera {
 					position: Vec3::new(1.0, 2.0, 3.0),
@@ -1454,8 +1656,8 @@ mod tests {
 	#[test]
 	fn a_record_of_the_wrong_width_is_refused_rather_than_misread() {
 		let mut bytes = encode(&sample()).expect("it fits");
-		// the body stride, which is the fifth u32 in the header.
-		bytes[20..24].copy_from_slice(&64_u32.to_le_bytes());
+		let at = offset_of!(SceneHeader, bulk_stride);
+		bytes[at..at + 4].copy_from_slice(&64_u32.to_le_bytes());
 
 		let refused = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
 			.expect_err("it should not read")
@@ -1471,8 +1673,7 @@ mod tests {
 	fn an_arena_larger_than_the_arena_is_refused() {
 		let mut bytes = encode(&sample()).expect("it fits");
 		let length = u32::try_from(STATE_BYTES + 1).expect("small");
-		// arena_length is the twenty-second u32 in the header.
-		let at = 8 + 20 * 4;
+		let at = offset_of!(SceneHeader, arena_length);
 		bytes[at..at + 4].copy_from_slice(&length.to_le_bytes());
 
 		let refused = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
@@ -1486,16 +1687,20 @@ mod tests {
 	}
 	#[test]
 	fn each_block_is_checked_against_the_file_on_its_own() {
-		// the offsets, in the order the header holds them, with the name the
-		// reader uses for each.
+		// where each offset sits, asked of the header rather than counted by
+		// hand: a field added in the middle used to make every number here
+		// address the wrong word, and the test then failed for a reason that
+		// had nothing to do with what it is about.
 		let blocks = [
-			(32_usize, "settings"),
-			(36, "entities"),
-			(40, "bodies"),
-			(44, "joints"),
-			(72, "generations"),
-			(84, "game state"),
-			(92, "names"),
+			(offset_of!(SceneHeader, setting_offset), "settings"),
+			(offset_of!(SceneHeader, stood_offset), "entities"),
+			(offset_of!(SceneHeader, bulk_offset), "bodies"),
+			(offset_of!(SceneHeader, tie_offset), "joints"),
+			(offset_of!(SceneHeader, bent_offset), "poses"),
+			(offset_of!(SceneHeader, locals_offset), "bones"),
+			(offset_of!(SceneHeader, generations_offset), "generations"),
+			(offset_of!(SceneHeader, arena_offset), "game state"),
+			(offset_of!(SceneHeader, names_offset), "names"),
 		];
 
 		for (at, what) in blocks {

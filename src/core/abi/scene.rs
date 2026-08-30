@@ -39,7 +39,8 @@ use crate::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
-		MaterialId, Registry, Renderable, Shape, ShapeKind, Transform, World, state::STATE_BYTES,
+		MaterialId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind, Transform, World,
+		state::STATE_BYTES,
 	},
 	err,
 	glam::{Quat, Vec3},
@@ -131,12 +132,56 @@ pub struct Thing {
 
 	/// Its own tint, linear RGB.
 	pub color: Vec3,
+
+	/// Which entry of [`SceneData::posed`] moves it, or [`NO_INDEX`].
+	pub pose: u32,
 }
 
 impl Thing {
 	/// The slot it occupied and the generation it held there.
 	///
 	/// What a restore keys the table's rebuilt generation array on.
+	#[must_use]
+	pub const fn key(&self) -> (u32, u32) { (self.slot, self.generation) }
+}
+
+/// A posed skeleton, with its skeleton named rather than handled.
+///
+/// A pose is not an asset and not an entity: it is one character's own
+/// attitude, shared by every entity the character is drawn as. So it is a list
+/// of its own and a [`Thing`] points into it by index, the way a [`Solid`]
+/// points at its entity - two entities naming the same index are two entities
+/// moved by one set of bones, which is what a model of two materials is.
+///
+/// Only the present is written. A pose's past is what the picture interpolates
+/// through, and a world put back is a world nobody has stepped since: its past
+/// is its present, and a restore says so rather than storing a second copy of
+/// every bone.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Posed {
+	/// What this is called, or empty.
+	///
+	/// A pose has no name in the world - nothing points at one except an
+	/// entity, and an entity points by handle. It has one *here* because a
+	/// source refers to it by name, the way a body refers to its entity, and
+	/// because the writer then has something to invent a name into.
+	pub name: String,
+
+	/// The slot it occupied, for a restore.
+	pub slot: u32,
+
+	/// Which occupant of that slot it was.
+	pub generation: u32,
+
+	/// The asset name of the skeleton it poses, or empty.
+	pub skeleton: String,
+
+	/// Where each bone is, relative to its parent.
+	pub locals: Vec<Transform>,
+}
+
+impl Posed {
+	/// The slot it occupied and the generation it held there.
 	#[must_use]
 	pub const fn key(&self) -> (u32, u32) { (self.slot, self.generation) }
 }
@@ -346,6 +391,9 @@ pub struct SceneData {
 	/// Every joint that was alive.
 	pub links: Vec<Link>,
 
+	/// Every pose that was alive.
+	pub posed: Vec<Posed>,
+
 	/// The generation each entity slot was on, dead ones included.
 	///
 	/// One per slot the table had ever handed out, which is what makes a
@@ -360,6 +408,9 @@ pub struct SceneData {
 
 	/// The same for joint slots.
 	pub link_generations: Vec<u32>,
+
+	/// The same for pose slots.
+	pub pose_generations: Vec<u32>,
 
 	/// The game's own state, or nothing.
 	///
@@ -512,11 +563,23 @@ impl SceneData {
 			links.push(copy);
 		}
 
+		// the poses of whatever came along, renumbered like everything else. A
+		// character cut out of a world is cut out standing as it stood; two of
+		// its entities naming one pose still name one pose afterwards.
+		let mut pose_of = vec![NO_INDEX; self.posed.len()];
+		let mut posed = Vec::new();
+
+		for thing in &mut things {
+			thing.pose = drag_pose(&self.posed, thing.pose, &mut pose_of, &mut posed);
+		}
+
 		Self {
 			stage: self.stage,
 			thing_generations: vec![1; things.len()],
 			solid_generations: vec![1; kept.len()],
 			link_generations: vec![1; links.len()],
+			pose_generations: vec![1; posed.len()],
+			posed,
 			things,
 			solids: kept,
 			links,
@@ -575,6 +638,31 @@ fn drag_along(things: &[Thing], at: u32, moved: &mut [u32], kept: &mut Vec<Thing
 	moved[at]
 }
 
+/// The same for the pose an entity that came along is moved by.
+///
+/// A copy of [`drag_along`] rather than one function generic over the two:
+/// what the records have in common is two words, and a trait to say so would
+/// be more machinery than the second copy is.
+fn drag_pose(posed: &[Posed], at: u32, moved: &mut [u32], kept: &mut Vec<Posed>) -> u32 {
+	let Ok(at) = usize::try_from(at) else {
+		return NO_INDEX;
+	};
+
+	let Some(pose) = posed.get(at) else {
+		return NO_INDEX;
+	};
+
+	if moved[at] == NO_INDEX {
+		moved[at] = count(kept.len());
+		let mut copy = pose.clone();
+		copy.slot = count(kept.len());
+		copy.generation = 1;
+		kept.push(copy);
+	}
+
+	moved[at]
+}
+
 /// What an old index became, or [`NO_INDEX`] for the world and for anything
 /// left behind.
 fn at_new(table: &[u32], index: u32) -> u32 {
@@ -590,7 +678,22 @@ fn at_new(table: &[u32], index: u32) -> u32 {
 /// @return the description, with the arena in it
 #[must_use]
 pub fn capture(world: &World) -> SceneData {
-	let things = things(world);
+	// before the entities, because a thing points at a pose by index and the
+	// indices only exist once the list does.
+	let posed = poses(world);
+	let mut pose_of = vec![NO_INDEX; world.poses.slots()];
+
+	for (index, pose) in posed.iter().enumerate() {
+		let (Ok(index), Ok(slot)) = (u32::try_from(index), usize::try_from(pose.slot)) else {
+			continue;
+		};
+
+		if let Some(entry) = pose_of.get_mut(slot) {
+			*entry = index;
+		}
+	}
+
+	let things = things(world, &pose_of);
 	// slot to index, so a body naming an entity and a joint naming a body both
 	// look their answer up rather than searching. Sized by the table rather
 	// than by what is alive, so a slot is an index into it directly.
@@ -628,6 +731,10 @@ pub fn capture(world: &World) -> SceneData {
 	SceneData {
 		stage: stage(world),
 		links: links(world, &solid_of),
+		posed,
+		pose_generations: (0..world.poses.slots())
+			.map(|slot| world.poses.generation(slot))
+			.collect(),
 		thing_generations: (0..world.entities.slots())
 			.map(|slot| world.entities.generation(slot))
 			.collect(),
@@ -660,11 +767,16 @@ fn stage(world: &World) -> Stage {
 }
 
 /// Every living entity, with its handles resolved back to names.
-fn things(world: &World) -> Vec<Thing> {
+fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 	world
 		.entities
 		.iter()
 		.map(|(id, transform, renderable)| Thing {
+			pose: pose_of
+				.get(renderable.pose.slot())
+				.copied()
+				.filter(|_| world.poses.alive(renderable.pose))
+				.unwrap_or(NO_INDEX),
 			name: world.entities.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
@@ -678,6 +790,26 @@ fn things(world: &World) -> Vec<Thing> {
 				.entry(renderable.material)
 				.map_or_else(String::new, |entry| entry.name().to_owned()),
 			color: renderable.color,
+		})
+		.collect()
+}
+
+/// Every living pose, with its skeleton named.
+fn poses(world: &World) -> Vec<Posed> {
+	world
+		.poses
+		.iter()
+		.map(|(id, pose)| Posed {
+			// nothing in the world names a pose, so a captured one has none.
+			// The writer invents one where something refers to it.
+			name: String::new(),
+			slot: u32::try_from(id.slot()).unwrap_or(0),
+			generation: id.generation(),
+			skeleton: world
+				.skeletons
+				.get(pose.skeleton)
+				.map_or_else(String::new, |entry| entry.name().to_owned()),
+			locals: pose.locals.clone(),
 		})
 		.collect()
 }
@@ -843,9 +975,11 @@ static EMPTY: SceneData = SceneData {
 	things: Vec::new(),
 	solids: Vec::new(),
 	links: Vec::new(),
+	posed: Vec::new(),
 	thing_generations: Vec::new(),
 	solid_generations: Vec::new(),
 	link_generations: Vec::new(),
+	pose_generations: Vec::new(),
 	arena: None,
 };
 
@@ -860,6 +994,9 @@ pub struct Restored {
 
 	/// How many joints did.
 	pub links: usize,
+
+	/// How many poses did.
+	pub posed: usize,
 
 	/// Whether the game's own arena was put back.
 	pub arena: bool,
@@ -898,8 +1035,14 @@ pub struct Restored {
 pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	agreed(world, scene)?;
 
+	// before the entities, because a restored entity's renderable names a pose
+	// handle and the handles only exist once the table has been rebuilt.
+	let generations = slots(&scene.pose_generations, scene.posed.iter().map(Posed::key));
+	let entries = poses_of(world, scene);
+	let poses = world.poses.restore(&generations, &entries);
+
 	let generations = slots(&scene.thing_generations, scene.things.iter().map(Thing::key));
-	let entries = placed(world, scene);
+	let entries = placed(world, scene, &poses);
 	let things = world.entities.restore(&generations, &entries);
 
 	let generations = slots(&scene.solid_generations, scene.solids.iter().map(Solid::key));
@@ -937,6 +1080,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 		things: things.iter().filter(|id| id.is_some()).count(),
 		solids: solids.iter().filter(|id| id.is_some()).count(),
 		links: links.iter().filter(|id| id.is_some()).count(),
+		posed: poses.iter().filter(|id| id.is_some()).count(),
 		arena: scene.arena.is_some(),
 	})
 }
@@ -997,7 +1141,11 @@ fn slots<I: Iterator<Item = (u32, u32)>>(written: &[u32], records: I) -> Vec<u32
 }
 
 /// Every entity, with its named assets looked up.
-fn placed(world: &World, scene: &SceneData) -> Vec<(usize, Transform, Renderable)> {
+fn placed(
+	world: &World,
+	scene: &SceneData,
+	poses: &[PoseId],
+) -> Vec<(usize, Transform, Renderable)> {
 	scene
 		.things
 		.iter()
@@ -1006,11 +1154,46 @@ fn placed(world: &World, scene: &SceneData) -> Vec<(usize, Transform, Renderable
 				mesh: world.meshes.find(&thing.mesh),
 				material: material(world, &thing.material),
 				color: thing.color,
+				pose: at(poses, thing.pose).unwrap_or(PoseId::NONE),
 			};
 
 			(usize::try_from(thing.slot).unwrap_or(usize::MAX), thing.transform, renderable)
 		})
 		.collect()
+}
+
+/// Every pose, with its skeleton looked up and its past caught up.
+///
+/// A world put back has not been stepped, so there is nothing between its past
+/// and its present to draw: they are the same, and saying so here is why the
+/// description carries one set of bones rather than two.
+fn poses_of(world: &World, scene: &SceneData) -> Vec<(usize, Pose)> {
+	scene
+		.posed
+		.iter()
+		.map(|posed| (usize::try_from(posed.slot).unwrap_or(usize::MAX), pose_of(world, posed)))
+		.collect()
+}
+
+/// One pose, with its skeleton looked up and its bones filled in.
+///
+/// **A description with no bones in it is a pose at rest**, not a pose of no
+/// bones. That is the whole of how an authored scene works: a source says
+/// which skeleton and nothing else, because where a character's bones are is a
+/// property of the moment rather than of the level, and what comes out stands
+/// in the shape its model was drawn in.
+fn pose_of(world: &World, posed: &Posed) -> Pose {
+	let skeleton = world.skeletons.find(&posed.skeleton);
+
+	if posed.locals.is_empty() {
+		return Pose::resting(skeleton, world.skeletons.bones(skeleton));
+	}
+
+	Pose {
+		skeleton,
+		previous: posed.locals.clone(),
+		locals: posed.locals.clone(),
+	}
 }
 
 /// Every body, with its shape's mesh and its entity looked up.
@@ -1143,6 +1326,10 @@ pub struct Remap {
 
 	/// And for joints.
 	links: Vec<(String, JointId)>,
+
+	/// And for poses, which have no names because nothing points at one by
+	/// anything but its place in the file.
+	poses: Vec<PoseId>,
 }
 
 impl Remap {
@@ -1167,6 +1354,14 @@ impl Remap {
 	pub fn joint(&self, index: u32) -> JointId {
 		handle(&self.links, index).unwrap_or(JointId::NONE)
 	}
+
+	/// What the pose at a place in the file became.
+	///
+	/// @param index - its place in [`SceneData::posed`]
+	/// @return the handle, or [`PoseId::NONE`] for an index that is not one or
+	/// a pose the world had no room for
+	#[must_use]
+	pub fn pose(&self, index: u32) -> PoseId { at(&self.poses, index).unwrap_or(PoseId::NONE) }
 
 	/// What the entity somebody called this became.
 	///
@@ -1253,10 +1448,20 @@ fn named<T: Copy>(list: &[(String, T)], name: &str) -> Option<T> {
 /// description says
 /// @return what each record became
 pub fn instantiate(world: &mut World, scene: &SceneData, at: Vec3) -> Remap {
+	// before the entities, for the reason a restore does it first: an entity
+	// names a pose by handle and the handles do not exist yet. Two things
+	// naming one index come out sharing one pose, which is what a copy of a
+	// character has to be.
+	let poses: Vec<PoseId> = scene
+		.posed
+		.iter()
+		.map(|posed| spawn_pose(world, posed))
+		.collect();
+
 	let things: Vec<(String, EntityId)> = scene
 		.things
 		.iter()
-		.map(|thing| (thing.name.clone(), spawn_thing(world, thing, at)))
+		.map(|thing| (thing.name.clone(), spawn_thing(world, thing, &poses, at)))
 		.collect();
 
 	let solids: Vec<(String, BodyId)> = scene
@@ -1271,11 +1476,22 @@ pub fn instantiate(world: &mut World, scene: &SceneData, at: Vec3) -> Remap {
 		.map(|link| (link.name.clone(), spawn_link(world, link, &solids, at)))
 		.collect();
 
-	Remap { things, solids, links }
+	Remap { things, solids, links, poses }
+}
+
+/// Creates one pose, standing where the description left its bones.
+///
+/// A copy of a posed character is posed the same way, not put back at rest: a
+/// duplicate of something mid-stride should look like what was duplicated.
+/// Its past is its present, because it has not moved yet.
+fn spawn_pose(world: &mut World, posed: &Posed) -> PoseId {
+	let pose = pose_of(world, posed);
+
+	world.poses.spawn(pose)
 }
 
 /// Creates one entity.
-fn spawn_thing(world: &mut World, thing: &Thing, at: Vec3) -> EntityId {
+fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> EntityId {
 	let mut transform = thing.transform;
 	transform.position += at;
 
@@ -1287,10 +1503,19 @@ fn spawn_thing(world: &mut World, thing: &Thing, at: Vec3) -> EntityId {
 	// the copy is called what the original was called. Two things with one
 	// name is exactly what a dupe is, and the handle is what tells them apart.
 	world.entities.set_name(id, &thing.name);
+	// the shadowing is why this is not `at`: the offset a paste applies is
+	// also called that, and it is the older of the two names here.
+	let pose = usize::try_from(thing.pose)
+		.ok()
+		.and_then(|index| poses.get(index))
+		.copied()
+		.unwrap_or(PoseId::NONE);
+
 	world.entities.set_renderable(id, Renderable {
 		mesh: world.meshes.find(&thing.mesh),
 		material: material(world, &thing.material),
 		color: thing.color,
+		pose,
 	});
 
 	id
@@ -1374,7 +1599,10 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::abi::{MAX_ENTITIES, Material, MeshData, mesh};
+	use crate::abi::{
+		MAX_ENTITIES, Material, MeshData, mesh,
+		skeleton::{Bone, SkeletonData, SkeletonId},
+	};
 
 	/// A world with a mesh, a material and one entity standing on a body.
 	fn furnished() -> World {
@@ -1618,6 +1846,188 @@ mod tests {
 		world.time = 3.25;
 
 		world
+	}
+
+	/// A skeleton of two bones, registered under a name.
+	fn rigged(world: &mut World) -> SkeletonId {
+		world
+			.skeletons
+			.insert("models/hero/rig", SkeletonData {
+				bones: vec![
+					Bone {
+						name: "hips".to_owned(),
+						..Bone::default()
+					},
+					Bone {
+						name: "head".to_owned(),
+						parent: 0,
+						rest: Transform::at(Vec3::Y),
+						..Bone::default()
+					},
+				],
+			})
+	}
+
+	/// A world with one character drawn as two entities sharing one pose.
+	fn character() -> World {
+		let mut world = furnished();
+		let skeleton = rigged(&mut world);
+		let mesh = world.meshes.find("meshes/crystal");
+		let pose = world
+			.poses
+			.spawn(Pose::resting(skeleton, world.skeletons.bones(skeleton)));
+
+		world
+			.poses
+			.get_mut(pose)
+			.expect("the pose is there")
+			.set(1, Transform::at(Vec3::new(0.0, 2.0, 0.0)));
+
+		for name in ["body", "eyes"] {
+			let id = world.entities.spawn_at(Transform::IDENTITY);
+
+			world.entities.set_name(id, name);
+			world
+				.entities
+				.set_renderable(id, Renderable::new(mesh, Vec3::ONE).posed(pose));
+		}
+
+		world
+	}
+
+	#[test]
+	fn a_posed_world_put_back_captures_the_same_way_it_did_before() {
+		let world = character();
+		let scene = capture(&world);
+
+		assert_eq!(scene.posed.len(), 1, "one pose, however many entities wear it");
+		assert_eq!(scene.posed[0].skeleton, "models/hero/rig", "named rather than handled");
+		assert_eq!(scene.posed[0].locals.len(), 2, "with both its bones written down");
+
+		let mut empty = furnished();
+		rigged(&mut empty);
+
+		let report = restore(&mut empty, &scene).expect("the layouts agree");
+
+		assert_eq!(report.posed, 1, "the pose landed");
+		assert_eq!(capture(&empty), scene, "and describing it again describes what was read");
+	}
+
+	#[test]
+	fn two_entities_that_shared_a_pose_still_share_one_afterwards() {
+		let scene = capture(&character());
+		let mut world = furnished();
+
+		rigged(&mut world);
+
+		let remap = instantiate(&mut world, &scene, Vec3::ZERO);
+		let body = remap.entity(0);
+		let eyes = remap.entity(1);
+		let of = |id| {
+			world
+				.entities
+				.renderable(id)
+				.map(|renderable| renderable.pose)
+		};
+
+		assert_eq!(of(body), of(eyes), "one pose, not one each");
+		assert!(of(body).is_some_and(PoseId::is_some), "and a real one");
+		assert_eq!(world.poses.len(), 1, "so the table holds one");
+		assert_eq!(remap.pose(0), of(body).expect("it is there"), "which the remap names");
+	}
+
+	#[test]
+	fn a_pasted_character_stands_the_way_the_one_it_was_copied_from_stood() {
+		let scene = capture(&character());
+		let mut world = furnished();
+
+		rigged(&mut world);
+		instantiate(&mut world, &scene, Vec3::ZERO);
+
+		let (_, pose) = world.poses.iter().next().expect("one pose");
+
+		assert_eq!(
+			pose.locals[1].position,
+			Vec3::new(0.0, 2.0, 0.0),
+			"mid-stride rather than back at rest"
+		);
+		assert_eq!(pose.previous, pose.locals, "and it has not moved yet, so it does not smear");
+	}
+
+	#[test]
+	fn a_description_that_names_a_skeleton_and_no_bones_comes_back_resting() {
+		let mut world = furnished();
+
+		rigged(&mut world);
+
+		// what a source produces: the skeleton and nothing else. It is not a
+		// pose of no bones, it is a character standing as it was drawn.
+		let scene = SceneData {
+			posed: vec![Posed {
+				name: "hero".to_owned(),
+				slot: 0,
+				generation: 1,
+				skeleton: "models/hero/rig".to_owned(),
+				locals: Vec::new(),
+			}],
+			pose_generations: vec![1],
+			..SceneData::default()
+		};
+
+		restore(&mut world, &scene).expect("nothing disagrees");
+
+		let (_, pose) = world.poses.iter().next().expect("one pose");
+
+		assert_eq!(pose.locals.len(), 2, "filled from the skeleton it named");
+		assert_eq!(pose.locals[1].position, Vec3::Y, "at the rest the skeleton has");
+	}
+
+	#[test]
+	fn a_pose_whose_skeleton_did_not_load_is_a_character_standing_still() {
+		let scene = capture(&character());
+		// the same description into a world that never saw the skeleton.
+		let mut world = furnished();
+
+		restore(&mut world, &scene).expect("nothing disagrees");
+
+		let (id, pose) = world
+			.poses
+			.iter()
+			.next()
+			.expect("the pose is still there");
+
+		assert_eq!(pose.skeleton, SkeletonId::NONE, "naming nothing");
+		assert_eq!(world.render_skinning(id, &mut Vec::new()), 0, "and moving nothing");
+	}
+
+	#[test]
+	fn cutting_a_character_out_takes_its_pose_with_it() {
+		let mut world = character();
+		let standing = world
+			.entities
+			.iter()
+			.next()
+			.map(|(id, ..)| id)
+			.expect("the body entity");
+		let body = world
+			.bodies
+			.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0).driving(standing));
+		let scene = capture(&world);
+		let solid = scene
+			.solids
+			.iter()
+			.position(|it| it.slot == u32::try_from(body.slot()).unwrap_or(0))
+			.expect("the body is in the description");
+		let piece = scene.subset(&[u32::try_from(solid).unwrap_or(0)]);
+
+		assert_eq!(piece.posed.len(), 1, "the pose came along");
+		assert_eq!(piece.posed[0].slot, 0, "renumbered like everything else");
+		assert_eq!(piece.things[0].pose, 0, "and the entity still points at it");
+		assert_eq!(
+			piece.posed[0].locals.len(),
+			2,
+			"with the bones it was standing in, not with none"
+		);
 	}
 
 	#[test]

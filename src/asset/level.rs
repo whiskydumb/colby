@@ -32,15 +32,28 @@
 //!   "bodies":   [ { "entity": "crate", "kind": "dynamic",
 //!                   "shape": { "kind": "box", "extents": [0.5, 0.5, 0.5] } } ],
 //!   "joints":   [ { "kind": "rope", "first": "crate", "length": 3.0,
-//!                   "anchors": [[0, 0, 0], [0, 7, 0]] } ]
+//!                   "anchors": [[0, 0, 0], [0, 7, 0]] } ],
+//!   "poses":    [ { "name": "hero", "skeleton": "models/hero/rig" } ]
 //! }
 //! ```
+//!
+//! **A pose is a record of its own and an entity names it**, rather than an
+//! entity naming a skeleton directly. The two are not the same claim: a model
+//! of two materials is two entities moved by one set of bones, and two
+//! entities that each named `models/hero/rig` would be two characters walking
+//! in step by accident. Naming the pose says which of those is meant.
+//!
+//! **A source never writes where the bones are.** A pose here is a skeleton
+//! and nothing else, and what comes out of it stands in the shape the model
+//! was drawn in; whatever an animation does to it afterwards belongs to a
+//! save, not to a level. Writing thirty-five transforms per character into a
+//! file a person edits would bury the two lines they came to change.
 
 use colby_core::{
 	Result,
 	abi::{
 		BodyKind, Camera, Joint, JointKind, Layers, ShapeKind, Transform,
-		scene::{Form, Link, NO_INDEX, SceneData, Solid, Stage, Thing},
+		scene::{Form, Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
 	err,
 	glam::{Quat, Vec3},
@@ -62,9 +75,10 @@ pub const EXTENSION: &str = "scene";
 /// something nothing answers to, or names one thing twice.
 pub fn import(text: &str) -> Result<SceneData> {
 	let root = json::parse(text)?;
-	fields(&root, &["stage", "entities", "bodies", "joints"], "the scene")?;
+	fields(&root, &["stage", "entities", "bodies", "joints", "poses"], "the scene")?;
 
-	let things = entities(root.get("entities"))?;
+	let posed = poses(root.get("poses"))?;
+	let things = entities(root.get("entities"), &posed)?;
 	let solids = bodies(root.get("bodies"), &things)?;
 	let links = joints(root.get("joints"), &solids)?;
 
@@ -73,9 +87,11 @@ pub fn import(text: &str) -> Result<SceneData> {
 		thing_generations: vec![1; things.len()],
 		solid_generations: vec![1; solids.len()],
 		link_generations: vec![1; links.len()],
+		pose_generations: vec![1; posed.len()],
 		things,
 		solids,
 		links,
+		posed,
 		// nothing an author could write. A scene laid out by hand is a world
 		// before any game has run in it, and the arena is what a game
 		// remembers about one that has.
@@ -135,19 +151,59 @@ fn camera(value: Option<&Value>) -> Result<Camera> {
 	})
 }
 
-/// Every entity the source stands.
-fn entities(value: Option<&Value>) -> Result<Vec<Thing>> {
+/// Every pose the source declares.
+///
+/// Bones are deliberately not readable here - @ref the module's own note. A
+/// pose out of a source is a skeleton and a name, and what stands on it stands
+/// in the shape its model was drawn in.
+fn poses(value: Option<&Value>) -> Result<Vec<Posed>> {
+	let mut posed: Vec<Posed> = Vec::new();
+
+	for (index, entry) in listed(value).iter().enumerate() {
+		fields(entry, &["name", "skeleton"], "a pose")?;
+
+		let name = text(entry.get("name"));
+		once(posed.iter().any(|it| it.name == name), &name, "pose")?;
+
+		posed.push(Posed {
+			name,
+			slot: count(index)?,
+			generation: 1,
+			skeleton: text(entry.get("skeleton")),
+			locals: Vec::new(),
+		});
+	}
+
+	Ok(posed)
+}
+
+/// Every entity the source stands, with the pose that moves it looked up.
+fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 	let mut things: Vec<Thing> = Vec::new();
 
 	for (index, entry) in listed(value).iter().enumerate() {
 		fields(
 			entry,
-			&["name", "at", "turn", "scale", "mesh", "material", "color"],
+			&["name", "at", "turn", "scale", "mesh", "material", "color", "pose"],
 			"an entity",
 		)?;
 
 		let name = text(entry.get("name"));
 		once(things.iter().any(|it| it.name == name), &name, "entity")?;
+
+		let moved = text(entry.get("pose"));
+		let pose = if moved.is_empty() {
+			NO_INDEX
+		} else {
+			count(
+				posed
+					.iter()
+					.position(|it| it.name == moved)
+					.ok_or_else(|| {
+						err!(Asset("an entity is moved by {moved}, and no pose is that"))
+					})?,
+			)?
+		};
 
 		things.push(Thing {
 			name,
@@ -157,6 +213,7 @@ fn entities(value: Option<&Value>) -> Result<Vec<Thing>> {
 			mesh: text(entry.get("mesh")),
 			material: text(entry.get("material")),
 			color: vector(entry.get("color"), Vec3::ONE),
+			pose,
 		});
 	}
 
@@ -534,12 +591,18 @@ pub fn export(scene: &SceneData) -> Result<String> {
 		"body",
 	);
 	let link_names = named(&scene.links, |link| link.name.as_str(), |_| false, "joint");
+	let pose_names = named(
+		&scene.posed,
+		|posed| posed.name.as_str(),
+		|index| scene.things.iter().any(|it| it.pose == index),
+		"pose",
+	);
 
 	let things: Vec<String> = scene
 		.things
 		.iter()
 		.zip(&thing_names)
-		.map(|(thing, name)| thing_of(thing, name))
+		.map(|(thing, name)| thing_of(thing, name, &pose_names))
 		.collect();
 	let solids: Vec<String> = scene
 		.solids
@@ -553,6 +616,12 @@ pub fn export(scene: &SceneData) -> Result<String> {
 		.zip(&link_names)
 		.map(|(link, name)| link_of(link, name, &solid_names))
 		.collect();
+	let poses: Vec<String> = scene
+		.posed
+		.iter()
+		.zip(&pose_names)
+		.map(|(posed, name)| pose_of(posed, name))
+		.collect();
 
 	// gathered rather than appended, so that the comma between two of them is
 	// written by whatever knows there is a next one. A trailing one is the
@@ -562,6 +631,7 @@ pub fn export(scene: &SceneData) -> Result<String> {
 		block("entities", &things),
 		block("bodies", &solids),
 		block("joints", &links),
+		block("poses", &poses),
 	]
 	.into_iter()
 	.flatten()
@@ -648,7 +718,7 @@ fn stage_of(stage: &Stage) -> Option<String> {
 }
 
 /// One entity.
-fn thing_of(thing: &Thing, name: &str) -> String {
+fn thing_of(thing: &Thing, name: &str, poses: &[String]) -> String {
 	let mut fields: Vec<(&str, String)> = Vec::new();
 
 	put_text(&mut fields, "name", name);
@@ -656,6 +726,21 @@ fn thing_of(thing: &Thing, name: &str) -> String {
 	put_text(&mut fields, "mesh", &thing.mesh);
 	put_text(&mut fields, "material", &thing.material);
 	put_vector(&mut fields, "color", thing.color, Vec3::ONE);
+	put_text(&mut fields, "pose", &at_index(poses, thing.pose));
+
+	object(&fields)
+}
+
+/// One pose: which skeleton it wears, and nothing about where its bones are.
+///
+/// Where they are is left out on purpose - @ref the module's own note. A
+/// source is a level rather than a moment, and thirty-five transforms a
+/// character would bury everything a person came to the file to change.
+fn pose_of(posed: &Posed, name: &str) -> String {
+	let mut fields: Vec<(&str, String)> = Vec::new();
+
+	put_text(&mut fields, "name", name);
+	put_text(&mut fields, "skeleton", &posed.skeleton);
 
 	object(&fields)
 }
@@ -1098,6 +1183,106 @@ mod tests {
 			  "stiffness": 8.0, "damping": 0.6, "max impulse": 45.0, "max torque": 12.5 }
 		]
 	}"#;
+
+	/// A source with a character in it, drawn as two entities on one pose.
+	const RIGGED: &str = r#"{
+		"poses": [ { "name": "hero", "skeleton": "models/hero/rig" } ],
+		"entities": [
+			{ "name": "body", "mesh": "models/hero/body", "pose": "hero" },
+			{ "name": "eyes", "mesh": "models/hero/eyes", "pose": "hero" },
+			{ "name": "crate", "mesh": "cube" }
+		]
+	}"#;
+
+	#[test]
+	fn a_source_pose_is_read_and_the_entities_that_wear_it_point_at_it() {
+		let scene = import(RIGGED).expect("it is a scene");
+
+		assert_eq!(scene.posed.len(), 1, "one pose");
+		assert_eq!(scene.posed[0].skeleton, "models/hero/rig");
+		assert!(
+			scene.posed[0].locals.is_empty(),
+			"and no bones, which is what makes it rest when it is loaded"
+		);
+		assert_eq!(scene.things[0].pose, 0, "the body wears it");
+		assert_eq!(scene.things[1].pose, 0, "so does the eyes, and it is the same one");
+		assert_eq!(scene.things[2].pose, NO_INDEX, "the crate wears nothing");
+	}
+
+	#[test]
+	fn a_pose_survives_being_written_back_out_and_read_again() {
+		let once = import(RIGGED).expect("it is a scene");
+		let text = export(&once).expect("it writes");
+		let twice = import(&text).expect("and reads back");
+
+		assert_eq!(twice, once, "exactly, which is the only test a writer and a reader share");
+		assert!(text.contains("\"poses\""), "and the block is really in the text: {text}");
+	}
+
+	#[test]
+	fn a_pose_nothing_wears_and_nothing_names_is_still_written() {
+		let orphan = r#"{ "poses": [ { "skeleton": "models/hero/rig" } ] }"#;
+		let scene = import(orphan).expect("it is a scene");
+		let text = export(&scene).expect("it writes");
+
+		assert!(text.contains("models/hero/rig"), "got {text}");
+		assert_eq!(import(&text).expect("it reads back"), scene);
+	}
+
+	#[test]
+	fn a_captured_pose_is_given_a_name_only_because_something_wears_it() {
+		// what a capture produces: no name at all, because nothing in a world
+		// names a pose. The writer has to invent one, or the entity wearing it
+		// has nothing to point at.
+		let scene = SceneData {
+			posed: vec![Posed {
+				skeleton: "models/hero/rig".to_owned(),
+				generation: 1,
+				..Posed::default()
+			}],
+			things: vec![Thing {
+				generation: 1,
+				pose: 0,
+				..Thing::default()
+			}],
+			pose_generations: vec![1],
+			thing_generations: vec![1],
+			..SceneData::default()
+		};
+		let text = export(&scene).expect("it writes");
+
+		assert!(text.contains("\"pose 0\""), "a name was invented: {text}");
+		assert_eq!(import(&text).expect("it reads back").things[0].pose, 0);
+	}
+
+	#[test]
+	fn an_entity_worn_by_a_pose_nobody_declared_is_an_error_naming_it() {
+		let refused = import(r#"{ "entities": [ { "name": "a", "pose": "ghost" } ] }"#)
+			.expect_err("there is no such pose")
+			.to_string();
+
+		assert!(refused.contains("ghost"), "it says which: {refused}");
+		assert!(refused.contains("no pose is that"), "got {refused}");
+	}
+
+	#[test]
+	fn two_poses_called_the_same_are_an_error() {
+		let twice = r#"{ "poses": [ { "name": "one" }, { "name": "one" } ] }"#;
+		let refused = import(twice)
+			.expect_err("two poses cannot be called the same")
+			.to_string();
+
+		assert!(refused.contains("one"), "got {refused}");
+	}
+
+	#[test]
+	fn a_field_a_pose_does_not_have_is_an_error_naming_it() {
+		let refused = import(r#"{ "poses": [ { "bones": [] } ] }"#)
+			.expect_err("a source does not write bones")
+			.to_string();
+
+		assert!(refused.contains("bones"), "it names the field: {refused}");
+	}
 
 	#[test]
 	fn a_source_reads_into_a_description_of_itself() {
