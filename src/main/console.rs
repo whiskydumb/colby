@@ -212,6 +212,18 @@ pub(crate) fn install(world: &mut World) {
 		"throw away every debug line that has a lifetime",
 	);
 
+	install_scenes(world);
+}
+
+/// The four that read or write a file.
+///
+/// Split off for the lint rather than for the shape, and the shape is better
+/// for it: these are the only commands in the table that do not answer inside
+/// the frame they were typed in. Every one of them leaves a note for the frame
+/// loop instead. @ref [`crate::saves`].
+///
+/// @param world - the table to register into
+fn install_scenes(world: &mut World) {
 	world
 		.cvars
 		.command("scene.save", save_scene, "write the world into saves/<name>.cscene");
@@ -224,6 +236,11 @@ pub(crate) fn install(world: &mut World) {
 		"scene.load",
 		load_scene,
 		"put saves/<name>.cscene back, replacing this world",
+	);
+	world.cvars.command(
+		"scene.prop",
+		write_prop,
+		"write the scene registered as props/<name> into assets/props/<name>.scene",
 	);
 }
 
@@ -414,6 +431,23 @@ unsafe extern "C-unwind" fn save_scene(_world: *mut World, args: *const Args) {
 	let args = unsafe { &*args };
 
 	crate::saves::ask(crate::saves::Request::Save(args.rest()));
+}
+
+/// `scene.prop <name>` - writes one registered scene out as a prop.
+///
+/// The half of saving a contraption that needs a filesystem. The other half is
+/// the game's: it cuts the piece out and registers it, because what is under
+/// somebody's crosshair is not something the host can see. @ref
+/// [`crate::saves::Request::Prop`].
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn write_prop(_world: *mut World, args: *const Args) {
+	// SAFETY: as help.
+	let args = unsafe { &*args };
+
+	crate::saves::ask(crate::saves::Request::Prop(args.rest()));
 }
 
 /// `scene.write <name>` - writes the world out as a source somebody can edit.

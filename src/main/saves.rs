@@ -57,6 +57,14 @@ pub(crate) const DIRECTORY: &str = "saves";
 /// a source written anywhere else would be a file nothing compiles.
 pub(crate) const SOURCES: &str = "scenes";
 
+/// The directory props live in, under the same tree.
+///
+/// Also not a choice: the spawn menu finds a prop by walking the scene registry
+/// for everything named `props/`, and the compiler names an asset by its own
+/// path. So a contraption written here is offered by the menu on the next run
+/// with nothing told about it.
+pub(crate) const PROPS: &str = "props";
+
 /// What a console command has asked the host to do, waiting for a frame.
 ///
 /// One at a time: typing two loads before the next frame means the second one
@@ -74,6 +82,15 @@ pub(crate) enum Request {
 
 	/// Write the world out as a source somebody can edit.
 	Write(String),
+
+	/// Write one *registered scene* out as a prop somebody can spawn.
+	///
+	/// The odd one out, and deliberately so: the other three are about the
+	/// world, and this one is about a piece of it that the game has already
+	/// cut out and put in the registry. The host has no idea which piece,
+	/// because what is under somebody's crosshair is the game's business and
+	/// lives in its arena. What the two share is a name.
+	Prop(String),
 }
 
 /// Leaves a note for the frame loop.
@@ -98,6 +115,7 @@ pub(crate) fn serve(world: &mut World, simulation: &mut Simulation) {
 		| Request::Save(name) => save(world, name),
 		| Request::Load(name) => load(world, simulation, name),
 		| Request::Write(name) => write(world, name),
+		| Request::Prop(name) => prop(world, name),
 	};
 
 	if let Err(failure) = outcome {
@@ -198,6 +216,57 @@ fn write(world: &World, name: &str) -> Result {
 		bodies = world.bodies.len(),
 		replaced = existed,
 		"scene written as a source"
+	);
+
+	Ok(())
+}
+
+/// Writes one registered scene out as a prop.
+///
+/// **A saved contraption is a prop and there is no second format for one.** The
+/// game cuts a connected piece out of the world, registers it under
+/// `props/<name>`, and asks for this; what lands on disk is an ordinary
+/// `.scene` in the directory the spawn menu already walks, so the next run
+/// offers it beside the ones written by hand. Nothing new reads it and nothing
+/// new writes it.
+///
+/// @param world - the registry to take the scene from
+/// @param name - what it is called, without its prefix or its extension
+///
+/// # Errors
+///
+/// If the name is not a plain file name, if nothing is registered under it, if
+/// the piece holds a number JSON cannot write, or if the file cannot be
+/// written.
+fn prop(world: &World, name: &str) -> Result {
+	let path = crate::assets::source_root()
+		.join(PROPS)
+		.join(plain(name)?)
+		.with_extension(level::EXTENSION);
+	let registered = format!("{PROPS}/{name}");
+	let id = world.scenes.find(&registered);
+
+	if !id.is_some() {
+		return Err(err!(Asset("nothing is registered as {registered}")));
+	}
+
+	let existed = path.exists();
+	let piece = world.scenes.data(id);
+	let text = level::export(piece)?;
+
+	if let Some(directory) = path.parent() {
+		fs::create_dir_all(directory)?;
+	}
+
+	fs::write(&path, text.as_bytes())?;
+	info!(
+		path = %path.display(),
+		bytes = text.len(),
+		entities = piece.things.len(),
+		bodies = piece.solids.len(),
+		joints = piece.links.len(),
+		replaced = existed,
+		"prop written"
 	);
 
 	Ok(())

@@ -21,8 +21,8 @@ use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, Joint,
 		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Renderable,
-		SceneData, SceneId, Shape, ShapeKind, TouchKind, TraceInfo, Transform, World, character,
-		debug, scene,
+		SceneData, SceneId, Shape, ShapeKind, Stage, TouchKind, TraceInfo, Transform, World,
+		character, console, debug, scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -179,6 +179,12 @@ const DROP_REACH: f32 = 1.6;
 const DROP_LIFT: f32 = 0.9;
 
 const HUD: &str = "ui/hud";
+
+/// A slot number no table will ever hand out.
+///
+/// Used to make a comparison against a slot that does not exist fail, rather
+/// than to name anything.
+const NO_SLOT: u32 = u32::MAX;
 
 /// How many things the scene lays out.
 ///
@@ -658,6 +664,11 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		use_it,
 		"use the toolgun on a named body, or on whatever the crosshair is on",
 	);
+	world.cvars.command(
+		"game.save",
+		keep_one,
+		"keep what is held or aimed at as a prop called <name>, joints and all",
+	);
 
 	// on every load, not only a fresh one: the mesh a name resolves to is the
 	// host's business, and an asset that appeared since the last swap should be
@@ -761,17 +772,15 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	count_landings(world);
 }
 
-/// Copies whatever the cursor is on and stands the copy beside it.
+/// Copies the contraption the cursor is on and stands the copy beside it.
 ///
-/// The sandbox's duplicator, at the size one prop makes it. What it
-/// demonstrates is that a scene is a *value*: the whole world is described,
-/// two records are kept out of it, and those two are created again. Nothing
-/// here transcribes a body field by field, which is the difference between a
-/// dupe and a second spawn function that has to be kept in step with the first
-/// one forever.
-///
-/// The copy goes into the same ring the spawn menu drops into, so a room does
-/// not fill up with copies and the panel's count is the feedback.
+/// The sandbox's duplicator. What it demonstrates is that a scene is a *value*:
+/// the whole world is described, a connected piece of it is kept, and that
+/// piece is created again. Nothing here transcribes a body field by field,
+/// which is the difference between a dupe and a second spawn function that has
+/// to be kept in step with the first one forever - and it is why a copy of a
+/// welded bridge arrives welded, with no code anywhere knowing what a bridge
+/// is.
 ///
 /// @param world - the picked body, and the tables the copy is added to
 /// @param yaw - which way the camera is looking, so the copy appears to one
@@ -791,7 +800,10 @@ fn duplicate(world: &mut World, yaw: f32) {
 		return;
 	}
 
-	let Some(scene) = cut_out(world, body) else {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let held = state.hold;
+
+	let Some(scene) = cut_out(world, body, held) else {
 		return;
 	};
 
@@ -801,27 +813,117 @@ fn duplicate(world: &mut World, yaw: f32) {
 	trace!(of = body.slot(), into = put.body(0).slot(), "duplicated");
 }
 
-/// Describes the world and cuts one body and what it drives out of it.
+/// Describes the world and cuts out the whole contraption one body is part of.
 ///
-/// Two lines of arithmetic and one call, because the cutting is
-/// [`SceneData::subset`] and lives in the engine: what a description *is* is
-/// the engine's business even though what it *becomes* is the game's, and the
-/// editor wants the same call to export a selection as a prefab. What is left
-/// here is finding which entry of the description a handle is, which is the one
-/// question a game can answer and a description cannot.
+/// Two lines of arithmetic and two calls, because both the walking and the
+/// cutting are the engine's: what a description *is* is its business even
+/// though what one *becomes* is the game's, and the editor wants the identical
+/// pair to export a selection as a prefab. What is left here is finding which
+/// entry of the description a handle is, which is the one question a game can
+/// answer and a description cannot.
+///
+/// **A piece rather than a prop, and that is the whole of what a duplicator
+/// is.** Point at one plank of a bridge and what comes back is the bridge:
+/// every prop the joints reach and every joint between them, renumbered into a
+/// description of its own. A prop nothing is welded to is a piece of one, which
+/// is why this replaced cutting a single body rather than being added beside
+/// it.
+///
+/// **The gun's own grip is not part of the thing it is holding**, and finding
+/// that out cost a saved contraption with a physics gun welded into it. The
+/// joint a carry makes is a weld pinned to a point in the world, which is
+/// exactly what nailing a prop to a wall is, so nothing about the joint itself
+/// could tell them apart. What can is the game, which knows which joint it
+/// made, so it takes it out of the description before the cutting starts.
 ///
 /// @param world - the world to describe
-/// @param body - the body to keep
-/// @return a scene of one prop, or nothing if the handle is in no description
-fn cut_out(world: &World, body: BodyId) -> Option<SceneData> {
-	let whole = scene::capture(world);
+/// @param body - a body of the piece to keep
+/// @param ignoring - a joint to leave out, or [`JointId::NONE`]
+/// @return the piece, or nothing if the handle is in no description
+fn cut_out(world: &World, body: BodyId, ignoring: JointId) -> Option<SceneData> {
+	let mut whole = scene::capture(world);
 	let slot = u32::try_from(body.slot()).ok()?;
+
+	if ignoring.is_some() {
+		let held = u32::try_from(ignoring.slot()).unwrap_or(NO_SLOT);
+		whole.links.retain(|link| link.slot != held);
+	}
+
 	let at = whole
 		.solids
 		.iter()
 		.position(|solid| solid.slot == slot)?;
+	let seed = u32::try_from(at).ok()?;
 
-	Some(whole.subset(&[u32::try_from(at).ok()?]))
+	Some(whole.subset(&whole.connected(seed)))
+}
+
+/// Keeps the piece being held, or the one under the crosshair, as a prop.
+///
+/// **A saved contraption is a prop, and there is no second format for one.**
+/// The piece is registered as `props/<name>`, which is the only thing the spawn
+/// menu ever looks at, so it is spawnable the moment it is saved - before
+/// anything reaches a disk at all. Writing it down is then a separate thing
+/// that makes it survive a restart, and the host does it, because a game module
+/// has no business reaching into the asset tree.
+///
+/// The way it asks is the console, which is the surface a document's own script
+/// already reaches gameplay through. @ref `colby-abi-rules`.
+///
+/// @param world - the world to cut from and the registry to add to
+/// @param name - what to call it, without a prefix or an extension
+/// @return whether one was kept
+fn keep_build(world: &mut World, name: &str) -> bool {
+	if name.is_empty() {
+		warn!("a build needs a name to be saved under");
+
+		return false;
+	}
+
+	// what is held, or what is aimed at. The same rule the freeze key follows,
+	// and it is the useful one: a contraption you are carrying is a contraption
+	// you have just decided you want.
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let body = if state.held.is_some() {
+		state.held
+	} else {
+		state.picked_body
+	};
+
+	let held = state.hold;
+
+	let Some(mut piece) = cut_out(world, body, held) else {
+		warn!(name, "nothing held or under the crosshair to keep");
+
+		return false;
+	};
+
+	// a saved contraption is a *template* rather than a snapshot. What was
+	// caught mid-drift would otherwise be spawned mid-drift every time, and the
+	// world it was cut from is nobody's business once it is a prop.
+	for solid in &mut piece.solids {
+		solid.velocity = Vec3::ZERO;
+		solid.angular = Vec3::ZERO;
+		solid.sleeping = false;
+	}
+	piece.stage = Stage::DEFAULT;
+	center(&mut piece);
+
+	let registered = format!("{PROPS_DIR}{name}");
+	world.scenes.insert(&registered, piece.clone());
+	info!(
+		name = registered,
+		bodies = piece.solids.len(),
+		joints = piece.links.len(),
+		"kept, and it is a prop now"
+	);
+
+	// the host's half: a file under `assets/props/`, so that it is still a prop
+	// next time. Asked for by name through the console rather than done here,
+	// because the filesystem and the asset tree are the runner's.
+	console::run(world, &format!("scene.prop {name}"));
+
+	true
 }
 
 /// Every prop the tree holds, in a fixed order.
@@ -966,6 +1068,55 @@ fn spawn_prop(world: &mut World, name: &str) -> bool {
 	trace!(name, body = put.body(0).slot(), "spawned");
 
 	true
+}
+
+/// Moves a description so that its bodies stand around the origin.
+///
+/// A piece cut out of a world is written down in that world's coordinates, and
+/// a prop is spawned by [`scene::instantiate`] offsetting everything by where
+/// it is being put - so a contraption saved eight units from the middle of the
+/// yard would arrive eight units from wherever it was asked for. Every prop
+/// written by hand stands at the origin for the same reason.
+///
+/// The middle is the mean of the bodies rather than the seed the piece was
+/// walked from, because `connected` hands its answer back in index order and
+/// which body that puts first is not something a person chose.
+///
+/// Only a joint pinned to the *world* moves with them: every other anchor is in
+/// a body's own space and moves with the body. That is the same rule
+/// `instantiate` follows in the other direction.
+///
+/// @note: this is arguably `SceneData`'s rather than the game's - an editor
+/// exporting a selection as a prefab wants the identical arithmetic. It is
+/// here because the cutting commit had already landed. @ref the audit list.
+///
+/// @param piece - the description to move, written
+fn center(piece: &mut SceneData) {
+	let count = u16::try_from(piece.solids.len()).unwrap_or(0);
+	if count == 0 {
+		return;
+	}
+
+	let total: Vec3 = piece
+		.solids
+		.iter()
+		.map(|solid| solid.transform.position)
+		.sum();
+	let middle = total / f32::from(count);
+
+	for thing in &mut piece.things {
+		thing.transform.position -= middle;
+	}
+
+	for solid in &mut piece.solids {
+		solid.transform.position -= middle;
+	}
+
+	for link in &mut piece.links {
+		if link.second == scene::NO_INDEX {
+			link.second_anchor -= middle;
+		}
+	}
 }
 
 /// Every prop in the world, however it got there.
@@ -2202,6 +2353,23 @@ unsafe extern "C-unwind" fn use_it(world: *mut World, args: *const Args) {
 	};
 
 	use_tool(world, body, at, normal);
+}
+
+/// `game.save <name>` - keeps a contraption as a prop.
+///
+/// Not `scene.save`, which is the host's and writes the *world* into `saves/`.
+/// This one writes a piece of it into the asset tree, where a prop lives.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn keep_one(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let named = unsafe { &*args }.rest();
+
+	keep_build(world, &named);
 }
 
 /// `game.cleanup` - what the interface's own second button asks for.
