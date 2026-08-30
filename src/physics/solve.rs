@@ -899,14 +899,17 @@ impl Solver {
 
 	/// Applies gravity and damping to everything awake.
 	fn accelerate(&mut self, bodies: &Bodies, gravity: Vec3, dt: f32) {
-		for (id, _) in bodies.iter() {
+		for (id, body) in bodies.iter() {
 			let slot = id.slot();
 
 			if self.inverse_mass[slot] <= 0.0 {
 				continue;
 			}
 
-			self.velocity[slot] += gravity * dt;
+			if !body.weightless {
+				self.velocity[slot] += gravity * dt;
+			}
+
 			self.velocity[slot] *= 1.0 / dt.mul_add(LINEAR_DAMPING, 1.0);
 			self.angular[slot] *= 1.0 / dt.mul_add(ANGULAR_DAMPING, 1.0);
 		}

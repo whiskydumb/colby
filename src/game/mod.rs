@@ -205,8 +205,11 @@ const PROPS: usize = 5;
 /// engine compiles assets on a timer.
 ///
 /// Three boxes over each other and two balls beside them: the boxes show that a
-/// stack settles and stays settled, and the balls show that it is a solver
-/// rather than a set of rules about boxes.
+/// stack settles and stays settled, and one ball shows that it is a solver
+/// rather than a set of rules about boxes. The other ball is `weightless`, so
+/// it hangs where it was let go with nothing holding it up and is still shoved
+/// by anything that touches it - which is the difference between a body gravity
+/// does not reach and one the solver does not move.
 const PROPS_SCENE: &str = "scenes/props";
 
 /// Where the rope is tied when there is no scene to say.

@@ -199,6 +199,9 @@ pub struct Solid {
 	/// Whether it notices rather than pushes.
 	pub sensor: bool,
 
+	/// Whether gravity reaches it.
+	pub weightless: bool,
+
 	/// Whether the solver had stopped integrating it.
 	pub sleeping: bool,
 
@@ -490,6 +493,7 @@ fn solids(world: &World, thing_of: &[u32]) -> Vec<Solid> {
 			restitution: body.restitution,
 			friction: body.friction,
 			sensor: body.sensor,
+			weightless: body.weightless,
 			sleeping: body.sleeping,
 			layers: body.layers,
 			thing: thing_of
@@ -815,6 +819,7 @@ fn solid_bodies(world: &World, scene: &SceneData, things: &[EntityId]) -> Vec<(u
 			body.restitution = solid.restitution;
 			body.friction = solid.friction;
 			body.sensor = solid.sensor;
+			body.weightless = solid.weightless;
 			body.sleeping = solid.sleeping;
 			body.layers = solid.layers;
 			body.entity = at(things, solid.thing).unwrap_or(EntityId::NONE);
@@ -1101,6 +1106,7 @@ fn spawn_solid(
 	body.restitution = solid.restitution;
 	body.friction = solid.friction;
 	body.sensor = solid.sensor;
+	body.weightless = solid.weightless;
 	body.layers = solid.layers;
 	body.entity = handle(things, solid.thing).unwrap_or(EntityId::NONE);
 
@@ -1662,6 +1668,55 @@ mod tests {
 
 		assert_eq!(joint.first, body_id, "the rope holds the restored body");
 		assert_eq!(joint.second, BodyId::NONE, "and a point in the world, as it did");
+	}
+
+	#[test]
+	fn a_body_gravity_does_not_reach_is_still_out_of_its_reach_afterwards() {
+		// the field crosses this boundary three times - once on the way out and
+		// once in each loader - and the file's own round trip covers none of
+		// them: that one starts and ends at a `SceneData`.
+		let mut world = World::new();
+		let entity = world.entities.spawn();
+		let second = world.entities.spawn();
+		let floating = world.attach_body(entity, BodyKind::Dynamic, Shape::UNIT);
+		let falling = world.attach_body(second, BodyKind::Dynamic, Shape::UNIT);
+
+		if let Some(body) = world.bodies.get_mut(floating) {
+			body.weightless = true;
+		}
+
+		let scene = capture(&world);
+		assert!(scene.solids[0].weightless, "the description says which one floats");
+		assert!(!scene.solids[1].weightless, "and which one does not");
+
+		let mut put_back = World::new();
+		restore(&mut put_back, &scene).expect("no arena to disagree about");
+
+		assert!(
+			put_back
+				.bodies
+				.get(floating)
+				.is_some_and(|body| body.weightless),
+			"a restore hands the same body back still weightless"
+		);
+		assert!(
+			put_back
+				.bodies
+				.get(falling)
+				.is_some_and(|body| !body.weightless),
+			"and the other one still with its weight"
+		);
+
+		let mut beside = World::new();
+		let put = instantiate(&mut beside, &scene, Vec3::ZERO);
+
+		assert!(
+			beside
+				.bodies
+				.get(put.body(0))
+				.is_some_and(|body| body.weightless),
+			"and so does an instantiate, which shares none of the same handles"
+		);
 	}
 
 	#[test]

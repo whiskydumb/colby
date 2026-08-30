@@ -447,6 +447,22 @@ pub struct Body {
 	/// that says nothing behaves exactly as it did before layers existed.
 	pub layers: Layers,
 
+	/// Whether gravity reaches it.
+	///
+	/// A weightless body still has a mass and an inertia tensor and is still
+	/// pushed by everything that touches it: what it does not have is a weight.
+	/// Left where it is, it stays there; shoved, it drifts away and keeps
+	/// going. That is a different thing from [`BodyKind::Kinematic`], which is
+	/// a body the solver does not move at all, and a sandbox wants both.
+	///
+	/// Damping still applies, because damping is what the air does rather than
+	/// what the ground does.
+	///
+	/// Named for what is unusual, so that `false` is the ordinary body and a
+	/// zero anywhere - a defaulted struct, a cleared bit in a file written
+	/// before this existed - is a body that falls.
+	pub weightless: bool,
+
 	/// Whether the solver has stopped integrating this body.
 	///
 	/// Set by the solver when a dynamic body has been slow enough for long
@@ -488,6 +504,7 @@ impl Body {
 			restitution: Self::RESTITUTION,
 			friction: Self::FRICTION,
 			sensor: false,
+			weightless: false,
 			layers: Layers::DEFAULT,
 			sleeping: false,
 			entity: EntityId::NONE,

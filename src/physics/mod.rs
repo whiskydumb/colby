@@ -1012,6 +1012,89 @@ mod tests {
 	}
 
 	#[test]
+	fn a_weightless_body_does_not_fall_and_is_still_pushed() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+
+		let started = Vec3::new(0.0, 5.0, 0.0);
+		let falling = world
+			.bodies
+			.spawn(Body::dynamic(Shape::UNIT, Transform::at(started), 1.0));
+		let floating = world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(started + Vec3::X * 4.0),
+			1.0,
+		));
+
+		if let Some(body) = world.bodies.get_mut(floating) {
+			body.weightless = true;
+		}
+
+		settle(&mut world, &mut simulation, 120);
+
+		assert!(
+			placed(&world, falling).y < 1.0,
+			"the ordinary one is on the floor, at {}",
+			placed(&world, falling).y
+		);
+		assert!(
+			(placed(&world, floating).y - started.y).abs() < 0.05,
+			"and the weightless one is where it was let go, at {}",
+			placed(&world, floating).y
+		);
+
+		// still dynamic and not frozen: shoving it moves it, and it keeps
+		// going rather than settling back. That is the whole difference between
+		// this and a kinematic body.
+		if let Some(body) = world.bodies.get_mut(floating) {
+			body.velocity = Vec3::X * 2.0;
+			body.sleeping = false;
+		}
+		let before = placed(&world, floating);
+		settle(&mut world, &mut simulation, 60);
+
+		assert!(
+			placed(&world, floating).x > before.x + 1.0,
+			"a shove carries it, from {} to {}",
+			before.x,
+			placed(&world, floating).x
+		);
+		assert!(
+			(placed(&world, floating).y - started.y).abs() < 0.05,
+			"and it still does not sink, at {}",
+			placed(&world, floating).y
+		);
+	}
+
+	#[test]
+	fn a_weightless_body_still_loses_speed_to_the_air() {
+		// damping is what the air does and gravity is what the ground does, so
+		// turning one off does not turn the other off. Without this the field
+		// would quietly be two changes rather than one.
+		let (mut world, mut simulation) = wired();
+		let drifting = world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.0, 5.0, 0.0)),
+			1.0,
+		));
+
+		if let Some(body) = world.bodies.get_mut(drifting) {
+			body.weightless = true;
+			body.velocity = Vec3::X * 10.0;
+		}
+
+		settle(&mut world, &mut simulation, 300);
+
+		let speed = world
+			.bodies
+			.get(drifting)
+			.map_or(0.0, |body| body.velocity.length());
+
+		assert!(speed < 10.0, "it has slowed, to {speed}");
+		assert!(speed > 0.0, "but not stopped, at {speed}");
+	}
+
+	#[test]
 	fn a_rigid_weld_eases_a_gap_shut_rather_than_snapping_it() {
 		// what the Baumgarte factor is for, and the only test that pins it. A
 		// joint that took its whole error out in one step would fling anything

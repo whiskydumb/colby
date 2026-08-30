@@ -8,7 +8,7 @@
 		  "mesh": "cube",   "material": "plastic", "color": [0.75, 0.45, 0.35] },
 		{ "name": "ball hung",  "at": [5.20, 2.60, -5.40], "scale": [0.70, 0.70, 0.70],
 		  "mesh": "sphere", "material": "metal",   "color": [0.35, 0.85, 0.85] },
-		{ "name": "ball loose", "at": [5.00, 1.90, -7.60], "scale": [0.52, 0.52, 0.52],
+		{ "name": "ball loose", "at": [1.00, 1.90, -8.50], "scale": [0.52, 0.52, 0.52],
 		  "mesh": "sphere", "material": "metal",   "color": [0.35, 0.95, 0.85] }
 	],
 
@@ -27,7 +27,8 @@
 		  "mass": 1.0, "restitution": 0.22, "friction": 0.62, "layer": 1 },
 		{ "name": "ball loose", "entity": "ball loose", "kind": "dynamic",
 		  "shape": { "kind": "sphere", "radius": 0.5 },
-		  "mass": 1.0, "restitution": 0.22, "friction": 0.62, "layer": 1 }
+		  "mass": 1.0, "restitution": 0.22, "friction": 0.62, "layer": 1,
+		  "weightless": true }
 	],
 
 	"joints": [

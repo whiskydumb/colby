@@ -184,6 +184,7 @@ fn bodies(value: Option<&Value>, things: &[Thing]) -> Result<Vec<Solid>> {
 				"restitution",
 				"friction",
 				"sensor",
+				"weightless",
 				"layer",
 				"collides",
 			],
@@ -231,6 +232,7 @@ fn bodies(value: Option<&Value>, things: &[Thing]) -> Result<Vec<Solid>> {
 			restitution: number(entry.get("restitution"), 0.2),
 			friction: number(entry.get("friction"), 0.5),
 			sensor: flag(entry.get("sensor")),
+			weightless: flag(entry.get("weightless")),
 			sleeping: false,
 			layers: layers(entry)?,
 			thing,
@@ -693,6 +695,10 @@ fn solid_of(scene: &SceneData, solid: &Solid, name: &str, things: &[String]) -> 
 
 	if solid.sensor {
 		fields.push(("sensor", "true".to_owned()));
+	}
+
+	if solid.weightless {
+		fields.push(("weightless", "true".to_owned()));
 	}
 
 	put_layers(&mut fields, solid.layers);
@@ -1529,6 +1535,32 @@ mod tests {
 		let written = export(&first).expect("it can be written");
 		assert!(written.contains("\"layer\": 2"), "written as an index: {written}");
 		assert!(written.contains("\"collides\": [0, 2]"), "and a list of them");
+	}
+
+	#[test]
+	fn a_body_gravity_does_not_reach_says_so_and_says_it_back() {
+		// its own source rather than an extra record in the shared one, which
+		// three tests count the bodies of.
+		let source = r#"{
+			"bodies": [
+				{ "name": "balloon", "kind": "dynamic", "at": [2, 3, 0], "weightless": true },
+				{ "name": "brick", "kind": "dynamic", "at": [0, 3, 0] }
+			]
+		}"#;
+
+		let (first, again) = round(source);
+
+		assert!(first.solids[0].weightless, "the one that said so");
+		assert!(!first.solids[1].weightless, "and the one that did not");
+		assert_eq!(again.solids[0].weightless, first.solids[0].weightless, "and it survives");
+		assert_eq!(again.solids[1].weightless, first.solids[1].weightless, "both ways");
+
+		let written = export(&first).expect("it can be written");
+		assert_eq!(
+			written.matches("\"weightless\": true").count(),
+			1,
+			"written once, on the body it is true of, and left out of the other: {written}"
+		);
 	}
 
 	#[test]

@@ -271,6 +271,18 @@ pub const BULK_SENSOR: u32 = 1;
 /// The bit that says the solver had stopped integrating it.
 pub const BULK_SLEEPING: u32 = 2;
 
+/// The bit that says gravity does not reach it.
+///
+/// **This bit did not move [`FORMAT_VERSION`], and it is the one kind of field
+/// that does not have to.** The rule everywhere else is that a new field bumps
+/// the version, because a new field changes the size of a fixed record and
+/// therefore every offset after it. A bit in a word that already exists changes
+/// neither, and a file written before this bit had a meaning has it clear,
+/// which reads as the body that falls. So an asset compiled by the previous
+/// build is still correct and is not rebuilt, and a save taken by it still
+/// loads.
+pub const BULK_WEIGHTLESS: u32 = 4;
+
 /// One body: its shape, where it is, how it moves and what it is made of.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -297,7 +309,7 @@ pub struct Bulk {
 	/// Which entry of the entity block it drives, or [`u32::MAX`].
 	pub thing: u32,
 
-	/// [`BULK_SENSOR`] and [`BULK_SLEEPING`].
+	/// [`BULK_SENSOR`], [`BULK_SLEEPING`] and [`BULK_WEIGHTLESS`].
 	pub flags: u32,
 
 	/// The layers it is on.
@@ -578,6 +590,7 @@ impl SceneFile {
 			restitution: bulk.restitution,
 			friction: bulk.friction,
 			sensor: bulk.flags & BULK_SENSOR != 0,
+			weightless: bulk.flags & BULK_WEIGHTLESS != 0,
 			sleeping: bulk.flags & BULK_SLEEPING != 0,
 			layers: Layers::new(bulk.layer, bulk.mask),
 			thing: bulk.thing,
@@ -778,6 +791,9 @@ fn bulk_of(solid: &Solid, names: &mut Names) -> Bulk {
 	}
 	if solid.sleeping {
 		flags |= BULK_SLEEPING;
+	}
+	if solid.weightless {
+		flags |= BULK_WEIGHTLESS;
 	}
 
 	Bulk {
@@ -1148,6 +1164,7 @@ mod tests {
 				restitution: 0.3,
 				friction: 0.6,
 				sensor: true,
+				weightless: false,
 				sleeping: false,
 				layers: Layers::new(4, 12),
 				thing: 1,
@@ -1169,7 +1186,10 @@ mod tests {
 				mass: 1.0,
 				restitution: 0.2,
 				friction: 0.5,
+				// the two flags set on different records, so a round trip that
+				// dropped either would show it
 				sensor: false,
+				weightless: true,
 				sleeping: true,
 				layers: Layers::DEFAULT,
 				thing: scene::NO_INDEX,
