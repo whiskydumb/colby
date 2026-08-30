@@ -21,8 +21,8 @@ use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, Joint,
 		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Renderable,
-		SceneData, SceneId, Shape, Solid, TouchKind, TraceInfo, Transform, World, character,
-		debug, scene,
+		SceneData, SceneId, Shape, ShapeKind, Solid, TouchKind, TraceInfo, Transform, World,
+		character, debug, scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -337,6 +337,17 @@ const MUZZLE_AT: (f32, f32) = (0.3, 0.45);
 /// How big the cross marking where the beam is attached is.
 const MUZZLE_MARK: f32 = 0.09;
 
+/// What a frozen prop is outlined in.
+///
+/// Drawn rather than tinted, and the reason is bookkeeping. A tint would have
+/// to remember what the prop was colored before it was frozen, and where that
+/// color comes from differs by how the prop arrived: the scene's five carry
+/// their own, the menu's come from [`prop_color`], and a duplicate carries
+/// whatever it was copied from. An outline needs none of that, restores itself
+/// by not being drawn, and works for a prop that arrived by a route nobody has
+/// written yet.
+const FROZEN_COLOR: Vec3 = Vec3::new(0.55, 0.85, 1.0);
+
 /// The game's own state, kept in the host's arena.
 ///
 /// Add a field, bump [`STATE_LAYOUT`], save: the arena zeroes itself and the
@@ -562,6 +573,19 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	world
 		.cvars
 		.command("game.release", drop_held, "let go of whatever is held");
+	world.cvars.command(
+		"game.freeze",
+		hold_still,
+		"stop a prop where it stands, by name or under the crosshair",
+	);
+	world.cvars.command(
+		"game.unfreeze",
+		let_go,
+		"let one go again, by name or under the crosshair",
+	);
+	world
+		.cvars
+		.command("game.thaw", thaw_all, "let every frozen prop go at once");
 
 	// on every load, not only a fresh one: the mesh a name resolves to is the
 	// host's business, and an asset that appeared since the last swap should be
@@ -655,6 +679,8 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	swallow(world);
 	pick(world);
 	physgun(world, yaw);
+	freezer(world);
+	outline_frozen(world);
 	duplicate(world, yaw);
 	light_up(world);
 	label_pick(world);
@@ -1202,6 +1228,17 @@ fn grab(world: &mut World, yaw: f32, named: &str) {
 		return;
 	};
 
+	// taking hold of a frozen prop lets it go first, which is what the field
+	// does and is the only thing that could be meant: the alternative is a gun
+	// that silently refuses half the props in the yard.
+	if frozen(solid) {
+		unfreeze(world, body);
+	}
+
+	let Some(solid) = world.bodies.get(body) else {
+		return;
+	};
+
 	// only something the solver owns, and only something on the prop layer.
 	// The map is neither, which is what stops the gun picking up the hangar.
 	if !solid.movable() || !on_layer(solid, PROP_LAYERS) {
@@ -1337,6 +1374,177 @@ fn carry(world: &mut World, yaw: f32) {
 	world.debug.point(grip, MUZZLE_MARK, debug::CYAN);
 }
 
+/// Whether a prop has been frozen.
+///
+/// **Frozen is a body kind and not a flag.** There is no field anywhere saying
+/// so: a frozen prop is a [`BodyKind::Kinematic`] one, which in this engine
+/// means gameplay owns its transform and the solver leaves it alone. Nothing
+/// writes a frozen prop's transform, so it stays exactly where it was, and
+/// everything else piles on it as though it were the map. That is what freezing
+/// *is*, and it is the first consumer `Kinematic` has ever had that is not the
+/// player.
+///
+/// The layer is part of the question because the player's own box is kinematic
+/// too, and it is not frozen.
+///
+/// @param body - the body to ask about
+fn frozen(body: &Body) -> bool {
+	matches!(body.kind, BodyKind::Kinematic) && on_layer(body, PROP_LAYERS)
+}
+
+/// Freezes and unfreezes, on one key.
+///
+/// Holding something and pressing it freezes that and lets go, which is the one
+/// gesture worth having: you carry a prop into place and nail it there without
+/// a second thought about which button. With nothing held it toggles whatever
+/// the crosshair is on.
+///
+/// @param world - the bodies to change
+fn freezer(world: &mut World) {
+	if !world.input.pressed(Key::R) {
+		return;
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (held, picked) = (state.held, state.picked_body);
+
+	if state.hold.is_some() {
+		freeze(world, held);
+
+		return;
+	}
+
+	if world.bodies.get(picked).is_some_and(frozen) {
+		unfreeze(world, picked);
+	} else {
+		freeze(world, picked);
+	}
+}
+
+/// Stops a prop where it stands.
+///
+/// The speed goes with the motion: a body that came back to life carrying the
+/// velocity it had when it was frozen would leap the moment it was thawed, and
+/// the whole point of freezing something is that you have decided where it
+/// belongs.
+///
+/// @param world - the body table
+/// @param body - what to freeze
+/// @return whether anything was frozen
+fn freeze(world: &mut World, body: BodyId) -> bool {
+	let Some(solid) = world.bodies.get(body) else {
+		return false;
+	};
+
+	if !solid.movable() || !on_layer(solid, PROP_LAYERS) {
+		return false;
+	}
+
+	// letting go is part of freezing rather than something the key does before
+	// it, so that the console and the key mean the same thing. A gun still
+	// holding a kinematic body is a gun pulling on a wall: the joint spends its
+	// whole ceiling every step and nothing moves.
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	if state.held == body {
+		release(world);
+	}
+
+	let Some(solid) = world.bodies.get_mut(body) else {
+		return false;
+	};
+
+	solid.kind = BodyKind::Kinematic;
+	solid.velocity = Vec3::ZERO;
+	solid.angular = Vec3::ZERO;
+	solid.sleeping = false;
+
+	trace!(body = body.slot(), "frozen");
+
+	true
+}
+
+/// Lets one go again.
+///
+/// Awake rather than asleep, because a prop that has just been handed back to
+/// the solver has not been still for any length of time - it has been *held*
+/// still, which is a different thing and is exactly the case the sleeping rule
+/// is not allowed to confuse.
+///
+/// @param world - the body table
+/// @param body - what to release
+/// @return whether anything was thawed
+fn unfreeze(world: &mut World, body: BodyId) -> bool {
+	let Some(solid) = world.bodies.get_mut(body) else {
+		return false;
+	};
+
+	if !frozen(solid) {
+		return false;
+	}
+
+	solid.kind = BodyKind::Dynamic;
+	solid.sleeping = false;
+
+	trace!(body = body.slot(), "thawed");
+
+	true
+}
+
+/// Lets every frozen prop go at once.
+///
+/// The same walk the map and the sweep do, one question along: what is frozen
+/// is a body on the prop layer of a certain kind, so the set of them is found
+/// rather than remembered.
+///
+/// @param world - the bodies to walk
+/// @return how many were let go
+fn thaw(world: &mut World) -> usize {
+	let stuck: Vec<BodyId> = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| frozen(body))
+		.map(|(id, _)| id)
+		.collect();
+
+	for body in &stuck {
+		unfreeze(world, *body);
+	}
+
+	stuck.len()
+}
+
+/// Outlines every frozen prop.
+///
+/// A prop is a box or a ball and never a mesh, because a mesh body is never
+/// dynamic and so could never have been frozen. Two arms and no third.
+///
+/// @param world - the bodies to walk and the table the segments go in
+fn outline_frozen(world: &mut World) {
+	let stuck: Vec<(Shape, Transform)> = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| frozen(body))
+		.map(|(_, body)| (body.shape, body.transform))
+		.collect();
+
+	for (shape, placed) in stuck {
+		match shape.kind {
+			| ShapeKind::Box => world.debug.cuboid(
+				placed.position,
+				shape.extents.abs() * placed.scale.abs(),
+				placed.rotation,
+				FROZEN_COLOR,
+			),
+			| ShapeKind::Sphere => world.debug.ball(
+				placed.position,
+				shape.radius.abs() * placed.scale.abs().max_element(),
+				FROZEN_COLOR,
+			),
+			| ShapeKind::Mesh => {},
+		}
+	}
+}
+
 /// Brightens whatever the pick ray found and puts everything else back.
 ///
 /// Written every step rather than toggled, for the reason the interface's text
@@ -1425,6 +1633,11 @@ fn interface(world: &mut World) {
 		.iter()
 		.filter(|(_, body)| on_layer(body, PROP_LAYERS))
 		.count();
+	let stuck = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| frozen(body))
+		.count();
 	let swallowed = state.swallowed;
 
 	world
@@ -1442,7 +1655,7 @@ fn interface(world: &mut World) {
 		.set_text(hud, "joints", &format!("{joints} held, {landings} landings"));
 	world
 		.ui
-		.set_text(hud, "props", &format!("{loose} loose, {swallowed} lost"));
+		.set_text(hud, "props", &format!("{loose} loose, {stuck} frozen, {swallowed} lost"));
 	world.ui.set_text(hud, "player", footing);
 }
 
@@ -1520,6 +1733,70 @@ unsafe extern "C-unwind" fn drop_held(world: *mut World, _args: *const Args) {
 	let world = unsafe { &mut *world };
 
 	release(world);
+}
+
+/// The body a console command is about: the one named, or the one aimed at.
+///
+/// @param world - the bodies to search
+/// @param named - a name, or empty for the crosshair
+fn asked_for(world: &mut World, named: &str) -> BodyId {
+	if named.is_empty() {
+		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+		return state.picked_body;
+	}
+
+	world
+		.bodies
+		.iter()
+		.find(|(id, _)| world.bodies.name(*id) == named)
+		.map_or(BodyId::NONE, |(id, _)| id)
+}
+
+/// `game.freeze` - the console's way of pressing the key.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn hold_still(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let named = unsafe { &*args }.rest();
+	let body = asked_for(world, &named);
+
+	if !freeze(world, body) {
+		warn!(name = named, "nothing there to freeze");
+	}
+}
+
+/// `game.unfreeze` - and of pressing it again.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn let_go(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let named = unsafe { &*args }.rest();
+	let body = asked_for(world, &named);
+
+	if !unfreeze(world, body) {
+		warn!(name = named, "nothing there to thaw");
+	}
+}
+
+/// `game.thaw` - every one of them at once.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn thaw_all(world: *mut World, _args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+
+	info!(gone = thaw(world), "everything is moving again");
 }
 
 /// `game.cleanup` - what the interface's own second button asks for.
