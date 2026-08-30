@@ -46,8 +46,8 @@ pub mod ui;
 
 pub use self::{
 	anim::{
-		Channel, Clip, ClipData, ClipId, Clips, Interpolation, MAX_KEYS, MAX_TRACKS, NO_BONE,
-		Track,
+		Channel, Clip, ClipData, ClipId, Clips, Interpolation, MAX_KEYS, MAX_NODES, MAX_TRACKS,
+		NO_BONE, Node, Track, Tree,
 	},
 	camera::Camera,
 	character::{Motion, Moved},
@@ -82,7 +82,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 32;
+pub const ABI_VERSION: u32 = 33;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -362,6 +362,15 @@ pub struct World {
 
 	/// How far the frame being drawn sits past the last simulated state.
 	interpolation: f32,
+
+	/// One pose per node, while a blend tree is being worked out.
+	///
+	/// Private and kept between calls for the reason every other scratch in
+	/// this engine is: a game animating a crowd should allocate once rather
+	/// than once a character a step. Nothing outside
+	/// [`animate`](Self::animate) ever looks at it, and what it holds between
+	/// two calls means nothing.
+	blending: Vec<Transform>,
 }
 
 impl World {
@@ -401,6 +410,7 @@ impl World {
 			debug: Debug::new(),
 			state: GameState::new(),
 			physics: Physics::STUB,
+			blending: Vec::new(),
 			camera_previous: Camera::DEFAULT,
 			camera_snap: false,
 			// one, so that a world nobody paces - a test, a screenshot - draws
@@ -543,6 +553,48 @@ impl World {
 			.sample(time, looping, clips.bones(clip, skeleton), &mut posed.locals);
 
 		true
+	}
+
+	/// Works a blend tree out into a pose.
+	///
+	/// What [`play`](Self::play) is for one clip, for as many as a game cares
+	/// to mix: it binds every clip the tree names to the pose's skeleton, then
+	/// works the tree out in one forward pass. The scratch it needs lives here
+	/// rather than being asked for, because a game's own memory is plain bytes
+	/// and cannot hold one.
+	///
+	/// Every leaf starts from the skeleton at rest, exactly as `play` does, so
+	/// every pose inside the tree is a whole one and blending two of them
+	/// means what it looks like it means.
+	///
+	/// @param pose - the pose to write
+	/// @param tree - the blend to work out
+	/// @return `false` if the pose handle is stale or the tree could not be
+	/// worked out; in the second case the pose is left at rest
+	pub fn animate(&mut self, pose: PoseId, tree: &Tree) -> bool {
+		let Some(skeleton) = self.poses.get(pose).map(|posed| posed.skeleton) else {
+			return false;
+		};
+
+		for node in &tree.nodes {
+			if let Node::Clip { clip, .. } = *node {
+				self.clips.bind(clip, skeleton, &self.skeletons);
+			}
+		}
+
+		let Self { poses, clips, skeletons, blending, .. } = self;
+		let Some(posed) = poses.get_mut(pose) else {
+			return false;
+		};
+
+		anim::evaluate(
+			tree,
+			clips,
+			skeleton,
+			skeletons.bones(skeleton),
+			blending,
+			&mut posed.locals,
+		)
 	}
 
 	/// Hands the world the queries a solver can answer.

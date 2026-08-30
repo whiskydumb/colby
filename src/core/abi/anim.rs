@@ -36,7 +36,7 @@
 use super::{
 	entity::Transform,
 	registry::{Entry, Registry},
-	skeleton::{SkeletonData, SkeletonId, Skeletons},
+	skeleton::{Bone, NO_PARENT, SkeletonData, SkeletonId, Skeletons},
 };
 use crate::{
 	glam::{Quat, Vec3},
@@ -635,13 +635,305 @@ fn revision_of(skeletons: &Skeletons, skeleton: SkeletonId) -> u32 {
 	skeletons.get(skeleton).map_or(0, Entry::revision)
 }
 
+/// The most nodes one blend tree may have.
+///
+/// A tree is built by the game every step out of a handful of nodes - a couple
+/// of clips, a blend between them, a layer over the top. This is a bound on a
+/// runaway rather than a budget, and it is what keeps the scratch a blend
+/// works in from being asked to hold an arbitrary number of poses.
+pub const MAX_NODES: usize = 64;
+
+/// One step of a blend.
+///
+/// Plain data, and small enough to copy: a game builds a `Vec` of these every
+/// step out of numbers it worked out that step, rather than editing a graph
+/// somebody authored. That is the one place this engine departs from what the
+/// field does, and it is a departure in the tooling rather than in the shape -
+/// every engine checked carries its graph as data too, and two of the five
+/// build one from code as readily as from an editor. Revisit when there is a
+/// graph view to author one in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Node {
+	/// One clip, at a moment on the game's own clock.
+	///
+	/// The leaf, and the only node that reads nothing: what comes out is the
+	/// skeleton at rest with the clip written over it, which is what makes
+	/// every pose in the tree a whole one.
+	Clip {
+		/// What to play.
+		clip: ClipId,
+
+		/// Seconds on whatever clock the game keeps for it.
+		time: f32,
+
+		/// Whether it starts again rather than holding its last key.
+		looping: bool,
+	},
+
+	/// Two poses mixed evenly over every bone.
+	///
+	/// The two-input blend every engine has under some name. A weight of zero
+	/// is the first input untouched and a weight of one is the second; a blend
+	/// space over several clips is a chain of these, which is what a blend
+	/// space *is* once the neighbors have been picked.
+	Blend {
+		/// Where the pose at weight zero comes from.
+		first: u16,
+
+		/// Where the pose at weight one comes from.
+		second: u16,
+
+		/// How far between them, `0.0 ..= 1.0`.
+		weight: f32,
+	},
+
+	/// Two poses mixed over one branch of the skeleton and not the rest.
+	///
+	/// An upper body doing one thing while the legs do another: the bone named
+	/// by `branch` and everything hanging off it are blended towards the second
+	/// input, and every other bone is the first input untouched. One bone
+	/// rather than a set of them because a branch is what a body part *is*, and
+	/// because two of these chained cover the case a single set would.
+	Mask {
+		/// Where the pose outside the branch comes from, whole.
+		first: u16,
+
+		/// Where the pose inside the branch is blended towards.
+		second: u16,
+
+		/// The bone the branch starts at, and which is itself inside it. A
+		/// bone this skeleton does not have leaves the whole pose as `first`.
+		branch: u16,
+
+		/// How far towards the second input inside the branch, `0.0 ..= 1.0`.
+		weight: f32,
+	},
+}
+
+/// A blend, as a list of steps with the answer at one of them.
+///
+/// **A child is always written before the node that reads it**, which is the
+/// same rule a skeleton's bones follow and buys the same three things: the
+/// whole tree evaluates in one forward pass with no recursion, a cycle cannot
+/// be built, and an index that passes the check is an index that exists. @ref
+/// [`Self::is_ordered`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tree {
+	/// Every step, children before the nodes that read them.
+	pub nodes: Vec<Node>,
+
+	/// Which of them is the answer.
+	pub root: u16,
+}
+
+impl Tree {
+	/// A tree with nothing in it.
+	#[must_use]
+	pub const fn new() -> Self { Self { nodes: Vec::new(), root: 0 } }
+
+	/// Adds a step, and makes it the answer.
+	///
+	/// Building bottom up is the only order the ordering rule allows, so the
+	/// node added last is the root of every tree that is built at all. Setting
+	/// it here means a game never has to say so, and one that wants something
+	/// else writes [`root`](Self::root) itself afterwards.
+	///
+	/// @param node - the step to add
+	/// @return where it landed, which is what a later node names it by
+	pub fn push(&mut self, node: Node) -> u16 {
+		let at = u16::try_from(self.nodes.len()).unwrap_or(u16::MAX);
+
+		self.nodes.push(node);
+		self.root = at;
+
+		at
+	}
+
+	/// How many steps it has.
+	#[must_use]
+	pub fn len(&self) -> usize { self.nodes.len() }
+
+	/// Whether it has none, which cannot be evaluated.
+	#[must_use]
+	pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
+
+	/// Whether every node's inputs come before it, and the root is one of them.
+	///
+	/// The invariant evaluation stands on. It also proves every input is a real
+	/// index, which is the same statement: an input below a node's own index is
+	/// below the length as well.
+	#[must_use]
+	pub fn is_ordered(&self) -> bool {
+		// a tree with no nodes is refused by this too, because every index is
+		// past the end of nothing.
+		if usize::from(self.root) >= self.nodes.len() {
+			return false;
+		}
+
+		self.nodes
+			.iter()
+			.enumerate()
+			.all(|(at, node)| match *node {
+				| Node::Clip { .. } => true,
+				| Node::Blend { first, second, .. } | Node::Mask { first, second, .. } =>
+					usize::from(first) < at && usize::from(second) < at,
+			})
+	}
+}
+
+/// Whether one bone is the branch's own bone or hangs off it.
+///
+/// A walk up the parents rather than a pass down the children, because a bone
+/// knows its parent and nothing knows its children. The walk is bounded by the
+/// number of bones, so a skeleton whose parents contradict themselves stops
+/// rather than climbing forever - though one that does is refused where it is
+/// read. The cost is the depth of the skeleton per bone, which for a biped is
+/// about eight.
+///
+/// @note: the check for [`NO_PARENT`] is deliberately redundant with the bounds
+/// check below it, because the sentinel is past any index a skeleton can hold
+/// and asking for it would miss anyway. It is kept because it is the only line
+/// that says a walk stops at a root, and because that being safe otherwise
+/// depends on the sentinel's value rather than on anything written down.
+fn inside(bones: &[Bone], bone: usize, branch: u16) -> bool {
+	let mut at = bone;
+
+	for _ in 0..bones.len() {
+		if u16::try_from(at).is_ok_and(|index| index == branch) {
+			return true;
+		}
+
+		let Some(parent) = bones.get(at).map(|bone| bone.parent) else {
+			return false;
+		};
+
+		if parent == NO_PARENT {
+			return false;
+		}
+
+		at = usize::from(parent);
+	}
+
+	false
+}
+
+/// One bone of a masked blend.
+///
+/// Its own function because the alternative is a conditional three levels deep
+/// inside a loop inside a match arm, which reads as nesting rather than as the
+/// one sentence it is: inside the branch a bone moves towards the layer, and
+/// outside it the bone is left alone.
+fn masked(outside: Transform, within: Transform, weight: f32, within_branch: bool) -> Transform {
+	if within_branch {
+		outside.lerp(within, weight)
+	} else {
+		outside
+	}
+}
+
+/// One already-written pose out of the scratch.
+fn run(done: &[Transform], index: u16, width: usize) -> &[Transform] {
+	let at = usize::from(index).saturating_mul(width);
+
+	done.get(at..at.saturating_add(width))
+		.unwrap_or_default()
+}
+
+/// Works a blend tree out into one pose.
+///
+/// A single forward pass: each node writes its own run of the scratch out of
+/// runs that are already written, because a child always comes first. Nothing
+/// recurses, nothing is visited twice, and a tree that could loop cannot be
+/// built - @ref [`Tree::is_ordered`], which is checked before anything is
+/// written.
+///
+/// The scratch is one pose per node and belongs to the caller, so a game
+/// animating ten characters allocates nothing after the first of them.
+///
+/// @param tree - what to work out
+/// @param clips - the registry the leaves name, with its bindings
+/// @param skeleton - which skeleton the leaves are bound against
+/// @param bones - that skeleton's bones, parents first
+/// @param scratch - a buffer the caller keeps between calls, resized as needed
+/// @param out - the root's pose, one local transform per bone
+/// @return `false` if the tree could not be worked out, in which case `out` is
+/// the skeleton at rest rather than anything half written
+pub fn evaluate(
+	tree: &Tree,
+	clips: &Clips,
+	skeleton: SkeletonId,
+	bones: &[Bone],
+	scratch: &mut Vec<Transform>,
+	out: &mut Vec<Transform>,
+) -> bool {
+	out.clear();
+	out.extend(bones.iter().map(|bone| bone.rest));
+
+	if tree.len() > MAX_NODES || !tree.is_ordered() || bones.is_empty() {
+		return false;
+	}
+
+	let width = bones.len();
+
+	// @note: the clear cannot be observed, because every node writes the whole
+	// of its own run before anything reads it. It is kept so that what a node
+	// would inherit if one ever did not is a transform that means nothing
+	// rather than a pose left over from another tree.
+	scratch.clear();
+	scratch.resize(tree.len().saturating_mul(width), Transform::IDENTITY);
+
+	for (at, node) in tree.nodes.iter().enumerate() {
+		let (done, rest) = scratch.split_at_mut(at.saturating_mul(width));
+		let Some(here) = rest.get_mut(..width) else {
+			return false;
+		};
+
+		match *node {
+			| Node::Clip { clip, time, looping } => {
+				for (slot, bone) in here.iter_mut().zip(bones) {
+					*slot = bone.rest;
+				}
+
+				clips
+					.data(clip)
+					.sample(time, looping, clips.bones(clip, skeleton), here);
+			},
+			| Node::Blend { first, second, weight } => {
+				let (one, two) = (run(done, first, width), run(done, second, width));
+
+				for ((slot, earlier), later) in here.iter_mut().zip(one).zip(two) {
+					*slot = earlier.lerp(*later, weight);
+				}
+			},
+			| Node::Mask { first, second, branch, weight } => {
+				let (one, two) = (run(done, first, width), run(done, second, width));
+
+				for (index, ((slot, outside), within)) in
+					here.iter_mut().zip(one).zip(two).enumerate()
+				{
+					*slot = masked(*outside, *within, weight, inside(bones, index, branch));
+				}
+			},
+		}
+	}
+
+	let answer = usize::from(tree.root).saturating_mul(width);
+	let Some(pose) = scratch.get(answer..answer.saturating_add(width)) else {
+		return false;
+	};
+
+	out.clear();
+	out.extend_from_slice(pose);
+
+	true
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{
 		super::{
 			World,
 			pose::{Pose, PoseId},
-			skeleton::{Bone, NO_PARENT},
 		},
 		*,
 	};
@@ -727,6 +1019,461 @@ mod tests {
 			.spawn(Pose::resting(rig, world.skeletons.bones(rig)));
 
 		(world, pose, played)
+	}
+
+	/// A clip that puts the elbow four along `y` and leaves it there.
+	fn held(along: f32) -> ClipData {
+		ClipData {
+			tracks: vec![Track {
+				bone: "elbow".to_owned(),
+				channel: Channel::Position,
+				interpolation: Interpolation::Linear,
+				times: vec![0.0],
+				values: vec![0.0, along, 0.0],
+			}],
+		}
+	}
+
+	/// A clip that turns the wrist a right angle and leaves it there.
+	fn twisted() -> ClipData {
+		let turned = quarter();
+
+		ClipData {
+			tracks: vec![Track {
+				bone: "wrist".to_owned(),
+				channel: Channel::Rotation,
+				interpolation: Interpolation::Linear,
+				times: vec![0.0],
+				values: turned.to_vec(),
+			}],
+		}
+	}
+
+	/// A registry of two clips over one skeleton, both already bound.
+	fn stage(one: ClipData, two: ClipData) -> (Clips, Skeletons, SkeletonId, ClipId, ClipId) {
+		let mut clips = Clips::new();
+		let mut skeletons = Skeletons::new();
+		let rig = skeletons.insert("rig", arm());
+		let first = clips.insert("one", one);
+		let second = clips.insert("two", two);
+
+		clips.bind(first, rig, &skeletons);
+		clips.bind(second, rig, &skeletons);
+
+		(clips, skeletons, rig, first, second)
+	}
+
+	/// Works a tree out over the three-bone arm.
+	fn worked(
+		tree: &Tree,
+		clips: &Clips,
+		skeletons: &Skeletons,
+		rig: SkeletonId,
+	) -> Vec<Transform> {
+		let mut scratch = Vec::new();
+		let mut out = Vec::new();
+
+		evaluate(tree, clips, rig, skeletons.bones(rig), &mut scratch, &mut out);
+
+		out
+	}
+
+	#[test]
+	fn a_tree_of_one_clip_is_the_clip() {
+		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
+		let mut tree = Tree::new();
+
+		tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+
+		let out = worked(&tree, &clips, &skeletons, rig);
+
+		assert_eq!(out.len(), 3, "one transform per bone");
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1.0e-6),
+			"the elbow where the clip put it"
+		);
+		assert!(
+			out[0].position.abs_diff_eq(Vec3::ZERO, 1.0e-6),
+			"and the shoulder at the rest the leaf started from"
+		);
+	}
+
+	#[test]
+	fn a_blend_is_the_first_at_nothing_the_second_at_one_and_between_them_between() {
+		let (clips, skeletons, rig, first, second) = stage(held(4.0), held(8.0));
+
+		for (weight, want) in [(0.0, 4.0), (0.25, 5.0), (0.5, 6.0), (1.0, 8.0)] {
+			let mut tree = Tree::new();
+			let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+			let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+
+			tree.push(Node::Blend { first: one, second: two, weight });
+
+			let out = worked(&tree, &clips, &skeletons, rig);
+
+			assert!(
+				out[1]
+					.position
+					.abs_diff_eq(Vec3::new(0.0, want, 0.0), 1.0e-6),
+				"at {weight} the elbow should be {want} along, and it is {:?}",
+				out[1].position
+			);
+		}
+	}
+
+	#[test]
+	fn a_blend_of_a_clip_with_itself_is_the_clip_at_every_weight() {
+		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
+		let mut tree = Tree::new();
+		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+
+		tree.push(Node::Blend { first: one, second: one, weight: 0.5 });
+
+		let out = worked(&tree, &clips, &skeletons, rig);
+
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1.0e-6),
+			"both sides are the same run of the scratch, read twice rather than taken once"
+		);
+	}
+
+	#[test]
+	fn a_bone_only_one_side_moves_blends_against_that_side_s_rest() {
+		// what makes a leaf start from the rest worth the cost: the second
+		// clip says nothing about the elbow, so the blend is between where the
+		// first clip put it and where the skeleton has it, rather than between
+		// it and wherever it happened to be last step.
+		let (clips, skeletons, rig, first, second) = stage(held(4.0), twisted());
+		let mut tree = Tree::new();
+		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+
+		tree.push(Node::Blend { first: one, second: two, weight: 0.5 });
+
+		let out = worked(&tree, &clips, &skeletons, rig);
+
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.5, 2.0, 0.0), 1.0e-6),
+			"halfway between four along y and the elbow's own rest one along x, which is {:?}",
+			out[1].position
+		);
+		assert!(
+			out[2]
+				.rotation
+				.abs_diff_eq(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4), 1.0e-6),
+			"and the wrist half of the way to the right angle the other clip turns it"
+		);
+	}
+
+	#[test]
+	fn a_mask_moves_the_branch_and_leaves_the_rest_of_the_skeleton_alone() {
+		let (clips, skeletons, rig, first, second) = stage(held(4.0), twisted());
+		let mut tree = Tree::new();
+		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+
+		// the branch starts at the elbow, so the elbow and the wrist are in it
+		// and the shoulder is not.
+		tree.push(Node::Mask {
+			first: one,
+			second: two,
+			branch: 1,
+			weight: 1.0,
+		});
+
+		let out = worked(&tree, &clips, &skeletons, rig);
+
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(1.0, 0.0, 0.0), 1.0e-6),
+			"the elbow is inside the branch, so it comes from the layer - which says nothing \
+			 about it and therefore rests it"
+		);
+		assert!(
+			out[2]
+				.rotation
+				.abs_diff_eq(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2), 1.0e-6),
+			"the wrist hangs off the elbow, so it is inside too and the layer turns it"
+		);
+		assert!(
+			out[0].position.abs_diff_eq(Vec3::ZERO, 1.0e-6),
+			"and the shoulder is outside and keeps the first input"
+		);
+	}
+
+	#[test]
+	fn a_mask_at_half_weight_takes_the_branch_half_the_way() {
+		let (clips, skeletons, rig, first, second) = stage(held(4.0), twisted());
+		let mut tree = Tree::new();
+		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+
+		tree.push(Node::Mask {
+			first: one,
+			second: two,
+			branch: 2,
+			weight: 0.5,
+		});
+
+		let out = worked(&tree, &clips, &skeletons, rig);
+
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1.0e-6),
+			"the elbow is above the branch, so it is the first input whole"
+		);
+		assert!(
+			out[2]
+				.rotation
+				.abs_diff_eq(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4), 1.0e-6),
+			"and the wrist, which is the branch, is half of the way over"
+		);
+	}
+
+	#[test]
+	fn a_mask_over_a_bone_the_rig_has_not_leaves_every_bone_as_the_first_input() {
+		let (clips, skeletons, rig, first, second) = stage(held(4.0), twisted());
+		let mut tree = Tree::new();
+		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+
+		tree.push(Node::Mask {
+			first: one,
+			second: two,
+			branch: 40,
+			weight: 1.0,
+		});
+
+		let out = worked(&tree, &clips, &skeletons, rig);
+
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1.0e-6),
+			"nothing is inside a branch that is not there"
+		);
+		assert!(
+			out[2]
+				.rotation
+				.abs_diff_eq(Quat::IDENTITY, 1.0e-6),
+			"including the wrist"
+		);
+	}
+
+	#[test]
+	fn a_tree_whose_inputs_do_not_come_first_is_refused_rather_than_read() {
+		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
+		let backwards = Tree {
+			nodes: vec![Node::Blend { first: 1, second: 1, weight: 0.5 }, Node::Clip {
+				clip: first,
+				time: 0.0,
+				looping: false,
+			}],
+			root: 0,
+		};
+
+		assert!(!backwards.is_ordered(), "the blend reads a node written after it");
+
+		let mut scratch = Vec::new();
+		let mut out = Vec::new();
+
+		assert!(
+			!evaluate(&backwards, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out),
+			"and evaluating it says so"
+		);
+		assert_eq!(out.len(), 3, "with the pose left at rest rather than half written");
+		assert!(out[1].position.abs_diff_eq(Vec3::X, 1.0e-6), "which is where the rest is");
+	}
+
+	#[test]
+	fn a_node_that_reads_itself_is_refused_on_either_side() {
+		// the cycle the ordering rule exists to make unbuildable, and it is
+		// worth having both sides of it: a node reading itself through its
+		// second input is a loop exactly as much as one reading itself through
+		// its first.
+		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
+		let leaf = Node::Clip { clip: first, time: 0.0, looping: false };
+
+		for (one, two) in [(1_u16, 0_u16), (0, 1)] {
+			let looping = Tree {
+				nodes: vec![leaf, Node::Blend { first: one, second: two, weight: 0.5 }],
+				root: 1,
+			};
+
+			assert!(
+				!looping.is_ordered(),
+				"a blend at one reading node one is reading itself, whichever input it is"
+			);
+
+			let mut scratch = Vec::new();
+			let mut out = Vec::new();
+
+			assert!(
+				!evaluate(&looping, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out),
+				"and working it out says so rather than reading a pose nobody wrote"
+			);
+		}
+	}
+
+	#[test]
+	fn the_answer_is_the_node_the_root_names_rather_than_the_last_one() {
+		// pushing makes the last node the answer, which is the convention and
+		// not the rule. A game that writes the field gets what it wrote.
+		let (clips, skeletons, rig, first, second) = stage(held(4.0), held(8.0));
+		let mut tree = Tree::new();
+		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+
+		tree.push(Node::Blend { first: one, second: two, weight: 1.0 });
+		tree.root = one;
+
+		let out = worked(&tree, &clips, &skeletons, rig);
+
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1.0e-6),
+			"the first clip, which is what the root names, rather than the blend at the end"
+		);
+	}
+
+	#[test]
+	fn an_empty_tree_and_a_root_that_is_not_a_node_are_both_refused() {
+		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
+
+		assert!(!Tree::new().is_ordered(), "nothing to work out");
+
+		let stray = Tree {
+			nodes: vec![Node::Clip { clip: first, time: 0.0, looping: false }],
+			root: 7,
+		};
+
+		assert!(!stray.is_ordered(), "and an answer at a node that is not there");
+
+		let mut scratch = Vec::new();
+		let mut out = Vec::new();
+
+		assert!(!evaluate(&stray, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out));
+	}
+
+	#[test]
+	fn more_nodes_than_a_tree_may_hold_are_refused() {
+		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
+		let leaf = Node::Clip { clip: first, time: 0.0, looping: false };
+		let mut tree = Tree::new();
+
+		for _ in 0..=MAX_NODES {
+			tree.push(leaf);
+		}
+
+		assert!(tree.is_ordered(), "every one of them reads nothing, so the order is fine");
+
+		let mut scratch = Vec::new();
+		let mut out = Vec::new();
+
+		assert!(
+			!evaluate(&tree, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out),
+			"and it is the count that refuses it"
+		);
+	}
+
+	#[test]
+	fn pushing_a_node_makes_it_the_answer() {
+		let leaf = Node::Clip {
+			clip: ClipId::NONE,
+			time: 0.0,
+			looping: false,
+		};
+		let mut tree = Tree::new();
+
+		assert_eq!(tree.push(leaf), 0, "the first lands at nothing");
+		assert_eq!(tree.root, 0, "and is the answer");
+		assert_eq!(tree.push(leaf), 1);
+		assert_eq!(tree.root, 1, "and so is whatever was added last");
+		assert_eq!(tree.len(), 2);
+		assert!(!tree.is_empty());
+	}
+
+	#[test]
+	fn a_scratch_is_reused_between_two_trees_of_different_sizes() {
+		// the buffer belongs to the caller so that a crowd allocates once, and
+		// what it held last time has to be nothing to a later call.
+		let (clips, skeletons, rig, first, second) = stage(held(4.0), held(8.0));
+		let mut scratch = Vec::new();
+		let mut out = Vec::new();
+		let mut big = Tree::new();
+		let one = big.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		let two = big.push(Node::Clip { clip: second, time: 0.0, looping: false });
+
+		big.push(Node::Blend { first: one, second: two, weight: 1.0 });
+
+		assert!(evaluate(&big, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out));
+
+		let mut small = Tree::new();
+		small.push(Node::Clip { clip: first, time: 0.0, looping: false });
+
+		assert!(evaluate(&small, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out));
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1.0e-6),
+			"the second tree's answer, not a run left over from the first"
+		);
+	}
+
+	#[test]
+	fn animating_a_pose_binds_every_clip_the_tree_names_and_writes_the_answer() {
+		let mut world = World::new();
+		let rig = world.skeletons.insert("rig", arm());
+		let first = world.clips.insert("one", held(4.0));
+		let second = world.clips.insert("two", held(8.0));
+		let pose = world
+			.poses
+			.spawn(Pose::resting(rig, world.skeletons.bones(rig)));
+		let mut tree = Tree::new();
+		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+
+		tree.push(Node::Blend { first: one, second: two, weight: 0.5 });
+
+		assert!(world.animate(pose, &tree), "the pose is there and the tree works out");
+		assert_eq!(world.clips.bindings(), 2, "both leaves were bound, and nobody asked");
+
+		let locals = &world.poses.get(pose).expect("still there").locals;
+
+		assert!(
+			locals[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 6.0, 0.0), 1.0e-6),
+			"halfway between the two clips"
+		);
+	}
+
+	#[test]
+	fn animating_a_stale_pose_handle_writes_nothing() {
+		let mut world = World::new();
+		let rig = world.skeletons.insert("rig", arm());
+		let pose = world
+			.poses
+			.spawn(Pose::resting(rig, world.skeletons.bones(rig)));
+		let mut tree = Tree::new();
+
+		tree.push(Node::Clip {
+			clip: ClipId::NONE,
+			time: 0.0,
+			looping: false,
+		});
+		world.poses.despawn(pose);
+
+		assert!(!world.animate(pose, &tree), "a stale pose is refused rather than made");
 	}
 
 	#[test]
