@@ -65,7 +65,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// Bump it whenever the header or any block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it
 /// agreed.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -417,6 +417,13 @@ pub struct Bulk {
 	pub angular: [f32; 3],
 }
 
+/// The bit in [`Tie::flags`] that says the two bodies it holds still collide.
+///
+/// The bit means the *unusual* answer, so a record whose flags are zero is the
+/// joint every engine hands out by default. @ref
+/// [`Joint::collide`](colby_core::abi::Joint::collide).
+pub const TIE_COLLIDE: u32 = 1;
+
 /// One joint holding two bodies, or one body and a point in the world.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -433,6 +440,9 @@ pub struct Tie {
 
 	/// Which of the four it is, as [`JointKind`] in declaration order.
 	pub kind: u32,
+
+	/// [`TIE_COLLIDE`], and room for whatever comes after it.
+	pub flags: u32,
 
 	/// Which entry of the body block it holds, or [`u32::MAX`].
 	pub first: u32,
@@ -721,6 +731,7 @@ impl SceneFile {
 			slot: tie.slot,
 			generation: tie.generation,
 			kind: joint_kind(tie.kind),
+			collide: tie.flags & TIE_COLLIDE != 0,
 			first: tie.first,
 			second: tie.second,
 			first_anchor: Vec3::from_array(tie.first_anchor),
@@ -737,16 +748,29 @@ impl SceneFile {
 
 	/// A block, borrowed out of the buffer.
 	fn block<T: Pod>(&self, offset: u32, count: u32) -> &[T] {
-		let Some(range) = span::<T>(offset, count) else {
-			return &[];
-		};
-
-		self.bytes
-			.as_slice()
-			.get(range)
-			.and_then(|slice| bytemuck::try_cast_slice(slice).ok())
-			.unwrap_or(&[])
+		block_of(self.bytes.as_slice(), offset, count)
 	}
+}
+
+/// One record block, cast out of bytes that have already been checked.
+///
+/// A free function rather than a method because [`check`] reads the records
+/// too, and two castings of the same block that could disagree is the sort of
+/// thing that is only found by a file nobody has.
+///
+/// @param bytes - the whole file
+/// @param offset - where the block starts, as the header stores it
+/// @param count - how many records, as the header stores it
+/// @return the records, or nothing at all if they cannot be read
+fn block_of<T: Pod>(bytes: &[u8], offset: u32, count: u32) -> &[T] {
+	let Some(range) = span::<T>(offset, count) else {
+		return &[];
+	};
+
+	bytes
+		.get(range)
+		.and_then(|slice| bytemuck::try_cast_slice(slice).ok())
+		.unwrap_or(&[])
 }
 
 /// What a settings record reads as when there is not one.
@@ -1006,6 +1030,7 @@ fn tie_of(link: &Link, names: &mut Names) -> Tie {
 		slot: link.slot,
 		generation: link.generation,
 		kind: joint_code(link.kind),
+		flags: if link.collide { TIE_COLLIDE } else { 0 },
 		first: link.first,
 		second: link.second,
 		length: link.length,
@@ -1070,8 +1095,8 @@ fn transform_of(position: [f32; 3], rotation: [f32; 4], scale: [f32; 3]) -> Tran
 
 /// What kind of body a code stands for.
 ///
-/// An unknown one is static, which is the safe way to be wrong: a body that
-/// does not move cannot fall through the world or shove anything.
+/// The last arm is unreachable: [`codes`] has refused every code that is
+/// not one of these before anything gets here.
 const fn body_kind(code: u32) -> BodyKind {
 	match code {
 		| 1 => BodyKind::Kinematic,
@@ -1090,6 +1115,9 @@ const fn body_code(kind: BodyKind) -> u32 {
 }
 
 /// What kind of shape a code stands for.
+///
+/// The last arm is unreachable: [`codes`] has refused every code that is
+/// not one of these before anything gets here.
 const fn shape_kind(code: u32) -> ShapeKind {
 	match code {
 		| 1 => ShapeKind::Sphere,
@@ -1108,6 +1136,9 @@ const fn shape_code(kind: ShapeKind) -> u32 {
 }
 
 /// What kind of joint a code stands for.
+///
+/// The last arm is unreachable: [`codes`] has refused every code that is
+/// not one of these before anything gets here.
 const fn joint_kind(code: u32) -> JointKind {
 	match code {
 		| 1 => JointKind::Weld,
@@ -1223,8 +1254,59 @@ fn check(bytes: &[u8]) -> std::result::Result<SceneHeader, String> {
 
 	strides(&header)?;
 	blocks(bytes, &header)?;
+	codes(bytes, &header)?;
 
 	Ok(header)
+}
+
+/// Whether every code in a record is one this build knows.
+///
+/// **A code is refused and a flag bit is not**, and the difference is what
+/// each one means. A bit says a record has a property, so a build that does
+/// not know the bit reads a record without that property - which is a smaller
+/// answer than the file's rather than a wrong one, and is the whole reason
+/// [`BULK_WEIGHTLESS`] could be added without moving [`FORMAT_VERSION`]. A
+/// code says *which* record this is, so a build that does not know it has
+/// nothing smaller to fall back to: it would read a hinge as a rope, or a
+/// ball as a rope, and go on as though the file had said so.
+///
+/// The cost is that a file written by a later build with one more kind in it
+/// is refused by this one, and that is the point.
+///
+/// Runs after [`blocks`], which is what makes the casts here safe.
+///
+/// @param bytes - the whole file
+/// @param header - its header, already checked
+fn codes(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String> {
+	let bulks: &[Bulk] = block_of(bytes, header.bulk_offset, header.bulk_count);
+	let ties: &[Tie] = block_of(bytes, header.tie_offset, header.tie_count);
+
+	for bulk in bulks {
+		if bulk.kind > 2 {
+			return Err(format!(
+				"a body in this scene is kind {}, which this build does not have",
+				bulk.kind
+			));
+		}
+
+		if bulk.shape_kind > 2 {
+			return Err(format!(
+				"a body in this scene is shaped {}, which this build does not have",
+				bulk.shape_kind
+			));
+		}
+	}
+
+	for tie in ties {
+		if tie.kind > 3 {
+			return Err(format!(
+				"a joint in this scene is kind {}, which this build does not have",
+				tie.kind
+			));
+		}
+	}
+
+	Ok(())
 }
 
 /// Whether every record is the size this build reads.
@@ -1440,6 +1522,7 @@ mod tests {
 				damping: 0.4,
 				max_impulse: 90.0,
 				max_torque: 35.5,
+				collide: true,
 			}],
 			thing_generations: vec![1, 0, 3],
 			solid_generations: vec![0, 2, 0, 0, 1],
@@ -1541,6 +1624,92 @@ mod tests {
 
 		assert_eq!(file.stood()[1].name, 0, "an empty name is offset zero");
 		assert!(file.name(0).is_empty(), "and offset zero reads as nothing");
+	}
+
+	#[test]
+	fn whether_a_joint_lets_its_bodies_collide_survives_both_ways() {
+		for collide in [false, true] {
+			let mut data = sample();
+			data.links[0].collide = collide;
+
+			assert_eq!(
+				round_trip(&data).links[0].collide,
+				collide,
+				"a joint that says {collide} comes back saying it"
+			);
+		}
+	}
+
+	#[test]
+	fn a_joint_that_holds_its_bodies_apart_is_what_a_record_of_no_flags_is() {
+		let mut data = sample();
+		data.links[0].collide = false;
+
+		let bytes = encode(&data).expect("it fits");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+
+		assert_eq!(
+			file.tie()[0].flags,
+			0,
+			"the bit means the unusual answer, so the usual one writes nothing"
+		);
+	}
+
+	/// The bytes of a scene with one field of one record overwritten.
+	///
+	/// @param field - how far into the record it is
+	/// @param code - what to put there
+	fn tie_kind_of(field: usize, code: u32) -> Vec<u8> {
+		let mut bytes = encode(&sample()).expect("it fits");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+		let at = usize::try_from(file.header().tie_offset).expect("an offset") + field;
+
+		bytes[at..at + 4].copy_from_slice(&code.to_le_bytes());
+
+		bytes
+	}
+
+	#[test]
+	fn a_kind_of_joint_this_build_does_not_have_is_refused_rather_than_read_as_a_rope() {
+		let bytes = tie_kind_of(core::mem::offset_of!(Tie, kind), 9);
+		let reason = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("a kind nothing answers to is not readable");
+
+		assert!(
+			format!("{reason}").contains('9'),
+			"and the message says which one, got {reason}"
+		);
+	}
+
+	#[test]
+	fn a_flag_on_a_joint_this_build_does_not_know_is_ignored_rather_than_refused() {
+		// the opposite of the rule above, and deliberately so: a bit says a
+		// record has a property, and a build that does not know the bit reads a
+		// record without it. That is what let the weightless bit be added
+		// without moving the version, and refusing here would take it away.
+		let bytes = tie_kind_of(core::mem::offset_of!(Tie, flags), 1 << 20);
+
+		assert!(
+			SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).is_ok(),
+			"a bit from the future is a property this build does not have"
+		);
+	}
+
+	#[test]
+	fn a_kind_of_body_or_shape_this_build_does_not_have_is_refused_too() {
+		for field in [core::mem::offset_of!(Bulk, kind), core::mem::offset_of!(Bulk, shape_kind)]
+		{
+			let mut bytes = encode(&sample()).expect("it fits");
+			let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+			let at = usize::try_from(file.header().bulk_offset).expect("an offset") + field;
+
+			bytes[at..at + 4].copy_from_slice(&7_u32.to_le_bytes());
+
+			assert!(
+				SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).is_err(),
+				"a body code nothing answers to is refused rather than read as the first kind"
+			);
+		}
 	}
 
 	#[test]

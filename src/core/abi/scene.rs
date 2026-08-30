@@ -312,6 +312,10 @@ pub struct Link {
 
 	/// The most it may turn with, or zero for no ceiling.
 	pub max_torque: f32,
+
+	/// Whether the two bodies it holds still collide with each other. @ref
+	/// [`Joint::collide`].
+	pub collide: bool,
 }
 
 impl Default for Link {
@@ -338,6 +342,7 @@ impl Default for Link {
 			damping: Joint::DAMPING,
 			max_impulse: Joint::NO_CEILING,
 			max_torque: Joint::NO_CEILING,
+			collide: false,
 		}
 	}
 }
@@ -873,6 +878,7 @@ fn links(world: &World, solid_of: &[u32]) -> Vec<Link> {
 			damping: joint.damping,
 			max_impulse: joint.max_impulse,
 			max_torque: joint.max_torque,
+			collide: joint.collide,
 		})
 		.collect()
 }
@@ -1238,6 +1244,7 @@ fn link_joints(scene: &SceneData, solids: &[BodyId]) -> Vec<(usize, Joint)> {
 				damping: link.damping,
 				max_impulse: link.max_impulse,
 				max_torque: link.max_torque,
+				collide: link.collide,
 			};
 
 			(usize::try_from(link.slot).unwrap_or(usize::MAX), joint)
@@ -1590,6 +1597,7 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 		damping: link.damping,
 		max_impulse: link.max_impulse,
 		max_torque: link.max_torque,
+		collide: link.collide,
 	});
 	world.joints.set_name(id, &link.name);
 
@@ -2285,6 +2293,46 @@ mod tests {
 
 		assert_eq!(joint.first, body_id, "the rope holds the restored body");
 		assert_eq!(joint.second, BodyId::NONE, "and a point in the world, as it did");
+	}
+
+	#[test]
+	fn whether_a_joint_lets_its_bodies_collide_is_written_down_and_put_back() {
+		let mut world = furnished();
+		let first =
+			world
+				.bodies
+				.spawn(Body::dynamic(Shape::UNIT, Transform::at(Vec3::ZERO), 1.0));
+		let second = world
+			.bodies
+			.spawn(Body::dynamic(Shape::UNIT, Transform::at(Vec3::X), 1.0));
+
+		world.join(Joint::weld(first, second, (Vec3::ZERO, Vec3::ZERO)));
+		world.join(Joint::weld(first, second, (Vec3::ZERO, Vec3::ZERO)).touching());
+
+		let scene = capture(&world);
+
+		assert_eq!(
+			scene
+				.links
+				.iter()
+				.map(|link| link.collide)
+				.collect::<Vec<bool>>(),
+			vec![false, true],
+			"a capture reads it off each joint rather than assuming"
+		);
+
+		let mut empty = furnished();
+		restore(&mut empty, &scene).expect("the layouts agree");
+
+		assert_eq!(
+			empty
+				.joints
+				.iter()
+				.map(|(_, joint)| joint.collide)
+				.collect::<Vec<bool>>(),
+			vec![false, true],
+			"and a restore puts both back the way they were"
+		);
 	}
 
 	/// A description of `count` bodies, each driving an entity of its own.

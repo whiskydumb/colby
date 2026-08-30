@@ -199,6 +199,25 @@ pub struct Joint {
 	/// Two numbers rather than one because the units differ: one is an impulse
 	/// and the other an angular impulse, and no single number is both.
 	pub max_torque: f32,
+
+	/// Whether the two bodies it holds still collide with each other.
+	///
+	/// **False by default, so a joint switches their collision off**, which is
+	/// what every engine checked does with its own version of this field. The
+	/// reason is what a joint is for: two things held together are usually
+	/// touching, and a pair that is both held at a distance and pushed apart
+	/// at that distance spends every step arguing with itself. A ragdoll is
+	/// the case that makes it unavoidable - a thigh and a shin overlap at the
+	/// knee by construction.
+	///
+	/// It says nothing about anything else either of them touches, and nothing
+	/// about a pair no joint holds. A joint pinned to a point in the world has
+	/// no pair at all and this means nothing to it.
+	///
+	/// **A sensor is not affected**, because a sensor does not collide: it
+	/// notices, and switching off a notice is a different promise from
+	/// switching off a push.
+	pub collide: bool,
 }
 
 impl Joint {
@@ -259,6 +278,7 @@ impl Joint {
 			damping: Self::DAMPING,
 			max_impulse: Self::NO_CEILING,
 			max_torque: Self::NO_CEILING,
+			collide: false,
 		}
 	}
 
@@ -285,6 +305,16 @@ impl Joint {
 	pub const fn sprung(mut self, stiffness: f32, damping: f32) -> Self {
 		self.stiffness = stiffness;
 		self.damping = damping;
+
+		self
+	}
+
+	/// The same joint, with the two bodies left colliding with each other.
+	///
+	/// @return the joint, no longer switching their collision off
+	#[must_use]
+	pub const fn touching(mut self) -> Self {
+		self.collide = true;
 
 		self
 	}

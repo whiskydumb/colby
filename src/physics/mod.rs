@@ -43,8 +43,8 @@ use std::collections::HashSet;
 
 use colby_core::{
 	abi::{
-		Bodies, BodyId, Entry, MeshData, Overlap, Physics, Shape, ShapeKind, Touch, TouchKind,
-		TraceInfo, TraceResult, World,
+		Bodies, BodyId, Entry, Joints, MeshData, Overlap, Physics, Shape, ShapeKind, Touch,
+		TouchKind, TraceInfo, TraceResult, World,
 	},
 	glam::Vec3,
 	trace,
@@ -132,6 +132,15 @@ pub struct Simulation {
 	/// [`contact::find`].
 	sensed: Vec<Manifold>,
 
+	/// Which pairs a joint holds and has switched collision off between.
+	///
+	/// Rebuilt at the top of every step out of the joint table, because a
+	/// joint is created, broken and rewritten by gameplay and nothing tells
+	/// this when. A set rather than a scan per pair: the narrow phase asks
+	/// once for every pair of bodies in the world, which is a square, and the
+	/// joints are a list.
+	held: HashSet<(BodyId, BodyId)>,
+
 	/// The sequential-impulse solver and its per-body scratch.
 	solver: Solver,
 }
@@ -148,6 +157,7 @@ impl Simulation {
 			previous: HashSet::new(),
 			manifolds: Vec::new(),
 			sensed: Vec::new(),
+			held: HashSet::new(),
 			solver: Solver::new(),
 		}
 	}
@@ -181,6 +191,7 @@ impl Simulation {
 	/// @param world - the host state; `bodies` is read, `entities` written
 	pub fn step(&mut self, world: &mut World) {
 		self.sync(world);
+		self.excuse(&world.joints);
 		Self::pull(world);
 
 		// taken out and put back so that the narrow phase can borrow the
@@ -213,6 +224,44 @@ impl Simulation {
 		// rather than the one the last frame did. Costs one console lookup per
 		// variable when it is off, which is what off should cost.
 		debug::draw(world, self);
+	}
+
+	/// Notes which pairs are not to be collided this step.
+	///
+	/// A joint that holds two bodies switches their collision off unless it
+	/// says otherwise, which is what every engine checked does: two things
+	/// held together are usually touching, and a pair both held at a distance
+	/// and pushed apart at it argues with itself every step.
+	///
+	/// A joint with no second body is pinned to a point in the world and holds
+	/// no pair at all, so there is nothing to excuse.
+	///
+	/// @note: that second half of the guard cannot be caught by a mutation and
+	/// is kept anyway. Without it the set gains a `(body, BodyId::NONE)` entry
+	/// that nothing can ever match, because every pair asked about names two
+	/// living bodies and a living handle never has generation zero. What it
+	/// buys is size: a physics gun makes and breaks one of these every time
+	/// somebody picks a prop up, and every prop nailed to a wall is another.
+	///
+	/// @param joints - the table, read
+	fn excuse(&mut self, joints: &Joints) {
+		self.held.clear();
+
+		for (_, joint) in joints.iter() {
+			if joint.collide || !joint.second.is_some() {
+				continue;
+			}
+
+			self.held
+				.insert(ordered(joint.first, joint.second));
+		}
+	}
+
+	/// Whether a joint has switched collision off between two bodies.
+	///
+	/// @param pair - the two, in either order
+	pub(crate) fn excused(&self, pair: (BodyId, BodyId)) -> bool {
+		self.held.contains(&ordered(pair.0, pair.1))
 	}
 
 	/// Drops everything a step derived, so the next one starts from the body
@@ -1422,6 +1471,138 @@ mod tests {
 
 		assert!(spun(Vec3::Y) > 0.5, "about its own axis it turns freely, got {}", spun(Vec3::Y));
 		assert!(spun(Vec3::X) < 0.1, "and about anything else it is held, got {}", spun(Vec3::X));
+	}
+
+	#[test]
+	fn a_joint_holds_two_bodies_apart_instead_of_pushing_them_apart() {
+		// two boxes overlapping by half their width, welded where they stand.
+		// Without the joint the narrow phase separates them; with it there is
+		// no pair at all and they stay overlapping, which is what holding two
+		// things together has to mean.
+		let overlapped = |collide: bool| {
+			let (mut world, mut simulation) = wired();
+			world.gravity = Vec3::ZERO;
+			let left =
+				world
+					.bodies
+					.spawn(Body::dynamic(Shape::UNIT, Transform::at(Vec3::ZERO), 1.0));
+			let right = world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.5, 0.0, 0.0)),
+				1.0,
+			));
+			let mut joint = Joint::weld(left, right, (Vec3::ZERO, Vec3::new(-0.5, 0.0, 0.0)));
+			joint.collide = collide;
+
+			world.join(joint);
+
+			// the contacts are read at the top rather than at the end: the pair
+			// that is *not* excused is pushed apart until it no longer overlaps,
+			// and a pair that has stopped overlapping has stopped touching, so
+			// both runs report nothing by the time they have settled.
+			settle(&mut world, &mut simulation, 2);
+
+			let touching = simulation.contacts();
+
+			settle(&mut world, &mut simulation, 120);
+
+			(placed(&world, left).distance(placed(&world, right)), touching)
+		};
+
+		let (held, held_contacts) = overlapped(false);
+		let (pushed, pushed_contacts) = overlapped(true);
+
+		assert_eq!(held_contacts, 0, "a joint that holds them makes no contact between them");
+		assert!(
+			(held - 0.5).abs() < 0.02,
+			"so they stay exactly as overlapped as they were welded, got {held}"
+		);
+		assert!(pushed_contacts > 0, "while a joint that says otherwise leaves the contact");
+		assert!(
+			pushed > 0.8,
+			"and the narrow phase shoves them apart against the weld, got {pushed}"
+		);
+	}
+
+	#[test]
+	fn a_joint_pinned_to_a_point_in_the_world_excuses_nothing() {
+		// the physics gun's own joint: a weld whose second body is nothing. It
+		// holds no pair, so a prop carried into a wall still hits the wall.
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+		ground(&mut world);
+
+		let carried = world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.0, 0.2, 0.0)),
+			1.0,
+		));
+
+		world.join(Joint::weld(carried, BodyId::NONE, (Vec3::ZERO, Vec3::new(0.0, 0.2, 0.0))));
+		settle(&mut world, &mut simulation, 60);
+
+		assert!(
+			simulation.contacts() > 0,
+			"the floor is still in the way of something pinned to a point above it"
+		);
+	}
+
+	#[test]
+	fn a_trigger_still_notices_what_a_joint_holds() {
+		// the filter is about collision, and a sensor does not collide. Welding
+		// a prop to a trigger volume must not make the trigger blind to it.
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+		let volume = world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::splat(2.0)),
+			Transform::at(Vec3::ZERO),
+		));
+
+		world
+			.bodies
+			.get_mut(volume)
+			.expect("alive")
+			.sensor = true;
+
+		let inside =
+			world
+				.bodies
+				.spawn(Body::dynamic(Shape::UNIT, Transform::at(Vec3::ZERO), 1.0));
+
+		world.join(Joint::weld(inside, volume, (Vec3::ZERO, Vec3::ZERO)));
+		settle(&mut world, &mut simulation, 2);
+
+		assert!(
+			world.bodies.inside(volume).any(|it| it == inside),
+			"the trigger is still overlapping what it is welded to"
+		);
+	}
+
+	#[test]
+	fn breaking_a_joint_puts_the_collision_between_its_bodies_back() {
+		// the set is rebuilt every step out of the table, and this is what that
+		// buys: nothing has to tell the simulation that a joint is gone.
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+		let left = world
+			.bodies
+			.spawn(Body::dynamic(Shape::UNIT, Transform::at(Vec3::ZERO), 1.0));
+		let right = world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.5, 0.0, 0.0)),
+			1.0,
+		));
+		let joint = world.join(Joint::weld(left, right, (Vec3::ZERO, Vec3::new(-0.5, 0.0, 0.0))));
+
+		settle(&mut world, &mut simulation, 30);
+
+		assert_eq!(simulation.contacts(), 0, "held, they do not touch");
+
+		world.joints.despawn(joint);
+		settle(&mut world, &mut simulation, 1);
+
+		assert!(simulation.contacts() > 0, "and the step after it breaks, they do");
 	}
 
 	#[test]

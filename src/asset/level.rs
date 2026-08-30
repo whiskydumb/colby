@@ -318,6 +318,7 @@ fn joints(value: Option<&Value>, solids: &[Solid]) -> Result<Vec<Link>> {
 				"damping",
 				"max impulse",
 				"max torque",
+				"collide",
 			],
 			"a joint",
 		)?;
@@ -347,6 +348,7 @@ fn joints(value: Option<&Value>, solids: &[Solid]) -> Result<Vec<Link>> {
 			damping: number(entry.get("damping"), Joint::DAMPING),
 			max_impulse: number(entry.get("max impulse"), Joint::NO_CEILING),
 			max_torque: number(entry.get("max torque"), Joint::NO_CEILING),
+			collide: flag(entry.get("collide")),
 		});
 	}
 
@@ -818,6 +820,10 @@ fn link_of(link: &Link, name: &str, solids: &[String]) -> String {
 	put_number(&mut fields, "damping", link.damping, Joint::DAMPING);
 	put_number(&mut fields, "max impulse", link.max_impulse, Joint::NO_CEILING);
 	put_number(&mut fields, "max torque", link.max_torque, Joint::NO_CEILING);
+
+	if link.collide {
+		fields.push(("collide", "true".to_owned()));
+	}
 
 	object(&fields)
 }
@@ -1464,6 +1470,40 @@ mod tests {
 		let scene = import(&text).expect("a quarter turn is a rotation");
 
 		assert!(scene.things[0].transform.rotation.is_normalized(), "and it survives");
+	}
+
+	#[test]
+	fn a_joint_says_nothing_about_collision_unless_it_wants_the_unusual_answer() {
+		let text = r#"{
+			"entities": [ {} ],
+			"bodies": [
+				{ "name": "a", "kind": "dynamic" },
+				{ "name": "b", "kind": "dynamic" }
+			],
+			"joints": [
+				{ "kind": "weld", "first": "a", "second": "b" },
+				{ "kind": "weld", "first": "a", "second": "b", "collide": true }
+			]
+		}"#;
+		let scene = import(text).expect("a scene");
+
+		assert!(!scene.links[0].collide, "a joint that says nothing holds them apart");
+		assert!(scene.links[1].collide, "and one that asks for the other answer gets it");
+
+		let written = export(&scene).expect("it can be written");
+
+		assert_eq!(
+			written.matches("\"collide\"").count(),
+			1,
+			"only the unusual one is written down, and it appears once: {written}"
+		);
+		assert_eq!(
+			import(&written)
+				.expect("what was written reads back")
+				.links,
+			scene.links,
+			"and both come back the way they went in"
+		);
 	}
 
 	#[test]

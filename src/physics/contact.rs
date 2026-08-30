@@ -144,11 +144,20 @@ pub(crate) fn find(
 				continue;
 			}
 
-			// and last, the filter a game set up on purpose. Last because it is
-			// the only one of the four that is somebody's decision rather than an
-			// arrangement of the world, so a pair skipped here is skipped for a
-			// reason that can be read out of the two bodies.
+			// and last, the two filters a game set up on purpose. Last because
+			// they are the only ones that are somebody's decision rather than
+			// an arrangement of the world, so a pair skipped here is skipped
+			// for a reason that can be read out of the two bodies and whatever
+			// holds them.
 			if !one.layers.meets(other.layers) {
+				continue;
+			}
+
+			// a joint between them, saying they are held together rather than
+			// pushed apart. Only the solid pair: a sensor does not collide, so
+			// there is no collision here for a joint to have switched off, and
+			// a trigger a welded prop is carried through still notices it.
+			if !sensing && simulation.excused((first, second)) {
 				continue;
 			}
 
