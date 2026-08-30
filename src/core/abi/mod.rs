@@ -86,7 +86,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 35;
+pub const ABI_VERSION: u32 = 36;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -375,6 +375,13 @@ pub struct World {
 	/// [`animate`](Self::animate) ever looks at it, and what it holds between
 	/// two calls means nothing.
 	blending: Vec<Transform>,
+
+	/// One matrix per bone, while a ragdoll is being read either way.
+	///
+	/// The same arrangement [`blending`](Self::blending) is, for the same
+	/// reason: a game's own memory is plain bytes and cannot hold a `Vec`, so
+	/// the scratch a ragdoll needs lives here rather than being asked for.
+	rigging: Vec<Mat4>,
 }
 
 impl World {
@@ -415,6 +422,7 @@ impl World {
 			state: GameState::new(),
 			physics: Physics::STUB,
 			blending: Vec::new(),
+			rigging: Vec::new(),
 			camera_previous: Camera::DEFAULT,
 			camera_snap: false,
 			// one, so that a world nobody paces - a test, a screenshot - draws
@@ -601,6 +609,144 @@ impl World {
 		)
 	}
 
+	/// Puts a ragdoll's bodies where the pose says its bones are.
+	///
+	/// The direction that runs while a character is on its feet: an animation
+	/// writes the pose, this carries the bodies along with it, and the bodies
+	/// are [`BodyKind::Kinematic`] so that the solver leaves them alone and
+	/// they still shove whatever they walk into. It is also what makes
+	/// switching a ragdoll on cost nothing: the bodies are already exactly
+	/// where the character is, so there is no seam to hide and nothing to
+	/// snap.
+	///
+	/// A part whose body handle does not resolve is skipped, which is what a
+	/// plan that has not been spawned yet looks like.
+	///
+	/// @param pose - the pose to read
+	/// @param at - where the character stands, the transform its entities wear
+	/// @param ragdoll - the layout, its bodies filled in
+	/// @return `false` if the pose handle is stale, in which case nothing moved
+	pub fn pull_ragdoll(&mut self, pose: PoseId, at: Transform, ragdoll: &Ragdoll) -> bool {
+		let Self { poses, skeletons, bodies, rigging, .. } = self;
+		let Some(bones) = poses
+			.get(pose)
+			.map(|posed| skeletons.bones(posed.skeleton))
+		else {
+			return false;
+		};
+
+		rigging.clear();
+
+		// the present rather than anything interpolated: this is inside the
+		// step, and what the frames between two steps are drawn at is the
+		// renderer's business and nobody else's.
+		poses.model(pose, bones, 1.0, rigging);
+
+		let stance = at.matrix();
+
+		for part in &ragdoll.parts {
+			let (Some(model), Some(body)) =
+				(rigging.get(usize::from(part.bone)), bodies.get_mut(part.body))
+			else {
+				continue;
+			};
+
+			body.transform = Transform::from_matrix(stance * *model * part.in_bone.matrix());
+		}
+
+		true
+	}
+
+	/// Writes a pose from where a ragdoll's bodies have ended up.
+	///
+	/// The other direction, and the one that makes a character fall over. Two
+	/// passes over the bones and no recursion, which the skeleton's own
+	/// ordering buys:
+	///
+	/// - the first works out where every bone is. A bone a part follows takes
+	///   its place from that part's body; every other bone is carried by its
+	///   parent, exactly as it was. That second half is what keeps a neck
+	///   between a chest and a head, and what lets a hand ride on the forearm
+	///   that has a body while having none itself.
+	/// - the second writes back the local transform of the bones that have
+	///   bodies, each against wherever its parent ended up.
+	///
+	/// **The character's own transform is not written and does not move.** A
+	/// ragdoll that rolls away leaves the entity where it stood and carries
+	/// everything in the bones, which is what the two engines that do this
+	/// both do. The cost is named in the notes: after a fall, an entity's
+	/// position no longer says where the character is.
+	///
+	/// Switching *off* is the discontinuity, not switching on: the bones jump
+	/// from wherever they fell to wherever the animation puts them, so a game
+	/// that stops a ragdoll owes [`Poses::snap`].
+	///
+	/// @param pose - the pose to write
+	/// @param at - where the character stands, the transform its entities wear
+	/// @param ragdoll - the layout, its bodies filled in
+	/// @return `false` if the pose handle is stale, in which case nothing was
+	/// written
+	pub fn push_ragdoll(&mut self, pose: PoseId, at: Transform, ragdoll: &Ragdoll) -> bool {
+		let Self { poses, skeletons, bodies, rigging, .. } = self;
+		let Some(bones) = poses
+			.get(pose)
+			.map(|posed| skeletons.bones(posed.skeleton))
+		else {
+			return false;
+		};
+		let Some(posed) = poses.get(pose) else {
+			return false;
+		};
+
+		let stance = at.matrix().inverse();
+
+		rigging.clear();
+		rigging.reserve(bones.len());
+
+		for (index, bone) in bones.iter().enumerate() {
+			let carried = u16::try_from(index)
+				.ok()
+				.and_then(|it| ragdoll.part_of(it))
+				.and_then(|part| ragdoll.parts.get(usize::from(part)))
+				.and_then(|part| Some((part, bodies.get(part.body)?)));
+
+			let model = match carried {
+				| Some((part, body)) =>
+					stance * body.transform.matrix() * part.in_bone.matrix().inverse(),
+				// carried by whatever is above it, exactly as the pose had it.
+				| None =>
+					over(bone, rigging)
+						* posed
+							.locals
+							.get(index)
+							.copied()
+							.unwrap_or(bone.rest)
+							.matrix(),
+			};
+
+			rigging.push(model);
+		}
+
+		let Some(posed) = poses.get_mut(pose) else {
+			return false;
+		};
+
+		for part in &ragdoll.parts {
+			let index = usize::from(part.bone);
+			let (Some(bone), Some(model)) = (bones.get(index), rigging.get(index)) else {
+				continue;
+			};
+
+			if !bodies.alive(part.body) {
+				continue;
+			}
+
+			posed.set(part.bone, Transform::from_matrix(over(bone, rigging).inverse() * *model));
+		}
+
+		true
+	}
+
 	/// Hands the world the queries a solver can answer.
 	///
 	/// The host's to call, once, at startup. The pointers inside address the
@@ -699,9 +845,377 @@ impl Default for World {
 	fn default() -> Self { Self::new() }
 }
 
+/// Where a bone's parent is, out of a buffer of model matrices.
+///
+/// The identity for a root, and the identity again for a parent the buffer
+/// does not reach - which is the same answer a bone standing on its own
+/// deserves and is why the two cases are not told apart.
+///
+/// @note: the first of those two cannot be caught by a mutation and is kept
+/// anyway, which is the fourth line in this ABI to be in that position and the
+/// same reason each time: [`NO_PARENT`] is 65535 and a skeleton holds at most
+/// [`MAX_BONES`], so the lookup below would miss and answer the same. It is
+/// the only line that says what the sentinel means.
+///
+/// @param bone - the bone whose parent is wanted
+/// @param matrices - one per bone, parents already written
+fn over(bone: &Bone, matrices: &[Mat4]) -> Mat4 {
+	if bone.parent == NO_PARENT {
+		return Mat4::IDENTITY;
+	}
+
+	matrices
+		.get(usize::from(bone.parent))
+		.copied()
+		.unwrap_or(Mat4::IDENTITY)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A world holding a two-limbed skeleton, a pose of it, and a ragdoll with
+	/// a body spawned for each part.
+	///
+	/// The skeleton is a leg down `x` with a foot bone at the end that no part
+	/// follows, which is what makes the "a bone with no body rides the one
+	/// above it" question askable at all.
+	fn strung() -> (Box<World>, PoseId, Ragdoll) {
+		let bone = |name: &str, parent: u16, at: Vec3| Bone {
+			name: name.to_owned(),
+			parent,
+			inverse_bind: Mat4::IDENTITY,
+			rest: Transform::at(at),
+		};
+		let bones = vec![
+			bone("hip", NO_PARENT, Vec3::new(0.0, 4.0, 0.0)),
+			bone("thigh", 0, Vec3::ZERO),
+			bone("shin", 1, Vec3::new(1.0, 0.0, 0.0)),
+			bone("foot", 2, Vec3::new(2.0, 0.0, 0.0)),
+		];
+
+		let mut world = Box::new(World::new());
+		let skeleton = world
+			.skeletons
+			.insert("models/hero/rig", SkeletonData { bones: bones.clone() });
+		let pose = world
+			.poses
+			.spawn(Pose::resting(skeleton, world.skeletons.bones(skeleton)));
+
+		let mut ragdoll = ragdoll::plan(
+			&bones,
+			&[Segment::new("thigh", "shin"), Segment::new("shin", "foot")],
+			Build::DEFAULT,
+		);
+
+		for part in &mut ragdoll.parts {
+			part.body = world.bodies.spawn(Body::new(
+				BodyKind::Kinematic,
+				part.shape,
+				Transform::IDENTITY,
+			));
+		}
+
+		(world, pose, ragdoll)
+	}
+
+	/// Where every bone of a pose is, in the model's own space.
+	fn bones_at(world: &World, pose: PoseId) -> Vec<Vec3> {
+		let skeleton = world
+			.poses
+			.get(pose)
+			.expect("the pose is there")
+			.skeleton;
+		let mut out = Vec::new();
+
+		world
+			.poses
+			.model(pose, world.skeletons.bones(skeleton), 1.0, &mut out);
+
+		out.iter()
+			.map(|matrix| matrix.w_axis.truncate())
+			.collect()
+	}
+
+	#[test]
+	fn a_bodys_place_is_the_pose_and_the_stance_together() {
+		let (mut world, pose, ragdoll) = strung();
+		let at = Transform {
+			position: Vec3::new(10.0, 0.0, -3.0),
+			rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+			scale: Vec3::ONE,
+		};
+
+		assert!(world.pull_ragdoll(pose, at, &ragdoll), "the pose is there");
+
+		// the thigh bone rests at (0, 4, 0) and its segment runs a unit along
+		// x, so the body's middle sits at (0.5, 4, 0) in the model. A quarter
+		// turn about y sends model x to world -z, and the stance is ten along
+		// x and three back.
+		let thigh = world
+			.bodies
+			.get(ragdoll.parts[0].body)
+			.expect("alive")
+			.transform;
+
+		assert!(
+			thigh
+				.position
+				.abs_diff_eq(Vec3::new(10.0, 4.0, -3.5), 1e-4),
+			"the body is carried by both the pose and the stance, got {}",
+			thigh.position
+		);
+	}
+
+	#[test]
+	fn pulling_then_pushing_leaves_a_pose_exactly_where_it_was() {
+		// the round trip is the whole contract: `in_bone` and its inverse have
+		// to agree, and the two passes of the push have to undo what the pull
+		// composed. Started from a pose that is *not* the rest, so an
+		// implementation that quietly wrote rests would fail.
+		let (mut world, pose, ragdoll) = strung();
+		let at = Transform {
+			position: Vec3::new(-2.0, 1.0, 0.5),
+			rotation: Quat::from_rotation_z(0.7),
+			scale: Vec3::ONE,
+		};
+		let bend = Transform {
+			rotation: Quat::from_rotation_z(0.5),
+			..Transform::IDENTITY
+		};
+
+		world
+			.poses
+			.get_mut(pose)
+			.expect("the pose is there")
+			.set(2, bend);
+
+		let before = bones_at(&world, pose);
+
+		assert!(world.pull_ragdoll(pose, at, &ragdoll));
+		assert!(world.push_ragdoll(pose, at, &ragdoll));
+
+		for (was, is) in before.iter().zip(bones_at(&world, pose)) {
+			assert!(was.abs_diff_eq(is, 1e-4), "a bone moved: {was} became {is}");
+		}
+	}
+
+	#[test]
+	fn a_pull_follows_the_pose_it_is_handed_rather_than_the_one_before_it() {
+		// what a game does every step while a character is on its feet: the
+		// animation moves the bones and the bodies have to arrive at the new
+		// places rather than at last step's.
+		let (mut world, pose, ragdoll) = strung();
+		let at = Transform::IDENTITY;
+
+		world.pull_ragdoll(pose, at, &ragdoll);
+
+		let was = world
+			.bodies
+			.get(ragdoll.parts[1].body)
+			.expect("alive")
+			.transform
+			.position;
+
+		world
+			.poses
+			.get_mut(pose)
+			.expect("the pose is there")
+			.set(1, Transform {
+				rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+				..Transform::IDENTITY
+			});
+		world.pull_ragdoll(pose, at, &ragdoll);
+
+		let is = world
+			.bodies
+			.get(ragdoll.parts[1].body)
+			.expect("alive")
+			.transform
+			.position;
+
+		assert!(
+			was.abs_diff_eq(Vec3::new(2.0, 4.0, 0.0), 1e-4),
+			"the shin's body starts a unit past the thigh, got {was}"
+		);
+		assert!(
+			is.abs_diff_eq(Vec3::new(0.0, 6.0, 0.0), 1e-4),
+			"and a quarter turn at the thigh swings it onto y, got {is}"
+		);
+	}
+
+	#[test]
+	fn a_body_shoved_by_hand_takes_its_bone_with_it() {
+		let (mut world, pose, ragdoll) = strung();
+		let at = Transform::IDENTITY;
+
+		world.pull_ragdoll(pose, at, &ragdoll);
+
+		let shin = ragdoll.parts[1];
+		let moved = world
+			.bodies
+			.get(shin.body)
+			.expect("alive")
+			.transform
+			.position + Vec3::new(0.0, 3.0, 0.0);
+
+		world
+			.bodies
+			.get_mut(shin.body)
+			.expect("alive")
+			.transform
+			.position = moved;
+
+		assert!(world.push_ragdoll(pose, at, &ragdoll));
+
+		// where the bone ends up is where the body says its own far end is:
+		// the anchor is half a length back along the body's x.
+		let places = bones_at(&world, pose);
+		let wanted = world
+			.bodies
+			.get(shin.body)
+			.expect("alive")
+			.transform
+			.matrix()
+			.transform_point3(shin.anchor);
+
+		assert!(
+			places[2].abs_diff_eq(wanted, 1e-4),
+			"the shin's bone follows its body, got {} for {}",
+			places[2],
+			wanted
+		);
+	}
+
+	#[test]
+	fn a_bone_no_part_follows_rides_the_one_above_it() {
+		// the foot bone has no body of its own. It must end up where the shin
+		// carried it, which is the whole reason the first pass walks every
+		// bone rather than only the parts.
+		let (mut world, pose, ragdoll) = strung();
+		let at = Transform::IDENTITY;
+
+		world.pull_ragdoll(pose, at, &ragdoll);
+
+		let shin = ragdoll.parts[1];
+
+		world
+			.bodies
+			.get_mut(shin.body)
+			.expect("alive")
+			.transform
+			.position += Vec3::new(0.0, 3.0, 0.0);
+		world.push_ragdoll(pose, at, &ragdoll);
+
+		let places = bones_at(&world, pose);
+
+		assert!(
+			(places[3] - places[2]).abs_diff_eq(Vec3::new(2.0, 0.0, 0.0), 1e-4),
+			"the foot stays two units past the shin, got {}",
+			places[3] - places[2]
+		);
+		assert!(
+			places[3].y > 2.5,
+			"and it went up with it rather than staying at the rest, got {}",
+			places[3]
+		);
+	}
+
+	#[test]
+	fn a_ragdoll_never_writes_the_transform_a_character_stands_at() {
+		let (mut world, pose, ragdoll) = strung();
+		let entity = world.entities.spawn_at(Transform::at(Vec3::Y));
+		let at = Transform::at(Vec3::new(4.0, 0.0, 0.0));
+
+		world.pull_ragdoll(pose, at, &ragdoll);
+		world
+			.bodies
+			.get_mut(ragdoll.parts[0].body)
+			.expect("alive")
+			.transform
+			.position += Vec3::new(0.0, 9.0, 0.0);
+		world.push_ragdoll(pose, at, &ragdoll);
+
+		assert_eq!(
+			world
+				.entities
+				.transform(entity)
+				.map(|it| it.position),
+			Some(Vec3::Y),
+			"the entity stands where it stood, whatever the bodies did"
+		);
+	}
+
+	#[test]
+	fn a_part_with_no_body_is_stepped_over_rather_than_guessed_at() {
+		let (mut world, pose, ragdoll) = strung();
+		let mut unspawned = ragdoll.clone();
+		unspawned.parts[0].body = BodyId::NONE;
+
+		let bend = Transform {
+			rotation: Quat::from_rotation_z(0.3),
+			..Transform::IDENTITY
+		};
+
+		world
+			.poses
+			.get_mut(pose)
+			.expect("the pose is there")
+			.set(unspawned.parts[0].bone, bend);
+
+		let before = bones_at(&world, pose);
+
+		assert!(world.pull_ragdoll(pose, Transform::IDENTITY, &unspawned));
+		assert!(
+			world
+				.bodies
+				.get(ragdoll.parts[0].body)
+				.expect("alive")
+				.transform
+				.position
+				.abs_diff_eq(Vec3::ZERO, 1e-5),
+			"the body nobody claimed was left where it was spawned"
+		);
+
+		assert!(world.push_ragdoll(pose, Transform::IDENTITY, &unspawned));
+
+		for (was, is) in before.iter().zip(bones_at(&world, pose)) {
+			assert!(was.abs_diff_eq(is, 1e-4), "and its bone was left where it was as well");
+		}
+
+		// exactly, not nearly. A part with no body still has a bone, and that
+		// bone's place would be recovered through a matrix and read back apart
+		// again on every step of a long fall - so "close enough" here is a
+		// bone that walks away from where it was put.
+		assert_eq!(
+			world
+				.poses
+				.get(pose)
+				.expect("the pose is there")
+				.locals[usize::from(unspawned.parts[0].bone)],
+			bend,
+			"a bone no living body follows is not written at all"
+		);
+	}
+
+	#[test]
+	fn a_stale_pose_handle_moves_nothing_either_way() {
+		let (mut world, pose, ragdoll) = strung();
+
+		assert!(world.poses.despawn(pose), "it was there");
+		assert!(!world.pull_ragdoll(pose, Transform::IDENTITY, &ragdoll), "nothing to read");
+		assert!(!world.push_ragdoll(pose, Transform::IDENTITY, &ragdoll), "nothing to write");
+		assert!(
+			world
+				.bodies
+				.get(ragdoll.parts[0].body)
+				.expect("alive")
+				.transform
+				.position
+				.abs_diff_eq(Vec3::ZERO, 1e-5),
+			"and no body moved"
+		);
+	}
 
 	#[test]
 	fn game_api_is_a_table_of_pointers() {
