@@ -1,20 +1,30 @@
 //! colby's runtime mesh format: `.cmesh`.
 //!
 //! The whole file is a fixed [`MeshHeader`] followed by two `#[repr(C)]`
-//! blocks - vertices, then indices - with nothing between them. Everything is
-//! little-endian, which is what every target the engine builds for already is;
-//! a big-endian port would byte-swap on load and pay for it there rather than
-//! making every loader on every machine pay for a decode step.
+//! blocks - vertices, then indices - and, for a mesh bones move, a third.
+//! Everything is little-endian, which is what every target the engine builds
+//! for already is; a big-endian port would byte-swap on load and pay for it
+//! there rather than making every loader on every machine pay for a decode
+//! step.
 //!
 //! ```text
-//!   0  MeshHeader                        64 bytes
-//!  64  [MeshVertex; vertex_count]        48 bytes each
+//!   0  MeshHeader                        80 bytes
+//!  80  [MeshVertex; vertex_count]        48 bytes each
 //!   .  [u32;        index_count]          4 bytes each
+//!   .  [SkinVertex; skin_count]          12 bytes each, and only sometimes
 //! ```
 //!
-//! The header is sixty-four bytes so that the vertex block inherits the
-//! buffer's sixteen-byte alignment, and both blocks are exactly the layout the
-//! GPU wants. Reading a mesh is therefore a file read into an
+//! **The skin block is the only optional one, and `skin_count` is the only
+//! thing that says whether it is there.** It was going to be a bit in
+//! [`MeshHeader::flags`], and that turned out to be redundant state: two fields
+//! that can disagree, and one of them would have had to win. The flags word
+//! keeps its documented job instead - it is what lets a *later* block be added
+//! without moving the header, which this one could not do anyway, because the
+//! header itself grew.
+//!
+//! The header is eighty bytes so that the vertex block inherits the buffer's
+//! sixteen-byte alignment, and every block is exactly the layout the GPU
+//! wants. Reading a mesh is therefore a file read into an
 //! [`AlignedBytes`](crate::AlignedBytes) and two `bytemuck` casts -
 //! [`MeshFile::vertices`] and [`MeshFile::indices`] borrow straight out of the
 //! buffer and copy nothing.
@@ -29,7 +39,10 @@ use std::path::Path;
 
 use colby_core::{
 	Result,
-	abi::mesh::{MeshData, MeshVertex},
+	abi::{
+		mesh::{MeshData, MeshVertex, SkinVertex},
+		skeleton::MAX_BONES,
+	},
 	bytemuck::{self, Pod, Zeroable},
 	err,
 	glam::Vec3,
@@ -44,13 +57,13 @@ pub const MAGIC: [u8; 8] = *b"COLBYMSH";
 ///
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The extension a compiled mesh is written with.
 pub const EXTENSION: &str = "cmesh";
 
 /// How big [`MeshHeader`] is, and where the vertex block starts.
-pub const HEADER_BYTES: usize = 64;
+pub const HEADER_BYTES: usize = 80;
 
 /// The fixed head of a `.cmesh`.
 ///
@@ -95,6 +108,26 @@ pub struct MeshHeader {
 
 	/// The high corner of the same box.
 	pub bounds_max: [f32; 3],
+
+	/// Bytes per skin entry. Must be `size_of::<SkinVertex>()`, or zero when
+	/// there is no skin block.
+	pub skin_stride: u32,
+
+	/// How many skin entries there are: either zero or `vertex_count`.
+	///
+	/// The only thing that says whether the third block is here at all.
+	pub skin_count: u32,
+
+	/// Where the skin block starts, or zero when there is none.
+	pub skin_offset: u32,
+
+	/// Nothing yet, and a reader refuses a file that puts something here.
+	///
+	/// It exists because the header has to be a multiple of sixteen bytes for
+	/// the vertex block to stay aligned, and three new fields left four bytes
+	/// over. Refusing rather than ignoring is the same rule
+	/// [`flags`](Self::flags) follows.
+	pub reserved: u32,
 }
 
 /// A `.cmesh` held in memory, checked, and ready to be read in place.
@@ -143,6 +176,14 @@ impl MeshFile {
 		self.block(self.header.index_offset, self.header.index_count)
 	}
 
+	/// The skin block, borrowed out of the buffer.
+	///
+	/// Empty for a mesh nothing moves, which is almost all of them.
+	#[must_use]
+	pub fn skin(&self) -> &[SkinVertex] {
+		self.block(self.header.skin_offset, self.header.skin_count)
+	}
+
 	/// The bounding box the compiler measured.
 	#[must_use]
 	pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -163,6 +204,7 @@ impl MeshFile {
 		MeshData {
 			vertices: self.vertices().to_vec(),
 			indices: self.indices().to_vec(),
+			skin: self.skin().to_vec(),
 		}
 	}
 
@@ -191,26 +233,26 @@ impl MeshFile {
 /// @param data - the geometry to write
 /// @return the whole file, ready to put on disk
 pub fn encode(data: &MeshData) -> Result<Vec<u8>> {
-	if !data.indices_are_in_range() {
-		return Err(err!(Asset(
-			"the mesh has an index past the end of its {} vertices",
-			data.vertices.len()
-		)));
-	}
-
-	if !data.indices.len().is_multiple_of(3) {
-		return Err(err!(Asset(
-			"the mesh has {} indices, which is not a whole number of triangles",
-			data.indices.len()
-		)));
-	}
+	sound(data)?;
 
 	let vertex_count = count(data.vertices.len(), "vertices")?;
 	let index_count = count(data.indices.len(), "indices")?;
 	let vertex_offset = count(HEADER_BYTES, "header")?;
+	let skin_count = count(data.skin.len(), "skin entries")?;
+	let too_large = || err!(Asset("the mesh is too large to address with 32-bit offsets"));
 	let index_offset = vertex_offset
 		.checked_add(vertex_count.saturating_mul(stride::<MeshVertex>()))
-		.ok_or_else(|| err!(Asset("the mesh is too large to address with 32-bit offsets")))?;
+		.ok_or_else(too_large)?;
+
+	// zero rather than "where it would have been", because the offset of a
+	// block that is not there is not a fact about the file.
+	let skin_offset = if skin_count == 0 {
+		0
+	} else {
+		index_offset
+			.checked_add(index_count.saturating_mul(stride::<u32>()))
+			.ok_or_else(too_large)?
+	};
 
 	let (bounds_min, bounds_max) = data.bounds();
 	let header = MeshHeader {
@@ -225,15 +267,69 @@ pub fn encode(data: &MeshData) -> Result<Vec<u8>> {
 		index_offset,
 		bounds_min: bounds_min.to_array(),
 		bounds_max: bounds_max.to_array(),
+		skin_stride: if skin_count == 0 { 0 } else { stride::<SkinVertex>() },
+		skin_count,
+		skin_offset,
+		reserved: 0,
 	};
 
-	let mut out =
-		Vec::with_capacity(HEADER_BYTES + data.vertices.len() * size_of::<MeshVertex>());
+	let mut out = Vec::with_capacity(
+		HEADER_BYTES
+			+ data.vertices.len() * size_of::<MeshVertex>()
+			+ data.indices.len() * size_of::<u32>()
+			+ data.skin.len() * size_of::<SkinVertex>(),
+	);
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::cast_slice(&data.vertices));
 	out.extend_from_slice(bytemuck::cast_slice(&data.indices));
+	out.extend_from_slice(bytemuck::cast_slice(&data.skin));
 
 	Ok(out)
+}
+
+/// Everything about a mesh that has to be true before it is worth writing.
+///
+/// Here rather than at load because it is the compiler's job to refuse
+/// nonsense, and because a file colby wrote is trusted further than one it
+/// merely found - @ref [`check`] for what is checked again anyway.
+fn sound(data: &MeshData) -> Result<()> {
+	if !data.indices_are_in_range() {
+		return Err(err!(Asset(
+			"the mesh has an index past the end of its {} vertices",
+			data.vertices.len()
+		)));
+	}
+
+	if !data.indices.len().is_multiple_of(3) {
+		return Err(err!(Asset(
+			"the mesh has {} indices, which is not a whole number of triangles",
+			data.indices.len()
+		)));
+	}
+
+	if !data.skin_fits() {
+		return Err(err!(Asset(
+			"the mesh has {} skin entries against {} vertices, and a mesh is either skinned all \
+			 the way through or not at all",
+			data.skin.len(),
+			data.vertices.len()
+		)));
+	}
+
+	if !data.weights_are_whole() {
+		return Err(err!(Asset(
+			"the mesh has a vertex whose bone weights do not add up to {}",
+			SkinVertex::WHOLE
+		)));
+	}
+
+	if !data.bones_are_in_range(MAX_BONES) {
+		return Err(err!(Asset(
+			"the mesh names a bone past the {MAX_BONES} a skeleton may hold"
+		)));
+	}
+
+	Ok(())
 }
 
 /// The format version a file on disk was written by.
@@ -272,6 +368,10 @@ fn check(bytes: &[u8]) -> std::result::Result<MeshHeader, String> {
 			size_of::<MeshVertex>() == 48,
 			"MeshVertex is no longer two vec3s, a vec2 and a vec4"
 		);
+		assert!(
+			size_of::<SkinVertex>() == 12,
+			"SkinVertex is no longer four shorts and four bytes"
+		);
 	}
 
 	let head = bytes.get(..HEADER_BYTES).ok_or_else(|| {
@@ -307,9 +407,17 @@ fn check(bytes: &[u8]) -> std::result::Result<MeshHeader, String> {
 		));
 	}
 
+	if header.reserved != 0 {
+		return Err(format!(
+			"puts {:#010X} in a header word that has no meaning yet",
+			header.reserved
+		));
+	}
+
 	check_strides(header)?;
 	check_blocks(header, bytes.len())?;
 	check_indices(bytes, header)?;
+	check_skin(bytes, header)?;
 
 	Ok(*header)
 }
@@ -339,6 +447,21 @@ fn check_strides(header: &MeshHeader) -> std::result::Result<(), String> {
 		));
 	}
 
+	// zero and zero for a mesh nothing moves: the stride of a block that is
+	// not there is not a fact about the file either.
+	let skin_stride = if header.skin_count == 0 {
+		0
+	} else {
+		stride::<SkinVertex>()
+	};
+
+	if header.skin_stride != skin_stride {
+		return Err(format!(
+			"has {}-byte skin entries, and this build reads {skin_stride}-byte ones",
+			header.skin_stride
+		));
+	}
+
 	Ok(())
 }
 
@@ -354,6 +477,11 @@ fn check_blocks(header: &MeshHeader, len: usize) -> std::result::Result<(), Stri
 			"index",
 			header.index_offset,
 			span::<u32>(header.index_offset, header.index_count),
+		),
+		(
+			"skin",
+			header.skin_offset,
+			span::<SkinVertex>(header.skin_offset, header.skin_count),
 		),
 	];
 
@@ -414,6 +542,65 @@ fn check_indices(bytes: &[u8], header: &MeshHeader) -> std::result::Result<(), S
 	Ok(())
 }
 
+/// Checks that a skin block, if there is one, could move this mesh.
+///
+/// The same argument [`check_indices`] makes: the GPU draws whatever the bytes
+/// say, and what a garbled weight looks like on screen is a limb stretched to
+/// the origin rather than an error. One pass at load turns that into a
+/// sentence.
+fn check_skin(bytes: &[u8], header: &MeshHeader) -> std::result::Result<(), String> {
+	if header.skin_count == 0 {
+		if header.skin_offset != 0 {
+			return Err(format!(
+				"says its skin block is at {} and then says it has no entries",
+				header.skin_offset
+			));
+		}
+
+		return Ok(());
+	}
+
+	if header.skin_count != header.vertex_count {
+		return Err(format!(
+			"has {} skin entries against {} vertices, and a mesh is either skinned all the way \
+			 through or not at all",
+			header.skin_count, header.vertex_count
+		));
+	}
+
+	let Some(range) = span::<SkinVertex>(header.skin_offset, header.skin_count) else {
+		return Err("declares a skin block that overflows its offsets".to_owned());
+	};
+
+	let skin: &[SkinVertex] = bytes
+		.get(range)
+		.and_then(|slice| bytemuck::try_cast_slice(slice).ok())
+		.ok_or_else(|| "has a skin block that cannot be read in place".to_owned())?;
+
+	if let Some((at, entry)) = skin
+		.iter()
+		.enumerate()
+		.find(|(_, entry)| !entry.is_sound())
+	{
+		return Err(format!(
+			"has a vertex at {at} whose bone weights add up to {} rather than {}",
+			entry.total(),
+			SkinVertex::WHOLE
+		));
+	}
+
+	if let Some(at) = skin
+		.iter()
+		.position(|entry| !entry.bones_below(MAX_BONES))
+	{
+		return Err(format!(
+			"has a vertex at {at} naming a bone past the {MAX_BONES} a skeleton may hold"
+		));
+	}
+
+	Ok(())
+}
+
 /// The size of `T` as the header stores it.
 ///
 /// Saturating rather than checked: every `T` this is called with is two dozen
@@ -437,6 +624,47 @@ mod tests {
 	/// A cube, encoded.
 	fn encoded() -> Vec<u8> { encode(&cube()).expect("a cube encodes") }
 
+	/// Where each of the four fields added in version four starts.
+	const SKIN_STRIDE_AT: usize = 64;
+	const SKIN_COUNT_AT: usize = 68;
+	const SKIN_OFFSET_AT: usize = 72;
+	const RESERVED_AT: usize = 76;
+
+	/// A quad every vertex of which is pulled by bones, one of them by four.
+	fn skinned() -> MeshData {
+		let pulls = [
+			SkinVertex::rigid(0),
+			SkinVertex::rigid(3),
+			SkinVertex {
+				bones: [1, 2, 0, 0],
+				weights: [128, 127, 0, 0],
+			},
+			SkinVertex {
+				bones: [0, 1, 2, 3],
+				weights: [64, 64, 64, 63],
+			},
+		];
+		let mut mesh = quad();
+		mesh.skin = pulls
+			.iter()
+			.copied()
+			.cycle()
+			.take(mesh.vertices.len())
+			.collect();
+
+		mesh
+	}
+
+	/// A skinned quad, encoded.
+	fn skinned_bytes() -> Vec<u8> { encode(&skinned()).expect("a skinned quad encodes") }
+
+	/// What encoding a mesh went wrong with.
+	fn refused(data: &MeshData) -> String {
+		encode(data)
+			.expect_err("the mesh should not be written")
+			.to_string()
+	}
+
 	/// The encoded cube, read back.
 	fn opened() -> MeshFile {
 		MeshFile::from_bytes(AlignedBytes::from_slice(&encoded())).expect("and reads back")
@@ -453,7 +681,7 @@ mod tests {
 
 	#[test]
 	fn the_header_is_the_size_the_layout_depends_on() {
-		assert_eq!(size_of::<MeshHeader>(), HEADER_BYTES, "sixty-four bytes, exactly");
+		assert_eq!(size_of::<MeshHeader>(), HEADER_BYTES, "eighty bytes, exactly");
 		assert_eq!(align_of::<MeshHeader>(), 4, "and no padding beyond its fields");
 		assert_eq!(HEADER_BYTES % ALIGNMENT, 0, "so the vertex block stays aligned");
 	}
@@ -478,7 +706,11 @@ mod tests {
 		assert_eq!(header.version, FORMAT_VERSION, "and this build's version");
 		assert_eq!(header.vertex_count, 24, "a cube's twenty-four vertices");
 		assert_eq!(header.index_count, 36, "and its thirty-six indices");
-		assert_eq!(header.vertex_offset, 64, "the vertex block follows the header");
+		assert_eq!(
+			header.vertex_offset,
+			u32::try_from(HEADER_BYTES).expect("the header is small"),
+			"the vertex block follows the header"
+		);
 		assert_eq!(
 			header.index_offset,
 			u32::try_from(HEADER_BYTES + 24 * size_of::<MeshVertex>()).expect("a cube is small"),
@@ -535,6 +767,181 @@ mod tests {
 		assert!(
 			error.to_string().contains("not a colby mesh"),
 			"the magic is checked first: {error}"
+		);
+	}
+
+	#[test]
+	fn a_mesh_nothing_moves_carries_no_skin_block_at_all() {
+		let file = MeshFile::from_bytes(AlignedBytes::from_slice(&encoded()))
+			.expect("a cube reads back");
+		let header = file.header();
+
+		assert_eq!(header.skin_count, 0, "a cube is moved by nothing");
+		assert_eq!(header.skin_offset, 0, "so there is no offset to give");
+		assert_eq!(header.skin_stride, 0, "and no entry size either");
+		assert!(file.skin().is_empty(), "and nothing to read");
+	}
+
+	#[test]
+	fn a_skinned_mesh_survives_the_trip_to_bytes_and_back() {
+		let original = skinned();
+		let file = MeshFile::from_bytes(AlignedBytes::from_slice(&skinned_bytes()))
+			.expect("a skinned quad reads back");
+
+		assert_eq!(file.to_mesh_data(), original, "every vertex, index and weight");
+		assert_eq!(
+			file.header().skin_count,
+			file.header().vertex_count,
+			"one entry per vertex, which is the only shape there is"
+		);
+		assert_eq!(file.header().skin_stride, 12, "four shorts and four bytes");
+	}
+
+	#[test]
+	fn the_skin_block_is_borrowed_in_place_like_the_other_two() {
+		let bytes = AlignedBytes::from_slice(&skinned_bytes());
+		let file = MeshFile::from_bytes(bytes).expect("it reads back");
+		let base = file.bytes.as_slice().as_ptr().addr();
+		let skin = file.skin().as_ptr().addr();
+
+		assert_eq!(
+			skin,
+			base + usize::try_from(file.header().skin_offset).expect("a quad is small"),
+			"the skin is the file's own bytes"
+		);
+		assert_eq!(skin % align_of::<SkinVertex>(), 0, "aligned where it sits");
+		assert!(
+			skin > base + usize::try_from(file.header().index_offset).expect("still small"),
+			"and it is the last block, so the two that were always there did not move"
+		);
+	}
+
+	#[test]
+	fn a_mesh_skinned_only_part_of_the_way_through_is_not_written() {
+		let mut half = skinned();
+		half.skin.pop();
+
+		let message = refused(&half);
+
+		assert!(message.contains("skin entries"), "it says what is short: {message}");
+		assert!(
+			message.contains("all the way through"),
+			"and that there is no half measure: {message}"
+		);
+	}
+
+	#[test]
+	fn weights_that_do_not_add_up_to_a_whole_vertex_are_not_written() {
+		let mut light = skinned();
+		light.skin[0].weights[0] = 254;
+
+		assert!(
+			refused(&light).contains("do not add up"),
+			"a vertex pulled by less than one bone's worth would drift towards the origin"
+		);
+
+		let mut heavy = skinned();
+		heavy.skin[0] = SkinVertex {
+			bones: [0, 1, 0, 0],
+			weights: [255, 255, 0, 0],
+		};
+
+		assert!(refused(&heavy).contains("do not add up"), "and so is one pulled by two");
+	}
+
+	#[test]
+	fn a_bone_past_what_any_skeleton_may_hold_is_not_written() {
+		let mut wild = skinned();
+		wild.skin[0].bones[0] = 4000;
+
+		assert!(
+			refused(&wild).contains("past the"),
+			"the mesh does not know its own skeleton, so this is the only bound there is"
+		);
+	}
+
+	#[test]
+	fn a_bone_index_beside_a_weight_of_nothing_is_not_a_claim() {
+		let mut idle = skinned();
+		idle.skin[0].bones[3] = 9000;
+
+		assert!(
+			encode(&idle).is_ok(),
+			"a bone with no weight is never read, so whatever sits beside it means nothing"
+		);
+	}
+
+	#[test]
+	fn a_file_claiming_a_skin_block_it_does_not_hold_is_refused() {
+		let mut bytes = encoded();
+		bytes[SKIN_COUNT_AT..SKIN_COUNT_AT + 4].copy_from_slice(&24_u32.to_le_bytes());
+
+		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("the block is not there");
+
+		assert!(
+			error.to_string().contains("skin entries"),
+			"the stride gives it away first, which is fine: {error}"
+		);
+	}
+
+	#[test]
+	fn a_file_that_says_where_a_skin_is_and_then_that_there_is_none_is_refused() {
+		let mut bytes = encoded();
+		bytes[SKIN_OFFSET_AT..SKIN_OFFSET_AT + 4].copy_from_slice(&256_u32.to_le_bytes());
+
+		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("it contradicts itself");
+
+		assert!(
+			error.to_string().contains("no entries"),
+			"and the message says which half is empty: {error}"
+		);
+	}
+
+	#[test]
+	fn a_skin_written_by_a_build_with_a_different_entry_is_refused() {
+		let mut bytes = skinned_bytes();
+		bytes[SKIN_STRIDE_AT..SKIN_STRIDE_AT + 4].copy_from_slice(&16_u32.to_le_bytes());
+
+		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("sixteen-byte entries are not these");
+
+		assert!(error.to_string().contains("16-byte skin"), "and says so: {error}");
+	}
+
+	#[test]
+	fn weights_garbled_on_disk_are_caught_at_load_rather_than_drawn() {
+		let mut bytes = skinned_bytes();
+		let weights = usize::try_from(
+			MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
+				.expect("it reads before it is broken")
+				.header()
+				.skin_offset,
+		)
+		.expect("a quad is small")
+			+ 8;
+		bytes[weights] = 3;
+
+		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("the first vertex no longer adds up");
+		let message = error.to_string();
+
+		assert!(message.contains("vertex at 0"), "it names the vertex: {message}");
+		assert!(message.contains("255"), "and what the sum should have been: {message}");
+	}
+
+	#[test]
+	fn a_word_the_header_has_no_meaning_for_yet_is_refused() {
+		let mut bytes = encoded();
+		bytes[RESERVED_AT..RESERVED_AT + 4].copy_from_slice(&1_u32.to_le_bytes());
+
+		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("something is in a word that means nothing");
+
+		assert!(
+			error.to_string().contains("no meaning yet"),
+			"the same rule the flags word follows: {error}"
 		);
 	}
 

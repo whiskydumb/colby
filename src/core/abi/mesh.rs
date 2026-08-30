@@ -111,6 +111,96 @@ impl MeshVertex {
 	}
 }
 
+/// How many bones may move one vertex.
+///
+/// Four, which is what the exchange format allows in one set and what every
+/// tool exports by default. A file wanting more says so with a second set, and
+/// colby refuses that rather than reading half of it: the cost of the fifth
+/// bone is a wider vertex for every character in the world, and no rig this
+/// engine is aimed at needs one.
+pub const BONES_PER_VERTEX: usize = 4;
+
+/// What a vertex adds when the mesh it belongs to is moved by bones.
+///
+/// A second, optional block rather than four more fields on [`MeshVertex`].
+/// The reason is that almost no mesh is skinned: a world of crates and walls
+/// would pay twelve bytes a vertex for something none of them uses, and the
+/// GPU would read it. Kept apart, a skinned mesh binds one more vertex buffer
+/// and a static one binds nothing extra.
+///
+/// @note: `#[repr(C)]` and `Pod` for the same reason [`MeshVertex`] is - these
+/// are the bytes the file holds and the bytes the vertex buffer holds, and
+/// there is nothing in between.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+pub struct SkinVertex {
+	/// Which bones move this vertex, as indices into its skeleton.
+	///
+	/// A bone whose weight is zero is not read, so the index beside it means
+	/// nothing and is conventionally zero.
+	pub bones: [u16; BONES_PER_VERTEX],
+
+	/// How much each of them moves it, as a fraction of 255.
+	///
+	/// Eight bits rather than a float, which is what the exchange format
+	/// offers and what the tools that write it settled on: the visible
+	/// difference is a fifth of a percent of one bone's pull, and the vertex is
+	/// twelve bytes instead of twenty-four.
+	///
+	/// **They sum to exactly 255**, @ref [`Self::is_sound`]. The sum being one
+	/// is what makes a skinned vertex land on the surface rather than
+	/// somewhere between it and the origin.
+	pub weights: [u8; BONES_PER_VERTEX],
+}
+
+impl SkinVertex {
+	/// What the weights of one vertex must add up to.
+	///
+	/// The whole of it, expressed in the fractions the weights are stored in.
+	pub const WHOLE: u16 = 255;
+
+	/// A vertex carried by one bone and nothing else.
+	///
+	/// What a rigid piece bolted to a bone looks like, and the only skinning a
+	/// mesh built out of boxes has.
+	///
+	/// @param bone - the index of the bone that moves it
+	#[must_use]
+	pub const fn rigid(bone: u16) -> Self {
+		Self {
+			bones: [bone, 0, 0, 0],
+			weights: [255, 0, 0, 0],
+		}
+	}
+
+	/// What this vertex's weights add up to.
+	#[must_use]
+	pub fn total(&self) -> u16 { self.weights.iter().copied().map(u16::from).sum() }
+
+	/// Whether the weights add up to the whole of one vertex.
+	///
+	/// Checked where geometry enters the process rather than where it is
+	/// drawn, exactly like [`MeshData::indices_are_in_range`]: the GPU would
+	/// happily draw the wrong answer, and the wrong answer is a character with
+	/// a limb sucked towards the origin.
+	#[must_use]
+	pub fn is_sound(&self) -> bool { self.total() == Self::WHOLE }
+
+	/// Whether every bone this vertex actually reads is below a bound.
+	///
+	/// A bone whose weight is zero is not read, so whatever index sits beside
+	/// it is not a claim about anything and is not checked.
+	///
+	/// @param bones - how many bones there are to name
+	#[must_use]
+	pub fn bones_below(&self, bones: usize) -> bool {
+		self.bones
+			.iter()
+			.zip(self.weights)
+			.all(|(bone, weight)| weight == 0 || usize::from(*bone) < bones)
+	}
+}
+
 /// A mesh as plain data, before it reaches the GPU.
 ///
 /// Indices are `u32` rather than `u16`. Sixteen bits is enough for everything
@@ -124,6 +214,13 @@ pub struct MeshData {
 	/// Three indices per triangle, each addressing
 	/// [`vertices`](Self::vertices).
 	pub indices: Vec<u32>,
+
+	/// What moves each vertex, or empty for a mesh nothing moves.
+	///
+	/// Either empty or exactly as long as [`vertices`](Self::vertices); there
+	/// is no such thing as a partly skinned mesh, because the vertex a shader
+	/// reads has to be one shape or the other. @ref [`Self::skin_fits`].
+	pub skin: Vec<SkinVertex>,
 }
 
 impl MeshData {
@@ -165,6 +262,42 @@ impl MeshData {
 		let count = u32::try_from(self.vertices.len()).unwrap_or(0);
 
 		self.indices.iter().all(|index| *index < count)
+	}
+
+	/// Whether bones move this mesh at all.
+	#[must_use]
+	pub const fn is_skinned(&self) -> bool { !self.skin.is_empty() }
+
+	/// Whether the skin block, if there is one, covers every vertex.
+	///
+	/// There is no partly skinned mesh: a vertex the shader reads is one shape
+	/// or the other, so the block is either absent or exactly as long as the
+	/// vertices beside it.
+	#[must_use]
+	pub const fn skin_fits(&self) -> bool {
+		self.skin.is_empty() || self.skin.len() == self.vertices.len()
+	}
+
+	/// Whether every vertex is pulled by a whole bone's worth of weight.
+	///
+	/// True of a mesh with no skin at all, which is pulled by nothing and is
+	/// therefore not wrong.
+	#[must_use]
+	pub fn weights_are_whole(&self) -> bool { self.skin.iter().all(SkinVertex::is_sound) }
+
+	/// Whether every bone a vertex names could be a bone.
+	///
+	/// The mesh does not know which skeleton moves it - that pairing is the
+	/// model's - so the only bound available here is the one no skeleton may
+	/// exceed. It catches a garbled index rather than a merely wrong one.
+	///
+	/// @param bones - how many bones the skeleton has, or
+	/// [`MAX_BONES`](super::skeleton::MAX_BONES) when nothing more is known
+	#[must_use]
+	pub fn bones_are_in_range(&self, bones: usize) -> bool {
+		self.skin
+			.iter()
+			.all(|vertex| vertex.bones_below(bones))
 	}
 }
 
@@ -389,6 +522,7 @@ pub fn cube() -> MeshData {
 	let mut mesh = MeshData {
 		vertices: Vec::with_capacity(CUBE_FACES.len() * FACE_CORNERS.len()),
 		indices: Vec::with_capacity(CUBE_FACES.len() * 6),
+		skin: Vec::new(),
 	};
 
 	for (normal, right, up) in CUBE_FACES {
@@ -423,6 +557,7 @@ pub fn sphere() -> MeshData {
 	let mut mesh = MeshData {
 		vertices: Vec::with_capacity((SPHERE_RINGS + 1) * (SPHERE_SEGMENTS + 1)),
 		indices: Vec::with_capacity(SPHERE_RINGS * SPHERE_SEGMENTS * 6),
+		skin: Vec::new(),
 	};
 
 	let rings = fraction(SPHERE_RINGS);
@@ -527,6 +662,7 @@ mod tests {
 				.map(|(position, uv)| MeshVertex::new(*position, Vec3::Y, *uv))
 				.collect(),
 			indices: (0..u32::try_from(corners.len()).expect("the fixture is small")).collect(),
+			skin: Vec::new(),
 		}
 	}
 
@@ -624,6 +760,7 @@ mod tests {
 				MeshVertex::new(Vec3::X, Vec3::Y, Vec2::new(0.0, tiny)),
 			],
 			indices: vec![0, 1, 2, 0, 3, 4],
+			skin: Vec::new(),
 		};
 
 		tangents(&mut mesh);
@@ -998,5 +1135,74 @@ mod tests {
 		mesh.indices[0] = 99;
 
 		assert!(!mesh.indices_are_in_range(), "and one past the end is caught");
+	}
+
+	#[test]
+	fn a_vertex_carried_by_one_bone_adds_up_to_a_whole_one() {
+		let rigid = SkinVertex::rigid(7);
+
+		assert_eq!(rigid.bones[0], 7, "the bone it hangs off");
+		assert_eq!(rigid.total(), SkinVertex::WHOLE, "and all of the pull is that bone's");
+		assert!(rigid.is_sound());
+	}
+
+	#[test]
+	fn a_zeroed_skin_entry_is_not_a_usable_one() {
+		let nothing = SkinVertex::default();
+
+		assert_eq!(nothing.total(), 0, "nothing pulls it");
+		assert!(
+			!nothing.is_sound(),
+			"which matters because a resized vector is full of these, and a vertex nothing \
+			 pulls collapses to the origin rather than staying where it was drawn"
+		);
+	}
+
+	#[test]
+	fn four_bones_may_share_one_vertex_between_them() {
+		let shared = SkinVertex {
+			bones: [0, 1, 2, 3],
+			weights: [64, 64, 64, 63],
+		};
+
+		assert!(shared.is_sound(), "255 does not divide by four, so one of them carries less");
+	}
+
+	#[test]
+	fn a_mesh_is_skinned_all_the_way_through_or_not_at_all() {
+		let mut mesh = quad();
+
+		assert!(!mesh.is_skinned(), "a generated quad is moved by nothing");
+		assert!(mesh.skin_fits(), "and no skin fits every mesh");
+
+		mesh.skin = vec![SkinVertex::rigid(0); mesh.vertices.len()];
+
+		assert!(mesh.is_skinned());
+		assert!(mesh.skin_fits(), "one entry per vertex");
+
+		mesh.skin.pop();
+
+		assert!(!mesh.skin_fits(), "and one short is not a partly skinned mesh, it is broken");
+	}
+
+	#[test]
+	fn a_bone_nothing_weighs_on_is_never_read_and_so_is_never_wrong() {
+		let idle = SkinVertex {
+			bones: [1, 9000, 9000, 9000],
+			weights: [255, 0, 0, 0],
+		};
+
+		assert!(idle.bones_below(2), "only the bone with weight behind it is a claim");
+		assert!(!idle.bones_below(1), "and that one is checked");
+	}
+
+	#[test]
+	fn bones_are_checked_against_the_skeleton_that_would_move_them() {
+		let mut mesh = quad();
+		mesh.skin = vec![SkinVertex::rigid(3); mesh.vertices.len()];
+
+		assert!(mesh.bones_are_in_range(4), "bone three is there in a skeleton of four");
+		assert!(!mesh.bones_are_in_range(3), "and is not in a skeleton of three");
+		assert!(quad().bones_are_in_range(0), "a mesh with no skin names no bones");
 	}
 }

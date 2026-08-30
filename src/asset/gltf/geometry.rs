@@ -254,6 +254,7 @@ impl Build<'_> {
 				})
 				.collect(),
 			indices: self.indices(entry, count)?,
+			skin: Vec::new(),
 		};
 
 		if !data.indices.len().is_multiple_of(3) {

@@ -753,6 +753,10 @@ fn is_stale(source: &Path, output: &Path, root: &Path) -> bool {
 		return true;
 	}
 
+	if kind == Kind::Model && beside_is_stale(output) {
+		return true;
+	}
+
 	if mtime(source)
 		.ok()
 		.is_none_or(|edited| edited >= built)
@@ -771,6 +775,31 @@ fn is_stale(source: &Path, output: &Path, root: &Path) -> bool {
 				.ok()
 				.is_none_or(|edited| edited >= built)
 		})
+}
+
+/// Whether anything a model wrote beside its own file is in an old format.
+///
+/// A model is the one source that writes more than one output, and the check
+/// above is handed only the first of them. Its meshes and its pictures are
+/// ordinary assets in a directory named after it, so a bump to `.cmesh` or
+/// `.ctex` leaves them behind - and being left behind here is not a stale
+/// picture, it is a file the loader refuses outright and a model standing on
+/// nothing.
+///
+/// @param output - the `.cmodel` the model was compiled into
+/// @return whether it has to be built again for its neighbors' sake
+fn beside_is_stale(output: &Path) -> bool {
+	// no directory at all is a model with neither geometry nor pictures of its
+	// own, which is unusual and is not a reason to rebuild it.
+	let Ok(entries) = fs::read_dir(output.with_extension("")) else {
+		return false;
+	};
+
+	entries.flatten().any(|entry| {
+		let path = entry.path();
+
+		Kind::of_output(&path).is_some_and(|kind| kind.version_of(&path) != Some(kind.version()))
+	})
 }
 
 /// Everything besides the source itself that an output was built out of.
@@ -1474,6 +1503,44 @@ mod model_tests {
 		)
 		.expect("the model reads")
 		.to_model_data()
+	}
+
+	#[test]
+	fn a_model_is_rebuilt_when_a_file_it_wrote_beside_itself_is_left_behind() {
+		let dir = workspace("stale-beside");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		run(&dir, false);
+
+		// only the .cmodel carries the model format's own version, so a bump
+		// to .cmesh or .ctex is invisible from it. Push one of its meshes back
+		// a version, which is what every model in a tree looks like the day
+		// the mesh format moves.
+		let mesh = fs::read_dir(output_root(&dir).join("models").join("lamp"))
+			.expect("the directory is there")
+			.flatten()
+			.map(|entry| entry.path())
+			.find(|path| Kind::of_output(path) == Some(Kind::Mesh))
+			.expect("the model wrote at least one mesh");
+		let mut bytes = fs::read(&mesh).expect("the mesh is there");
+		bytes[8..12].copy_from_slice(&(format::FORMAT_VERSION - 1).to_le_bytes());
+		fs::write(&mesh, &bytes).expect("and is rewritten as an older format");
+
+		let report = run(&dir, false);
+
+		assert_eq!(
+			report.compiled.len(),
+			1,
+			"the model is stale because something it wrote is, and nothing else says so"
+		);
+		assert_eq!(
+			MeshFile::open(&mesh)
+				.expect("and reads back")
+				.header()
+				.version,
+			format::FORMAT_VERSION,
+			"as this build's version"
+		);
 	}
 
 	#[test]
