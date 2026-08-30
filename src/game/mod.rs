@@ -45,19 +45,6 @@ mod_dtor! {}
 /// under a running process, exactly as the props do.
 const MAP_SCENE: &str = "scenes/construct";
 
-/// How many times the floor's image repeats across it.
-///
-/// The cube's own coordinates run zero to one whatever it is scaled to, so a
-/// fifty unit slab shows one tile stretched across fifty units without this.
-/// Nineteen over fifty by forty-four is about two and a half units a tile.
-///
-/// It is square because `uv_scale` is one number a side and a cube's six faces
-/// do not agree about which world axis each side is: matching one face exactly
-/// stretches the rest. Every other surface in the map is a flat color, where
-/// the question does not arise. @ref `colby-sandbox-brief` for what the
-/// expensive answer would be.
-const MAP_TILES: f32 = 19.0;
-
 /// Where the player stands when the scene is put back.
 ///
 /// In the yard, south of the hangar, with the props beside it and the camera
@@ -107,15 +94,44 @@ const START_ORBIT: (f32, f32, f32) = (3.6, 0.35, 9.0);
 /// The color of the box the player is.
 const PLAYER_COLOR: Vec3 = Vec3::new(0.30, 0.85, 0.55);
 
-/// The image the floor is made of.
-const FLOOR_TEXTURE: &str = "textures/tiles";
-
-/// The normal map over it, which is what makes the grout look sunk rather than
-/// painted on.
+/// What the map's five surfaces are made of, and how many times each repeats.
 ///
-/// Compiled as numbers rather than as a color because its name ends in
-/// `_normal` - the whole of the rule is in `colby_asset::compile`.
-const FLOOR_NORMALS: &str = "textures/tiles_normal";
+/// The material name, the texture's own name and the tiling, in one table
+/// because they are one decision.
+///
+/// **The tilings are worked out from the surface each material is mostly on**,
+/// because `uv_scale` is per material and a cube's own coordinates run zero to
+/// one whatever it is scaled to. The floor is one slab fifty by forty-four, so
+/// nineteen is about two and a half units a tile; the hangar's walls are
+/// eighteen by six, so six is about a unit a band; the platforms are four to
+/// six across, so three is about a unit and a half. Everything smaller that
+/// shares a material is therefore denser, which is the cost of the cheap answer
+/// and is named in `colby-sandbox-brief`.
+const SURFACES: [(&str, &str, f32); 5] = [
+	("construct/floor", "textures/construct/floor", 19.0),
+	("construct/wall", "textures/construct/wall", 6.0),
+	("construct/metal", "textures/construct/metal", 8.0),
+	("construct/trim", "textures/construct/trim", 10.0),
+	("construct/platform", "textures/construct/wood", 3.0),
+];
+
+/// How rough each of them is, in the order above.
+///
+/// All five are dielectrics. There is no environment map, so a real metal is a
+/// dark shape with one bright edge on it, and the mezzanine reads better as
+/// painted steel than as steel. @ref `colby-known-gaps`.
+const SURFACE_ROUGHNESS: [f32; 5] = [0.75, 0.85, 0.45, 0.6, 0.7];
+
+/// What a texture's normal map is called, given the texture.
+///
+/// The only rule in the project decided by a file's name: a `.png` whose stem
+/// ends in this is compiled as numbers rather than as a color, which is a
+/// different texel layout and a different mip filter. One compiled as a color
+/// is a map whose every mip level leans the same way.
+const NORMALS: &str = "_normal";
+
+/// How rough a surface is when nothing says otherwise.
+const ROUGH: f32 = 0.7;
 
 /// The model the scene stands in the far corner.
 ///
@@ -2522,38 +2538,32 @@ fn stand_model(world: &mut World) {
 /// nothing else: what each piece of the map is made of is written in
 /// `construct.scene` as a name.
 fn dress(world: &mut World) {
-	// asked for by name. The registry answers with a handle the game keeps for
-	// this load only - resolving again next time costs nothing and means an
-	// asset that arrived late is still found.
-	let tiles = world.textures.find(FLOOR_TEXTURE);
-	let tile_normals = world.textures.find(FLOOR_NORMALS);
-
 	// materials are the game's own table, so they are declared here rather than
 	// imported from anywhere. Registering by name is idempotent: a reload finds
-	// the same handles and overwrites the same entries.
-	world.materials.insert(
-		"construct/floor",
-		Material::textured(tiles)
-			.bumped(tile_normals)
-			.finished(0.0, 0.75)
-			.tiled(MAP_TILES),
-	);
-	world
-		.materials
-		.insert("construct/wall", Material::DEFAULT.finished(0.0, 0.85));
-	// a polished dielectric rather than a metal, which is the same call the
-	// demo's crystal made and for the same reason: there is no environment map,
-	// so a real metal is a dark shape with one bright edge on it. @ref
-	// `colby-known-gaps`.
-	world
-		.materials
-		.insert("construct/metal", Material::DEFAULT.finished(0.0, 0.45));
-	world
-		.materials
-		.insert("construct/trim", Material::DEFAULT.finished(0.0, 0.6));
-	world
-		.materials
-		.insert("construct/platform", Material::DEFAULT.finished(0.0, 0.7));
+	// the same handles and overwrites the same entries, so a texture that
+	// arrived since the last swap is picked up by this one.
+	for (index, &(material, texture, tiles)) in SURFACES.iter().enumerate() {
+		// asked for by name, and a name the registry does not answer to is not
+		// an error: `NONE` samples one white texel and `bumped` turns it into
+		// the flat map, so a surface whose picture has not been compiled is the
+		// flat color it would have been anyway.
+		let albedo = world.textures.find(texture);
+		let normals = world
+			.textures
+			.find(&format!("{texture}{NORMALS}"));
+		let roughness = SURFACE_ROUGHNESS
+			.get(index)
+			.copied()
+			.unwrap_or(ROUGH);
+
+		world.materials.insert(
+			material,
+			Material::textured(albedo)
+				.bumped(normals)
+				.finished(0.0, roughness)
+				.tiled(tiles),
+		);
+	}
 
 	let plastic = world
 		.materials

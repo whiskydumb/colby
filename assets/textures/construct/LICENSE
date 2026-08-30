@@ -1,0 +1,41 @@
+The images beside this file - floor.png, wall.png, metal.png, trim.png,
+wood.png and the *_normal.png maps generated from them - come from the FoxTex
+texture pack and are used under CC0 1.0 Universal (Public Domain Dedication).
+
+    Pack:   FoxTex
+    Author: Foxhead
+    Source: https://foxh3ad.itch.io/foxtexcom
+
+Where the CC0 claim comes from, honestly: the pack itself carries no license
+text anywhere in it. The author confirmed CC0 in a reply to a question on the
+download page around the middle of 2026 and said the page information would be
+updated. If the page now states it, cite the page here and delete this
+paragraph; if it does not, this paragraph is the evidence and should stay.
+
+The full CC0 1.0 legal code is at:
+
+    https://creativecommons.org/publicdomain/zero/1.0/legalcode
+
+CC0 1.0 in short: the person who associated a work with this deed has dedicated
+it to the public domain by waiving all of their rights to the work worldwide
+under copyright law, including all related and neighboring rights, to the
+extent allowed by law. The work can be copied, modified, distributed and
+performed, even for commercial purposes, all without asking permission.
+
+The *_normal.png files are not the author's work. They were generated from the
+albedo images in this directory, in three steps, and the recipe is written down
+because nothing downstream can tell a measured normal from a guessed one:
+
+  1. the luminance is thresholded into a height field, with everything more
+     than 2.2 standard deviations below the image's own mean counting as fully
+     deep and everything less than 0.8 below it counting as flat. That is the
+     step that matters: using luminance *directly* as a height turns every
+     speck of the albedo's mottling into a facet, and the first attempt at
+     these did exactly that - fourteen times the per-pixel variation of a map
+     that worked;
+  2. the height is blurred by two to three pixels, which is what turns a step
+     into a bevel;
+  3. the gradient is taken, wrapping at the edges because these textures tile.
+
+It is a guess about shape made from a photograph of color, and it is right only
+in so far as darker means deeper on these particular surfaces.

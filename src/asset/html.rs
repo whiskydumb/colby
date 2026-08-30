@@ -15,8 +15,8 @@
 //! - **`<script>`** holds Lua, kept verbatim and handed to the host to run;
 //!   **`<script src="hud.lua">`** names a file beside the document and is
 //!   resolved by the compiler the same way a `<link>` is. @ref [`scripts`].
-//! - **`<img src="textures/tiles">`** draws a texture, by the name it is
-//!   registered under. The one part of the interface that was already free.
+//! - **`<img src="textures/construct/floor">`** draws a texture, by the name it
+//!   is registered under. The one part of the interface that was already free.
 //! - **`<body>`** at the top level, if there is one, is the root itself rather
 //!   than a box inside it.
 //! - anything else is a box. `div`, `span`, `button`, `p` - the tag is not
