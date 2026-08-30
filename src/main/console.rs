@@ -144,6 +144,11 @@ pub(crate) fn install(world: &mut World) {
 	world
 		.cvars
 		.command("sim.step", step, "run this many simulation steps, paused or not");
+	world.cvars.var(
+		crate::mode::EDIT,
+		Value::Bool(false),
+		"edit the world instead of playing it; stopping puts back what play started from",
+	);
 
 	world.cvars.var(
 		crate::app::GRAVITY,

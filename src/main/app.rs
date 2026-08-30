@@ -35,7 +35,7 @@ use colby_ui::Interface;
 
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
-use crate::{assets::Assets, console::Console, game::Game, input, step};
+use crate::{assets::Assets, console::Console, game::Game, input, mode::Mode, step};
 
 /// The window title.
 const TITLE: &str = "colby";
@@ -80,6 +80,9 @@ pub(crate) struct App {
 	/// would leave that pointer behind. @ref `colby_physics`.
 	simulation: Box<Simulation>,
 	assets: Assets,
+	/// Whether the world is being played or edited, and the world play started
+	/// from. @ref `crate::mode`.
+	mode: Mode,
 	console: Option<Console>,
 	#[cfg(feature = "editor")]
 	editor: Option<Editor>,
@@ -119,6 +122,7 @@ impl App {
 			scripts: None,
 			simulation,
 			assets: Assets::new(&crate::workspace()),
+			mode: Mode::new(),
 			console: None,
 			#[cfg(feature = "editor")]
 			editor: None,
@@ -330,6 +334,13 @@ impl App {
 		// saw. @ref `crate::saves`.
 		crate::saves::serve(&mut self.world, &mut self.simulation);
 
+		// and the mode's own edge, in the same place and for the same reason:
+		// stopping play replaces every table in the world, so it happens
+		// between steps rather than inside one.
+		let editing = crate::mode::wanted(&self.world);
+		self.mode
+			.follow(&mut self.world, &mut self.simulation, editing);
+
 		// whatever the console asked for on top of real time. Taken rather than
 		// read: an owed step is owed once. Clamped because the field is a public
 		// one, and a game that writes four billion into it should cost a wrong
@@ -375,18 +386,25 @@ impl App {
 		while let Some(time) = self.clock.step() {
 			step::run(
 				&mut self.world,
-				self.game.as_mut(),
-				&mut self.interface,
-				self.scripts.as_mut(),
-				&mut self.simulation,
+				step::Parts {
+					game: self.game.as_mut(),
+					interface: &mut self.interface,
+					scripts: self.scripts.as_mut(),
+					simulation: self.simulation.as_mut(),
+				},
 				&mut self.input,
 				time,
+				editing,
 			);
 		}
 
 		self.frames = self.frames.saturating_add(1);
-		self.world
-			.set_interpolation(self.clock.interpolation());
+		// the mode has a say in this: a world being edited is drawn as it
+		// stands rather than blended. @ref `Mode::interpolation`.
+		self.world.set_interpolation(
+			self.mode
+				.interpolation(self.clock.interpolation()),
+		);
 
 		// the interface is laid out again here rather than reused from the step:
 		// the window may have been resized since, and a document that is a share
@@ -503,6 +521,11 @@ impl App {
 			| NamedKey::Escape => event_loop.exit(),
 			#[cfg(feature = "editor")]
 			| NamedKey::F1 => Editor::toggle(&mut self.world),
+			// under the same feature as F1, and for the same reason: play and
+			// stop is a tool's gesture. A build with no editor in it still has
+			// the variable, and nothing in it presses this.
+			#[cfg(feature = "editor")]
+			| NamedKey::F5 => crate::mode::toggle(&mut self.world),
 			| _ => {},
 		}
 	}

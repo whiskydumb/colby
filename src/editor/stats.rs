@@ -27,6 +27,14 @@ pub(crate) fn show(context: &Context, world: &World, clock: &Clock, frames: u64)
 				1.0 / seconds.max(1.0e-6),
 				seconds * 1000.0
 			));
+			// which mode, said first and said plainly: everything else in this
+			// window is a number that means something different depending on
+			// it, starting with the two that stop moving.
+			ui.label(if world.editing {
+				"editing. F5 plays, and stopping puts this world back"
+			} else {
+				"playing. F5 stops, and comes back to the world it started from"
+			});
 			ui.separator();
 
 			Grid::new("numbers")

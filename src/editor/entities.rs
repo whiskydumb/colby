@@ -1,11 +1,20 @@
 //! The entity table, and one entity at a time in detail.
 //!
 //! The interesting part is not the list, it is what happens when a number is
-//! dragged: the editor writes the transform and then calls
-//! `Entities::snap`, because an entity moved by a person is a teleport and not
-//! a journey. Without that the thing being dragged would smear across the gap
-//! every frame, which is the same rule gameplay follows and the reason it is a
-//! rule rather than a special case.
+//! dragged. This panel writes a transform once a *frame*, and the renderer
+//! draws somewhere between the last two *steps* - so the two disagree, and the
+//! answer depends on which mode the world is in.
+//!
+//! - **Editing**: nothing is being simulated, so the host pins the blend to the
+//!   present and what is written is what is drawn. The panel does nothing about
+//!   it.
+//! - **Playing**: the blend is real, so a written transform is drawn sliding
+//!   out of wherever the last step left it. `Entities::snap` is what says the
+//!   entity was moved rather than that it traveled - the same call gameplay
+//!   makes for a teleport, for the same reason.
+//!
+//! So the snap below is for the second case, and the first case needed no
+//! mechanism at all. @ref `colby_core::abi::World::editing`.
 
 use colby_core::{
 	abi::{EntityId, World},
@@ -112,16 +121,23 @@ impl Inspector {
 				*held = edited;
 			}
 
-			// dragged, not traveled: without this the entity is drawn sliding
-			// from where it was to where the mouse put it, every frame the
-			// mouse moves. @ref `Entities::snap`.
+			// dragged, not traveled. Only play mode blends at all, so this is
+			// only about that one - and it costs nothing to say it in both.
+			// @ref the module docs.
 			world.entities.snap(id);
 		}
 
 		Self::tint(ui, world, id);
 
 		ui.separator();
-		ui.label("`sim.pause 1` first, or the game writes these back every step");
+		// the honest answer to "why did my drag not stick", which used to be a
+		// workaround written on the panel and is now a mode. @ref
+		// `colby_core::abi::World::editing`.
+		ui.label(if world.editing {
+			"editing, so these are yours"
+		} else {
+			"playing, so the game may write these back every step. F5 to edit"
+		});
 	}
 
 	/// The selected entity's own color.

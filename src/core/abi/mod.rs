@@ -73,7 +73,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 24;
+pub const ABI_VERSION: u32 = 25;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -156,6 +156,21 @@ pub struct World {
 	/// How many times the game module has been swapped in. Host-written, and
 	/// the game's cue that it is looking at state an older build left behind.
 	pub reloads: u32,
+
+	/// Whether the world is being edited rather than played. Host-written.
+	///
+	/// While this is set the host does not call the game's `update` at all and
+	/// does not step the solver, so nothing here moves except what a person
+	/// moves. It is exposed anyway, for two reasons. A game that draws
+	/// something from outside `update` - a console command, a script handler -
+	/// can tell which it is. And every engine with an editor publishes the
+	/// same fact under some name, because gameplay code that runs at authoring
+	/// time eventually needs to know that it is.
+	///
+	/// The step still runs: input, the interface, its scripts and the debug
+	/// table's sweep all happen, so time goes on and what is drawn over the
+	/// world stays fresh.
+	pub editing: bool,
 
 	/// The window's width divided by its height. Host-written; the renderer
 	/// uses it so that a shape does not stretch with the window.
@@ -324,6 +339,7 @@ impl World {
 			steps: 0,
 			reloads: 0,
 			aspect: 1.0,
+			editing: false,
 			input: Input::default(),
 			camera: Camera::DEFAULT,
 			clear: Vec3::ZERO,

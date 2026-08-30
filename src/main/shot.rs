@@ -126,12 +126,18 @@ pub(crate) fn take(path: &Path) -> Result {
 
 		step::run(
 			&mut world,
-			Some(&mut game),
-			&mut interface,
-			Some(&mut scripts),
-			&mut simulation,
+			step::Parts {
+				game: Some(&mut game),
+				interface: &mut interface,
+				scripts: Some(&mut scripts),
+				simulation: simulation.as_mut(),
+			},
 			&mut input,
 			time,
+			// a screenshot always plays. There is no console in this path to
+			// ask for anything else, and a picture of a world nobody stepped
+			// is not what `--shot` is for.
+			false,
 		);
 	}
 
