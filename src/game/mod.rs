@@ -199,10 +199,7 @@ const PROPS: usize = 5;
 /// does not reach and one the solver does not move.
 const PROPS_SCENE: &str = "scenes/props";
 
-/// Where the rope is tied when there is no scene to say.
-const HOOK: Vec3 = Vec3::new(5.20, 4.00, -5.40);
-
-/// How big the cross marking the rope's hook is, in world units.
+/// How big the cross marking a joint's far anchor is, in world units.
 const HOOK_SIZE: f32 = 0.08;
 
 /// The layer the map is on.
@@ -315,6 +312,59 @@ const MUZZLE_AT: (f32, f32) = (0.3, 0.45);
 /// How big the cross marking where the beam is attached is.
 const MUZZLE_MARK: f32 = 0.09;
 
+/// The five things the toolgun does, in the order the number keys pick them.
+///
+/// Chosen so that between them they drive every joint the engine has and every
+/// verb the sandbox already grew: a weld and a hinge are the two joint kinds
+/// nothing had ever made, a rope is the one the demo made by hand, and the last
+/// two are the console's `game.remove` and `game.freeze` with a crosshair in
+/// front of them.
+const TOOLS: [&str; 5] = ["weld", "hinge", "rope", "remover", "freeze"];
+
+/// Which of them is which.
+const WELD: u32 = 0;
+/// @ref [`TOOLS`].
+const HINGE: u32 = 1;
+/// @ref [`TOOLS`].
+const ROPE: u32 = 2;
+/// @ref [`TOOLS`].
+const REMOVER: u32 = 3;
+/// @ref [`TOOLS`].
+const FREEZE: u32 = 4;
+
+/// Which gun is in the hands: the one that carries, or the one with modes.
+const PHYSGUN: u32 = 0;
+/// @ref [`PHYSGUN`].
+const TOOLGUN: u32 = 1;
+
+/// How stiff a weld the toolgun makes is, in hertz.
+///
+/// Soft rather than rigid, and it is the second thing the spring was added for.
+/// A rigid weld takes a fifth of its error out every step whatever that costs,
+/// and the sandbox's ordinary case is welding two props that are *not*
+/// touching, so a rigid one yanks them together hard enough to knock over
+/// whatever they were standing on.
+///
+/// **Small, because stiffness passes rigid on the way up rather than
+/// approaching it.** The rigid path corrects by a tuned Baumgarte fifth; a
+/// spring's own bias is derived and climbs towards one, so it overtakes the
+/// rigid path at about seven hertz. Measured across a unit of gap: rigid yanks
+/// at twelve units a second and arrives in ten steps, this yanks at five and a
+/// half and arrives in seventeen, and twenty hertz yanks at *more* than rigid.
+const WELD_STIFFNESS: f32 = 3.5;
+
+/// How quickly that weld stops ringing.
+const WELD_DAMPING: f32 = 1.4;
+
+/// What the first half of a two-click tool is marked with.
+const PENDING_COLOR: Vec3 = Vec3::new(1.0, 0.45, 0.15);
+
+/// How big that mark is.
+const PENDING_MARK: f32 = 0.12;
+
+/// What a joint is drawn in.
+const JOINT_COLOR: Vec3 = Vec3::new(1.0, 0.9, 0.1);
+
 /// What whatever the crosshair is on is outlined in.
 ///
 /// Drawn rather than tinted, for the reason a frozen prop is: what a prop was
@@ -426,6 +476,9 @@ struct State {
 	/// is built without bytemuck, so nothing holding one can be.
 	picked_at: [f32; 3],
 
+	/// Which way the surface faced there, which is a hinge's axis.
+	picked_normal: [f32; 3],
+
 	/// The joint carrying whatever the gun is holding, or nothing.
 	///
 	/// The gun *is* this joint: there is no second mechanism, no controller and
@@ -450,6 +503,21 @@ struct State {
 	/// what makes carrying one feel like carrying rather than like aiming.
 	hold_yaw: f32,
 
+	/// Which gun is in the hands. @ref [`PHYSGUN`].
+	gun: u32,
+
+	/// Which of [`TOOLS`] the toolgun is set to.
+	tool: u32,
+
+	/// The body a two-click tool is waiting on, or nothing.
+	tool_first: BodyId,
+
+	/// Where on it the first click landed, in the world.
+	tool_at: [f32; 3],
+
+	/// Which way the surface faced there, for a hinge's axis.
+	tool_normal: [f32; 3],
+
 	/// One entity per piece of the model standing in the yard.
 	///
 	/// Spawned once and never moved, so it is the one thing in this scene the
@@ -462,7 +530,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 15;
+const STATE_LAYOUT: u64 = 16;
 
 /// The module's single exported symbol.
 ///
@@ -502,6 +570,10 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	let (state, fresh) = world.state.get::<State>(STATE_LAYOUT);
 	if fresh {
 		(state.yaw, state.pitch, state.distance) = START_ORBIT;
+		// said rather than relied on: a fresh arena is zeroed, and zero happens
+		// to be both guns' and the first tool's number.
+		state.gun = PHYSGUN;
+		state.tool = WELD;
 
 		// the arena was reset, so the handles it held are gone. Anything the
 		// old build spawned would be orphaned; clear the table and start over.
@@ -565,6 +637,16 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		"game.spawn",
 		put_one,
 		"drop a prop in front of the player, by the name the menu shows",
+	);
+	world.cvars.command(
+		"game.tool",
+		pick_tool,
+		"put the toolgun in hand and set it, or list the modes",
+	);
+	world.cvars.command(
+		"game.apply",
+		use_it,
+		"use the toolgun on a named body, or on whatever the crosshair is on",
 	);
 
 	// on every load, not only a fresh one: the mesh a name resolves to is the
@@ -655,11 +737,12 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 
 	relay_map(world);
 	relay_props(world);
-	rope_line(world);
+	draw_joints(world);
 	swallow(world);
 	pick(world);
 	physgun(world, yaw);
 	freezer(world);
+	toolgun(world);
 	outline_frozen(world);
 	outline_picked(world);
 	duplicate(world, yaw);
@@ -1145,6 +1228,7 @@ fn pick(world: &mut World) {
 	// the ray landed on, which is what makes carrying a long prop by its end
 	// behave like carrying it by its end.
 	state.picked_at = result.end.to_array();
+	state.picked_normal = result.normal.to_array();
 	let state = *state;
 
 	if moved {
@@ -1174,12 +1258,14 @@ fn pick(world: &mut World) {
 fn physgun(world: &mut World, yaw: f32) {
 	let over_interface = world.ui.pointer_over();
 	let input = world.input;
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let carrying = state.gun == PHYSGUN;
 
-	if input.button_pressed(Button::Left) && !over_interface {
+	if carrying && input.button_pressed(Button::Left) && !over_interface {
 		grab(world, yaw, "");
 	}
 
-	if input.button_released(Button::Left) {
+	if carrying && input.button_released(Button::Left) {
 		release(world);
 	}
 
@@ -1376,6 +1462,228 @@ fn carry(world: &mut World, yaw: f32) {
 
 	world.debug.line(muzzle, grip, debug::CYAN);
 	world.debug.point(grip, MUZZLE_MARK, debug::CYAN);
+}
+
+/// The toolgun: five modes on one weapon.
+///
+/// **Q swaps the two guns and the number keys pick a mode**, and picking one
+/// puts the toolgun in your hands, because reaching for a tool is what saying
+/// which tool means. The left button then means one thing whichever gun is out:
+/// use what you are holding.
+///
+/// @param world - the tables to read and change
+fn toolgun(world: &mut World) {
+	let input = world.input;
+	let over_interface = world.ui.pointer_over();
+
+	if input.pressed(Key::Q) {
+		// putting a gun away drops what it was holding, which is the only thing
+		// it could mean. Without this the prop stays on the end of a joint
+		// nothing is driving, and the next click of the *other* gun lets go of
+		// it as a side effect.
+		release(world);
+		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+		state.gun = if state.gun == PHYSGUN { TOOLGUN } else { PHYSGUN };
+		forget_first(world);
+	}
+
+	for (index, key) in [Key::Digit1, Key::Digit2, Key::Digit3, Key::Digit4, Key::Digit5]
+		.into_iter()
+		.enumerate()
+	{
+		if !input.pressed(key) {
+			continue;
+		}
+
+		release(world);
+		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+		state.gun = TOOLGUN;
+		state.tool = u32::try_from(index).unwrap_or(0);
+		forget_first(world);
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	if state.gun != TOOLGUN {
+		return;
+	}
+
+	if input.button_pressed(Button::Left) && !over_interface {
+		let (body, at, normal) = (state.picked_body, state.picked_at, state.picked_normal);
+		use_tool(world, body, Vec3::from_array(at), Vec3::from_array(normal));
+	}
+
+	mark_pending(world);
+}
+
+/// Does whatever the gun is set to, to whatever was named.
+///
+/// The one entry point, so that a click and a console line cannot come to mean
+/// different things. Everything below it is a named function over the world
+/// with no input in it at all, which is the shape replication will want and is
+/// what lets a script drive the whole weapon.
+///
+/// @param world - the tables to change
+/// @param body - what was hit
+/// @param at - where on it, in the world
+/// @param normal - which way the surface faced there
+fn use_tool(world: &mut World, body: BodyId, at: Vec3, normal: Vec3) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+	match state.tool {
+		| REMOVER => {
+			remove_prop(world, body);
+		},
+		| FREEZE => {
+			freeze(world, body);
+		},
+		| _ => link(world, body, at, normal),
+	}
+}
+
+/// The half of the toolgun that takes two clicks.
+///
+/// The first names one end and is remembered; the second makes the joint and
+/// forgets it. A second click on the map rather than on a prop pins the joint
+/// to a point in the world instead, which is how a prop is nailed to a wall -
+/// and it costs nothing, because a joint whose second body is nothing has meant
+/// exactly that since joints existed.
+///
+/// @param world - the tables to change
+/// @param body - what was hit
+/// @param at - where on it, in the world
+/// @param normal - which way the surface faced there
+fn link(world: &mut World, body: BodyId, at: Vec3, normal: Vec3) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (first, tool) = (state.tool_first, state.tool);
+
+	if !first.is_some() {
+		// the first end has to be something the solver owns: a joint between
+		// two pieces of the map holds nothing that could move.
+		if !world.bodies.get(body).is_some_and(Body::movable) {
+			return;
+		}
+
+		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+		state.tool_first = body;
+		state.tool_at = at.to_array();
+		state.tool_normal = normal.to_array();
+
+		trace!(
+			tool = TOOLS[usize::try_from(tool).unwrap_or(0)],
+			body = body.slot(),
+			"first end"
+		);
+
+		return;
+	}
+
+	if body == first {
+		forget_first(world);
+
+		return;
+	}
+
+	let started = Vec3::from_array(state.tool_at);
+	let facing = Vec3::from_array(state.tool_normal);
+	let Some(one) = world.bodies.get(first).copied() else {
+		forget_first(world);
+
+		return;
+	};
+
+	// a second end the solver does not own is the world, and the anchor on that
+	// side is then a point rather than a place on something.
+	let solid = world.bodies.get(body).copied();
+	let movable = solid.is_some_and(|it| it.movable());
+	let second = if movable { body } else { BodyId::NONE };
+	let far = match solid.filter(|_| movable) {
+		| Some(it) => anchor_on(&it, at),
+		| None => at,
+	};
+
+	let joint = match tool {
+		| HINGE => Joint::axis(
+			first,
+			second,
+			(anchor_on(&one, started), far),
+			// the face that was clicked. A hinge whose axis is the surface
+			// normal is the one a person means by pointing at a face, and it is
+			// what makes a door out of a plank and a wall.
+			one.transform.rotation.inverse() * facing,
+		),
+		| ROPE =>
+			Joint::rope(first, second, (anchor_on(&one, started), far), (at - started).length()),
+		| _ => Joint::weld(first, second, (anchor_on(&one, started), far))
+			.sprung(WELD_STIFFNESS, WELD_DAMPING),
+	};
+
+	let made = world.join(joint);
+	let name = TOOLS[usize::try_from(tool).unwrap_or(0)];
+	trace!(tool = name, joint = made.slot(), first = first.slot(), "joined");
+
+	forget_first(world);
+}
+
+/// Where a point on a body is, in that body's own space.
+///
+/// Rotated and *not* scaled, because that is what the solver does with an
+/// anchor on the way back out. Getting it wrong is a joint that holds somewhere
+/// other than where it was made.
+///
+/// @param solid - the body
+/// @param at - a point on it, in the world
+fn anchor_on(solid: &Body, at: Vec3) -> Vec3 {
+	solid.transform.rotation.inverse() * (at - solid.transform.position)
+}
+
+/// Drops the end a two-click tool was waiting on.
+///
+/// @param world - the arena
+fn forget_first(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.tool_first = BodyId::NONE;
+}
+
+/// Draws the end a two-click tool is waiting on, and the line it would make.
+///
+/// @param world - the arena and the table the segments go in
+fn mark_pending(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (first, at, picked) = (state.tool_first, state.tool_at, state.picked_at);
+
+	if !first.is_some() {
+		return;
+	}
+
+	let (at, picked) = (Vec3::from_array(at), Vec3::from_array(picked));
+	world.debug.point(at, PENDING_MARK, PENDING_COLOR);
+	world.debug.line(at, picked, PENDING_COLOR);
+}
+
+/// Takes one prop out of the world, joints and all.
+///
+/// @param world - the tables to remove from
+/// @param body - the prop to remove
+/// @return whether one went
+fn remove_prop(world: &mut World, body: BodyId) -> bool {
+	let Some(solid) = world.bodies.get(body) else {
+		return false;
+	};
+
+	if !on_layer(solid, PROP_LAYERS) {
+		return false;
+	}
+
+	let entity = solid.entity;
+	// before the body, not after: a joint naming a slot that has been handed
+	// out again holds whoever moved into it.
+	world.joints.forget(body);
+	world.bodies.despawn(body);
+	world.entities.despawn(entity);
+
+	trace!(body = body.slot(), "removed");
+
+	true
 }
 
 /// Whether a prop has been frozen.
@@ -1623,6 +1931,17 @@ fn interface(world: &mut World) {
 	let joints = world.joints.len();
 	let contacts = world.contacts;
 	let footing = if grounded { "on the ground" } else { "in the air" };
+	let in_hand = if state.gun == TOOLGUN {
+		let tool = TOOLS
+			.get(usize::try_from(state.tool).unwrap_or(0))
+			.copied()
+			.unwrap_or(TOOLS[0]);
+		let waiting = if state.tool_first.is_some() { ", one end" } else { "" };
+
+		format!("toolgun: {tool}{waiting}")
+	} else {
+		"physgun".to_owned()
+	};
 
 	// counted rather than remembered, which is the same rule the map follows:
 	// what a prop is is a body on a layer, so how many there are is a walk.
@@ -1664,6 +1983,7 @@ fn interface(world: &mut World) {
 		&format!("{} loose, {stuck} frozen, {swallowed} lost", loose.len()),
 	);
 	world.ui.set_text(hud, "player", footing);
+	world.ui.set_text(hud, "gun", &in_hand);
 }
 
 /// Puts the scene and the camera back where they started.
@@ -1826,6 +2146,65 @@ unsafe extern "C-unwind" fn put_one(world: *mut World, args: *const Args) {
 	spawn_prop(world, &named);
 }
 
+/// `game.tool` - the console's way of pressing a number key.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn pick_tool(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let named = unsafe { &*args }.rest();
+
+	let Some(index) = TOOLS.iter().position(|it| *it == named) else {
+		info!(modes = ?TOOLS, "the toolgun's modes");
+
+		return;
+	};
+
+	release(world);
+	forget_first(world);
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.gun = TOOLGUN;
+	state.tool = u32::try_from(index).unwrap_or(0);
+
+	info!(tool = named, "in hand");
+}
+
+/// `game.apply` - and of clicking with it.
+///
+/// A named body is taken at its middle and by the way it is facing up, because
+/// a console has no crosshair to have clicked a face with. That is the one
+/// place this and the button differ, and it matters only to a hinge.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn use_it(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let named = unsafe { &*args }.rest();
+	let body = asked_for(world, &named);
+
+	let Some(solid) = world.bodies.get(body).copied() else {
+		warn!(name = named, "nothing there to use it on");
+
+		return;
+	};
+
+	let (at, normal) = if named.is_empty() {
+		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+		(Vec3::from_array(state.picked_at), Vec3::from_array(state.picked_normal))
+	} else {
+		(solid.transform.position, Vec3::Y)
+	};
+
+	use_tool(world, body, at, normal);
+}
+
 /// `game.cleanup` - what the interface's own second button asks for.
 ///
 /// A console command rather than something the interface does, because the
@@ -1868,13 +2247,8 @@ fn sweep_props(world: &mut World) {
 		.map(|(id, body)| (id, body.entity))
 		.collect();
 
-	for (body, entity) in &loose {
-		// before the body, not after: a joint naming a slot that has been
-		// handed out again holds whoever moved into it, and the solver visits
-		// it every step either way.
-		world.joints.forget(*body);
-		world.bodies.despawn(*body);
-		world.entities.despawn(*entity);
+	for (body, _) in &loose {
+		remove_prop(world, *body);
 	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
@@ -1888,6 +2262,7 @@ fn sweep_props(world: &mut World) {
 	// between a handle that is stale for a step and one that never is.
 	state.hold = JointId::NONE;
 	state.held = BodyId::NONE;
+	state.tool_first = BodyId::NONE;
 
 	info!(gone = loose.len(), "props swept");
 }
@@ -2176,32 +2551,40 @@ fn collide(world: &mut World) {
 	info!(bodies = world.bodies.len(), "the player has a body");
 }
 
-/// Draws the rope one of the props hangs from.
+/// Draws every joint in the world as a line between its two anchors.
 ///
-/// The whole of what used to put a scene where it belongs. Everything else this
-/// function did was the demo turning a ring of cubes, and the map that replaced
-/// it does not move: a `.scene` says where its thirty boxes are, and nothing
-/// writes them again afterwards.
+/// It used to draw exactly one rope out of a handle in the arena, because there
+/// was exactly one joint and the game had made it. The toolgun makes as many as
+/// somebody clicks, so what is drawn is the table rather than a handle - and a
+/// weld, a hinge and a rope all become visible for nothing.
 ///
-/// Read out of the *joint* rather than out of a constant, so that moving the
-/// hook in the file moves the line drawn to it, and out of the *body* rather
-/// than the entity, so the far end is where the solver put it rather than a
-/// step behind.
+/// The anchors come from the *bodies* rather than from the entities, so the
+/// ends are where the solver put them rather than a step behind. A joint whose
+/// second body is nothing is pinned to a point, and its second anchor is that
+/// point rather than a place on something.
 ///
-/// @param world - the joint to read and the table the segments go in
-fn rope_line(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (held, hook) = world
+/// @param world - the joints to read and the table the segments go in
+fn draw_joints(world: &mut World) {
+	let held: Vec<(Vec3, Vec3)> = world
 		.joints
-		.get(state.rope)
-		.map_or((BodyId::NONE, HOOK), |joint| (joint.first, joint.second_anchor));
-	let end = world
-		.bodies
-		.get(held)
-		.map_or(hook, |body| body.transform.position);
+		.iter()
+		.filter_map(|(_, joint)| {
+			let one = world.bodies.get(joint.first)?.transform;
+			let far = world
+				.bodies
+				.get(joint.second)
+				.map_or(joint.second_anchor, |other| {
+					other.transform.position + other.transform.rotation * joint.second_anchor
+				});
 
-	world.debug.line(hook, end, debug::YELLOW);
-	world.debug.point(hook, HOOK_SIZE, debug::YELLOW);
+			Some((one.position + one.rotation * joint.first_anchor, far))
+		})
+		.collect();
+
+	for (from, to) in held {
+		world.debug.line(from, to, JOINT_COLOR);
+		world.debug.point(to, HOOK_SIZE, JOINT_COLOR);
+	}
 }
 
 /// Lays the map out from its scene, throwing away whatever was there.

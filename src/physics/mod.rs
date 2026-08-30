@@ -1094,6 +1094,76 @@ mod tests {
 		assert!(speed > 0.0, "but not stopped, at {speed}");
 	}
 
+	/// Welds a body to a static post across a unit of gap and reports the pull.
+	///
+	/// What a person clicking a weld tool actually does: the two props are not
+	/// touching, and the joint has to close that. No gravity and no floor,
+	/// because what is being measured is the weld and a prop that is also
+	/// falling makes every number a mixture.
+	///
+	/// @param spring - stiffness in hertz and damping ratio, or zero for rigid
+	/// @return the fastest it ever moved, and how many steps it took to arrive
+	fn welded_across_a_gap(spring: (f32, f32)) -> (f32, usize) {
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+
+		let post = world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.0, 5.0, 0.0)),
+		));
+		let other = world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(Vec3::new(3.0, 5.0, 0.0)),
+			1.0,
+		));
+
+		let mut weld = Joint::weld(other, post, (Vec3::ZERO, Vec3::new(2.0, 0.0, 0.0)));
+		if spring.0 > 0.0 {
+			weld = weld.sprung(spring.0, spring.1);
+		}
+		world.join(weld);
+
+		let (mut yank, mut arrive) = (0.0_f32, usize::MAX);
+		for step in 0..240 {
+			settle(&mut world, &mut simulation, 1);
+			yank = yank.max(
+				world
+					.bodies
+					.get(other)
+					.map_or(0.0, |body| body.velocity.length()),
+			);
+
+			if arrive == usize::MAX && (placed(&world, other).x - 2.0).abs() < 0.1 {
+				arrive = step;
+			}
+		}
+
+		(yank, arrive)
+	}
+
+	#[test]
+	fn a_soft_weld_pulls_two_props_together_gently_and_still_gets_there() {
+		let (hard, quick) = welded_across_a_gap((Joint::RIGID, Joint::DAMPING));
+		let (gentle, slower) = welded_across_a_gap((3.5, 1.4));
+
+		assert!(gentle < hard * 0.6, "half the pull, {gentle} against {hard}");
+		assert!(slower < 30, "and it still arrives, in {slower} steps against {quick}");
+	}
+
+	#[test]
+	fn a_spring_above_a_few_hertz_pulls_harder_than_a_rigid_joint_does() {
+		// the thing nobody expects, and the reason the weld tool's number is
+		// small. The rigid path's bias is a Baumgarte factor of a fifth, tuned
+		// and measured; the soft path's is derived and climbs towards one. So
+		// "stiffness" is not a dial from soft to rigid: it passes rigid on the
+		// way up and keeps going.
+		let (hard, _) = welded_across_a_gap((Joint::RIGID, Joint::DAMPING));
+		let (stiffer, _) = welded_across_a_gap((20.0, 1.0));
+
+		assert!(stiffer > hard, "twenty hertz pulls harder: {stiffer} against {hard}");
+	}
+
 	#[test]
 	fn a_rigid_weld_eases_a_gap_shut_rather_than_snapping_it() {
 		// what the Baumgarte factor is for, and the only test that pins it. A
