@@ -180,8 +180,13 @@ const DROP_LIFT: f32 = 0.9;
 
 const HUD: &str = "ui/hud";
 
-/// How many loose props the scene drops on the floor.
-const PROPS: usize = 5;
+/// How many things the scene lays out.
+///
+/// The arena mirrors the set the *file* holds, so a sixth record in it needs a
+/// sixth slot here. That is the one place `props.scene` is not simply data: a
+/// prop added there and not here is laid out and then not remembered, which is
+/// invisible until something wants to put it back.
+const PROPS: usize = 6;
 
 /// The scene the props are written in.
 ///
@@ -197,6 +202,11 @@ const PROPS: usize = 5;
 /// it hangs where it was let go with nothing holding it up and is still shoved
 /// by anything that touches it - which is the difference between a body gravity
 /// does not reach and one the solver does not move.
+///
+/// The sixth is a door on the hangar, hung on a hinge with a vertical axis. It
+/// is the only thing in the demo that shows what a `JointKind::Axis` is *for*:
+/// five directions held and one left free, so it swings and cannot be pushed
+/// off its hinge. Shoving it with the physics gun is the whole demonstration.
 const PROPS_SCENE: &str = "scenes/props";
 
 /// How big the cross marking a joint's far anchor is, in world units.

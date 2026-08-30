@@ -8,6 +8,8 @@
 		  "mesh": "cube",   "material": "plastic", "color": [0.75, 0.45, 0.35] },
 		{ "name": "ball hung",  "at": [5.20, 2.60, -5.40], "scale": [0.70, 0.70, 0.70],
 		  "mesh": "sphere", "material": "metal",   "color": [0.35, 0.85, 0.85] },
+		{ "name": "door", "at": [6.00, 1.60, 2.20], "scale": [2.60, 3.00, 0.14],
+		  "mesh": "cube", "material": "plastic", "color": [0.72, 0.42, 0.28] },
 		{ "name": "ball loose", "at": [1.00, 1.90, -8.50], "scale": [0.52, 0.52, 0.52],
 		  "mesh": "sphere", "material": "metal",   "color": [0.35, 0.95, 0.85] }
 	],
@@ -25,6 +27,9 @@
 		{ "name": "ball hung",  "entity": "ball hung",  "kind": "dynamic",
 		  "shape": { "kind": "sphere", "radius": 0.5 },
 		  "mass": 1.0, "restitution": 0.22, "friction": 0.62, "layer": 1 },
+		{ "name": "door", "entity": "door", "kind": "dynamic",
+		  "shape": { "kind": "box" },
+		  "mass": 8.0, "restitution": 0.05, "friction": 0.62, "layer": 1 },
 		{ "name": "ball loose", "entity": "ball loose", "kind": "dynamic",
 		  "shape": { "kind": "sphere", "radius": 0.5 },
 		  "mass": 1.0, "restitution": 0.22, "friction": 0.62, "layer": 1,
@@ -32,6 +37,8 @@
 	],
 
 	"joints": [
+		{ "name": "hinge", "kind": "axis", "first": "door",
+		  "anchors": [[-1.3, 0, 0], [4.70, 1.60, 2.20]], "axis": [0, 1, 0] },
 		{ "name": "rope", "kind": "rope", "first": "ball hung",
 		  "anchors": [[0, 0, 0], [5.20, 4.00, -5.40]], "length": 1.4 }
 	]
