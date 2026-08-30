@@ -40,7 +40,7 @@
 
 use core::ffi::c_void;
 
-use super::{entity::EntityId, mesh::MeshId};
+use super::{entity::EntityId, mesh::MeshId, names::Names};
 use crate::{
 	abi::Transform,
 	glam::{Mat3, Quat, Vec3},
@@ -755,6 +755,9 @@ pub struct Overlap {
 /// the entity it drives and the host already does that.
 pub struct Bodies {
 	bodies: Vec<Body>,
+	/// What each slot is called, or the empty string. @ref
+	/// [`names`](crate::abi::names).
+	names: Names,
 	generations: Vec<u32>,
 	alive: Vec<bool>,
 	free: Vec<u32>,
@@ -773,6 +776,7 @@ impl Bodies {
 	pub const fn new() -> Self {
 		Self {
 			bodies: Vec::new(),
+			names: Names::new(),
 			generations: Vec::new(),
 			alive: Vec::new(),
 			free: Vec::new(),
@@ -860,6 +864,8 @@ impl Bodies {
 		self.generations[slot] = self.generations[slot].saturating_add(1);
 		self.alive[slot] = true;
 		self.bodies[slot] = body;
+		// the one place a name is cleared. @ref `abi::names`.
+		self.names.set(slot, "");
 		self.live += 1;
 
 		BodyId {
@@ -934,6 +940,34 @@ impl Bodies {
 		self.slot(id).map(|slot| &mut self.bodies[slot])
 	}
 
+	/// What a body is called, or the empty string.
+	///
+	/// A body is named separately from the entity it drives, because a scene
+	/// source lets a joint say which body it holds and the answer has to be
+	/// writable even for a body no entity stands on. @ref
+	/// [`names`](crate::abi::names).
+	#[must_use]
+	pub fn name(&self, id: BodyId) -> &str {
+		self.slot(id)
+			.map_or("", |slot| self.names.at(slot))
+	}
+
+	/// Names a body, cutting anything past
+	/// [`MAX_NAME`](crate::abi::MAX_NAME).
+	///
+	/// @param id - what to name
+	/// @param name - what to call it; empty clears the name
+	/// @return `true` if the handle resolved
+	pub fn set_name(&mut self, id: BodyId, name: &str) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.names.set(slot, name);
+
+		true
+	}
+
 	/// Every living body, with its handle.
 	pub fn iter(&self) -> impl Iterator<Item = (BodyId, &Body)> {
 		self.bodies
@@ -973,6 +1007,7 @@ impl Bodies {
 
 		self.bodies.clear();
 		self.bodies.resize(slots, Body::default());
+		self.names.reset(slots);
 		self.generations.clear();
 		self.generations
 			.extend_from_slice(&generations[..slots]);
@@ -1060,6 +1095,7 @@ impl Bodies {
 		}
 
 		self.bodies.push(Body::default());
+		self.names.push();
 		self.generations.push(0);
 		self.alive.push(false);
 
@@ -1660,5 +1696,42 @@ mod tests {
 			Layers::ALL,
 			"of either kind"
 		);
+	}
+
+	#[test]
+	fn a_body_carries_a_name_and_a_reused_slot_does_not_inherit_it() {
+		let mut bodies = Bodies::new();
+		let old = bodies.spawn(Body::default());
+
+		assert_eq!(bodies.name(old), "", "a body starts unnamed");
+		assert!(bodies.set_name(old, "floor"), "and can be told what it is");
+		assert_eq!(bodies.name(old), "floor");
+
+		bodies.despawn(old);
+		let new = bodies.spawn(Body::default());
+
+		assert_eq!(bodies.name(old), "", "the stale handle reaches nothing");
+		assert_eq!(bodies.name(new), "", "and the slot came back unnamed");
+		assert!(!bodies.set_name(old, "ghost"), "naming a stale handle does nothing");
+	}
+
+	#[test]
+	fn every_body_array_stays_the_same_length() {
+		let mut bodies = Bodies::new();
+		let mut ids = Vec::new();
+		for _ in 0..6 {
+			ids.push(bodies.spawn(Body::default()));
+		}
+
+		bodies.despawn(ids[2]);
+		bodies.spawn(Body::default());
+		bodies.clear();
+		bodies.spawn(Body::default());
+
+		let length = bodies.bodies.len();
+
+		assert_eq!(bodies.alive.len(), length, "the table is one table");
+		assert_eq!(bodies.generations.len(), length, "and every array in it agrees");
+		assert_eq!(bodies.names.slots(), length, "and every array in it agrees");
 	}
 }

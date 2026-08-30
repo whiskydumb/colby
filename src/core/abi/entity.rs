@@ -18,7 +18,7 @@
 //! goes on writing one transform per step and knowing nothing about the rate
 //! the picture is drawn at.
 
-use super::{material::MaterialId, mesh::MeshId};
+use super::{material::MaterialId, mesh::MeshId, names::Names};
 use crate::{
 	bytemuck::{Pod, Zeroable},
 	glam::{Mat4, Quat, Vec3},
@@ -219,6 +219,10 @@ pub struct Entities {
 	/// `transforms`, and the same length; the renderer draws between the two.
 	previous: Vec<Transform>,
 	renderables: Vec<Renderable>,
+	/// What each slot is called, or the empty string. The same slots again,
+	/// and the one array here that is not read by anything the engine does -
+	/// it exists for whoever has to point at a particular entity in words.
+	names: Names,
 	generations: Vec<u32>,
 	alive: Vec<bool>,
 	free: Vec<u32>,
@@ -240,6 +244,7 @@ impl Entities {
 			transforms: Vec::new(),
 			previous: Vec::new(),
 			renderables: Vec::new(),
+			names: Names::new(),
 			generations: Vec::new(),
 			alive: Vec::new(),
 			free: Vec::new(),
@@ -278,6 +283,11 @@ impl Entities {
 		self.previous[slot] = transform;
 		self.pending.push(slot);
 		self.renderables[slot] = Renderable::NOTHING;
+		// whatever the previous occupant of this slot was called is not what
+		// this is called. This is the only place a name is cleared, and it is
+		// here rather than at the despawn because a slot reaches the free list
+		// three ways and leaves it one. @ref `abi::names`.
+		self.names.set(slot, "");
 		self.live += 1;
 
 		EntityId {
@@ -373,6 +383,33 @@ impl Entities {
 		};
 
 		self.renderables[slot] = renderable;
+
+		true
+	}
+
+	/// What an entity is called, or the empty string.
+	///
+	/// Never an identifier - that is the handle, and it is unique where this
+	/// is not. @ref [`names`](crate::abi::names) for why the world holds this
+	/// at all.
+	#[must_use]
+	pub fn name(&self, id: EntityId) -> &str {
+		self.slot(id)
+			.map_or("", |slot| self.names.at(slot))
+	}
+
+	/// Names an entity, cutting anything past
+	/// [`MAX_NAME`](crate::abi::MAX_NAME).
+	///
+	/// @param id - what to name
+	/// @param name - what to call it; empty clears the name
+	/// @return `true` if the handle resolved
+	pub fn set_name(&mut self, id: EntityId, name: &str) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.names.set(slot, name);
 
 		true
 	}
@@ -521,6 +558,7 @@ impl Entities {
 		self.renderables.clear();
 		self.renderables
 			.resize(slots, Renderable::NOTHING);
+		self.names.reset(slots);
 		self.generations.clear();
 		self.generations
 			.extend_from_slice(&generations[..slots]);
@@ -617,6 +655,7 @@ impl Entities {
 		self.transforms.push(Transform::IDENTITY);
 		self.previous.push(Transform::IDENTITY);
 		self.renderables.push(Renderable::NOTHING);
+		self.names.push();
 		self.generations.push(0);
 		self.alive.push(false);
 
@@ -979,6 +1018,7 @@ mod tests {
 		assert_eq!(entities.renderables.len(), length, "and the rest of the table agrees");
 		assert_eq!(entities.alive.len(), length, "and the rest of the table agrees");
 		assert_eq!(entities.generations.len(), length, "and the rest of the table agrees");
+		assert_eq!(entities.names.slots(), length, "and the rest of the table agrees");
 	}
 
 	#[test]
@@ -1018,5 +1058,76 @@ mod tests {
 			Some(MeshId::CUBE),
 			"and a shape can be given afterwards"
 		);
+	}
+
+	#[test]
+	fn an_entity_is_unnamed_until_it_is_named() {
+		let mut entities = Entities::new();
+		let id = entities.spawn();
+
+		assert_eq!(entities.name(id), "", "spawning is not the same as being called something");
+		assert!(entities.set_name(id, "crate"), "naming reports that it did something");
+		assert_eq!(entities.name(id), "crate");
+	}
+
+	#[test]
+	fn a_reused_slot_is_not_called_what_was_there_before() {
+		let mut entities = Entities::new();
+		let old = entities.spawn();
+		entities.set_name(old, "crate");
+		entities.despawn(old);
+
+		let new = entities.spawn();
+
+		assert_eq!(entities.name(old), "", "the stale handle reaches nothing at all");
+		assert_eq!(
+			entities.name(new),
+			"",
+			"and whoever took the slot did not inherit the name with it"
+		);
+	}
+
+	#[test]
+	fn naming_a_stale_handle_does_nothing_and_says_so() {
+		let mut entities = Entities::new();
+		let id = entities.spawn();
+		entities.despawn(id);
+
+		assert!(!entities.set_name(id, "ghost"), "a stale handle names nothing");
+		assert_eq!(entities.name(id), "");
+	}
+
+	#[test]
+	fn a_slot_freed_by_a_clear_is_unnamed_when_it_comes_back() {
+		let mut entities = Entities::new();
+		let first = entities.spawn();
+		let second = entities.spawn();
+		entities.set_name(first, "crate");
+		entities.set_name(second, "floor");
+
+		// the other way a slot reaches the free list. A despawn is covered by
+		// the test above; nothing clears a name in either path, so what is
+		// being checked is that handing the slot out again does.
+		entities.clear();
+
+		let taken = entities.spawn();
+		assert_eq!(entities.name(taken), "", "a slot handed out after a clear is unnamed");
+	}
+
+	#[test]
+	fn a_restore_leaves_every_slot_unnamed_for_the_caller_to_write() {
+		let mut entities = Entities::new();
+		let id = entities.spawn();
+		entities.set_name(id, "crate");
+
+		let put = entities.restore(&[4, 1], &[(0, Transform::IDENTITY, Renderable::NOTHING)]);
+
+		assert_eq!(
+			entities.name(put[0]),
+			"",
+			"a restore sizes the array and writes no names; the names come after"
+		);
+		assert!(entities.set_name(put[0], "barrel"), "and the slot is there to be written");
+		assert_eq!(entities.name(put[0]), "barrel");
 	}
 }

@@ -16,7 +16,7 @@
 //! by whoever owns the body. Converting is one matrix each, and the solver does
 //! it.
 
-use super::physics::BodyId;
+use super::{names::Names, physics::BodyId};
 use crate::{
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec3},
@@ -241,6 +241,9 @@ impl Default for Joint {
 /// The same storage discipline as [`Bodies`](super::physics::Bodies).
 pub struct Joints {
 	joints: Vec<Joint>,
+	/// What each slot is called, or the empty string. @ref
+	/// [`names`](crate::abi::names).
+	names: Names,
 	generations: Vec<u32>,
 	alive: Vec<bool>,
 	free: Vec<u32>,
@@ -253,6 +256,7 @@ impl Joints {
 	pub const fn new() -> Self {
 		Self {
 			joints: Vec::new(),
+			names: Names::new(),
 			generations: Vec::new(),
 			alive: Vec::new(),
 			free: Vec::new(),
@@ -283,6 +287,7 @@ impl Joints {
 
 		self.joints.clear();
 		self.joints.resize(slots, Joint::default());
+		self.names.reset(slots);
 		self.generations.clear();
 		self.generations
 			.extend_from_slice(&generations[..slots]);
@@ -409,6 +414,30 @@ impl Joints {
 		self.slot(id).map(|slot| &mut self.joints[slot])
 	}
 
+	/// What a joint is called, or the empty string. @ref
+	/// [`names`](crate::abi::names).
+	#[must_use]
+	pub fn name(&self, id: JointId) -> &str {
+		self.slot(id)
+			.map_or("", |slot| self.names.at(slot))
+	}
+
+	/// Names a joint, cutting anything past
+	/// [`MAX_NAME`](crate::abi::MAX_NAME).
+	///
+	/// @param id - what to name
+	/// @param name - what to call it; empty clears the name
+	/// @return `true` if the handle resolved
+	pub fn set_name(&mut self, id: JointId, name: &str) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.names.set(slot, name);
+
+		true
+	}
+
 	/// Whether there are none at all.
 	#[must_use]
 	pub const fn is_empty(&self) -> bool { self.live == 0 }
@@ -452,6 +481,8 @@ impl Joints {
 		self.generations[slot] = self.generations[slot].saturating_add(1);
 		self.alive[slot] = true;
 		self.joints[slot] = joint;
+		// the one place a name is cleared. @ref `abi::names`.
+		self.names.set(slot, "");
 		self.live += 1;
 
 		JointId {
@@ -484,6 +515,7 @@ impl Joints {
 		}
 
 		self.joints.push(Joint::default());
+		self.names.push();
 		self.generations.push(0);
 		self.alive.push(false);
 
@@ -572,5 +604,45 @@ mod tests {
 
 		assert!(!joints.alive(JointId::NONE), "zero is never a live generation");
 		assert!(joints.is_empty(), "and an empty table is empty");
+	}
+
+	#[test]
+	fn a_joint_carries_a_name_and_a_reused_slot_does_not_inherit_it() {
+		let mut joints = Joints::new();
+		let anchors = (Vec3::ZERO, Vec3::Y);
+		let old = joints.spawn(Joint::rope(BodyId::NONE, BodyId::NONE, anchors, 1.0));
+
+		assert_eq!(joints.name(old), "", "a joint starts unnamed");
+		assert!(joints.set_name(old, "rope"), "and can be told what it is");
+		assert_eq!(joints.name(old), "rope");
+
+		joints.despawn(old);
+		let new = joints.spawn(Joint::rope(BodyId::NONE, BodyId::NONE, anchors, 1.0));
+
+		assert_eq!(joints.name(old), "", "the stale handle reaches nothing");
+		assert_eq!(joints.name(new), "", "and the slot came back unnamed");
+		assert!(!joints.set_name(old, "ghost"), "naming a stale handle does nothing");
+	}
+
+	#[test]
+	fn every_joint_array_stays_the_same_length() {
+		let mut joints = Joints::new();
+		let anchors = (Vec3::ZERO, Vec3::Y);
+		let rope = || Joint::rope(BodyId::NONE, BodyId::NONE, anchors, 1.0);
+		let mut ids = Vec::new();
+		for _ in 0..5 {
+			ids.push(joints.spawn(rope()));
+		}
+
+		joints.despawn(ids[1]);
+		joints.spawn(rope());
+		joints.clear();
+		joints.spawn(rope());
+
+		let length = joints.joints.len();
+
+		assert_eq!(joints.alive.len(), length, "the table is one table");
+		assert_eq!(joints.generations.len(), length, "and every array in it agrees");
+		assert_eq!(joints.names.slots(), length, "and every array in it agrees");
 	}
 }

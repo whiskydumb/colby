@@ -33,6 +33,7 @@ pub mod joint;
 pub mod material;
 pub mod mesh;
 pub mod model;
+pub mod names;
 pub mod physics;
 pub mod registry;
 pub mod scene;
@@ -52,6 +53,7 @@ pub use self::{
 	material::{Material, MaterialId, Materials},
 	mesh::{Mesh, MeshData, MeshId, MeshVertex, Meshes},
 	model::{Model, ModelData, ModelId, Models, Placement},
+	names::MAX_NAME,
 	physics::{
 		Bodies, Body, BodyId, BodyKind, Layers, MAX_BODIES, MAX_OVERLAPS, MAX_TOUCHES, Overlap,
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
@@ -71,7 +73,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 23;
+pub const ABI_VERSION: u32 = 24;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";

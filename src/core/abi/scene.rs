@@ -106,10 +106,12 @@ impl Default for Stage {
 pub struct Thing {
 	/// What this is called, or empty.
 	///
-	/// Written by whoever authored the scene and never by the capture, which
-	/// has nothing to call anything: an entity in this engine has no name of
-	/// its own. A name is what an instantiate hands back a handle under, and
-	/// it is how a scene file refers to a thing a person typed.
+	/// Written by whoever authored the scene and by the capture alike: an
+	/// entity carries a name in the world, so a world written down keeps every
+	/// name in it and a world read back puts them all on again. A name is also
+	/// what an instantiate hands back a handle under, and it is how a scene
+	/// file refers to a thing a person typed. @ref
+	/// [`names`](crate::abi::names) for why it is not an identifier.
 	pub name: String,
 
 	/// The slot it occupied, for a restore.
@@ -416,7 +418,7 @@ fn things(world: &World) -> Vec<Thing> {
 		.entities
 		.iter()
 		.map(|(id, transform, renderable)| Thing {
-			name: String::new(),
+			name: world.entities.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
 			transform: *transform,
@@ -439,7 +441,7 @@ fn solids(world: &World, thing_of: &[u32]) -> Vec<Solid> {
 		.bodies
 		.iter()
 		.map(|(id, body)| Solid {
-			name: String::new(),
+			name: world.bodies.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
 			kind: body.kind,
@@ -476,7 +478,7 @@ fn links(world: &World, solid_of: &[u32]) -> Vec<Link> {
 		.joints
 		.iter()
 		.map(|(id, joint)| Link {
-			name: String::new(),
+			name: world.joints.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
 			kind: joint.kind,
@@ -656,6 +658,23 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	let generations = slots(&scene.link_generations, scene.links.iter().map(Link::key));
 	let entries = link_joints(scene, &solids);
 	let links = world.joints.restore(&generations, &entries);
+
+	// after the three restores rather than inside them: a table restore is
+	// handed slots and plain records, and a handle is the only way to address
+	// what it just put back. It is also the only way that cannot get the two
+	// lists out of step, because a record whose slot the table refused comes
+	// back as a null handle and names nothing.
+	for (id, thing) in things.iter().zip(&scene.things) {
+		world.entities.set_name(*id, &thing.name);
+	}
+
+	for (id, solid) in solids.iter().zip(&scene.solids) {
+		world.bodies.set_name(*id, &solid.name);
+	}
+
+	for (id, link) in links.iter().zip(&scene.links) {
+		world.joints.set_name(*id, &link.name);
+	}
 
 	if let Some(arena) = scene.arena.as_ref() {
 		world.state.put_raw(&arena.bytes, arena.layout);
@@ -1010,6 +1029,9 @@ fn spawn_thing(world: &mut World, thing: &Thing, at: Vec3) -> EntityId {
 		return id;
 	}
 
+	// the copy is called what the original was called. Two things with one
+	// name is exactly what a dupe is, and the handle is what tells them apart.
+	world.entities.set_name(id, &thing.name);
 	world.entities.set_renderable(id, Renderable {
 		mesh: world.meshes.find(&thing.mesh),
 		material: material(world, &thing.material),
@@ -1039,7 +1061,10 @@ fn spawn_solid(
 	body.layers = solid.layers;
 	body.entity = handle(things, solid.thing).unwrap_or(EntityId::NONE);
 
-	world.bodies.spawn(body)
+	let id = world.bodies.spawn(body);
+	world.bodies.set_name(id, &solid.name);
+
+	id
 }
 
 /// Creates one joint, if both the bodies it names are there.
@@ -1067,7 +1092,7 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 		link.second_anchor
 	};
 
-	world.joints.spawn(Joint {
+	let id = world.joints.spawn(Joint {
 		kind: link.kind,
 		first: first.unwrap_or(BodyId::NONE),
 		second: second.unwrap_or(BodyId::NONE),
@@ -1081,7 +1106,10 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 		// the file. @ref `World::join`, which is the other case.
 		rest: link.rest,
 		give: link.give,
-	})
+	});
+	world.joints.set_name(id, &link.name);
+
+	id
 }
 
 #[cfg(test)]
@@ -2131,5 +2159,134 @@ mod tests {
 			thing: NO_INDEX,
 			..Solid::default()
 		}
+	}
+
+	#[test]
+	fn what_things_are_called_is_written_down_and_put_back() {
+		let mut world = peopled();
+		let entity = world
+			.entities
+			.iter()
+			.next()
+			.map(|(id, ..)| id)
+			.unwrap_or_default();
+		let body = world
+			.bodies
+			.iter()
+			.next()
+			.map(|(id, _)| id)
+			.unwrap_or_default();
+		let joint = world
+			.joints
+			.iter()
+			.next()
+			.map(|(id, _)| id)
+			.unwrap_or_default();
+
+		world.entities.set_name(entity, "crystal");
+		world.bodies.set_name(body, "ball");
+		world.joints.set_name(joint, "rope");
+
+		let scene = capture(&world);
+
+		assert!(
+			scene
+				.things
+				.iter()
+				.any(|thing| thing.name == "crystal"),
+			"a capture writes the name the world was holding"
+		);
+		assert!(
+			scene
+				.solids
+				.iter()
+				.any(|solid| solid.name == "ball"),
+			"for a body too"
+		);
+		assert!(scene.links.iter().any(|link| link.name == "rope"), "and for a joint");
+
+		// somebody else's world entirely, so the names cannot survive by
+		// having been left behind in the tables.
+		let mut other = furnished();
+		restore(&mut other, &scene).expect("an unclaimed arena agrees with anything");
+
+		assert_eq!(other.entities.name(entity), "crystal", "and a restore puts them all back");
+		assert_eq!(other.bodies.name(body), "ball", "on the same handles they were on");
+		assert_eq!(other.joints.name(joint), "rope", "in all three tables");
+	}
+
+	#[test]
+	fn a_restore_forgets_a_name_the_world_it_replaced_was_holding() {
+		let mut world = World::new();
+		let doomed = world.entities.spawn_at(Transform::IDENTITY);
+		world.entities.set_name(doomed, "leftover");
+
+		let scene = SceneData {
+			things: vec![Thing {
+				name: String::new(),
+				slot: doomed.slot().try_into().unwrap_or(0),
+				generation: doomed.generation(),
+				..Thing::default()
+			}],
+			..SceneData::default()
+		};
+
+		restore(&mut world, &scene).expect("nothing to disagree about");
+
+		assert!(world.entities.alive(doomed), "the slot came back on the same generation");
+		assert_eq!(
+			world.entities.name(doomed),
+			"",
+			"and a description that calls it nothing is what it is now called"
+		);
+	}
+
+	#[test]
+	fn a_copy_is_called_what_the_original_was_called() {
+		let mut world = peopled();
+		let entity = world
+			.entities
+			.iter()
+			.next()
+			.map(|(id, ..)| id)
+			.unwrap_or_default();
+		let body = world
+			.bodies
+			.iter()
+			.next()
+			.map(|(id, _)| id)
+			.unwrap_or_default();
+		let joint = world
+			.joints
+			.iter()
+			.next()
+			.map(|(id, _)| id)
+			.unwrap_or_default();
+
+		world.entities.set_name(entity, "crystal");
+		world.bodies.set_name(body, "ball");
+		world.joints.set_name(joint, "rope");
+
+		let scene = capture(&world);
+		// back into the world it came from, which is the only place a handle
+		// means anything: two empty worlds would both hand out slot zero and
+		// the comparison below would pass with this completely broken.
+		let put = instantiate(&mut world, &scene, Vec3::ZERO);
+
+		let copied = put.entity_named("crystal");
+		let copied_body = put.body_named("ball");
+		let copied_joint = put.joint_named("rope");
+
+		assert!(copied.is_some(), "the copy answers to the name the original had");
+		assert_ne!(copied, entity, "and is not the original");
+		assert_eq!(world.entities.name(copied), "crystal", "and carries the name in the world");
+
+		assert!(copied_body.is_some(), "a body is copied by name as well");
+		assert_ne!(copied_body, body, "and is its own body");
+		assert_eq!(world.bodies.name(copied_body), "ball");
+
+		assert!(copied_joint.is_some(), "and a joint");
+		assert_ne!(copied_joint, joint, "which is its own joint");
+		assert_eq!(world.joints.name(copied_joint), "rope");
 	}
 }
