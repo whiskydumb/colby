@@ -153,37 +153,24 @@ const MENU: &str = "ui/spawn";
 
 /// How many rows that document has.
 ///
-/// The document's, not the game's: a document is what the file says and nothing
-/// at run time can add a box to it, so a menu with more to offer than this
-/// shows the first twelve of it. Growing a list from data is a mechanism this
-/// engine does not have yet.
-const ROWS: usize = 12;
+/// The document's, not the game's. @ref [`menu`].
+const MENU_ROWS: usize = 16;
 
-/// What the menu offers: a label, whether it is a ball, and how big.
+/// Where a prop comes from.
 ///
-/// Two shapes at six sizes rather than a catalogue, because the list is here to
-/// exercise the interface rather than to be a sandbox's inventory. Typing
-/// `ball` cuts it to six and `0.9` to two, which is what a search box is for.
-const SPAWNABLE: [(&str, bool, f32); ROWS] = [
-	("cube 0.30", false, 0.30),
-	("cube 0.45", false, 0.45),
-	("cube 0.60", false, 0.60),
-	("cube 0.75", false, 0.75),
-	("cube 0.90", false, 0.90),
-	("cube 1.05", false, 1.05),
-	("ball 0.30", true, 0.30),
-	("ball 0.45", true, 0.45),
-	("ball 0.60", true, 0.60),
-	("ball 0.75", true, 0.75),
-	("ball 0.90", true, 0.90),
-	("ball 1.05", true, 1.05),
-];
+/// A prefix in the scene registry rather than a directory anything opens: the
+/// compiler has already walked `assets/` and named everything under it by its
+/// own path, so `assets/props/crate.scene` is the scene `props/crate` and the
+/// catalogue is a filter over names. @ref [`catalogue`].
+const PROPS_DIR: &str = "props/";
 
-/// How many things the menu will drop before it starts again at the oldest.
+/// How many props the yard will hold before it stops taking more.
 ///
-/// Bounded like every table in the engine, and small because the point is a
-/// menu rather than a pile.
-const SPAWNED: usize = 8;
+/// Not the body table's limit, which is a thousand and change: this is the
+/// number past which the broadphase - a linear scan over every pair - stops
+/// being free. What is refused says so in the log rather than quietly not
+/// happening.
+const MAX_PROPS: usize = 96;
 
 /// How far in front of the player a dropped thing appears, in units.
 const DROP_REACH: f32 = 1.6;
@@ -264,15 +251,6 @@ const PIT_BODY: &str = "pit";
 /// How far above whatever the pick ray found its label is written.
 const LABEL_LIFT: f32 = 0.55;
 
-/// How heavy a prop is.
-const PROP_MASS: f32 = 1.0;
-
-/// How much of an impact a prop gives back.
-const PROP_BOUNCE: f32 = 0.22;
-
-/// How hard a prop is to slide.
-const PROP_GRIP: f32 = 0.62;
-
 /// How far to one side of the original a copy is stood, in units.
 ///
 /// A little more than a prop is wide, so a copy lands clear of what it was
@@ -289,9 +267,6 @@ const DUPE_LIFT: f32 = 0.35;
 /// Longer than the camera ever gets from the scene, so that "nothing there" is
 /// really nothing rather than the ray running out.
 const REACH: f32 = 60.0;
-
-/// How much brighter whatever is under the cursor is drawn.
-const HIGHLIGHT: f32 = 1.45;
 
 /// How close and how far the gun will hold something, in units.
 ///
@@ -340,15 +315,22 @@ const MUZZLE_AT: (f32, f32) = (0.3, 0.45);
 /// How big the cross marking where the beam is attached is.
 const MUZZLE_MARK: f32 = 0.09;
 
+/// What whatever the crosshair is on is outlined in.
+///
+/// Drawn rather than tinted, for the reason a frozen prop is: what a prop was
+/// colored before depends on which file it came out of, and an outline needs to
+/// remember nothing. It also works for the map, which a tint could not - the
+/// map's entities are laid out once and never written again.
+const PICKED_COLOR: Vec3 = Vec3::new(1.0, 0.85, 0.35);
+
 /// What a frozen prop is outlined in.
 ///
 /// Drawn rather than tinted, and the reason is bookkeeping. A tint would have
 /// to remember what the prop was colored before it was frozen, and where that
 /// color comes from differs by how the prop arrived: the scene's five carry
-/// their own, the menu's come from [`prop_color`], and a duplicate carries
-/// whatever it was copied from. An outline needs none of that, restores itself
-/// by not being drawn, and works for a prop that arrived by a route nobody has
-/// written yet.
+/// their own and a duplicate carries whatever it was copied from. An outline
+/// needs none of that, restores itself by not being drawn, and works for a prop
+/// that arrived by a route nobody has written yet.
 const FROZEN_COLOR: Vec3 = Vec3::new(0.55, 0.85, 1.0);
 
 /// The game's own state, kept in the host's arena.
@@ -422,16 +404,6 @@ struct State {
 
 	/// The panel the spawn menu is shown in.
 	menu: PanelId,
-
-	/// What the menu has dropped, oldest first.
-	dropped: [EntityId; SPAWNED],
-
-	/// Their bodies.
-	dropped_bodies: [BodyId; SPAWNED],
-
-	/// How many of those slots have ever been used, so the next one is
-	/// `dropped_next % SPAWNED` and the oldest is the one it lands on.
-	dropped_next: u32,
 
 	/// How many times a prop has started touching something.
 	///
@@ -589,6 +561,11 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	world
 		.cvars
 		.command("game.thaw", thaw_all, "let every frozen prop go at once");
+	world.cvars.command(
+		"game.spawn",
+		put_one,
+		"drop a prop in front of the player, by the name the menu shows",
+	);
 
 	// on every load, not only a fresh one: the mesh a name resolves to is the
 	// host's business, and an asset that appeared since the last swap should be
@@ -684,8 +661,8 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	physgun(world, yaw);
 	freezer(world);
 	outline_frozen(world);
+	outline_picked(world);
 	duplicate(world, yaw);
-	light_up(world);
 	label_pick(world);
 	menu(world);
 	count_landings(world);
@@ -712,7 +689,7 @@ fn duplicate(world: &mut World, yaw: f32) {
 	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (entity, body, next) = (state.picked, state.picked_body, state.dropped_next);
+	let (entity, body) = (state.picked, state.picked_body);
 
 	// only something the solver owns. Copying the floor, or the crystal the
 	// ring turns around, is a request nobody meant to make - and the copy
@@ -725,25 +702,10 @@ fn duplicate(world: &mut World, yaw: f32) {
 		return;
 	};
 
-	// the oldest of the ring goes, exactly as a spawn does, and before the copy
-	// is made rather than after: the slot the copy lands in is then the one
-	// that has just been freed, which is what keeps the ring a ring.
-	let slot = usize::try_from(next).unwrap_or(0) % SPAWNED;
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (old_entity, old_body) = (state.dropped[slot], state.dropped_bodies[slot]);
-	world.bodies.despawn(old_body);
-	world.entities.despawn(old_entity);
-
 	let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
 	let put = scene::instantiate(world, &scene, right * DUPE_SIDEWAYS + Vec3::Y * DUPE_LIFT);
-	let (copied, copied_body) = (put.entity(0), put.body(0));
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.dropped[slot] = copied;
-	state.dropped_bodies[slot] = copied_body;
-	state.dropped_next = next.saturating_add(1);
-
-	trace!(of = body.slot(), into = copied_body.slot(), "duplicated");
+	trace!(of = body.slot(), into = put.body(0).slot(), "duplicated");
 }
 
 /// Describes the world and keeps only one body and what it drives.
@@ -780,7 +742,32 @@ fn cut_out(world: &World, body: BodyId) -> Option<SceneData> {
 	})
 }
 
-/// Shows the spawn menu, filters it by what is in the search box, and drops
+/// Every prop the tree holds, in a fixed order.
+///
+/// **There is no prop table and no prop format.** The compiler turns every
+/// `.scene` under `assets/` into an asset named by its own path, so a file at
+/// `assets/props/crate.scene` is a scene called `props/crate`, and finding the
+/// catalogue is walking the registry for that prefix. Adding a prop is adding a
+/// file; nothing in this module is told and nothing has to be rebuilt.
+///
+/// Sorted, because a registry is in whatever order the walk found things and a
+/// menu that reshuffles itself between runs is a menu nobody can learn.
+///
+/// @param world - the scene registry to walk
+/// @return the names without their prefix, sorted
+fn catalogue(world: &World) -> Vec<String> {
+	let mut found: Vec<String> = world
+		.scenes
+		.iter()
+		.filter_map(|scene| scene.name().strip_prefix(PROPS_DIR))
+		.map(str::to_owned)
+		.collect();
+	found.sort();
+
+	found
+}
+
+/// Shows the spawn menu, filters it by what is in the search box, and spawns
 /// whatever was clicked.
 ///
 /// The whole of the interface's fourth step as a game sees it: a list longer
@@ -789,7 +776,13 @@ fn cut_out(world: &World, body: BodyId) -> Option<SceneData> {
 /// scrolling - both are the stylesheet's - which is the property that makes
 /// them worth having in the engine rather than in the game.
 ///
-/// @param world - the panel to fill and the bodies to add to
+/// **A document is what the file says**, so the menu can only address the rows
+/// `spawn.html` was written with. A tree holding more props than that shows the
+/// first [`MENU_ROWS`] of them and the rest are reached by typing into the
+/// search box. Growing a list from data is a mechanism this engine does not
+/// have, and it is the interface's own step rather than the sandbox's.
+///
+/// @param world - the panel to fill and the tables to add to
 fn menu(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let mut panel = state.menu;
@@ -805,99 +798,108 @@ fn menu(world: &mut World) {
 		return;
 	}
 
+	let offered = catalogue(world);
 	let wanted = world.ui.text(panel, "search").to_lowercase();
-	let mut shown = 0;
+	let shown: Vec<&String> = offered
+		.iter()
+		.filter(|name| wanted.is_empty() || name.contains(&wanted))
+		.collect();
 	let mut clicked = None;
 
-	for (index, &(label, ..)) in SPAWNABLE.iter().enumerate() {
-		let name = format!("item{index}");
-		let matches = wanted.is_empty() || label.contains(&wanted);
+	for row in 0..MENU_ROWS {
+		let id = format!("item{row}");
+		let label = shown.get(row);
 
-		if matches {
-			shown += 1;
+		if label.is_some_and(|_| world.ui.clicked(panel, &id)) {
+			clicked = label.map(|name| (*name).clone());
 		}
 
-		if matches && world.ui.clicked(panel, &name) {
-			clicked = Some(index);
+		match label {
+			| Some(name) => {
+				world.ui.set_text(panel, &id, name);
+				world.ui.set_classes(panel, &id, "entry");
+			},
+			// the class the stylesheet turns into `display: none`, which takes
+			// the row out of the layout rather than merely hiding it - so the
+			// list is exactly as tall as what is left and the bar says the
+			// truth.
+			| None => world.ui.set_classes(panel, &id, "entry gone"),
 		}
-
-		world.ui.set_text(panel, &name, label);
-		// the class the stylesheet turns into `display: none`, which takes the
-		// row out of the layout rather than merely hiding it - so the list is
-		// exactly as tall as what is left and the bar says the truth.
-		world
-			.ui
-			.set_classes(panel, &name, if matches { "entry" } else { "entry gone" });
 	}
 
-	if let Some(index) = clicked {
-		drop_one(world, index);
+	if let Some(name) = clicked {
+		spawn_prop(world, &name);
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let count = state
-		.dropped_next
-		.min(u32::try_from(SPAWNED).unwrap_or(0));
+	let loose = props(world).len();
+	let (fits, total) = (shown.len().min(MENU_ROWS), offered.len());
 
 	world
 		.ui
-		.set_text(panel, "shown", &format!("{shown}/{ROWS}"));
+		.set_text(panel, "shown", &format!("{fits}/{total}"));
 	world
 		.ui
-		.set_text(panel, "dropped", &format!("{count} out"));
+		.set_text(panel, "dropped", &format!("{loose} out"));
 }
 
-/// Drops one of the menu's entries in front of the player.
+/// Puts one of them in front of the player.
 ///
-/// The oldest is reused once [`SPAWNED`] of them exist, entity and body
-/// together: a body whose entity was despawned is still traced against, so the
-/// two lifetimes are kept in step by hand. @ref `colby-known-gaps`.
+/// Nothing is remembered about it. The prop is a description the loader turns
+/// into an entity and a body with fresh handles, and from then on it is found
+/// the way every prop is found - by the layer it is on. That is what lets the
+/// yard fill up without a fixed array anywhere deciding how full it may get.
 ///
-/// @param world - the entities and bodies to add to
-/// @param index - which row of [`SPAWNABLE`] was clicked
-fn drop_one(world: &mut World, index: usize) {
-	let Some(&(_, ball, size)) = SPAWNABLE.get(index) else {
-		return;
-	};
+/// @param world - the tables to add to
+/// @param name - which prop, without its prefix
+/// @return whether one was made
+fn spawn_prop(world: &mut World, name: &str) -> bool {
+	let loose = props(world).len();
+	if loose >= MAX_PROPS {
+		warn!(loose, room = MAX_PROPS, name, "the yard is full");
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (player, yaw, next) = (state.player, state.yaw, state.dropped_next);
-	let slot = usize::try_from(next).unwrap_or(0) % SPAWNED;
-	let (old_entity, old_body) = (state.dropped[slot], state.dropped_bodies[slot]);
+		return false;
+	}
 
-	let Some(&standing) = world.entities.transform(player) else {
-		return;
-	};
+	let scene = world.scenes.find(&format!("{PROPS_DIR}{name}"));
+	if !scene.is_some() {
+		warn!(name, "nothing in assets/props is called that");
 
-	world.bodies.despawn(old_body);
-	world.entities.despawn(old_entity);
-
-	let ahead = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
-	let mut place = Transform::at(standing.position + ahead * DROP_REACH + Vec3::Y * DROP_LIFT);
-	place.set_scale(size);
-
-	let entity = world.entities.spawn_at(place);
-	let mesh = if ball { MeshId::SPHERE } else { MeshId::CUBE };
-	let material = world.materials.find("plastic");
-
-	world
-		.entities
-		.set_renderable(entity, Renderable::of(mesh, material, prop_color(index % PROPS, ball)));
-
-	let shape = if ball { Shape::ball(0.5) } else { Shape::UNIT };
-	let body = world.attach_body(entity, BodyKind::Dynamic, shape);
-
-	if let Some(solid) = world.bodies.get_mut(body) {
-		solid.mass = PROP_MASS;
-		solid.restitution = PROP_BOUNCE;
-		solid.friction = PROP_GRIP;
-		solid.layers = PROP_LAYERS;
+		return false;
 	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.dropped[slot] = entity;
-	state.dropped_bodies[slot] = body;
-	state.dropped_next = next.saturating_add(1);
+	let (player, yaw) = (state.player, state.yaw);
+
+	let Some(&standing) = world.entities.transform(player) else {
+		return false;
+	};
+
+	let ahead = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+	let at = standing.position + ahead * DROP_REACH + Vec3::Y * DROP_LIFT;
+	// cloned first: the table is read through `world` and the instantiate
+	// writes through it.
+	let data = world.scenes.data(scene).clone();
+	let put = scene::instantiate(world, &data, at);
+
+	trace!(name, body = put.body(0).slot(), "spawned");
+
+	true
+}
+
+/// Every prop in the world, however it got there.
+///
+/// The scene's own, the menu's, a duplicate and one somebody welded to a wall
+/// are all the same set as far as anything asking a question about props is
+/// concerned, and what makes them one set is the layer rather than an array.
+///
+/// @param world - the bodies to walk
+fn props(world: &World) -> Vec<BodyId> {
+	world
+		.bodies
+		.iter()
+		.filter(|(_, body)| on_layer(body, PROP_LAYERS))
+		.map(|(id, _)| id)
+		.collect()
 }
 
 /// Walks the player one step and writes where it ended up.
@@ -1088,15 +1090,14 @@ fn label_pick(world: &mut World) {
 /// by the host beside the input edges, so a step that runs twice in one frame
 /// does not count a landing twice.
 fn count_landings(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let props = state.prop_bodies;
+	let loose = props(world);
 
 	let landed = world
 		.bodies
 		.touches()
 		.iter()
 		.filter(|touch| touch.kind == TouchKind::Began)
-		.filter(|touch| props.iter().any(|&id| touch.names(id)))
+		.filter(|touch| loose.iter().any(|&id| touch.names(id)))
 		.count();
 
 	if landed == 0 {
@@ -1523,67 +1524,67 @@ fn thaw(world: &mut World) -> usize {
 ///
 /// @param world - the bodies to walk and the table the segments go in
 fn outline_frozen(world: &mut World) {
-	let stuck: Vec<(Shape, Transform)> = world
+	let stuck: Vec<BodyId> = world
 		.bodies
 		.iter()
 		.filter(|(_, body)| frozen(body))
-		.map(|(_, body)| (body.shape, body.transform))
+		.map(|(id, _)| id)
 		.collect();
 
-	for (shape, placed) in stuck {
-		match shape.kind {
-			| ShapeKind::Box => world.debug.cuboid(
-				placed.position,
-				shape.extents.abs() * placed.scale.abs(),
-				placed.rotation,
-				FROZEN_COLOR,
-			),
-			| ShapeKind::Sphere => world.debug.ball(
-				placed.position,
-				shape.radius.abs() * placed.scale.abs().max_element(),
-				FROZEN_COLOR,
-			),
-			| ShapeKind::Mesh => {},
-		}
+	for body in stuck {
+		outline(world, body, FROZEN_COLOR);
 	}
 }
 
-/// Brightens whatever the pick ray found and puts everything else back.
+/// Draws one body's shape as segments.
 ///
-/// Written every step rather than toggled, for the reason the interface's text
-/// is: there is then nothing to remember between steps and nothing a reload can
-/// leave behind lit.
+/// The one place either outline is drawn, so that a frozen prop and the thing
+/// under the crosshair cannot come to disagree about what a shape looks like.
+/// A mesh draws nothing: the only mesh bodies here are the map's, which is
+/// boxes, and a triangle soup outlined is a wall of noise rather than an
+/// answer.
 ///
-/// @param world - the entities to color
-fn light_up(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let picked = state.picked;
-	let (props, scene) = (state.props, state.props_scene);
-
-	// the props' own colors are the scene's rather than a formula's, so they
-	// are read back out of it here. A highlight multiplies whatever the file
-	// wrote.
-	let mut base = [Vec3::ONE; PROPS];
-	for (slot, thing) in base
-		.iter_mut()
-		.zip(&world.scenes.data(scene).things)
-	{
-		*slot = thing.color;
-	}
-
-	let lit = |id: EntityId, color: Vec3| {
-		if id == picked && id.is_some() {
-			color * HIGHLIGHT
-		} else {
-			color
-		}
+/// @param world - the body to read and the table the segments go in
+/// @param body - what to draw
+/// @param color - what to draw it in
+fn outline(world: &mut World, body: BodyId, color: Vec3) {
+	let Some(solid) = world.bodies.get(body) else {
+		return;
 	};
 
-	for (index, id) in props.into_iter().enumerate() {
-		if let Some(renderable) = world.entities.renderable_mut(id) {
-			renderable.color = lit(id, base[index]);
-		}
+	let (shape, placed) = (solid.shape, solid.transform);
+
+	match shape.kind {
+		| ShapeKind::Box => world.debug.cuboid(
+			placed.position,
+			shape.extents.abs() * placed.scale.abs(),
+			placed.rotation,
+			color,
+		),
+		| ShapeKind::Sphere => world.debug.ball(
+			placed.position,
+			shape.radius.abs() * placed.scale.abs().max_element(),
+			color,
+		),
+		| ShapeKind::Mesh => {},
 	}
+}
+
+/// Outlines whatever the pick ray found.
+///
+/// It used to brighten it instead, by writing the entity's color every step and
+/// restoring it from whatever laid the thing out. That worked while there were
+/// five props from one file and stopped the moment a prop could come from any
+/// file in a directory, be duplicated, or be a piece of the map - because then
+/// "put it back the way it was" needs a table of what every thing's color was,
+/// which is a table nobody wants to keep. An outline remembers nothing.
+///
+/// @param world - the picked body and the table the segments go in
+fn outline_picked(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let picked = state.picked_body;
+
+	outline(world, picked, PICKED_COLOR);
 }
 
 /// Fills the interface in and reads what was clicked in it.
@@ -1616,25 +1617,24 @@ fn interface(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let state = *state;
 	let hit = named(world, &state);
-	let props = state.props;
 	let grounded = state.player_grounded != 0;
 	let (time, entities) = (world.time, world.entities.len());
 	let landings = state.landings;
 	let joints = world.joints.len();
-	let asleep = props
-		.iter()
-		.filter(|&&id| id.is_some())
-		.filter(|&&id| resting(world, id))
-		.count();
 	let contacts = world.contacts;
 	let footing = if grounded { "on the ground" } else { "in the air" };
 
 	// counted rather than remembered, which is the same rule the map follows:
 	// what a prop is is a body on a layer, so how many there are is a walk.
-	let loose = world
-		.bodies
+	let loose = props(world);
+	let asleep = loose
 		.iter()
-		.filter(|(_, body)| on_layer(body, PROP_LAYERS))
+		.filter(|&&id| {
+			world
+				.bodies
+				.get(id)
+				.is_some_and(|body| body.sleeping)
+		})
 		.count();
 	let stuck = world
 		.bodies
@@ -1650,15 +1650,19 @@ fn interface(world: &mut World) {
 		.ui
 		.set_text(hud, "entities", &format!("{entities}"));
 	world.ui.set_text(hud, "hit", &hit);
-	world
-		.ui
-		.set_text(hud, "physics", &format!("{asleep}/{PROPS} asleep, {contacts} hits"));
+	world.ui.set_text(
+		hud,
+		"physics",
+		&format!("{asleep}/{} asleep, {contacts} hits", loose.len()),
+	);
 	world
 		.ui
 		.set_text(hud, "joints", &format!("{joints} held, {landings} landings"));
-	world
-		.ui
-		.set_text(hud, "props", &format!("{loose} loose, {stuck} frozen, {swallowed} lost"));
+	world.ui.set_text(
+		hud,
+		"props",
+		&format!("{} loose, {stuck} frozen, {swallowed} lost", loose.len()),
+	);
 	world.ui.set_text(hud, "player", footing);
 }
 
@@ -1802,6 +1806,26 @@ unsafe extern "C-unwind" fn thaw_all(world: *mut World, _args: *const Args) {
 	info!(gone = thaw(world), "everything is moving again");
 }
 
+/// `game.spawn` - the console's way of clicking a row of the menu.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn put_one(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let named = unsafe { &*args }.rest();
+
+	if named.is_empty() {
+		info!(offered = ?catalogue(world), "what there is");
+
+		return;
+	}
+
+	spawn_prop(world, &named);
+}
+
 /// `game.cleanup` - what the interface's own second button asks for.
 ///
 /// A console command rather than something the interface does, because the
@@ -1856,9 +1880,6 @@ fn sweep_props(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	state.props = [EntityId::NONE; PROPS];
 	state.prop_bodies = [BodyId::NONE; PROPS];
-	state.dropped = [EntityId::NONE; SPAWNED];
-	state.dropped_bodies = [BodyId::NONE; SPAWNED];
-	state.dropped_next = 0;
 	state.rope = JointId::NONE;
 	state.picked = EntityId::NONE;
 	state.picked_body = BodyId::NONE;
@@ -2011,25 +2032,6 @@ fn dress(world: &mut World) {
 		.set_renderable(player, Renderable::of(MeshId::CUBE, plastic, PLAYER_COLOR));
 
 	stand_model(world);
-}
-
-/// A color for the `index`th thing the spawn menu drops.
-///
-/// Deliberately not [`hue`]: the ring walks the whole circle and what the menu
-/// drops should read as a separate set of things rather than as more of it.
-/// The five props the scene lays out carry their own colors and do not come
-/// through here.
-///
-/// @param index - which of a run of them this is
-/// @param ball - whether it is round, which is worth telling apart at a glance
-fn prop_color(index: usize, ball: bool) -> Vec3 {
-	let shade = turn(index, PROPS).mul_add(0.4, 0.55);
-
-	if ball {
-		return Vec3::new(0.35, shade, 0.85);
-	}
-
-	Vec3::new(shade, 0.45, 0.35)
 }
 
 /// Lays the props out from their scene, throwing away whatever was there.
@@ -2289,18 +2291,6 @@ fn relay_map(world: &mut World) {
 	lay_map(world);
 }
 
-/// Whether the body driving an entity has gone to sleep.
-///
-/// Asked through the entity because that is the handle this scene keeps for a
-/// prop; the body is found by walking the table, which for five props is
-/// cheaper than another array in the arena.
-fn resting(world: &World, entity: EntityId) -> bool {
-	world
-		.bodies
-		.iter()
-		.any(|(_, body)| body.entity == entity && body.sleeping)
-}
-
 /// What the pick ray found, as a line of text.
 ///
 /// **Read out of the world rather than compared against the arena.** Every
@@ -2339,12 +2329,4 @@ fn named(world: &World, state: &State) -> String {
 	}
 
 	format!("{name} @ {distance:.1}")
-}
-
-/// `index` out of `count`, as a fraction of a full turn.
-fn turn(index: usize, count: usize) -> f32 {
-	let index = u16::try_from(index).unwrap_or(0);
-	let count = u16::try_from(count).unwrap_or(1).max(1);
-
-	f32::from(index) / f32::from(count)
 }

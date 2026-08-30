@@ -1,0 +1,12 @@
+{
+	"entities": [
+		{ "name": "slab", "at": [0, 0, 0], "scale": [1.4, 0.22, 1.4],
+		  "mesh": "cube", "material": "metal", "color": [0.58, 0.6, 0.64] }
+	],
+
+	"bodies": [
+		{ "name": "slab", "entity": "slab", "kind": "dynamic",
+		  "shape": { "kind": "box" },
+		  "mass": 3.0, "restitution": 0.22, "friction": 0.62, "layer": 1 }
+	]
+}

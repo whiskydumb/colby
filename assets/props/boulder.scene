@@ -1,0 +1,12 @@
+{
+	"entities": [
+		{ "name": "boulder", "at": [0, 0, 0], "scale": [1.1, 1.1, 1.1],
+		  "mesh": "sphere", "material": "plastic", "color": [0.52, 0.5, 0.48] }
+	],
+
+	"bodies": [
+		{ "name": "boulder", "entity": "boulder", "kind": "dynamic",
+		  "shape": { "kind": "sphere", "radius": 0.5 },
+		  "mass": 6.0, "restitution": 0.22, "friction": 0.62, "layer": 1 }
+	]
+}

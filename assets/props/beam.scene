@@ -1,0 +1,12 @@
+{
+	"entities": [
+		{ "name": "beam", "at": [0, 0, 0], "scale": [2.6, 0.26, 0.26],
+		  "mesh": "cube", "material": "plastic", "color": [0.66, 0.54, 0.38] }
+	],
+
+	"bodies": [
+		{ "name": "beam", "entity": "beam", "kind": "dynamic",
+		  "shape": { "kind": "box" },
+		  "mass": 1.2, "restitution": 0.22, "friction": 0.62, "layer": 1 }
+	]
+}

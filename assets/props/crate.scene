@@ -1,0 +1,12 @@
+{
+	"entities": [
+		{ "name": "crate", "at": [0, 0, 0], "scale": [0.7, 0.7, 0.7],
+		  "mesh": "cube", "material": "plastic", "color": [0.72, 0.55, 0.35] }
+	],
+
+	"bodies": [
+		{ "name": "crate", "entity": "crate", "kind": "dynamic",
+		  "shape": { "kind": "box" },
+		  "mass": 1.0, "restitution": 0.22, "friction": 0.62, "layer": 1 }
+	]
+}
