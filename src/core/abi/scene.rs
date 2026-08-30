@@ -218,7 +218,7 @@ impl Solid {
 }
 
 /// One joint, naming the two bodies it holds by their place in the file.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Link {
 	/// What this is called, or empty. @ref [`Thing::name`].
 	pub name: String,
@@ -253,8 +253,45 @@ pub struct Link {
 	/// The relative rotation the joint was made at.
 	pub rest: Quat,
 
-	/// How much of the pull is given up each step.
-	pub give: f32,
+	/// How stiff the spring holding it together is, in hertz. Zero is rigid.
+	pub stiffness: f32,
+
+	/// How quickly that spring stops ringing, as a ratio.
+	pub damping: f32,
+
+	/// The most it may pull with over one step, or zero for no ceiling.
+	pub max_impulse: f32,
+
+	/// The most it may turn with, or zero for no ceiling.
+	pub max_torque: f32,
+}
+
+impl Default for Link {
+	/// The joint [`Joint::default`] describes, written down.
+	///
+	/// Hand-written rather than derived, and the reason is one field: a
+	/// derived `Default` gives a damping of zero, which is a spring that rings
+	/// forever, and `Link` is used as a template with `..Default::default()`.
+	/// Every other field's zero is the value a joint actually has.
+	fn default() -> Self {
+		Self {
+			name: String::new(),
+			slot: 0,
+			generation: 0,
+			kind: JointKind::default(),
+			first: 0,
+			second: 0,
+			first_anchor: Vec3::ZERO,
+			second_anchor: Vec3::ZERO,
+			axis: Vec3::ZERO,
+			length: 0.0,
+			rest: Quat::IDENTITY,
+			stiffness: Joint::RIGID,
+			damping: Joint::DAMPING,
+			max_impulse: Joint::NO_CEILING,
+			max_torque: Joint::NO_CEILING,
+		}
+	}
 }
 
 impl Link {
@@ -489,7 +526,10 @@ fn links(world: &World, solid_of: &[u32]) -> Vec<Link> {
 			axis: joint.axis,
 			length: joint.length,
 			rest: joint.rest,
-			give: joint.give,
+			stiffness: joint.stiffness,
+			damping: joint.damping,
+			max_impulse: joint.max_impulse,
+			max_torque: joint.max_torque,
 		})
 		.collect()
 }
@@ -799,7 +839,10 @@ fn link_joints(scene: &SceneData, solids: &[BodyId]) -> Vec<(usize, Joint)> {
 				axis: link.axis,
 				length: link.length,
 				rest: link.rest,
-				give: link.give,
+				stiffness: link.stiffness,
+				damping: link.damping,
+				max_impulse: link.max_impulse,
+				max_torque: link.max_torque,
 			};
 
 			(usize::try_from(link.slot).unwrap_or(usize::MAX), joint)
@@ -1105,7 +1148,10 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 		// whatever angle they were written down at, so the answer is already in
 		// the file. @ref `World::join`, which is the other case.
 		rest: link.rest,
-		give: link.give,
+		stiffness: link.stiffness,
+		damping: link.damping,
+		max_impulse: link.max_impulse,
+		max_torque: link.max_torque,
 	});
 	world.joints.set_name(id, &link.name);
 

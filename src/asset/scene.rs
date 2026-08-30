@@ -63,7 +63,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// Bump it whenever the header or any block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it
 /// agreed.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -363,8 +363,17 @@ pub struct Tie {
 	/// How far apart a rope lets them get.
 	pub length: f32,
 
-	/// How much of the pull is given up each step.
-	pub give: f32,
+	/// How stiff the spring holding it together is, in hertz. Zero is rigid.
+	pub stiffness: f32,
+
+	/// How quickly that spring stops ringing, as a ratio.
+	pub damping: f32,
+
+	/// The most it may pull with over one step, or zero for no ceiling.
+	pub max_impulse: f32,
+
+	/// The most it may turn with, or zero for no ceiling.
+	pub max_torque: f32,
 
 	/// Where it attaches on the first body, in that body's own space.
 	pub first_anchor: [f32; 3],
@@ -589,7 +598,10 @@ impl SceneFile {
 			axis: Vec3::from_array(tie.axis),
 			length: tie.length,
 			rest: Quat::from_array(tie.rest),
-			give: tie.give,
+			stiffness: tie.stiffness,
+			damping: tie.damping,
+			max_impulse: tie.max_impulse,
+			max_torque: tie.max_torque,
 		}
 	}
 
@@ -802,7 +814,10 @@ fn tie_of(link: &Link, names: &mut Names) -> Tie {
 		first: link.first,
 		second: link.second,
 		length: link.length,
-		give: link.give,
+		stiffness: link.stiffness,
+		damping: link.damping,
+		max_impulse: link.max_impulse,
+		max_torque: link.max_torque,
 		first_anchor: link.first_anchor.to_array(),
 		second_anchor: link.second_anchor.to_array(),
 		axis: link.axis.to_array(),
@@ -1195,7 +1210,12 @@ mod tests {
 				axis: Vec3::X,
 				length: 2.5,
 				rest: Quat::from_xyzw(TURN, 0.0, 0.0, TURN),
-				give: 0.1,
+				// four numbers a reader would not produce from nothing, so the
+				// round trip has to carry every one of them
+				stiffness: 12.5,
+				damping: 0.4,
+				max_impulse: 90.0,
+				max_torque: 35.5,
 			}],
 			thing_generations: vec![1, 0, 3],
 			solid_generations: vec![0, 2, 0, 0, 1],

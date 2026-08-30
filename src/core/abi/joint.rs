@@ -129,17 +129,69 @@ pub struct Joint {
 	/// [`Joints::spawn`] directly is answerable for it itself.
 	pub rest: Quat,
 
-	/// How much of the pull is given up each step, from zero to one.
+	/// How stiff the spring holding it together is, in hertz.
 	///
-	/// Zero is a rigid joint. Anything above it is a joint that sags under
-	/// load, which is what a rope made of rope does and what a weld made of
-	/// metal does not. Above about a half nothing holds together at all.
-	pub give: f32,
+	/// **Zero is rigid**, and that is a flag rather than a limit: a spring of
+	/// no frequency would be no spring at all, and what zero selects instead is
+	/// the hard constraint this table has always solved, bit for bit. It is the
+	/// convention the field uses, and it is what makes every joint written
+	/// before this field existed behave exactly as it did.
+	///
+	/// Anything above zero is a *soft* constraint: the joint is allowed to be
+	/// out, and pulls itself back at this rate. That is what a physics gun
+	/// carrying a prop is, and what a weld that gives under load is. The number
+	/// is a frequency rather than a spring constant so that it does not have to
+	/// be retuned for every mass: a stiffness of ten holds a feather and an
+	/// anvil equally well.
+	///
+	/// **The step rate is the ceiling on what this can mean.** A spring is
+	/// integrated once a step, so a frequency approaching half the step rate is
+	/// already rigid as far as the solver can tell, and numbers taken from an
+	/// engine running a different rate do not transfer.
+	pub stiffness: f32,
+
+	/// How quickly the spring stops ringing, as a ratio.
+	///
+	/// One is critical: the joint arrives and stops. Below it the prop
+	/// overshoots and comes back; above it the joint is sluggish and never
+	/// quite arrives. Read only when [`stiffness`](Self::stiffness) is
+	/// something other than zero, because a rigid constraint has nothing to
+	/// damp.
+	pub damping: f32,
+
+	/// The most force it may spend on holding the anchors together, over one
+	/// whole step, as an impulse.
+	///
+	/// **Zero is no ceiling at all.** That is a sentinel and it is worth the
+	/// one it costs: the honest value would be an infinity, a `.scene` is JSON
+	/// and JSON has no spelling for one, and a joint permitted to spend nothing
+	/// is a joint that does not hold - which is what deleting it is for. So the
+	/// unusable end of the range carries the meaning.
+	///
+	/// It is a cap on *effort*, not a breaking strain: a joint that reaches it
+	/// stops pulling harder and goes on existing. Something too heavy to lift
+	/// is therefore something that stays where it is, rather than something
+	/// that tears the gun out of your hands.
+	///
+	/// Spent across the whole step rather than per pass, because the number of
+	/// passes is a console variable about *quality* and a ceiling that moved
+	/// when it did would not be a ceiling.
+	pub max_impulse: f32,
+
+	/// The same, for the half that holds the two orientations together.
+	///
+	/// Two numbers rather than one because the units differ: one is an impulse
+	/// and the other an angular impulse, and no single number is both.
+	pub max_torque: f32,
 }
 
 impl Joint {
-	/// How much a joint gives unless it says otherwise.
-	pub const GIVE: f32 = 0.0;
+	/// How quickly a spring settles unless it says otherwise.
+	pub const DAMPING: f32 = 1.0;
+	/// How much a joint may spend unless it says otherwise, which is all of it.
+	pub const NO_CEILING: f32 = 0.0;
+	/// How stiff a joint is unless it says otherwise, which is perfectly.
+	pub const RIGID: f32 = 0.0;
 
 	/// A hinge between two bodies.
 	///
@@ -177,7 +229,10 @@ impl Joint {
 			axis: Vec3::Y,
 			rest: Quat::IDENTITY,
 			length: 0.0,
-			give: Self::GIVE,
+			stiffness: Self::RIGID,
+			damping: Self::DAMPING,
+			max_impulse: Self::NO_CEILING,
+			max_torque: Self::NO_CEILING,
 		}
 	}
 
@@ -195,12 +250,27 @@ impl Joint {
 		joint
 	}
 
-	/// The same joint, softened.
+	/// The same joint, held by a spring rather than rigidly.
 	///
-	/// @param give - how much of the pull is given up each step
+	/// @param stiffness - how quickly it pulls itself back, in hertz
+	/// @param damping - how quickly the spring stops ringing, one being
+	/// critical
 	#[must_use]
-	pub const fn soft(mut self, give: f32) -> Self {
-		self.give = give;
+	pub const fn sprung(mut self, stiffness: f32, damping: f32) -> Self {
+		self.stiffness = stiffness;
+		self.damping = damping;
+
+		self
+	}
+
+	/// The same joint, with a limit on what it may spend in one step.
+	///
+	/// @param max_impulse - the most it may pull with, or zero for no ceiling
+	/// @param max_torque - the most it may turn with, or zero for no ceiling
+	#[must_use]
+	pub const fn capped(mut self, max_impulse: f32, max_torque: f32) -> Self {
+		self.max_impulse = max_impulse;
+		self.max_torque = max_torque;
 
 		self
 	}

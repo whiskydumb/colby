@@ -19,7 +19,7 @@
 //! anywhere asks whether the thing on the other side of a contact is a wall,
 //! because a wall is a row that divides by infinity.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, f32::consts::TAU};
 
 use colby_core::{
 	abi::{Bodies, Body, BodyId, BodyKind, Joint, JointKind, Joints},
@@ -96,6 +96,108 @@ const MEND: f32 = 0.2;
 
 /// How far a joint may be out before it is worth mending at all.
 const JOINT_SLOP: f32 = 1.0e-3;
+
+/// What a joint's spring works out to, for one step at one rate.
+///
+/// The soft-constraint formulation, and the whole of it is two scalars over the
+/// arithmetic that was already here. Writing `K` for the effective inverse mass
+/// a constraint presents, `h` for the step, `w` for the spring's frequency in
+/// radians and `z` for its damping ratio, the usual derivation gives a bias
+/// factor and a softness `y`:
+///
+/// ```text
+/// q = h*w * (2z + h*w)      y = K / q      bias = h*w / (2z + h*w)
+/// ```
+///
+/// and the impulse is `(K + y)^-1 * -(Cdot + bias/h * C + y * spent)`. Because
+/// `y` is `K/q` rather than a free number, `K + y` is `K * (q+1)/q`, its
+/// inverse is the *rigid* effective mass times `q/(q+1)`, and the whole soft
+/// solve collapses into the rigid one scaled by one number with a second number
+/// times the running total taken off it. No matrix in this file changes, and
+/// the rigid path is the case `push = 1, relax = 0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Spring {
+	/// What fraction of the error is asked back as a velocity each step.
+	bias: f32,
+
+	/// What fraction of the impulse a rigid joint would want this one takes.
+	push: f32,
+}
+
+impl Spring {
+	/// The constraint this table solved before springs existed.
+	///
+	/// Not the limit of the formula above as the frequency rises - that limit
+	/// has a bias of one - but the Baumgarte factor that was measured and
+	/// tuned. Keeping it is what makes a joint written before this field
+	/// existed behave bit for bit as it did.
+	const RIGID: Self = Self { bias: MEND, push: 1.0 };
+
+	/// What a joint's numbers work out to at this step length.
+	///
+	/// @param joint - the joint, for its stiffness and damping
+	/// @param dt - how long a step is, in seconds
+	fn of(joint: &Joint, dt: f32) -> Self {
+		if joint.stiffness <= 0.0 {
+			return Self::RIGID;
+		}
+
+		let omega = TAU * joint.stiffness;
+		let zeta = joint.damping.max(0.0);
+		let reach = 2.0_f32.mul_add(zeta, dt * omega);
+		let quality = dt * omega * reach;
+
+		if quality <= EPSILON || reach <= EPSILON {
+			return Self::RIGID;
+		}
+
+		Self {
+			bias: dt * omega / reach,
+			push: quality / (quality + 1.0),
+		}
+	}
+
+	/// How much of what has already been spent is handed back each pass.
+	const fn relax(self) -> f32 { 1.0 - self.push }
+}
+
+/// What one joint has spent so far this step.
+///
+/// Cleared at the top of every step rather than carried across one, because
+/// joints are not warm started - @ref `colby-known-gaps`. Two vectors because
+/// the two halves of a joint have different units and cannot share a ceiling.
+#[derive(Clone, Copy, Debug, Default)]
+struct Spent {
+	/// The impulse spent holding the anchors together.
+	linear: Vec3,
+
+	/// The angular impulse spent holding the orientations together.
+	angular: Vec3,
+}
+
+/// Holds a running total to a ceiling and says what may still be applied.
+///
+/// The clamp is on the *total over the step* and not on one pass's share,
+/// because the pass count is a console variable about quality and a ceiling
+/// that rose with it would not be a ceiling. A pass that would take the total
+/// past the limit therefore applies the part that fits and nothing more, and
+/// every pass after it in the same step applies nothing at all.
+///
+/// @param total - what has been spent, written
+/// @param wanted - what it would be if this pass had its way
+/// @param ceiling - the most it may reach, or zero for no ceiling
+/// @return the impulse that may actually be applied now
+fn hold(total: &mut Vec3, wanted: Vec3, ceiling: f32) -> Vec3 {
+	let held = if ceiling > 0.0 && wanted.length() > ceiling {
+		wanted.normalize_or_zero() * ceiling
+	} else {
+		wanted
+	};
+	let applied = held - *total;
+	*total = held;
+
+	applied
+}
 
 /// How many contact points one pair is remembered by.
 const REMEMBERED: usize = 4;
@@ -229,6 +331,14 @@ pub(crate) struct Solver {
 	/// obvious jitter. Seeded with last step's answer, the passes start
 	/// converged and the crawl is gone.
 	cache: HashMap<(BodyId, BodyId, u32), [Remembered; REMEMBERED]>,
+
+	/// What each joint has spent this step, indexed by joint slot.
+	///
+	/// Two things read it and it exists for both: a ceiling has to know what
+	/// has already gone, and a soft constraint hands part of what it has
+	/// already spent back every pass. Doing either without the other would be
+	/// the same array twice.
+	spent: Vec<Spent>,
 }
 
 /// What one contact point pushed with, kept for the next step.
@@ -264,6 +374,7 @@ impl Solver {
 			rows: Vec::new(),
 			groups: Vec::new(),
 			cache: HashMap::new(),
+			spent: Vec::new(),
 		}
 	}
 
@@ -315,11 +426,17 @@ impl Solver {
 		self.rows(bodies, manifolds, dt);
 		self.warm();
 
+		// nothing spent yet. Cleared here rather than carried, because joints
+		// are not warm started and because a ceiling is a ceiling *per step*.
+		self.spent.clear();
+		self.spent
+			.resize(joints.slots(), Spent::default());
+
 		for _ in 0..passes.clamp(1, MAX_PASSES) {
 			// joints first: they are the stiffer constraint, and a contact that
 			// has to argue with one converges faster than the other way round.
-			for (_, joint) in joints.iter() {
-				self.joint(joint, dt);
+			for (id, joint) in joints.iter() {
+				self.joint(id.slot(), joint, dt);
 			}
 
 			self.push();
@@ -534,9 +651,10 @@ impl Solver {
 	/// scalar along the line between the anchors, and unlike everything else in
 	/// this file it may only ever *pull*.
 	///
+	/// @param slot - which joint this is, for the ceiling's running total
 	/// @param joint - the joint
 	/// @param dt - how long a step is, for turning an error into a speed
-	fn joint(&mut self, joint: &Joint, dt: f32) {
+	fn joint(&mut self, slot: usize, joint: &Joint, dt: f32) {
 		let world = self.center.len() - 1;
 		let (first, second) = (joint.first.slot(), joint.second.slot());
 
@@ -563,13 +681,18 @@ impl Solver {
 			self.center[second] + self.rotation[second] * joint.second_anchor
 		};
 
-		let keep = 1.0 - joint.give.clamp(0.0, 0.95);
+		if slot >= self.spent.len() {
+			return;
+		}
+
+		let spring = Spring::of(joint, dt);
 
 		match joint.kind {
-			| JointKind::Rope => self.rope(joint, (first, second), (one, other), dt, keep),
+			| JointKind::Rope =>
+				self.rope(slot, joint, (first, second), (one, other), dt, spring),
 			| JointKind::Weld | JointKind::Axis => {
-				self.pinned((first, second), (one, other), dt, keep);
-				self.aligned(joint, (first, second), dt, keep);
+				self.pinned(slot, joint, (first, second), (one, other), dt, spring);
+				self.aligned(slot, joint, (first, second), dt, spring);
 			},
 		}
 	}
@@ -577,11 +700,12 @@ impl Solver {
 	/// The one scalar constraint of a rope.
 	fn rope(
 		&mut self,
+		slot: usize,
 		joint: &Joint,
 		slots: (usize, usize),
 		anchors: (Vec3, Vec3),
 		dt: f32,
-		keep: f32,
+		spring: Spring,
 	) {
 		let (first, second) = slots;
 		let between = anchors.1 - anchors.0;
@@ -600,14 +724,25 @@ impl Solver {
 			.dot(along);
 		let mass = self.effective(first, second, from_first, from_second, along);
 
-		let mend = MEND * (stretch - JOINT_SLOP).max(0.0) / dt;
-		let impulse = -(closing + mend) * mass * keep;
+		let mend = spring.bias * (stretch - JOINT_SLOP).max(0.0) / dt;
+		let rigid = -(closing + mend) * mass;
+		let already = self.spent[slot].linear;
+		let wanted = already + along * (rigid * spring.push) - already * spring.relax();
 
-		self.apply(first, second, from_first, from_second, along * impulse);
+		let applied = hold(&mut self.spent[slot].linear, wanted, joint.max_impulse);
+		self.apply(first, second, from_first, from_second, applied);
 	}
 
 	/// The three constraints that hold two anchors in the same place.
-	fn pinned(&mut self, slots: (usize, usize), anchors: (Vec3, Vec3), dt: f32, keep: f32) {
+	fn pinned(
+		&mut self,
+		slot: usize,
+		joint: &Joint,
+		slots: (usize, usize),
+		anchors: (Vec3, Vec3),
+		dt: f32,
+		spring: Spring,
+	) {
 		let (first, second) = slots;
 		let (from_first, from_second) = self.arms(slots, anchors);
 		let drift = anchors.1 - anchors.0;
@@ -623,10 +758,13 @@ impl Solver {
 			return;
 		}
 
-		let mend = drift * (MEND / dt);
-		let impulse = mass.inverse() * -(closing + mend) * keep;
+		let mend = drift * (spring.bias / dt);
+		let rigid = mass.inverse() * -(closing + mend);
+		let already = self.spent[slot].linear;
+		let wanted = already + rigid * spring.push - already * spring.relax();
 
-		self.apply(first, second, from_first, from_second, impulse);
+		let applied = hold(&mut self.spent[slot].linear, wanted, joint.max_impulse);
+		self.apply(first, second, from_first, from_second, applied);
 	}
 
 	/// The angular constraints that stop two bodies turning away from each
@@ -636,7 +774,14 @@ impl Solver {
 	/// which is the usual approximation and is exact enough for a joint that is
 	/// never allowed to get far out. A hinge then throws away the component
 	/// along its own axis, which is the one direction it is *for*.
-	fn aligned(&mut self, joint: &Joint, slots: (usize, usize), dt: f32, keep: f32) {
+	fn aligned(
+		&mut self,
+		slot: usize,
+		joint: &Joint,
+		slots: (usize, usize),
+		dt: f32,
+		spring: Spring,
+	) {
 		let (first, second) = slots;
 		let relative = self.rotation[second] * self.rotation[first].inverse();
 		let drift = relative * joint.rest.inverse();
@@ -662,13 +807,17 @@ impl Solver {
 			return;
 		}
 
-		let mend = error * (MEND / dt);
-		let mut impulse = mass.inverse() * -(closing + mend) * keep;
+		let mend = error * (spring.bias / dt);
+		let mut rigid = mass.inverse() * -(closing + mend);
 
 		if joint.kind == JointKind::Axis {
 			let axis = (self.rotation[first] * joint.axis).normalize_or(Vec3::Y);
-			impulse -= axis * impulse.dot(axis);
+			rigid -= axis * rigid.dot(axis);
 		}
+
+		let already = self.spent[slot].angular;
+		let wanted = already + rigid * spring.push - already * spring.relax();
+		let impulse = hold(&mut self.spent[slot].angular, wanted, joint.max_torque);
 
 		self.angular[first] -= self.inverse_inertia[first] * impulse;
 		self.angular[second] += self.inverse_inertia[second] * impulse;
@@ -1205,5 +1354,112 @@ mod tests {
 
 		platform.velocity = Vec3::X;
 		assert!(disturbs(&platform), "and one that is moving is not");
+	}
+
+	/// A joint of a stiffness, with everything else left alone.
+	fn sprung(stiffness: f32, damping: f32) -> Joint {
+		Joint::weld(BodyId::NONE, BodyId::NONE, (Vec3::ZERO, Vec3::ZERO))
+			.sprung(stiffness, damping)
+	}
+
+	#[test]
+	fn a_joint_with_no_stiffness_is_the_constraint_this_table_always_solved() {
+		let rigid = Spring::of(&sprung(Joint::RIGID, 1.0), 1.0 / 60.0);
+
+		assert_eq!(rigid, Spring::RIGID, "zero selects the hard constraint, not a limp spring");
+		assert!((rigid.push - 1.0).abs() < f32::EPSILON, "which takes all of what it wants");
+		assert!(rigid.relax().abs() < f32::EPSILON, "and hands none of it back");
+	}
+
+	#[test]
+	fn a_spring_takes_part_of_what_a_rigid_joint_would_and_hands_the_rest_back() {
+		let spring = Spring::of(&sprung(10.0, 1.0), 1.0 / 60.0);
+
+		assert!(spring.push > 0.0 && spring.push < 1.0, "part of it, got {}", spring.push);
+		assert!(
+			spring.bias > 0.0 && spring.bias < 1.0,
+			"and part of the error, got {}",
+			spring.bias
+		);
+		assert!(
+			(spring.push + spring.relax() - 1.0).abs() < 1.0e-6,
+			"what it does not take is exactly what it gives back"
+		);
+	}
+
+	#[test]
+	fn a_stiffer_spring_is_closer_to_rigid() {
+		let dt = 1.0 / 60.0;
+		let soft = Spring::of(&sprung(2.0, 1.0), dt);
+		let firm = Spring::of(&sprung(20.0, 1.0), dt);
+		let hard = Spring::of(&sprung(2000.0, 1.0), dt);
+
+		assert!(soft.push < firm.push, "a stiffer spring keeps more of its impulse");
+		assert!(firm.push < hard.push, "and more again");
+		assert!(soft.bias < firm.bias, "and asks for more of the error back");
+		assert!(hard.push > 0.99, "and a very stiff one is rigid in all but name");
+	}
+
+	#[test]
+	fn a_faster_step_makes_the_same_spring_softer() {
+		let slow = Spring::of(&sprung(10.0, 1.0), 1.0 / 30.0);
+		let fast = Spring::of(&sprung(10.0, 1.0), 1.0 / 240.0);
+
+		// the same number of hertz is a smaller fraction of a shorter step, so
+		// numbers taken from an engine running another rate do not transfer.
+		assert!(fast.push < slow.push, "the shorter the step, the less rigid a spring is");
+	}
+
+	#[test]
+	fn a_ceiling_of_zero_is_no_ceiling() {
+		let mut total = Vec3::ZERO;
+		let applied = hold(&mut total, Vec3::new(0.0, 900.0, 0.0), 0.0);
+
+		assert_eq!(applied, Vec3::new(0.0, 900.0, 0.0), "all of it goes through");
+		assert_eq!(total, Vec3::new(0.0, 900.0, 0.0), "and all of it is counted");
+	}
+
+	#[test]
+	fn a_ceiling_holds_the_total_over_the_step_and_not_one_pass_of_it() {
+		let mut total = Vec3::ZERO;
+		let mut spent = Vec3::ZERO;
+
+		// ten passes each asking for three quarters of the ceiling. Per pass
+		// they would spend seven and a half of it; over the step they spend
+		// exactly one.
+		for _ in 0..10 {
+			let wanted = total + Vec3::Y * 0.75;
+			spent += hold(&mut total, wanted, 1.0);
+		}
+
+		assert!((total.y - 1.0).abs() < 1.0e-6, "the total stops at the ceiling, got {total}");
+		assert!(
+			(spent.y - 1.0).abs() < 1.0e-6,
+			"and what was actually applied adds up to the same, got {spent}"
+		);
+	}
+
+	#[test]
+	fn a_pass_past_the_ceiling_applies_nothing_at_all() {
+		let mut total = Vec3::new(0.0, 1.0, 0.0);
+		let applied = hold(&mut total, Vec3::new(0.0, 4.0, 0.0), 1.0);
+
+		assert_eq!(applied, Vec3::ZERO, "there is nothing left to spend");
+		assert_eq!(total, Vec3::new(0.0, 1.0, 0.0), "and the total did not move");
+	}
+
+	#[test]
+	fn a_ceiling_keeps_the_direction_the_constraint_asked_for() {
+		let mut total = Vec3::ZERO;
+		let wanted = Vec3::new(3.0, 4.0, 0.0);
+		let applied = hold(&mut total, wanted, 1.0);
+
+		assert!((applied.length() - 1.0).abs() < 1.0e-6, "shortened to the ceiling");
+		assert!(
+			applied
+				.normalize()
+				.abs_diff_eq(wanted.normalize(), 1.0e-6),
+			"and pointing where it was asked to"
+		);
 	}
 }

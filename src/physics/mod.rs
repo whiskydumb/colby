@@ -940,6 +940,235 @@ mod tests {
 	}
 
 	#[test]
+	fn a_rigid_weld_eases_a_gap_shut_rather_than_snapping_it() {
+		// what the Baumgarte factor is for, and the only test that pins it. A
+		// joint that took its whole error out in one step would fling anything
+		// welded across a gap, which is the thing a sandbox does constantly:
+		// two props are almost never touching when somebody welds them.
+		let (mut world, mut simulation) = wired();
+		let post = world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.0, 8.0, 0.0)),
+		));
+		// a whole unit of gap between where the anchors are and where they say
+		// they should be
+		let hung = world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(Vec3::new(2.0, 8.0, 0.0)),
+			1.0,
+		));
+
+		world.join(Joint::weld(hung, post, (Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0))));
+		settle(&mut world, &mut simulation, 1);
+
+		let after = placed(&world, hung).x;
+
+		assert!(after < 2.0, "it does move towards where it belongs, ended at {after}");
+		assert!(after > 1.5, "but nothing like all the way there in one step, ended at {after}");
+	}
+
+	#[test]
+	fn a_weld_that_may_not_turn_hard_cannot_stop_a_spin() {
+		// both anchors at the held body's own middle, so a spin about that
+		// middle produces no velocity at the anchor at all and the point half
+		// of the weld has nothing to say. What is being measured is the
+		// angular half alone, which is the half `max_torque` is the ceiling on.
+		let turned = |ceiling: f32| {
+			let (mut world, mut simulation) = wired();
+			let post = world.bodies.spawn(Body::new(
+				BodyKind::Static,
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 8.0, 0.0)),
+			));
+			let held = world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(2.0, 8.0, 0.0)),
+				1.0,
+			));
+
+			world.join(
+				Joint::weld(held, post, (Vec3::ZERO, Vec3::new(2.0, 0.0, 0.0)))
+					.capped(Joint::NO_CEILING, ceiling),
+			);
+
+			if let Some(body) = world.bodies.get_mut(held) {
+				body.angular = Vec3::new(0.0, 30.0, 0.0);
+			}
+
+			settle(&mut world, &mut simulation, 20);
+
+			world.bodies.get(held).map_or(0.0, |body| {
+				body.transform
+					.rotation
+					.angle_between(Quat::IDENTITY)
+			})
+		};
+
+		let arrested = turned(Joint::NO_CEILING);
+		let loose = turned(0.02);
+
+		assert!(arrested < 0.2, "with no ceiling the weld stops the spin, turned {arrested}");
+		assert!(
+			loose > arrested + 0.3,
+			"and with one it cannot: turned {loose} against {arrested}"
+		);
+	}
+
+	/// A body welded out on a lever arm from a post, and where it ends up.
+	///
+	/// The arrangement the sag is measured on: the weld is made across no gap
+	/// at all, so what moves afterwards is the joint giving under the body's
+	/// own weight rather than the joint yanking it into place.
+	///
+	/// @param spring - the stiffness and damping to make the weld with
+	/// @param steps - how long to let it settle
+	/// @return how far below where it was made the body ends up
+	fn sag_of(spring: (f32, f32), steps: usize) -> f32 {
+		let (mut world, mut simulation) = wired();
+		let post = world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.0, 4.0, 0.0)),
+		));
+		let started = Vec3::new(1.0, 4.0, 0.0);
+		let held = world
+			.bodies
+			.spawn(Body::dynamic(Shape::UNIT, Transform::at(started), 1.0));
+
+		world.join(
+			Joint::weld(held, post, (Vec3::new(-0.5, 0.0, 0.0), Vec3::new(0.5, 0.0, 0.0)))
+				.sprung(spring.0, spring.1),
+		);
+		settle(&mut world, &mut simulation, steps);
+
+		started.y - placed(&world, held).y
+	}
+
+	#[test]
+	fn a_soft_weld_sags_where_a_rigid_one_does_not() {
+		let rigid = sag_of((Joint::RIGID, Joint::DAMPING), 600);
+		let soft = sag_of((6.0, 1.0), 600);
+
+		assert!(rigid < 0.05, "a rigid weld holds it where it was, sagged {rigid}");
+		assert!(soft > rigid * 2.0, "and a sprung one does not, sagged {soft}");
+		assert!(soft < 1.0, "but it still holds it rather than dropping it, sagged {soft}");
+	}
+
+	#[test]
+	fn a_soft_weld_settles_rather_than_going_on_sagging() {
+		// the property that matters is not how far it gives but that it stops
+		// giving: a joint whose error grows every step is one that comes apart
+		// eventually, and the two are told apart only by waiting.
+		let early = sag_of((6.0, 1.0), 300);
+		let late = sag_of((6.0, 1.0), 1200);
+
+		assert!(
+			(late - early).abs() < 0.02,
+			"four times as long and the same place: {early} then {late}"
+		);
+	}
+
+	#[test]
+	fn a_weld_that_may_spend_nothing_much_cannot_hold_what_it_is_given() {
+		let held = |ceiling: f32| {
+			let (mut world, mut simulation) = wired();
+			let post = world.bodies.spawn(Body::new(
+				BodyKind::Static,
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 8.0, 0.0)),
+			));
+			let hung = world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 7.0, 0.0)),
+				20.0,
+			));
+
+			world.join(
+				Joint::weld(hung, post, (Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, -0.5, 0.0)))
+					.capped(ceiling, 0.0),
+			);
+			settle(&mut world, &mut simulation, 120);
+
+			placed(&world, hung).y
+		};
+
+		// twenty kilograms under ten units a second squared is about three and
+		// a third newton-seconds of weight per sixtieth of a second, so a
+		// ceiling well under that cannot carry it and one well over can.
+		let uncapped = held(Joint::NO_CEILING);
+		let capped = held(0.4);
+
+		assert!(uncapped > 6.9, "with no ceiling the weld holds it, ended at {uncapped}");
+		assert!(
+			capped < uncapped - 0.5,
+			"and with one it does not, ended at {capped} against {uncapped}"
+		);
+	}
+
+	#[test]
+	fn a_ceiling_does_not_move_when_the_pass_count_does() {
+		// the whole reason the total is kept across the passes rather than
+		// clamped inside one. `phys.passes` is a console variable about how
+		// hard the solver tries, and a limit that rose with it would be a limit
+		// a person could turn off by asking for a better simulation.
+		let under = |passes: f32| {
+			let (mut world, mut simulation) = wired();
+			world.cvars.var(
+				PASSES,
+				colby_core::abi::Value::Float(passes),
+				"how hard the solver tries, for this test only",
+			);
+
+			let post = world.bodies.spawn(Body::new(
+				BodyKind::Static,
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 8.0, 0.0)),
+			));
+			let hung = world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 7.0, 0.0)),
+				20.0,
+			));
+
+			world.join(
+				Joint::weld(hung, post, (Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, -0.5, 0.0)))
+					.capped(0.4, 0.0),
+			);
+			settle(&mut world, &mut simulation, 120);
+
+			placed(&world, hung).y
+		};
+
+		// the same scene with no joint in it at all. Without this control the
+		// test passes when the ceiling does nothing whatever, because a body
+		// in free fall is also in the same place at every pass count.
+		let dropped = {
+			let (mut world, mut simulation) = wired();
+			let falling = world.bodies.spawn(Body::dynamic(
+				Shape::UNIT,
+				Transform::at(Vec3::new(0.0, 7.0, 0.0)),
+				20.0,
+			));
+			settle(&mut world, &mut simulation, 120);
+
+			placed(&world, falling).y
+		};
+
+		let few = under(4.0);
+		let many = under(32.0);
+
+		assert!(
+			few > dropped + 0.5,
+			"the ceiling is spending what it may: {few} against a free fall to {dropped}"
+		);
+		assert!(
+			(few - many).abs() < 0.05,
+			"eight times the passes and the same ceiling: {few} against {many}"
+		);
+	}
+
+	#[test]
 	fn a_hinge_turns_about_its_axis_and_holds_every_other_way() {
 		let spun = |axis: Vec3| {
 			let (mut world, mut simulation) = wired();

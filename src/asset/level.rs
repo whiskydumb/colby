@@ -39,7 +39,7 @@
 use colby_core::{
 	Result,
 	abi::{
-		BodyKind, Camera, JointKind, Layers, ShapeKind, Transform,
+		BodyKind, Camera, Joint, JointKind, Layers, ShapeKind, Transform,
 		scene::{Form, Link, NO_INDEX, SceneData, Solid, Stage, Thing},
 	},
 	err,
@@ -247,7 +247,19 @@ fn joints(value: Option<&Value>, solids: &[Solid]) -> Result<Vec<Link>> {
 	for (index, entry) in listed(value).iter().enumerate() {
 		fields(
 			entry,
-			&["name", "kind", "first", "second", "anchors", "axis", "length", "give"],
+			&[
+				"name",
+				"kind",
+				"first",
+				"second",
+				"anchors",
+				"axis",
+				"length",
+				"stiffness",
+				"damping",
+				"max impulse",
+				"max torque",
+			],
 			"a joint",
 		)?;
 
@@ -272,7 +284,10 @@ fn joints(value: Option<&Value>, solids: &[Solid]) -> Result<Vec<Link>> {
 			// written at, which is no relative rotation at all: they are
 			// exactly where the file put them.
 			rest: Quat::IDENTITY,
-			give: number(entry.get("give"), 0.0),
+			stiffness: number(entry.get("stiffness"), Joint::RIGID),
+			damping: number(entry.get("damping"), Joint::DAMPING),
+			max_impulse: number(entry.get("max impulse"), Joint::NO_CEILING),
+			max_torque: number(entry.get("max torque"), Joint::NO_CEILING),
 		});
 	}
 
@@ -707,7 +722,10 @@ fn link_of(link: &Link, name: &str, solids: &[String]) -> String {
 
 	put_vector(&mut fields, "axis", link.axis, Vec3::Y);
 	put_number(&mut fields, "length", link.length, 1.0);
-	put_number(&mut fields, "give", link.give, 0.0);
+	put_number(&mut fields, "stiffness", link.stiffness, Joint::RIGID);
+	put_number(&mut fields, "damping", link.damping, Joint::DAMPING);
+	put_number(&mut fields, "max impulse", link.max_impulse, Joint::NO_CEILING);
+	put_number(&mut fields, "max torque", link.max_torque, Joint::NO_CEILING);
 
 	object(&fields)
 }
@@ -1027,7 +1045,7 @@ fn spellable(scene: &SceneData) -> Result<()> {
 		let good = link.first_anchor.is_finite()
 			&& link.second_anchor.is_finite()
 			&& link.axis.is_finite()
-			&& [link.length, link.give]
+			&& [link.length, link.stiffness, link.damping, link.max_impulse, link.max_torque]
 				.iter()
 				.all(|it| it.is_finite());
 
@@ -1070,7 +1088,8 @@ mod tests {
 		],
 		"joints": [
 			{ "name": "rope", "kind": "rope", "first": "crate",
-			  "anchors": [[0, 1, 0], [0, 8, 0]], "length": 3.5, "give": 0.05 }
+			  "anchors": [[0, 1, 0], [0, 8, 0]], "length": 3.5,
+			  "stiffness": 8.0, "damping": 0.6, "max impulse": 45.0, "max torque": 12.5 }
 		]
 	}"#;
 
@@ -1539,6 +1558,17 @@ mod tests {
 		let mut blown = import(SOURCE).expect("it is a scene");
 		blown.solids[0].velocity.x = f32::INFINITY;
 		assert!(export(&blown).is_err(), "and an infinity is refused too");
+
+		// a joint's own numbers, which is where an infinity is most tempting:
+		// "no ceiling" is arithmetically an infinity and is written as a zero
+		// for exactly this reason.
+		let mut uncapped = import(SOURCE).expect("it is a scene");
+		uncapped.links[0].max_impulse = f32::INFINITY;
+		let refused = export(&uncapped).expect_err("a joint cannot carry one either");
+		assert!(
+			format!("{refused}").contains("joint"),
+			"and the message says which kind of record: {refused}"
+		);
 	}
 
 	#[test]
