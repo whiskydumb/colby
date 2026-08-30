@@ -19,12 +19,13 @@
 
 use colby_core::{
 	abi::{
-		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, JointId,
-		Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Renderable, SceneData,
-		SceneId, Shape, Solid, TouchKind, TraceInfo, Transform, World, character, debug, scene,
+		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, Joint,
+		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Renderable,
+		SceneData, SceneId, Shape, Solid, TouchKind, TraceInfo, Transform, World, character,
+		debug, scene,
 	},
 	bytemuck::{Pod, Zeroable},
-	glam::{Vec2, Vec3},
+	glam::{Quat, Vec2, Vec3},
 	info, mod_ctor, mod_dtor, trace, warn,
 };
 
@@ -289,6 +290,53 @@ const REACH: f32 = 60.0;
 /// How much brighter whatever is under the cursor is drawn.
 const HIGHLIGHT: f32 = 1.45;
 
+/// How close and how far the gun will hold something, in units.
+///
+/// The near end is far enough that a carried prop is not inside the player's
+/// own box; the far end is most of the yard.
+const HOLD_RANGE: (f32, f32) = (2.0, 24.0);
+
+/// How much one line of scroll moves what is being held.
+const HOLD_STEP: f32 = 0.8;
+
+/// How stiff the joint that carries a prop is, in hertz.
+///
+/// Measured on a grid rather than taken from anywhere: @ref the doc on
+/// [`carry`]. The numbers the field publishes are for a solver running a
+/// different step, and a frequency near half of sixty is rigid here whatever it
+/// says elsewhere.
+const HOLD_STIFFNESS: f32 = 12.0;
+
+/// How quickly that spring stops ringing.
+///
+/// Above one on purpose: a prop that overshoots the point it is being carried
+/// to and comes back is a prop that feels like it is on elastic.
+const HOLD_DAMPING: f32 = 1.6;
+
+/// How many times a prop's own weight the gun may spend in one step.
+///
+/// The ceiling is scaled by the held body's mass rather than being a number of
+/// newtons, which is what stops the gun feeling sluggish on a light prop and
+/// explosive on a heavy one. What it buys is not a weight limit - a physics gun
+/// is supposed to lift anything it can hold - but a bound on what one step may
+/// do, so a prop shoved into a wall pushes rather than launching.
+const HOLD_STRENGTH: f32 = 26.0;
+
+/// The same, for the half that keeps the prop facing the way it was picked up.
+const HOLD_TWIST: f32 = 6.0;
+
+/// Where the beam is drawn from, above the player's middle and in front of it.
+///
+/// The forward part is not decoration. The player is a box a unit tall centered
+/// on its own middle, so a muzzle only *lifted* is a muzzle inside the thing
+/// that draws it, and the beam comes out of the player's chest and is hidden by
+/// it. Found by looking at a shot: the line was there and almost none of it
+/// was.
+const MUZZLE_AT: (f32, f32) = (0.3, 0.45);
+
+/// How big the cross marking where the beam is attached is.
+const MUZZLE_MARK: f32 = 0.09;
+
 /// The game's own state, kept in the host's arena.
 ///
 /// Add a field, bump [`STATE_LAYOUT`], save: the arena zeroes itself and the
@@ -386,6 +434,36 @@ struct State {
 	/// How far away it was, in units.
 	picked_distance: f32,
 
+	/// Where on it the ray landed, in the world.
+	///
+	/// Three floats rather than a `Vec3` because the arena is [`Pod`] and glam
+	/// is built without bytemuck, so nothing holding one can be.
+	picked_at: [f32; 3],
+
+	/// The joint carrying whatever the gun is holding, or nothing.
+	///
+	/// The gun *is* this joint: there is no second mechanism, no controller and
+	/// no per-step teleport. Letting go is despawning it.
+	hold: JointId,
+
+	/// The body it is holding.
+	held: BodyId,
+
+	/// How far in front of the eye it is being carried.
+	hold_distance: f32,
+
+	/// Where the beam is attached, in the held body's own space.
+	hold_anchor: [f32; 3],
+
+	/// How the prop was turned when it was picked up, xyzw.
+	hold_rest: [f32; 4],
+
+	/// Which way the camera was looking then.
+	///
+	/// A carried prop turns with the player and not with the pitch, which is
+	/// what makes carrying one feel like carrying rather than like aiming.
+	hold_yaw: f32,
+
 	/// One entity per piece of the model standing in the yard.
 	///
 	/// Spawned once and never moved, so it is the one thing in this scene the
@@ -398,7 +476,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 14;
+const STATE_LAYOUT: u64 = 15;
 
 /// The module's single exported symbol.
 ///
@@ -472,6 +550,18 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	world
 		.cvars
 		.command("game.cleanup", clear, "despawn every prop, leaving the map alone");
+	// every action the gun performs is a named function over the world with a
+	// console command in front of it. That is the discipline replication will
+	// want, and until there is any it is what lets a script with no mouse in it
+	// drive the whole weapon.
+	world.cvars.command(
+		"game.grab",
+		take,
+		"take hold of what the crosshair is on, or of a named body",
+	);
+	world
+		.cvars
+		.command("game.release", drop_held, "let go of whatever is held");
 
 	// on every load, not only a fresh one: the mesh a name resolves to is the
 	// host's business, and an asset that appeared since the last swap should be
@@ -529,10 +619,19 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 		state.pitch = input.cursor_delta[1].mul_add(DRAG_RATE, state.pitch);
 	}
 
-	state.distance = input
-		.wheel
-		.mul_add(-ZOOM_STEP, state.distance)
-		.clamp(DISTANCE_RANGE.0, DISTANCE_RANGE.1);
+	// the wheel moves what is held, or the camera when nothing is. One knob,
+	// two meanings, and which one is obvious from what is in front of you.
+	if state.hold.is_some() {
+		state.hold_distance = input
+			.wheel
+			.mul_add(HOLD_STEP, state.hold_distance)
+			.clamp(HOLD_RANGE.0, HOLD_RANGE.1);
+	} else {
+		state.distance = input
+			.wheel
+			.mul_add(-ZOOM_STEP, state.distance)
+			.clamp(DISTANCE_RANGE.0, DISTANCE_RANGE.1);
+	}
 
 	let (yaw, pitch, distance) = (state.yaw, state.pitch, state.distance);
 
@@ -555,6 +654,7 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	rope_line(world);
 	swallow(world);
 	pick(world);
+	physgun(world, yaw);
 	duplicate(world, yaw);
 	light_up(world);
 	label_pick(world);
@@ -1011,6 +1111,10 @@ fn pick(world: &mut World) {
 	state.picked = result.entity;
 	state.picked_body = result.body;
 	state.picked_distance = if result.hit { result.fraction * REACH } else { 0.0 };
+	// where, not only how far: the physics gun attaches its beam at the point
+	// the ray landed on, which is what makes carrying a long prop by its end
+	// behave like carrying it by its end.
+	state.picked_at = result.end.to_array();
 	let state = *state;
 
 	if moved {
@@ -1021,6 +1125,216 @@ fn pick(world: &mut World) {
 		// it. @ref the pre-commit audit list.
 		trace!(hit = %named(world, &state), fraction = result.fraction, "pick");
 	}
+}
+
+/// The physics gun: grab, carry, let go.
+///
+/// **A physics gun is a joint.** Not a spring bolted to the side of the solver,
+/// not a teleport, and not a controller that writes a velocity every step: a
+/// `Weld` pinned to a point in the world, made on the press and destroyed on
+/// the release, whose far anchor is rewritten each step to sit in front of the
+/// eye. Everything that makes it feel like a gun rather than like a magnet is
+/// two numbers on that joint - a spring and a ceiling on what it may spend.
+///
+/// The left button, because the camera already has the right one. The wheel
+/// moves what is held rather than the camera, and only while something is held.
+///
+/// @param world - the tables to read and the joint to make
+/// @param yaw - which way the camera is looking
+fn physgun(world: &mut World, yaw: f32) {
+	let over_interface = world.ui.pointer_over();
+	let input = world.input;
+
+	if input.button_pressed(Button::Left) && !over_interface {
+		grab(world, yaw, "");
+	}
+
+	if input.button_released(Button::Left) {
+		release(world);
+	}
+
+	carry(world, yaw);
+}
+
+/// Takes hold of whatever the crosshair is on.
+///
+/// Reads what [`pick`] already found rather than tracing again, which is not
+/// only cheaper: the pick ray is *unfiltered*, so a prop behind a wall is not
+/// what it found and cannot be grabbed through one. A trace narrowed to the
+/// prop layer would reach straight through the map, which is the wrong kind of
+/// gun.
+///
+/// @param world - the picked body, and the joint table
+/// @param yaw - which way the camera is looking, remembered for the carry
+/// @param named - a body to take instead of the one under the crosshair
+fn grab(world: &mut World, yaw: f32, named: &str) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+	if state.hold.is_some() {
+		return;
+	}
+
+	let (body, distance, at) = (state.picked_body, state.picked_distance, state.picked_at);
+	let at = Vec3::from_array(at);
+
+	// naming one takes it by its middle from wherever the player is standing,
+	// which is what a console has instead of a crosshair. The pointer is the
+	// ordinary way in and this is the one a script can drive.
+	let (body, at, distance) = if named.is_empty() {
+		(body, at, distance)
+	} else {
+		let Some((found, solid)) = world
+			.bodies
+			.iter()
+			.find(|(id, _)| world.bodies.name(*id) == named)
+		else {
+			warn!(name = named, "nothing in the world is called that");
+
+			return;
+		};
+		let middle = solid.transform.position;
+		let eye = world.camera.position;
+
+		(found, middle, (middle - eye).length())
+	};
+
+	let Some(solid) = world.bodies.get(body) else {
+		return;
+	};
+
+	// only something the solver owns, and only something on the prop layer.
+	// The map is neither, which is what stops the gun picking up the hangar.
+	if !solid.movable() || !on_layer(solid, PROP_LAYERS) {
+		return;
+	}
+
+	let placed = solid.transform;
+	let mass = solid.mass.max(Body::MASS);
+	// the anchor is rotated into the body's own space and *not* scaled, because
+	// that is what the solver does with it on the way back out.
+	let anchor = placed.rotation.inverse() * (at - placed.position);
+	let rest = placed.rotation;
+
+	// a sleeping body is a body of no inverse mass, which is to say a wall, and
+	// a joint that pulled on one would pull against infinity. Nothing else
+	// wakes it: the solver rouses the ends of a joint only when one of them is
+	// already moving.
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.sleeping = false;
+	}
+
+	let gravity = world.gravity.length().max(1.0);
+	let dt = world.dt.max(f32::EPSILON);
+	let weight = mass * gravity * dt;
+
+	let joint = world.join(
+		Joint::weld(body, BodyId::NONE, (anchor, at))
+			.sprung(HOLD_STIFFNESS, HOLD_DAMPING)
+			.capped(weight * HOLD_STRENGTH, weight * HOLD_TWIST),
+	);
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.hold = joint;
+	state.held = body;
+	state.hold_distance = distance.clamp(HOLD_RANGE.0, HOLD_RANGE.1);
+	state.hold_anchor = anchor.to_array();
+	state.hold_rest = rest.to_array();
+	state.hold_yaw = yaw;
+
+	trace!(body = body.slot(), distance = state.hold_distance, "grabbed");
+}
+
+/// Lets go of whatever is held.
+///
+/// The prop keeps whatever speed the joint had given it, which is what throwing
+/// something is: there is no separate throw, and there does not need to be.
+///
+/// @param world - the joint table
+fn release(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (joint, body) = (state.hold, state.held);
+
+	if !joint.is_some() {
+		return;
+	}
+
+	state.hold = JointId::NONE;
+	state.held = BodyId::NONE;
+	world.joints.despawn(joint);
+
+	trace!(body = body.slot(), "let go");
+}
+
+/// Moves the point a held prop is being pulled towards, and draws the beam.
+///
+/// Three things happen here and each is one line of the reason the gun is a
+/// joint at all. The far anchor is rewritten, so the prop follows the eye. The
+/// `rest` is rewritten from the *yaw alone*, so the prop turns with the player
+/// and does not roll when the player looks up. And the body is kept awake,
+/// because a prop carried steadily is a prop that has been still for a while
+/// and the solver would otherwise put it to sleep in mid-air.
+///
+/// **The two numbers on the joint were measured rather than chosen.** @ref
+/// `colby-known-gaps` for the grid.
+///
+/// @param world - the joint to move and the table the beam goes in
+/// @param yaw - which way the camera is looking now
+fn carry(world: &mut World, yaw: f32) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (joint, body, distance) = (state.hold, state.held, state.hold_distance);
+	let (rest, held_yaw) = (state.hold_rest, state.hold_yaw);
+	let (player, anchor) = (state.player, state.hold_anchor);
+
+	if !joint.is_some() {
+		return;
+	}
+
+	// the prop was taken out from under the gun by something else - the hole,
+	// a cleanup, a scene reloading. Nothing to carry and a joint to drop.
+	if world.bodies.get(body).is_none() {
+		release(world);
+
+		return;
+	}
+
+	let camera = world.camera;
+	let viewport = world.ui.viewport();
+	let pointer = world.ui.pointer();
+	let aim = if pointer.cmpge(Vec2::ZERO).all() && pointer.cmple(viewport).all() {
+		pointer
+	} else {
+		viewport * 0.5
+	};
+	let target = camera.position + camera.pixel_direction(aim, viewport) * distance;
+	let turned = Quat::from_rotation_y(yaw - held_yaw) * Quat::from_array(rest);
+
+	if let Some(link) = world.joints.get_mut(joint) {
+		link.second_anchor = target;
+		// a world-pinned weld reads `rest` against an identity rotation on the
+		// far side, so the orientation it holds the body at is the inverse of
+		// what is written here. @ref `Joint::rest`.
+		link.rest = turned.inverse();
+	}
+
+	let Some(solid) = world.bodies.get_mut(body) else {
+		return;
+	};
+
+	solid.sleeping = false;
+	let placed = solid.transform;
+	let grip = placed.position + placed.rotation * Vec3::from_array(anchor);
+
+	// a line rather than a beam, because there is no transparency in the scene
+	// pass and a solid quad pretending to be one would look worse than a line
+	// that is honestly a line. @ref `colby-direction`, step fourteen.
+	let ahead = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+	let muzzle = world
+		.entities
+		.transform(player)
+		.map_or(camera.position, |it| it.position + Vec3::Y * MUZZLE_AT.1 + ahead * MUZZLE_AT.0);
+
+	world.debug.line(muzzle, grip, debug::CYAN);
+	world.debug.point(grip, MUZZLE_MARK, debug::CYAN);
 }
 
 /// Brightens whatever the pick ray found and puts everything else back.
@@ -1177,6 +1491,37 @@ unsafe extern "C-unwind" fn reset(world: *mut World, _args: *const Args) {
 	recenter(world);
 }
 
+/// `game.grab` - the console's way of pressing the left button.
+///
+/// # Safety
+///
+/// `world` must point to a live [`World`] owned by the host, and `args` to a
+/// live argument list. The host removes this command from the table before
+/// unloading the module it lives in.
+unsafe extern "C-unwind" fn take(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let named = unsafe { &*args }.rest();
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let yaw = state.yaw;
+
+	grab(world, yaw, &named);
+}
+
+/// `game.release` - and of letting go of it.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn drop_held(world: *mut World, _args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+
+	release(world);
+}
+
 /// `game.cleanup` - what the interface's own second button asks for.
 ///
 /// A console command rather than something the interface does, because the
@@ -1237,6 +1582,11 @@ fn sweep_props(world: &mut World) {
 	state.rope = JointId::NONE;
 	state.picked = EntityId::NONE;
 	state.picked_body = BodyId::NONE;
+	// the gun was holding one of them. `carry` notices a body that has gone and
+	// lets go by itself, so this is not load-bearing; it is the difference
+	// between a handle that is stale for a step and one that never is.
+	state.hold = JointId::NONE;
+	state.held = BodyId::NONE;
 
 	info!(gone = loose.len(), "props swept");
 }

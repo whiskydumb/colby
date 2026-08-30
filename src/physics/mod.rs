@@ -939,6 +939,78 @@ mod tests {
 		);
 	}
 
+	/// Carries a body to a point that jumps, and reports how the carry went.
+	///
+	/// The arrangement a physics gun is: a weld pinned to a point in the world,
+	/// sprung rather than rigid, with a ceiling on what it may spend. The
+	/// target moves three units sideways in one step, which is what happens
+	/// when somebody carrying a prop turns round.
+	///
+	/// @param spring - stiffness in hertz and damping ratio
+	/// @param strength - how many times the body's weight the ceiling is
+	/// @return how far it overshot, how far off it settled, and how many steps
+	/// it took to get within a sixth of a unit
+	fn carried(spring: (f32, f32), strength: f32) -> (f32, f32, usize) {
+		let dt = 1.0 / 60.0;
+		let (mut world, mut simulation) = wired();
+		let start = Vec3::new(0.0, 6.0, 0.0);
+		let held = world
+			.bodies
+			.spawn(Body::dynamic(Shape::UNIT, Transform::at(start), 1.0));
+		let weight = world.gravity.length() * dt;
+
+		let joint = world.join(
+			Joint::weld(held, BodyId::NONE, (Vec3::ZERO, start))
+				.sprung(spring.0, spring.1)
+				.capped(weight * strength, weight * 6.0),
+		);
+
+		let target = Vec3::new(3.0, 6.0, 0.0);
+		if let Some(link) = world.joints.get_mut(joint) {
+			link.second_anchor = target;
+		}
+
+		let (mut overshoot, mut arrive) = (0.0_f32, usize::MAX);
+		for step in 0..180 {
+			settle(&mut world, &mut simulation, 1);
+			let at = placed(&world, held);
+			overshoot = overshoot.max(at.x - target.x);
+
+			if arrive == usize::MAX && (at - target).length() < 0.15 {
+				arrive = step;
+			}
+		}
+
+		(overshoot, (placed(&world, held) - target).length(), arrive)
+	}
+
+	#[test]
+	fn a_sprung_weld_carries_a_body_to_a_point_that_moves() {
+		let (overshoot, settled, arrive) = carried((12.0, 1.6), 26.0);
+
+		assert!(arrive < 20, "it gets there quickly, took {arrive} steps");
+		assert!(overshoot < 0.05, "without sailing past, overshot {overshoot}");
+		assert!(settled < 0.02, "and stops on the point, ended {settled} off");
+	}
+
+	#[test]
+	fn a_ceiling_too_low_to_brake_with_makes_a_carry_worse_rather_than_gentler() {
+		// the finding this test exists to keep, because it is backwards from
+		// what the number looks like it does and somebody will one day
+		// "improve" the gun by turning it down. A ceiling clips the spring's
+		// *braking* half as well as its pull, and the braking half is what
+		// stops the body on the point - so a gun that may spend less does not
+		// carry more gently, it sails past and takes longer to come back.
+		let (tight, _, slow) = carried((12.0, 1.6), 6.0);
+		let (roomy, _, quick) = carried((12.0, 1.6), 26.0);
+
+		assert!(
+			tight > roomy + 0.5,
+			"the tighter ceiling overshoots further: {tight} against {roomy}"
+		);
+		assert!(slow > quick * 2, "and arrives later: {slow} steps against {quick}");
+	}
+
 	#[test]
 	fn a_rigid_weld_eases_a_gap_shut_rather_than_snapping_it() {
 		// what the Baumgarte factor is for, and the only test that pins it. A
