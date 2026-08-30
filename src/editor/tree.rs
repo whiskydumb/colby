@@ -63,11 +63,19 @@ impl Tree {
 	///
 	/// @param context - egui, mid-frame
 	/// @param world - the tables to show, and to edit
-	pub(crate) fn show(&mut self, context: &Context, world: &mut World) {
+	/// @param picked - what a click in the world landed on, if there was one.
+	/// [`Pick::Nothing`] is a click on empty space and clears the selection,
+	/// which is a different answer from not having clicked at all
+	pub(crate) fn show(&mut self, context: &Context, world: &mut World, picked: Option<Pick>) {
 		// before anything is drawn: the world may have been replaced since the
 		// last frame by a scene load or by play being stopped, and the point of
 		// a selection that remembers its name is that it survives that.
 		self.selection.refresh(world);
+
+		if let Some(pick) = picked {
+			self.selection.set(world, pick);
+		}
+
 		self.gather(world);
 
 		Window::new("scene")

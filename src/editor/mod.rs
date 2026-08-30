@@ -32,10 +32,12 @@ use wgpu::{
 };
 use winit::{event::WindowEvent, window::Window};
 
+mod aim;
 mod console;
 mod select;
 mod stats;
 mod tree;
+mod viewport;
 
 /// The variable that decides whether the editor is on screen.
 ///
@@ -55,6 +57,7 @@ pub struct Editor {
 	points: f32,
 	console: console::Console,
 	tree: tree::Tree,
+	viewport: viewport::Viewport,
 }
 
 impl Editor {
@@ -90,6 +93,7 @@ impl Editor {
 			points: 1.0,
 			console: console::Console::default(),
 			tree: tree::Tree::default(),
+			viewport: viewport::Viewport::default(),
 		}
 	}
 
@@ -146,6 +150,7 @@ impl Editor {
 		let input = self.state.take_egui_input(window);
 		let console = &mut self.console;
 		let tree = &mut self.tree;
+		let viewport = &mut self.viewport;
 
 		// cloned before the run rather than reached through the `Ui` egui hands
 		// the closure: a `Context` is a handle, cloning it is a refcount, and
@@ -155,7 +160,10 @@ impl Editor {
 		let output = self.context.run_ui(input, |_ui| {
 			stats::show(&context, world, clock, frames);
 			console.show(&context, world);
-			tree.show(&context, world);
+			// the viewport before the tree, so that a click out in the world
+			// is already in hand when the tree draws the row it selected.
+			let picked = viewport.run(&context, world);
+			tree.show(&context, world, picked);
 		});
 
 		self.state
