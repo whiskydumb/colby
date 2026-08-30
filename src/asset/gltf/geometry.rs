@@ -42,13 +42,13 @@ use colby_core::{
 	Result,
 	abi::{
 		Transform,
-		mesh::{self, MeshData, MeshVertex},
+		mesh::{self, BONES_PER_VERTEX, MeshData, MeshVertex, SkinVertex},
 	},
 	err,
 	glam::{Mat4, Quat, Vec2, Vec3},
 };
 
-use super::{Extracted, Gltf, Surface};
+use super::{Extracted, Gltf, Skin, Surface, skin};
 use crate::json::Value;
 
 /// The drawing mode colby reads. Everything else is skipped with a warning.
@@ -76,6 +76,11 @@ pub struct Model {
 	/// Pictures that were stored inside the file and have to be written out
 	/// beside its meshes, because nothing else will.
 	pub textures: Vec<Extracted>,
+
+	/// Every skin the file declares, in its own order, which is what a
+	/// [`Placement::skeleton`] indexes. One that could not be read is here
+	/// with no bones in it and is named by nothing.
+	pub skins: Vec<Skin>,
 
 	/// What the file said that could not be used. Not a failure: the rest of it
 	/// imported, and this is the one moment anybody is told.
@@ -110,6 +115,14 @@ pub struct Placement {
 
 	/// Where it stands, with the whole tree above it already worked in.
 	pub transform: Transform,
+
+	/// Which of [`Model::skins`] moves it, when anything does.
+	///
+	/// A skinned node's own transform is deliberately not in
+	/// [`transform`](Self::transform): the specification says the transform of
+	/// a skinned mesh node is ignored, because every vertex of it is placed by
+	/// its bones instead.
+	pub skeleton: Option<usize>,
 }
 
 /// Reads a file's scene into geometry.
@@ -117,14 +130,17 @@ pub struct Placement {
 /// @param file - the document with its buffers, from [`Gltf::open`]
 /// @return every mesh, where each stands, and what could not be read
 pub fn import(file: &Gltf) -> Result<Model> {
+	let mut rigs = skin::read(file);
 	let mut build = Build {
 		file,
+		mesh_skin: mesh_skins(file, rigs.skins.len(), &mut rigs.warnings),
+		skins: rigs.skins,
 		meshes: Vec::new(),
 		upright: Vec::new(),
 		mirrored: Vec::new(),
 		named: Vec::new(),
 		placed: Vec::new(),
-		warnings: Vec::new(),
+		warnings: rigs.warnings,
 	};
 
 	build.pieces()?;
@@ -139,13 +155,59 @@ pub fn import(file: &Gltf) -> Result<Model> {
 		placements,
 		materials: coats.surfaces,
 		textures: coats.pictures,
+		skins: build.skins,
 		warnings,
 	})
+}
+
+/// Which skin moves each mesh, worked out from the nodes that stand them.
+///
+/// A mesh's vertices name bones, and which bones those are is a property of
+/// the skin the *node* points at - so the pairing has to be settled before any
+/// geometry is read. The format allows one mesh to be stood by two nodes with
+/// different skins; nothing exports that, and the first one wins with a word
+/// about it rather than a refusal.
+fn mesh_skins(file: &Gltf, skins: usize, warnings: &mut Vec<String>) -> Vec<Option<usize>> {
+	let mut out = vec![None; file.table("meshes").len()];
+
+	for (index, node) in file.table("nodes").iter().enumerate() {
+		let (Some(mesh), Some(skin)) = (
+			node.get("mesh").and_then(Value::as_usize),
+			node.get("skin").and_then(Value::as_usize),
+		) else {
+			continue;
+		};
+
+		if skin >= skins {
+			warnings.push(format!("node {index} names skin {skin}, which is not there"));
+
+			continue;
+		}
+
+		let Some(slot) = out.get_mut(mesh) else {
+			continue;
+		};
+
+		match *slot {
+			| Some(already) if already != skin => warnings.push(format!(
+				"mesh {mesh} is moved by skin {already} and by skin {skin}, and colby gives it \
+				 the first"
+			)),
+			| Some(_) => (),
+			| None => *slot = Some(skin),
+		}
+	}
+
+	out
 }
 
 /// One import in progress.
 struct Build<'a> {
 	file: &'a Gltf,
+	/// Every skin of the file, already sorted into skeletons.
+	skins: Vec<Skin>,
+	/// Which skin moves each mesh, or nothing for a mesh bones do not move.
+	mesh_skin: Vec<Option<usize>>,
 	meshes: Vec<Piece>,
 	/// Which piece each primitive became, by mesh and then by primitive.
 	upright: Vec<Vec<Option<usize>>>,
@@ -213,6 +275,13 @@ impl Build<'_> {
 		primitive: usize,
 		entry: &Value,
 	) -> Result<Option<MeshData>> {
+		if entry.get("targets").is_some() {
+			self.warnings.push(format!(
+				"mesh {mesh} primitive {primitive} has shapes it can be morphed into, which \
+				 colby does not read, and stands in the one it was modeled in"
+			));
+		}
+
 		let attributes = entry.get("attributes");
 		let Some(positions) = attributes
 			.and_then(|named| named.get("POSITION"))
@@ -276,6 +345,8 @@ impl Build<'_> {
 			flatten(&mut data);
 		}
 
+		data.skin = self.skin_of(mesh, primitive, attributes, count);
+
 		match tangents {
 			| Some(read) =>
 				for (vertex, stored) in data.vertices.iter_mut().enumerate() {
@@ -290,6 +361,110 @@ impl Build<'_> {
 		}
 
 		Ok(Some(data))
+	}
+
+	/// What moves each vertex of one primitive, when bones do.
+	///
+	/// Two things happen here that nothing above this function knows about.
+	/// The bone indices are the file's joint slots and are carried over to the
+	/// bones those slots became, because sorting the skeleton renumbered them.
+	/// And the weights are quantized into bytes adding to exactly 255, which
+	/// is the shape a skin block holds and which the exchange format offers as
+	/// one of its own three.
+	fn skin_of(
+		&mut self,
+		mesh: usize,
+		primitive: usize,
+		attributes: Option<&Value>,
+		count: usize,
+	) -> Vec<SkinVertex> {
+		// taken by value rather than borrowed: everything below this wants
+		// `&mut self` to say what it could not read.
+		let Some(slots) = self
+			.mesh_skin
+			.get(mesh)
+			.copied()
+			.flatten()
+			.and_then(|index| self.skins.get(index))
+			.filter(|rig| !rig.data.is_empty())
+			.map(|rig| rig.slots.clone())
+		else {
+			return Vec::new();
+		};
+
+		if attributes.is_some_and(|named| named.get("JOINTS_1").is_some()) {
+			self.warnings.push(format!(
+				"mesh {mesh} primitive {primitive} names more than four bones for a vertex, and \
+				 colby reads the first four"
+			));
+		}
+
+		let Some(accessor) = attributes
+			.and_then(|named| named.get("JOINTS_0"))
+			.and_then(Value::as_usize)
+		else {
+			self.warnings.push(format!(
+				"mesh {mesh} primitive {primitive} is moved by a skin and says which bones for \
+				 none of its vertices, and is left where it was"
+			));
+
+			return Vec::new();
+		};
+
+		let bones = match self.file.wholes(accessor) {
+			| Ok(read) if read.lanes() == BONES_PER_VERTEX && read.rows() == count => read,
+			| Ok(read) => {
+				self.warnings.push(format!(
+					"mesh {mesh} primitive {primitive} names bones {} at a time for {} of its \
+					 {count} vertices, and is left where it was",
+					read.lanes(),
+					read.rows()
+				));
+
+				return Vec::new();
+			},
+			| Err(error) => {
+				self.warnings.push(format!(
+					"mesh {mesh} primitive {primitive} has bone indices that could not be read \
+					 ({error}), and is left where it was"
+				));
+
+				return Vec::new();
+			},
+		};
+
+		let Some(weights) = self.lanes(attributes, "WEIGHTS_0", BONES_PER_VERTEX, count) else {
+			self.warnings.push(format!(
+				"mesh {mesh} primitive {primitive} names bones and says how much each pulls for \
+				 none of its vertices, and is left where it was"
+			));
+
+			return Vec::new();
+		};
+
+		let mut wild = false;
+		let mut limp = false;
+		let out = (0..count)
+			.map(|vertex| {
+				pulled(bones.row(vertex), weights.row(vertex), &slots, &mut limp, &mut wild)
+			})
+			.collect();
+
+		if wild {
+			self.warnings.push(format!(
+				"mesh {mesh} primitive {primitive} names a bone its own skin does not have, and \
+				 colby reads that pull as the skin's first bone"
+			));
+		}
+
+		if limp {
+			self.warnings.push(format!(
+				"mesh {mesh} primitive {primitive} has a vertex nothing pulls on, and colby \
+				 hangs it rigidly off the first bone it names"
+			));
+		}
+
+		out
 	}
 
 	/// One named attribute, when it is there and is the shape it should be.
@@ -406,6 +581,17 @@ impl Build<'_> {
 			return;
 		}
 
+		let moved = node
+			.get("skin")
+			.and_then(Value::as_usize)
+			.filter(|index| {
+				self.skins
+					.get(*index)
+					.is_some_and(|rig| !rig.data.is_empty())
+			});
+		// a skinned node's own transform is ignored, which the specification
+		// says outright: every vertex of it is placed by its bones instead, and
+		// applying both would place it twice.
 		let transform = self.decompose(index, world);
 		let turned = world.determinant() < 0.0;
 		let written = node
@@ -431,7 +617,12 @@ impl Build<'_> {
 			out.push(Placement {
 				name: super::unique(&mut self.placed, &base),
 				mesh: piece,
-				transform,
+				transform: if moved.is_some() {
+					Transform::IDENTITY
+				} else {
+					transform
+				},
+				skeleton: moved,
 			});
 		}
 	}
@@ -532,7 +723,7 @@ fn orphans(file: &Gltf) -> Vec<usize> {
 }
 
 /// One node's own transform, however it wrote it.
-fn local(node: &Value) -> Mat4 {
+pub(super) fn local(node: &Value) -> Mat4 {
 	if let Some(written) = node.get("matrix") {
 		let cells = written.as_array();
 
@@ -634,6 +825,111 @@ fn flatten(data: &mut MeshData) {
 	data.vertices = vertices;
 }
 
+/// One vertex's bones and weights, with the file's joint slots carried over.
+///
+/// The weights are settled before the bones, because a bone with none of them
+/// is never read: whatever index sat beside it in the file is not carried over
+/// and is left at zero, which is what a skin block says such a slot holds and
+/// what makes two exports of one mesh come out byte for byte the same.
+///
+/// @param names - what the file said, indexing its own `skin.joints`
+/// @param shares - how much each pulls, already read as floats
+/// @param slots - where each of the file's joint slots ended up after sorting
+/// @param limp - set when nothing pulls on this vertex at all
+/// @param wild - set when it names a bone its skin does not have
+fn pulled(
+	names: &[u32],
+	shares: &[f32],
+	slots: &[u16],
+	limp: &mut bool,
+	wild: &mut bool,
+) -> SkinVertex {
+	let mut pull = [0.0_f32; BONES_PER_VERTEX];
+
+	for (share, read) in pull.iter_mut().zip(shares) {
+		*share = read.max(0.0);
+	}
+
+	if pull.iter().sum::<f32>() <= 0.0 {
+		*limp = true;
+		pull[0] = 1.0;
+	}
+
+	let given = quantize(pull);
+	let mut bones = [0_u16; BONES_PER_VERTEX];
+
+	for (bone, (wanted, weight)) in bones.iter_mut().zip(names.iter().zip(given)) {
+		if weight == 0 {
+			continue;
+		}
+
+		match usize::try_from(*wanted)
+			.ok()
+			.and_then(|at| slots.get(at))
+		{
+			| Some(found) => *bone = *found,
+			| None => *wild = true,
+		}
+	}
+
+	SkinVertex { bones, weights: given }
+}
+
+/// Four weights as the bytes a skin block holds, adding to exactly 255.
+///
+/// Normalized first, because the specification only asks an exporter to come
+/// reasonably close to one, and then handed out by largest remainder: every
+/// share takes its whole part and what is left over goes to whichever shares
+/// the rounding cheated most. That is what makes the four add up to exactly
+/// [`SkinVertex::WHOLE`], which is the invariant `.cmesh` refuses a file over.
+///
+/// A vertex nothing pulls on, or one whose weights are not finite numbers, is
+/// hung rigidly off the first bone it names. Leaving it at zero would put it
+/// at the origin rather than on the character.
+///
+/// @param weights - one share per bone, none of them negative
+/// @return the same shares as bytes, summing to 255
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "each value is floored and clamped into 0..=255 on the line above the cast, and \
+	          try_from is not available for a float"
+)]
+fn quantize(weights: [f32; BONES_PER_VERTEX]) -> [u8; BONES_PER_VERTEX] {
+	let whole = f32::from(SkinVertex::WHOLE);
+	let total: f32 = weights.iter().sum();
+
+	if !total.is_finite() || total <= 0.0 {
+		let mut out = [0_u8; BONES_PER_VERTEX];
+		out[0] = 255;
+
+		return out;
+	}
+
+	let mut given = [0_u16; BONES_PER_VERTEX];
+	let mut owed = [0.0_f32; BONES_PER_VERTEX];
+
+	for (index, share) in weights.iter().enumerate() {
+		let exact = ((share / total) * whole).clamp(0.0, whole);
+		let floor = exact.floor();
+
+		given[index] = floor as u16;
+		owed[index] = exact - floor;
+	}
+
+	let mut order = [0_usize, 1, 2, 3];
+	order.sort_by(|first, second| owed[*second].total_cmp(&owed[*first]));
+
+	let short = SkinVertex::WHOLE.saturating_sub(given.iter().sum());
+
+	for index in order.iter().take(usize::from(short)) {
+		given[*index] = given[*index].saturating_add(1);
+	}
+
+	given.map(|share| u8::try_from(share).unwrap_or(u8::MAX))
+}
+
 /// The same geometry with every triangle wound the other way.
 ///
 /// For a placement whose transform mirrors it. The handedness stored in the
@@ -671,6 +967,196 @@ mod tests {
 
 	/// Three points in the xy plane, wound the way a front face is.
 	const TRIANGLE: &str = "AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA";
+
+	/// The same triangle with bones and weights after it, ninety-six bytes.
+	const SKINNED: &str = "AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAABAAABAAAAAACAPwAAAAAAAAAAAAAAAAAAAD8AAAA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAA";
+
+	/// A document holding that triangle, moved by whatever the body declares.
+	///
+	/// Accessor zero is the positions, one the bone indices as unsigned bytes,
+	/// two the weights as floats - which is what an exporter actually writes.
+	fn rigged(body: &str) -> Model {
+		let text = format!(
+			"{{ \"asset\": {{ \"version\": \"2.0\" }}, \"buffers\": [ {{ \"byteLength\": 96, \
+			 \"uri\": \"data:application/octet-stream;base64,{SKINNED}\" }} ], \"bufferViews\": \
+			 [ {{ \"buffer\": 0, \"byteLength\": 36 }}, {{ \"buffer\": 0, \"byteOffset\": 36, \
+			 \"byteLength\": 12 }}, {{ \"buffer\": 0, \"byteOffset\": 48, \"byteLength\": 48 }} \
+			 ], \"accessors\": [ {{ \"bufferView\": 0, \"componentType\": 5126, \"count\": 3, \
+			 \"type\": \"VEC3\" }}, {{ \"bufferView\": 1, \"componentType\": 5121, \"count\": \
+			 3, \"type\": \"VEC4\" }}, {{ \"bufferView\": 2, \"componentType\": 5126, \
+			 \"count\": 3, \"type\": \"VEC4\" }} ], {body} }}"
+		);
+		let file = Gltf::read(text.as_bytes(), Path::new("rig.gltf"), Path::new(""))
+			.expect("the fixture reads");
+
+		import(&file).expect("and imports")
+	}
+
+	/// Two joints and a mesh hanging off them, with the joints listed
+	/// child-first so the sort has to renumber them.
+	const RIG: &str = "\"meshes\": [ { \"primitives\": [ { \"attributes\": { \"POSITION\": 0, \
+	                   \"JOINTS_0\": 1, \"WEIGHTS_0\": 2 } } ] } ], \"nodes\": [ { \"name\": \
+	                   \"root\", \"children\": [1] }, { \"name\": \"tip\", \"translation\": \
+	                   [0.0, 1.0, 0.0] }, { \"name\": \"body\", \"mesh\": 0, \"skin\": 0, \
+	                   \"translation\": [5.0, 0.0, 0.0] } ], \"skins\": [ { \"name\": \"rig\", \
+	                   \"joints\": [1, 0] } ], \"scenes\": [ { \"nodes\": [0, 2] } ]";
+
+	#[test]
+	fn a_skinned_primitive_comes_back_with_a_bone_and_a_weight_per_vertex() {
+		let model = rigged(RIG);
+		let skin = &model.meshes[0].data.skin;
+
+		assert_eq!(model.warnings, Vec::<String>::new(), "nothing is wrong with it");
+		assert_eq!(skin.len(), 3, "one entry per vertex");
+		assert!(model.meshes[0].data.weights_are_whole(), "and every one of them adds up");
+	}
+
+	#[test]
+	fn the_bones_a_vertex_names_are_carried_over_to_where_the_sort_put_them() {
+		let model = rigged(RIG);
+		let skin = &model.meshes[0].data.skin;
+
+		// the file lists its joints tip first, so slot zero is the tip and the
+		// sort moves the tip to bone one. A vertex naming slot zero has to
+		// come back naming bone one, or the character bends at the wrong end.
+		assert_eq!(model.skins[0].slots, vec![1, 0]);
+		assert_eq!(skin[0].bones[0], 1, "vertex zero hangs off slot zero, which is the tip");
+		assert_eq!(skin[2].bones[0], 0, "and vertex two off slot one, which is the root");
+	}
+
+	#[test]
+	fn two_bones_sharing_a_vertex_are_quantized_to_bytes_that_still_add_up() {
+		let model = rigged(RIG);
+		let shared = model.meshes[0].data.skin[1];
+
+		assert_eq!(
+			shared.weights,
+			[128, 127, 0, 0],
+			"half and half does not divide 255, so the rounding gives the odd one away"
+		);
+		assert_eq!(shared.total(), SkinVertex::WHOLE);
+		assert_eq!(shared.bones, [1, 0, 0, 0], "both carried over, in the file's own order");
+	}
+
+	#[test]
+	fn a_skinned_piece_stands_at_the_origin_whatever_its_node_said() {
+		let model = rigged(RIG);
+		let placement = &model.placements[0];
+
+		assert_eq!(placement.skeleton, Some(0), "it names the skin that moves it");
+		assert_eq!(
+			placement.transform,
+			Transform::IDENTITY,
+			"and drops the five units its node was moved by, because the specification says a \
+			 skinned node's transform is ignored and its bones place every vertex instead"
+		);
+	}
+
+	#[test]
+	fn a_mesh_nothing_moves_keeps_its_transform_and_carries_no_skin() {
+		let model = rigged(&RIG.replace("\"skin\": 0, ", ""));
+
+		assert!(model.meshes[0].data.skin.is_empty(), "no skin block");
+		assert_eq!(model.placements[0].skeleton, None, "and nothing names one");
+		assert!(
+			model.placements[0]
+				.transform
+				.position
+				.abs_diff_eq(Vec3::new(5.0, 0.0, 0.0), 1.0e-6),
+			"so its own node transform is the whole of where it stands"
+		);
+	}
+
+	#[test]
+	fn a_skinned_primitive_with_no_weights_is_left_where_it_was() {
+		let model = rigged(&RIG.replace(", \"WEIGHTS_0\": 2", ""));
+
+		assert!(model.meshes[0].data.skin.is_empty(), "half a skin is not a skin");
+		assert!(
+			model
+				.warnings
+				.iter()
+				.any(|said| said.contains("how much each pulls")),
+			"and it says so: {:?}",
+			model.warnings
+		);
+	}
+
+	#[test]
+	fn shapes_a_primitive_can_be_morphed_into_are_named_rather_than_read() {
+		let model = rigged(&RIG.replace(
+			"\"WEIGHTS_0\": 2 } } ]",
+			"\"WEIGHTS_0\": 2 }, \"targets\": [ { \"POSITION\": 0 } ] } ]",
+		));
+
+		assert_eq!(model.meshes[0].data.vertices.len(), 3, "the base shape is still read");
+		assert!(
+			model
+				.warnings
+				.iter()
+				.any(|said| said.contains("morphed into")),
+			"and the rest are named rather than silently dropped: {:?}",
+			model.warnings
+		);
+	}
+
+	#[test]
+	fn a_second_set_of_bones_is_named_rather_than_read() {
+		let model = rigged(&RIG.replace("\"WEIGHTS_0\": 2", "\"WEIGHTS_0\": 2, \"JOINTS_1\": 1"));
+
+		assert_eq!(model.meshes[0].data.skin.len(), 3, "the first four bones are still read");
+		assert!(
+			model
+				.warnings
+				.iter()
+				.any(|said| said.contains("more than four bones")),
+			"and the rest are named: {:?}",
+			model.warnings
+		);
+	}
+
+	#[test]
+	fn a_vertex_naming_a_bone_its_skin_does_not_have_is_pulled_by_the_first_one() {
+		// one joint, and the vertices still name slot one.
+		let model = rigged(&RIG.replace("\"joints\": [1, 0]", "\"joints\": [0]"));
+		let skin = &model.meshes[0].data.skin;
+
+		assert!(skin.iter().all(|vertex| vertex.bones_below(1)), "nothing points past the bone");
+		assert!(
+			model
+				.warnings
+				.iter()
+				.any(|said| said.contains("does not have")),
+			"and it says so: {:?}",
+			model.warnings
+		);
+	}
+
+	#[test]
+	fn a_mesh_two_skins_claim_goes_to_the_first_of_them() {
+		let model = rigged(
+			&RIG.replace(
+				"\"skins\": [ { \"name\": \"rig\", \"joints\": [1, 0] } ]",
+				"\"skins\": [ { \"name\": \"rig\", \"joints\": [1, 0] }, { \"name\": \"other\", \
+				 \"joints\": [0] } ]",
+			)
+			.replace("\"nodes\": [0, 2]", "\"nodes\": [0, 2, 3]")
+			.replace(
+				"\"translation\": [5.0, 0.0, 0.0] } ]",
+				"\"translation\": [5.0, 0.0, 0.0] }, { \"name\": \"twin\", \"mesh\": 0, \
+				 \"skin\": 1 } ]",
+			),
+		);
+
+		assert!(
+			model
+				.warnings
+				.iter()
+				.any(|said| said.contains("gives it the first")),
+			"got {:?}",
+			model.warnings
+		);
+	}
 
 	/// The scene an exporter wrote, imported.
 	fn exported() -> Model {

@@ -27,12 +27,12 @@ use std::{
 
 use colby_asset::{
 	MeshFile, TextureFile, compile, compile::Kind, document::DocumentFile, font::FontFile,
-	model::ModelFile, scene::SceneFile,
+	model::ModelFile, scene::SceneFile, skeleton::SkeletonFile,
 };
 use colby_core::{
 	abi::{
 		DocumentData, FontData, Material, MaterialId, MeshData, MeshId, ModelData, Placement,
-		SceneData, TextureData, TextureId, World,
+		SceneData, SkeletonData, SkeletonId, TextureData, TextureId, World,
 	},
 	debug, info, warn,
 };
@@ -230,6 +230,7 @@ impl Assets {
 			| Kind::Document => load_document(world, path, &name),
 			| Kind::Model => load_model(world, path, &name),
 			| Kind::Scene => load_scene(world, path, &name),
+			| Kind::Skeleton => load_skeleton(world, path, &name),
 		}
 	}
 
@@ -258,6 +259,11 @@ impl Assets {
 				| Kind::Document => drop(world.ui.insert(&name, DocumentData::empty())),
 				| Kind::Model => drop(world.models.insert(&name, ModelData::default())),
 				| Kind::Scene => drop(world.scenes.insert(&name, SceneData::default())),
+				| Kind::Skeleton => drop(
+					world
+						.skeletons
+						.insert(&name, SkeletonData::default()),
+				),
 			}
 
 			info!(name, ?kind, "asset unloaded; its file is gone");
@@ -495,6 +501,7 @@ fn load_model(world: &mut World, path: &Path, name: &str) {
 			} else {
 				world.materials.find(&placement.material)
 			},
+			skeleton: reserve_skeleton(world, &placement.skeleton),
 			transform: placement.transform,
 		})
 		.collect();
@@ -518,6 +525,58 @@ fn load_model(world: &mut World, path: &Path, name: &str) {
 	let id = world.models.insert(name, loaded);
 
 	info!(name, slot = id.index(), standing, materials, "model loaded");
+}
+
+/// Reads one `.cskel` into the world's skeleton registry.
+fn load_skeleton(world: &mut World, path: &Path, name: &str) {
+	let data = match SkeletonFile::open(path) {
+		| Ok(file) => file.to_skeleton_data(),
+		| Err(error) => {
+			warn!(%error, "the skeleton on disk could not be read");
+
+			return;
+		},
+	};
+	let existing = world.skeletons.find(name);
+
+	if existing.is_some()
+		&& world
+			.skeletons
+			.get(existing)
+			.is_some_and(|skeleton| *skeleton.value() == data)
+	{
+		// as every other loader: a skeleton whose bones did not move does not
+		// need registering again, and its revision is what anything watching
+		// it would otherwise see move for nothing.
+		return;
+	}
+
+	let bones = data.len();
+	let id = world.skeletons.insert(name, data);
+
+	info!(name, slot = id.index(), bones, "skeleton loaded");
+}
+
+/// The handle a name will resolve to, claiming the slot if nothing has yet.
+///
+/// The same reservation a mesh gets, for the same reason: a model may be
+/// walked before the skeleton it names, and an entry claimed now is the one
+/// the real file overwrites later. Without it a model read first would stand
+/// on nothing for the life of the process.
+fn reserve_skeleton(world: &mut World, name: &str) -> SkeletonId {
+	if name.is_empty() {
+		return SkeletonId::NONE;
+	}
+
+	let found = world.skeletons.find(name);
+
+	if found.is_some() {
+		return found;
+	}
+
+	world
+		.skeletons
+		.insert(name, SkeletonData::default())
 }
 
 /// The handle of a mesh a model names, claiming the slot when it is not loaded.

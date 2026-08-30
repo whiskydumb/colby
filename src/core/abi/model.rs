@@ -37,6 +37,7 @@ use super::{
 	material::MaterialId,
 	mesh::MeshId,
 	registry::{Entry, Registry},
+	skeleton::SkeletonId,
 };
 use crate::registry_handle;
 
@@ -62,6 +63,17 @@ pub struct Placement {
 	/// What it is made of, or [`MaterialId::DEFAULT`] when the file said
 	/// nothing.
 	pub material: MaterialId,
+
+	/// The bones that move it, or [`SkeletonId::NONE`] for a piece nothing
+	/// moves.
+	///
+	/// A piece that names one is drawn by a pose rather than by
+	/// [`transform`](Self::transform), which is then the identity - the
+	/// exchange format says outright that a skinned piece's own transform is
+	/// ignored, because every vertex of it is placed by its bones instead.
+	/// What a game does with this is the same loop everything else here is:
+	/// make a pose from the skeleton and hand it to the entity.
+	pub skeleton: SkeletonId,
 
 	/// Where it stands, with the whole tree above it already worked in.
 	pub transform: Transform,
@@ -155,12 +167,14 @@ mod tests {
 					name: "shade".to_owned(),
 					mesh: MeshId::new(4),
 					material: MaterialId::new(2),
+					skeleton: SkeletonId::NONE,
 					transform: Transform::at(Vec3::Y),
 				},
 				Placement {
 					name: "stem".to_owned(),
 					mesh: MeshId::new(5),
 					material: MaterialId::DEFAULT,
+					skeleton: SkeletonId::new(1),
 					transform: Transform::IDENTITY,
 				},
 			],

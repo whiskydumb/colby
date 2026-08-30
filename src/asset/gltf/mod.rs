@@ -44,10 +44,12 @@ use crate::json::{self, Value};
 
 mod geometry;
 mod material;
+mod skin;
 
 pub use self::{
 	geometry::{Model, Piece, Placement, import},
 	material::{Extracted, Picture, Surface},
+	skin::{Skin, Skins},
 };
 
 /// The extension of a glTF written as JSON with its buffers beside it.
@@ -260,6 +262,46 @@ impl Gltf {
 		Ok(values)
 	}
 
+	/// One accessor's values as the whole numbers they are, however wide.
+	///
+	/// For the bone indices of a skin, which the specification stores as
+	/// unsigned bytes or unsigned shorts in fours. [`Self::integers`] is the
+	/// scalar case and refuses anything wider, because an index buffer is
+	/// scalar by definition; this is the other shape, and it refuses signed
+	/// and fractional components for the same reason that one does.
+	///
+	/// A `normalized` accessor is a file saying its integers stand for
+	/// fractions, which an index never does, so it is refused rather than
+	/// scaled.
+	///
+	/// @param accessor - its index in the document's `accessors`
+	/// @return the values, row by row, or why they could not be read
+	pub fn wholes(&self, accessor: usize) -> Result<Wholes> {
+		let plan = self.plan(accessor)?;
+
+		if !plan.component.is_unsigned() {
+			return Err(err!(Asset(
+				"accessor {accessor} holds numbers that may be negative or fractional, which an \
+				 index into anything may not be"
+			)));
+		}
+
+		if plan.normalized {
+			return Err(err!(Asset(
+				"accessor {accessor} says its whole numbers stand for fractions, which an index \
+				 does not"
+			)));
+		}
+
+		let mut values = Vec::with_capacity(plan.count.saturating_mul(plan.lanes));
+
+		self.walk(accessor, &plan, |bytes, at| {
+			values.push(plan.component.whole(bytes, at));
+		})?;
+
+		Ok(Wholes { values, lanes: plan.lanes })
+	}
+
 	/// Works out where an accessor's values are and how to read them.
 	fn plan(&self, accessor: usize) -> Result<Plan> {
 		let entry = self
@@ -424,6 +466,41 @@ impl Floats {
 	/// Every number, row after row.
 	#[must_use]
 	pub fn values(&self) -> &[f32] { &self.values }
+}
+
+/// The values one accessor holds, as whole numbers.
+///
+/// The same shape [`Floats`] has and for the same reason; the two are apart
+/// because widening an index to a float and back is a loss nobody asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Wholes {
+	values: Vec<u32>,
+	lanes: usize,
+}
+
+impl Wholes {
+	/// How many numbers make one value: four, for a set of bone indices.
+	#[must_use]
+	pub const fn lanes(&self) -> usize { self.lanes }
+
+	/// How many values there are.
+	#[must_use]
+	pub const fn rows(&self) -> usize {
+		match self.values.len().checked_div(self.lanes) {
+			| Some(rows) => rows,
+			| None => 0,
+		}
+	}
+
+	/// One value, or nothing where there is none.
+	#[must_use]
+	pub fn row(&self, index: usize) -> &[u32] {
+		let at = index * self.lanes;
+
+		self.values
+			.get(at..at + self.lanes)
+			.unwrap_or(&[])
+	}
 }
 
 /// What reading one accessor takes.

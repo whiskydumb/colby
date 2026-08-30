@@ -10,7 +10,7 @@
 //! ```text
 //!   0  ModelHeader                      64 bytes
 //!  64  [Coat;  material_count]          36 bytes each
-//!   .  [Stand; placement_count]         52 bytes each
+//!   .  [Stand; placement_count]         56 bytes each
 //!   .  the string blob, NUL-separated UTF-8
 //! ```
 //!
@@ -53,7 +53,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYMDL";
 ///
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The extension a compiled model is written with.
 pub const EXTENSION: &str = "cmodel";
@@ -169,6 +169,9 @@ pub struct Stand {
 	/// Offset of the material's name, or zero for the default one.
 	pub material: u32,
 
+	/// Offset of the skeleton's name, or zero for a piece bones do not move.
+	pub skeleton: u32,
+
 	/// Where it stands, in world space.
 	pub position: [f32; 3],
 
@@ -229,6 +232,13 @@ pub struct Placement {
 
 	/// The material's name, or empty for the default one.
 	pub material: String,
+
+	/// The skeleton's asset name, or empty for a piece bones do not move.
+	///
+	/// A piece that names one is drawn by a pose rather than by its own
+	/// transform, and the transform beside this is then the identity - which
+	/// is what the exchange format says a skinned node's transform means.
+	pub skeleton: String,
 
 	/// Where it stands, with the whole tree above it already worked in.
 	pub transform: Transform,
@@ -341,6 +351,7 @@ impl ModelFile {
 					name: self.name(stand.name).to_owned(),
 					mesh: self.name(stand.mesh).to_owned(),
 					material: self.name(stand.material).to_owned(),
+					skeleton: self.name(stand.skeleton).to_owned(),
 					transform: Transform {
 						position: Vec3::from_array(stand.position),
 						rotation: Quat::from_array(stand.rotation),
@@ -399,6 +410,7 @@ pub fn encode(data: &ModelData) -> Result<Vec<u8>> {
 			name: names.put(&placement.name),
 			mesh: names.put(&placement.mesh),
 			material: names.put(&placement.material),
+			skeleton: names.put(&placement.skeleton),
 			position: placement.transform.position.to_array(),
 			rotation: placement.transform.rotation.to_array(),
 			scale: placement.transform.scale.to_array(),
@@ -583,6 +595,7 @@ mod tests {
 					name: "shade".to_owned(),
 					mesh: "models/lamp/shade".to_owned(),
 					material: "models/lamp/brass".to_owned(),
+					skeleton: String::new(),
 					transform: Transform {
 						position: Vec3::new(1.0, 2.0, 3.0),
 						rotation: Quat::from_xyzw(0.0, TURN, 0.0, TURN),
@@ -593,6 +606,7 @@ mod tests {
 					name: "stem".to_owned(),
 					mesh: "models/lamp/stem".to_owned(),
 					material: String::new(),
+					skeleton: "models/lamp/rig".to_owned(),
 					transform: Transform::IDENTITY,
 				},
 			],
@@ -630,9 +644,27 @@ mod tests {
 
 		assert_eq!(coats[0].albedo, coats[1].albedo, "one offset, one copy in the blob");
 		assert_eq!(file.name(coats[0].albedo), "models/lamp/tiles");
+
+		// measured against the fixture rather than against a number somebody
+		// calibrated once: what sharing buys is a blob smaller than writing
+		// every field's name out, and that stays true as records grow fields.
+		let data = sample();
+		let apart: usize =
+			data.materials
+				.iter()
+				.map(|coat| coat.name.len() + coat.albedo.len() + coat.normal.len() + 3)
+				.chain(data.placements.iter().map(|stand| {
+					stand.name.len()
+						+ stand.mesh.len() + stand.material.len()
+						+ stand.skeleton.len()
+						+ 4
+				}))
+				.sum();
+
 		assert!(
-			file.header().names_length < 128,
-			"the blob holds each name once and it is {} bytes",
+			usize::try_from(file.header().names_length).expect("the blob is small") < apart,
+			"the blob holds each name once, so it is under the {apart} bytes writing them all \
+			 out would take, and it is {}",
 			file.header().names_length
 		);
 	}

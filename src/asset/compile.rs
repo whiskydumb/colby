@@ -44,7 +44,8 @@ use std::{
 use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
 use crate::{
-	document, font, format, gltf, html, jpeg, level, model, obj, png, scene, texture, ttf,
+	document, font, format, gltf, html, jpeg, level, model, obj, png, scene, skeleton, texture,
+	ttf,
 };
 
 /// The directory under a workspace that holds editable sources.
@@ -83,6 +84,7 @@ pub const OUTPUT_EXTENSIONS: &[&str] = &[
 	document::EXTENSION,
 	model::EXTENSION,
 	scene::EXTENSION,
+	skeleton::EXTENSION,
 ];
 
 /// Which of colby's formats a source compiles into.
@@ -116,6 +118,15 @@ pub enum Kind {
 	/// format is one rather than two: a level and a saved game are the same
 	/// list of things standing in the same places.
 	Scene,
+
+	/// A `.cskel`, which **no source compiles into**.
+	///
+	/// The only kind with no source of its own: a skeleton comes out of a
+	/// model beside its meshes, and never from a file somebody wrote. It is a
+	/// kind all the same, because a `.cskel` left behind by a format bump has
+	/// to make the model that wrote it stale - @ref [`beside_is_stale`] - and
+	/// that check works by asking an output which format it is in.
+	Skeleton,
 }
 
 impl Kind {
@@ -148,6 +159,7 @@ impl Kind {
 			| Self::Document => document::EXTENSION,
 			| Self::Model => model::EXTENSION,
 			| Self::Scene => scene::EXTENSION,
+			| Self::Skeleton => skeleton::EXTENSION,
 		}
 	}
 
@@ -166,6 +178,7 @@ impl Kind {
 			| document::EXTENSION => Some(Self::Document),
 			| model::EXTENSION => Some(Self::Model),
 			| scene::EXTENSION => Some(Self::Scene),
+			| skeleton::EXTENSION => Some(Self::Skeleton),
 			| _ => None,
 		}
 	}
@@ -180,6 +193,7 @@ impl Kind {
 			| Self::Document => document::version_of(path),
 			| Self::Model => model::version_of(path),
 			| Self::Scene => scene::version_of(path),
+			| Self::Skeleton => skeleton::version_of(path),
 		}
 	}
 
@@ -193,6 +207,7 @@ impl Kind {
 			| Self::Document => document::FORMAT_VERSION,
 			| Self::Model => model::FORMAT_VERSION,
 			| Self::Scene => scene::FORMAT_VERSION,
+			| Self::Skeleton => skeleton::FORMAT_VERSION,
 		}
 	}
 }
@@ -253,6 +268,9 @@ pub enum Produced {
 	Model {
 		/// How many meshes were written beside it.
 		meshes: usize,
+
+		/// How many skeletons were, for the meshes bones move.
+		skeletons: usize,
 
 		/// How many pictures had to be taken out of it.
 		textures: usize,
@@ -493,6 +511,15 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 
 			(bytes, produced)
 		},
+		// unreachable through `Kind::of`, which is the only way a source
+		// becomes a kind, and named rather than caught by a wildcard so that
+		// the next kind added has to say what it compiles from.
+		| Kind::Skeleton =>
+			return Err(err!(Asset(
+				"{}: a skeleton is only ever written beside a model, never compiled from a \
+				 source of its own",
+				source.display()
+			))),
 	};
 
 	if let Some(parent) = output.parent() {
@@ -551,6 +578,19 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 		fs::write(beside(&directory, &picture.name, texture::EXTENSION), bytes)?;
 	}
 
+	// a skin with no bones in it could not be read, and nothing names it, so
+	// there is nothing to write down.
+	for rig in imported
+		.skins
+		.iter()
+		.filter(|rig| !rig.data.is_empty())
+	{
+		let bytes = skeleton::encode(&rig.data)
+			.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+
+		fs::write(beside(&directory, &rig.name, skeleton::EXTENSION), bytes)?;
+	}
+
 	let data = model::ModelData {
 		materials: imported
 			.materials
@@ -579,6 +619,11 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 						.and_then(|index| imported.materials.get(index))
 						.map(|surface| format!("{stem}/{}", surface.name))
 						.unwrap_or_default(),
+					skeleton: placement
+						.skeleton
+						.and_then(|index| imported.skins.get(index))
+						.map(|rig| format!("{stem}/{}", rig.name))
+						.unwrap_or_default(),
 					transform: placement.transform,
 				})
 			})
@@ -586,6 +631,11 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 	};
 	let produced = Produced::Model {
 		meshes: imported.meshes.len(),
+		skeletons: imported
+			.skins
+			.iter()
+			.filter(|rig| !rig.data.is_empty())
+			.count(),
 		textures: imported.textures.len(),
 		materials: data.materials.len(),
 		placements: data.placements.len(),
@@ -1381,7 +1431,8 @@ f 4 1 5 8
 						file.glyphs()
 							.iter()
 							.any(|glyph| glyph.codepoint == u32::from('Ж')),
-						"{} compiled without Cyrillic, which is half the text anyone here will 						 type",
+						"{} compiled without Cyrillic, which is half the text anyone here will \
+						 type",
 						compiled.name
 					);
 				},
@@ -1422,6 +1473,10 @@ f 4 1 5 8
 						compiled.warnings
 					);
 				},
+				| Some(Kind::Skeleton) => panic!(
+					"{} compiled straight into a skeleton, and only a model writes one",
+					compiled.name
+				),
 				| None => panic!("{} compiled to something unrecognized", compiled.name),
 			}
 		}

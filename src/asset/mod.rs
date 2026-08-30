@@ -39,6 +39,7 @@ pub mod obj;
 pub mod png;
 pub mod scene;
 pub mod sdf;
+pub mod skeleton;
 pub mod texture;
 pub mod ttf;
 
