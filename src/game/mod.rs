@@ -459,14 +459,20 @@ const MUZZLE_AT: (f32, f32) = (0.3, 0.45);
 /// How big the cross marking where the beam is attached is.
 const MUZZLE_MARK: f32 = 0.09;
 
-/// The five things the toolgun does, in the order the number keys pick them.
+/// The six things the toolgun does, in the order the number keys pick them.
 ///
 /// Chosen so that between them they drive every joint the engine has and every
-/// verb the sandbox already grew: a weld and a hinge are the two joint kinds
-/// nothing had ever made, a rope is the one the demo made by hand, and the last
-/// two are the console's `game.remove` and `game.freeze` with a crosshair in
-/// front of them.
-const TOOLS: [&str; 5] = ["weld", "hinge", "rope", "remover", "freeze"];
+/// verb the sandbox already grew: a weld, a hinge and a ball are the three
+/// joint kinds nothing else makes by hand, a rope is the one the demo made
+/// itself, and the other two are the console's `game.remove` and `game.freeze`
+/// with a crosshair in front of them.
+///
+/// **A new one goes on the end**, whatever it belongs beside. Which tool is in
+/// hand is a number in the arena, so putting the ball where it reads best -
+/// after the rope - would silently turn somebody's freeze into a remover, and
+/// the way to say that is a layout bump rather than nothing. It is the same
+/// rule the joint kinds themselves follow.
+const TOOLS: [&str; 6] = ["weld", "hinge", "rope", "remover", "freeze", "ball"];
 
 /// Which of them is which.
 const WELD: u32 = 0;
@@ -478,6 +484,8 @@ const ROPE: u32 = 2;
 const REMOVER: u32 = 3;
 /// @ref [`TOOLS`].
 const FREEZE: u32 = 4;
+/// @ref [`TOOLS`].
+const BALL: u32 = 5;
 
 /// Which gun is in the hands: the one that carries, or the one with modes.
 const PHYSGUN: u32 = 0;
@@ -1857,9 +1865,10 @@ fn toolgun(world: &mut World) {
 		forget_first(world);
 	}
 
-	for (index, key) in [Key::Digit1, Key::Digit2, Key::Digit3, Key::Digit4, Key::Digit5]
-		.into_iter()
-		.enumerate()
+	for (index, key) in
+		[Key::Digit1, Key::Digit2, Key::Digit3, Key::Digit4, Key::Digit5, Key::Digit6]
+			.into_iter()
+			.enumerate()
 	{
 		if !input.pressed(key) {
 			continue;
@@ -1983,6 +1992,11 @@ fn link(world: &mut World, body: BodyId, at: Vec3, normal: Vec3) {
 		),
 		| ROPE =>
 			Joint::rope(first, second, (anchor_on(&one, started), far), (at - started).length()),
+		// held together and free to turn any way at all. Two props on one of
+		// these no longer collide with each other either - every joint switches
+		// that off unless it says otherwise - so it is a pivot rather than two
+		// things grinding against each other at a point.
+		| BALL => Joint::ball(first, second, (anchor_on(&one, started), far)),
 		| _ => Joint::weld(first, second, (anchor_on(&one, started), far))
 			.sprung(WELD_STIFFNESS, WELD_DAMPING),
 	};
