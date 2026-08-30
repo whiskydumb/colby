@@ -34,6 +34,7 @@ use winit::{event::WindowEvent, window::Window};
 
 mod aim;
 mod console;
+mod gizmo;
 mod select;
 mod stats;
 mod tree;
@@ -56,6 +57,9 @@ pub struct Editor {
 	textures: egui::TexturesDelta,
 	points: f32,
 	console: console::Console,
+	/// What is selected, held here rather than in a panel: the viewport picks
+	/// into it and the tree draws it, and two copies could disagree.
+	selection: select::Selection,
 	tree: tree::Tree,
 	viewport: viewport::Viewport,
 }
@@ -92,6 +96,7 @@ impl Editor {
 			textures: egui::TexturesDelta::default(),
 			points: 1.0,
 			console: console::Console::default(),
+			selection: select::Selection::default(),
 			tree: tree::Tree::default(),
 			viewport: viewport::Viewport::default(),
 		}
@@ -149,6 +154,7 @@ impl Editor {
 	pub fn run(&mut self, window: &Window, world: &mut World, clock: &Clock, frames: u64) {
 		let input = self.state.take_egui_input(window);
 		let console = &mut self.console;
+		let selection = &mut self.selection;
 		let tree = &mut self.tree;
 		let viewport = &mut self.viewport;
 
@@ -160,10 +166,19 @@ impl Editor {
 		let output = self.context.run_ui(input, |_ui| {
 			stats::show(&context, world, clock, frames);
 			console.show(&context, world);
+
+			// the world may have been replaced since the last frame by a scene
+			// load or by play being stopped. Once, here, before anything reads
+			// the selection.
+			selection.refresh(world);
+
 			// the viewport before the tree, so that a click out in the world
 			// is already in hand when the tree draws the row it selected.
-			let picked = viewport.run(&context, world);
-			tree.show(&context, world, picked);
+			if let Some(pick) = viewport.run(&context, world, selection) {
+				selection.set(world, pick);
+			}
+
+			tree.show(&context, world, selection, viewport.tool());
 		});
 
 		self.state

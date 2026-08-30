@@ -25,7 +25,10 @@ use colby_core::{
 };
 use egui::{Context, DragValue, Grid, ScrollArea, Window};
 
-use crate::select::{self, Pick, Selection};
+use crate::{
+	gizmo::Tool,
+	select::{self, Pick, Selection},
+};
 
 /// How tall the tree is allowed to get before it scrolls.
 const TREE_HEIGHT: f32 = 240.0;
@@ -42,9 +45,6 @@ const SCALE_SPEED: f32 = 0.01;
 /// The scene window's own state.
 #[derive(Debug, Default)]
 pub(crate) struct Tree {
-	/// What is selected, and what it was called when it was picked.
-	selection: Selection,
-
 	/// The living entity handles, refilled every frame.
 	///
 	/// Refilled rather than held: the tables are the host's, and anything in
@@ -63,19 +63,16 @@ impl Tree {
 	///
 	/// @param context - egui, mid-frame
 	/// @param world - the tables to show, and to edit
-	/// @param picked - what a click in the world landed on, if there was one.
-	/// [`Pick::Nothing`] is a click on empty space and clears the selection,
-	/// which is a different answer from not having clicked at all
-	pub(crate) fn show(&mut self, context: &Context, world: &mut World, picked: Option<Pick>) {
-		// before anything is drawn: the world may have been replaced since the
-		// last frame by a scene load or by play being stopped, and the point of
-		// a selection that remembers its name is that it survives that.
-		self.selection.refresh(world);
-
-		if let Some(pick) = picked {
-			self.selection.set(world, pick);
-		}
-
+	/// @param selection - what is selected, which a row here may change
+	/// @param tool - what the gizmo out in the world is doing, so that the
+	/// three keys that switch it are written down somewhere
+	pub(crate) fn show(
+		&mut self,
+		context: &Context,
+		world: &mut World,
+		selection: &mut Selection,
+		tool: Tool,
+	) {
 		self.gather(world);
 
 		Window::new("scene")
@@ -92,10 +89,12 @@ impl Tree {
 				ScrollArea::vertical()
 					.max_height(TREE_HEIGHT)
 					.auto_shrink([false, true])
-					.show(ui, |ui| self.branches(ui, world));
+					.show(ui, |ui| self.branches(ui, world, selection));
 
 				ui.separator();
-				self.detail(ui, world);
+				detail(ui, world, selection.at());
+				ui.separator();
+				ui.label(format!("gizmo: {} - w move, e turn, r size", tool.word()));
 			});
 	}
 
@@ -115,22 +114,28 @@ impl Tree {
 	}
 
 	/// Every entity with its bodies under it, then the rest.
-	fn branches(&mut self, ui: &mut egui::Ui, world: &World) {
+	fn branches(&self, ui: &mut egui::Ui, world: &World, selection: &mut Selection) {
 		for index in 0..self.entities.len() {
 			let Some(entity) = self.entities.get(index).copied() else {
 				continue;
 			};
 
-			self.row(ui, world, Pick::Entity(entity), &entity_label(world, entity));
-			self.under(ui, world, entity);
+			row(ui, world, selection, Pick::Entity(entity), &entity_label(world, entity));
+			self.under(ui, world, selection, entity);
 		}
 
-		self.loose(ui, world);
-		self.ties(ui, world);
+		self.loose(ui, world, selection);
+		self.ties(ui, world, selection);
 	}
 
 	/// The bodies driving one entity, indented under it.
-	fn under(&mut self, ui: &mut egui::Ui, world: &World, entity: EntityId) {
+	fn under(
+		&self,
+		ui: &mut egui::Ui,
+		world: &World,
+		selection: &mut Selection,
+		entity: EntityId,
+	) {
 		let driving: Vec<BodyId> = self
 			.bodies
 			.iter()
@@ -144,7 +149,7 @@ impl Tree {
 
 		ui.indent(entity.slot(), |ui| {
 			for body in driving {
-				self.row(ui, world, Pick::Body(body), &body_label(world, body));
+				row(ui, world, selection, Pick::Body(body), &body_label(world, body));
 			}
 		});
 	}
@@ -154,7 +159,7 @@ impl Tree {
 	/// The floor is usually one of these: a shape with no entity behind it,
 	/// because there is nothing to draw. So is a body whose entity was
 	/// despawned without it, which is a bug worth being able to see.
-	fn loose(&mut self, ui: &mut egui::Ui, world: &World) {
+	fn loose(&self, ui: &mut egui::Ui, world: &World, selection: &mut Selection) {
 		let alone: Vec<BodyId> = self
 			.bodies
 			.iter()
@@ -170,12 +175,12 @@ impl Tree {
 		ui.label("bodies on their own");
 
 		for body in alone {
-			self.row(ui, world, Pick::Body(body), &body_label(world, body));
+			row(ui, world, selection, Pick::Body(body), &body_label(world, body));
 		}
 	}
 
 	/// The joints, which hold bodies rather than standing anywhere.
-	fn ties(&mut self, ui: &mut egui::Ui, world: &World) {
+	fn ties(&self, ui: &mut egui::Ui, world: &World, selection: &mut Selection) {
 		if self.joints.is_empty() {
 			return;
 		}
@@ -188,63 +193,61 @@ impl Tree {
 				continue;
 			};
 
-			self.row(ui, world, Pick::Joint(joint), &joint_label(world, joint));
+			row(ui, world, selection, Pick::Joint(joint), &joint_label(world, joint));
 		}
 	}
+}
 
-	/// One selectable line.
-	fn row(&mut self, ui: &mut egui::Ui, world: &World, pick: Pick, label: &str) {
-		if ui
-			.selectable_label(self.selection.is(pick), label)
-			.clicked()
-		{
-			// through the world rather than by assignment, so that what is
-			// selected is remembered by name as well as by handle, and can be
-			// found again when the world is replaced.
-			self.selection.set(world, pick);
-		}
+/// One selectable line.
+fn row(ui: &mut egui::Ui, world: &World, selection: &mut Selection, pick: Pick, label: &str) {
+	if ui
+		.selectable_label(selection.is(pick), label)
+		.clicked()
+	{
+		// through the world rather than by assignment, so that what is
+		// selected is remembered by name as well as by handle, and can be
+		// found again when the world is replaced.
+		selection.set(world, pick);
+	}
+}
+
+/// The selected thing, in detail.
+fn detail(ui: &mut egui::Ui, world: &mut World, pick: Pick) {
+	match pick {
+		| Pick::Nothing => {
+			ui.label("nothing selected");
+		},
+		| Pick::Entity(id) => {
+			naming(ui, world, pick);
+			placing(ui, world, pick);
+			tint(ui, world, id);
+		},
+		| Pick::Body(id) => {
+			naming(ui, world, pick);
+			ui.label(
+				world
+					.bodies
+					.get(id)
+					.map_or_else(|| "gone".to_owned(), |body| format!("a {}", body_words(body))),
+			);
+			placing(ui, world, pick);
+			solid(ui, world, id);
+		},
+		| Pick::Joint(id) => {
+			naming(ui, world, pick);
+			tie(ui, world, id);
+		},
 	}
 
-	/// The selected thing, in detail.
-	fn detail(&self, ui: &mut egui::Ui, world: &mut World) {
-		let pick = self.selection.at();
-
-		match pick {
-			| Pick::Nothing => {
-				ui.label("nothing selected");
-			},
-			| Pick::Entity(id) => {
-				naming(ui, world, pick);
-				placing(ui, world, pick);
-				tint(ui, world, id);
-			},
-			| Pick::Body(id) => {
-				naming(ui, world, pick);
-				ui.label(
-					world.bodies.get(id).map_or_else(
-						|| "gone".to_owned(),
-						|body| format!("a {}", body_words(body)),
-					),
-				);
-				placing(ui, world, pick);
-				solid(ui, world, id);
-			},
-			| Pick::Joint(id) => {
-				naming(ui, world, pick);
-				tie(ui, world, id);
-			},
-		}
-
-		ui.separator();
-		// the honest answer to "why did my drag not stick", which used to be a
-		// workaround written on the panel and is now a mode. @ref
-		// `colby_core::abi::World::editing`.
-		ui.label(if world.editing {
-			"editing, so these are yours"
-		} else {
-			"playing, so the game may write these back every step. F5 to edit"
-		});
-	}
+	ui.separator();
+	// the honest answer to "why did my drag not stick", which used to be a
+	// workaround written on the panel and is now a mode. @ref
+	// `colby_core::abi::World::editing`.
+	ui.label(if world.editing {
+		"editing, so these are yours"
+	} else {
+		"playing, so the game may write these back every step. F5 to edit"
+	});
 }
 
 /// The entity a body drives, if it is still there.
