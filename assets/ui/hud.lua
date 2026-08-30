@@ -18,15 +18,18 @@ ui.on("reset", "click", function()
 	colby.command("game.reset")
 end)
 
--- and the button that remembers something itself. Whether it is pressed is this
--- program's business, the words and the color are its business too, and the
--- only part the game is told about is that the ring should stop turning.
-local holding = false
+-- and the button that remembers something itself. How many times the yard has
+-- been cleared is this program's business, the words and the color are its
+-- business too, and the only part the game is told about is that the props
+-- should go. Editing this file replaces the program and `swept` starts at zero
+-- again; a reload of the *gameplay* module does not, which is the difference
+-- the VM living in the host buys.
+local swept = 0
 
-ui.on("hold", "click", function()
-	holding = not holding
+ui.on("cleanup", "click", function()
+	swept = swept + 1
 
-	colby.command("game.hold")
-	ui.set_text("hold", holding and "holding" or "hold")
-	ui.set_classes("hold", holding and "button on" or "button")
+	colby.command("game.cleanup")
+	ui.set_text("cleanup", "cleanup " .. swept)
+	ui.set_classes("cleanup", "button on")
 end)

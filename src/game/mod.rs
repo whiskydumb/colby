@@ -17,54 +17,52 @@
 
 #![allow(unsafe_code)]
 
-use std::f32::consts::TAU;
-
 use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, JointId,
-		Key, Layers, Length, Material, MaterialId, MeshId, Motion, PanelId, Renderable,
-		SceneData, SceneId, Shape, Solid, TouchKind, TraceInfo, Transform, Value, World,
-		character, debug, scene,
+		Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Renderable, SceneData,
+		SceneId, Shape, Solid, TouchKind, TraceInfo, Transform, World, character, debug, scene,
 	},
 	bytemuck::{Pod, Zeroable},
-	glam::{Quat, Vec2, Vec3},
+	glam::{Vec2, Vec3},
 	info, mod_ctor, mod_dtor, trace, warn,
 };
 
 mod_ctor! {}
 mod_dtor! {}
 
-/// How many cubes stand in the ring.
-const RING: usize = 8;
-
-/// How far the ring's cubes stand from the middle.
-const RING_RADIUS: f32 = 2.6;
-
-/// How fast the ring turns, in radians per second.
+/// The map everything else stands on.
 ///
-/// The default only: `init` registers it as a console variable, `update` reads
-/// that variable, and `game.spin_rate 3` in the console turns the ring faster
-/// without a rebuild. A value typed there survives a reload, and this constant
-/// is what it goes back to.
-const SPIN_RATE: f32 = 0.4;
+/// `assets/scenes/construct.scene`: a yard, a parapet round it, a hangar with a
+/// ramp and a stair up to a mezzanine, a few platforms, and a hole in one
+/// corner to lose things down. Boxes rather than one mesh, and the reason is
+/// the solver: a mesh collider is a linear scan over every triangle behind one
+/// bounds rejection, and the bounds of a whole map pass every trace, so every
+/// ray would walk thousands of triangles. Thirty boxes cost thirty exact tests.
+///
+/// Nothing in this module knows what is in it. Editing the file moves the world
+/// under a running process, exactly as the props do.
+const MAP_SCENE: &str = "scenes/construct";
 
-/// The console variable [`SPIN_RATE`] is the default of.
-const SPIN_RATE_CVAR: &str = "game.spin_rate";
-
-/// How high the ring's cubes bob, and how fast.
-const BOB: (f32, f32) = (0.35, 1.6);
-
-/// How wide the floor is.
-const FLOOR_SIZE: f32 = 14.0;
-
-/// How high the floor's surface sits.
-const FLOOR_Y: f32 = -0.5;
-
-/// How big the shape in the middle is drawn.
-const CENTER_SCALE: f32 = 0.9;
+/// How many times the floor's image repeats across it.
+///
+/// The cube's own coordinates run zero to one whatever it is scaled to, so a
+/// fifty unit slab shows one tile stretched across fifty units without this.
+/// Nineteen over fifty by forty-four is about two and a half units a tile.
+///
+/// It is square because `uv_scale` is one number a side and a cube's six faces
+/// do not agree about which world axis each side is: matching one face exactly
+/// stretches the rest. Every other surface in the map is a flat color, where
+/// the question does not arise. @ref `colby-sandbox-brief` for what the
+/// expensive answer would be.
+const MAP_TILES: f32 = 19.0;
 
 /// Where the player stands when the scene is put back.
-const PLAYER_START: Vec3 = Vec3::new(1.4, 0.4, 1.4);
+///
+/// In the yard, south of the hangar, with the props beside it and the camera
+/// far enough back to see both. Half a unit up because the box is a unit tall
+/// and the floor's surface is zero.
+const PLAYER_START: Vec3 = Vec3::new(2.0, 0.5, -6.0);
 
 /// Half-extents of the player's box.
 ///
@@ -95,34 +93,18 @@ const DISTANCE_RANGE: (f32, f32) = (2.0, 40.0);
 const DRAG_RATE: f32 = 0.006;
 
 /// Where the camera starts: yaw, pitch, distance.
-const START_ORBIT: (f32, f32, f32) = (0.6, 0.5, 9.0);
-
-/// What the floor is tinted, on top of its texture.
 ///
-/// Close to white: the image already carries the color, and a tint is for
-/// nudging it rather than replacing it.
-const FLOOR_COLOR: Vec3 = Vec3::new(0.82, 0.84, 0.88);
+/// Chosen against the map rather than picked: the orbit puts the camera at
+/// `target + (sin(yaw), .., cos(yaw)) * distance`, so a yaw whose cosine is
+/// positive stands it *north* of the player, which for this map is inside the
+/// hangar's west wall. The first screenshot taken of the map was a view from
+/// inside that wall, and the readout said `hangar wall west @ 0.0` because the
+/// pick ray started solid. There is no camera collision here and nothing plans
+/// to add one; what there is instead is a starting pose that does not need it.
+const START_ORBIT: (f32, f32, f32) = (3.6, 0.35, 9.0);
 
 /// The color of the box the player is.
 const PLAYER_COLOR: Vec3 = Vec3::new(0.30, 0.85, 0.55);
-
-/// What the shape in the middle is colored.
-const CENTER_COLOR: Vec3 = Vec3::new(0.95, 0.76, 0.20);
-
-/// The asset the middle of the scene is made of.
-///
-/// A name, resolved against the host's registry every time this module is
-/// swapped in. `assets/meshes/crystal.obj` compiles to this name; edit that
-/// file and the shape changes under a running process, because the handle the
-/// name resolves to stays the same and only the geometry behind it moves.
-const CENTER_MESH: &str = "meshes/crystal";
-
-/// What the middle falls back to when the asset is not there.
-///
-/// Not an error: a checkout with no `assets/` directory, or one where the
-/// crystal failed to compile, should still put something on screen rather than
-/// a hole where the scene was.
-const CENTER_FALLBACK: MeshId = MeshId::CUBE;
 
 /// The image the floor is made of.
 const FLOOR_TEXTURE: &str = "textures/tiles";
@@ -146,7 +128,7 @@ const LAMP_MODEL: &str = "models/lamp";
 /// A placement is in the *model's* own space, so putting one in a scene is
 /// the game's arithmetic: this one only moves and scales, and a model that
 /// had to be turned as well would compose the rotations here.
-const LAMP_AT: Vec3 = Vec3::new(1.3, 0.0, 4.6);
+const LAMP_AT: Vec3 = Vec3::new(-6.0, 0.0, -1.0);
 
 /// How much of the model's own size it is drawn at.
 const LAMP_SCALE: f32 = 1.6;
@@ -227,16 +209,23 @@ const PROPS: usize = 5;
 const PROPS_SCENE: &str = "scenes/props";
 
 /// Where the rope is tied when there is no scene to say.
-const HOOK: Vec3 = Vec3::new(4.60, 3.20, 0.60);
+const HOOK: Vec3 = Vec3::new(5.20, 4.00, -5.40);
 
 /// How big the cross marking the rope's hook is, in world units.
 const HOOK_SIZE: f32 = 0.08;
 
-/// The layer the floor, the crystal and the ring are on.
+/// The layer the map is on.
 ///
 /// Layers are numbers here rather than names in a manifest, and a game naming
 /// its own is the whole of the mechanism: the engine holds two bitmasks per
 /// body and has no opinion about what any bit means.
+///
+/// This is also how the map is *found*. A sandbox's scenery and its props are
+/// open-ended, so neither belongs in the arena as an array of handles; walking
+/// the body table and asking which layer each one is on answers "what is the
+/// map" without anything having to remember. It is what `Layers` is for, and it
+/// is why the pit's own volume is on this layer too rather than on one of its
+/// own.
 const LAYER_WORLD: u32 = 0;
 
 /// The layer everything the solver throws about is on.
@@ -245,45 +234,28 @@ const LAYER_PROP: u32 = 1;
 /// The layer the player's box is on.
 const LAYER_PLAYER: u32 = 2;
 
-/// The layer the trigger volume is on.
-const LAYER_TRIGGER: u32 = 3;
-
-/// What the scenery is: on the world layer, in the way of everything.
+/// What a piece of the map is: on the world layer, in the way of everything.
+///
+/// The same thing [`Layers::DEFAULT`] is, which is why nothing in
+/// `construct.scene` writes a layer at all.
 const WORLD_LAYERS: Layers = Layers::single(LAYER_WORLD);
 
 /// What a prop is.
 const PROP_LAYERS: Layers = Layers::single(LAYER_PROP);
 
 /// What the player is, and what it walks into.
-///
-/// Everything except the trigger, which it would pass through anyway - a
-/// sensor pushes nothing - but saying so here is what makes the trigger's own
-/// mask readable as a decision rather than as a coincidence.
 const PLAYER_LAYERS: Layers = Layers::new(
 	Layers::bit(LAYER_PLAYER),
 	Layers::bit(LAYER_WORLD) | Layers::bit(LAYER_PROP) | Layers::bit(LAYER_PLAYER),
 );
 
-/// What the trigger is: interested in props and in nothing else.
-const TRIGGER_LAYERS: Layers = Layers::new(Layers::bit(LAYER_TRIGGER), Layers::bit(LAYER_PROP));
-
-/// Where the trigger volume sits, in the world.
+/// What the map calls the volume at the bottom of its hole.
 ///
-/// Over the corner the props are dropped into rather than somewhere tidy, so
-/// that a screenshot taken at any moment has something in it. A volume nothing
-/// ever enters demonstrates nothing.
-const TRIGGER_CENTER: Vec3 = Vec3::new(4.80, 0.45, -0.35);
-
-/// Its half-extents.
-///
-/// Sized to the corner the props are dropped into rather than around what it
-/// must not touch: it is on [`TRIGGER_LAYERS`], which is interested in props
-/// alone, so the floor slab it now reaches through and the ring it now reaches
-/// into are not in its list. It still ends below the ball that hangs, which is
-/// what makes the count four out of five rather than five out of five - and
-/// that is a fact about where the ball is rather than about the geometry
-/// underneath.
-const TRIGGER_EXTENTS: Vec3 = Vec3::new(1.75, 1.05, 1.55);
+/// A sensor on the world layer whose mask is props and the player, so it
+/// notices those two and nothing else: the floor it hangs under and the
+/// parapet beside it are on the world layer as well, and the pair is refused
+/// before the narrow phase ever sees it. @ref [`swallow`].
+const PIT_BODY: &str = "pit";
 
 /// How far above whatever the pick ray found its label is written.
 const LABEL_LIFT: f32 = 0.55;
@@ -317,27 +289,6 @@ const REACH: f32 = 60.0;
 /// How much brighter whatever is under the cursor is drawn.
 const HIGHLIGHT: f32 = 1.45;
 
-/// How thick the floor's collider is.
-///
-/// The floor is drawn as a quad, which has no thickness at all, and a surface
-/// a trace can pass through edge-on is not a floor. Half a tenth of a unit is
-/// enough to be solid and too little to see.
-///
-/// The slab is hung *below* the quad rather than centered on it, which is why
-/// the floor is the one body in this scene with no entity behind it: a shape
-/// has no offset of its own, so the only way to put a surface where a person
-/// drew one is to move the body, and a body that follows an entity cannot be
-/// moved. Getting this wrong is props resting five centimeters above the
-/// floor - small enough to miss and quite visible once seen.
-const FLOOR_THICKNESS: f32 = 0.05;
-
-/// How many times that image repeats across the floor.
-///
-/// The quad's own coordinates run zero to one whatever it is scaled to, so this
-/// is what decides how big a tile looks. Six across fourteen units is about
-/// two units a tile.
-const FLOOR_TILES: f32 = 6.0;
-
 /// The game's own state, kept in the host's arena.
 ///
 /// Add a field, bump [`STATE_LAYOUT`], save: the arena zeroes itself and the
@@ -347,9 +298,6 @@ const FLOOR_TILES: f32 = 6.0;
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
 struct State {
-	/// Radians the ring has turned so far.
-	spin: f32,
-
 	/// Where the camera sits, as an orbit around its target.
 	yaw: f32,
 
@@ -359,26 +307,29 @@ struct State {
 	/// How far from the target.
 	distance: f32,
 
-	/// The floor, so the game moves exactly the entities it made.
-	floor: EntityId,
-
-	/// The cube in the middle.
-	center: EntityId,
-
-	/// The cubes standing around it.
-	ring: [EntityId; RING],
-
 	/// The panel the interface is shown in.
 	hud: PanelId,
 
-	/// The slab under the floor.
-	floor_body: BodyId,
+	/// The map's scene, so that editing the file lays it out again.
+	///
+	/// Two words for thirty entities and thirty-one bodies, because none of
+	/// them is here: the map is *found* by walking the body table for
+	/// [`LAYER_WORLD`], which is what keeps an open-ended thing out of a fixed
+	/// arena. @ref [`lay_map`].
+	map_scene: SceneId,
 
-	/// The shape in the middle, collided against as its own triangles.
-	center_body: BodyId,
+	/// Which revision of it is standing.
+	map_revision: u32,
 
-	/// One box per cube of the ring.
-	ring_bodies: [BodyId; RING],
+	/// The volume at the bottom of the hole, looked up by name once.
+	pit: BodyId,
+
+	/// How many props the hole has swallowed.
+	///
+	/// A running count rather than what is inside it now: a thing falling past
+	/// a volume is inside it for about a step, so the momentary number is zero
+	/// whenever anybody looks.
+	swallowed: u32,
 
 	/// The loose props the solver owns.
 	props: [EntityId; PROPS],
@@ -395,9 +346,6 @@ struct State {
 
 	/// The rope one of them hangs from.
 	rope: JointId,
-
-	/// The volume that notices what is in it and pushes nothing.
-	trigger: BodyId,
 
 	/// The box the player walks around as.
 	player: EntityId,
@@ -438,15 +386,11 @@ struct State {
 	/// How far away it was, in units.
 	picked_distance: f32,
 
-	/// One entity per piece of the model in the corner.
+	/// One entity per piece of the model standing in the yard.
 	///
 	/// Spawned once and never moved, so it is the one thing in this scene the
 	/// editor can drag and have it stay put.
 	lamp: [EntityId; LAMP_PIECES],
-
-	/// Whether the `hold` button is holding the ring still. Not a `bool`
-	/// because [`Pod`] wants every bit pattern to be a valid value.
-	holding: u32,
 }
 
 /// The version of [`State`]'s layout. Bump it whenever the struct changes.
@@ -454,7 +398,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 13;
+const STATE_LAYOUT: u64 = 14;
 
 /// The module's single exported symbol.
 ///
@@ -493,7 +437,6 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	// the first load and whenever STATE_LAYOUT moves.
 	let (state, fresh) = world.state.get::<State>(STATE_LAYOUT);
 	if fresh {
-		state.spin = 0.0;
 		(state.yaw, state.pitch, state.distance) = START_ORBIT;
 
 		// the arena was reset, so the handles it held are gone. Anything the
@@ -502,11 +445,6 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		// and the bodies with them: a body naming an entity that no longer
 		// exists drives nothing, and would still be traced against.
 		world.bodies.clear();
-		state.floor = world.entities.spawn();
-		state.center = world.entities.spawn();
-		for slot in &mut state.ring {
-			*slot = world.entities.spawn();
-		}
 		for slot in &mut state.lamp {
 			*slot = world.entities.spawn();
 		}
@@ -526,11 +464,6 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	// be registered again whatever happens, because the host drops it before
 	// unloading this library - its address is in here. @ref
 	// [`cvar`](colby_core::abi::cvar).
-	world.cvars.saved(
-		SPIN_RATE_CVAR,
-		Value::Float(SPIN_RATE),
-		"how fast the ring turns, in radians a second",
-	);
 	world.cvars.command(
 		"game.reset",
 		reset,
@@ -538,19 +471,20 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	);
 	world
 		.cvars
-		.command("game.hold", hold, "stop the ring turning, or let it turn again");
+		.command("game.cleanup", clear, "despawn every prop, leaving the map alone");
 
 	// on every load, not only a fresh one: the mesh a name resolves to is the
 	// host's business, and an asset that appeared since the last swap should be
-	// picked up by this one.
+	// picked up by this one. The materials the map names are declared in here,
+	// so this has to run before anything is laid out.
 	dress(world);
-	place(world);
 	collide(world);
 
 	if fresh {
-		// only on a fresh arena: a reload should leave the pile exactly where
-		// the last build left it, which is the whole point of the state living
-		// in the host.
+		// only on a fresh arena: a reload should leave the map and the pile
+		// exactly where the last build left them, which is the whole point of
+		// the state living in the host.
+		lay_map(world);
 		lay_props(world);
 	}
 
@@ -562,8 +496,8 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 
 	info!(
 		reloads = world.reloads,
-		ring = RING,
 		entities = world.entities.len(),
+		bodies = world.bodies.len(),
 		fresh,
 		"game init"
 	);
@@ -578,17 +512,8 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	// SAFETY: as init.
 	let world = unsafe { &mut *world };
 	let input = world.input;
-	let dt = world.dt;
 
-	// the ring's speed comes from the console variable, falling back to the
-	// constant that is its default. This is the only line that changes when a
-	// number becomes something a person can turn while watching it.
-	let spin_rate = world
-		.cvars
-		.float(SPIN_RATE_CVAR)
-		.unwrap_or(SPIN_RATE);
-
-	interface(world, spin_rate);
+	interface(world);
 
 	// a click that landed on the interface is not also a click on the world.
 	// The host applies the same rule between the editor and the game; this is
@@ -609,13 +534,6 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 		.mul_add(-ZOOM_STEP, state.distance)
 		.clamp(DISTANCE_RANGE.0, DISTANCE_RANGE.1);
 
-	// the left button holds the ring still, and so does the interface's own
-	// button - one behavior, two ways to ask for it.
-	let held = state.holding != 0 || (input.button_held(Button::Left) && !over_interface);
-	if !held {
-		state.spin = dt.mul_add(spin_rate, state.spin);
-	}
-
 	let (yaw, pitch, distance) = (state.yaw, state.pitch, state.distance);
 
 	walk(world, yaw);
@@ -632,13 +550,14 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 
 	world.camera.orbit(yaw, pitch, distance);
 
-	place(world);
+	relay_map(world);
 	relay_props(world);
+	rope_line(world);
+	swallow(world);
 	pick(world);
 	duplicate(world, yaw);
 	light_up(world);
 	label_pick(world);
-	trigger(world);
 	menu(world);
 	count_landings(world);
 }
@@ -920,36 +839,89 @@ fn walk(world: &mut World, yaw: f32) {
 	state.player_grounded = u32::from(moved.grounded);
 }
 
-/// Outlines the trigger volume and writes what is in it above it.
+/// Removes whatever has fallen into the hole, and puts the player back.
 ///
-/// Drawn by the game rather than left to `phys.draw_shapes`, for the reason
-/// the rope is drawn: a screenshot has no console to turn anything on with,
-/// and a trigger nobody can see is indistinguishable from one that is not
-/// working. Magenta because that is the color the solver's own drawing gives a
-/// sensor, and two names for one thing is how a picture stops meaning
-/// anything.
+/// What the sensor at the bottom of the map is *for*, rather than a volume that
+/// exists to prove sensors work. A prop that leaves the map would otherwise
+/// fall forever, keeping a body awake and a slot taken for the life of the
+/// process; a player that leaves it would never come back.
 ///
-/// @param world - the overlap list to read and the table the lines go in
-fn trigger(world: &mut World) {
+/// The two are told apart by which layer the body is on, which is the same
+/// question `lay_map` asks and the same one the pit's own mask already answered
+/// once: the volume never even forms a pair with the map around it.
+///
+/// @param world - the overlap list to read, and the tables to remove from
+fn swallow(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let volume = state.trigger;
+	let (pit, player) = (state.pit, state.player_body);
 
-	if !volume.is_some() {
+	if !pit.is_some() {
 		return;
 	}
 
-	let inside = world.bodies.inside(volume).count();
-	let lifted = TRIGGER_CENTER + Vec3::new(0.0, TRIGGER_EXTENTS.y + LABEL_LIFT, 0.0);
-	let text = if inside == 0 {
-		"trigger: empty".to_owned()
-	} else {
-		format!("trigger: {inside}")
-	};
+	// collected first: removing a body writes the table the overlap list is
+	// read out of.
+	let fallen: Vec<(BodyId, EntityId)> = world
+		.bodies
+		.inside(pit)
+		.filter(|&id| id != player)
+		.filter_map(|id| world.bodies.get(id).map(|body| (id, body.entity)))
+		.collect();
 
-	world
-		.debug
-		.cuboid(TRIGGER_CENTER, TRIGGER_EXTENTS, Quat::IDENTITY, debug::MAGENTA);
-	world.debug.label(lifted, &text, debug::MAGENTA);
+	let caught = world.bodies.inside(pit).any(|id| id == player);
+
+	for (body, entity) in &fallen {
+		// @ref [`sweep_props`] for why the joints go first.
+		world.joints.forget(*body);
+		world.bodies.despawn(*body);
+		world.entities.despawn(*entity);
+	}
+
+	if caught {
+		// the only witness there is: the player is put back where it started,
+		// so a picture taken afterwards looks exactly like one taken before the
+		// fall. @ref the pre-commit audit list, which this line belongs on.
+		trace!("the player fell out of the map");
+		put_player_back(world);
+	}
+
+	if fallen.is_empty() {
+		return;
+	}
+
+	let gone = u32::try_from(fallen.len()).unwrap_or(0);
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.swallowed = state.swallowed.saturating_add(gone);
+
+	trace!(gone, total = state.swallowed, "the hole swallowed something");
+}
+
+/// Stands the player back where it starts, with nothing left of the fall.
+///
+/// Through `teleport_body` rather than by writing the entity: the two are
+/// copied into each other once a step, so moving one of them alone is a body
+/// and a picture in different places until the next step, and the picture would
+/// be drawn crossing the whole map to get there. @ref
+/// [`teleport_body`](colby_core::abi::World::teleport_body).
+///
+/// @param world - the player to move
+fn put_player_back(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let body = state.player_body;
+
+	let mut stance = Transform::at(PLAYER_START);
+	stance.scale = PLAYER_EXTENTS * 2.0;
+	world.teleport_body(body, stance);
+
+	// the speed of a fall that is over. `walk` reads it back out of the body
+	// every step, so leaving it would put the player on the floor already
+	// moving at whatever it reached on the way down.
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.velocity = Vec3::ZERO;
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.player_grounded = 0;
 }
 
 /// Writes what the pick ray found above the thing it found.
@@ -967,7 +939,10 @@ fn label_pick(world: &mut World) {
 		return;
 	}
 
-	let (picked, text) = (state.picked, named(state));
+	// copied out of the arena, because `named` reads the tables the arena is
+	// borrowed from.
+	let state = *state;
+	let (picked, text) = (state.picked, named(world, &state));
 	let Some(&transform) = world.entities.transform(picked) else {
 		return;
 	};
@@ -1036,6 +1011,7 @@ fn pick(world: &mut World) {
 	state.picked = result.entity;
 	state.picked_body = result.body;
 	state.picked_distance = if result.hit { result.fraction * REACH } else { 0.0 };
+	let state = *state;
 
 	if moved {
 		// one line per change rather than one per step, so a live run can be
@@ -1043,7 +1019,7 @@ fn pick(world: &mut World) {
 		// and in particular the only way to see it still answering after a
 		// module reload - the table is the host's, and a swap must not disturb
 		// it. @ref the pre-commit audit list.
-		trace!(hit = %named(state), fraction = result.fraction, "pick");
+		trace!(hit = %named(world, &state), fraction = result.fraction, "pick");
 	}
 }
 
@@ -1056,7 +1032,7 @@ fn pick(world: &mut World) {
 /// @param world - the entities to color
 fn light_up(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (center, ring, picked) = (state.center, state.ring, state.picked);
+	let picked = state.picked;
 	let (props, scene) = (state.props, state.props_scene);
 
 	// the props' own colors are the scene's rather than a formula's, so they
@@ -1078,16 +1054,6 @@ fn light_up(world: &mut World) {
 		}
 	};
 
-	if let Some(renderable) = world.entities.renderable_mut(center) {
-		renderable.color = lit(center, Vec3::ONE);
-	}
-
-	for (index, id) in ring.into_iter().enumerate() {
-		if let Some(renderable) = world.entities.renderable_mut(id) {
-			renderable.color = lit(id, hue(index));
-		}
-	}
-
 	for (index, id) in props.into_iter().enumerate() {
 		if let Some(renderable) = world.entities.renderable_mut(id) {
 			renderable.color = lit(id, base[index]);
@@ -1102,13 +1068,12 @@ fn light_up(world: &mut World) {
 /// nothing to remember between steps and nothing to tear down on a reload.
 ///
 /// @param world - the interface to write into and the events to read
-/// @param spin_rate - what the ring is turning at, for the readout
-fn interface(world: &mut World, spin_rate: f32) {
+fn interface(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let mut hud = state.hud;
 
-	// re-resolved when it is nothing, for the same reason the crystal's mesh
-	// is: the document may have been compiled after this module was loaded.
+	// re-resolved when it is nothing, for the same reason a mesh handle is:
+	// the document may have been compiled after this module was loaded.
 	if !hud.is_some() {
 		hud = world.ui.show(HUD);
 		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
@@ -1124,10 +1089,9 @@ fn interface(world: &mut World, spin_rate: f32) {
 	// is everything below, which needs the world - a script can see the
 	// interface and nothing else.
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let spin = state.spin;
-	let hit = named(state);
+	let state = *state;
+	let hit = named(world, &state);
 	let props = state.props;
-	let volume = state.trigger;
 	let grounded = state.player_grounded != 0;
 	let (time, entities) = (world.time, world.entities.len());
 	let landings = state.landings;
@@ -1138,8 +1102,16 @@ fn interface(world: &mut World, spin_rate: f32) {
 		.filter(|&&id| resting(world, id))
 		.count();
 	let contacts = world.contacts;
-	let inside = world.bodies.inside(volume).count();
 	let footing = if grounded { "on the ground" } else { "in the air" };
+
+	// counted rather than remembered, which is the same rule the map follows:
+	// what a prop is is a body on a layer, so how many there are is a walk.
+	let loose = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| on_layer(body, PROP_LAYERS))
+		.count();
+	let swallowed = state.swallowed;
 
 	world
 		.ui
@@ -1147,9 +1119,6 @@ fn interface(world: &mut World, spin_rate: f32) {
 	world
 		.ui
 		.set_text(hud, "entities", &format!("{entities}"));
-	world
-		.ui
-		.set_text(hud, "rate", &format!("{spin_rate:.2}"));
 	world.ui.set_text(hud, "hit", &hit);
 	world
 		.ui
@@ -1159,15 +1128,8 @@ fn interface(world: &mut World, spin_rate: f32) {
 		.set_text(hud, "joints", &format!("{joints} held, {landings} landings"));
 	world
 		.ui
-		.set_text(hud, "trigger", &format!("{inside} inside"));
+		.set_text(hud, "props", &format!("{loose} loose, {swallowed} lost"));
 	world.ui.set_text(hud, "player", footing);
-
-	// the one thing a class cannot say: how full the bar is. A stylesheet
-	// decides what the bar looks like and the game decides how long it is.
-	let turn = (spin / TAU).fract() * 100.0;
-	if let Some(style) = world.ui.style_mut(hud, "fill") {
-		style.width = Some(Length::Percent(turn.max(1.0)));
-	}
 }
 
 /// Puts the scene and the camera back where they started.
@@ -1177,40 +1139,21 @@ fn interface(world: &mut World, spin_rate: f32) {
 /// @param world - the state to put back
 fn recenter(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.spin = 0.0;
 	(state.yaw, state.pitch, state.distance) = START_ORBIT;
+	state.swallowed = 0;
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (player, body) = (state.player, state.player_body);
-	let (dropped, dropped_bodies) = (state.dropped, state.dropped_bodies);
-	state.player_grounded = 0;
-	state.dropped = [EntityId::NONE; SPAWNED];
-	state.dropped_bodies = [BodyId::NONE; SPAWNED];
-	state.dropped_next = 0;
-
-	for (entity, solid) in dropped.into_iter().zip(dropped_bodies) {
-		world.bodies.despawn(solid);
-		world.entities.despawn(entity);
-	}
-
-	if let Some(transform) = world.entities.transform_mut(player) {
-		transform.position = PLAYER_START;
-		transform.scale = PLAYER_EXTENTS * 2.0;
-	}
-
-	if let Some(solid) = world.bodies.get_mut(body) {
-		solid.transform.position = PLAYER_START;
-		solid.velocity = Vec3::ZERO;
-	}
+	// every prop, whatever laid it out: the scene's five, whatever the menu
+	// dropped and whatever was duplicated are one set as far as this is
+	// concerned, because they are one layer. @ref [`sweep_props`].
+	sweep_props(world);
+	put_player_back(world);
+	lay_props(world);
 
 	let (yaw, pitch, distance) = START_ORBIT;
 	world.camera.target = PLAYER_START + Vec3::Y * EYE_LIFT;
 	world.camera.orbit(yaw, pitch, distance);
 
-	place(world);
-	lay_props(world);
-
-	// a cut rather than a move: the ring's angle, the camera's target and its
+	// a cut rather than a move: the player's place, the camera's target and its
 	// orbit all jumped at once, and the host would otherwise draw every one of
 	// them traveling there over the next frame. This is the whole of what a
 	// fixed timestep asks of gameplay code, and it is said once here rather
@@ -1234,24 +1177,68 @@ unsafe extern "C-unwind" fn reset(world: *mut World, _args: *const Args) {
 	recenter(world);
 }
 
-/// `game.hold` - what the interface's own button asks for.
+/// `game.cleanup` - what the interface's own second button asks for.
 ///
-/// A console command rather than a flag the interface writes, because the
+/// A console command rather than something the interface does, because the
 /// console is the one surface a document's script can reach: the button in
-/// `hud.lua` keeps its own idea of whether it is pressed and says this when it
-/// changes. Typing `game.hold` has always been the other way to ask.
+/// `hud.lua` says this and nothing else. Typing `game.cleanup` is the other way
+/// to ask, and it is also how a script with no mouse in it drives the same
+/// thing.
 ///
 /// # Safety
 ///
 /// `world` must point to a live [`World`] owned by the host, and `args` to a
 /// live argument list. The host removes this command from the table before
 /// unloading the module it lives in.
-unsafe extern "C-unwind" fn hold(world: *mut World, _args: *const Args) {
+unsafe extern "C-unwind" fn clear(world: *mut World, _args: *const Args) {
 	// SAFETY: as init.
 	let world = unsafe { &mut *world };
 
+	sweep_props(world);
+}
+
+/// Removes every prop, leaving the map and the player alone.
+///
+/// The same walk [`lay_map`] does, one layer along: what a prop *is* is a body
+/// on [`LAYER_PROP`], so nothing has to have been remembered for this to find
+/// all of them. That is the property the arena is being kept clear for, and it
+/// is why this can remove things the scene laid out, things the menu dropped
+/// and copies made by the duplicator without knowing which is which.
+///
+/// The handles the arena does still hold are cleared afterwards, because a
+/// handle to a despawned body would otherwise be handed to the solver by
+/// whatever reads it next.
+///
+/// @param world - the tables to remove from
+fn sweep_props(world: &mut World) {
+	// collected first: despawning writes the table being walked.
+	let loose: Vec<(BodyId, EntityId)> = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| on_layer(body, PROP_LAYERS))
+		.map(|(id, body)| (id, body.entity))
+		.collect();
+
+	for (body, entity) in &loose {
+		// before the body, not after: a joint naming a slot that has been
+		// handed out again holds whoever moved into it, and the solver visits
+		// it every step either way.
+		world.joints.forget(*body);
+		world.bodies.despawn(*body);
+		world.entities.despawn(*entity);
+	}
+
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.holding ^= 1;
+	state.props = [EntityId::NONE; PROPS];
+	state.prop_bodies = [BodyId::NONE; PROPS];
+	state.dropped = [EntityId::NONE; SPAWNED];
+	state.dropped_bodies = [BodyId::NONE; SPAWNED];
+	state.dropped_next = 0;
+	state.rope = JointId::NONE;
+	state.picked = EntityId::NONE;
+	state.picked_body = BodyId::NONE;
+
+	info!(gone = loose.len(), "props swept");
 }
 
 /// Runs once before this module is swapped out.
@@ -1326,66 +1313,69 @@ fn stand_model(world: &mut World) {
 	}
 }
 
-/// Gives every entity of the scene its shape and color.
+/// Declares every material the scenes can name, and dresses the player.
+///
+/// **Every material a `.scene` names has to be registered before that scene is
+/// laid out**, because a description carries the *name* and the loader resolves
+/// it once on the way in. That is why this runs ahead of [`lay_map`] and
+/// [`lay_props`] rather than beside them.
 ///
 /// Cheap enough to run on every load rather than only on a fresh arena, which
-/// is what lets the middle pick up an asset the host has since compiled.
+/// is what lets a surface pick up a texture the host has since compiled.
+///
+/// The map's own surfaces are five, one per kind of thing rather than one per
+/// slab, and only the floor is textured. The rest are flat colors until there
+/// is a pack to point them at, which is a change to these five lines and to
+/// nothing else: what each piece of the map is made of is written in
+/// `construct.scene` as a name.
 fn dress(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (floor, center, ring) = (state.floor, state.center, state.ring);
-
 	// asked for by name. The registry answers with a handle the game keeps for
 	// this load only - resolving again next time costs nothing and means an
 	// asset that arrived late is still found.
-	let crystal = world.meshes.find(CENTER_MESH);
-	let crystal = if crystal.is_some() { crystal } else { CENTER_FALLBACK };
 	let tiles = world.textures.find(FLOOR_TEXTURE);
 	let tile_normals = world.textures.find(FLOOR_NORMALS);
 
 	// materials are the game's own table, so they are declared here rather than
 	// imported from anywhere. Registering by name is idempotent: a reload finds
 	// the same handles and overwrites the same entries.
-	let stone = world.materials.insert(
-		"stone",
+	world.materials.insert(
+		"construct/floor",
 		Material::textured(tiles)
 			.bumped(tile_normals)
 			.finished(0.0, 0.75)
-			.tiled(FLOOR_TILES),
+			.tiled(MAP_TILES),
 	);
-	// a polished dielectric rather than a metal: that is what a crystal is, and
-	// a metal with nothing to reflect is a dark shape with one bright edge.
-	let quartz = world
+	world
 		.materials
-		.insert("quartz", Material::colored(CENTER_COLOR).finished(0.0, 0.12));
+		.insert("construct/wall", Material::DEFAULT.finished(0.0, 0.85));
+	// a polished dielectric rather than a metal, which is the same call the
+	// demo's crystal made and for the same reason: there is no environment map,
+	// so a real metal is a dark shape with one bright edge on it. @ref
+	// `colby-known-gaps`.
+	world
+		.materials
+		.insert("construct/metal", Material::DEFAULT.finished(0.0, 0.45));
+	world
+		.materials
+		.insert("construct/trim", Material::DEFAULT.finished(0.0, 0.6));
+	world
+		.materials
+		.insert("construct/platform", Material::DEFAULT.finished(0.0, 0.7));
+
 	let plastic = world
 		.materials
 		.insert("plastic", Material::DEFAULT.finished(0.0, 0.5));
-	// the ring alternates between plastic and this one; the props in
-	// `scenes/props` name it too, which is why every material a scene can name
-	// is registered here before anything is laid out. @ref [`lay_props`].
-	let metal = world
+	// the props in `scenes/props` name this one, which is the other half of
+	// the rule at the top of this function. @ref [`lay_props`].
+	world
 		.materials
 		.insert("metal", Material::DEFAULT.finished(1.0, 0.25));
-
-	world
-		.entities
-		.set_renderable(floor, Renderable::of(MeshId::QUAD, stone, FLOOR_COLOR));
-	world
-		.entities
-		.set_renderable(center, Renderable::of(crystal, quartz, Vec3::ONE));
-
-	for (index, id) in ring.into_iter().enumerate() {
-		let material = if index % 2 == 0 { plastic } else { metal };
-
-		world
-			.entities
-			.set_renderable(id, Renderable::of(MeshId::CUBE, material, hue(index)));
-	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let player = state.player;
 
-	// the props are not here: what they are made of is written in their scene.
+	// the props are not here, and neither is the map: what either is made of is
+	// written in its own scene.
 	world
 		.entities
 		.set_renderable(player, Renderable::of(MeshId::CUBE, plastic, PLAYER_COLOR));
@@ -1427,6 +1417,7 @@ fn lay_props(world: &mut World) {
 
 	world.joints.despawn(rope);
 	for (entity, body) in props.into_iter().zip(bodies) {
+		world.joints.forget(body);
 		world.bodies.despawn(body);
 		world.entities.despawn(entity);
 	}
@@ -1488,6 +1479,22 @@ fn relay_props(world: &mut World) {
 	lay_props(world);
 }
 
+/// Whether a body is one of the things some layers name.
+///
+/// The whole of how this game finds anything open-ended: a piece of the map is
+/// a body on [`WORLD_LAYERS`] and a prop is one on [`PROP_LAYERS`], so the set
+/// of either is a walk of the body table rather than an array of handles in a
+/// four-thousand-byte arena. That is what lets a map grow to two hundred boxes
+/// and a yard fill up with props without a constant anywhere having to say how
+/// many there may be.
+///
+/// Only the layer is compared and not the mask: what a body *is* and what it is
+/// interested in are different questions, and only the first is an identity.
+///
+/// @param body - the body to ask about
+/// @param layers - the layers that name a kind of thing
+fn on_layer(body: &Body, layers: Layers) -> bool { body.layers.layer == layers.layer }
+
 /// Puts a body on some layers, once it exists.
 ///
 /// `attach_body` hands back a handle rather than a body, so this is the second
@@ -1503,63 +1510,21 @@ fn layer(world: &mut World, body: BodyId, layers: Layers) {
 	}
 }
 
-/// Gives every entity of the scene a body to be traced against.
+/// Gives the player the box the solver knows it by.
 ///
-/// Rebuilt on every load rather than only on a fresh arena, and that is not
-/// laziness: a collision mesh is baked when its body is created and does not
-/// follow the `.obj` afterwards, so a body that outlived a reload would be
-/// collided against the geometry the *previous* build compiled. Bodies are four
-/// dozen bytes; correctness here is cheaper than cleverness.
+/// The map's own bodies are not here: they are written in `construct.scene`
+/// beside the entities that draw them, which is what a scene format is for.
+/// What is left is the one body no file could describe, because it is made at
+/// the same moment as the entity it drives and lives exactly as long as this
+/// module's idea of a player.
 ///
-/// Everything is [`BodyKind::Static`], so the bodies follow the entities the
-/// game moves rather than the other way round. @ref
-/// [`Body::transform`](colby_core::abi::Body::transform).
+/// Rebuilt on every load rather than only on a fresh arena, which costs four
+/// dozen bytes and means a change to its size or its layers takes effect on the
+/// next save rather than on the next restart.
 fn collide(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (center, ring) = (state.center, state.ring);
 	let player = state.player;
-	let old = [state.floor_body, state.center_body, state.trigger, state.player_body];
-
-	for id in old.into_iter().chain(state.ring_bodies) {
-		world.bodies.despawn(id);
-	}
-
-	// the middle collides against its own triangles, which is the one place
-	// this scene exercises a mesh shape - and it is the shape a prop wants,
-	// because a crystal's box is a poor answer to "did the cursor touch it".
-	let crystal = world
-		.entities
-		.renderable(center)
-		.map_or(CENTER_FALLBACK, |renderable| renderable.mesh);
-
-	// hung under the quad rather than attached to it, @ref [`FLOOR_THICKNESS`].
-	let mut slab = Transform::at(Vec3::new(0.0, FLOOR_Y - FLOOR_THICKNESS, 0.0));
-	slab.scale = Vec3::new(FLOOR_SIZE, 1.0, FLOOR_SIZE);
-	let floor_body = world.bodies.spawn(
-		Body::new(BodyKind::Static, Shape::cuboid(Vec3::new(0.5, FLOOR_THICKNESS, 0.5)), slab)
-			.layered(WORLD_LAYERS),
-	);
-	let center_body = world.attach_body(center, BodyKind::Static, Shape::mesh(crystal));
-	layer(world, center_body, WORLD_LAYERS);
-
-	// a volume that notices and pushes nothing. Static and driving no entity:
-	// there is nothing to draw it as and nothing to move it, and the whole of
-	// what it is for is the list of what is inside it.
-	let trigger = world.bodies.spawn(
-		Body::new(
-			BodyKind::Static,
-			Shape::cuboid(TRIGGER_EXTENTS),
-			Transform::at(TRIGGER_CENTER),
-		)
-		.sensing()
-		.layered(TRIGGER_LAYERS),
-	);
-
-	let mut ring_bodies = [BodyId::NONE; RING];
-	for (slot, id) in ring_bodies.iter_mut().zip(ring) {
-		*slot = world.attach_body(id, BodyKind::Static, Shape::UNIT);
-		layer(world, *slot, WORLD_LAYERS);
-	}
+	world.bodies.despawn(state.player_body);
 
 	// kinematic rather than dynamic: the controller decides where the player
 	// goes, and the solver's job is only to push props out from under it. A
@@ -1570,61 +1535,29 @@ fn collide(world: &mut World) {
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	state.player_body = player_body;
-	state.floor_body = floor_body;
-	state.center_body = center_body;
-	state.ring_bodies = ring_bodies;
-	state.trigger = trigger;
 	// what the ray found is per-load and not worth carrying across one: the
 	// bodies it named are the ones just despawned. Clearing it also means the
 	// first trace of every load says so in the log, which is what makes a live
 	// reload readable.
 	state.picked = EntityId::NONE;
 
-	info!(bodies = world.bodies.len(), "scene given collision");
+	info!(bodies = world.bodies.len(), "the player has a body");
 }
 
-/// Puts every entity of the scene where this frame says it should be.
+/// Draws the rope one of the props hangs from.
 ///
-/// A handle that no longer resolves is skipped rather than treated as an error:
-/// the entity table belongs to the host, and something else is allowed to have
-/// removed one.
-fn place(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (spin, floor, center, ring) = (state.spin, state.floor, state.center, state.ring);
-
-	if let Some(transform) = world.entities.transform_mut(floor) {
-		*transform = Transform {
-			position: Vec3::new(0.0, FLOOR_Y, 0.0),
-			rotation: Quat::IDENTITY,
-			scale: Vec3::new(FLOOR_SIZE, 1.0, FLOOR_SIZE),
-		};
-	}
-
-	// stood on the floor by its own bounding box rather than by a number typed
-	// here. Make the crystal taller in assets/meshes/crystal.obj and it rises to
-	// match instead of sinking through the floor - which is the difference
-	// between an asset the engine knows the shape of and one it merely draws.
-	let rest = world
-		.entities
-		.renderable(center)
-		.map(|renderable| renderable.mesh)
-		.and_then(|mesh| world.meshes.get(mesh))
-		.map_or(0.0, |mesh| -mesh.value().bounds().0.y * CENTER_SCALE);
-
-	if let Some(transform) = world.entities.transform_mut(center) {
-		transform.position = Vec3::new(0.0, FLOOR_Y + rest, 0.0);
-		transform.rotation = Quat::from_rotation_y(-spin * 1.5);
-		transform.set_scale(CENTER_SCALE);
-	}
-
-	// the rope, drawn between its hook and whatever it is holding. Read from the
-	// *body* rather than the entity so that it is exactly where the solver put
-	// it rather than a step behind. This used to be a very thin cube with an
-	// entity of its own, because there was nothing else to draw a line with.
-	// read out of the joint rather than out of a constant, so that moving the
-	// hook in the scene moves the line drawn to it. Read from the *body* rather
-	// than the entity so the far end is where the solver put it rather than a
-	// step behind.
+/// The whole of what used to put a scene where it belongs. Everything else this
+/// function did was the demo turning a ring of cubes, and the map that replaced
+/// it does not move: a `.scene` says where its thirty boxes are, and nothing
+/// writes them again afterwards.
+///
+/// Read out of the *joint* rather than out of a constant, so that moving the
+/// hook in the file moves the line drawn to it, and out of the *body* rather
+/// than the entity, so the far end is where the solver put it rather than a
+/// step behind.
+///
+/// @param world - the joint to read and the table the segments go in
+fn rope_line(world: &mut World) {
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	let (held, hook) = world
 		.joints
@@ -1637,19 +1570,93 @@ fn place(world: &mut World) {
 
 	world.debug.line(hook, end, debug::YELLOW);
 	world.debug.point(hook, HOOK_SIZE, debug::YELLOW);
+}
 
-	for (index, id) in ring.into_iter().enumerate() {
-		let Some(transform) = world.entities.transform_mut(id) else {
-			continue;
-		};
+/// Lays the map out from its scene, throwing away whatever was there.
+///
+/// The map is thirty boxes and a volume, and **not one of their handles is kept
+/// anywhere**: what is standing is found by walking the body table for
+/// [`LAYER_WORLD`], which is what makes a map that grows cost the arena nothing
+/// at all. The two words this does keep are the scene and its revision, which
+/// is only how it knows the file has changed.
+///
+/// @param world - the tables to clear and fill
+fn lay_map(world: &mut World) {
+	// collected first: despawning writes the table being walked. The entity is
+	// taken along because a body whose entity outlives it is a thing drawn with
+	// nothing behind it, and the reverse is a thing traced against with nothing
+	// in front.
+	let standing: Vec<(BodyId, EntityId)> = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| on_layer(body, WORLD_LAYERS))
+		.map(|(id, body)| (id, body.entity))
+		.collect();
 
-		let angle = TAU.mul_add(turn(index, RING), spin);
-		let bob = spin.mul_add(BOB.1, angle).sin() * BOB.0;
-
-		transform.position = Vec3::new(RING_RADIUS * angle.cos(), bob, RING_RADIUS * angle.sin());
-		transform.rotation = Quat::from_rotation_y(angle) * Quat::from_rotation_x(spin);
-		transform.set_scale(0.6);
+	for (body, entity) in &standing {
+		world.bodies.despawn(*body);
+		world.entities.despawn(*entity);
 	}
+
+	let scene = world.scenes.find(MAP_SCENE);
+	let revision = world.scenes.get(scene).map_or(0, Entry::revision);
+	// cloned first: the table is read through `world` and the instantiate
+	// writes through it.
+	let data = world.scenes.data(scene).clone();
+	let put = scene::instantiate(world, &data, Vec3::ZERO);
+	let pit = put.body_named(PIT_BODY);
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.map_scene = scene;
+	state.map_revision = revision;
+	state.pit = pit;
+
+	if !pit.is_some() {
+		warn!(
+			scene = MAP_SCENE,
+			body = PIT_BODY,
+			"the map has no volume to catch what falls off it"
+		);
+	}
+
+	info!(
+		scene = MAP_SCENE,
+		revision,
+		entities = put.entities().count(),
+		replaced = standing.len(),
+		"map laid out"
+	);
+}
+
+/// Lays it out again when its file has changed.
+///
+/// The same six lines the props have, for the same reason and against the same
+/// mechanism: the host recompiles the file, the registry entry is rewritten
+/// under the same name and its revision moves, and this notices. Editing
+/// `construct.scene` therefore rebuilds the map in the running window with no
+/// module reload at all.
+///
+/// @param world - the scene to read and the tables to fill
+fn relay_map(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (scene, was) = (state.map_scene, state.map_revision);
+
+	// re-resolved when it is nothing, for the reason the props' is: a file that
+	// did not exist when the game started is one somebody may be about to
+	// write.
+	if !scene.is_some() {
+		if world.scenes.find(MAP_SCENE).is_some() {
+			lay_map(world);
+		}
+
+		return;
+	}
+
+	if world.scenes.get(scene).map_or(0, Entry::revision) == was {
+		return;
+	}
+
+	lay_map(world);
 }
 
 /// Whether the body driving an entity has gone to sleep.
@@ -1666,52 +1673,42 @@ fn resting(world: &World, entity: EntityId) -> bool {
 
 /// What the pick ray found, as a line of text.
 ///
-/// @param state - the arena, for the handles to compare against
-fn named(state: &State) -> String {
+/// **Read out of the world rather than compared against the arena.** Every
+/// piece of the map is called something in `construct.scene`, `instantiate`
+/// copies those names onto the bodies it creates, and asking the table is
+/// therefore the whole of this - which is what stops a readout being a list of
+/// special cases that has to grow by one line every time the map does.
+///
+/// By body rather than by entity, because a body is what the ray answers with
+/// and not every body draws anything: the volume at the bottom of the hole is
+/// nameable and invisible.
+///
+/// @param world - the tables to ask
+/// @param state - the arena, for what the ray found
+fn named(world: &World, state: &State) -> String {
 	if !state.picked_body.is_some() {
 		return "nothing".to_owned();
 	}
 
 	let distance = state.picked_distance;
 
-	// by body rather than by entity, because the floor has no entity: its slab
-	// hangs below the quad and so cannot follow one. @ref [`FLOOR_THICKNESS`].
-	if state.picked_body == state.floor_body {
-		return format!("floor @ {distance:.1}");
-	}
-
-	if state.picked == state.center {
-		return format!("crystal @ {distance:.1}");
-	}
-
 	if state.picked == state.player {
 		return format!("player @ {distance:.1}");
 	}
 
-	if let Some(index) = state
-		.ring
-		.iter()
-		.position(|&id| id == state.picked)
-	{
-		return format!("cube {index} @ {distance:.1}");
+	// the body first, then the entity it drives: a scene names both, and a body
+	// spawned by this module rather than read out of a file has only the
+	// second. Neither is a fact the arena could have held.
+	let name = match world.bodies.name(state.picked_body) {
+		| "" => world.entities.name(state.picked),
+		| named => named,
+	};
+
+	if name.is_empty() {
+		return format!("something @ {distance:.1}");
 	}
 
-	state
-		.props
-		.iter()
-		.position(|&id| id == state.picked)
-		.map_or_else(
-			|| format!("something @ {distance:.1}"),
-			|index| format!("prop {index} @ {distance:.1}"),
-		)
-}
-
-/// A color for the `index`th cube of the ring, walked around the hue circle.
-fn hue(index: usize) -> Vec3 {
-	let angle = TAU * turn(index, RING);
-	let channel = |offset: f32| (angle + offset).sin().mul_add(0.4, 0.55);
-
-	Vec3::new(channel(0.0), channel(TAU / 3.0), channel(TAU * 2.0 / 3.0))
+	format!("{name} @ {distance:.1}")
 }
 
 /// `index` out of `count`, as a fraction of a full turn.

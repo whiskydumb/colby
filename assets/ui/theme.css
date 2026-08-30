@@ -23,7 +23,7 @@ body {
 	border-radius: 10px;
 	padding: 16px 18px;
 	gap: 10px;
-	width: 300px;
+	width: 360px;
 }
 
 .heading {
@@ -42,18 +42,6 @@ body {
 	font-size: 13px;
 }
 
-.track {
-	height: 8px;
-	background-color: #262d3a;
-	border-radius: 4px;
-}
-
-.fill {
-	height: 8px;
-	background-color: #4c8dff;
-	border-radius: 4px;
-}
-
 .buttons {
 	gap: 10px;
 }
@@ -70,10 +58,11 @@ body {
 	background-color: #3b4757;
 }
 
-/* what the hold button looks like while it is holding, written from hud.lua by
- * putting a second class on the box. A selector here is one class at a time, so
- * this is `.on` rather than `.button.on` -- and it comes after `.button`
- * because two rules of equal weight are settled by which was written last. */
+/* what the cleanup button looks like once it has been used, written from
+ * hud.lua by putting a second class on the box. A selector here is one class at
+ * a time, so this is `.on` rather than `.button.on` -- and it comes after
+ * `.button` because two rules of equal weight are settled by which was written
+ * last. */
 .on {
 	background-color: #f4c02f;
 	color: #12161e;

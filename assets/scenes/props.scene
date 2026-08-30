@@ -1,14 +1,14 @@
 {
 	"entities": [
-		{ "name": "box lower",  "at": [4.20, 0.20, -0.90], "scale": [0.62, 0.62, 0.62],
+		{ "name": "box lower",  "at": [3.00, 0.32, -7.00], "scale": [0.62, 0.62, 0.62],
 		  "mesh": "cube",   "material": "plastic", "color": [0.55, 0.45, 0.35] },
-		{ "name": "box middle", "at": [4.20, 1.05, -0.90], "scale": [0.62, 0.62, 0.62],
+		{ "name": "box middle", "at": [3.00, 0.95, -7.00], "scale": [0.62, 0.62, 0.62],
 		  "mesh": "cube",   "material": "plastic", "color": [0.65, 0.45, 0.35] },
-		{ "name": "box upper",  "at": [4.20, 1.90, -0.90], "scale": [0.62, 0.62, 0.62],
+		{ "name": "box upper",  "at": [3.00, 1.58, -7.00], "scale": [0.62, 0.62, 0.62],
 		  "mesh": "cube",   "material": "plastic", "color": [0.75, 0.45, 0.35] },
-		{ "name": "ball hung",  "at": [5.60, 2.60,  0.60], "scale": [0.70, 0.70, 0.70],
+		{ "name": "ball hung",  "at": [5.20, 2.60, -5.40], "scale": [0.70, 0.70, 0.70],
 		  "mesh": "sphere", "material": "metal",   "color": [0.35, 0.85, 0.85] },
-		{ "name": "ball loose", "at": [5.40, 2.30, -1.50], "scale": [0.52, 0.52, 0.52],
+		{ "name": "ball loose", "at": [5.00, 1.90, -7.60], "scale": [0.52, 0.52, 0.52],
 		  "mesh": "sphere", "material": "metal",   "color": [0.35, 0.95, 0.85] }
 	],
 
@@ -32,6 +32,6 @@
 
 	"joints": [
 		{ "name": "rope", "kind": "rope", "first": "ball hung",
-		  "anchors": [[0, 0, 0], [4.60, 3.20, 0.60]], "length": 1.4 }
+		  "anchors": [[0, 0, 0], [5.20, 4.00, -5.40]], "length": 1.4 }
 	]
 }
