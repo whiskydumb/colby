@@ -431,7 +431,7 @@ pub struct Tie {
 	/// Which occupant of that slot it was.
 	pub generation: u32,
 
-	/// Which of the three it is, as [`JointKind`] in declaration order.
+	/// Which of the four it is, as [`JointKind`] in declaration order.
 	pub kind: u32,
 
 	/// Which entry of the body block it holds, or [`u32::MAX`].
@@ -1112,6 +1112,7 @@ const fn joint_kind(code: u32) -> JointKind {
 	match code {
 		| 1 => JointKind::Weld,
 		| 2 => JointKind::Axis,
+		| 3 => JointKind::Ball,
 		| _ => JointKind::Rope,
 	}
 }
@@ -1122,6 +1123,7 @@ const fn joint_code(kind: JointKind) -> u32 {
 		| JointKind::Rope => 0,
 		| JointKind::Weld => 1,
 		| JointKind::Axis => 2,
+		| JointKind::Ball => 3,
 	}
 }
 
@@ -1545,19 +1547,27 @@ mod tests {
 	fn every_kind_of_body_shape_and_joint_survives() {
 		let kinds = [BodyKind::Static, BodyKind::Kinematic, BodyKind::Dynamic];
 		let shapes = [ShapeKind::Box, ShapeKind::Sphere, ShapeKind::Mesh];
-		let joints = [JointKind::Rope, JointKind::Weld, JointKind::Axis];
+		let joints = [JointKind::Rope, JointKind::Weld, JointKind::Axis, JointKind::Ball];
 
 		for (index, kind) in kinds.into_iter().enumerate() {
 			let mut data = sample();
 			data.solids[0].kind = kind;
 			data.solids[0].shape.kind = shapes[index];
-			data.links[0].kind = joints[index];
 
 			let back = round_trip(&data);
 
 			assert_eq!(back.solids[0].kind, kind, "the body kind survives");
 			assert_eq!(back.solids[0].shape.kind, shapes[index], "and the shape kind");
-			assert_eq!(back.links[0].kind, joints[index], "and the joint kind");
+		}
+
+		// a loop of its own, because there is one more kind of joint than
+		// there are kinds of body and walking the two together would quietly
+		// stop testing the last one.
+		for kind in joints {
+			let mut data = sample();
+			data.links[0].kind = kind;
+
+			assert_eq!(round_trip(&data).links[0].kind, kind, "the joint kind survives");
 		}
 	}
 

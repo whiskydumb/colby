@@ -701,8 +701,8 @@ unsafe fn borrow<'a>(
 mod tests {
 	use colby_core::{
 		abi::{
-			Body, BodyKind, EntityId, Joint, Layers, MeshId, Motion, Moved, Transform, character,
-			scene,
+			Body, BodyKind, EntityId, Joint, JointKind, Layers, MeshId, Motion, Moved, Transform,
+			character, scene,
 		},
 		glam::{Quat, Vec2},
 		time::STEP_SECONDS,
@@ -1422,6 +1422,156 @@ mod tests {
 
 		assert!(spun(Vec3::Y) > 0.5, "about its own axis it turns freely, got {}", spun(Vec3::Y));
 		assert!(spun(Vec3::X) < 0.1, "and about anything else it is held, got {}", spun(Vec3::X));
+	}
+
+	#[test]
+	fn a_ball_joint_turns_every_way_a_hinge_will_not() {
+		let spun = |kind: JointKind, axis: Vec3| {
+			let (mut world, mut simulation) = wired();
+			world.gravity = Vec3::ZERO;
+			let swinging = world.bodies.spawn(
+				Body::dynamic(Shape::UNIT, Transform::at(Vec3::new(1.0, 0.0, 0.0)), 1.0)
+					.moving(Vec3::ZERO, axis * 3.0),
+			);
+			let mut joint =
+				Joint::new(kind, swinging, BodyId::NONE, (Vec3::new(-1.0, 0.0, 0.0), Vec3::ZERO));
+			joint.axis = Vec3::Y;
+
+			world.join(joint);
+			settle(&mut world, &mut simulation, 90);
+
+			world
+				.bodies
+				.get(swinging)
+				.expect("alive")
+				.transform
+				.rotation
+				.angle_between(Quat::IDENTITY)
+		};
+
+		for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+			assert!(
+				spun(JointKind::Ball, axis) > 0.5,
+				"a ball leaves every axis free, and one is held: got {}",
+				spun(JointKind::Ball, axis)
+			);
+			assert!(
+				spun(JointKind::Weld, axis) < 0.1,
+				"while a weld holds all three, and one got away: {}",
+				spun(JointKind::Weld, axis)
+			);
+		}
+
+		assert!(
+			spun(JointKind::Axis, Vec3::X) < 0.1,
+			"and a hinge is the one in between, held about anything but its own axis"
+		);
+	}
+
+	#[test]
+	fn a_ball_joint_holds_its_anchor_through_a_swing_a_weld_would_not_allow() {
+		// the same pendulum twice, and the only difference is the kind. A ball
+		// keeps the anchor on the hook and lets the body swing right over; a
+		// weld keeps the anchor on the hook and holds the body flat. Asking
+		// both is what makes this about the *missing* half rather than about
+		// gravity.
+		let swung = |kind: JointKind| {
+			let (mut world, mut simulation) = wired();
+			let hook = Vec3::new(0.0, 5.0, 0.0);
+			let local = Vec3::new(-0.5, 0.0, 0.0);
+			let swinging =
+				world
+					.bodies
+					.spawn(Body::dynamic(Shape::UNIT, Transform::at(hook - local), 1.0));
+
+			world.join(Joint::new(kind, swinging, BodyId::NONE, (local, hook)));
+
+			let (mut turned, mut strayed) = (0.0_f32, 0.0_f32);
+
+			for _ in 0..600 {
+				settle(&mut world, &mut simulation, 1);
+
+				let now = world
+					.bodies
+					.get(swinging)
+					.expect("alive")
+					.transform;
+
+				turned = turned.max(now.rotation.angle_between(Quat::IDENTITY));
+				strayed = strayed.max(
+					now.matrix()
+						.transform_point3(local)
+						.distance(hook),
+				);
+			}
+
+			(turned, strayed)
+		};
+
+		let (ball_turned, ball_strayed) = swung(JointKind::Ball);
+		let (weld_turned, weld_strayed) = swung(JointKind::Weld);
+
+		assert!(
+			ball_strayed < 0.05,
+			"the anchor is the half a ball keeps, and it left the hook by {ball_strayed}"
+		);
+		assert!(
+			ball_turned > 2.0,
+			"while the body swings right over, and it only reached {ball_turned}"
+		);
+		assert!(weld_turned < 0.1, "where a weld holds it flat, and it reached {weld_turned}");
+		assert!(weld_strayed < 0.05, "keeping its anchor as well");
+	}
+
+	#[test]
+	fn a_chain_on_ball_joints_hangs_without_stretching() {
+		let (mut world, mut simulation) = wired();
+		let hook = Vec3::new(0.0, 5.0, 0.0);
+		let gap = 0.8_f32;
+		let half = Vec3::new(0.0, gap / 2.0, 0.0);
+
+		// balls rather than boxes, and further apart than they are wide, so
+		// that nothing here measures a contact: what is being asked is whether
+		// the joints themselves give under three bodies of load.
+		let mut links: Vec<BodyId> = Vec::new();
+
+		for index in [0.0_f32, 1.0, 2.0] {
+			let at = hook - Vec3::new(0.0, gap.mul_add(0.5, gap * index), 0.0);
+			let body =
+				world
+					.bodies
+					.spawn(Body::dynamic(Shape::ball(0.1), Transform::at(at), 1.0));
+			let above = links.last().copied().unwrap_or(BodyId::NONE);
+
+			world.join(Joint::ball(
+				body,
+				above,
+				(half, if above.is_some() { -half } else { hook }),
+			));
+			links.push(body);
+		}
+
+		settle(&mut world, &mut simulation, 600);
+
+		let places: Vec<Vec3> = links
+			.iter()
+			.map(|&id| placed(&world, id))
+			.collect();
+
+		assert!(
+			(places[0].y - (hook.y - gap / 2.0)).abs() < 0.02,
+			"the top link hangs at half a gap under the hook, got {}",
+			places[0]
+		);
+
+		for pair in places.windows(2) {
+			let apart = pair[0].distance(pair[1]);
+
+			assert!(
+				(apart - gap).abs() < 0.02,
+				"and every link stays a gap from the next rather than stretching, got {apart}"
+			);
+		}
 	}
 
 	#[test]

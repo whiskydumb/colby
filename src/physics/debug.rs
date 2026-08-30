@@ -204,6 +204,7 @@ fn draw_joints(table: &mut debug::Debug, world: &World) {
 			| JointKind::Rope => debug::YELLOW,
 			| JointKind::Weld => debug::ORANGE,
 			| JointKind::Axis => debug::CYAN,
+			| JointKind::Ball => debug::MAGENTA,
 		};
 
 		// a joint whose second body is nothing is pinned to a point in the

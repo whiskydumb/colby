@@ -690,6 +690,10 @@ impl Solver {
 		match joint.kind {
 			| JointKind::Rope =>
 				self.rope(slot, joint, (first, second), (one, other), dt, spring),
+			// a ball is the point half and nothing else, which is why it is
+			// the one kind that reads as an omission rather than as a case.
+			| JointKind::Ball =>
+				self.pinned(slot, joint, (first, second), (one, other), dt, spring),
 			| JointKind::Weld | JointKind::Axis => {
 				self.pinned(slot, joint, (first, second), (one, other), dt, spring);
 				self.aligned(slot, joint, (first, second), dt, spring);

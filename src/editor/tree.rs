@@ -370,6 +370,7 @@ const fn joint_word(kind: JointKind) -> &'static str {
 		| JointKind::Rope => "rope",
 		| JointKind::Weld => "weld",
 		| JointKind::Axis => "hinge",
+		| JointKind::Ball => "ball",
 	}
 }
 

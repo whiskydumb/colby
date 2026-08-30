@@ -465,12 +465,13 @@ fn body_kind(value: Option<&Value>) -> Result<BodyKind> {
 	}
 }
 
-/// Which of the three joints one is.
+/// Which of the four joints one is.
 fn joint_kind(value: Option<&Value>) -> Result<JointKind> {
 	match text(value).as_str() {
 		| "" | "rope" => Ok(JointKind::Rope),
 		| "weld" => Ok(JointKind::Weld),
 		| "axis" => Ok(JointKind::Axis),
+		| "ball" => Ok(JointKind::Ball),
 		| other => Err(err!(Asset("{other} is not a kind of joint"))),
 	}
 }
@@ -1075,6 +1076,7 @@ const fn joint_word(kind: JointKind) -> &'static str {
 		| JointKind::Rope => "rope",
 		| JointKind::Weld => "weld",
 		| JointKind::Axis => "axis",
+		| JointKind::Ball => "ball",
 	}
 }
 
@@ -1477,7 +1479,8 @@ mod tests {
 			"joints": [
 				{ "kind": "rope", "first": "a" },
 				{ "kind": "weld", "first": "a", "second": "b" },
-				{ "kind": "axis", "first": "b", "second": "c", "axis": [1, 0, 0] }
+				{ "kind": "axis", "first": "b", "second": "c", "axis": [1, 0, 0] },
+				{ "kind": "ball", "first": "a", "second": "c" }
 			]
 		}"#;
 		let scene = import(text).expect("a scene");
@@ -1492,7 +1495,19 @@ mod tests {
 
 		assert_eq!(kinds, vec![BodyKind::Static, BodyKind::Kinematic, BodyKind::Dynamic]);
 		assert_eq!(shapes, vec![ShapeKind::Box, ShapeKind::Sphere, ShapeKind::Mesh]);
-		assert_eq!(joints, vec![JointKind::Rope, JointKind::Weld, JointKind::Axis]);
+		assert_eq!(joints, vec![
+			JointKind::Rope,
+			JointKind::Weld,
+			JointKind::Axis,
+			JointKind::Ball
+		]);
+		assert_eq!(
+			import(&export(&scene).expect("it can be written"))
+				.expect("what was written reads back")
+				.links,
+			scene.links,
+			"and every one of those words survives being written out again"
+		);
 		assert!(scene.solids[2].sensor, "and a sensor says so");
 		assert!((scene.solids[1].shape.radius - 2.0).abs() < f32::EPSILON, "with its radius");
 	}

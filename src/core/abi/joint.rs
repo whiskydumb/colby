@@ -1,9 +1,10 @@
 //! Joints: the ways two bodies can be told to stay near each other.
 //!
-//! Three of them, and they are the three a sandbox actually builds with - a
-//! rope that stops two things drifting apart, a weld that stops them moving at
-//! all, and a hinge that leaves one axis free. Everything a physics gun does is
-//! made of those.
+//! Four of them. Three are what a sandbox builds with - a rope that stops two
+//! things drifting apart, a weld that stops them moving at all, and a hinge
+//! that leaves one axis free - and everything a physics gun does is made of
+//! those. The fourth holds two anchors together and lets the bodies turn any
+//! way they like, which is what a limb of a ragdoll hangs off.
 //!
 //! Shaped exactly like [`Bodies`](super::physics::Bodies), for the same
 //! reasons: plain data in the host, a bounded table, a generational handle,
@@ -29,6 +30,9 @@ use crate::{
 pub const MAX_JOINTS: usize = 1024;
 
 /// What a joint does to the two bodies it holds.
+///
+/// **Declaration order is the order a scene file writes them in**, so a new
+/// kind goes on the end rather than in the middle of the list it belongs to.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum JointKind {
@@ -51,6 +55,18 @@ pub enum JointKind {
 	/// Five constraints: the three of a weld's position, and two of its three
 	/// angular ones. The third is [`Joint::axis`] and is left free.
 	Axis,
+
+	/// Holds the anchors together and lets them turn any way at all.
+	///
+	/// Three constraints: a weld's position and none of its angle. It is the
+	/// joint a ragdoll's limbs hang off, and it is deliberately the *simplest*
+	/// one that can be: with nothing stopping a limb turning, a ragdoll made
+	/// of these crumples - an elbow folds the wrong way, a head lies on a
+	/// chest. Every engine checked says the same thing about its own version
+	/// of this, and every one of them ships it as the default all the same,
+	/// because the answer is a limit on the angle rather than a different
+	/// joint. Those limits are not here yet.
+	Ball,
 }
 
 /// A handle to a joint.
@@ -207,9 +223,19 @@ impl Joint {
 		joint
 	}
 
+	/// A ball and socket between two bodies.
+	///
+	/// @param first - one body
+	/// @param second - the other
+	/// @param anchors - where it attaches on each, in that body's own space
+	#[must_use]
+	pub const fn ball(first: BodyId, second: BodyId, anchors: (Vec3, Vec3)) -> Self {
+		Self::new(JointKind::Ball, first, second, anchors)
+	}
+
 	/// A joint of a kind, between two bodies.
 	///
-	/// @param kind - which of the three
+	/// @param kind - which of the four
 	/// @param first - one body
 	/// @param second - the other, or [`BodyId::NONE`] to pin to the world
 	/// @param anchors - where it attaches on each, in that body's own space
@@ -296,6 +322,7 @@ impl Joint {
 			| JointKind::Rope => 1,
 			| JointKind::Weld => 6,
 			| JointKind::Axis => 5,
+			| JointKind::Ball => 3,
 		}
 	}
 }
@@ -665,6 +692,27 @@ mod tests {
 			Joint::axis(none, none, anchors, Vec3::Y).constraints(),
 			5,
 			"a hinge is everything but the one it turns about"
+		);
+		assert_eq!(
+			Joint::ball(none, none, anchors).constraints(),
+			3,
+			"and a ball is a weld with the angle taken out"
+		);
+	}
+
+	#[test]
+	fn a_ball_is_a_weld_with_nothing_said_about_the_angle() {
+		let anchors = (Vec3::X, Vec3::NEG_X);
+		let ball = Joint::ball(BodyId::NONE, BodyId::NONE, anchors);
+		let weld = Joint::weld(BodyId::NONE, BodyId::NONE, anchors);
+
+		assert_eq!(ball.kind, JointKind::Ball, "it is its own kind");
+		assert_eq!(ball.first_anchor, weld.first_anchor, "with a weld's anchors");
+		assert_eq!(ball.second_anchor, weld.second_anchor);
+		assert_eq!(
+			Joint { kind: JointKind::Weld, ..ball },
+			weld,
+			"and nothing else about it differs"
 		);
 	}
 
