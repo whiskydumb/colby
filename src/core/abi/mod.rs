@@ -45,7 +45,10 @@ pub mod texture;
 pub mod ui;
 
 pub use self::{
-	anim::{Channel, ClipData, Interpolation, MAX_KEYS, MAX_TRACKS, Track},
+	anim::{
+		Channel, Clip, ClipData, ClipId, Clips, Interpolation, MAX_KEYS, MAX_TRACKS, NO_BONE,
+		Track,
+	},
 	camera::Camera,
 	character::{Motion, Moved},
 	cvar::{Args, ConsoleFn, Cvars, Value},
@@ -79,7 +82,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 31;
+pub const ABI_VERSION: u32 = 32;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -280,6 +283,15 @@ pub struct World {
 	/// [`model`](crate::abi::model).
 	pub models: Models,
 
+	/// Every animation clip the host has loaded, reached by handle.
+	///
+	/// Filled the same way as `meshes`, from the same tree, and holding no
+	/// skeleton: a clip names the bones it moves with text, so the same walk
+	/// plays on every rig whose bones answer to the same names. What turns
+	/// that text into indices is a table this registry keeps beside its
+	/// entries. @ref [`anim`](crate::abi::anim).
+	pub clips: Clips,
+
 	/// Every skeleton the host has loaded, reached by handle.
 	///
 	/// Filled the same way as `meshes`, from the same tree, and holding no
@@ -379,6 +391,7 @@ impl World {
 			textures: Textures::new(),
 			fonts: Fonts::new(),
 			models: Models::new(),
+			clips: Clips::new(),
 			skeletons: Skeletons::new(),
 			poses: Poses::new(),
 			scenes: Scenes::new(),
@@ -483,6 +496,53 @@ impl World {
 
 		self.poses
 			.skinning(id, self.skeletons.bones(pose.skeleton), self.interpolation, out)
+	}
+
+	/// Plays one clip into a pose, over the skeleton the pose names.
+	///
+	/// The whole of what animating a character costs a game while there is one
+	/// clip to play: a handle, a moment on the game's own clock, and whether
+	/// it starts again at the end. Where the moment comes from is the game's -
+	/// a phase it advances by `dt` and keeps in its own memory - because that
+	/// is the one part of this that is gameplay.
+	///
+	/// Three things happen, in this order, and the order is the whole of the
+	/// contract. The clip's tracks are matched to the skeleton's bones by
+	/// name, once, and kept - @ref [`Clips::bind`]. Every bone is put back
+	/// where the skeleton rests it, so a bone the clip says nothing about
+	/// stands rather than keeping last step's attitude. Then the clip is
+	/// written over that.
+	///
+	/// Resting first is what makes a played pose *complete*, and a complete
+	/// pose is what makes it possible to blend two of them later. The cost is
+	/// that this cannot be called twice to lay one clip over another; laying
+	/// one over another is a blend, and a blend is not two writes.
+	///
+	/// @param pose - the pose to write
+	/// @param clip - what to play into it
+	/// @param time - seconds on the game's own clock
+	/// @param looping - whether the clip starts again rather than holding its
+	/// last key
+	/// @return `false` if the pose handle is stale, in which case nothing was
+	/// written
+	pub fn play(&mut self, pose: PoseId, clip: ClipId, time: f32, looping: bool) -> bool {
+		let Some(skeleton) = self.poses.get(pose).map(|posed| posed.skeleton) else {
+			return false;
+		};
+		let Self { poses, clips, skeletons, .. } = self;
+
+		clips.bind(clip, skeleton, skeletons);
+
+		let Some(posed) = poses.get_mut(pose) else {
+			return false;
+		};
+
+		posed.rest(skeletons.bones(skeleton));
+		clips
+			.data(clip)
+			.sample(time, looping, clips.bones(clip, skeleton), &mut posed.locals);
+
+		true
 	}
 
 	/// Hands the world the queries a solver can answer.

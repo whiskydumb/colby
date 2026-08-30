@@ -26,13 +26,13 @@ use std::{
 };
 
 use colby_asset::{
-	MeshFile, TextureFile, compile, compile::Kind, document::DocumentFile, font::FontFile,
-	model::ModelFile, scene::SceneFile, skeleton::SkeletonFile,
+	MeshFile, TextureFile, anim::ClipFile, compile, compile::Kind, document::DocumentFile,
+	font::FontFile, model::ModelFile, scene::SceneFile, skeleton::SkeletonFile,
 };
 use colby_core::{
 	abi::{
-		DocumentData, FontData, Material, MaterialId, MeshData, MeshId, ModelData, Placement,
-		SceneData, SkeletonData, SkeletonId, TextureData, TextureId, World,
+		ClipData, DocumentData, FontData, Material, MaterialId, MeshData, MeshId, ModelData,
+		Placement, SceneData, SkeletonData, SkeletonId, TextureData, TextureId, World,
 	},
 	debug, info, warn,
 };
@@ -185,6 +185,12 @@ impl Assets {
 		}
 
 		self.forget_missing(world, &present);
+
+		// a clip's tracks are matched to a skeleton's bones by name, and this
+		// pass is the one moment either of them can be rewritten. Without it,
+		// a rig edited to gain a bone leaves every clip playing on it one bone
+		// out - and silently, because every index still resolves to something.
+		world.clips.relink(&world.skeletons);
 	}
 
 	/// Loads one compiled asset if it is new or has moved since it was last
@@ -231,10 +237,7 @@ impl Assets {
 			| Kind::Model => load_model(world, path, &name),
 			| Kind::Scene => load_scene(world, path, &name),
 			| Kind::Skeleton => load_skeleton(world, path, &name),
-			// a clip reaches the world through the pose that plays it, and
-			// nothing plays one yet. It is compiled and left on disk until
-			// something does.
-			| Kind::Clip => (),
+			| Kind::Clip => load_clip(world, path, &name),
 		}
 	}
 
@@ -268,7 +271,7 @@ impl Assets {
 						.skeletons
 						.insert(&name, SkeletonData::default()),
 				),
-				| Kind::Clip => (),
+				| Kind::Clip => drop(world.clips.insert(&name, ClipData::default())),
 			}
 
 			info!(name, ?kind, "asset unloaded; its file is gone");
@@ -532,6 +535,38 @@ fn load_model(world: &mut World, path: &Path, name: &str) {
 	info!(name, slot = id.index(), standing, materials, "model loaded");
 }
 
+/// Reads one `.canim` into the world's clip registry.
+fn load_clip(world: &mut World, path: &Path, name: &str) {
+	let data = match ClipFile::open(path) {
+		| Ok(file) => file.to_clip_data(),
+		| Err(error) => {
+			warn!(%error, "the clip on disk could not be read");
+
+			return;
+		},
+	};
+	let existing = world.clips.find(name);
+
+	if existing.is_some()
+		&& world
+			.clips
+			.get(existing)
+			.is_some_and(|clip| *clip.value() == data)
+	{
+		// as every other loader: a clip whose keys did not move does not need
+		// registering again, and its revision is what the bindings watching it
+		// would otherwise see move for nothing.
+		return;
+	}
+
+	let tracks = data.len();
+	let keys = data.keys();
+	let seconds = data.duration();
+	let id = world.clips.insert(name, data);
+
+	info!(name, slot = id.index(), tracks, keys, seconds, "clip loaded");
+}
+
 /// Reads one `.cskel` into the world's skeleton registry.
 fn load_skeleton(world: &mut World, path: &Path, name: &str) {
 	let data = match SkeletonFile::open(path) {
@@ -621,7 +656,7 @@ fn mtime(path: &Path) -> std::io::Result<SystemTime> { path.metadata()?.modified
 mod tests {
 	use std::{fs, thread::sleep};
 
-	use colby_core::abi::{Mesh, Model, Texture};
+	use colby_core::abi::{Clip, Mesh, Model, Texture};
 
 	use super::*;
 
@@ -968,6 +1003,215 @@ mod tests {
 			world.textures.len(),
 			3,
 			"and the null texture, the white one and the flat normal map"
+		);
+	}
+
+	/// A rig of two bones with one animation over it, and no geometry at all.
+	///
+	/// Written as text with its buffer inside it so that there is one more
+	/// binary fixture than there needs to be, which is none. The buffer is
+	/// three key times and then three turns.
+	const MOVES: &str = r#"{
+		"asset": { "version": "2.0" },
+		"buffers": [{ "byteLength": 60, "uri": "data:application/octet-stream;base64,AAAAAAAAgD8AAABAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAA8wQ1P/MENT8AAAAAAAAAAAAAAAAAAIA/" }],
+		"bufferViews": [
+			{ "buffer": 0, "byteOffset": 0, "byteLength": 12 },
+			{ "buffer": 0, "byteOffset": 12, "byteLength": 48 }
+		],
+		"accessors": [
+			{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "SCALAR" },
+			{ "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC4" }
+		],
+		"nodes": [
+			{ "name": "hips", "children": [1] },
+			{ "name": "spine" }
+		],
+		"skins": [{ "name": "rig", "joints": [0, 1] }],
+		"animations": [{
+			"name": "walk",
+			"samplers": [{ "input": 0, "output": 1, "interpolation": "LINEAR" }],
+			"channels": [{ "sampler": 0, "target": { "node": 1, "path": "rotation" } }]
+		}]
+	}"#;
+
+	/// The world after a fixture tree holding one animated rig is compiled.
+	fn with_moves(name: &str) -> (World, Assets) {
+		let (source, output) = trees(name);
+
+		put(&source, "models/moves.gltf", MOVES);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source, output);
+
+		assets.sync(&mut world);
+
+		(world, assets)
+	}
+
+	#[test]
+	fn a_clip_beside_a_model_reaches_the_registry_with_its_keys() {
+		let (world, _) = with_moves("clip-load");
+		let id = world.clips.find("models/moves/walk");
+
+		assert!(id.is_some(), "the clip reached the registry under the model's own name");
+
+		let clip = world.clips.data(id);
+
+		assert_eq!(clip.len(), 1, "one channel, one track");
+		assert_eq!(clip.tracks[0].bone, "spine", "naming the bone the skin named");
+		assert_eq!(clip.tracks[0].keys(), 3, "three keys");
+		assert!((clip.duration() - 2.0).abs() < 1.0e-6, "running two seconds");
+	}
+
+	#[test]
+	fn a_clip_binds_to_the_skeleton_that_was_written_beside_it() {
+		let (mut world, _) = with_moves("clip-bind");
+		let clip = world.clips.find("models/moves/walk");
+		let skeleton = world.skeletons.find("models/moves/rig");
+
+		assert!(skeleton.is_some(), "the rig reached the registry too");
+
+		world.clips.bind(clip, skeleton, &world.skeletons);
+
+		assert_eq!(
+			world.clips.bones(clip, skeleton),
+			&[1],
+			"the track lands on the spine, which is the second bone of the rig"
+		);
+	}
+
+	#[test]
+	fn a_binding_survives_another_pass_over_a_tree_that_did_not_change() {
+		// the relink at the end of every pass is what keeps a binding honest
+		// when a rig is recompiled, and what it must not do is throw one away
+		// because nothing happened.
+		let (mut world, mut assets) = with_moves("clip-relink");
+		let clip = world.clips.find("models/moves/walk");
+		let skeleton = world.skeletons.find("models/moves/rig");
+
+		world.clips.bind(clip, skeleton, &world.skeletons);
+		assets.sync(&mut world);
+
+		assert_eq!(world.clips.bindings(), 1, "the binding is still the one binding");
+		assert_eq!(world.clips.bones(clip, skeleton), &[1], "and still points at the spine");
+	}
+
+	#[test]
+	fn deleting_a_clip_leaves_its_handle_resolving_to_an_animation_of_nothing() {
+		let (source, output) = trees("clip-delete");
+
+		put(&source, "models/moves.gltf", MOVES);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+
+		assets.sync(&mut world);
+
+		let id = world.clips.find("models/moves/walk");
+
+		assert!(!world.clips.data(id).is_empty(), "there is a clip there to begin with");
+
+		fs::remove_file(source.join("models").join("moves.gltf")).expect("it is deleted");
+		assets.sync(&mut world);
+
+		assert_eq!(world.clips.find("models/moves/walk"), id, "the handle still resolves");
+		assert!(
+			world.clips.data(id).is_empty(),
+			"and plays nothing, which is the honest picture of a clip that is gone"
+		);
+	}
+
+	/// The same rig with a bone above it, so every bone below is renumbered.
+	const MOVES_TALLER: &str = r#"{
+		"asset": { "version": "2.0" },
+		"buffers": [{ "byteLength": 60, "uri": "data:application/octet-stream;base64,AAAAAAAAgD8AAABAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAA8wQ1P/MENT8AAAAAAAAAAAAAAAAAAIA/" }],
+		"bufferViews": [
+			{ "buffer": 0, "byteOffset": 0, "byteLength": 12 },
+			{ "buffer": 0, "byteOffset": 12, "byteLength": 48 }
+		],
+		"accessors": [
+			{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "SCALAR" },
+			{ "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC4" }
+		],
+		"nodes": [
+			{ "name": "hips", "children": [1] },
+			{ "name": "spine" },
+			{ "name": "root", "children": [0] }
+		],
+		"skins": [{ "name": "rig", "joints": [0, 1, 2] }],
+		"animations": [{
+			"name": "walk",
+			"samplers": [{ "input": 0, "output": 1, "interpolation": "LINEAR" }],
+			"channels": [{ "sampler": 0, "target": { "node": 1, "path": "rotation" } }]
+		}]
+	}"#;
+
+	#[test]
+	fn a_rig_that_gained_a_bone_moves_every_binding_on_it_by_the_next_pass() {
+		// the whole reason the pass relinks. Nothing tells a binding that the
+		// rig under it was recompiled, and every index it holds still resolves
+		// to a bone - just not the one whose name the track carries.
+		let (source, output) = trees("relink-grown");
+
+		put(&source, "models/moves.gltf", MOVES);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+
+		assets.sync(&mut world);
+
+		let clip = world.clips.find("models/moves/walk");
+		let skeleton = world.skeletons.find("models/moves/rig");
+
+		world.clips.bind(clip, skeleton, &world.skeletons);
+
+		assert_eq!(world.clips.bones(clip, skeleton), &[1], "the spine, second of two");
+
+		// the mtime rule is `newer than`, and the two writes are microseconds
+		// apart on a filesystem with finer resolution than that.
+		sleep(Duration::from_millis(20));
+		put(&source, "models/moves.gltf", MOVES_TALLER);
+		assets.sync(&mut world);
+
+		assert_eq!(
+			world.skeletons.bones(skeleton).len(),
+			3,
+			"the rig was recompiled into the entry the handle already pointed at"
+		);
+		assert_eq!(
+			world.clips.bones(clip, skeleton),
+			&[2],
+			"and the binding moved with the name, rather than staying on the bone that index \
+			 now means"
+		);
+	}
+
+	#[test]
+	fn rewriting_a_clip_source_without_changing_it_does_not_move_its_revision() {
+		// what the revision is for: a binding is worked out again when it
+		// moves, so moving it for a file whose keys are identical is work
+		// nobody asked for on every save of an unrelated part of the model.
+		let (source, output) = trees("clip-quiet");
+
+		put(&source, "models/moves.gltf", MOVES);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+
+		assets.sync(&mut world);
+
+		let id = world.clips.find("models/moves/walk");
+
+		assert_eq!(world.clips.get(id).map(Clip::revision), Some(0), "loaded once");
+
+		sleep(Duration::from_millis(20));
+		put(&source, "models/moves.gltf", MOVES);
+		assets.sync(&mut world);
+
+		assert_eq!(
+			world.clips.get(id).map(Clip::revision),
+			Some(0),
+			"and read again without being registered again, because nothing in it changed"
 		);
 	}
 
