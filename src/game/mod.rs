@@ -19,10 +19,11 @@
 
 use colby_core::{
 	abi::{
-		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, Joint,
-		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, Node, PanelId, Pose, PoseId,
-		Renderable, SceneData, SceneId, Shape, ShapeKind, SkeletonId, Stage, TouchKind,
-		TraceInfo, Transform, Tree, World, character, console, debug, scene,
+		ABI_VERSION, Args, Body, BodyId, BodyKind, Build, Button, EntityId, Entry, GameApi,
+		Joint, JointId, Key, Layers, Material, MaterialId, MeshId, Motion, Node, PanelId, Pose,
+		PoseId, Ragdoll, Renderable, SceneData, SceneId, Segment, Shape, ShapeKind, SkeletonId,
+		Stage, TouchKind, TraceInfo, Transform, Tree, World, character, console, debug, ragdoll,
+		scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -191,6 +192,69 @@ const WALK_SPEED: f32 = 1.4;
 /// the weight.
 const WALK_FLOOR: f32 = 0.1;
 
+/// How many limbs the character's ragdoll is made of.
+///
+/// Thirteen, which is what the wizard everybody copies asks for and what the
+/// blockout's own skeleton supports: a pelvis, a chest, a head, an upper and a
+/// lower arm each side, and a thigh, a shin and a foot each side.
+const RAGDOLL_PARTS: usize = 13;
+
+/// The limbs, named by the bones each one runs between.
+///
+/// Text rather than a rule over the skeleton, and that was measured rather
+/// than preferred: on this rig the obvious rule makes a limb out of a utility
+/// bone pointing backwards from the hips, a limb of no length between the root
+/// and the pelvis, and nothing at all where the hands are. @ref
+/// [`ragdoll`](colby_core::abi::ragdoll) for the whole argument.
+///
+/// **The order here is not the order they come out in.** A plan sorts its
+/// parts by bone so that a parent is always earlier than its children, and
+/// [`State::limbs`] is written in *that* order. Editing this table therefore
+/// moves what the arena means, which is what [`STATE_LAYOUT`] is for.
+const CHARACTER_LIMBS: [Segment<'static>; RAGDOLL_PARTS] = [
+	Segment::new("bip001-pelvis", "bip001-spine1"),
+	Segment::new("bip001-spine1", "bip001-neck"),
+	Segment::new("bip001-head", "bip001-headnub"),
+	Segment::new("bip001-l-upperarm", "bip001-l-forearm"),
+	Segment::new("bip001-l-forearm", "bip001-l-hand"),
+	Segment::new("bip001-r-upperarm", "bip001-r-forearm"),
+	Segment::new("bip001-r-forearm", "bip001-r-hand"),
+	// the two thighs and the two shins carry their own thickness rather than
+	// taking it from their length, and the number is measured: at the ratio
+	// below a thigh is 0.103 half-wide and the hips are 0.096 apart, so the
+	// two boxes cross the middle line and spend the simulation shoving each
+	// other. No joint holds that pair, so nothing else would have stopped it.
+	Segment::thick("bip001-l-thigh", "bip001-l-calf", LEG_GIRTH),
+	Segment::thick("bip001-l-calf", "bip001-l-foot", LEG_GIRTH),
+	Segment::new("bip001-l-foot", "bip001-l-toe0"),
+	Segment::thick("bip001-r-thigh", "bip001-r-calf", LEG_GIRTH),
+	Segment::thick("bip001-r-calf", "bip001-r-foot", LEG_GIRTH),
+	Segment::new("bip001-r-foot", "bip001-r-toe0"),
+];
+
+/// How thick a leg is, as a half-extent. @ref [`CHARACTER_LIMBS`].
+const LEG_GIRTH: f32 = 0.085;
+
+/// The whole-ragdoll numbers.
+///
+/// The mass is by eye against the props, which are a kilogram each: a
+/// character that is much lighter is thrown about by a crate and one that is
+/// much heavier cannot be shoved at all. The thickness is a share of a limb's
+/// own length and is what everything but the legs takes.
+const RAGDOLL: Build = Build { mass: 8.0, girth: 0.3 };
+
+/// The layer the character's limbs are on.
+///
+/// Their own rather than the props', because a limb is not a prop: the
+/// cleanup sweeps props by layer and would take the character's arms with it.
+/// They collide with everything, including each other, and the pairs that
+/// would otherwise fight - a thigh against the shin below it - are the pairs a
+/// joint holds, which no longer collide at all.
+const LAYER_RAGDOLL: u32 = 3;
+
+/// What a limb is.
+const RAGDOLL_LAYERS: Layers = Layers::single(LAYER_RAGDOLL);
+
 /// How many pieces of it the demo has room for.
 ///
 /// One material is one piece. Two would be two entities sharing one pose,
@@ -314,7 +378,10 @@ const PROP_LAYERS: Layers = Layers::single(LAYER_PROP);
 /// What the player is, and what it walks into.
 const PLAYER_LAYERS: Layers = Layers::new(
 	Layers::bit(LAYER_PLAYER),
-	Layers::bit(LAYER_WORLD) | Layers::bit(LAYER_PROP) | Layers::bit(LAYER_PLAYER),
+	Layers::bit(LAYER_WORLD)
+		| Layers::bit(LAYER_PROP)
+		| Layers::bit(LAYER_PLAYER)
+		| Layers::bit(LAYER_RAGDOLL),
 );
 
 /// What the map calls the volume at the bottom of its hole.
@@ -622,6 +689,26 @@ struct State {
 	/// What weight `game.blend` pinned, or [`BLEND_FREE`].
 	blend_pinned: f32,
 
+	/// The bodies of the character's ragdoll, one a limb.
+	///
+	/// In the order a plan hands them back, which is by bone and therefore
+	/// parents first. @ref [`CHARACTER_LIMBS`].
+	limbs: [BodyId; RAGDOLL_PARTS],
+
+	/// The ball joints holding those together, one a limb.
+	///
+	/// A limb with nothing above it has [`JointId::NONE`] here. Kept so that
+	/// breaking a ragdoll apart is possible without walking the joint table
+	/// looking for the ones that name a limb.
+	limb_joints: [JointId; RAGDOLL_PARTS],
+
+	/// Whether the bodies are writing the bones rather than the other way
+	/// round.
+	///
+	/// A word rather than a `bool` because the arena is `Pod` and a `bool`
+	/// with a bit pattern other than zero or one is the one thing that is not.
+	limp: u32,
+
 	/// The bones every one of those pieces is moved by.
 	///
 	/// One pose for the whole character rather than one per piece, which is
@@ -636,7 +723,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 18;
+const STATE_LAYOUT: u64 = 19;
 
 /// The module's single exported symbol.
 ///
@@ -729,6 +816,14 @@ fn register_commands(world: &mut World) {
 		keep_one,
 		"keep what is held or aimed at as a prop called <name>, joints and all",
 	);
+	world.cvars.command(
+		"game.ragdoll",
+		go_limp,
+		"let the character fall over, shoved at <speed> the way it faces",
+	);
+	world
+		.cvars
+		.command("game.stand", stand_up, "put the character back on its feet");
 }
 
 /// Runs once each time this module is swapped in.
@@ -835,11 +930,7 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 
 	interface(world);
 
-	// the character paces whatever is going on: it is scenery that walks, and
-	// the speed it is going is what mixes its two clips.
-	let speed = pace_character(world);
-
-	animate_character(world, speed);
+	carry_character(world);
 
 	// a click that landed on the interface is not also a click on the world.
 	// The host applies the same rule between the editor and the game; this is
@@ -2822,6 +2913,242 @@ fn stand_character(world: &mut World) {
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	state.character_pose = pose;
+
+	rig_character(world);
+}
+
+/// Where the character stands, which is the transform its entities wear.
+///
+/// Read off the entity rather than worked out again, because that is the
+/// matrix the renderer puts the model at and a ragdoll that used a second
+/// answer would put the bodies somewhere the character is not.
+///
+/// @param world - the tables to read
+fn character_stance(world: &mut World) -> Transform {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let slot = state.character[0];
+
+	world
+		.entities
+		.transform(slot)
+		.copied()
+		.unwrap_or(Transform::at(CHARACTER_AT))
+}
+
+/// The character's ragdoll: the layout worked out again, with this world's
+/// bodies in it.
+///
+/// Rebuilt every step rather than kept, exactly as the blend tree is and for
+/// the same reason: what a game can hold between two steps is its arena, and
+/// an arena is bytes. What the arena holds is the thirteen handles, and the
+/// plan they are put back into is deterministic, so the two always line up.
+///
+/// @param world - the tables to read
+/// @return the layout, or an empty one if the character has no pose
+fn character_ragdoll(world: &mut World) -> Ragdoll {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (pose, limbs) = (state.character_pose, state.limbs);
+	let Some(skeleton) = world.poses.get(pose).map(|posed| posed.skeleton) else {
+		return Ragdoll::default();
+	};
+	let mut plan = ragdoll::plan(world.skeletons.bones(skeleton), &CHARACTER_LIMBS, RAGDOLL);
+
+	for (part, body) in plan.parts.iter_mut().zip(limbs) {
+		part.body = body;
+	}
+
+	plan
+}
+
+/// Gives the character a body for every limb and a ball joint between each and
+/// the one above it.
+///
+/// Called from [`stand_character`], so it runs on every load and does its work
+/// once: the bodies live in the host's table and survive a module swap, and
+/// spawning them again each reload would leak thirteen slots a load.
+///
+/// The bodies are put where the pose has them *before* the joints are made, so
+/// every joint is created already satisfied and nothing yanks on the first
+/// step. They are [`BodyKind::Kinematic`] to begin with, which in this engine
+/// means the solver leaves their transform alone - so the animation carries
+/// them, and they shove whatever the character walks into all the same.
+///
+/// @param world - the tables to fill
+fn rig_character(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let pose = state.character_pose;
+
+	if world.bodies.alive(state.limbs[0]) {
+		return;
+	}
+
+	let Some(skeleton) = world.poses.get(pose).map(|posed| posed.skeleton) else {
+		return;
+	};
+	let mut plan = ragdoll::plan(world.skeletons.bones(skeleton), &CHARACTER_LIMBS, RAGDOLL);
+
+	if plan.dropped() > 0 {
+		warn!(
+			model = CHARACTER_MODEL,
+			dropped = plan.dropped(),
+			"the ragdoll is missing limbs the skeleton has no bones for"
+		);
+	}
+
+	// copied out because naming a body borrows the body table, and the names
+	// are still inside the skeleton.
+	let named: Vec<String> = plan
+		.parts
+		.iter()
+		.map(|part| {
+			world
+				.skeletons
+				.bones(skeleton)
+				.get(usize::from(part.bone))
+				.map_or_else(String::new, |bone| bone.name.clone())
+		})
+		.collect();
+
+	for (part, name) in plan.parts.iter_mut().zip(&named) {
+		let mut limb =
+			Body::dynamic(part.shape, Transform::IDENTITY, part.mass).layered(RAGDOLL_LAYERS);
+		limb.kind = BodyKind::Kinematic;
+		part.body = world.bodies.spawn(limb);
+		world.bodies.set_name(part.body, name);
+	}
+
+	let stance = character_stance(world);
+	world.pull_ragdoll(pose, stance, &plan);
+
+	let mut joints = [JointId::NONE; RAGDOLL_PARTS];
+	let mut limbs = [BodyId::NONE; RAGDOLL_PARTS];
+
+	for (index, part) in plan.parts.iter().enumerate() {
+		limbs[index] = part.body;
+
+		// a root has no part above it, and `NO_PART` is past the end of the
+		// list rather than a case of its own.
+		let Some(above) = plan.parts.get(usize::from(part.parent)) else {
+			continue;
+		};
+
+		joints[index] =
+			world.join(Joint::ball(part.body, above.body, (part.anchor, part.parent_anchor)));
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.limbs = limbs;
+	state.limb_joints = joints;
+
+	info!(model = CHARACTER_MODEL, limbs = plan.len(), "the character is rigged");
+}
+
+/// Moves the character's bones, whichever way round they are being moved.
+///
+/// The one place the two directions are chosen between. On its feet the
+/// animation writes the pose and the bodies are carried along with it; once it
+/// is down the bodies write the pose instead and nothing paces.
+///
+/// @param world - the tables to read and write
+fn carry_character(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (pose, limp) = (state.character_pose, state.limp != 0);
+	let plan = character_ragdoll(world);
+	let stance = character_stance(world);
+
+	if limp {
+		world.push_ragdoll(pose, stance, &plan);
+
+		return;
+	}
+
+	// the character paces whatever else is going on: it is scenery that walks,
+	// and the speed it is going is what mixes its two clips.
+	let speed = pace_character(world);
+
+	animate_character(world, speed);
+	world.pull_ragdoll(pose, stance, &plan);
+}
+
+/// `game.ragdoll [speed]` - let the character fall over.
+///
+/// Every limb becomes [`BodyKind::Dynamic`] and the pose starts being written
+/// from wherever they end up. There is no seam to hide: the bodies were
+/// already exactly where the character was, because the animation had been
+/// carrying them there every step.
+///
+/// The optional speed is a shove along the way it is facing, which is the only
+/// way to knock it over without a mouse.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn go_limp(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let shove = unsafe { &*args }.float(0).unwrap_or(0.0);
+	let stance = character_stance(world);
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+	if state.limp != 0 {
+		info!("the character is already down");
+
+		return;
+	}
+
+	state.limp = 1;
+
+	let limbs = state.limbs;
+	// the model faces +z, measured off its own rest pose rather than guessed.
+	let push = stance.rotation * Vec3::Z * shove;
+
+	for id in limbs {
+		if let Some(limb) = world.bodies.get_mut(id) {
+			limb.kind = BodyKind::Dynamic;
+			limb.sleeping = false;
+			limb.velocity = push;
+			limb.angular = Vec3::ZERO;
+		}
+	}
+
+	info!(shove, "the character goes limp");
+}
+
+/// `game.stand` - put the character back on its feet.
+///
+/// The limbs go back to being carried, and this direction *is* a
+/// discontinuity: the bones jump from where they fell to wherever the walk
+/// puts them. So the pose is snapped, which is deferred until the end of the
+/// step and therefore right whichever side of the step this was typed on.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn stand_up(world: *mut World, _args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (limbs, pose) = (state.limbs, state.character_pose);
+
+	if state.limp == 0 {
+		info!("the character is already on its feet");
+
+		return;
+	}
+
+	state.limp = 0;
+
+	for id in limbs {
+		if let Some(limb) = world.bodies.get_mut(id) {
+			limb.kind = BodyKind::Kinematic;
+			limb.velocity = Vec3::ZERO;
+			limb.angular = Vec3::ZERO;
+		}
+	}
+
+	world.poses.snap(pose);
+	info!("the character stands up");
 }
 
 /// Stands the model in the corner of the scene.
@@ -3103,13 +3430,24 @@ fn collide(world: &mut World) {
 /// second body is nothing is pinned to a point, and its second anchor is that
 /// point rather than a place on something.
 ///
+/// **A ragdoll's own joints are left out**, and the layer is what says so
+/// rather than a list of handles. What this exists to show is what somebody
+/// built with the toolgun; the twelve inside a character are that character's
+/// skeleton, and drawn they are a dozen yellow specks over its chest.
+///
 /// @param world - the joints to read and the table the segments go in
 fn draw_joints(world: &mut World) {
 	let held: Vec<(Vec3, Vec3)> = world
 		.joints
 		.iter()
 		.filter_map(|(_, joint)| {
-			let one = world.bodies.get(joint.first)?.transform;
+			let solid = world.bodies.get(joint.first)?;
+
+			if on_layer(solid, RAGDOLL_LAYERS) {
+				return None;
+			}
+
+			let one = solid.transform;
 			let far = world
 				.bodies
 				.get(joint.second)
