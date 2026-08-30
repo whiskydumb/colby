@@ -20,9 +20,9 @@
 use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Button, EntityId, Entry, GameApi, Joint,
-		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Renderable,
-		SceneData, SceneId, Shape, ShapeKind, Stage, TouchKind, TraceInfo, Transform, World,
-		character, console, debug, scene,
+		JointId, Key, Layers, Material, MaterialId, MeshId, Motion, PanelId, Pose, PoseId,
+		Renderable, SceneData, SceneId, Shape, ShapeKind, SkeletonId, Stage, TouchKind,
+		TraceInfo, Transform, World, character, console, debug, scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -149,6 +149,24 @@ const LAMP_AT: Vec3 = Vec3::new(-6.0, 0.0, -1.0);
 
 /// How much of the model's own size it is drawn at.
 const LAMP_SCALE: f32 = 1.6;
+
+/// The model the scene stands beside the map, moved by bones.
+///
+/// A whole character reached by one name: geometry with a skin block, a
+/// skeleton beside it, and a placement that names both. What the game does
+/// with it is the loop below, which is the lamp's loop plus one line - the
+/// pose - and that is the whole of what a character costs a game.
+const CHARACTER_MODEL: &str = "models/citizen";
+
+/// Where it stands.
+const CHARACTER_AT: Vec3 = Vec3::new(0.2, 0.0, -8.2);
+
+/// How many pieces of it the demo has room for.
+///
+/// One material is one piece. Two would be two entities sharing one pose,
+/// which is the arrangement the pose table exists for; the blockout has one
+/// and the reservation is what a second would need.
+const CHARACTER_PIECES: usize = 2;
 
 /// How many of a model's pieces the demo has room for.
 ///
@@ -555,6 +573,17 @@ struct State {
 	/// Spawned once and never moved, so it is the one thing in this scene the
 	/// editor can drag and have it stay put.
 	lamp: [EntityId; LAMP_PIECES],
+
+	/// One entity per piece of the character standing beside the map.
+	character: [EntityId; CHARACTER_PIECES],
+
+	/// The bones every one of those pieces is moved by.
+	///
+	/// One pose for the whole character rather than one per piece, which is
+	/// what the pose table is for: a model of two materials is two entities
+	/// wearing one attitude, and two poses would be two attitudes drifting
+	/// apart.
+	character_pose: PoseId,
 }
 
 /// The version of [`State`]'s layout. Bump it whenever the struct changes.
@@ -562,7 +591,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 16;
+const STATE_LAYOUT: u64 = 17;
 
 /// The module's single exported symbol.
 ///
@@ -616,6 +645,17 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		for slot in &mut state.lamp {
 			*slot = world.entities.spawn();
 		}
+
+		for slot in &mut state.character {
+			*slot = world.entities.spawn();
+		}
+
+		// the pose table is the host's and survives a reload, but the handle
+		// into it was in the arena that was just zeroed - so whatever was
+		// there is orphaned and a new one is made. Emptying the table first is
+		// the same argument the entities above are cleared for.
+		world.poses.clear();
+		state.character_pose = PoseId::NONE;
 		// spawned where it stands and at the size it is, because nothing writes
 		// the player's transform afterwards except the controller, which only
 		// ever moves it. `place` deliberately leaves it alone.
@@ -2462,6 +2502,85 @@ unsafe extern "C-unwind" fn shutdown(world: *mut World) {
 	info!(steps = world.steps, entities = world.entities.len(), "game shutdown");
 }
 
+/// Stands the character beside the map, in the shape it was modeled in.
+///
+/// The lamp's loop plus one line, and the line is the whole of what a
+/// character costs a game: a placement that names a skeleton gets a pose made
+/// from it, and every piece of the model wears that one pose. Where the bones
+/// go after that is nobody's business here - a resting pose is the model
+/// standing as it was drawn, which is the honest thing to show before there
+/// is an animation to play.
+///
+/// Read on every load like [`stand_model`], and for the same reason. The pose
+/// is made only when there is not one already: it lives in the host's table
+/// and survives a swap, so remaking it every load would leak a slot a
+/// reload.
+fn stand_character(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let slots = state.character;
+	let mut pose = state.character_pose;
+	let id = world.models.find(CHARACTER_MODEL);
+	let standing = world.models.placements(id).len();
+
+	// copied out for the reason the lamp's are: placing them writes the entity
+	// table, which cannot be done while the model is borrowed.
+	let pieces: Vec<(MeshId, MaterialId, SkeletonId, Transform)> = world
+		.models
+		.placements(id)
+		.iter()
+		.take(CHARACTER_PIECES)
+		.map(|placement| {
+			(placement.mesh, placement.material, placement.skeleton, placement.transform)
+		})
+		.collect();
+
+	if standing > CHARACTER_PIECES {
+		warn!(
+			model = CHARACTER_MODEL,
+			standing,
+			room = CHARACTER_PIECES,
+			"the character has more pieces than the scene reserved room for"
+		);
+	}
+
+	let skeleton = pieces
+		.iter()
+		.map(|(_, _, skeleton, _)| *skeleton)
+		.find(|skeleton| skeleton.is_some())
+		.unwrap_or(SkeletonId::NONE);
+
+	if !world.poses.alive(pose) && skeleton.is_some() {
+		let bones = world.skeletons.bones(skeleton);
+
+		pose = world.poses.spawn(Pose::resting(skeleton, bones));
+
+		info!(model = CHARACTER_MODEL, bones = bones.len(), "the character is posed");
+	}
+
+	for (slot, (mesh, material, _, transform)) in slots.into_iter().zip(&pieces) {
+		let mut stance = *transform;
+		stance.position += CHARACTER_AT;
+
+		if let Some(placed) = world.entities.transform_mut(slot) {
+			*placed = stance;
+		}
+
+		world.entities.snap(slot);
+		world
+			.entities
+			.set_renderable(slot, Renderable::of(*mesh, *material, Vec3::ONE).posed(pose));
+	}
+
+	for slot in slots.into_iter().skip(pieces.len()) {
+		world
+			.entities
+			.set_renderable(slot, Renderable::NOTHING);
+	}
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.character_pose = pose;
+}
+
 /// Stands the model in the corner of the scene.
 ///
 /// The whole of what a game does with a model, and it is deliberately a loop
@@ -2584,6 +2703,7 @@ fn dress(world: &mut World) {
 		.set_renderable(player, Renderable::of(MeshId::CUBE, plastic, PLAYER_COLOR));
 
 	stand_model(world);
+	stand_character(world);
 }
 
 /// Lays the props out from their scene, throwing away whatever was there.
