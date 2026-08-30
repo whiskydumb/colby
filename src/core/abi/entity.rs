@@ -110,6 +110,23 @@ impl Transform {
 	#[must_use]
 	pub const fn at(position: Vec3) -> Self { Self { position, ..Self::IDENTITY } }
 
+	/// The transform a model matrix stands for.
+	///
+	/// The other way round from [`matrix`](Self::matrix), and the pair is only
+	/// exact for a matrix that really is a translation, a rotation and a
+	/// scale. **A chain of those is not always one of them**: a non-uniform
+	/// scale with a rotation under it shears, and a shear has no rotation to
+	/// recover, so what comes back is the nearest thing that is not a shear.
+	/// Every skeleton in this project scales uniformly or not at all.
+	///
+	/// @param matrix - what to read apart
+	#[must_use]
+	pub fn from_matrix(matrix: Mat4) -> Self {
+		let (scale, rotation, position) = matrix.to_scale_rotation_translation();
+
+		Self { position, rotation, scale }
+	}
+
 	/// The model matrix this transform stands for.
 	#[must_use]
 	pub fn matrix(&self) -> Mat4 {
@@ -694,7 +711,7 @@ impl Default for Entities {
 
 #[cfg(test)]
 mod tests {
-	use std::f32::consts::{FRAC_PI_6, TAU};
+	use std::f32::consts::{FRAC_PI_2, FRAC_PI_6, TAU};
 
 	use super::*;
 
@@ -1154,5 +1171,59 @@ mod tests {
 		);
 		assert!(entities.set_name(put[0], "barrel"), "and the slot is there to be written");
 		assert_eq!(entities.name(put[0]), "barrel");
+	}
+
+	/// Whether two rotations do the same thing to the three axes.
+	fn turns(one: Quat, other: Quat, within: f32) -> bool {
+		[Vec3::X, Vec3::Y, Vec3::Z]
+			.into_iter()
+			.all(|axis| (one * axis).abs_diff_eq(other * axis, within))
+	}
+
+	#[test]
+	fn a_transform_read_out_of_its_own_matrix_is_the_transform_again() {
+		let there = Transform {
+			position: Vec3::new(1.5, -2.0, 0.25),
+			rotation: Quat::from_rotation_y(0.9) * Quat::from_rotation_x(-0.4),
+			scale: Vec3::splat(2.0),
+		};
+		let back = Transform::from_matrix(there.matrix());
+
+		assert!(back.position.abs_diff_eq(there.position, 1e-5), "the place comes back");
+		// what the rotation *does*, rather than `angle_between`. Near zero that
+		// function is a square root of the error, so two quaternions one f32
+		// step apart come out about seven ten-thousandths of a radian apart
+		// and any tolerance tight enough to mean something fails.
+		assert!(
+			turns(back.rotation, there.rotation, 1e-5),
+			"and the turn, got {} against {}",
+			back.rotation,
+			there.rotation
+		);
+		assert!(back.scale.abs_diff_eq(there.scale, 1e-5), "and the size");
+	}
+
+	#[test]
+	fn a_matrix_of_two_transforms_reads_apart_as_the_pair_composed() {
+		// what a ragdoll actually does with this: a body's place in the world is
+		// two matrices multiplied and then read back out as one transform.
+		let outer = Transform {
+			position: Vec3::new(0.0, 3.0, 0.0),
+			rotation: Quat::from_rotation_z(FRAC_PI_2),
+			scale: Vec3::ONE,
+		};
+		let inner = Transform::at(Vec3::X);
+		let both = Transform::from_matrix(outer.matrix() * inner.matrix());
+
+		assert!(
+			both.position
+				.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1e-5),
+			"the inner offset is turned by the outer rotation, got {}",
+			both.position
+		);
+		assert!(
+			turns(both.rotation, outer.rotation, 1e-5),
+			"and the turn is the outer one, the inner having none"
+		);
 	}
 }

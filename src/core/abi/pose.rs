@@ -443,6 +443,37 @@ impl Poses {
 	/// @param out - the buffer to append to
 	/// @return how many matrices were appended
 	pub fn skinning(&self, id: PoseId, bones: &[Bone], t: f32, out: &mut Vec<Mat4>) -> usize {
+		let base = out.len();
+		let written = self.model(id, bones, t, out);
+
+		for (matrix, bone) in out
+			.get_mut(base..)
+			.unwrap_or_default()
+			.iter_mut()
+			.zip(bones)
+		{
+			*matrix *= bone.inverse_bind;
+		}
+
+		written
+	}
+
+	/// Where every bone of one pose is, in the model's own space.
+	///
+	/// The first of [`skinning`](Self::skinning)'s two passes on its own, and
+	/// the two share this one implementation rather than each having a copy of
+	/// the walk. What it hands back is a bone's *place*, which is what a
+	/// ragdoll wants: the matrix that carries the limb's body, rather than the
+	/// one that carries a vertex. The two differ by the inverse bind, and a
+	/// bone's children want this one.
+	///
+	/// @param id - the pose to resolve
+	/// @param bones - its skeleton's bones, parents first
+	/// @param t - how far past the previous step this sits, `0.0 ..= 1.0`; a
+	/// step wants one, which is the present
+	/// @param out - the buffer to append to
+	/// @return how many matrices were appended
+	pub fn model(&self, id: PoseId, bones: &[Bone], t: f32, out: &mut Vec<Mat4>) -> usize {
 		let Some(pose) = self.get(id) else {
 			return 0;
 		};
@@ -470,15 +501,6 @@ impl Poses {
 			};
 
 			out.push(model);
-		}
-
-		for (matrix, bone) in out
-			.get_mut(base..)
-			.unwrap_or_default()
-			.iter_mut()
-			.zip(bones)
-		{
-			*matrix *= bone.inverse_bind;
 		}
 
 		bones.len()
@@ -606,6 +628,77 @@ mod tests {
 		assert_eq!(written, out.len(), "it says how many it wrote");
 
 		out
+	}
+
+	#[test]
+	fn a_model_matrix_is_where_the_bone_is_and_a_skinning_one_is_what_it_does() {
+		// the two differ by the inverse bind, and at rest that difference is the
+		// whole of what each one says: skinning is the identity, because nothing
+		// has moved, while the model matrix is the place the bone was drawn at.
+		let (poses, id, arm) = posed();
+		let mut at = Vec::new();
+
+		assert_eq!(poses.model(id, &arm.bones, 1.0, &mut at), arm.bones.len(), "one a bone");
+		assert!(
+			at[2]
+				.w_axis
+				.truncate()
+				.abs_diff_eq(Vec3::new(2.0, 0.0, 0.0), 1e-5),
+			"the wrist rests two units along x, got {}",
+			at[2].w_axis.truncate()
+		);
+		assert!(
+			matrices(&poses, id, &arm, 1.0)[2].abs_diff_eq(Mat4::IDENTITY, 1e-5),
+			"while what it does to a vertex at rest is nothing at all"
+		);
+	}
+
+	#[test]
+	fn a_model_matrix_carries_the_bone_the_pose_moved() {
+		let (mut poses, id, arm) = posed();
+		let turn = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+
+		poses
+			.get_mut(id)
+			.expect("the pose is there")
+			.set(0, Transform { rotation: turn, ..Transform::IDENTITY });
+		poses.snap(id);
+		poses.settle();
+
+		let mut at = Vec::new();
+		poses.model(id, &arm.bones, 1.0, &mut at);
+
+		assert!(
+			at[2]
+				.w_axis
+				.truncate()
+				.abs_diff_eq(Vec3::new(0.0, 2.0, 0.0), 1e-5),
+			"a quarter turn at the shoulder swings the wrist onto y, got {}",
+			at[2].w_axis.truncate()
+		);
+	}
+
+	#[test]
+	fn a_model_matrix_appends_rather_than_clearing_what_it_is_given() {
+		// the same contract `skinning` has, and it is what lets one buffer hold
+		// every character in the frame.
+		let (poses, id, arm) = posed();
+		let mut at = vec![Mat4::ZERO; 2];
+
+		poses.model(id, &arm.bones, 1.0, &mut at);
+
+		assert_eq!(at.len(), 2 + arm.bones.len(), "it went on the end");
+		assert_eq!(at[0], Mat4::ZERO, "and what was already there is untouched");
+	}
+
+	#[test]
+	fn a_pose_nobody_holds_a_handle_to_writes_no_model_matrices() {
+		let (mut poses, id, arm) = posed();
+		let mut at = Vec::new();
+
+		assert!(poses.despawn(id), "it was there");
+		assert_eq!(poses.model(id, &arm.bones, 1.0, &mut at), 0, "and now it is not");
+		assert!(at.is_empty(), "so nothing was written");
 	}
 
 	#[test]

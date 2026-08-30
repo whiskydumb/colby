@@ -37,6 +37,7 @@ pub mod model;
 pub mod names;
 pub mod physics;
 pub mod pose;
+pub mod ragdoll;
 pub mod registry;
 pub mod scene;
 pub mod skeleton;
@@ -66,12 +67,15 @@ pub use self::{
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
 	},
 	pose::{MAX_POSES, Pose, PoseId, Poses},
+	ragdoll::{Build, MAX_PARTS, NO_PART, Part, Ragdoll, Segment},
 	registry::{Entry, Registry},
 	scene::{
 		Arena, Form, Link, Posed, Remap, Restored, Scene, SceneData, SceneId, Scenes, Solid,
 		Stage, Thing,
 	},
-	skeleton::{Bone, MAX_BONES, NO_PARENT, Skeleton, SkeletonData, SkeletonId, Skeletons},
+	skeleton::{
+		Bone, MAX_BONES, NO_PARENT, Skeleton, SkeletonData, SkeletonId, Skeletons, rests,
+	},
 	state::GameState,
 	texture::{Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},

@@ -157,6 +157,37 @@ impl SkeletonData {
 	pub fn is_empty(&self) -> bool { self.bones.is_empty() }
 }
 
+/// Every bone's model-space matrix with nothing animating it.
+///
+/// The rest pose composed all the way down, which is the shape a mesh was
+/// authored in. One forward pass, no recursion and no scratch, for the reason
+/// everything else here manages the same: a parent is always written first.
+///
+/// It is what a ragdoll's layout is worked out from, and it is the honest way
+/// to answer "which way does this model face" - compose the rests and look at
+/// where the toe sits relative to the ankle, rather than guessing at a sign.
+///
+/// @param bones - the skeleton, parents before children
+/// @param out - cleared and filled, one matrix a bone
+pub fn rests(bones: &[Bone], out: &mut Vec<Mat4>) {
+	out.clear();
+	out.reserve(bones.len());
+
+	for bone in bones {
+		let local = bone.rest.matrix();
+		let model = if bone.parent == NO_PARENT {
+			local
+		} else {
+			out.get(usize::from(bone.parent))
+				.copied()
+				.unwrap_or(Mat4::IDENTITY)
+				* local
+		};
+
+		out.push(model);
+	}
+}
+
 /// One entry of the skeleton registry.
 pub type Skeleton = Entry<SkeletonData>;
 
@@ -228,7 +259,7 @@ impl Default for Skeletons {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::glam::Vec3;
+	use crate::glam::{Quat, Vec3};
 
 	/// A bone hanging off another one, a stride along `x` from it.
 	fn bone(name: &str, parent: u16, along: f32) -> Bone {
@@ -411,5 +442,68 @@ mod tests {
 				bone.name
 			);
 		}
+	}
+
+	#[test]
+	fn a_rest_is_composed_all_the_way_down_rather_than_read_off_the_bone() {
+		// a quarter turn at the shoulder and a unit along x under it, so an
+		// implementation that forgot the parent would put the hand at (1, 0, 0)
+		// and the right one puts it a unit up from the shoulder.
+		let bones = vec![
+			Bone {
+				name: "shoulder".to_owned(),
+				parent: NO_PARENT,
+				inverse_bind: Mat4::IDENTITY,
+				rest: Transform {
+					position: Vec3::new(0.0, 2.0, 0.0),
+					rotation: Quat::from_rotation_z(core::f32::consts::FRAC_PI_2),
+					scale: Vec3::ONE,
+				},
+			},
+			Bone {
+				name: "hand".to_owned(),
+				parent: 0,
+				inverse_bind: Mat4::IDENTITY,
+				rest: Transform::at(Vec3::X),
+			},
+		];
+		let mut at = Vec::new();
+
+		rests(&bones, &mut at);
+
+		assert_eq!(at.len(), 2, "one matrix a bone");
+		assert!(
+			at[0]
+				.w_axis
+				.truncate()
+				.abs_diff_eq(Vec3::new(0.0, 2.0, 0.0), 1e-5),
+			"the root is where its own rest puts it"
+		);
+		assert!(
+			at[1]
+				.w_axis
+				.truncate()
+				.abs_diff_eq(Vec3::new(0.0, 3.0, 0.0), 1e-5),
+			"and the child is carried by its parent's turn, got {}",
+			at[1].w_axis.truncate()
+		);
+	}
+
+	#[test]
+	fn rests_clears_what_it_is_given_rather_than_appending_to_it() {
+		let mut at = vec![Mat4::ZERO; 5];
+
+		rests(&arm().bones, &mut at);
+
+		assert_eq!(at.len(), arm().bones.len(), "the buffer holds this skeleton and no other");
+	}
+
+	#[test]
+	fn a_skeleton_of_no_bones_rests_at_nothing() {
+		let mut at = vec![Mat4::ZERO];
+
+		rests(&[], &mut at);
+
+		assert!(at.is_empty(), "and the buffer is emptied rather than left as it was");
 	}
 }
