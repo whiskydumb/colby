@@ -31,7 +31,10 @@
 //! - [`channel`] - one end of a conversation: sequence numbers, what the far
 //!   end has acknowledged, the round-trip estimate and what was lost;
 //! - [`reliable`] - the ring of numbered console lines that is the only thing
-//!   on this wire nothing is allowed to lose.
+//!   on this wire nothing is allowed to lose;
+//! - [`random`] - a seeded shift register, so that a run can be repeated;
+//! - [`link`] - a wire made as bad as somebody wants it, which is what there is
+//!   to point a change at when the change is about loss.
 //!
 //! **Nothing is encrypted and nobody is authenticated.** Said out loud rather
 //! than left to be discovered: anything that can reach the socket can say
@@ -46,15 +49,19 @@
 
 pub mod channel;
 pub mod fragment;
+pub mod link;
 pub mod packet;
+pub mod random;
 pub mod reliable;
 
 pub use self::{
 	channel::{Channel, Delivery, HISTORY},
+	link::{BURST, Conditions, DUPLICATE, JITTER, LAG, LOSS, Link},
 	packet::{
 		ACK_BITS, HEADER_BYTES, Header, MAGIC, MAX_DATAGRAM, MAX_FRAGMENTS, MAX_MESSAGE,
 		MAX_PAYLOAD, PROTOCOL_VERSION, Reason, after, distance,
 	},
+	random::Random,
 	reliable::{MAX_COMMAND, MAX_COMMANDS, Reliable},
 };
 
