@@ -31,6 +31,9 @@ path = "src/engine"
 [workspace.dependencies.colby_game]
 path = "src/game"
 
+[workspace.dependencies.colby_net]
+path = "src/net"
+
 [workspace.dependencies.colby_physics]
 path = "src/physics"
 

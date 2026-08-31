@@ -1,0 +1,23 @@
+[package]
+name = "colby_net"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+
+# @note: one dependency, and it is the one every crate here has. There is no
+# socket in this crate and no operating system in it either: a datagram arrives
+# as a slice of bytes and leaves as a slice of bytes, and whoever owns the
+# handle they came through is somebody else's problem. That is the same split
+# the mixer has against its device, and it is what makes every line below
+# checkable by running a test.
+[dependencies]
+colby_core.workspace = true
+
+[lints]
+workspace = true

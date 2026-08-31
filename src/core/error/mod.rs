@@ -59,6 +59,15 @@ pub enum Error {
 	#[error("script: {0}")]
 	Script(String),
 
+	/// A failure on the wire, or a peer saying something that cannot be true.
+	///
+	/// Almost never fatal to the process and almost always fatal to one
+	/// connection: what is on the far end of a socket is not under this
+	/// program's control, so a message that does not parse is a peer to stop
+	/// talking to rather than a reason to stop running.
+	#[error("network: {0}")]
+	Network(String),
+
 	/// A panic that unwound out of a hot-reload module and was caught at the
 	/// boundary.
 	///
