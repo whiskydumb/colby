@@ -36,6 +36,7 @@ pub mod material;
 pub mod mesh;
 pub mod model;
 pub mod names;
+pub mod net;
 pub mod physics;
 pub mod pose;
 pub mod ragdoll;
@@ -67,6 +68,7 @@ pub use self::{
 	mesh::{BONES_PER_VERTEX, Mesh, MeshData, MeshId, MeshVertex, Meshes, SkinVertex},
 	model::{Model, ModelData, ModelId, Models, Placement},
 	names::MAX_NAME,
+	net::{PeerId, Role},
 	physics::{
 		Bodies, Body, BodyId, BodyKind, Layers, MAX_BODIES, MAX_OVERLAPS, MAX_TOUCHES, Overlap,
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
@@ -91,7 +93,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 38;
+pub const ABI_VERSION: u32 = 39;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -189,6 +191,30 @@ pub struct World {
 	/// table's sweep all happen, so time goes on and what is drawn over the
 	/// world stays fresh.
 	pub editing: bool,
+
+	/// Which endpoint of a conversation this process is.
+	///
+	/// **Nothing writes this yet.** It is [`PeerId::HOST`] from
+	/// [`World::new`](Self::new) onwards in every world this engine currently
+	/// builds, and that is not a placeholder: a process playing on its own
+	/// simulates its own world, so it really is its own authority, and every
+	/// body in it reads back as [`Role::Authority`]. The commit that admits a
+	/// client is the one that starts writing it, and until then the two other
+	/// roles are reachable only from a test.
+	///
+	/// The value a client is meant to hold before it has been told who it is
+	/// is [`PeerId::NONE`], which owns nothing and decides nothing. That is
+	/// the deliberate part: the unknown answer is the powerless one, and the
+	/// default is not an unknown but a statement.
+	///
+	/// What a game does with this is ask a body what part it plays:
+	/// `body.role(world.peer)`. @ref [`net`](crate::abi::net).
+	///
+	/// Not written down by a save. Which endpoint a process is, is a fact
+	/// about the process rather than about the world - a world captured on a
+	/// host and restored on a client would otherwise claim to be the
+	/// authority. Same reason [`editing`](Self::editing) is not written down.
+	pub peer: PeerId,
 
 	/// The window's width divided by its height. Host-written; the renderer
 	/// uses it so that a shape does not stretch with the window.
@@ -428,6 +454,9 @@ impl World {
 			reloads: 0,
 			aspect: 1.0,
 			editing: false,
+			// its own authority, until somebody says otherwise. @ref the
+			// field, and note this is deliberately not the zero value.
+			peer: PeerId::HOST,
 			input: Input::default(),
 			camera: Camera::DEFAULT,
 			clear: Vec3::ZERO,
@@ -1397,6 +1426,62 @@ mod tests {
 
 		assert_eq!(world.input.keys, [0; input::KEY_WORDS], "nothing is down before a frame");
 		assert_eq!(world.input.buttons, 0, "nothing is down before a frame");
+	}
+
+	#[test]
+	fn a_world_on_its_own_is_its_own_authority() {
+		let mut world = World::new();
+
+		assert_eq!(world.peer, PeerId::HOST, "and it is not the zero value");
+		assert!(world.peer.is_host());
+
+		let body = world.bodies.spawn(Body::default());
+		let claimed = world
+			.bodies
+			.spawn(Body { owner: PeerId::HOST, ..Body::default() });
+
+		for id in [body, claimed] {
+			assert_eq!(
+				world
+					.bodies
+					.get(id)
+					.map(|body| body.role(world.peer)),
+				Some(Role::Authority),
+				"nothing in an unnetworked world is anybody else's to decide"
+			);
+		}
+	}
+
+	#[test]
+	fn a_world_that_is_a_client_decides_only_what_it_owns() {
+		let mut world = World::new();
+		let mine = PeerId::at(1, 1);
+
+		world.peer = mine;
+
+		let owned = world
+			.bodies
+			.spawn(Body { owner: mine, ..Body::default() });
+		let theirs = world.bodies.spawn(Body {
+			owner: PeerId::at(2, 1),
+			..Body::default()
+		});
+		let nobodys = world.bodies.spawn(Body::default());
+
+		let role = |id| {
+			world
+				.bodies
+				.get(id)
+				.map(|body| body.role(world.peer))
+		};
+
+		assert_eq!(role(owned), Some(Role::AutonomousProxy));
+		assert_eq!(role(theirs), Some(Role::SimulatedProxy), "somebody else's is watched");
+		assert_eq!(
+			role(nobodys),
+			Some(Role::SimulatedProxy),
+			"and the map is the host's business, not everybody's"
+		);
 	}
 
 	#[test]

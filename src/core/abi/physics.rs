@@ -40,7 +40,12 @@
 
 use core::ffi::c_void;
 
-use super::{entity::EntityId, mesh::MeshId, names::Names};
+use super::{
+	entity::EntityId,
+	mesh::MeshId,
+	names::Names,
+	net::{PeerId, Role},
+};
 use crate::{
 	abi::Transform,
 	glam::{Mat3, Quat, Vec3},
@@ -477,6 +482,32 @@ pub struct Body {
 	/// Optional on purpose: a trigger volume, a clip brush and a query-only
 	/// collider are all bodies with nothing to draw.
 	pub entity: EntityId,
+
+	/// Which peer this belongs to, or [`PeerId::NONE`] for nobody's.
+	///
+	/// Meant to be game-written and host-read: who owns a prop is a gameplay
+	/// question - picking one up is what claims it - and what the host does
+	/// with the answer is decide what to send to whom and whose commands may
+	/// move it. **Nothing outside a test writes or reads it yet**; it is here
+	/// from the first commit of the step so that growing into per-object
+	/// ownership later costs no move of the boundary. Nobody's is the ordinary
+	/// case and the default: the map, the props lying about, and every body in
+	/// a world that has never heard of a network.
+	///
+	/// **An owner is not written down by a save.** A restored world's bodies
+	/// are all nobody's, and the half of the rule a voice follows that applies
+	/// here is the first half: an owner is a moment rather than a thing. A
+	/// peer that had a claim on something is not a peer the world reading the
+	/// file necessarily has. A snapshot is where an owner will cross instead,
+	/// because there both sides really are looking at the same peers - and
+	/// there is no snapshot yet. @ref [`scene`](crate::abi::scene) for the one
+	/// path where this costs something today.
+	///
+	/// Note this is not the same question as [`role`](Self::role), and the two
+	/// disagree on a host: the host is the authority over every body whatever
+	/// its owner says, so `role` answers what may be done and this answers who
+	/// asked for it.
+	pub owner: PeerId,
 }
 
 impl Body {
@@ -508,6 +539,7 @@ impl Body {
 			layers: Layers::DEFAULT,
 			sleeping: false,
 			entity: EntityId::NONE,
+			owner: PeerId::NONE,
 		}
 	}
 
@@ -547,6 +579,20 @@ impl Body {
 	pub const fn movable(&self) -> bool {
 		matches!(self.kind, BodyKind::Dynamic) && !matches!(self.shape.kind, ShapeKind::Mesh)
 	}
+
+	/// What part one peer plays in this body.
+	///
+	/// A forwarder onto [`Role::of`], so that the common question reads as one
+	/// and so that its two arguments cannot be handed over the wrong way
+	/// round. Nothing is stored: the answer is worked out from
+	/// [`owner`](Self::owner) and the peer asking, every time, which is what
+	/// keeps a role from disagreeing with the owner it is about.
+	///
+	/// @param peer - who is asking. @ref
+	/// [`World::peer`](crate::abi::World::peer)
+	/// @return what that peer may do about this body
+	#[must_use]
+	pub fn role(&self, peer: PeerId) -> Role { Role::of(peer, self.owner) }
 
 	/// One over the mass, or zero for anything the solver does not move.
 	///
@@ -1585,6 +1631,46 @@ mod tests {
 		assert!(body.movable(), "the solver still integrates it, so it falls");
 		assert!(!body.solid(), "and it still pushes nothing on the way down");
 		assert_eq!(body.kind, BodyKind::Dynamic, "the two questions are separate");
+	}
+
+	#[test]
+	fn a_body_belongs_to_nobody_until_something_claims_it() {
+		assert_eq!(Body::default().owner, PeerId::NONE);
+		assert_eq!(
+			Body::dynamic(Shape::UNIT, Transform::IDENTITY, 1.0).owner,
+			PeerId::NONE,
+			"and a body made by any of the constructors goes through the same one"
+		);
+		assert_eq!(
+			Body::default().role(PeerId::HOST),
+			Role::Authority,
+			"and a world nobody networked is a world one process decides all of"
+		);
+	}
+
+	#[test]
+	fn a_body_answers_the_peer_that_is_asking() {
+		let mine = PeerId::at(1, 1);
+		let theirs = PeerId::at(2, 1);
+		let body = Body { owner: mine, ..Body::default() };
+
+		assert_eq!(body.role(mine), Role::AutonomousProxy, "the peer that owns it decides");
+		assert_eq!(body.role(theirs), Role::SimulatedProxy, "and any other peer is told");
+		assert_eq!(
+			body.role(PeerId::HOST),
+			Role::Authority,
+			"and the host decides whoever owns it"
+		);
+
+		let nobodys = Body::default();
+
+		assert_eq!(
+			nobodys.role(mine),
+			Role::SimulatedProxy,
+			"a body nobody owns is not the asking peer's, which is what makes the owner the \
+			 thing the answer turns on"
+		);
+		assert_eq!(nobodys.role(PeerId::HOST), Role::Authority);
 	}
 
 	#[test]

@@ -34,6 +34,25 @@
 //! panels and binds, which a game shows again from `init`; and everything a
 //! step derives and clears - input, the debug table, the touch and overlap
 //! queues. @ref `colby-known-gaps` for what that costs.
+//!
+//! **And who owns a body**, which is the one entry on that list that is about
+//! a field this description *could* carry and deliberately does not. An owner
+//! names a peer that exists at this moment - it is a moment rather than a
+//! thing, which is the half of the argument against writing a voice down that
+//! applies here - and the peers a save was written among are generally not the
+//! ones it is read among. So both loaders leave every body nobody's, and a
+//! game that wants a claim back makes it again. A snapshot is where an owner
+//! crosses instead, because there both sides really are looking at the same
+//! peers, and a snapshot is not this format. @ref [`net`](crate::abi::net).
+//!
+//! **One path where "generally" is doing real work**, and it is worth naming
+//! rather than leaving to be discovered: the editor captures the world when
+//! play starts and restores it when play stops, in one process, seconds apart,
+//! with the same peers on both sides. An owner is dropped there too. Nothing
+//! sets one yet so nothing is lost today, and the trigger is the first commit
+//! that does: whether pressing stop should hand every prop a client was
+//! holding back to nobody is a question that has an answer, and this is not
+//! it.
 
 use crate::{
 	Result,
@@ -1211,6 +1230,10 @@ fn pose_of(world: &World, posed: &Posed) -> Pose {
 }
 
 /// Every body, with its shape's mesh and its entity looked up.
+///
+/// @note: `owner` is not among the fields written back, and the omission is
+/// the point rather than an oversight - `Body::new` leaves it as nobody's and
+/// nothing here puts a claim back. @ref the module comment.
 fn solid_bodies(world: &World, scene: &SceneData, things: &[EntityId]) -> Vec<(usize, Body)> {
 	scene
 		.solids
@@ -1616,7 +1639,7 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 mod tests {
 	use super::*;
 	use crate::abi::{
-		MAX_ENTITIES, Material, MeshData, mesh,
+		MAX_ENTITIES, Material, MeshData, PeerId, Role, mesh,
 		skeleton::{Bone, SkeletonData, SkeletonId},
 	};
 
@@ -2301,6 +2324,57 @@ mod tests {
 
 		assert_eq!(joint.first, body_id, "the rope holds the restored body");
 		assert_eq!(joint.second, BodyId::NONE, "and a point in the world, as it did");
+	}
+
+	#[test]
+	fn neither_loader_puts_a_claim_on_a_body_back() {
+		let mut source = peopled();
+		let claimed = source.bodies.iter().next().expect("one body").0;
+
+		source
+			.bodies
+			.get_mut(claimed)
+			.expect("it is there")
+			.owner = PeerId::HOST;
+
+		let scene = capture(&source);
+
+		// restored *over* a world that already holds a claim, rather than into
+		// an empty one. That is the case a merge rather than an overwrite
+		// would get wrong, and it is the only version of this the loaders can
+		// actually fail: `Solid` has no owner field, so there is no channel
+		// for one to travel down and nothing capture could have written.
+		let mut put_back = peopled();
+		let sitting = put_back.bodies.iter().next().expect("one body").0;
+
+		put_back
+			.bodies
+			.get_mut(sitting)
+			.expect("it is there")
+			.owner = PeerId::at(4, 1);
+		put_back.peer = PeerId::at(4, 1);
+
+		restore(&mut put_back, &scene).expect("the layouts agree");
+
+		let (_, restored) = put_back.bodies.iter().next().expect("one body");
+
+		assert_eq!(
+			restored.owner,
+			PeerId::NONE,
+			"a peer that claimed something is not a peer the world it is read into has"
+		);
+		assert_eq!(
+			restored.role(put_back.peer),
+			Role::SimulatedProxy,
+			"so the peer that had it holds nothing over it afterwards"
+		);
+
+		let mut beside = furnished();
+		instantiate(&mut beside, &scene, Vec3::ZERO);
+
+		let (_, pasted) = beside.bodies.iter().next().expect("one body");
+
+		assert_eq!(pasted.owner, PeerId::NONE, "and a paste is a fresh thing entirely");
 	}
 
 	#[test]
