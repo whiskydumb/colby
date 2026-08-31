@@ -89,6 +89,15 @@ hot: hot-build
 shot path="colby.png": hot-build
     ./{{hot_dir}}/colby.exe --shot "{{path}}"
 
+# record what a run sounds like, into a wav
+#
+# @note: the mirror of `just shot`, and deliberately the same ninety steps by
+# default, so the picture and the sound describe the same moment. No window and
+# no output device: the same build writes the same file on every machine, which
+# is what makes a hash of it worth comparing. Pass a step count for longer.
+hear path="colby.wav" steps="90": hot-build
+    ./{{hot_dir}}/colby.exe --record "{{path}}" {{steps}}
+
 # build and open the documentation
 doc:
     cargo doc --workspace --no-deps --open

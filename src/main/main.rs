@@ -18,6 +18,7 @@ mod console;
 mod game;
 mod input;
 mod mode;
+mod record;
 mod saves;
 mod shot;
 mod step;
@@ -63,6 +64,16 @@ fn run() -> Result {
 	// a screenshot never opens a window, so it takes its own way out.
 	if let Some(path) = shot::requested() {
 		let result = shot::take(&path);
+		finish();
+
+		return result;
+	}
+
+	// and neither does a recording, which additionally opens no device: what
+	// it writes has to be the same file on a machine with speakers and one
+	// without.
+	if let Some(request) = record::requested() {
+		let result = record::take(&request);
 		finish();
 
 		return result;

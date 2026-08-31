@@ -115,6 +115,60 @@ pub fn import(bytes: &[u8]) -> Result<SoundData> {
 	Ok(data)
 }
 
+/// Writes samples out as a canonical sixteen-bit PCM WAV.
+///
+/// The one format this project *writes*, and it is written rather than a
+/// `.csnd` for one reason: a `.csnd` is read by colby and by nothing else,
+/// and the thing a recording is for is being opened by whatever somebody
+/// already has. Every part of it is the shape the reader above expects, which
+/// is what makes `import(encode(x))` an exact round trip and therefore a test.
+///
+/// @param data - the samples to write
+/// @return the whole file, ready to put on disk
+///
+/// # Errors
+///
+/// If the samples are not ones anything can play, or if there are more of them
+/// than a thirty-two bit length can describe.
+pub fn encode(data: &SoundData) -> Result<Vec<u8>> {
+	data.check()
+		.map_err(|reason| err!(Asset("{reason}")))?;
+
+	let bytes = data.samples.len().saturating_mul(2);
+	let length = u32::try_from(bytes)
+		.map_err(|_| err!(Asset("{bytes} bytes of samples is more than a WAV can describe")))?;
+	let align = data.channels.saturating_mul(2);
+
+	let mut out = Vec::with_capacity(bytes + 44);
+	out.extend_from_slice(&RIFF);
+	// everything after this field: the four bytes of "WAVE", two chunk heads
+	// of eight, sixteen of format, and the samples.
+	out.extend_from_slice(&length.saturating_add(36).to_le_bytes());
+	out.extend_from_slice(&WAVE);
+
+	out.extend_from_slice(&FMT);
+	out.extend_from_slice(&(u32::try_from(FMT_BYTES).unwrap_or(16)).to_le_bytes());
+	out.extend_from_slice(&FORMAT_PCM.to_le_bytes());
+	out.extend_from_slice(&data.channels.to_le_bytes());
+	out.extend_from_slice(&data.rate.to_le_bytes());
+	out.extend_from_slice(
+		&data
+			.rate
+			.saturating_mul(u32::from(align))
+			.to_le_bytes(),
+	);
+	out.extend_from_slice(&align.to_le_bytes());
+	out.extend_from_slice(&16_u16.to_le_bytes());
+
+	out.extend_from_slice(&DATA);
+	out.extend_from_slice(&length.to_le_bytes());
+	for sample in &data.samples {
+		out.extend_from_slice(&sample.to_le_bytes());
+	}
+
+	Ok(out)
+}
+
 /// What a `fmt ` chunk said.
 #[derive(Clone, Copy, Debug)]
 struct Format {
@@ -370,6 +424,21 @@ fn from_float(sample: f32) -> i16 { (sample.clamp(-1.0, 1.0) * f32::from(i16::MA
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Three frames of stereo at 22050, values 1, -1, 2, -2, 3, -3, written by
+	/// python's `wave` module.
+	///
+	/// Not this project's own encoder, which is the whole point: a reader
+	/// checked against a writer they were both written against proves only
+	/// that the two agree. It is used twice - once to prove the reader takes
+	/// what a real recorder wrote, and once to prove the writer produces the
+	/// same bytes.
+	const RECORDED: &[u8] = &[
+		0x52, 0x49, 0x46, 0x46, 0x30, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6D, 0x74,
+		0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x22, 0x56, 0x00, 0x00, 0x88, 0x58,
+		0x01, 0x00, 0x04, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x0C, 0x00, 0x00, 0x00, 0x01,
+		0x00, 0xFF, 0xFF, 0x02, 0x00, 0xFE, 0xFF, 0x03, 0x00, 0xFD, 0xFF,
+	];
 
 	/// Builds a WAV around a block of sample bytes.
 	///
@@ -715,22 +784,101 @@ mod tests {
 
 	#[test]
 	fn a_file_from_an_outside_tool_reads_back() {
-		// written by python's `wave` module, which is not this project's own
-		// encoder: a reader checked against a writer they were both written
-		// against proves only that the two agree. Three frames of stereo at
-		// 22050, values 1, -1, 2, -2, 3, -3.
-		const RECORDED: &[u8] = &[
-			0x52, 0x49, 0x46, 0x46, 0x30, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6D,
-			0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x22, 0x56, 0x00, 0x00,
-			0x88, 0x58, 0x01, 0x00, 0x04, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x0C, 0x00,
-			0x00, 0x00, 0x01, 0x00, 0xFF, 0xFF, 0x02, 0x00, 0xFE, 0xFF, 0x03, 0x00, 0xFD, 0xFF,
-		];
-
 		let sound = import(RECORDED).expect("a real recorder's file");
 
 		assert_eq!(sound.rate, 22_050, "the rate it was recorded at");
 		assert_eq!(sound.channels, 2, "in stereo");
 		assert_eq!(sound.samples, vec![1, -1, 2, -2, 3, -3], "and every sample of it");
+	}
+
+	#[test]
+	fn what_this_writes_is_what_it_reads() {
+		// the round trip is exact because both halves are the same eight
+		// numbers; anything that made it approximate would be a bug in one of
+		// them.
+		let cases = [
+			SoundData {
+				samples: vec![0, 1000, -1000, i16::MAX, i16::MIN],
+				rate: 8000,
+				channels: 1,
+			},
+			SoundData {
+				samples: vec![1, -1, 2, -2],
+				rate: 48_000,
+				channels: 2,
+			},
+			SoundData {
+				samples: Vec::new(),
+				rate: 44_100,
+				channels: 2,
+			},
+		];
+
+		for original in cases {
+			let bytes = encode(&original).expect("it writes");
+			let back = import(&bytes).expect("and reads back");
+
+			assert_eq!(back, original, "every sample, the rate and the channels");
+		}
+	}
+
+	#[test]
+	fn what_this_writes_has_the_head_a_wav_file_has() {
+		let bytes = encode(&SoundData {
+			samples: vec![7; 6],
+			rate: 22_050,
+			channels: 2,
+		})
+		.expect("it writes");
+
+		assert_eq!(bytes.len(), 44 + 12, "a forty-four byte head and six samples");
+		assert_eq!(&bytes[..4], b"RIFF");
+		assert_eq!(&bytes[8..12], b"WAVE");
+		assert_eq!(&bytes[12..16], b"fmt ");
+		assert_eq!(&bytes[36..40], b"data");
+		assert_eq!(
+			u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes")),
+			u32::try_from(bytes.len() - 8).expect("it fits"),
+			"the length names everything after itself"
+		);
+		assert_eq!(
+			u32::from_le_bytes(bytes[40..44].try_into().expect("four bytes")),
+			12,
+			"and the data chunk names the samples"
+		);
+	}
+
+	#[test]
+	fn what_a_python_recorder_writes_and_what_this_writes_agree() {
+		// the same three frames of stereo the fixture above holds, written by
+		// this encoder. If the two ever disagree it is this one that is wrong,
+		// because the other came from outside the project.
+		let ours = encode(&SoundData {
+			samples: vec![1, -1, 2, -2, 3, -3],
+			rate: 22_050,
+			channels: 2,
+		})
+		.expect("it writes");
+
+		assert_eq!(ours.len(), RECORDED.len(), "the same length");
+		assert_eq!(ours, RECORDED, "and the same bytes, head and all");
+	}
+
+	#[test]
+	fn samples_nothing_can_play_are_not_written() {
+		let ragged = SoundData {
+			samples: vec![0; 3],
+			rate: 8000,
+			channels: 2,
+		};
+
+		assert!(
+			encode(&ragged)
+				.expect_err("it is not writable")
+				.to_string()
+				.contains("whole number"),
+			"the shared check refuses it on the way out as it does on the way in"
+		);
 	}
 
 	#[test]
