@@ -270,6 +270,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "colby_audio"
+version = "0.1.0"
+dependencies = [
+ "colby_asset",
+ "colby_core",
+]
+
+[[package]]
 name = "colby_core"
 version = "0.1.0"
 dependencies = [

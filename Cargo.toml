@@ -16,6 +16,9 @@ license = "MIT"
 [workspace.dependencies.colby_asset]
 path = "src/asset"
 
+[workspace.dependencies.colby_audio]
+path = "src/audio"
+
 [workspace.dependencies.colby_core]
 path = "src/core"
 

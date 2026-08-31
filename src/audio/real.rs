@@ -1,0 +1,297 @@
+//! What the mixer does to a recording somebody made, rather than to a ramp.
+//!
+//! Every test in the modules beside this one feeds the mixer four samples it
+//! can check by hand, which is what a test should do and is also the shape that
+//! cannot notice a whole class of mistake: a resampler that is subtly wrong
+//! over three hundred milliseconds looks exactly right over four frames.
+//!
+//! So this module plays the recording that ships with the workspace, at a rate
+//! that is not the recording's own, and measures what comes out against what
+//! went in. It is a `#[cfg(test)]` module and it reads a file, which is why it
+//! is its own file rather than another block at the bottom of the mixer.
+
+use std::path::{Path, PathBuf};
+
+use colby_core::abi::{SoundData, Sounds};
+
+use crate::{
+	bank::Bank,
+	mix::{CHANNELS, Mixer},
+	snapshot::{Playing, Snapshot},
+};
+
+/// The workspace this crate is in.
+fn workspace() -> PathBuf {
+	Path::new(env!("CARGO_MANIFEST_DIR"))
+		.ancestors()
+		.nth(2)
+		.unwrap_or_else(|| Path::new("."))
+		.to_path_buf()
+}
+
+/// The recording the sandbox will play when something lands.
+fn thud() -> Option<SoundData> {
+	let path = workspace().join("assets/sounds/thud.wav");
+	if !path.is_file() {
+		eprintln!("no {}; skipping", path.display());
+
+		return None;
+	}
+
+	Some(colby_asset::wav::import_file(&path).expect("the shipped recording reads"))
+}
+
+/// The root mean square of a slice, which is what "how loud" means.
+fn loudness(samples: &[f32]) -> f32 {
+	if samples.is_empty() {
+		return 0.0;
+	}
+
+	let total: f32 = samples.iter().map(|sample| sample * sample).sum();
+
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_precision_loss,
+		reason = "a block length is a few thousand, which an f32 counts exactly"
+	)]
+	let count = samples.len() as f32;
+
+	(total / count).sqrt()
+}
+
+/// The whole recording rendered at `rate`, as the left channel only.
+fn played(data: &SoundData, rate: u32, speed: f32) -> Vec<f32> {
+	let mut sounds = Sounds::new();
+	let sound = sounds.insert("sounds/thud", data.clone());
+	let mut bank = Bank::new();
+	bank.sync(&sounds);
+
+	let mut mixer = Mixer::new(rate);
+	let mut snapshot = Snapshot {
+		voices: vec![Playing {
+			slot: 0,
+			generation: 1,
+			sound,
+			head: 0.0,
+			speed,
+			left: 1.0,
+			right: 1.0,
+			looping: false,
+			downmix: false,
+		}],
+		step: 0,
+	};
+
+	// a second of output, in blocks the size a device really asks for, so that
+	// the block-to-block seam is exercised rather than stepped over. The
+	// snapshot is advanced the way a step advances it, because the mixer
+	// checks itself against it and a snapshot standing still is a thing the
+	// real system does only while it is paused.
+	let block = 480;
+	let mut out = Vec::new();
+	let mut buffer = vec![0.0; block * CHANNELS];
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_precision_loss,
+		reason = "a rate is at most MAX_RATE and a block is a few hundred"
+	)]
+	let seconds = block as f32 / rate as f32;
+
+	#[expect(
+		clippy::as_conversions,
+		reason = "a rate is at most MAX_RATE, which is far inside a usize"
+	)]
+	let blocks = rate as usize / block + 1;
+
+	for index in 0..blocks {
+		mixer.render(&bank, &snapshot, &mut buffer);
+		out.extend(buffer.iter().step_by(CHANNELS));
+
+		#[expect(
+			clippy::as_conversions,
+			clippy::cast_precision_loss,
+			reason = "a block index over a second of audio is a few hundred"
+		)]
+		let elapsed = (index + 1) as f32 * seconds;
+		snapshot.voices[0].head = elapsed * speed;
+		snapshot.step = u64::try_from(index + 1).unwrap_or(0);
+	}
+
+	out
+}
+
+/// How many frames at the front are not silence.
+fn sounding(samples: &[f32]) -> usize {
+	samples
+		.iter()
+		.rposition(|sample| sample.abs() > 1e-4)
+		.map_or(0, |last| last + 1)
+}
+
+#[test]
+fn a_real_recording_at_its_own_rate_keeps_its_length_and_its_level() {
+	let Some(data) = thud() else {
+		return;
+	};
+
+	let heard = played(&data, data.rate, 1.0);
+	let frames = sounding(&heard);
+
+	assert!(
+		frames.abs_diff(data.frames()) <= 2,
+		"{frames} frames out against {} in, at the same rate",
+		data.frames()
+	);
+
+	let peak = heard
+		.iter()
+		.fold(0.0_f32, |most, sample| most.max(sample.abs()));
+
+	assert!((peak - 0.85).abs() < 0.02, "the recording peaks at 0.85 and this is {peak}");
+}
+
+#[test]
+fn a_real_recording_resampled_upwards_lasts_the_same_time() {
+	// the case a four-sample fixture cannot see: 44100 into 48000 is a step of
+	// 0.91875, and an error in the third decimal of that is inaudible over
+	// four frames and half a millisecond out over three hundred.
+	let Some(data) = thud() else {
+		return;
+	};
+
+	let heard = played(&data, 48_000, 1.0);
+	let frames = sounding(&heard);
+	let wanted = data.frames() * 48_000 / usize::try_from(data.rate).unwrap_or(1);
+
+	assert!(
+		frames.abs_diff(wanted) <= 4,
+		"{frames} frames at forty-eight kilohertz against the {wanted} the same time is"
+	);
+}
+
+#[test]
+fn a_real_recording_resampled_keeps_the_shape_of_its_envelope() {
+	// the measurement that would catch a resampler reading the same sample
+	// over and over, or reading past the end and wrapping: both of those hold
+	// the level up instead of letting it fall.
+	let Some(data) = thud() else {
+		return;
+	};
+
+	let heard = played(&data, 48_000, 1.0);
+	let window = 48_000 / 100;
+	let envelope: Vec<f32> = heard
+		.chunks(window)
+		.take(10)
+		.map(loudness)
+		.collect();
+
+	assert!(envelope[0] > 0.3, "it starts loud: {}", envelope[0]);
+	for pair in envelope.windows(2) {
+		assert!(
+			pair[1] < pair[0],
+			"and every ten milliseconds is quieter than the one before: {envelope:?}"
+		);
+	}
+
+	// the recipe beside the file gives the body a seventy-millisecond time
+	// constant, so ninety milliseconds later it should be about
+	// `exp(-9/7)`, a little over a quarter of where it started. A resampler
+	// reading at the wrong rate would decay at the wrong rate and land
+	// outside this.
+	let fallen = envelope[9] / envelope[0];
+
+	assert!(
+		(0.2..0.35).contains(&fallen),
+		"it fell to {fallen} of where it began, and the recipe says about 0.28: {envelope:?}"
+	);
+}
+
+#[test]
+fn playing_a_real_recording_faster_makes_it_shorter_by_the_same_factor() {
+	let Some(data) = thud() else {
+		return;
+	};
+
+	let plain = sounding(&played(&data, 48_000, 1.0));
+	let quick = sounding(&played(&data, 48_000, 2.0));
+
+	assert!(
+		quick.abs_diff(plain / 2) <= 4,
+		"{quick} frames at double speed against half of {plain}"
+	);
+}
+
+#[test]
+fn a_real_recording_never_leaves_the_range_a_device_takes() {
+	let Some(data) = thud() else {
+		return;
+	};
+
+	for rate in [22_050, 44_100, 48_000, 96_000] {
+		for sample in played(&data, rate, 1.0) {
+			assert!((-1.0..=1.0).contains(&sample), "at {rate} a sample came out at {sample}");
+		}
+	}
+}
+
+#[test]
+fn a_real_recording_played_from_a_handle_the_bank_knows_is_not_silence() {
+	// the smallest possible guard against the whole chain being silent for
+	// some reason none of the measurements above would report, since every one
+	// of them is a comparison rather than a floor.
+	let Some(data) = thud() else {
+		return;
+	};
+
+	assert!(loudness(&played(&data, 48_000, 1.0)) > 0.01, "something came out");
+	assert!(
+		loudness(&played(&data, 48_000, 1.0)) < 1.0,
+		"and it is not a full-scale square wave, which is what a broken index sounds like"
+	);
+}
+
+#[test]
+fn a_real_recording_looped_does_not_run_dry() {
+	let Some(data) = thud() else {
+		return;
+	};
+
+	let mut sounds = Sounds::new();
+	let sound = sounds.insert("sounds/thud", data);
+	let mut bank = Bank::new();
+	bank.sync(&sounds);
+
+	let mut mixer = Mixer::new(48_000);
+	let snapshot = Snapshot {
+		voices: vec![Playing {
+			slot: 0,
+			generation: 1,
+			sound,
+			head: 0.0,
+			speed: 1.0,
+			left: 1.0,
+			right: 1.0,
+			looping: true,
+			downmix: false,
+		}],
+		step: 1,
+	};
+
+	let mut buffer = vec![0.0; 480 * CHANNELS];
+	let mut quietest = f32::MAX;
+
+	// five seconds, which is sixteen times round a three-hundred-millisecond
+	// recording. A wrap that lost its place would go silent inside that.
+	for _ in 0..500 {
+		mixer.render(&bank, &snapshot, &mut buffer);
+		let block: Vec<f32> = buffer.iter().step_by(CHANNELS).copied().collect();
+		quietest = quietest.min(
+			block
+				.iter()
+				.fold(0.0_f32, |most, sample| most.max(sample.abs())),
+		);
+	}
+
+	assert!(quietest > 0.001, "every block still had something in it: {quietest}");
+}
