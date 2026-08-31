@@ -35,6 +35,7 @@
 //! else's cadence is a value that cannot be unit-tested.
 
 pub mod bank;
+pub mod device;
 pub mod mix;
 pub mod pan;
 #[cfg(test)]
@@ -43,6 +44,7 @@ pub mod snapshot;
 
 pub use self::{
 	bank::{Bank, Recording},
+	device::Device,
 	mix::{CHANNELS, Mixer, SLEW_SECONDS},
 	snapshot::{Playing, Snapshot},
 };

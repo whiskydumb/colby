@@ -45,6 +45,28 @@ version = "1.25"
 default-features = false
 features = ["derive"]
 
+# @note: the first external dependency taken in the whole of stage two, and the
+# only one in the audio subsystem. It is the *device*, not the mixer: what it
+# does is enumerate outputs, negotiate a format with the driver and hand over a
+# buffer to fill, and everything that happens to that buffer is written here.
+# That is the same bargain wgpu and winit are - a device and a window - and the
+# opposite of the one `rapier3d` was refused for, which was an algorithm.
+#
+# The measured cost on this workspace is **two crates that actually build on
+# Windows**, `cpal` and `dasp_sample`: the `windows` crate it binds through is
+# already in the lock at the exact version it wants, because wgpu put it there.
+# The other twenty-three lock entries are ALSA, CoreAudio and the Objective-C
+# bindings for platforms this is not built for.
+#
+# The alternative was WASAPI by hand through that same `windows` crate: zero new
+# dependencies and about three hundred and fifty lines of unsafe COM. It was
+# refused for one reason that is not fashion - shared-mode format negotiation is
+# a matrix of rates, channel counts and sample types that cannot be tested on one
+# machine, and it is exactly where the bugs are. @ref the pre-commit audit list.
+[workspace.dependencies.cpal]
+version = "0.17"
+default-features = false
+
 [workspace.dependencies.ctor]
 version = "1.0"
 default-features = false

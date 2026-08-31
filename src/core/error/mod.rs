@@ -36,6 +36,14 @@ pub enum Error {
 	#[error("graphics: {0}")]
 	Graphics(String),
 
+	/// A failure opening or feeding the output device.
+	///
+	/// Never fatal, unlike most of these: an engine whose picture works and
+	/// whose sound did not start is worth running, and the message is how
+	/// somebody finds out which half is missing.
+	#[error("audio: {0}")]
+	Audio(String),
+
 	/// A failure importing, compiling or reading an asset.
 	///
 	/// Always carries enough to act on: which file, and which line of it where

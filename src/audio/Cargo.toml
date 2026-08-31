@@ -10,14 +10,14 @@ version.workspace = true
 path = "mod.rs"
 bench = false
 
-# @note: no dependency here, and that is on purpose for one commit. What this
-# crate is at this point is arithmetic over slices - resampling, panning,
-# summing - and every line of it is testable with nothing but a buffer. The
-# output device is the next commit and the only thing in the subsystem that
-# cannot be checked by running a test. Splitting them apart is what keeps the
-# untestable half as small as it turned out to be.
+# @note: two, and the split between them is the point. Everything but
+# `device.rs` is arithmetic over slices and is checked by running it; `cpal` is
+# the driver, the thread that is not ours and the callback whose cadence we do
+# not decide, and it is reached from exactly one file. @ref the workspace
+# manifest for what the dependency costs and what the alternative was.
 [dependencies]
 colby_core.workspace = true
+cpal.workspace = true
 
 # @note: a **dev** dependency, and the same one the renderer has for the same
 # reason: the tests below want a real recording rather than a synthesized one,
