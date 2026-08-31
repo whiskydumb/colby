@@ -1041,6 +1041,14 @@ pub struct Restored {
 pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	agreed(world, scene)?;
 
+	// nothing playing survives, and this is the one thing a restore has to do
+	// about audio. A description carries no voices - a voice is a moment
+	// rather than a thing - so the arena about to be put back holds handles
+	// into a table nobody restored, and a sound still running is one nothing
+	// can name. The same class of debt as `Simulation::forget`, and unlike
+	// that one it can be paid here, because the table is in `World`.
+	world.audio.stop_all();
+
 	// before the entities, because a restored entity's renderable names a pose
 	// handle and the handles only exist once the table has been rebuilt.
 	let generations = slots(&scene.pose_generations, scene.posed.iter().map(Posed::key));
@@ -2771,6 +2779,46 @@ mod tests {
 			busy.bodies.overlaps().is_empty(),
 			"and neither is what was inside a trigger that no longer exists"
 		);
+	}
+
+	#[test]
+	fn a_restore_stops_whatever_was_playing() {
+		// a description carries no voices, so the arena it puts back holds
+		// handles into a table nobody restored. Leaving a sound running would
+		// be a noise from the world before the load that nothing left in the
+		// world after it can name or stop.
+		let scene = capture(&peopled());
+		let mut busy = furnished();
+		let one = busy
+			.audio
+			.play(crate::abi::Voice::flat(crate::abi::SoundId::NONE).looping());
+		let two = busy
+			.audio
+			.play(crate::abi::Voice::flat(crate::abi::SoundId::NONE));
+
+		assert_eq!(busy.audio.len(), 2, "two things were playing");
+
+		restore(&mut busy, &scene).expect("the layouts agree");
+
+		assert!(busy.audio.is_empty(), "and now nothing is");
+		assert!(!busy.audio.alive(one), "not the loop");
+		assert!(!busy.audio.alive(two), "and not the one-shot either");
+	}
+
+	#[test]
+	fn an_instantiate_leaves_what_was_playing_alone() {
+		// the other half of the rule, and the reason it is not symmetric: a
+		// paste puts a prop down beside what is already there, and the arena
+		// it does not touch still holds every handle it held a moment ago.
+		let scene = capture(&peopled());
+		let mut busy = furnished();
+		let id = busy
+			.audio
+			.play(crate::abi::Voice::flat(crate::abi::SoundId::NONE).looping());
+
+		instantiate(&mut busy, &scene, Vec3::X * 3.0);
+
+		assert!(busy.audio.alive(id), "the ambience is still the same ambience");
 	}
 
 	#[test]

@@ -51,7 +51,10 @@ pub use self::{
 		Channel, Clip, ClipData, ClipId, Clips, Interpolation, MAX_KEYS, MAX_NODES, MAX_TRACKS,
 		NO_BONE, Node, Track, Tree,
 	},
-	audio::{Sound, SoundData, SoundId, Sounds},
+	audio::{
+		Category, Listener, MAX_VOICES, Mix, Sound, SoundData, SoundId, Sounds, Voice, VoiceId,
+		Voices,
+	},
 	camera::Camera,
 	character::{Motion, Moved},
 	cvar::{Args, ConsoleFn, Cvars, Value},
@@ -88,7 +91,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 37;
+pub const ABI_VERSION: u32 = 38;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -281,6 +284,26 @@ pub struct World {
 	/// [`audio`](crate::abi::audio).
 	pub sounds: Sounds,
 
+	/// Every sound being played, reached by handle.
+	///
+	/// Host-owned plain data like the bodies, and advanced by the step rather
+	/// than by whatever is turning it into samples: a voice ends after the
+	/// same number of steps on every machine. @ref
+	/// [`audio`](crate::abi::audio).
+	pub audio: Voices,
+
+	/// Where the world is heard from. Game-written, like the camera.
+	///
+	/// Deliberately not derived from the camera: a game whose camera is an
+	/// orbit control would otherwise hear the world from wherever somebody was
+	/// looking. @ref [`Listener::at_camera`] for the one line that makes it
+	/// follow.
+	pub listener: Listener,
+
+	/// How loud each category of sound is. Game-written, and written by the
+	/// host's console variables too - the same arrangement `gravity` has.
+	pub mix: Mix,
+
 	/// Every scene the host has loaded, reached by handle.
 	///
 	/// Filled the same way as `meshes`, from the same tree: an
@@ -421,6 +444,9 @@ impl World {
 			textures: Textures::new(),
 			fonts: Fonts::new(),
 			sounds: Sounds::new(),
+			audio: Voices::new(),
+			listener: Listener::DEFAULT,
+			mix: Mix::FULL,
 			models: Models::new(),
 			clips: Clips::new(),
 			skeletons: Skeletons::new(),

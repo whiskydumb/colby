@@ -75,6 +75,15 @@ pub(crate) fn run(
 	// `colby_core::abi::debug`.
 	world.debug.begin_step(time);
 
+	// and the playheads, at the top for a related reason: a sound the game
+	// starts during this step should have been audible for none of it when the
+	// step ends, and one started during the previous step for exactly one.
+	// Outside the `editing` guard below, like the debug sweep and for the same
+	// argument - time goes on while a world is being edited, and ambience that
+	// stopped the moment somebody pressed F5 would be a bug rather than a
+	// feature. @ref `colby_core::abi::audio`.
+	world.audio.advance(&world.sounds, STEP_SECONDS);
+
 	// hand the accumulated input over, then clear the parts that describe one
 	// step only. A second step in the same frame therefore sees what is held
 	// and none of the edges, which is what keeps one click from being four.
@@ -133,7 +142,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{Body, Key, Shape, Transform, debug},
+		abi::{Body, Key, Shape, SoundData, Transform, Voice, debug},
 		glam::Vec3,
 	};
 
@@ -251,5 +260,42 @@ mod tests {
 		assert!(world.debug.is_empty(), "and swept the geometry the previous one left");
 		assert!(!input.pressed(Key::W), "and drained the input edges");
 		assert!(input.held(Key::W), "without forgetting what is held");
+	}
+
+	#[test]
+	fn the_step_carries_the_playheads_in_either_mode() {
+		// audio goes with the debug sweep rather than with the solver: time
+		// goes on while a world is being edited, and ambience that stopped the
+		// moment somebody pressed F5 would be a bug. The test is in both modes
+		// for exactly that reason.
+		for editing in [false, true] {
+			let (mut world, mut simulation) = falling();
+			let mut input = Input::default();
+			let sound = world.sounds.insert("sounds/test", SoundData {
+				samples: vec![0; 1000],
+				rate: 1000,
+				channels: 1,
+			});
+			let voice = world.audio.play(Voice::flat(sound));
+
+			steps(&mut world, &mut simulation, &mut input, 6, editing);
+
+			let head = world
+				.audio
+				.get(voice)
+				.map_or(0.0, |playing| playing.head);
+
+			assert!(
+				6.0_f32.mul_add(-STEP_SECONDS, head).abs() < 1e-6,
+				"editing={editing}: six steps in, the playhead is six steps along: {head}"
+			);
+
+			steps(&mut world, &mut simulation, &mut input, 60, editing);
+
+			assert!(
+				!world.audio.alive(voice),
+				"editing={editing}: and a second of sound is over after a second of steps"
+			);
+		}
 	}
 }
