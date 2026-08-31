@@ -278,6 +278,7 @@ name = "colby"
 version = "0.1.0"
 dependencies = [
  "colby_asset",
+ "colby_audio",
  "colby_core",
  "colby_editor",
  "colby_engine",

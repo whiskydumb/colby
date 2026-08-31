@@ -7,6 +7,7 @@
 //! definition of what a step does, and nothing in it depends on how much real
 //! time has gone by.
 
+use colby_audio::Device;
 use colby_core::{
 	abi::{Input, World},
 	time::STEP_SECONDS,
@@ -36,6 +37,15 @@ pub(crate) struct Parts<'a> {
 
 	/// The physics, advanced here and queried by the game.
 	pub(crate) simulation: &'a mut Simulation,
+
+	/// The output device, if one opened.
+	///
+	/// Written to at the very bottom of the step and read from nowhere: what
+	/// the mixer needs is a copy of the voice table as the step left it, and
+	/// the step is the only place that knows when that is. `--shot` has none
+	/// of this and is unchanged by it, which is the property that keeps a
+	/// screenshot reproducible.
+	pub(crate) audio: Option<&'a mut Device>,
 }
 
 /// Advances the world by exactly one simulation step.
@@ -54,7 +64,13 @@ pub(crate) fn run(
 	time: f32,
 	editing: bool,
 ) {
-	let Parts { game, interface, scripts, simulation } = parts;
+	let Parts {
+		game,
+		interface,
+		scripts,
+		simulation,
+		audio,
+	} = parts;
 
 	// the present becomes the past before the game touches anything. What the
 	// renderer draws is somewhere between the two, and this is the one moment
@@ -137,6 +153,14 @@ pub(crate) fn run(
 	// and the physics events, for the same reason and beside them: a second
 	// step in the same frame must not be told twice that two things met.
 	world.bodies.end_step();
+
+	// last of all, and after `settle` rather than before it: what crosses to
+	// the mixer is where every voice stands at the end of this step, gains and
+	// all, and a snapshot taken any earlier would describe a world the game
+	// had not finished writing. @ref `colby_audio::snapshot`.
+	if let Some(audio) = audio {
+		audio.publish(world);
+	}
 }
 
 #[cfg(test)]
@@ -187,6 +211,7 @@ mod tests {
 				interface: &mut interface,
 				scripts: None,
 				simulation,
+				audio: None,
 			};
 
 			run(world, parts, input, time, editing);

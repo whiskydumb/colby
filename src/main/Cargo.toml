@@ -26,6 +26,7 @@ static_game = ["dep:colby_game"]
 
 [dependencies]
 colby_asset.workspace = true
+colby_audio.workspace = true
 colby_core.workspace = true
 colby_editor = { workspace = true, optional = true }
 colby_engine.workspace = true

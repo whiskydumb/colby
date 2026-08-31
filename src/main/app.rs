@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 
+use colby_audio::Device;
 use colby_core::{
 	Error, Result,
-	abi::{Input, World},
-	err, error,
+	abi::{Input, Mix, World},
+	debug, err, error,
 	glam::{Vec2, Vec3},
 	info,
 	time::{Clock, Pace, STEP},
@@ -75,6 +76,10 @@ pub(crate) struct App {
 	/// scripts did not start is still worth looking at, and the log says which
 	/// half is missing.
 	scripts: Option<Scripts>,
+	/// The output device and the mixer feeding it. An `Option` for the same
+	/// reason the scripts are: an engine whose picture works and whose sound
+	/// did not start is worth running, and the log says which half is missing.
+	audio: Option<Device>,
 	/// The physics. Boxed because the world holds its address: the table of
 	/// queries installed into `world` points here, and a value that moved
 	/// would leave that pointer behind. @ref `colby_physics`.
@@ -88,6 +93,11 @@ pub(crate) struct App {
 	editor: Option<Editor>,
 	#[cfg(feature = "hot_reload")]
 	watch: Option<Watch>,
+	/// The volumes the console last asked for. @ref
+	/// [`gravity`](Self::gravity), which is the same arrangement and the same
+	/// reason: `World::mix` is the game's field, so writing it every frame
+	/// would argue with a game that ducked the music during a cutscene.
+	mix: Mix,
 	/// The gravity the console last asked for.
 	///
 	/// `World::gravity` is the *game's* field, so the console must not write it
@@ -120,6 +130,7 @@ impl App {
 			renderer: None,
 			interface: Interface::new(),
 			scripts: None,
+			audio: None,
 			simulation,
 			assets: Assets::new(&crate::workspace()),
 			mode: Mode::new(),
@@ -128,6 +139,7 @@ impl App {
 			editor: None,
 			#[cfg(feature = "hot_reload")]
 			watch: None,
+			mix: Mix::FULL,
 			gravity: -PULL,
 			failure: None,
 		}
@@ -174,6 +186,16 @@ impl App {
 			| Ok(scripts) => self.scripts = Some(scripts),
 			| Err(error) =>
 				error!(%error, "no interpreter; documents with a script have no logic"),
+		}
+
+		// after the assets rather than before them, so the first copy into the
+		// mixer's bank finds a registry that is already full.
+		match Device::open() {
+			| Ok(mut device) => {
+				device.load(&self.world.sounds);
+				self.audio = Some(device);
+			},
+			| Err(error) => error!(%error, "no output device; nothing will make a sound"),
 		}
 
 		// and the host's console variables before *that*, so they belong to the
@@ -321,7 +343,19 @@ impl App {
 		self.report(pace);
 
 		self.reload_if_stale();
-		self.assets.poll(&mut self.world);
+
+		// the mixer keeps its own copy of every sound, so a pass over the tree
+		// is also when it has to be told. Only when the pass really ran: four
+		// times a second rather than sixty, which is what keeps the lock the
+		// audio callback wants out of its way.
+		if self.assets.poll(&mut self.world)
+			&& let Some(audio) = self.audio.as_mut()
+		{
+			let copied = audio.load(&self.world.sounds);
+			if copied > 0 {
+				debug!(copied, samples = audio.samples(), "sounds copied into the mixer");
+			}
+		}
 
 		if let Some(console) = self.console.as_ref() {
 			console.poll(&mut self.world);
@@ -357,6 +391,8 @@ impl App {
 			self.world.gravity = Vec3::new(0.0, asked, 0.0);
 		}
 
+		self.hear();
+
 		if let Some(renderer) = self.renderer.as_ref() {
 			// before the steps rather than after them: gameplay asking how
 			// wide the window is should not be told last frame's answer, four
@@ -391,6 +427,7 @@ impl App {
 					interface: &mut self.interface,
 					scripts: self.scripts.as_mut(),
 					simulation: self.simulation.as_mut(),
+					audio: self.audio.as_mut(),
 				},
 				&mut self.input,
 				time,
@@ -449,6 +486,20 @@ impl App {
 
 		self.clock
 			.set_speed(if paused { 0.0 } else { speed });
+	}
+
+	/// Writes the volumes the console asked for, if any of them moved.
+	///
+	/// The same shape gravity has, and the same rule: whoever said something
+	/// last wins, and standing still says nothing. Four numbers rather than
+	/// one, so the comparison is over the whole struct.
+	fn hear(&mut self) {
+		let asked = crate::console::volumes(&self.world.cvars);
+
+		if asked != self.mix {
+			self.mix = asked;
+			self.world.mix = asked;
+		}
 	}
 
 	/// Says something the first time the simulation falls behind, and the first

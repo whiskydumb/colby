@@ -28,12 +28,19 @@ use std::{
 
 use colby_core::{
 	Error,
-	abi::{Args, Value, World, console},
+	abi::{Args, Cvars, Mix, Sound, Value, Voice, World, console},
 	error, info, warn,
 };
 
 /// The file archived variables are kept in.
 const ARCHIVE: &str = "cvars.cfg";
+
+/// How many playing voices `snd.list` writes a line for.
+///
+/// The table holds sixty-four and a listing of all of them is a screen of
+/// identical lines. The count is what the question was about; the lines are for
+/// telling one voice from another.
+const LISTED_VOICES: usize = 12;
 
 /// The most steps one frame will run on top of real time.
 ///
@@ -213,6 +220,195 @@ pub(crate) fn install(world: &mut World) {
 	);
 
 	install_scenes(world);
+	install_audio(world);
+}
+
+/// The four volumes and the three commands over the voice table.
+///
+/// Split off like the scene commands and for the same reason as those: the
+/// installer is long enough that one more subsystem in it is one too many.
+/// Everything here is a write into plain data, so none of it needs the device -
+/// which is also why `snd.play` works in a build whose device failed to open.
+///
+/// @param world - the table to register into
+fn install_audio(world: &mut World) {
+	// archived, unlike the debug variables and like the editor's own: somebody
+	// who turned the sound down meant it, and coming back to a session with it
+	// loud again is the surprise this avoids.
+	world.cvars.saved(
+		colby_audio::MASTER,
+		Value::Float(1.0),
+		"how loud everything is, before anything else scales it",
+	);
+	world.cvars.saved(
+		colby_audio::EFFECTS,
+		Value::Float(1.0),
+		"how loud sounds in the world are",
+	);
+	world
+		.cvars
+		.saved(colby_audio::MUSIC, Value::Float(1.0), "how loud music is");
+	world
+		.cvars
+		.saved(colby_audio::INTERFACE, Value::Float(1.0), "how loud clicks and beeps are");
+
+	world.cvars.command(
+		"snd.play",
+		play_sound,
+		"play a compiled sound by name, at an optional volume",
+	);
+	world
+		.cvars
+		.command("snd.stop", stop_sounds, "stop everything that is playing");
+	world
+		.cvars
+		.command("snd.list", list_sounds, "report the sounds loaded and what is playing");
+}
+
+/// The four volumes, as the console table has them.
+///
+/// A function of the table and nothing else, which is what makes it the one
+/// piece of the audio wiring a test can reach - everything else in this
+/// subsystem's runner half is a call into a device or a write into a world.
+/// Same split as the editor's: if it can be a function of state, it goes
+/// somewhere it can be tested.
+///
+/// @param cvars - the table the four were registered into
+/// @return what the game's `World::mix` should be, with a variable that is
+/// missing or is not a number reading as full volume rather than as silence -
+/// a typo should not turn the sound off
+pub(crate) fn volumes(cvars: &Cvars) -> Mix {
+	let volume = |name: &str| cvars.float(name).unwrap_or(1.0);
+
+	Mix {
+		master: volume(colby_audio::MASTER),
+		effects: volume(colby_audio::EFFECTS),
+		music: volume(colby_audio::MUSIC),
+		interface: volume(colby_audio::INTERFACE),
+	}
+}
+
+/// `snd.play <name> [volume]` - plays a sound with no place in the world.
+///
+/// Flat rather than positioned, because a name typed at a console is not
+/// standing anywhere. It is the cheapest end-to-end check there is: one line
+/// reaches the registry, the voice table, the snapshot, the mixer and a driver.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn play_sound(world: *mut World, args: *const Args) {
+	// SAFETY: as help.
+	let world = unsafe { &mut *world };
+	// SAFETY: as help.
+	let args = unsafe { &*args };
+
+	// @note: this guard cannot be caught by any mutation and is kept for the
+	// message. Without it the empty name reaches `find`, which answers
+	// `SoundId::NONE`, which the check below refuses - so the outcome is the
+	// same and only the sentence differs. "wants the name of a sound" is what
+	// somebody who typed `snd.play` alone needs to read, and "no sound of that
+	// name is loaded" is not.
+	let Some(name) = args.word(0) else {
+		warn!("snd.play wants the name of a sound; snd.list says which there are");
+
+		return;
+	};
+
+	let sound = world.sounds.find(name);
+	if !sound.is_some() {
+		warn!(name, "no sound of that name is loaded");
+
+		return;
+	}
+
+	let volume = args.float(1).unwrap_or(1.0);
+	let id = world
+		.audio
+		.play(Voice::flat(sound).volume(volume));
+
+	if !id.is_some() {
+		warn!(name, "every voice is busy; nothing was played");
+
+		return;
+	}
+
+	info!(
+		name,
+		slot = id.slot(),
+		volume,
+		seconds = world.sounds.data(sound).seconds(),
+		"playing"
+	);
+}
+
+/// `snd.stop` - stops every voice.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn stop_sounds(world: *mut World, _args: *const Args) {
+	// SAFETY: as help.
+	let world = unsafe { &mut *world };
+	let stopped = world.audio.len();
+
+	world.audio.stop_all();
+	info!(stopped, "everything stopped");
+}
+
+/// `snd.list` - reports what is loaded and what is playing.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn list_sounds(world: *mut World, _args: *const Args) {
+	// SAFETY: as help.
+	let world = unsafe { &mut *world };
+
+	info!(
+		sounds = world.sounds.len().saturating_sub(1),
+		playing = world.audio.len(),
+		refused = world.audio.dropped(),
+		master = world.mix.master,
+		"audio"
+	);
+
+	// the null entry is slot zero and is silence, which is not a sound anybody
+	// compiled and not one anybody can play.
+	for entry in world.sounds.iter().skip(1) {
+		let data = entry.value();
+
+		info!(
+			name = entry.name(),
+			seconds = data.seconds(),
+			rate = data.rate,
+			channels = data.channels,
+			"sound"
+		);
+	}
+
+	// a line each, up to a point. Sixty-four of them is what filling the table
+	// looks like and it is not what somebody asking what is playing wants to
+	// read; the count above already answered that question.
+	for (id, voice) in world.audio.iter().take(LISTED_VOICES) {
+		info!(
+			slot = id.slot(),
+			sound = world
+				.sounds
+				.get(voice.sound)
+				.map_or("", Sound::name),
+			head = voice.head,
+			volume = voice.volume,
+			looping = voice.looping,
+			positioned = voice.positioned,
+			"voice"
+		);
+	}
+
+	let rest = world.audio.len().saturating_sub(LISTED_VOICES);
+	if rest > 0 {
+		info!(rest, "and more, not listed");
+	}
 }
 
 /// The four that read or write a file.
@@ -553,4 +749,132 @@ unsafe extern "C-unwind" fn step(world: *mut World, args: *const Args) {
 	};
 
 	world.owed_steps = world.owed_steps.saturating_add(count);
+}
+
+#[cfg(test)]
+mod tests {
+	use colby_core::abi::SoundData;
+
+	use super::*;
+
+	/// A table with the four volumes registered, as `install_audio` leaves it.
+	fn table() -> World {
+		let mut world = World::new();
+		install_audio(&mut world);
+
+		world
+	}
+
+	#[test]
+	fn a_table_nobody_has_touched_reads_as_full_volume() {
+		assert_eq!(volumes(&table().cvars), Mix::FULL, "silence is not a sensible default");
+	}
+
+	#[test]
+	fn a_table_with_no_audio_variables_at_all_still_reads_as_full_volume() {
+		// what a build whose `install_audio` never ran would look like, and
+		// what a config file naming a variable this build dropped looks like.
+		// Reading nothing as silence would be an engine that went quiet for a
+		// reason nobody could find.
+		assert_eq!(volumes(&World::new().cvars), Mix::FULL);
+	}
+
+	#[test]
+	fn each_variable_reaches_its_own_field_and_no_other() {
+		// the mistake this catches is two of them wired to the same name,
+		// which is invisible until somebody turns the music down and the
+		// footsteps go with it.
+		let cases = [
+			(colby_audio::MASTER, Mix { master: 0.25, ..Mix::FULL }),
+			(colby_audio::EFFECTS, Mix { effects: 0.25, ..Mix::FULL }),
+			(colby_audio::MUSIC, Mix { music: 0.25, ..Mix::FULL }),
+			(colby_audio::INTERFACE, Mix { interface: 0.25, ..Mix::FULL }),
+		];
+
+		for (name, expected) in cases {
+			let mut world = table();
+			console::run(&mut world, &format!("{name} 0.25"));
+
+			assert_eq!(volumes(&world.cvars), expected, "{name} moved the wrong field");
+		}
+	}
+
+	#[test]
+	fn the_volumes_are_written_into_the_config_and_the_debug_variables_are_not() {
+		// somebody who turned the sound down meant it. Somebody who turned the
+		// collision outlines on did not mean to find them on tomorrow.
+		let world = table();
+		let archived: Vec<&str> = world
+			.cvars
+			.iter()
+			.filter(|entry| entry.is_archived())
+			.map(colby_core::abi::cvar::Entry::name)
+			.collect();
+
+		for name in [
+			colby_audio::MASTER,
+			colby_audio::EFFECTS,
+			colby_audio::MUSIC,
+			colby_audio::INTERFACE,
+		] {
+			assert!(archived.contains(&name), "{name} should survive a restart");
+		}
+	}
+
+	#[test]
+	fn playing_a_sound_by_name_puts_a_voice_in_the_table() {
+		// the console command is the cheapest end-to-end reach there is, and
+		// it is also the one thing in this file that is a function of a world.
+		let mut world = table();
+		world.sounds.insert("sounds/test", SoundData {
+			samples: vec![0; 100],
+			rate: 1000,
+			channels: 1,
+		});
+
+		console::run(&mut world, "snd.play sounds/test 0.5");
+
+		assert_eq!(world.audio.len(), 1, "something is playing");
+
+		let (_, voice) = world.audio.iter().next().expect("just played");
+
+		assert!((voice.volume - 0.5).abs() < f32::EPSILON, "at the volume that was asked for");
+		assert!(!voice.positioned, "and with no place in the world, having been typed");
+	}
+
+	#[test]
+	fn playing_a_name_nothing_answers_to_plays_nothing() {
+		let mut world = table();
+
+		console::run(&mut world, "snd.play sounds/nothing");
+
+		assert!(world.audio.is_empty(), "a typo is not a voice holding a slot");
+	}
+
+	#[test]
+	fn playing_with_no_name_at_all_plays_nothing() {
+		let mut world = table();
+
+		console::run(&mut world, "snd.play");
+
+		assert!(world.audio.is_empty());
+	}
+
+	#[test]
+	fn stopping_empties_the_table() {
+		let mut world = table();
+		world.sounds.insert("sounds/test", SoundData {
+			samples: vec![0; 100],
+			rate: 1000,
+			channels: 1,
+		});
+
+		for _ in 0..4 {
+			console::run(&mut world, "snd.play sounds/test");
+		}
+
+		assert_eq!(world.audio.len(), 4);
+		console::run(&mut world, "snd.stop");
+		assert!(world.audio.is_empty(), "everything, not the first one");
+	}
 }

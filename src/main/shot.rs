@@ -131,6 +131,11 @@ pub(crate) fn take(path: &Path) -> Result {
 				interface: &mut interface,
 				scripts: Some(&mut scripts),
 				simulation: simulation.as_mut(),
+				// no device, deliberately: a screenshot must be the same on a
+				// machine with speakers and one without, and opening one would
+				// put a driver's cadence inside a path that has to be
+				// reproducible.
+				audio: None,
 			},
 			&mut input,
 			time,

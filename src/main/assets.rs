@@ -124,13 +124,19 @@ impl Assets {
 	/// The same, but at most once every [`POLL_INTERVAL`].
 	///
 	/// @param world - the host state whose registry is kept current
-	pub(crate) fn poll(&mut self, world: &mut World) {
+	/// @return whether the tree was actually looked at this time, which is
+	/// what anything keeping its own copy of an asset wants to know. Four
+	/// times a second rather than sixty, which is the difference between
+	/// taking the mixer's lock often enough to matter and not.
+	pub(crate) fn poll(&mut self, world: &mut World) -> bool {
 		if Instant::now() < self.next_poll {
-			return;
+			return false;
 		}
 
 		self.next_poll = Instant::now() + POLL_INTERVAL;
 		self.sync(world);
+
+		true
 	}
 
 	/// Runs the compiler over the source tree.
@@ -751,6 +757,29 @@ mod tests {
 		}
 
 		fs::write(&path, text).expect("the source is written");
+	}
+
+	#[test]
+	fn a_poll_says_whether_it_actually_looked() {
+		// the mixer keeps its own copy of every sound and is told to refresh it
+		// when this says yes. A poll that always said no would leave a
+		// recompiled sound loaded everywhere except where it is played, which
+		// is a silence nobody could explain.
+		let (source, output) = trees("poll-reports");
+		put(&source, "meshes/thing.obj", &triangle(1.0));
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source, output);
+
+		// the first one is inside the interval too: a fresh `Assets` is a
+		// quarter second away from its first pass, because the startup path
+		// calls `sync` directly rather than waiting for one.
+		assert!(!assets.poll(&mut world), "nothing has elapsed yet");
+
+		sleep(POLL_INTERVAL + Duration::from_millis(30));
+
+		assert!(assets.poll(&mut world), "and now the interval has");
+		assert!(!assets.poll(&mut world), "and the one right after it has not");
 	}
 
 	#[test]

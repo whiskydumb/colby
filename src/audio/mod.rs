@@ -34,6 +34,18 @@
 //! which is deliberate: a value computed on somebody else's thread at somebody
 //! else's cadence is a value that cannot be unit-tested.
 
+/// The variable that scales everything.
+pub const MASTER: &str = "snd.volume";
+
+/// The variable that scales sounds in the world.
+pub const EFFECTS: &str = "snd.effects";
+
+/// The variable that scales music.
+pub const MUSIC: &str = "snd.music";
+
+/// The variable that scales clicks and beeps.
+pub const INTERFACE: &str = "snd.interface";
+
 pub mod bank;
 pub mod device;
 pub mod mix;
