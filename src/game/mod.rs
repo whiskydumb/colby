@@ -20,10 +20,10 @@
 use colby_core::{
 	abi::{
 		ABI_VERSION, Args, Body, BodyId, BodyKind, Build, Button, EntityId, Entry, GameApi,
-		Joint, JointId, Key, Layers, Material, MaterialId, MeshId, Motion, Node, PanelId, Pose,
-		PoseId, Ragdoll, Renderable, SceneData, SceneId, Segment, Shape, ShapeKind, SkeletonId,
-		Stage, TouchKind, TraceInfo, Transform, Tree, World, character, console, debug, ragdoll,
-		scene,
+		Joint, JointId, Key, Layers, Listener, Material, MaterialId, MeshId, Motion, Node,
+		PanelId, Pose, PoseId, Ragdoll, Renderable, SceneData, SceneId, Segment, Shape,
+		ShapeKind, SkeletonId, Stage, TouchKind, TraceInfo, Transform, Tree, Voice, VoiceId,
+		World, character, console, debug, ragdoll, scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -717,6 +717,14 @@ struct State {
 	/// with a bit pattern other than zero or one is the one thing that is not.
 	limp: u32,
 
+	/// The gun's hum while it is holding something, or nothing.
+	///
+	/// The one voice in this game whose handle is worth keeping: everything
+	/// else is a noise that ends on its own and is never spoken of again. A
+	/// loop has to be stopped by somebody, and this is who. @ref
+	/// [`hum_along`].
+	hum: VoiceId,
+
 	/// The bones every one of those pieces is moved by.
 	///
 	/// One pose for the whole character rather than one per piece, which is
@@ -731,7 +739,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 19;
+const STATE_LAYOUT: u64 = 20;
 
 /// The module's single exported symbol.
 ///
@@ -866,6 +874,12 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 
 		// the arena was reset, so the handles it held are gone. Anything the
 		// old build spawned would be orphaned; clear the table and start over.
+		//
+		// The gun's hum is one of those handles, and a loop nobody can name is
+		// a noise that plays until the process ends. Nothing in the host does
+		// this for a game: the voice table is the game's to keep and the
+		// game's to empty. @ref `colby_core::abi::audio`.
+		world.audio.stop_all();
 		world.entities.clear();
 		// and the bodies with them: a body naming an entity that no longer
 		// exists drives nothing, and would still be traced against.
@@ -983,6 +997,9 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	}
 
 	world.camera.orbit(yaw, pitch, distance);
+	// after the camera and before anything that plays: what a sound is worth
+	// this step is worked out against wherever the ears are now.
+	listen(world);
 
 	relay_map(world);
 	relay_props(world);
@@ -1553,22 +1570,161 @@ fn label_pick(world: &mut World) {
 fn count_landings(world: &mut World) {
 	let loose = props(world);
 
-	let landed = world
+	let where_they_landed: Vec<Vec3> = world
 		.bodies
 		.touches()
 		.iter()
 		.filter(|touch| touch.kind == TouchKind::Began)
 		.filter(|touch| loose.iter().any(|&id| touch.names(id)))
-		.count();
+		.map(|touch| touch.point)
+		.collect();
 
-	if landed == 0 {
+	if where_they_landed.is_empty() {
 		return;
+	}
+
+	// at the point the two met rather than at either body's middle, which is
+	// what makes a plank landing on its end sound like it landed on its end.
+	// One voice a pair: a crate hitting the floor and a wall at once is two
+	// noises because it is two landings.
+	for at in &where_they_landed {
+		play_at(world, THUD, *at, THUD_VOLUME, THUD_RANGE);
 	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 	state.landings = state
 		.landings
-		.saturating_add(u32::try_from(landed).unwrap_or(0));
+		.saturating_add(u32::try_from(where_they_landed.len()).unwrap_or(0));
+}
+
+/// The sound a prop makes when it lands on something.
+const THUD: &str = "sounds/thud";
+
+/// The sound the physics gun makes while it is holding one.
+const HUM: &str = "sounds/hum";
+
+/// The sound the toolgun makes when it changes its mind.
+const CLICK: &str = "sounds/click";
+
+/// How loud a landing is, before the distance to it.
+const THUD_VOLUME: f32 = 0.8;
+
+/// How close a landing has to be to be at full volume, and how far away it
+/// stops getting quieter.
+///
+/// Six units and sixty. The first was measured rather than chosen: at two, a
+/// recording of the props settling peaked at 0.23, because everything that
+/// lands is ten to twenty units from where somebody is standing and the
+/// inverse of that is most of the volume gone. The engine one field over
+/// defaults its equivalent to ten. The second number is past the far corner of
+/// a map about forty across, so a crate landing on the other side of the yard
+/// is audible and quiet rather than silent, which is what a room sounds like.
+const THUD_RANGE: (f32, f32) = (6.0, 60.0);
+
+/// How loud the gun is.
+///
+/// Well under the thud on purpose: it is on for as long as somebody is holding
+/// something, and a continuous sound at the volume of an event is what makes a
+/// game tiring rather than lively.
+const HUM_VOLUME: f32 = 0.3;
+
+/// The same two numbers for the gun, closer in because it is being held.
+const HUM_RANGE: (f32, f32) = (3.0, 30.0);
+
+/// How loud the toolgun's click is.
+const CLICK_VOLUME: f32 = 0.5;
+
+/// Puts the ears where the eyes are.
+///
+/// One line, and it is deliberately a line the game writes rather than
+/// something the engine assumes: a game whose camera is a spectator's would
+/// otherwise hear the world from wherever somebody happened to be looking. @ref
+/// `colby_core::abi::audio`.
+///
+/// @param world - the camera to read and the listener to write
+fn listen(world: &mut World) { world.listener = Listener::at_camera(&world.camera); }
+
+/// Plays a sound at a place in the world, by name.
+///
+/// The name is looked up every time rather than resolved once into the arena.
+/// It is a scan over four entries, it happens a handful of times a second, and
+/// what it buys is that a sound compiled while the game is running is heard
+/// without a reload - the same property editing a `.scene` has.
+///
+/// @param world - the registry to look in and the table to play into
+/// @param name - what the compiler registered it as
+/// @param at - where it is, in world space
+/// @param volume - how loud, before the distance
+/// @param range - how close it is at full volume, and how far away it stops
+/// getting quieter
+/// @return the handle, which is [`VoiceId::NONE`] when the table is full or
+/// the name is not one the compiler wrote
+fn play_at(world: &mut World, name: &str, at: Vec3, volume: f32, range: (f32, f32)) -> VoiceId {
+	let sound = world.sounds.find(name);
+	if !sound.is_some() {
+		return VoiceId::NONE;
+	}
+
+	world.audio.play(
+		Voice::at(sound, at)
+			.volume(volume)
+			.range(range.0, range.1),
+	)
+}
+
+/// Plays a sound that is in the player's hands rather than out in the world.
+///
+/// @param world - the registry to look in and the table to play into
+/// @param name - what the compiler registered it as
+/// @param volume - how loud
+fn play_flat(world: &mut World, name: &str, volume: f32) {
+	let sound = world.sounds.find(name);
+	if sound.is_some() {
+		world
+			.audio
+			.play(Voice::flat(sound).volume(volume));
+	}
+}
+
+/// Starts the gun's hum, or moves the one already going.
+///
+/// Called from `carry`, so the sound follows the prop rather than the player -
+/// which is what makes letting a long plank swing out to one side audible.
+///
+/// @param world - the voice table, and the body to follow
+/// @param at - where the held prop is now
+fn hum_along(world: &mut World, at: Vec3) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let humming = state.hum;
+
+	if let Some(voice) = world.audio.get_mut(humming) {
+		voice.at = at;
+
+		return;
+	}
+
+	// either nothing was playing or the voice ended and its slot went to
+	// somebody else, which the generation in the handle is what catches.
+	let started = play_at(world, HUM, at, HUM_VOLUME, HUM_RANGE);
+	let looped = world
+		.audio
+		.get_mut(started)
+		.map(|voice| voice.looping = true)
+		.is_some();
+
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	state.hum = if looped { started } else { VoiceId::NONE };
+}
+
+/// Stops it.
+///
+/// @param world - the voice table
+fn hush(world: &mut World) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let humming = state.hum;
+
+	state.hum = VoiceId::NONE;
+	world.audio.stop(humming);
 }
 
 /// Traces from the camera through the pointer and remembers what is there.
@@ -1766,6 +1922,10 @@ fn release(world: &mut World) {
 	state.hold = JointId::NONE;
 	state.held = BodyId::NONE;
 	world.joints.despawn(joint);
+	// every way of letting go comes through here - the button, swapping guns,
+	// the prop being taken out from under the beam - which is what makes this
+	// the only place the loop has to be stopped.
+	hush(world);
 
 	trace!(body = body.slot(), "let go");
 }
@@ -1840,6 +2000,10 @@ fn carry(world: &mut World, yaw: f32) {
 
 	world.debug.line(muzzle, grip, debug::CYAN);
 	world.debug.point(grip, MUZZLE_MARK, debug::CYAN);
+
+	// at the grip rather than at the player, which is what makes carrying a
+	// long plank out to one side something you can hear.
+	hum_along(world, grip);
 }
 
 /// The toolgun: five modes on one weapon.
@@ -1879,6 +2043,9 @@ fn toolgun(world: &mut World) {
 		state.gun = TOOLGUN;
 		state.tool = u32::try_from(index).unwrap_or(0);
 		forget_first(world);
+		// flat rather than placed: it is in the player's hands, and the player
+		// is where the ears are.
+		play_flat(world, CLICK, CLICK_VOLUME);
 	}
 
 	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
