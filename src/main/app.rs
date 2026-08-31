@@ -5,7 +5,7 @@
 //! inside the hot-reloaded module, which is why swapping the module is allowed
 //! to be a two-line operation in the middle of a frame.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use colby_audio::Device;
 use colby_core::{
@@ -36,7 +36,7 @@ use colby_ui::Interface;
 
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
-use crate::{assets::Assets, console::Console, game::Game, input, mode::Mode, step};
+use crate::{assets::Assets, console::Console, game::Game, input, mode::Mode, net::Net, step};
 
 /// The window title.
 const TITLE: &str = "colby";
@@ -80,6 +80,16 @@ pub(crate) struct App {
 	/// reason the scripts are: an engine whose picture works and whose sound
 	/// did not start is worth running, and the log says which half is missing.
 	audio: Option<Device>,
+	/// The socket and the conversation over it, if `--connect` named a host.
+	/// An `Option` for the third time and the third same reason: an engine
+	/// whose window works and whose socket did not bind is worth running.
+	net: Option<Net>,
+	/// When this process started, which is the clock the wire is on.
+	///
+	/// Real time rather than simulated: a round-trip estimate measured in
+	/// simulated seconds would shrink whenever the machine stalled, and the
+	/// number is about the wire rather than about the world.
+	started: Instant,
 	/// The physics. Boxed because the world holds its address: the table of
 	/// queries installed into `world` points here, and a value that moved
 	/// would leave that pointer behind. @ref `colby_physics`.
@@ -131,6 +141,8 @@ impl App {
 			interface: Interface::new(),
 			scripts: None,
 			audio: None,
+			net: None,
+			started: Instant::now(),
 			simulation,
 			assets: Assets::new(&crate::workspace()),
 			mode: Mode::new(),
@@ -201,6 +213,17 @@ impl App {
 		// and the host's console variables before *that*, so they belong to the
 		// engine rather than to the module and survive a reload.
 		crate::console::install(&mut self.world);
+
+		// after them, because how bad the wire is is a console variable and the
+		// seed for it is one too. A window that was not told to connect to
+		// anything simply has no socket, which is the ordinary case.
+		if let Some(address) = crate::net::wanted() {
+			match Net::connect(address, crate::net::seed(&self.world.cvars)) {
+				| Ok(net) => self.net = Some(net),
+				| Err(error) => error!(%error, "no socket; this window is on its own"),
+			}
+		}
+
 		self.start_editor();
 
 		self.game = Some(Game::open(&mut self.world)?);
@@ -368,6 +391,17 @@ impl App {
 		// saw. @ref `crate::saves`.
 		crate::saves::serve(&mut self.world, &mut self.simulation);
 
+		// and whatever a command asked of the wire, beside it and for the same
+		// reason. Then everything the socket is holding, before any step: what
+		// a step runs against is what had arrived when it started rather than
+		// whatever turned up halfway through. @ref `crate::net`.
+		crate::net::serve(self.net.as_mut());
+
+		if let Some(net) = self.net.as_mut() {
+			net.set(crate::net::conditions(&self.world.cvars));
+			net.receive(self.started.elapsed());
+		}
+
 		// and the mode's own edge, in the same place and for the same reason:
 		// stopping play replaces every table in the world, so it happens
 		// between steps rather than inside one.
@@ -433,6 +467,13 @@ impl App {
 				time,
 				editing,
 			);
+
+			// and out once a step rather than once a frame, because a message
+			// has to mean "this is where things stand at this moment" and a
+			// frame rate is not a moment.
+			if let Some(net) = self.net.as_mut() {
+				net.send(self.started.elapsed());
+			}
 		}
 
 		self.frames = self.frames.saturating_add(1);

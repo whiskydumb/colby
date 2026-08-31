@@ -16,8 +16,11 @@ mod app;
 mod assets;
 mod console;
 mod game;
+mod host;
 mod input;
+mod link;
 mod mode;
+mod net;
 mod record;
 mod saves;
 mod shot;
@@ -59,6 +62,16 @@ fn main() -> ExitCode {
 /// Brings the process up, runs the event loop, and takes it back down in order.
 fn run() -> Result {
 	log::init()?;
+
+	// before anything else, including the check that this process is laid out
+	// for hot-reload: a two-endpoint run loads no module, opens no window and
+	// opens no socket. The wire between the two is a pair of inboxes, so the
+	// answer is the same on a machine with a network and one without, and in
+	// any build. @ref `crate::link`.
+	if let Some(steps) = link::requested() {
+		return link::run(steps);
+	}
+
 	prepare()?;
 
 	// a screenshot never opens a window, so it takes its own way out.
@@ -74,6 +87,15 @@ fn run() -> Result {
 	// without.
 	if let Some(request) = record::requested() {
 		let result = record::take(&request);
+		finish();
+
+		return result;
+	}
+
+	// and a host opens a socket instead of a window, which is a mode rather
+	// than a build: the same executable, the same module, the same step.
+	if let Some(port) = host::requested() {
+		let result = host::serve(port);
 		finish();
 
 		return result;

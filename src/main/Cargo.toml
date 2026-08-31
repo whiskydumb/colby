@@ -31,6 +31,7 @@ colby_core.workspace = true
 colby_editor = { workspace = true, optional = true }
 colby_engine.workspace = true
 colby_game = { workspace = true, optional = true }
+colby_net.workspace = true
 colby_physics.workspace = true
 colby_script.workspace = true
 colby_ui.workspace = true

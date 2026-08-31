@@ -98,6 +98,17 @@ shot path="colby.png": hot-build
 hear path="colby.wav" steps="90": hot-build
     ./{{hot_dir}}/colby.exe --record "{{path}}" {{steps}}
 
+# run two endpoints against each other over a wire that lies
+#
+# @note: the third of the family, after `just shot` and `just hear`, and the
+# same argument as both: a change to something nobody can look at is a change
+# nobody can review. No window, no socket and no clock - two endpoints in one
+# process, a wire between them that loses and delays on a seed, and a hash of
+# everything that got through. The same number on every machine, or it is not a
+# tool. Pass a step count for a longer run.
+link steps="600":
+    cargo run --quiet --package colby {{locked}} -- --link {{steps}}
+
 # build and open the documentation
 doc:
     cargo doc --workspace --no-deps --open

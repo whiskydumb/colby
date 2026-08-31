@@ -283,6 +283,7 @@ dependencies = [
  "colby_editor",
  "colby_engine",
  "colby_game",
+ "colby_net",
  "colby_physics",
  "colby_script",
  "colby_ui",

@@ -221,6 +221,28 @@ pub(crate) fn install(world: &mut World) {
 
 	install_scenes(world);
 	install_audio(world);
+	install_net(world);
+}
+
+/// The six numbers that make the wire bad, and the two commands over it.
+///
+/// Split off like the scenes and the volumes, and for the same reason: an
+/// installer with one more subsystem inlined in it is one nobody reads. The
+/// numbers themselves are registered by the subsystem that reads them back, so
+/// that the name and its meaning are written down once.
+///
+/// @param world - the table to register into
+fn install_net(world: &mut World) {
+	crate::net::install(&mut world.cvars);
+
+	world.cvars.command(
+		"net.say",
+		say,
+		"send the rest of the line to every peer, resent until each has it",
+	);
+	world
+		.cvars
+		.command("net.status", status, "report the wire and every peer on it");
 }
 
 /// The four volumes and the three commands over the voice table.
@@ -529,6 +551,40 @@ unsafe extern "C-unwind" fn echo(_world: *mut World, args: *const Args) {
 	let args = unsafe { &*args };
 
 	info!("{}", args.rest());
+}
+
+/// `net.say <text>` - queues a console line for every peer.
+///
+/// The only way to put something through the reliable ring from a live run, and
+/// therefore the cheapest end-to-end check there is: one line reaches the ring,
+/// the channel, the socket, the far end's link, its channel and its ring. What
+/// the far end does with the line is nothing, deliberately - @ref `crate::net`
+/// for why a peer may not run commands here yet.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn say(_world: *mut World, args: *const Args) {
+	// SAFETY: as help.
+	let args = unsafe { &*args };
+	let text = args.rest();
+
+	if text.is_empty() {
+		warn!("net.say needs something to say");
+
+		return;
+	}
+
+	crate::net::ask(crate::net::Request::Say(text));
+}
+
+/// `net.status` - reports the wire and every peer on it.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn status(_world: *mut World, _args: *const Args) {
+	crate::net::ask(crate::net::Request::Status);
 }
 
 /// `exec <path>` - runs a config file.
