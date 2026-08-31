@@ -27,12 +27,12 @@ use std::{
 
 use colby_asset::{
 	MeshFile, TextureFile, anim::ClipFile, compile, compile::Kind, document::DocumentFile,
-	font::FontFile, model::ModelFile, scene::SceneFile, skeleton::SkeletonFile,
+	font::FontFile, model::ModelFile, scene::SceneFile, skeleton::SkeletonFile, sound::SoundFile,
 };
 use colby_core::{
 	abi::{
 		ClipData, DocumentData, FontData, Material, MaterialId, MeshData, MeshId, ModelData,
-		Placement, SceneData, SkeletonData, SkeletonId, TextureData, TextureId, World,
+		Placement, SceneData, SkeletonData, SkeletonId, SoundData, TextureData, TextureId, World,
 	},
 	debug, info, warn,
 };
@@ -233,6 +233,7 @@ impl Assets {
 			| Kind::Mesh => load_mesh(world, path, &name),
 			| Kind::Texture => load_texture(world, path, &name),
 			| Kind::Font => load_font(world, path, &name),
+			| Kind::Sound => load_sound(world, path, &name),
 			| Kind::Document => load_document(world, path, &name),
 			| Kind::Model => load_model(world, path, &name),
 			| Kind::Scene => load_scene(world, path, &name),
@@ -263,6 +264,7 @@ impl Assets {
 				| Kind::Mesh => drop(world.meshes.insert(&name, MeshData::default())),
 				| Kind::Texture => drop(world.textures.insert(&name, TextureData::white())),
 				| Kind::Font => drop(world.fonts.insert(&name, FontData::empty())),
+				| Kind::Sound => drop(world.sounds.insert(&name, SoundData::silence())),
 				| Kind::Document => drop(world.ui.insert(&name, DocumentData::empty())),
 				| Kind::Model => drop(world.models.insert(&name, ModelData::default())),
 				| Kind::Scene => drop(world.scenes.insert(&name, SceneData::default())),
@@ -384,6 +386,38 @@ fn load_font(world: &mut World, path: &Path, name: &str) {
 	let id = world.fonts.insert(name, data);
 
 	info!(name, slot = id.index(), glyphs, width, height, "font loaded");
+}
+
+/// Reads one `.csnd` into the world's sound registry.
+fn load_sound(world: &mut World, path: &Path, name: &str) {
+	let file = match SoundFile::open(path) {
+		| Ok(file) => file,
+		| Err(error) => {
+			warn!(%error, "the sound on disk could not be read");
+
+			return;
+		},
+	};
+
+	let data = file.to_sound_data();
+
+	let existing = world.sounds.find(name);
+	if existing.is_some()
+		&& world
+			.sounds
+			.get(existing)
+			.is_some_and(|sound| *sound.value() == data)
+	{
+		// as the other three: samples that have not changed do not need
+		// replacing, and the revision is what tells the mixer to start a voice
+		// on this sound over from the beginning.
+		return;
+	}
+
+	let (frames, rate, channels) = (data.frames(), data.rate, data.channels);
+	let id = world.sounds.insert(name, data);
+
+	info!(name, slot = id.index(), frames, rate, channels, "sound loaded");
 }
 
 /// Reads one `.cdoc` into the world's document table.

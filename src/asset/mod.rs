@@ -41,8 +41,10 @@ pub mod png;
 pub mod scene;
 pub mod sdf;
 pub mod skeleton;
+pub mod sound;
 pub mod texture;
 pub mod ttf;
+pub mod wav;
 
 pub use self::{
 	bytes::AlignedBytes,

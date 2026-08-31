@@ -175,6 +175,10 @@ fn describe(produced: Produced) -> String {
 		},
 		| Produced::Texture { width, height, levels } =>
 			format!("{width:>6} x {height:<6} {levels} mip levels"),
+		| Produced::Sound { frames, rate, channels } => format!(
+			"{frames:>6} frames at {rate} a second, {}",
+			if channels == 1 { "mono" } else { "stereo" }
+		),
 		| Produced::Font { glyphs, width, height } =>
 			format!("{glyphs:>6} glyphs in a {width} x {height} atlas"),
 		| Produced::Document { nodes, rules } => format!("{nodes:>6} boxes {rules:>6} rules"),

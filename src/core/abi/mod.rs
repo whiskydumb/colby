@@ -22,6 +22,7 @@
 use crate::glam::{Mat4, Quat, Vec3};
 
 pub mod anim;
+pub mod audio;
 pub mod camera;
 pub mod character;
 pub mod console;
@@ -50,6 +51,7 @@ pub use self::{
 		Channel, Clip, ClipData, ClipId, Clips, Interpolation, MAX_KEYS, MAX_NODES, MAX_TRACKS,
 		NO_BONE, Node, Track, Tree,
 	},
+	audio::{Sound, SoundData, SoundId, Sounds},
 	camera::Camera,
 	character::{Motion, Moved},
 	cvar::{Args, ConsoleFn, Cvars, Value},
@@ -86,7 +88,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 36;
+pub const ABI_VERSION: u32 = 37;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -271,6 +273,14 @@ pub struct World {
 	/// links a font library. @ref [`font`](crate::abi::font).
 	pub fonts: Fonts,
 
+	/// Every sound the mixer can play, reached by handle.
+	///
+	/// Filled the same way as `meshes` and from the same tree: the compiler
+	/// turns whatever a recorder wrote into interleaved samples, and nothing
+	/// at runtime links an audio library to open a file. @ref
+	/// [`audio`](crate::abi::audio).
+	pub sounds: Sounds,
+
 	/// Every scene the host has loaded, reached by handle.
 	///
 	/// Filled the same way as `meshes`, from the same tree: an
@@ -410,6 +420,7 @@ impl World {
 			meshes: Meshes::new(),
 			textures: Textures::new(),
 			fonts: Fonts::new(),
+			sounds: Sounds::new(),
 			models: Models::new(),
 			clips: Clips::new(),
 			skeletons: Skeletons::new(),

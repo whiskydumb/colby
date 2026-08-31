@@ -45,7 +45,7 @@ use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
 use crate::{
 	anim, document, font, format, gltf, html, jpeg, level, model, obj, png, scene, skeleton,
-	texture, ttf,
+	sound, texture, ttf, wav,
 };
 
 /// The directory under a workspace that holds editable sources.
@@ -74,6 +74,7 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
 	gltf::EXTENSION,
 	gltf::BINARY_EXTENSION,
 	level::EXTENSION,
+	wav::EXTENSION,
 ];
 
 /// The extensions it writes.
@@ -86,6 +87,7 @@ pub const OUTPUT_EXTENSIONS: &[&str] = &[
 	scene::EXTENSION,
 	skeleton::EXTENSION,
 	anim::EXTENSION,
+	sound::EXTENSION,
 ];
 
 /// Which of colby's formats a source compiles into.
@@ -112,6 +114,14 @@ pub enum Kind {
 	/// directory named after it, loaded by exactly the code that loads a
 	/// mesh anybody made by hand.
 	Model,
+
+	/// A `.wav` becomes a `.csnd`.
+	///
+	/// The samples are widened to sixteen bits and otherwise left alone:
+	/// nothing is resampled, because the rate a machine's device runs at is
+	/// not knowable here, and nothing is compressed, because the thing that
+	/// forces a codec is music and there is none yet.
+	Sound,
 
 	/// A `.scene` becomes a `.cscene`, the same file a save is.
 	///
@@ -150,6 +160,7 @@ impl Kind {
 			| obj::EXTENSION => Some(Self::Mesh),
 			| png::EXTENSION | jpeg::EXTENSION | jpeg::LONG_EXTENSION => Some(Self::Texture),
 			| ttf::EXTENSION => Some(Self::Font),
+			| wav::EXTENSION => Some(Self::Sound),
 			| html::EXTENSION => Some(Self::Document),
 			| gltf::EXTENSION | gltf::BINARY_EXTENSION => Some(Self::Model),
 			| level::EXTENSION => Some(Self::Scene),
@@ -164,6 +175,7 @@ impl Kind {
 			| Self::Mesh => format::EXTENSION,
 			| Self::Texture => texture::EXTENSION,
 			| Self::Font => font::EXTENSION,
+			| Self::Sound => sound::EXTENSION,
 			| Self::Document => document::EXTENSION,
 			| Self::Model => model::EXTENSION,
 			| Self::Scene => scene::EXTENSION,
@@ -184,6 +196,7 @@ impl Kind {
 			| format::EXTENSION => Some(Self::Mesh),
 			| texture::EXTENSION => Some(Self::Texture),
 			| font::EXTENSION => Some(Self::Font),
+			| sound::EXTENSION => Some(Self::Sound),
 			| document::EXTENSION => Some(Self::Document),
 			| model::EXTENSION => Some(Self::Model),
 			| scene::EXTENSION => Some(Self::Scene),
@@ -200,6 +213,7 @@ impl Kind {
 			| Self::Mesh => format::version_of(path),
 			| Self::Texture => texture::version_of(path),
 			| Self::Font => font::version_of(path),
+			| Self::Sound => sound::version_of(path),
 			| Self::Document => document::version_of(path),
 			| Self::Model => model::version_of(path),
 			| Self::Scene => scene::version_of(path),
@@ -215,6 +229,7 @@ impl Kind {
 			| Self::Mesh => format::FORMAT_VERSION,
 			| Self::Texture => texture::FORMAT_VERSION,
 			| Self::Font => font::FORMAT_VERSION,
+			| Self::Sound => sound::FORMAT_VERSION,
 			| Self::Document => document::FORMAT_VERSION,
 			| Self::Model => model::FORMAT_VERSION,
 			| Self::Scene => scene::FORMAT_VERSION,
@@ -295,6 +310,18 @@ pub enum Produced {
 
 		/// How many pieces of it stand somewhere.
 		placements: usize,
+	},
+
+	/// Samples.
+	Sound {
+		/// How many frames long the recording is.
+		frames: usize,
+
+		/// How many of them go by in a second.
+		rate: u32,
+
+		/// One for mono, two for stereo.
+		channels: u16,
 	},
 
 	/// Letters.
@@ -485,6 +512,18 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 				glyphs: data.glyphs.len(),
 				width: data.atlas_width,
 				height: data.atlas_height,
+			};
+
+			(bytes, produced)
+		},
+		| Kind::Sound => {
+			let data = wav::import_file(source)?;
+			let bytes = sound::encode(&data)
+				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+			let produced = Produced::Sound {
+				frames: data.frames(),
+				rate: data.rate,
+				channels: data.channels,
 			};
 
 			(bytes, produced)
@@ -951,6 +990,111 @@ mod tests {
 
 	use super::*;
 	use crate::{document::DocumentFile, font::FontFile, format::MeshFile, texture::TextureFile};
+
+	/// Every kind the compiler knows about.
+	///
+	/// Written out rather than derived, and kept honest by
+	/// [`the_list_of_kinds_holds_every_one_there_is`], which indexes into it
+	/// through an exhaustive match: a variant added to [`Kind`] has to be given
+	/// an index, and the only index left over is one this array does not have.
+	const EVERY_KIND: [Kind; 9] = [
+		Kind::Mesh,
+		Kind::Texture,
+		Kind::Font,
+		Kind::Sound,
+		Kind::Document,
+		Kind::Model,
+		Kind::Scene,
+		Kind::Skeleton,
+		Kind::Clip,
+	];
+
+	/// Where a kind sits in [`EVERY_KIND`].
+	const fn index_of(kind: Kind) -> usize {
+		match kind {
+			| Kind::Mesh => 0,
+			| Kind::Texture => 1,
+			| Kind::Font => 2,
+			| Kind::Sound => 3,
+			| Kind::Document => 4,
+			| Kind::Model => 5,
+			| Kind::Scene => 6,
+			| Kind::Skeleton => 7,
+			| Kind::Clip => 8,
+		}
+	}
+
+	/// A path with this extension on it, for asking the two classifiers.
+	fn named(extension: &str) -> PathBuf { PathBuf::from("thing").with_extension(extension) }
+
+	#[test]
+	fn the_list_of_kinds_holds_every_one_there_is() {
+		// walked by index rather than by value, which is the direction with
+		// teeth: the other way round, a list holding one kind twice and
+		// another not at all agrees with itself and every test that walks it
+		// quietly skips the missing one.
+		for (index, kind) in EVERY_KIND.iter().enumerate() {
+			assert_eq!(
+				index_of(*kind),
+				index,
+				"{kind:?} sits at {index} and the match puts it at {}, so the list has a 				 \
+				 duplicate and a gap",
+				index_of(*kind)
+			);
+		}
+	}
+
+	#[test]
+	fn every_kind_writes_an_extension_the_walker_looks_for() {
+		// the bug this catches, which happened: a kind was added to `Kind::of`
+		// and to the compiler and left out of the two extension lists, so the
+		// walker never handed the compiler one of its sources and never found
+		// one of its outputs. Everything compiled, every other test passed,
+		// and the asset was invisible.
+		for kind in EVERY_KIND {
+			assert!(
+				OUTPUT_EXTENSIONS.contains(&kind.extension()),
+				"{kind:?} writes .{} and OUTPUT_EXTENSIONS does not list it, so nothing it 				 \
+				 wrote is ever loaded",
+				kind.extension()
+			);
+			assert_eq!(
+				Kind::of_output(&named(kind.extension())),
+				Some(kind),
+				"and .{} has to lead back to it",
+				kind.extension()
+			);
+		}
+	}
+
+	#[test]
+	fn every_kind_with_a_source_has_one_the_walker_looks_for() {
+		for kind in EVERY_KIND {
+			let reachable = SOURCE_EXTENSIONS
+				.iter()
+				.any(|extension| Kind::of(&named(extension)) == Some(kind));
+			// the two kinds with no source of their own are named rather than
+			// caught by a wildcard, so that a third one has to be thought
+			// about here.
+			let expected = !matches!(kind, Kind::Skeleton | Kind::Clip);
+
+			assert_eq!(
+				reachable, expected,
+				"{kind:?}: a kind with a source of its own has to be reachable through 				 \
+				 SOURCE_EXTENSIONS, or nothing ever hands the compiler one"
+			);
+		}
+	}
+
+	#[test]
+	fn every_source_extension_the_walker_collects_compiles_into_something() {
+		for extension in SOURCE_EXTENSIONS {
+			assert!(
+				Kind::of(&named(extension)).is_some(),
+				".{extension} is walked for and then not recognized, so every file with one 				 fails to compile"
+			);
+		}
+	}
 
 	/// A cube as OBJ, written the way a tool would.
 	const CUBE_OBJ: &str = "\
@@ -1503,6 +1647,16 @@ f 4 1 5 8
 						"{} compiled with complaints: {:?}",
 						compiled.name,
 						compiled.warnings
+					);
+				},
+				| Some(Kind::Sound) => {
+					let file =
+						sound::SoundFile::open(&compiled.output).expect("the sound reads back");
+
+					assert!(
+						!file.samples().is_empty(),
+						"{} compiled to a sound with no samples in it",
+						compiled.name
 					);
 				},
 				| Some(Kind::Skeleton | Kind::Clip) => panic!(
