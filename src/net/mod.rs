@@ -32,6 +32,8 @@
 //!   end has acknowledged, the round-trip estimate and what was lost;
 //! - [`reliable`] - the ring of numbered console lines that is the only thing
 //!   on this wire nothing is allowed to lose;
+//! - [`command`] - what a client is asking for, and which of its asks the host
+//!   has run;
 //! - [`snapshot`] - what moved, as a difference from what the far end already
 //!   has;
 //! - [`ring`] - what a host remembers having told one peer, so the next telling
@@ -52,6 +54,7 @@
 //! later step, said here so that nobody discovers it as a bug.
 
 pub mod channel;
+pub mod command;
 pub mod fragment;
 pub mod heard;
 pub mod link;
@@ -63,6 +66,7 @@ pub mod snapshot;
 
 pub use self::{
 	channel::{Channel, Delivery, HISTORY},
+	command::{Block, MAX_ASKED, MAX_BLOCK, Told},
 	heard::Heard,
 	link::{BURST, Conditions, DUPLICATE, JITTER, LAG, LOSS, Link},
 	packet::{

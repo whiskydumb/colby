@@ -466,13 +466,18 @@ const _: () = {
 	reason = "a const, where try_from is not available"
 )]
 const _: () = assert!(WORDS < GONE as usize, "the removal mark is out of the table's range");
-// and the two ceilings have to fit in one message together, or a full ring of
-// commands and a full snapshot are a message a channel refuses.
+// and the three ceilings have to fit in one message together, because all
+// three blocks go in every message and a channel refuses a message too long
+// whole rather than trimming it: a full reliable ring, a full snapshot and a
+// full block of commands at once must still be something that can be sent.
+//
 // no `+ HEAD`: `MAX_SNAPSHOT` is measured over the whole block, its own head
-// included, because that is what `write` compares against.
+// included, because that is what `write` compares against. @ref
+// `crate::command`, whose own ceiling is the third term and which points back
+// here rather than repeating the sum.
 const _: () = assert!(
-	MAX_SNAPSHOT + RING < crate::MAX_MESSAGE,
-	"a full ring and a full snapshot have to fit in one message"
+	MAX_SNAPSHOT + RING + crate::command::MAX_BLOCK < crate::MAX_MESSAGE,
+	"a full ring, a full snapshot and a full block of commands have to fit in one message"
 );
 const _: () = assert!(MAX_BASELINE > 0, "a snapshot has to be able to carry at least one body");
 

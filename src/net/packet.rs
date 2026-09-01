@@ -297,6 +297,20 @@ pub(crate) fn u32_at(bytes: &[u8], at: usize) -> u32 {
 	u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
+/// A little-endian eight-byte number at a place already checked.
+pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
+	u64::from_le_bytes([
+		bytes[at],
+		bytes[at + 1],
+		bytes[at + 2],
+		bytes[at + 3],
+		bytes[at + 4],
+		bytes[at + 5],
+		bytes[at + 6],
+		bytes[at + 7],
+	])
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

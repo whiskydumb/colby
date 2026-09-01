@@ -220,6 +220,48 @@ impl PeerId {
 	/// @param index - which slot
 	/// @param generation - which occupant of it
 	pub(crate) const fn at(index: u32, generation: u32) -> Self { Self { index, generation } }
+
+	/// This peer as eight bytes, for something that has to write it down.
+	///
+	/// The slot in the low half and the occupant in the high one, said as a
+	/// number rather than as a layout so that whoever writes it can put the
+	/// bytes down in whatever order their format uses. Nothing here is
+	/// endian-dependent, which is the whole point: the wire in this engine is
+	/// little-endian a byte at a time, and a struct copied whole would be
+	/// native-endian and would be wrong on a machine nobody has tested on.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "widening a u32 to a u64 is lossless, and From is not available in a const fn"
+	)]
+	pub const fn to_bits(self) -> u64 { ((self.generation as u64) << 32) | (self.index as u64) }
+
+	/// The peer those eight bytes name.
+	///
+	/// **Public, and it does not widen anything.** This looks like the
+	/// constructor this type deliberately keeps crate-private - only the table
+	/// that owns a slot may mint a peer - and it is not one: `PeerId` is
+	/// `Pod`, so any crate in the workspace can already turn eight bytes into
+	/// one of these and always could, which the type comment says outright.
+	/// What this adds is a *portable* way of doing it, which is the thing a
+	/// wire actually needs. What it does not add is a way to be handed
+	/// authority, because a peer decides nothing anywhere a table does not
+	/// agree it is there. @ref
+	/// [`Players::here`](crate::abi::state::Players::here).
+	///
+	/// @param bits - what [`to_bits`](Self::to_bits) gave
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_possible_truncation,
+		reason = "taking each half of the number is what this is for, and try_from is not \n		          available in a const fn"
+	)]
+	pub const fn from_bits(bits: u64) -> Self {
+		Self {
+			index: bits as u32,
+			generation: (bits >> 32) as u32,
+		}
+	}
 }
 
 /// What part this process plays in one thing.
@@ -1034,6 +1076,34 @@ mod tests {
 			"and nobody reports the host's slot too, which is why a slot is read only once \
 			 is_some has been asked"
 		);
+	}
+
+	/// A handle has to survive being written down and read back, and the two
+	/// halves have to come back the way round they went.
+	#[test]
+	fn a_peer_written_down_as_a_number_comes_back_itself() {
+		// a slot and an occupant that are different numbers, neither of them
+		// one, and both with bits set high enough that a half swapped or a
+		// half truncated is a different peer rather than the same one.
+		let peer = client(0x0000_0006, 0x1234_5678);
+		let bits = peer.to_bits();
+
+		assert_eq!(bits, 0x1234_5678_0000_0006, "the occupant above the slot");
+		assert_eq!(PeerId::from_bits(bits), peer);
+		assert_eq!(PeerId::from_bits(bits).slot(), 6);
+		assert_eq!(PeerId::from_bits(bits).generation(), 0x1234_5678);
+
+		for known in [PeerId::NONE, PeerId::HOST, client(8, u32::MAX), client(u32::MAX, 1)] {
+			assert_eq!(PeerId::from_bits(known.to_bits()), known);
+		}
+
+		assert_eq!(PeerId::NONE.to_bits(), 0, "and nobody is the number nought");
+		assert_eq!(
+			PeerId::HOST.to_bits(),
+			0xFFFF_FFFF_0000_0000,
+			"and the host is a slot of nought at a generation nothing reaches"
+		);
+		assert!(!PeerId::from_bits(0).is_some(), "so eight zeroed bytes read as nobody");
 	}
 
 	#[test]
