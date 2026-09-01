@@ -49,7 +49,7 @@ pub const MAX_COMMAND: usize = 1024;
 const SLOTS: usize = 64;
 
 /// How many bytes come before the first command.
-const HEAD: usize = 10;
+pub(crate) const HEAD: usize = 10;
 
 const _: () = assert!(
 	SLOTS == 64 && MAX_COMMANDS == 64,

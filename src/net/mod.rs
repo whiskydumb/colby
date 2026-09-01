@@ -32,6 +32,8 @@
 //!   end has acknowledged, the round-trip estimate and what was lost;
 //! - [`reliable`] - the ring of numbered console lines that is the only thing
 //!   on this wire nothing is allowed to lose;
+//! - [`snapshot`] - what moved, as a difference from what the far end already
+//!   has;
 //! - [`random`] - a seeded shift register, so that a run can be repeated;
 //! - [`link`] - a wire made as bad as somebody wants it, which is what there is
 //!   to point a change at when the change is about loss.
@@ -53,6 +55,7 @@ pub mod link;
 pub mod packet;
 pub mod random;
 pub mod reliable;
+pub mod snapshot;
 
 pub use self::{
 	channel::{Channel, Delivery, HISTORY},
@@ -63,6 +66,7 @@ pub use self::{
 	},
 	random::Random,
 	reliable::{MAX_COMMAND, MAX_COMMANDS, Reliable},
+	snapshot::{Change, FIELDS, Fault, MAX_SLOTS, MAX_SNAPSHOT, NOTHING, Snapshot, Solid, WORDS},
 };
 
 #[cfg(test)]
