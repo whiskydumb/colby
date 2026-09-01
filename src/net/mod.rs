@@ -53,6 +53,7 @@
 
 pub mod channel;
 pub mod fragment;
+pub mod heard;
 pub mod link;
 pub mod packet;
 pub mod random;
@@ -62,6 +63,7 @@ pub mod snapshot;
 
 pub use self::{
 	channel::{Channel, Delivery, HISTORY},
+	heard::Heard,
 	link::{BURST, Conditions, DUPLICATE, JITTER, LAG, LOSS, Link},
 	packet::{
 		ACK_BITS, HEADER_BYTES, Header, MAGIC, MAX_DATAGRAM, MAX_FRAGMENTS, MAX_MESSAGE,

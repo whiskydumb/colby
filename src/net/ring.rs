@@ -274,6 +274,37 @@ impl Ring {
 			| _ => return (&self.spread, NOTHING),
 		};
 
+		Self::fill(kept, &mut self.spread);
+		(&self.spread, holding)
+	}
+
+	/// The same, into a table the caller owns.
+	///
+	/// [`base`](Self::base) hands out a borrow of one scratch, which is what
+	/// makes asking twice a compile error - and asking twice is exactly what
+	/// blending two snapshots is. So there is this as well: the same answer,
+	/// into somebody else's table, taking the ring by shared reference.
+	///
+	/// @param number - which snapshot
+	/// @param into - where the world goes, emptied first
+	/// @return whether the ring had it, and so whether anything was written
+	pub fn world(&self, number: u32, into: &mut Vec<Slot>) -> bool {
+		into.clear();
+
+		let Some(kept) = self.kept[Self::slot(number)].as_ref() else {
+			return false;
+		};
+
+		if kept.number != number {
+			return false;
+		}
+
+		Self::fill(kept, into);
+		true
+	}
+
+	/// Spreads one kept snapshot back out into a dense table.
+	fn fill(kept: &Kept, into: &mut Vec<Slot>) {
 		let reach = kept
 			.held
 			.iter()
@@ -281,13 +312,11 @@ impl Ring {
 			.max()
 			.unwrap_or(0);
 
-		self.spread.resize(reach, None);
+		into.resize(reach, None);
 
 		for (slot, generation, solid) in &kept.held {
-			self.spread[usize::from(*slot)] = Some((*generation, *solid));
+			into[usize::from(*slot)] = Some((*generation, *solid));
 		}
-
-		(&self.spread, holding)
 	}
 
 	/// Forgets everything, for a peer that has gone.
@@ -751,6 +780,26 @@ mod tests {
 
 		assert_eq!(against, NOTHING);
 		assert!(base.is_empty(), "and one that is not leaves it empty");
+	}
+
+	#[test]
+	fn a_world_asked_for_by_a_number_the_ring_never_had_is_not_its_neighbors() {
+		// `world` is `base`'s answer into somebody else's table, and it has to
+		// make the same check: a number and its place agree only until the
+		// ring turns over.
+		let mut ring = Ring::new();
+		let mut into = vec![Some((9, somewhere()))];
+
+		ring.keep(1, &table(&[(0, 1, somewhere())]));
+
+		assert!(ring.world(1, &mut into), "the one it has");
+		assert_eq!(into.len(), 1);
+
+		let wrapped = 1 + u32::try_from(DEPTH).unwrap_or(0);
+
+		assert!(!ring.world(wrapped, &mut into), "and not the one sharing its place");
+		assert!(into.is_empty(), "which leaves the caller's table empty rather than wrong");
+		assert!(!ring.world(NOTHING, &mut into));
 	}
 
 	#[test]

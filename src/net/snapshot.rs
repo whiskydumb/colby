@@ -134,8 +134,9 @@
 //! design worth deliberately not copying.
 
 use colby_core::{
-	abi::{Body, BodyKind},
+	abi::{Body, BodyKind, Transform},
 	bytemuck,
+	glam::{Quat, Vec3},
 };
 
 use crate::packet::{u16_at, u32_at};
@@ -347,6 +348,60 @@ impl Solid {
 			},
 			entity: [u32::try_from(body.entity.slot()).unwrap_or(0), body.entity.generation()],
 			owner: [u32::try_from(body.owner.slot()).unwrap_or(0), body.owner.generation()],
+		}
+	}
+
+	/// Where the record says the thing is.
+	///
+	/// The half of a record a viewer needs. What it does *not* undo is the rest
+	/// of [`of`](Self::of): a record is not turned back into a body here,
+	/// because what a receiver does with one is a policy - which body, whether
+	/// to move it or to move what it drives - and this is only the arithmetic.
+	///
+	/// @return the position, rotation and scale as a transform
+	#[must_use]
+	pub fn transform(&self) -> Transform {
+		Transform {
+			position: Vec3::from_array(self.position),
+			rotation: Quat::from_array(self.rotation),
+			scale: Vec3::from_array(self.scale),
+		}
+	}
+
+	/// The record part way between this one and another.
+	///
+	/// **Only the fields that are quantities are blended.** A position, a
+	/// rotation, a scale, a velocity and a spin are all measurements of one
+	/// thing at two moments and the answer between them means something. The
+	/// rest are not: `kind`, `sleeping`, and both halves of `entity` and
+	/// `owner` are *names* and *states*, and a number half way between two
+	/// names is a third name that belongs to nobody. Those are taken from the
+	/// later record whole, so a thing that changed hands or fell asleep does so
+	/// at the moment the snapshot saying it arrives rather than fading into it.
+	///
+	/// The rotation goes the short way round, because [`Transform::lerp`] does.
+	///
+	/// @param later - the record at the far end of the interval
+	/// @param t - nought for this one, one for the later one
+	/// @return the record as it would have been in between
+	#[must_use]
+	pub fn between(&self, later: &Self, t: f32) -> Self {
+		let blended = self.transform().lerp(later.transform(), t);
+
+		Self {
+			position: blended.position.to_array(),
+			rotation: blended.rotation.to_array(),
+			scale: blended.scale.to_array(),
+			velocity: Vec3::from_array(self.velocity)
+				.lerp(Vec3::from_array(later.velocity), t.clamp(0.0, 1.0))
+				.to_array(),
+			angular: Vec3::from_array(self.angular)
+				.lerp(Vec3::from_array(later.angular), t.clamp(0.0, 1.0))
+				.to_array(),
+			sleeping: later.sleeping,
+			kind: later.kind,
+			entity: later.entity,
+			owner: later.owner,
 		}
 	}
 }
@@ -1586,6 +1641,82 @@ mod tests {
 			MAX_BASELINE < MAX_SLOTS,
 			"and a world of every slot does not, which is what interest management is for"
 		);
+	}
+
+	#[test]
+	fn a_record_half_way_is_half_way_in_what_can_be_and_whole_in_what_cannot() {
+		// the rule the whole blend rests on: a measurement between two moments
+		// means something, a name between two names does not. So a position
+		// arrives half way and a kind arrives all at once.
+		let mut earlier = somewhere();
+		let mut later = somewhere();
+
+		earlier.position = [0.0, 0.0, 0.0];
+		earlier.velocity = [0.0, 0.0, 0.0];
+		earlier.scale = [1.0, 1.0, 1.0];
+		earlier.sleeping = 0;
+		earlier.kind = 2;
+		earlier.entity = [4, 1];
+		later.position = [10.0, -4.0, 0.0];
+		later.velocity = [2.0, 0.0, 0.0];
+		later.scale = [3.0, 3.0, 3.0];
+		later.sleeping = 1;
+		later.kind = 1;
+		later.entity = [7, 2];
+
+		let half = earlier.between(&later, 0.5);
+
+		assert_eq!(bits(half.position), bits([5.0, -2.0, 0.0]), "a position is a measurement");
+		assert_eq!(bits(half.velocity), bits([1.0, 0.0, 0.0]), "so is a speed");
+		assert_eq!(bits(half.scale), bits([2.0, 2.0, 2.0]), "and a size");
+		assert_eq!(half.sleeping, 1, "a state arrives whole, at the later end");
+		assert_eq!(half.kind, 1, "so does what the solver may do with it");
+		assert_eq!(half.entity, [7, 2], "and a name is never half of one name and half another");
+	}
+
+	#[test]
+	fn a_record_at_either_end_of_the_interval_is_that_record() {
+		let mut earlier = somewhere();
+		let mut later = somewhere();
+
+		earlier.velocity = [0.0, 0.0, 0.0];
+		later.position = [9.0, 9.0, 9.0];
+		later.velocity = [4.0, 0.0, 0.0];
+
+		assert_eq!(
+			bits(earlier.between(&later, 0.0).position),
+			bits(earlier.position),
+			"nought is this one"
+		);
+		assert_eq!(
+			bits(earlier.between(&later, 1.0).position),
+			bits(later.position),
+			"and one is the other"
+		);
+		// past either end rather than off it: a viewer asking for a moment
+		// outside the interval is asking for something nobody described. The
+		// speeds are checked as well as the positions, because they are the
+		// fields `Transform::lerp` does not cover and so the ones whose
+		// clamping is this function's own.
+		assert_eq!(bits(earlier.between(&later, 2.0).position), bits(later.position));
+		assert_eq!(bits(earlier.between(&later, 2.0).velocity), bits(later.velocity));
+		assert_eq!(bits(earlier.between(&later, -1.0).position), bits(earlier.position));
+		assert_eq!(bits(earlier.between(&later, -1.0).velocity), bits(earlier.velocity));
+	}
+
+	#[test]
+	fn a_record_says_where_it_is_in_the_shape_the_world_uses() {
+		let mut solid = somewhere();
+
+		solid.position = [1.0, 2.0, 3.0];
+		solid.scale = [4.0, 5.0, 6.0];
+		solid.rotation = [0.0, 0.0, 0.0, 1.0];
+
+		let transform = solid.transform();
+
+		assert_eq!(bits(transform.position.to_array()), bits([1.0, 2.0, 3.0]));
+		assert_eq!(bits(transform.scale.to_array()), bits([4.0, 5.0, 6.0]));
+		assert_eq!(bits(transform.rotation.to_array()), bits([0.0, 0.0, 0.0, 1.0]));
 	}
 
 	#[test]
