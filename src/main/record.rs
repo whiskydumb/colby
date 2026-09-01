@@ -56,7 +56,8 @@ const STEPS_A_SECOND: u32 = 60;
 /// How many frames one simulation step is worth.
 #[expect(
 	clippy::as_conversions,
-	reason = "a u32 to usize is lossless on every target this builds for, and try_from is not available in a const item"
+	reason = "a u32 to usize is lossless on every target this builds for, and try_from is not \
+	          available in a const item"
 )]
 const FRAMES_PER_STEP: usize = (RATE / STEPS_A_SECOND) as usize;
 
@@ -253,9 +254,7 @@ pub(crate) fn take(request: &Request) -> Result {
 	clippy::cast_possible_truncation,
 	reason = "the value is clamped to a range an i16 holds on the line it is cast on"
 )]
-fn quantize(sample: f32) -> i16 {
-	(sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
-}
+fn quantize(sample: f32) -> i16 { (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16 }
 
 /// The loudest sample and the root mean square of all of them.
 ///
