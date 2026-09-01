@@ -68,7 +68,7 @@ pub use self::{
 	mesh::{BONES_PER_VERTEX, Mesh, MeshData, MeshId, MeshVertex, Meshes, SkinVertex},
 	model::{Model, ModelData, ModelId, Models, Placement},
 	names::MAX_NAME,
-	net::{PeerId, Role},
+	net::{Command, Commands, PeerId, Role},
 	physics::{
 		Bodies, Body, BodyId, BodyKind, Layers, MAX_BODIES, MAX_OVERLAPS, MAX_TOUCHES, Overlap,
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
@@ -93,7 +93,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 40;
+pub const ABI_VERSION: u32 = 41;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -221,7 +221,31 @@ pub struct World {
 	pub aspect: f32,
 
 	/// Keyboard and mouse for this step. Host-written.
+	///
+	/// **This machine's own, and it crosses to nobody.** The surface size, the
+	/// cursor in pixels, what was typed - none of it means anything on another
+	/// machine, and a window that is not this one has its own. What does cross
+	/// is the small part of it a host has to be told, and that is a
+	/// [`Command`] rather than this. @ref [`commands`](Self::commands).
 	pub input: Input,
+
+	/// What every peer recently asked for, one ring each.
+	///
+	/// Beside [`input`](Self::input) and the other end of the same wire a
+	/// snapshot travels: what is written here is what a person wanted, and
+	/// what a snapshot carries is what the machine that simulates decided
+	/// about it. A host reads everybody's ring and runs them; a client keeps
+	/// its own, sends the last few in every datagram, and re-runs whatever the
+	/// host has not confirmed.
+	///
+	/// **Nothing writes this yet**, the same way nothing wrote
+	/// [`peer`](Self::peer) when it appeared: the commit that fills it is the
+	/// one that teaches the runner to carry a command, and until then every
+	/// ring is empty and reading one costs a bounds check.
+	///
+	/// Not written down by a save, for the reason an owner is not: what
+	/// somebody was asking for a moment ago is a moment rather than a world.
+	pub commands: Commands,
 
 	/// Where the renderer looks from. Game-written.
 	pub camera: Camera,
@@ -483,6 +507,7 @@ impl World {
 			// field, and note this is deliberately not the zero value.
 			peer: PeerId::HOST,
 			input: Input::default(),
+			commands: Commands::new(),
 			camera: Camera::DEFAULT,
 			clear: Vec3::ZERO,
 			light: Vec3::new(-0.4, -1.0, -0.3),
@@ -1508,6 +1533,40 @@ mod tests {
 			role(nobodys),
 			Some(Role::SimulatedProxy),
 			"and the map is the host's business, not everybody's"
+		);
+	}
+
+	/// The two tables agree about who somebody is, which is the whole of what
+	/// makes them one mechanism rather than two.
+	#[test]
+	fn a_command_is_filed_under_the_peer_the_world_minted() {
+		let mut world = World::new();
+		let peer = world.players.admit();
+		let asked = Command {
+			step: world.steps,
+			number: 1,
+			buttons: 0b10,
+			yaw: 0.5,
+			pitch: -0.25,
+		};
+
+		assert!(world.commands.kept(peer).is_empty(), "a world starts asking for nothing");
+		assert!(world.commands.push(peer, asked));
+		assert_eq!(world.commands.kept(peer), &[asked]);
+		assert_eq!(world.commands.unsettled(peer), &[asked]);
+
+		// and the identity that came out of one table is the one the other is
+		// keyed by, generation and all: a peer let go by `players` is answered
+		// with nothing here as soon as its slot is handed on.
+		assert!(world.players.forget(peer));
+
+		let next = world.players.admit();
+
+		assert_eq!(next.slot(), peer.slot(), "the same slot, a different occupant");
+		assert!(world.commands.push(next, asked), "and its ring starts over");
+		assert!(
+			world.commands.kept(peer).is_empty(),
+			"so what the peer before asked for is not run for the one after"
 		);
 	}
 

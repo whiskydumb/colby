@@ -1158,6 +1158,21 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 		world.state.put_raw(&arena.bytes, arena.layout);
 	}
 
+	// and what anybody was asking for goes, unconditionally and before the
+	// peers are put back. Two reasons and either is enough. A command is a
+	// request against the world that was standing when it was made, and this
+	// is a different world - so it is not a late request, it is one about
+	// somewhere else. And the table of them leans on a peer's generation only
+	// going up, which `restore` is the one thing here that breaks: it puts
+	// generations back as they were, so a handle minted afterwards can be
+	// minted a second time and would otherwise find the last occupant's
+	// commands waiting under its own name. @ref `Commands::clear`.
+	//
+	// Outside `restore_players` rather than in it, because that function does
+	// nothing at all for a description written before the arena split, and the
+	// world is replaced either way.
+	world.commands.clear();
+
 	// after the tables and beside the world's own arena, for the reason that
 	// one is put back here: what a peer was holding is handles into tables
 	// that have only just been rebuilt.
@@ -1728,7 +1743,7 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 mod tests {
 	use super::*;
 	use crate::abi::{
-		MAX_ENTITIES, Material, MeshData, PeerId, Role, mesh,
+		Command, MAX_ENTITIES, Material, MeshData, PeerId, Role, mesh,
 		skeleton::{Bone, SkeletonData, SkeletonId},
 	};
 
@@ -2421,6 +2436,46 @@ mod tests {
 
 		assert_eq!(joint.first, body_id, "the rope holds the restored body");
 		assert_eq!(joint.second, BodyId::NONE, "and a point in the world, as it did");
+	}
+
+	/// A restore rewinds a slot's generation, which is the one thing the
+	/// command table's rule about generations does not survive.
+	#[test]
+	fn a_peer_minted_twice_over_a_restore_does_not_inherit_the_first_ones_commands() {
+		let before = capture(&furnished());
+		let mut world = furnished();
+
+		// admitted *after* the description was captured, so the restore below
+		// puts its slot's generation back to nothing and the very same handle
+		// can be minted again afterwards.
+		let peer = world.players.admit();
+
+		for number in [30_u32, 31] {
+			assert!(
+				world
+					.commands
+					.push(peer, Command { number, ..Command::default() }),
+				"each is above the last"
+			);
+		}
+
+		assert!(world.commands.settle(peer, 30));
+		restore(&mut world, &before).expect("the layouts agree");
+
+		assert!(world.commands.kept(peer).is_empty(), "a world put back is asking for nothing");
+		assert_eq!(world.commands.owner(peer.slot()), PeerId::NONE);
+
+		let again = world.players.admit();
+
+		assert_eq!(again, peer, "the rewind mints the same handle a second time");
+		assert!(
+			world
+				.commands
+				.push(again, Command { number: 1, ..Command::default() }),
+			"and its first command is not read as an old one of the peer before it"
+		);
+		assert_eq!(world.commands.newest(again), 1);
+		assert_eq!(world.commands.settled(again), 0, "nor does it start half done");
 	}
 
 	#[test]
