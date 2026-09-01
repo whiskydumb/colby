@@ -57,12 +57,14 @@ use std::{
 
 use colby_core::{
 	Result,
-	abi::{Bodies, Cvars, Value},
-	debug, err, info, warn,
+	abi::{Bodies, BodyId, BodyKind, Cvars, PeerId, Value, World},
+	debug, err,
+	glam::Vec3,
+	info, warn,
 };
 use colby_net::{
-	Channel, Conditions, Delivery, Link, MAX_DATAGRAM, NOTHING, Reliable, Ring, Slot, Snapshot,
-	Solid,
+	Channel, Conditions, Delivery, Heard, Link, MAX_DATAGRAM, NOTHING, Reliable, Ring, Slot,
+	Snapshot, Solid,
 };
 
 /// The port a host listens on when nobody says otherwise.
@@ -84,6 +86,23 @@ const MAX_PEERS: usize = 8;
 
 /// How long a peer may say nothing before it is forgotten.
 const QUIET: Duration = Duration::from_secs(10);
+
+/// How far behind the moment a client draws the world it was told about.
+///
+/// A tenth of a second, which is what the system this is modeled on defaults
+/// to and is two snapshots at the cadence with a little over.
+const INTERP: &str = "net.interp";
+
+/// The default, in seconds.
+const INTERP_DEFAULT: f32 = 0.1;
+
+/// The furthest behind anybody may ask to be, in seconds.
+///
+/// A second is already a world nobody could play in. What this defends is the
+/// arithmetic rather than the taste: a delay longer than the ring holds asks
+/// for a moment older than anything still here, which is answered with the
+/// oldest world there is and would look like the world had stopped.
+const MAX_INTERP: f32 = 1.0;
 
 /// The variable that seeds every lying link in this endpoint.
 pub(crate) const SEED: &str = "net.seed";
@@ -240,6 +259,34 @@ fn report(net: &Net) {
 			"a peer"
 		);
 	}
+}
+
+/// Says that this process has gone looking for somebody else's world.
+///
+/// A world is born believing it is the authority, because that is true of
+/// every world that is on its own, and most worlds are. A window that was
+/// told to connect is the one case where it is false, and nothing else in the
+/// engine can notice - so it is said here, once, at the moment the socket is
+/// opened.
+///
+/// *Which* peer this process is, nobody has said: there is no handshake, and
+/// until there is, a client cannot be told its own name. It does not need to
+/// be. "Not the host" is the whole of what [`Role::of`](colby_core::abi::Role)
+/// needs to call every body a proxy, and a proxy is a body this end draws
+/// rather than decides.
+///
+/// @param world - the world this process is running
+pub(crate) fn joined(world: &mut World) { world.peer = PeerId::NONE; }
+
+/// How far behind to draw, as the table has it.
+///
+/// @param cvars - the world's own table
+/// @return the delay, clamped to something the ring can answer
+#[must_use]
+pub(crate) fn behind(cvars: &Cvars) -> Duration {
+	let seconds = cvars.float(INTERP).unwrap_or(INTERP_DEFAULT);
+
+	Duration::from_secs_f32(seconds.clamp(0.0, MAX_INTERP))
 }
 
 /// Something that carries datagrams.
@@ -442,9 +489,9 @@ struct Peer {
 
 /// What one peer has said about the world, and what this end made of it.
 struct Taken {
-	/// The worlds taken from that peer, to read its next difference against.
+	/// The worlds taken from that peer, and when each of them arrived.
 	///
-	/// The same type the sending half uses, and it has to be: a block is
+	/// It holds a ring for the same reason the sending half does: a block is
 	/// written against a *numbered* snapshot, and the number it names is a
 	/// round trip old whenever snapshots go out faster than one per round
 	/// trip - which at twenty a second they do. Most of the time the newest
@@ -452,11 +499,10 @@ struct Taken {
 	/// since then changed once. The case it would not is a field that changed
 	/// and changed *back*, which the writer sees as unchanged and does not
 	/// send; a reader holding the value from halfway would keep it forever.
-	ring: Ring,
-
-	/// The newest snapshot taken, which is what goes out in the head of
-	/// everything sent to this peer.
-	holding: u32,
+	///
+	/// The times beside it are what lets a world be drawn a moment behind
+	/// rather than in jumps. @ref [`Heard`].
+	heard: Heard,
 
 	/// The newest snapshot *it* says it has, which is what the next difference
 	/// to it is written against.
@@ -499,6 +545,13 @@ pub(crate) struct Net {
 	payload: Vec<u8>,
 	commands: Vec<String>,
 	said: Vec<Said>,
+	/// Which bodies a world that arrived is about, and what it said of them.
+	///
+	/// Gathered in one walk over the body table and applied in another,
+	/// because a handle cannot be made from a slot number outside the table's
+	/// own crate and nothing here may forge one.
+	proxies: Vec<(BodyId, Solid)>,
+
 	/// Where an arriving snapshot is put together before it is committed.
 	///
 	/// One buffer for the endpoint rather than one per peer: a message is read
@@ -533,6 +586,7 @@ impl Net {
 			payload: Vec::new(),
 			commands: Vec::new(),
 			said: Vec::new(),
+			proxies: Vec::new(),
 			applying: Vec::new(),
 			sent: 0,
 			delivered: 0,
@@ -656,12 +710,12 @@ impl Net {
 		let Some(holding) = self
 			.peers
 			.get(index)
-			.map(|peer| peer.taken.holding)
+			.map(|peer| peer.taken.heard.holding())
 		else {
 			return &[];
 		};
 
-		self.peers[index].taken.ring.base(holding).0
+		self.peers[index].taken.heard.base(holding).0
 	}
 
 	/// The newest snapshot one peer says *it* holds.
@@ -687,7 +741,7 @@ impl Net {
 	pub(crate) fn holding(&self, index: usize) -> u32 {
 		self.peers
 			.get(index)
-			.map_or(NOTHING, |peer| peer.taken.holding)
+			.map_or(NOTHING, |peer| peer.taken.heard.holding())
 	}
 
 	/// How many datagrams the wire itself refused.
@@ -718,6 +772,81 @@ impl Net {
 		}
 
 		Ok(())
+	}
+
+	/// Puts a snapshot block into what the first peer holds, with no wire.
+	///
+	/// For a test in another module that has a world and a step to run but no
+	/// far end to hear from. Everything the real path does to a block before
+	/// this - the datagram, the channel, the reliable ring - is tested here.
+	///
+	/// @param bytes - the block
+	/// @param now - when it is to count as having arrived
+	/// @return whether it was something a working peer would have sent
+	#[cfg(test)]
+	pub(crate) fn absorbed(&mut self, bytes: &[u8], now: Duration) -> bool {
+		let Some(peer) = self.peers.first_mut() else {
+			return false;
+		};
+
+		absorb(&mut peer.taken, bytes, &mut self.applying, now)
+	}
+
+	/// Puts the world a host described into the world this end is running.
+	///
+	/// **A body this end does not own stops being simulated and is driven
+	/// instead.** That is one line here because the engine already had the
+	/// idea: [`BodyKind::Kinematic`] means the solver leaves a body's
+	/// transform alone and something else writes it, which is what freezing a
+	/// prop already used. So a proxy is a frozen body with the wire holding the
+	/// pen.
+	///
+	/// **What is written is the entity, not the body.** The solver copies a
+	/// body it does not move *from* the entity it drives, so writing the entity
+	/// is writing both - and writing the body instead would be overwritten a
+	/// moment later by the entity it was supposed to have moved.
+	///
+	/// A slot the far end describes and this end has no body in is passed over
+	/// in silence. Nothing here can make one: what a body *is* - its shape, its
+	/// mass, its surface - is not in a snapshot by design, so a thing that
+	/// appears on the host appears here when something says what it is, and
+	/// that message does not exist yet.
+	///
+	/// @param world - the world this end is running
+	/// @param when - the moment to draw, already behind the clock
+	pub(crate) fn arrive(&mut self, world: &mut World, when: Duration) {
+		// a host is the one that says what the world is; nothing tells it.
+		if self.hosting {
+			return;
+		}
+
+		let Some(peer) = self.peers.first_mut() else {
+			return;
+		};
+		let told = peer.taken.heard.at(when);
+
+		self.proxies.clear();
+
+		for (id, body) in world.bodies.iter() {
+			let Some((generation, solid)) = told.get(id.slot()).copied().flatten() else {
+				continue;
+			};
+
+			// the generation is what says this is the same body rather than
+			// the one that took its place, and a wrong answer here would drive
+			// a live body to where a dead one was.
+			if generation != id.generation() || body.role(world.peer).local() {
+				continue;
+			}
+
+			self.proxies.push((id, solid));
+		}
+
+		// the entities in one pass and the bodies in another, because a handle
+		// is only had by walking the table and the walk borrows it.
+		for (id, solid) in &self.proxies {
+			drive(world, *id, solid);
+		}
 	}
 
 	/// Takes everything off the wire and puts it through the channels.
@@ -860,7 +989,7 @@ impl Net {
 				// is still borrowed from the other.
 				let rest = message.get(used..).unwrap_or(&[]);
 
-				Some(absorb(&mut peer.taken, rest, &mut self.applying))
+				Some(absorb(&mut peer.taken, rest, &mut self.applying, now))
 			},
 			| Delivery::Fragment => Some(true),
 			| Delivery::Ignored(_) => {
@@ -933,8 +1062,7 @@ impl Net {
 			heard: now,
 			told: Ring::new(),
 			taken: Taken {
-				ring: Ring::new(),
-				holding: NOTHING,
+				heard: Heard::new(),
 				theirs: NOTHING,
 				baselines: 0,
 				stranded: false,
@@ -979,13 +1107,13 @@ pub(crate) fn records(bodies: &Bodies, into: &mut Vec<Slot>) {
 /// for something it cannot do
 fn describe(peer: &mut Peer, world: Option<&[Slot]>, out: &mut Vec<u8>) -> bool {
 	let Some(world) = world else {
-		nothing(peer.taken.holding, out);
+		nothing(peer.taken.heard.holding(), out);
 
 		return true;
 	};
 
 	let number = peer.told.next();
-	let holding = peer.taken.holding;
+	let holding = peer.taken.heard.holding();
 	let (base, against) = peer.told.base(peer.taken.theirs);
 
 	if Snapshot::write(number, against, holding, base, world, out).is_err() {
@@ -1025,13 +1153,89 @@ fn nothing(holding: u32, out: &mut Vec<u8>) {
 	debug_assert!(written.is_ok(), "a block of nothing but a head always fits");
 }
 
+/// Puts one body's share of a world that arrived into the world.
+///
+/// Its own function because the body and the entity it drives are two writes
+/// through two tables, and a `let Some` for each inside a loop is one level
+/// deeper than the house rules allow.
+///
+/// @param world - the world this end is running
+/// @param id - which body
+/// @param solid - what the far end said of it
+fn drive(world: &mut World, id: BodyId, solid: &Solid) {
+	let Some(body) = world.bodies.get_mut(id) else {
+		return;
+	};
+
+	// **the kind the far end sent, except that nothing this end does not own
+	// may be simulated here.** A body the host is simulating has to be
+	// kinematic locally or the solver fights the wire sixty times a second;
+	// one the host is *not* simulating is passed through as it is, so a static
+	// map body stays static and a prop the host froze reads as frozen.
+	//
+	// @note: what this cannot express is a host-simulated prop, which arrives
+	// as kinematic and is indistinguishable from a frozen one to anything that
+	// reads only the kind - and the sandbox's own `frozen` is exactly that. A
+	// game on a wire has to ask the *role* as well, and teaching it to is the
+	// commit that makes the sandbox two people.
+	let was = body.kind;
+
+	body.kind = match solid.kind {
+		| 0 => BodyKind::Static,
+		// one is kinematic and two is dynamic, and both arrive as kinematic:
+		// the first because that is what it is, the second because this end
+		// may not simulate it.
+		| _ => BodyKind::Kinematic,
+	};
+	// and the state, which is on the wire and used to be dropped. A body that
+	// fell asleep while this end was still simulating it would otherwise stay
+	// asleep as a proxy, and two sleeping bodies are a pair the broadphase
+	// refuses - so nothing would ever wake it again.
+	body.sleeping = solid.sleeping != 0;
+	// the speeds as well as the place. A body that is not simulated is not
+	// integrated from them, but the solver reads them to work out what it does
+	// to whatever it is pushing - so a proxy carrying a stale speed shoves
+	// things the wrong way.
+	body.velocity = Vec3::from_array(solid.velocity);
+	body.angular = Vec3::from_array(solid.angular);
+
+	let entity = body.entity;
+	let cut = matches!(was, BodyKind::Dynamic);
+
+	// **the entity when there is one, and the body itself when there is not.**
+	// The solver copies a body it does not move *from* the entity it drives, so
+	// for a body that drives one the entity is the only write that lasts. A
+	// body that drives none - a ragdoll limb, a collision brush a scene gave no
+	// thing to - is never copied over, so writing it directly is what places
+	// it. Setting the kind and then failing to place it would be a body the
+	// solver has stopped moving and the wire cannot move either.
+	let Some(transform) = world.entities.transform_mut(entity) else {
+		if let Some(body) = world.bodies.get_mut(id) {
+			body.transform = solid.transform();
+		}
+
+		return;
+	};
+
+	*transform = solid.transform();
+
+	// the first step a body is driven, it comes from wherever this end's own
+	// solver had left it, which is anywhere at all. Blending towards the truth
+	// from there is a slide across the map, so that one write is a cut.
+	if cut {
+		world.entities.snap(entity);
+	}
+}
+
 /// Reads the snapshot block at the end of a message into what a peer holds.
 ///
 /// @param taken - what this end has made of that peer's side of it
 /// @param bytes - the block, and nothing is expected after it
 /// @param applying - the endpoint's scratch, where the world is put together
+/// @param now - how long this endpoint has been running, which is the only
+/// clock a snapshot can be stamped with
 /// @return whether it was something a working peer would have sent
-fn absorb(taken: &mut Taken, bytes: &[u8], applying: &mut Vec<Slot>) -> bool {
+fn absorb(taken: &mut Taken, bytes: &[u8], applying: &mut Vec<Slot>, now: Duration) -> bool {
 	let Ok((number, against, holding)) = Snapshot::peek(bytes) else {
 		return false;
 	};
@@ -1052,7 +1256,7 @@ fn absorb(taken: &mut Taken, bytes: &[u8], applying: &mut Vec<Slot>) -> bool {
 	// against the world it names rather than the newest one held. `base`
 	// answers with nothing at all for a number that has fallen out of the
 	// ring, which is what makes a baseline land on an empty world.
-	let (base, _) = taken.ring.base(against);
+	let (base, _) = taken.heard.base(against);
 
 	applying.clear();
 	applying.extend_from_slice(base);
@@ -1077,11 +1281,9 @@ fn absorb(taken: &mut Taken, bytes: &[u8], applying: &mut Vec<Slot>) -> bool {
 	// the ring has it: a peer can name a snapshot old enough to have been
 	// refused and still be sitting in its place, and taking that in would walk
 	// what this end holds backwards. The scratch above is scratch either way.
-	if !taken.ring.keep(number, applying) {
+	if !taken.heard.take(number, applying, now) {
 		return true;
 	}
-
-	taken.holding = number;
 
 	if against == NOTHING {
 		taken.baselines = taken.baselines.saturating_add(1);
@@ -1229,6 +1431,11 @@ pub(crate) fn install(cvars: &mut Cvars) {
 		"deliver this share of arriving datagrams twice",
 	);
 	cvars.var(
+		INTERP,
+		Value::Float(INTERP_DEFAULT),
+		"draw the world this many seconds behind what has arrived, to draw it smoothly",
+	);
+	cvars.var(
 		SEED,
 		Value::Float(0.0),
 		"what the lying links start their chance from; nil is the usual one",
@@ -1239,6 +1446,7 @@ pub(crate) fn install(cvars: &mut Cvars) {
 mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
+	use colby_core::abi::{Body, Transform};
 	use colby_net::MAX_COMMAND;
 
 	use super::*;
@@ -1301,8 +1509,7 @@ mod tests {
 		// and never be told otherwise. Every other case is forgiving; this one
 		// is not.
 		let mut taken = Taken {
-			ring: Ring::new(),
-			holding: NOTHING,
+			heard: Heard::new(),
 			theirs: NOTHING,
 			baselines: 0,
 			stranded: false,
@@ -1314,13 +1521,13 @@ mod tests {
 
 		// snapshot one, a baseline.
 		Snapshot::write(1, NOTHING, NOTHING, &[], &one, &mut out).expect("it fits");
-		assert!(absorb(&mut taken, &out, &mut applying));
+		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 
 		// snapshot two, moved away, taken against one.
 		out.clear();
 		Snapshot::write(2, 1, NOTHING, &one, &two, &mut out).expect("it fits");
-		assert!(absorb(&mut taken, &out, &mut applying));
-		assert_eq!(taken.holding, 2);
+		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
+		assert_eq!(taken.heard.holding(), 2);
 
 		// snapshot three, back where it started - and written against ONE,
 		// because that is the last the sender heard of. Nothing about the
@@ -1330,10 +1537,10 @@ mod tests {
 		let spoken = Snapshot::write(3, 1, NOTHING, &one, &one, &mut out).expect("it fits");
 
 		assert_eq!(spoken, 0, "the sender sees nothing to say, which is the whole trap");
-		assert!(absorb(&mut taken, &out, &mut applying));
-		assert_eq!(taken.holding, 3);
+		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
+		assert_eq!(taken.heard.holding(), 3);
 		assert_eq!(
-			taken.ring.base(3).0,
+			taken.heard.base(3).0,
 			one.as_slice(),
 			"so the reader has to have gone back to the world the block named"
 		);
@@ -1346,8 +1553,7 @@ mod tests {
 		// ring has already passed is not news, and taking it in would make
 		// this end advertise a world two snapshots stale.
 		let mut taken = Taken {
-			ring: Ring::new(),
-			holding: NOTHING,
+			heard: Heard::new(),
 			theirs: NOTHING,
 			baselines: 0,
 			stranded: false,
@@ -1358,19 +1564,402 @@ mod tests {
 		for number in 1..=3 {
 			out.clear();
 			Snapshot::write(number, NOTHING, NOTHING, &[], &world(1.0), &mut out).expect("fits");
-			assert!(absorb(&mut taken, &out, &mut applying));
+			assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 		}
 
-		assert_eq!(taken.holding, 3);
+		assert_eq!(taken.heard.holding(), 3);
 		assert_eq!(taken.baselines, 3);
 
 		// and now snapshot two again, which the ring still has a place for.
 		out.clear();
 		Snapshot::write(2, NOTHING, NOTHING, &[], &world(9.0), &mut out).expect("it fits");
 
-		assert!(absorb(&mut taken, &out, &mut applying), "it is not a fault, only old news");
-		assert_eq!(taken.holding, 3, "and what this end holds did not move");
+		assert!(
+			absorb(&mut taken, &out, &mut applying, Duration::ZERO),
+			"it is not a fault, only old news"
+		);
+		assert_eq!(taken.heard.holding(), 3, "and what this end holds did not move");
 		assert_eq!(taken.baselines, 3, "nor did the count of worlds it was sent whole");
+	}
+
+	/// A client with one host peer, and a world with one body driving one
+	/// entity in it.
+	///
+	/// The body is `Dynamic` on purpose: what the apply has to do first is
+	/// stop the solver from simulating something the far end is in charge of,
+	/// and a body that was already kinematic could not show that.
+	fn client() -> (Net, World, BodyId) {
+		let wire = Rc::new(RefCell::new(Wire::default()));
+		let mut net = Net::over(Box::new(Loopback::at(somewhere(2), &wire)), false, 2);
+		let mut world = World::new();
+
+		// something in the slots before it, so that a slot number, a walk's
+		// index and "the first one" are three different numbers. One body in
+		// slot nought makes all three the same and hides a mix-up of any two.
+		for _ in 0..3 {
+			world.bodies.spawn(Body::default());
+		}
+
+		let entity = world.entities.spawn();
+		let body = world.bodies.spawn(Body {
+			kind: BodyKind::Dynamic,
+			entity,
+			transform: Transform::IDENTITY,
+			..Body::default()
+		});
+
+		// a window that went looking for a host is not the authority, which is
+		// what makes every body in its world a proxy. @ref `App::resumed`.
+		world.peer = PeerId::NONE;
+		net.introduce(somewhere(1));
+		(net, world, body)
+	}
+
+	/// A world of one body somewhere along an axis, in the slot a handle names.
+	///
+	/// The kind is the one a host is simulating, because that is the case the
+	/// apply has work to do in - `Solid::default` is a *static* body, and a
+	/// fixture built from one would say nothing about a proxy. The speed is
+	/// not the position either: they were the same number once and a test
+	/// cannot tell two fields apart when they hold one value.
+	fn told(body: BodyId, along: f32) -> Vec<Slot> {
+		let mut world = vec![None; body.slot() + 1];
+		let solid = Solid {
+			position: [along, 0.0, 0.0],
+			rotation: [0.0, 0.0, 0.0, 1.0],
+			scale: [1.0, 1.0, 1.0],
+			velocity: [0.0, along * 2.0, 0.0],
+			angular: [0.0, 0.0, along * 3.0],
+			kind: 2,
+			..Solid::default()
+		};
+
+		world[body.slot()] = Some((body.generation(), solid));
+		world
+	}
+
+	/// What one endpoint's peer was told, put in as though it had arrived.
+	fn arrived(net: &mut Net, number: u32, world: &[Slot], at: Duration) {
+		let mut out = Vec::new();
+		let (base, against) = net.peers[0].taken.heard.base(NOTHING);
+
+		assert_eq!(against, NOTHING);
+		Snapshot::write(number, against, NOTHING, base, world, &mut out).expect("it fits");
+
+		let mut applying = Vec::new();
+
+		assert!(absorb(&mut net.peers[0].taken, &out, &mut applying, at));
+	}
+
+	#[test]
+	fn a_body_the_far_end_owns_is_driven_rather_than_simulated() {
+		let (mut net, mut world, body) = client();
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.kind),
+			Some(BodyKind::Dynamic),
+			"it starts as something the solver moves"
+		);
+
+		arrived(&mut net, 1, &told(body, 4.0), Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.kind),
+			Some(BodyKind::Kinematic),
+			"and stops being one, because the far end is in charge of it"
+		);
+		assert_eq!(
+			world
+				.entities
+				.transform(
+					world
+						.bodies
+						.get(body)
+						.expect("it is there")
+						.entity
+				)
+				.map(|it| it.position.x),
+			Some(4.0),
+			"what is written is the entity, which is what the solver copies from"
+		);
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.velocity.y),
+			Some(8.0),
+			"and the speed, which is what it pushes with"
+		);
+		assert_eq!(world.bodies.get(body).map(|it| it.angular.z), Some(12.0), "and the spin");
+	}
+
+	#[test]
+	fn a_world_is_put_back_at_the_moment_it_is_asked_for_and_not_the_newest() {
+		// the whole of what the delay buys, seen from the world's side: two
+		// snapshots a tenth apart, and a moment half way between them puts the
+		// body half way rather than at either end.
+		let (mut net, mut world, body) = client();
+		let tenth = Duration::from_millis(100);
+
+		arrived(&mut net, 1, &told(body, 0.0), Duration::ZERO);
+		arrived(&mut net, 2, &told(body, 10.0), tenth);
+		net.arrive(&mut world, Duration::from_millis(50));
+
+		assert_eq!(
+			world
+				.entities
+				.transform(
+					world
+						.bodies
+						.get(body)
+						.expect("it is there")
+						.entity
+				)
+				.map(|it| it.position.x),
+			Some(5.0),
+			"half way between the two it was told about"
+		);
+	}
+
+	#[test]
+	fn a_body_that_drives_no_entity_is_written_where_it_stands() {
+		// a ragdoll limb, or a collision brush a scene gave no thing to. The
+		// solver only ever copies a body *from* an entity, so one with none is
+		// never copied over and the body itself is the write that lasts.
+		// Setting its kind and then failing to place it would be a body
+		// neither the solver nor the wire could move.
+		let (mut net, mut world, _) = client();
+		let alone = world.bodies.spawn(Body {
+			kind: BodyKind::Dynamic,
+			..Body::default()
+		});
+
+		assert_eq!(
+			world.bodies.get(alone).map(|it| it.entity),
+			Some(colby_core::abi::EntityId::NONE),
+			"it drives nothing"
+		);
+
+		arrived(&mut net, 1, &told(alone, 6.0), Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(
+			world
+				.bodies
+				.get(alone)
+				.map(|it| it.transform.position.x),
+			Some(6.0),
+			"so it is put where it was said to be, directly"
+		);
+	}
+
+	#[test]
+	fn the_kind_the_far_end_sent_is_kept_unless_it_is_one_the_solver_would_move() {
+		// a static map body stays static, and a prop the host froze reads as
+		// frozen. Only a body the *host* is simulating has to become kinematic
+		// here, and only so that this end's solver does not fight the wire.
+		let (mut net, mut world, body) = client();
+
+		for (sent, want) in
+			[(0_u32, BodyKind::Static), (1, BodyKind::Kinematic), (2, BodyKind::Kinematic)]
+		{
+			let mut said = told(body, 1.0);
+
+			said[body.slot()] = said[body.slot()].map(|(generation, mut solid)| {
+				solid.kind = sent;
+				(generation, solid)
+			});
+			arrived(&mut net, sent + 1, &said, Duration::ZERO);
+			net.arrive(&mut world, Duration::ZERO);
+
+			assert_eq!(
+				world.bodies.get(body).map(|it| it.kind),
+				Some(want),
+				"kind {sent} arrived"
+			);
+		}
+	}
+
+	#[test]
+	fn whether_a_proxy_is_asleep_is_the_far_ends_answer_and_not_this_ends() {
+		// two sleeping bodies are a pair the broadphase refuses, and nothing
+		// wakes a body it never makes a contact for. A body that fell asleep
+		// while this end was still simulating it would otherwise stay asleep
+		// as a proxy for the life of the process.
+		let (mut net, mut world, body) = client();
+
+		if let Some(it) = world.bodies.get_mut(body) {
+			it.sleeping = true;
+		}
+
+		arrived(&mut net, 1, &told(body, 1.0), Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.sleeping),
+			Some(false),
+			"the far end says it is moving, so it is awake here"
+		);
+	}
+
+	#[test]
+	fn a_slot_this_end_has_no_body_in_is_passed_over_in_silence() {
+		// a snapshot says where a thing is and never what it is, so a body
+		// that exists on the host and not here cannot be made from one. What
+		// must not happen is a panic or a body driven to somebody else's
+		// place.
+		let (mut net, mut world, body) = client();
+		let far = 900;
+		let mut said = vec![None; far + 1];
+
+		said[far] = told(body, 7.0)[body.slot()];
+		arrived(&mut net, 1, &said, Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.kind),
+			Some(BodyKind::Dynamic),
+			"the body this end does have was not spoken about and was left alone"
+		);
+	}
+
+	#[test]
+	fn a_slot_whose_occupant_changed_is_not_driven_to_the_dead_ones_place() {
+		// the generation is the whole of what says these are two bodies. A
+		// snapshot about the one that used to be in this slot must not move
+		// the one that is there now.
+		let (mut net, mut world, body) = client();
+		let mut said = told(body, 7.0);
+
+		said[body.slot()] = said[body.slot()].map(|(generation, solid)| (generation + 1, solid));
+		arrived(&mut net, 1, &said, Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.kind),
+			Some(BodyKind::Dynamic),
+			"a different occupant, so this one is not touched"
+		);
+	}
+
+	#[test]
+	fn a_world_that_joined_one_is_no_longer_the_authority_over_anything() {
+		let mut world = World::new();
+
+		assert!(world.peer.is_host(), "a world on its own is the authority");
+		assert!(
+			world.bodies.spawn(Body::default()).is_some(),
+			"and a body in it is one this end decides"
+		);
+
+		joined(&mut world);
+
+		assert!(!world.peer.is_host(), "and a world that went looking for one is not");
+
+		let body = world.bodies.spawn(Body::default());
+
+		assert!(
+			!world
+				.bodies
+				.get(body)
+				.expect("it is there")
+				.role(world.peer)
+				.local(),
+			"so every body in it is somebody else's to decide"
+		);
+	}
+
+	#[test]
+	fn a_body_this_end_has_authority_over_is_left_alone() {
+		// the role is what decides, not the wire. Today a client's world says
+		// it is nobody, so nothing is local and this arm is unreachable from
+		// the outside - the commit that gives a client its own name is what
+		// makes it ordinary, and the rule has to be right before then.
+		let (mut net, mut world, body) = client();
+
+		// this end is the authority again, which is what a peer owning a body
+		// will look like once there is a handshake to say so.
+		world.peer = PeerId::HOST;
+
+		arrived(&mut net, 1, &told(body, 4.0), Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.kind),
+			Some(BodyKind::Dynamic),
+			"a body this end decides is not driven by what somebody said about it"
+		);
+	}
+
+	#[test]
+	fn a_host_puts_nothing_back_even_if_its_world_forgot_it_is_one() {
+		// the endpoint knows what it is, and that is what has to stand between
+		// a client's claim and a host's world. `World::peer` is a public field
+		// a game module writes, so it cannot be the only thing that does.
+		let wire = Rc::new(RefCell::new(Wire::default()));
+		let mut host = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), true, 1);
+		let mut world = World::new();
+		let entity = world.entities.spawn();
+		let body = world.bodies.spawn(Body {
+			kind: BodyKind::Dynamic,
+			entity,
+			..Body::default()
+		});
+
+		// the inconsistent state on purpose: a host whose world does not say
+		// so. Nothing produces this today and something might.
+		world.peer = PeerId::NONE;
+		host.introduce(somewhere(2));
+		arrived(&mut host, 1, &told(body, 4.0), Duration::ZERO);
+		host.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.kind),
+			Some(BodyKind::Dynamic),
+			"a host is the end that says what the world is, whatever its world thinks"
+		);
+	}
+
+	#[test]
+	fn a_host_is_told_nothing_and_puts_nothing_back() {
+		// the one direction this does not go. A host is the end that says what
+		// the world is, so a world arriving at one would be the world
+		// overwriting itself with whatever a client claimed.
+		let wire = Rc::new(RefCell::new(Wire::default()));
+		let mut host = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), true, 1);
+		let mut world = World::new();
+		let entity = world.entities.spawn();
+		let body = world.bodies.spawn(Body {
+			kind: BodyKind::Dynamic,
+			entity,
+			..Body::default()
+		});
+
+		host.introduce(somewhere(2));
+		arrived(&mut host, 1, &told(body, 4.0), Duration::ZERO);
+		host.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.kind),
+			Some(BodyKind::Dynamic),
+			"nothing a peer said moved anything here"
+		);
+	}
+
+	#[test]
+	fn how_far_behind_to_draw_is_read_from_the_table_and_kept_sensible() {
+		let mut cvars = table();
+
+		assert_eq!(behind(&cvars), Duration::from_secs_f32(INTERP_DEFAULT));
+
+		assert!(cvars.set(INTERP, "0.25"));
+		assert_eq!(behind(&cvars), Duration::from_millis(250));
+
+		// a delay past what the ring can answer would ask for a moment older
+		// than anything still here, which reads as the world having stopped.
+		assert!(cvars.set(INTERP, "90"));
+		assert_eq!(behind(&cvars), Duration::from_secs_f32(MAX_INTERP));
+
+		assert!(cvars.set(INTERP, "-3"));
+		assert_eq!(behind(&cvars), Duration::ZERO, "and behind is never ahead");
 	}
 
 	#[test]

@@ -7,6 +7,8 @@
 //! definition of what a step does, and nothing in it depends on how much real
 //! time has gone by.
 
+use std::time::Duration;
+
 use colby_audio::Device;
 use colby_core::{
 	abi::{Input, World},
@@ -16,7 +18,7 @@ use colby_physics::Simulation;
 use colby_script::Scripts;
 use colby_ui::Interface;
 
-use crate::game::Game;
+use crate::{game::Game, net::Net};
 
 /// Everything a step drives that outlives it.
 ///
@@ -25,6 +27,14 @@ use crate::game::Game;
 /// grows every time a subsystem appears is a signature nobody reads. What is
 /// *not* in here is the per-step half - the world, the input, the moment and
 /// the mode - because those are what the step is actually about.
+pub(crate) struct Wired<'a> {
+	/// The endpoint.
+	pub(crate) net: &'a mut Net,
+
+	/// How long this process has been running.
+	pub(crate) now: Duration,
+}
+
 pub(crate) struct Parts<'a> {
 	/// The loaded module, if there is one.
 	pub(crate) game: Option<&'a mut Game>,
@@ -37,6 +47,15 @@ pub(crate) struct Parts<'a> {
 
 	/// The physics, advanced here and queried by the game.
 	pub(crate) simulation: &'a mut Simulation,
+
+	/// The endpoint, and the moment this process is at on its own clock.
+	///
+	/// The two travel together because neither means anything without the
+	/// other: a world that arrived is placed against the clock it arrived on,
+	/// and that clock is the wire's rather than the simulation's. `--shot` and
+	/// `--record` pass `None` and are untouched by any of it, which is the
+	/// property nothing in this step may disturb.
+	pub(crate) wire: Option<Wired<'a>>,
 
 	/// The output device, if one opened.
 	///
@@ -70,6 +89,7 @@ pub(crate) fn run(
 		scripts,
 		simulation,
 		audio,
+		wire,
 	} = parts;
 
 	// the present becomes the past before the game touches anything. What the
@@ -135,6 +155,21 @@ pub(crate) fn run(
 	// nothing responded in. What stops is the two things that *move* it, which
 	// is what makes a person the only writer while it is stopped.
 	if !editing {
+		// what the far end said, before the solver reads it: a body this end
+		// does not own is driven rather than simulated, and what drives it is
+		// the entity the solver is about to copy into it.
+		//
+		// Inside the edit-mode guard with the solver and the game, and for the
+		// same reason: what stops while a world is being edited is everything
+		// that *moves* it, and a wire is a third thing that moves it.
+		if let Some(wire) = wire {
+			wire.net.arrive(
+				world,
+				wire.now
+					.saturating_sub(crate::net::behind(&world.cvars)),
+			);
+		}
+
 		simulation.step(world);
 
 		if let Some(game) = game {
@@ -166,11 +201,143 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{Body, Key, Shape, SoundData, Transform, Voice, debug},
+		abi::{Body, BodyId, EntityId, Key, Shape, SoundData, Transform, Voice, debug},
 		glam::Vec3,
 	};
 
 	use super::*;
+
+	/// A client with a body driving an entity, and two snapshots already taken
+	/// a tenth of a second apart at nought and ten along an axis.
+	fn wired_client() -> (Net, Box<World>, Box<Simulation>, EntityId, BodyId) {
+		use std::{
+			cell::RefCell,
+			net::{IpAddr, Ipv4Addr, SocketAddr},
+			rc::Rc,
+		};
+
+		use colby_net::{NOTHING, Snapshot, Solid};
+
+		use crate::net::{Loopback, Wire};
+
+		let at = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+		let shared = Rc::new(RefCell::new(Wire::default()));
+		let mut net = Net::over(Box::new(Loopback::at(at(2), &shared)), false, 2);
+		let simulation = Box::new(Simulation::new());
+		let mut world = Box::<World>::default();
+
+		world.install_physics(simulation.table());
+		crate::net::install(&mut world.cvars);
+		crate::net::joined(&mut world);
+		net.introduce(at(1));
+
+		let entity = world.entities.spawn();
+		let body = world
+			.bodies
+			.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0).driving(entity));
+
+		for (number, along, when) in [(1_u32, 0.0_f32, 0_u64), (2, 10.0, 100)] {
+			let mut table = vec![None; body.slot() + 1];
+			let solid = Solid {
+				position: [along, 0.0, 0.0],
+				rotation: [0.0, 0.0, 0.0, 1.0],
+				scale: [1.0, 1.0, 1.0],
+				// the kind a host simulating it would send. `Solid::default`
+				// is a static body and would be passed through as one.
+				kind: 2,
+				..Solid::default()
+			};
+			let mut out = Vec::new();
+
+			table[body.slot()] = Some((body.generation(), solid));
+			Snapshot::write(number, NOTHING, NOTHING, &[], &table, &mut out).expect("fits");
+			assert!(net.absorbed(&out, Duration::from_millis(when)));
+		}
+
+		(net, world, simulation, entity, body)
+	}
+
+	/// Runs one step of a client at a moment on the wire's clock.
+	fn stepped_at(net: &mut Net, world: &mut World, simulation: &mut Simulation, now: u64) {
+		let parts = Parts {
+			game: None,
+			interface: &mut Interface::new(),
+			scripts: None,
+			simulation,
+			audio: None,
+			wire: Some(Wired { net, now: Duration::from_millis(now) }),
+		};
+
+		run(world, parts, &mut Input::default(), 0.0, false);
+	}
+
+	/// Where an entity is, and where it is drawn coming from.
+	fn drawn(world: &World, entity: EntityId) -> (Option<f32>, Option<f32>) {
+		(
+			world
+				.entities
+				.transform(entity)
+				.map(|it| it.position.x),
+			world
+				.entities
+				.interpolated(entity, 0.0)
+				.map(|it| it.position.x),
+		)
+	}
+
+	#[test]
+	fn a_step_draws_the_world_a_client_was_told_about_a_delay_behind() {
+		// the only test over the wiring rather than over the pieces, and the
+		// only thing that can see the delay being applied at all: `Net::arrive`
+		// is handed a moment, so a step that handed it the wrong one would be
+		// invisible everywhere else.
+		//
+		// The default delay is a tenth, so a step at a hundred and fifty
+		// milliseconds draws the moment at fifty - half way between the two
+		// snapshots rather than on either. Landing *on* one is the trap: at
+		// two hundred a step that forgot the delay would answer with snapshot
+		// two as well, because a moment past the newest is the newest.
+		let (mut net, mut world, mut simulation, entity, body) = wired_client();
+
+		stepped_at(&mut net, &mut world, &mut simulation, 150);
+
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.kind),
+			Some(colby_core::abi::BodyKind::Kinematic),
+			"the body the far end owns stopped being simulated"
+		);
+		assert_eq!(
+			drawn(&world, entity).0,
+			Some(5.0),
+			"and the world drawn is the one a tenth of a second behind, not the newest"
+		);
+	}
+
+	#[test]
+	fn the_first_step_a_body_is_driven_is_a_cut_and_the_next_one_is_not() {
+		// the first time, it comes from wherever this end's own solver had
+		// left it - the origin here - so blending towards the truth would draw
+		// it sliding in from there. `interpolated` at nought is the *previous*
+		// pose, and after a cut the previous pose is the new one.
+		let (mut net, mut world, mut simulation, entity, _) = wired_client();
+
+		stepped_at(&mut net, &mut world, &mut simulation, 150);
+
+		assert_eq!(drawn(&world, entity), (Some(5.0), Some(5.0)), "cut to, this first time");
+
+		// and again, with the body already driven: now it moves, so it is
+		// interpolated like anything else. Two hundred milliseconds rather
+		// than some number in between, because a moment that lands exactly on
+		// a snapshot is the only one whose answer is a float somebody can
+		// write down.
+		stepped_at(&mut net, &mut world, &mut simulation, 200);
+
+		assert_eq!(
+			drawn(&world, entity),
+			(Some(10.0), Some(5.0)),
+			"and then drawn coming from where it was, rather than cut to"
+		);
+	}
 
 	/// A world with one thing in it that falls if anything steps it.
 	fn falling() -> (Box<World>, Box<Simulation>) {
@@ -212,6 +379,7 @@ mod tests {
 				scripts: None,
 				simulation,
 				audio: None,
+				wire: None,
 			};
 
 			run(world, parts, input, time, editing);

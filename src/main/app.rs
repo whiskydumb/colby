@@ -5,7 +5,10 @@
 //! inside the hot-reloaded module, which is why swapping the module is allowed
 //! to be a two-line operation in the middle of a frame.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use colby_audio::Device;
 use colby_core::{
@@ -219,7 +222,13 @@ impl App {
 		// anything simply has no socket, which is the ordinary case.
 		if let Some(address) = crate::net::wanted() {
 			match Net::connect(address, crate::net::seed(&self.world.cvars)) {
-				| Ok(net) => self.net = Some(net),
+				| Ok(net) => {
+					self.net = Some(net);
+					// and this process stops being the authority, which is
+					// the one thing about a window that connected that
+					// nothing else could work out. @ref `crate::net::joined`.
+					crate::net::joined(&mut self.world);
+				},
 				| Err(error) => error!(%error, "no socket; this window is on its own"),
 			}
 		}
@@ -352,6 +361,52 @@ impl App {
 	/// hitch - and a picture either way, because what makes the motion smooth
 	/// is where the frame sits between two steps rather than how many of them
 	/// it ran.
+	/// The moment the next step is at, on the clock the wire is on.
+	///
+	/// Read once a frame and advanced a step at a time by the caller, rather
+	/// than read again inside the step loop: what the wire is asked for has to
+	/// move by exactly one step per step, or the renderer's own blend between
+	/// two steps is asked to cover a gap that is not one step wide - and a
+	/// body would be drawn speeding up and slowing down on a wire doing
+	/// nothing of the kind. @ref `step::Wired`.
+	///
+	/// @return how long this process has been running
+	fn moment(&self) -> Duration { self.started.elapsed() }
+
+	/// The endpoint and the moment, for the step about to run.
+	///
+	/// Its own function so that *which* clock the moment comes from is
+	/// something a test can ask about. It comes from the caller, which read it
+	/// once for the frame; reading it here would put a real-time sample inside
+	/// the step loop, and two steps in one frame would then be microseconds
+	/// apart where the renderer's blend assumes a step. @ref `step::Wired`.
+	///
+	/// @param net - the endpoint, if this process has one
+	/// @param moment - where the wire's clock stands for this step
+	/// @return the pair, or nothing when this process is on no wire
+	fn wired(net: Option<&mut Net>, moment: Duration) -> Option<step::Wired<'_>> {
+		let net = net?;
+
+		Some(step::Wired { net, now: moment })
+	}
+
+	/// Puts a message out for the step that has just run, and moves the wire's
+	/// own clock on by one step.
+	///
+	/// Out once a step rather than once a frame, because a message has to mean
+	/// "this is where things stand at this moment" and a frame rate is not a
+	/// moment.
+	///
+	/// @param moment - where the wire's clock stood for the step just run
+	/// @return where it stands for the next one
+	fn stepped(&mut self, moment: Duration) -> Duration {
+		if let Some(net) = self.net.as_mut() {
+			net.send(self.started.elapsed(), None);
+		}
+
+		moment.saturating_add(STEP)
+	}
+
 	fn frame(&mut self) -> Result {
 		// reading two variables is not the kind of work that moves the clock
 		// sample around, and the pace has to be set before the time it applies
@@ -453,6 +508,8 @@ impl App {
 				.set_pointer(Vec2::from(self.input.cursor));
 		}
 
+		let mut moment = self.moment();
+
 		while let Some(time) = self.clock.step() {
 			step::run(
 				&mut self.world,
@@ -462,18 +519,16 @@ impl App {
 					scripts: self.scripts.as_mut(),
 					simulation: self.simulation.as_mut(),
 					audio: self.audio.as_mut(),
+					// the endpoint and the clock it is on, so that a world a
+					// host described lands in this one. @ref `Net::arrive`.
+					wire: Self::wired(self.net.as_mut(), moment),
 				},
 				&mut self.input,
 				time,
 				editing,
 			);
 
-			// and out once a step rather than once a frame, because a message
-			// has to mean "this is where things stand at this moment" and a
-			// frame rate is not a moment.
-			if let Some(net) = self.net.as_mut() {
-				net.send(self.started.elapsed(), None);
-			}
+			moment = self.stepped(moment);
 		}
 
 		self.frames = self.frames.saturating_add(1);
@@ -708,6 +763,51 @@ impl ApplicationHandler for App {
 			stalls = self.clock.stalls(),
 			reloads = self.world.reloads,
 			"colby stopped"
+		);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_wires_clock_moves_by_exactly_one_step_a_step() {
+		// what the renderer's own blend between two steps assumes, and the
+		// only thing that says the moment is not re-read from the real clock
+		// inside the loop: two steps in one frame would then be microseconds
+		// apart, and two a frame apart a whole frame apart, with one blend
+		// asked to cover both.
+		let mut app = App::new();
+		let began = Duration::from_secs(7);
+		let after = app.stepped(began);
+
+		assert_eq!(after, began + STEP, "one step on, whatever the clock says");
+		assert_eq!(app.stepped(after), began + STEP * 2, "and again");
+	}
+
+	#[test]
+	fn the_moment_a_step_is_given_is_the_one_it_was_handed() {
+		// and not one this process read for itself. A window with no socket
+		// gets no wire at all, which is the ordinary case.
+		let mut app = App::new();
+		let asked = Duration::from_secs(3);
+
+		assert!(App::wired(app.net.as_mut(), asked).is_none(), "no socket, no wire");
+
+		app.net = Some(Net::over(
+			Box::new(crate::net::Loopback::at(
+				std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1),
+				&std::rc::Rc::new(std::cell::RefCell::new(crate::net::Wire::default())),
+			)),
+			false,
+			1,
+		));
+
+		assert_eq!(
+			App::wired(app.net.as_mut(), asked).map(|it| it.now),
+			Some(asked),
+			"the moment is the caller's, not a fresh reading"
 		);
 	}
 }

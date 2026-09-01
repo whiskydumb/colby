@@ -141,6 +141,10 @@ pub(crate) fn serve(port: u16) -> Result {
 					// a machine serving a world has nothing to make a noise
 					// into. @ref the module comment.
 					audio: None,
+					// and nothing tells a host what its world looks like, so
+					// the endpoint goes nowhere near the step. @ref
+					// `Net::arrive`, which refuses a host anyway.
+					wire: None,
 				},
 				&mut input,
 				time,

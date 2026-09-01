@@ -136,6 +136,8 @@ pub(crate) fn take(path: &Path) -> Result {
 				// put a driver's cadence inside a path that has to be
 				// reproducible.
 				audio: None,
+				// no wire, so a screenshot is what it always was.
+				wire: None,
 			},
 			&mut input,
 			time,
