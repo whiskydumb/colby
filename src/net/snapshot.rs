@@ -46,10 +46,11 @@
 //! [`Snapshot::against`].
 //!
 //! For a block with a real `against` the two ends can still disagree, and
-//! nothing here can stop them. A receiver has to decode against the world it
-//! named, not against the newest one it has - which means the receiving end
-//! needs a memory of what it applied, the same shape as the ring the sending
-//! end keeps. That is not in this commit and is called out where it bites.
+//! nothing here can stop them: a receiver has to decode against the world the
+//! block *names*, not against the newest one it has. What makes that possible
+//! is that the receiving end keeps a [`Ring`](crate::ring::Ring) of what it
+//! applied, exactly as the sending end keeps one of what it sent. Nothing in
+//! this module enforces it, because this module never sees either.
 //!
 //! ## The record, and why it is shaped like this
 //!
@@ -132,9 +133,36 @@
 //! decodes as a well-formed record of nothing - which is the one part of its
 //! design worth deliberately not copying.
 
-use colby_core::bytemuck;
+use colby_core::{
+	abi::{Body, BodyKind},
+	bytemuck,
+};
 
 use crate::packet::{u16_at, u32_at};
+
+/// How many simulation steps there are between snapshots.
+///
+/// Twenty a second at the simulation's sixty, which is the rate the systems
+/// this is modeled on settle on. [`DEPTH`](crate::ring::DEPTH) was chosen
+/// before this and against memory rather than against a rate; what this number
+/// does is settle what that depth *buys*, which is one and a half seconds of
+/// history rather than half of one.
+///
+/// **A step is not a snapshot and this is why.** The world is stepped sixty
+/// times a second because that is what makes a stack of boxes stand up; it is
+/// *described* twenty times a second because that is what a far end can be
+/// told without the description costing more than the simulation.
+///
+/// @note: this is a count of steps, not a rate, so the two are not independent
+/// after all - change the tick and the snapshot rate moves with it. That is
+/// the right coupling while the tick is a constant and the wrong one the day
+/// it is not, and it is the same open question the tick rate itself has.
+///
+/// @note: a peer still hears from this end every step. What a snapshot's
+/// cadence gates is whether a message carries a *description*; a message with
+/// none is still fourteen bytes of head saying what this end holds, which is
+/// what keeps the far end's differences from being baselines forever.
+pub const EVERY: u32 = 3;
 
 /// How many bodies one snapshot can speak about.
 ///
@@ -157,9 +185,20 @@ pub const MAX_SLOTS: usize = colby_core::abi::MAX_BODIES;
 /// number is [`MAX_BASELINE`].** A world with more moving parts than that
 /// cannot be sent in full at all: there is no continuation and no resume, so a
 /// baseline either fits or is refused. That is not an oversight to be fixed
-/// here - a world of hundreds of bodies is the stated trigger for deciding
-/// *which* of them a given peer is told about, and until something decides
-/// that, sending all of them is the only thing on offer.
+/// here - deciding *which* bodies a given peer is told about is what answers
+/// it, and until something decides that, sending all of them is the only thing
+/// on offer.
+///
+/// **The number is eighty three, and that is closer than it sounds.** The
+/// sandbox's map is fifty one bodies before a player has built anything, and
+/// its prop ceiling is ninety six, so a world past this limit is a few minutes
+/// of play rather than a hypothetical. What happens then is worse than a
+/// dropped frame: a peer with no base is owed a baseline, the baseline does
+/// not fit, nothing is kept, so the peer never learns of a base to answer
+/// with - and every attempt after it is the same baseline failing the same
+/// way. The endpoint that discovers this says so once, by address.
+/// @ref `crate::MAX_BASELINE`, which is the worst case; a record with fields
+/// it does not need to send is smaller and the real wall is higher.
 pub const MAX_SNAPSHOT: usize = 8192;
 
 /// How many bodies one snapshot can carry when every one of them is new.
@@ -272,6 +311,44 @@ pub struct Solid {
 
 	/// The peer that owns it, as a slot and a generation.
 	pub owner: [u32; 2],
+}
+
+impl Solid {
+	/// The record that describes one body.
+	///
+	/// Every field here comes from a body and none is computed, which is what
+	/// makes this the whole of the conversion rather than half of it. What a
+	/// body has and a record does not - its shape, its mass, its surface, the
+	/// layers it collides with - is the list above of what is deliberately not
+	/// sent.
+	///
+	/// The kind is written out as a `match` rather than cast. A cast would
+	/// compile after a fourth kind was added and would send it as whatever
+	/// number it happened to land on; this does not compile until somebody has
+	/// decided what the far end should be told.
+	///
+	/// @param body - the body as the solver left it
+	/// @return the record to compare against the last one sent
+	#[must_use]
+	pub fn of(body: &Body) -> Self {
+		let transform = body.transform;
+
+		Self {
+			position: transform.position.to_array(),
+			rotation: transform.rotation.to_array(),
+			velocity: body.velocity.to_array(),
+			angular: body.angular.to_array(),
+			sleeping: u32::from(body.sleeping),
+			scale: transform.scale.to_array(),
+			kind: match body.kind {
+				| BodyKind::Static => 0,
+				| BodyKind::Kinematic => 1,
+				| BodyKind::Dynamic => 2,
+			},
+			entity: [u32::try_from(body.entity.slot()).unwrap_or(0), body.entity.generation()],
+			owner: [u32::try_from(body.owner.slot()).unwrap_or(0), body.owner.generation()],
+		}
+	}
 }
 
 /// How many four-byte words one [`Solid`] is.
@@ -511,6 +588,28 @@ impl Snapshot {
 		out[began + HEAD - 2..began + HEAD].copy_from_slice(&count.to_le_bytes());
 
 		Ok(spoken)
+	}
+
+	/// Reads the head and nothing else.
+	///
+	/// A receiver cannot call [`read`](Self::read) until it knows what to read
+	/// against, and what to read against is in the block. This is the way out
+	/// of that: the head is a fixed fourteen bytes and needs nothing from
+	/// anybody, so it is read first and the base chosen from what it says.
+	///
+	/// @param bytes - the block, which may have anything after it
+	/// @return which snapshot it is, what it is written against, and what the
+	/// sender holds
+	///
+	/// # Errors
+	///
+	/// If there is not a whole head there.
+	pub fn peek(bytes: &[u8]) -> Result<(u32, u32, u32), Fault> {
+		if bytes.len() < HEAD {
+			return Err(Fault::Short);
+		}
+
+		Ok((u32_at(bytes, 0), u32_at(bytes, 4), u32_at(bytes, 8)))
 	}
 
 	/// Reads a snapshot back, against what the reader already had.
@@ -769,6 +868,10 @@ mod tests {
 			owner: [5, 3],
 		}
 	}
+
+	/// The words of a handful of floats, for comparing them the way the codec
+	/// does rather than the way arithmetic does.
+	fn bits<const N: usize>(of: [f32; N]) -> [u32; N] { of.map(f32::to_bits) }
 
 	/// A table of slots, from what is in each of them.
 	fn table(entries: &[(usize, u32, Solid)]) -> Vec<Slot> {
@@ -1483,6 +1586,113 @@ mod tests {
 			MAX_BASELINE < MAX_SLOTS,
 			"and a world of every slot does not, which is what interest management is for"
 		);
+	}
+
+	#[test]
+	fn a_body_becomes_the_record_that_describes_it() {
+		// every field, because the point of the conversion is that it is
+		// total: a word left at its default would be a body that arrives at
+		// the far end subtly wrong rather than missing.
+		use colby_core::{
+			abi::{Body, BodyKind, Entities, PeerId, Transform},
+			glam::{Quat, Vec3},
+		};
+
+		let mut entities = Entities::new();
+
+		entities.spawn();
+
+		let drives = entities.spawn();
+
+		assert!(drives.slot() > 0 && drives.generation() > 0, "a handle no zero could pass for");
+
+		let body = Body {
+			kind: BodyKind::Kinematic,
+			transform: Transform {
+				position: Vec3::new(1.0, 2.0, 3.0),
+				rotation: Quat::from_xyzw(0.5, 0.5, 0.5, 0.5),
+				scale: Vec3::new(4.0, 5.0, 6.0),
+			},
+			velocity: Vec3::new(7.0, 8.0, 9.0),
+			angular: Vec3::new(10.0, 11.0, 12.0),
+			sleeping: true,
+			entity: drives,
+			owner: PeerId::HOST,
+			..Body::default()
+		};
+		let record = Solid::of(&body);
+
+		// as words rather than as numbers, which is the rule the whole module
+		// is built on and applies to a test reading it as much as to the codec.
+		assert_eq!(bits(record.position), bits([1.0, 2.0, 3.0]));
+		assert_eq!(bits(record.rotation), bits([0.5, 0.5, 0.5, 0.5]), "xyzw, as glam stores it");
+		assert_eq!(bits(record.velocity), bits([7.0, 8.0, 9.0]));
+		assert_eq!(bits(record.angular), bits([10.0, 11.0, 12.0]));
+		assert_eq!(bits(record.scale), bits([4.0, 5.0, 6.0]));
+		assert_eq!(record.sleeping, 1, "a flag as the word it travels as");
+		assert_eq!(record.kind, 1, "and a kind as its own number rather than a cast");
+		assert_eq!(
+			record.entity,
+			[u32::try_from(drives.slot()).unwrap_or(0), drives.generation()],
+			"the entity it drives, slot and generation, which is what pairs the two"
+		);
+		assert_eq!(record.owner, [0, u32::MAX], "the host, whose generation says which it is");
+
+		// the other two arms of the table the doc makes a point of. A cast
+		// would put every kind on the wire correctly by accident; what is
+		// being checked is that each has been decided rather than derived.
+		for (kind, word) in [(BodyKind::Static, 0), (BodyKind::Dynamic, 2)] {
+			let one = Solid::of(&Body { kind, ..Body::default() });
+
+			assert_eq!(one.kind, word, "{kind:?} is its own number");
+		}
+	}
+
+	#[test]
+	fn a_record_of_a_still_body_costs_nothing_after_the_first_telling() {
+		// what the whole scheme is for, said over the conversion rather than
+		// over a fixture. Two records taken from one body at two moments have
+		// to be the same bytes when nothing about it changed, and different
+		// bytes when something did - a conversion that answered the same way
+		// either time would make a moving world free and a still one, too.
+		let mut body = Body::default();
+		let before = Solid::of(&body);
+		let still = Solid::of(&body);
+		let mut out = Vec::new();
+
+		assert_eq!(bytemuck::bytes_of(&before), bytemuck::bytes_of(&still), "the same body");
+
+		let spoken = Snapshot::write(
+			2,
+			1,
+			NOTHING,
+			&table(&[(0, 1, before)]),
+			&table(&[(0, 1, still)]),
+			&mut out,
+		)
+		.expect("it fits");
+
+		assert_eq!(spoken, 0, "so it is not spoken about");
+		assert_eq!(out.len(), HEAD, "and the block is a head and nothing else");
+
+		body.transform.position.x = 4.0;
+
+		let moved = Solid::of(&body);
+
+		out.clear();
+
+		let spoken = Snapshot::write(
+			2,
+			1,
+			NOTHING,
+			&table(&[(0, 1, before)]),
+			&table(&[(0, 1, moved)]),
+			&mut out,
+		)
+		.expect("it fits");
+
+		assert_eq!(spoken, 1, "and one that moved is");
+		assert!(out.len() > HEAD);
 	}
 
 	#[test]

@@ -472,7 +472,7 @@ impl App {
 			// has to mean "this is where things stand at this moment" and a
 			// frame rate is not a moment.
 			if let Some(net) = self.net.as_mut() {
-				net.send(self.started.elapsed());
+				net.send(self.started.elapsed(), None);
 			}
 		}
 

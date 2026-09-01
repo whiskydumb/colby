@@ -19,10 +19,14 @@
 //!
 //! Only the slots that were occupied. A world of a thousand slots holding fifty
 //! bodies is fifty records here, not a thousand - which matters because this is
-//! the one structure in the subsystem whose size is multiplied by two things at
-//! once, the depth of the ring and the number of peers. The channel's history
-//! of sent messages is multiplied the same way and is a fraction of the size,
-//! which is the comparison that makes this the one worth keeping sparse.
+//! the one structure in the subsystem whose size is multiplied by three things
+//! at once: the depth of the ring, the number of peers, and the two of these a
+//! conversation needs. One holds what was *sent* to a peer, to write the next
+//! difference against; the other holds what was *taken* from it, to read its
+//! next difference against. Every figure below is per ring, so double it for a
+//! conversation. The channel's history of sent messages is multiplied the same
+//! way and is a fraction of the size, which is the comparison that makes this
+//! the one worth keeping sparse.
 //!
 //! A slot costs ninety six bytes, not the eighty eight a [`Solid`] weighs: it
 //! is an `Option` of a generation and a body, and no field of a body has a
@@ -79,16 +83,15 @@
 //!
 //! Writing against an *older* base than necessary costs bytes, and it is
 //! correct only if the far end decodes against the base the block names rather
-//! than against the newest world it has. It cannot do that yet. A host sending
-//! twice a round trip will routinely write snapshot `n + 2` against `n` while
-//! the peer has already applied `n + 1`, and a receiver that decodes against
-//! what it currently holds gets a body whose unsent fields came from the wrong
-//! world.
+//! than against the newest world it has. A host sending twice a round trip
+//! routinely writes snapshot `n + 2` against `n` while the peer has already
+//! applied `n + 1`, and a receiver that decoded against what it currently held
+//! would get a body whose unsent fields came from the wrong world.
 //!
-//! @note: the fix is a ring on the receiving end too - this exact type, holding
-//! what was applied rather than what was sent - and it belongs with the commit
-//! that wires a client up. Until then the only safe cadence is one snapshot per
-//! round trip, which is not a cadence anybody wants.
+//! **So a receiver keeps one of these too**, holding what it applied rather
+//! than what it sent, and reads each block against the number the block names.
+//! That is why this type is not called something about sending: it is one half
+//! of a conversation seen from either end, and both ends need it.
 
 use crate::snapshot::{MAX_SLOTS, NOTHING, Slot, Solid};
 
@@ -102,14 +105,13 @@ use crate::snapshot::{MAX_SLOTS, NOTHING, Slot, Solid};
 ///
 /// What bounds it is memory against tolerance. Depth multiplies by peers, so
 /// every step costs eight worlds; and it buys how far behind a peer may fall
-/// and still be sent a difference rather than the whole world. Thirty two is
-/// half a second at the simulation's sixty a second and one and a half at the
-/// twenty a snapshot cadence is likely to settle on.
-///
-/// @note: which of those two it turns out to be is not settled here, and the
-/// cadence does not exist yet. If a peer's round trip is worse than the depth
-/// in time, every snapshot it gets is a baseline - so this number wants
-/// revisiting beside the cadence once there is one, and not before.
+/// and still be sent a difference rather than the whole world. At
+/// [`EVERY`](crate::snapshot::EVERY) that is **one and a half seconds** of
+/// history, which is the number to hold this against: a peer whose round trip
+/// is worse than that is sent a baseline every time. Being inside it is not a
+/// promise of the opposite - a peer whose own word about what it holds is lost
+/// for long enough falls out of the ring just the same - but it is the
+/// difference between that happening on a bad burst and happening always.
 pub const DEPTH: usize = 32;
 
 /// One snapshot as it was sent, kept only while it can still be named.
@@ -206,9 +208,16 @@ impl Ring {
 	///
 	/// @param number - the number it went out as, from [`next`](Self::next)
 	/// @param world - what was described, by slot
-	pub fn keep(&mut self, number: u32, world: &[Slot]) {
+	/// @return whether it was new, and so whether it was kept
+	///
+	/// The answer is worth having rather than working out again: "was this
+	/// number new" and "is this number in the ring" are different questions,
+	/// and a caller that asked [`has`](Self::has) instead would get a yes for
+	/// a number that was refused *because* an older telling of it is still
+	/// sitting there.
+	pub fn keep(&mut self, number: u32, world: &[Slot]) -> bool {
 		if self.next == NOTHING || number < self.next {
-			return;
+			return false;
 		}
 
 		// the vector already in this place is taken and refilled rather than
@@ -246,6 +255,7 @@ impl Ring {
 		// short way reads as an overflow that was shrugged at, and this one
 		// was chosen.
 		self.next = number.checked_add(1).unwrap_or(NOTHING);
+		true
 	}
 
 	/// The world one snapshot described, to write the next difference against.

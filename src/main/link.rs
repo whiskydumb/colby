@@ -18,6 +18,26 @@
 //! number of steps, and a hash of everything that got through. Same build, same
 //! number, on any machine.
 //!
+//! **There is a world in it now.** The host describes a small one that moves on
+//! a schedule with nothing random in it, twenty times a second out of sixty,
+//! and the client reads what it is told back. The digest covers what the client
+//! *ended up holding* rather than only what was said, which is the difference
+//! between checking that datagrams crossed and checking that the far end has
+//! the right world.
+//!
+//! The world is small and it is deliberately awkward: a body that never moves,
+//! one that changes only a late field, one that comes and goes, and a slot
+//! whose occupant is replaced by a different one. Each of those is a case the
+//! encoding treats differently, and a world of things all doing the same thing
+//! would exercise one path and look thorough.
+//!
+//! **The run ends by agreeing.** Nothing new happens for the last two seconds,
+//! the host keeps describing the same world, and the client is asked whether it
+//! holds exactly what the host does. A snapshot is not resent when it is lost -
+//! the next one replaces it - so what that proves is the property the whole
+//! scheme rests on: a stream of differences over a wire that drops a tenth of
+//! them converges, rather than drifting.
+//!
 //! The conditions are fixed here rather than read from the console, exactly as
 //! a screenshot's ninety steps are fixed: a tool whose answer depends on what
 //! somebody last typed is not a tool.
@@ -29,8 +49,8 @@ use std::{
 	time::Duration,
 };
 
-use colby_core::{Result, info, time::STEP, warn};
-use colby_net::Conditions;
+use colby_core::{Result, bytemuck, info, time::STEP, warn};
+use colby_net::{Conditions, EVERY, NOTHING, Slot, Solid};
 
 use crate::net::{Loopback, Net, Tally, Wire};
 
@@ -62,6 +82,22 @@ const CLIENT_EVERY: u32 = 90;
 /// have no chance at all to arrive - which is a wrong answer about the one
 /// thing this mode exists to check.
 const SETTLE: u32 = 120;
+
+/// How many slots the world in this run has.
+///
+/// Small on purpose. What is being checked is that every *kind* of change
+/// survives the wire, and a bigger world would say the same thing more slowly.
+const SLOTS: usize = 8;
+
+/// How often the body that comes and goes does so, in steps.
+///
+/// Not a multiple of the snapshot cadence, so that its appearing and its
+/// vanishing land on different snapshots over the run rather than always on
+/// the same beat of one.
+const BEAT: u32 = 70;
+
+/// How often the slot that changes hands does, in steps.
+const HANDS: u32 = 190;
 
 /// How bad the wire is.
 ///
@@ -146,6 +182,19 @@ pub(crate) struct Outcome {
 
 	/// The round trip each side settled on, in whole microseconds.
 	pub(crate) rtt: (u128, u128),
+
+	/// How many steps the client took a snapshot on.
+	///
+	/// Steps rather than snapshots: two arriving in one step would move what is
+	/// held once. Nothing in this run can produce that - the wire delivers in
+	/// order and the host sends one at a time - but the number is what it is.
+	pub(crate) taken: u32,
+
+	/// Whether the client ended up holding exactly the host's world.
+	pub(crate) agreed: bool,
+
+	/// How many of the client's snapshots were whole worlds, not differences.
+	pub(crate) baselines: u32,
 }
 
 /// Runs two endpoints against each other and reports what happened.
@@ -185,9 +234,20 @@ pub(crate) fn run(steps: u32) -> Result {
 		said = outcome.said,
 		heard = outcome.heard,
 		nowhere = outcome.nowhere,
+		taken = outcome.taken,
+		baselines = outcome.baselines,
+		agreed = outcome.agreed,
 		digest = format!("{:016x}", outcome.digest),
 		"everything that had to arrive, arrived"
 	);
+
+	if !outcome.agreed {
+		warn!(
+			taken = outcome.taken,
+			"the client did not end up with the host's world, which is the other thing this \
+			 cannot do"
+		);
+	}
 
 	if outcome.said != outcome.heard {
 		warn!(
@@ -220,6 +280,9 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 	let mut digest = 0xCBF2_9CE4_8422_2325_u64;
 	let mut said = 0_u32;
 	let mut heard = 0_u32;
+	let mut taken = 0_u32;
+	let mut held = NOTHING;
+	let mut world = Vec::new();
 
 	// a client that has never sent anything is a client the host has never
 	// heard of, so the first thing that happens is the client saying hello.
@@ -237,8 +300,19 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 			said += tell(&mut client, &format!("client.tick {step}"));
 		}
 
-		host.send(now);
-		client.send(now);
+		// the world stops moving when the talking does, so the last two
+		// seconds are the same world described over and over - which is what
+		// lets a client that lost the end of the run catch up rather than
+		// being asked to agree with something it was never told.
+		describe(step.min(steps), &mut world);
+
+		// twenty a second out of sixty, and only from the host: a snapshot is
+		// what an authority sends, and the client's blocks carry nothing but
+		// the number of the newest one it has.
+		let telling = step.is_multiple_of(EVERY);
+
+		host.send(now, telling.then_some(world.as_slice()));
+		client.send(now, None);
 		host.receive(now);
 		client.receive(now);
 
@@ -247,6 +321,15 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 				heard += 1;
 				digest = fold(digest, step, side, &arrived.text);
 			}
+		}
+
+		// what the client holds, folded in whenever it changes. Once a
+		// snapshot rather than once a step, because a step in which nothing
+		// arrived says nothing about whether the world crossed.
+		if client.holding(0) != held {
+			held = client.holding(0);
+			taken += 1;
+			digest = seen(digest, held, client.world(0));
 		}
 	}
 
@@ -259,7 +342,134 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 		tally: (host.tally(0), client.tally(0)),
 		nowhere: shared.borrow().nowhere(),
 		rtt: (host.rtt(0).as_micros(), client.rtt(0).as_micros()),
+		taken,
+		agreed: same(client.world(0), &world),
+		baselines: client.baselines(0),
 	}
+}
+
+/// The world at one step, which is the same world at that step every time.
+///
+/// Six different things happen in it, because six different things are what
+/// the encoding treats differently:
+///
+/// - slot nought never moves at all, so after the first snapshot it should cost
+///   nothing on the wire ever again;
+/// - slot one moves, which is the ordinary case and the cheap one;
+/// - slot two changes only its *kind*, which is late in the table and drags
+///   every word below it along;
+/// - slot three comes and goes on [`BEAT`], which is the removal case;
+/// - slot four is replaced by a different occupant on [`HANDS`], which is the
+///   case a generation exists for and the one a delta must refuse to take
+///   against its predecessor;
+/// - slots five and six **change and change back** every other snapshot, which
+///   is the case nothing else here reaches.
+///
+/// That last pair is worth the words. A difference is written against what the
+/// far end said it had, which is a round trip old, so a field that has changed
+/// and returned in between is a field the writer sees as unchanged and does not
+/// send. If the far end decoded against the newest world it holds rather than
+/// against the one the block *names*, it would keep the value from halfway and
+/// never be told otherwise. Every other body here moves in one direction, and a
+/// world made only of those cannot tell the two decodings apart.
+///
+/// Slot seven never changes and is never empty, which is what keeps the table
+/// eight long in every snapshot - so a base spread back out reaches the same
+/// distance every time and two worlds can be compared without allowing for a
+/// tail of holes.
+///
+/// @note: what slots five and six are for is not visible in `agreed`. Both
+/// decodings converge in the end; what they differ on is the world held *in
+/// between*, which only the digest sees, snapshot by snapshot. The direct
+/// version of that check is in `crate::net`'s own tests, over `absorb`.
+///
+/// @param step - which step
+/// @param into - where the world goes, emptied first
+fn describe(step: u32, into: &mut Vec<Slot>) {
+	into.clear();
+	into.resize(SLOTS, None);
+
+	// whole numbers, so that what crosses is exact and a run on another
+	// machine cannot differ by a rounding.
+	let along = f32::from(u16::try_from(step % 512).unwrap_or(0));
+	let still = body(1, [0.0, 0.0, 0.0]);
+
+	into[0] = Some((1, still));
+	into[1] = Some((1, body(1, [along, 0.0, -along])));
+	into[2] = Some((1, Solid { kind: step / 100 % 3, ..still }));
+
+	if (step / BEAT).is_multiple_of(2) {
+		into[3] = Some((1, body(1, [0.0, along, 0.0])));
+	}
+
+	// a new occupant of the same slot, which is a different body and not a
+	// moved one - the generation is what says so.
+	into[4] = Some((1 + step / HANDS, body(2, [along, along, along])));
+
+	// on and off every other snapshot, so that a snapshot written against the
+	// one before last sees them exactly as they were.
+	let back = (step / EVERY).is_multiple_of(2);
+
+	into[5] = Some((1, body(4, if back { [3.0, 0.0, 0.0] } else { [0.0, 3.0, 0.0] })));
+	into[6] = Some((1, Solid {
+		sleeping: u32::from(back),
+		..body(5, [6.0, 6.0, 6.0])
+	}));
+	into[7] = Some((1, body(3, [7.0, 7.0, 7.0])));
+}
+
+/// Whether two worlds are the same world, ignoring trailing holes.
+///
+/// A ring answers only as far as its last occupied slot, so a table with an
+/// empty tail and the same table without one are the same world and would not
+/// be equal. Nothing in the world above ends on a hole, which is what makes
+/// this belt over braces - but it is the kind of coincidence that stops being
+/// true the first time somebody edits the world, and then the failure would
+/// look like a networking bug.
+fn same(left: &[Slot], right: &[Slot]) -> bool {
+	let reach = left.len().max(right.len());
+
+	(0..reach).all(|slot| left.get(slot).copied().flatten() == right.get(slot).copied().flatten())
+}
+
+/// One body of the world above.
+fn body(entity: u32, position: [f32; 3]) -> Solid {
+	Solid {
+		position,
+		rotation: [0.0, 0.0, 0.0, 1.0],
+		velocity: [0.0, 0.0, 0.0],
+		angular: [0.0, 0.0, 0.0],
+		sleeping: 0,
+		scale: [1.0, 1.0, 1.0],
+		kind: 2,
+		entity: [entity, 1],
+		owner: [0, 0],
+	}
+}
+
+/// One snapshot's worth of world folded into the number that stands for a run.
+///
+/// Every word of every occupied slot, and the slot's own number with it, so
+/// that a body arriving in the wrong place is a different run rather than the
+/// same one.
+fn seen(hash: u64, number: u32, world: &[Slot]) -> u64 {
+	let mut folded = fold(hash, number, 2, "snapshot");
+
+	for (slot, held) in world.iter().enumerate() {
+		let Some((generation, solid)) = held else {
+			continue;
+		};
+		let place = u32::try_from(slot).unwrap_or(u32::MAX);
+
+		folded = fold(folded, place, 3, &format!("{generation}"));
+
+		for word in bytemuck::bytes_of(solid) {
+			folded ^= u64::from(*word);
+			folded = folded.wrapping_mul(0x0000_0100_0000_01B3);
+		}
+	}
+
+	folded
 }
 
 /// Points a client at a host it has not met.
@@ -363,8 +573,69 @@ mod tests {
 		// It moves when anything about what crosses moves - the draw order, the
 		// conditions, the schedule, the format of a block. That is the point:
 		// every one of those invalidates a recorded run, and this is what says
-		// so out loud rather than leaving it to be noticed.
-		assert_eq!(exchange(600, WIRE).digest, 0xFEA2_9F7A_1B23_1D5A);
+		// so out loud rather than leaving it to be noticed. It last moved when
+		// the world itself started crossing, and again when two bodies that
+		// change and change back were put into it.
+		assert_eq!(exchange(600, WIRE).digest, 0x769D_BE3F_0C72_BDBA);
+	}
+
+	#[test]
+	fn the_client_ends_up_holding_the_world_the_host_has() {
+		// the other thing this mode promises, and the newer one. A snapshot is
+		// never resent: one that is lost is replaced by the next rather than
+		// repeated, so the only reason the far end converges at all is that
+		// every snapshot is a difference from something it really has.
+		let outcome = exchange(600, WIRE);
+
+		assert!(outcome.taken > 100, "the client took snapshots: {}", outcome.taken);
+		assert!(outcome.agreed, "and ended up with the world the host had");
+	}
+
+	#[test]
+	fn the_world_crosses_as_differences_rather_than_over_and_over() {
+		// the one thing convergence does not prove. A conversation in which
+		// the far end never learns what this one holds still ends up with the
+		// right world - a baseline is correct, it is only the whole world every
+		// time - so nothing about `agreed` would look wrong if the differencing
+		// had quietly stopped working. This is what would look wrong.
+		let outcome = exchange(600, WIRE);
+
+		assert!(outcome.taken > 100, "snapshots got there: {}", outcome.taken);
+		// a handful at the start is right and is not a failure: the host sends
+		// its first snapshots before the client's first word about what it
+		// holds has crossed, and at a round trip of about ninety milliseconds
+		// against a snapshot every fifty that is two or three of them.
+		assert!(
+			outcome.baselines <= 5,
+			"only the opening ones were whole worlds: {} of {}",
+			outcome.baselines,
+			outcome.taken
+		);
+		// no third assertion about the share of them: with a cap of five and a
+		// hundred taken, a ratio is arithmetic rather than a check.
+	}
+
+	#[test]
+	fn a_wire_that_loses_everything_leaves_the_client_with_no_world_at_all() {
+		// what says the agreement above is worth reading. Two empty worlds are
+		// equal, so a client that was told nothing would agree with a host
+		// that had nothing - and this is the run where that would show.
+		let dead = Conditions { loss: 1.0, ..WIRE };
+		let outcome = exchange(600, dead);
+
+		assert_eq!(outcome.taken, 0, "not one snapshot got there");
+		assert!(!outcome.agreed, "so the client does not hold the host's world");
+	}
+
+	#[test]
+	fn a_perfect_wire_delivers_every_snapshot_the_cadence_asks_for() {
+		// the count is worked out here rather than read back: a snapshot goes
+		// out every `EVERY` steps of the whole run, settling included, and on
+		// a wire that loses nothing every one of them arrives whole.
+		let clean = exchange(600, Conditions::PERFECT);
+
+		assert_eq!(clean.taken, (600 + SETTLE) / EVERY, "every one of them");
+		assert!(clean.agreed);
 	}
 
 	#[test]

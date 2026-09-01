@@ -27,6 +27,7 @@ use colby_core::{
 	info,
 	time::{Clock, STEP},
 };
+use colby_net::{EVERY, Slot};
 use colby_physics::Simulation;
 use colby_script::Scripts;
 use colby_ui::Interface;
@@ -109,6 +110,8 @@ pub(crate) fn serve(port: u16) -> Result {
 	let mut input = Input::default();
 	let mut clock = Clock::new();
 	let started = Instant::now();
+	// taken down once a step and sent, rather than allocated per snapshot.
+	let mut records: Vec<Slot> = Vec::new();
 
 	info!(%port, address = %net.address(), "serving");
 
@@ -146,7 +149,25 @@ pub(crate) fn serve(port: u16) -> Result {
 
 			// and out once a step rather than once a pass, because a message
 			// has to mean "this is where things stand at this moment".
-			net.send(started.elapsed());
+			//
+			// The world itself goes with one message in every
+			// [`EVERY`](colby_net::EVERY): a step is what makes a stack of
+			// boxes stand up and a snapshot is what a far end can be told, and
+			// they are not the same rate. The messages in between still go,
+			// carrying what this end holds and whatever the reliable ring is
+			// still owed.
+			// @note: `World::steps` is public and a game module writes it, so
+			// the cadence is on a clock the game can move. Nothing does today;
+			// it is worth knowing before something does, because a game that
+			// set it back would stop describing the world for a while and
+			// nothing anywhere would say so.
+			let describing = world.steps.is_multiple_of(u64::from(EVERY));
+
+			if describing {
+				crate::net::records(&world.bodies, &mut records);
+			}
+
+			net.send(started.elapsed(), describing.then_some(records.as_slice()));
 			ran = true;
 		}
 

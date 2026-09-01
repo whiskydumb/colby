@@ -3,7 +3,8 @@
 //! ```text
 //!   net.receive(now)   everything the wire has, into the channels
 //!   ... a step ...
-//!   net.send(now)      one message to every peer
+//!   net.send(now, world)   one message to every peer, describing a world
+//!                          on the steps a snapshot goes out and not otherwise
 //! ```
 //!
 //! **The socket is read by the frame and written by the step.** Datagrams
@@ -21,6 +22,20 @@
 //! everything else here does when the wire is bad. Each peer's link is seeded
 //! from the endpoint's own seed and its place in the table, so two peers do not
 //! lose the same datagrams and the whole run is still the same run twice.
+//!
+//! **A message is two blocks and always both.** The reliable ring goes first
+//! because it says where what follows it begins, and a snapshot block follows
+//! it every single time - even from an endpoint with nothing to describe, and
+//! even on a step between snapshots. An empty one is fourteen bytes of head,
+//! and the only field in it that matters is what *this* end holds: without it
+//! the far end has nothing to write a difference against and every snapshot it
+//! sends is the whole world. @ref [`colby_net::Snapshot`].
+//!
+//! **A world goes out twenty times a second and is stepped sixty.** The
+//! cadence is [`colby_net::EVERY`] and the decision is the caller's: `send`
+//! describes the world it is handed and says only what it holds when it is
+//! handed none. That keeps the rule about *when* out of the endpoint, which has
+//! no clock of its own and no idea what a step is.
 //!
 //! **What arrives is reported, not run.** The reliable ring carries console
 //! lines and the console is the whole remote call surface - but nothing here is
@@ -42,10 +57,13 @@ use std::{
 
 use colby_core::{
 	Result,
-	abi::{Cvars, Value},
+	abi::{Bodies, Cvars, Value},
 	debug, err, info, warn,
 };
-use colby_net::{Channel, Conditions, Delivery, Link, MAX_DATAGRAM, Reliable};
+use colby_net::{
+	Channel, Conditions, Delivery, Link, MAX_DATAGRAM, NOTHING, Reliable, Ring, Slot, Snapshot,
+	Solid,
+};
 
 /// The port a host listens on when nobody says otherwise.
 pub(crate) const DEFAULT_PORT: u16 = 27015;
@@ -203,6 +221,7 @@ fn report(net: &Net) {
 		strangers = net.strangers(),
 		forgotten = net.forgotten(),
 		refused = net.refused(),
+		crowded = net.crowded(),
 		"the wire"
 	);
 
@@ -215,6 +234,9 @@ fn report(net: &Net) {
 			acknowledged,
 			lost,
 			rtt_us = net.rtt(index).as_micros(),
+			holding = net.holding(index),
+			theirs = net.theirs(index),
+			baselines = net.baselines(index),
 			"a peer"
 		);
 	}
@@ -408,6 +430,51 @@ struct Peer {
 	reliable: Reliable,
 	link: Link,
 	heard: Duration,
+
+	/// What was told to this peer, to write the next difference against.
+	told: Ring,
+
+	/// What was taken *from* it, which is a thing of its own so that reading a
+	/// block can borrow it while the block itself is still borrowed from the
+	/// channel beside it.
+	taken: Taken,
+}
+
+/// What one peer has said about the world, and what this end made of it.
+struct Taken {
+	/// The worlds taken from that peer, to read its next difference against.
+	///
+	/// The same type the sending half uses, and it has to be: a block is
+	/// written against a *numbered* snapshot, and the number it names is a
+	/// round trip old whenever snapshots go out faster than one per round
+	/// trip - which at twenty a second they do. Most of the time the newest
+	/// world would answer the same way, because most fields that changed
+	/// since then changed once. The case it would not is a field that changed
+	/// and changed *back*, which the writer sees as unchanged and does not
+	/// send; a reader holding the value from halfway would keep it forever.
+	ring: Ring,
+
+	/// The newest snapshot taken, which is what goes out in the head of
+	/// everything sent to this peer.
+	holding: u32,
+
+	/// The newest snapshot *it* says it has, which is what the next difference
+	/// to it is written against.
+	theirs: u32,
+
+	/// Whether this peer has already been told about a world that would not
+	/// fit, so that the saying of it happens once rather than twenty times a
+	/// second for the rest of the conversation.
+	stranded: bool,
+
+	/// How many of the snapshots taken were whole worlds rather than
+	/// differences.
+	///
+	/// The number that says whether any of this is working. A conversation
+	/// where the far end never learns what this one holds still *converges* -
+	/// a baseline is correct, it is only expensive - so nothing about the
+	/// world arriving would look wrong. This is what would look wrong.
+	baselines: u32,
 }
 
 /// A command that crossed, and who said it.
@@ -432,11 +499,20 @@ pub(crate) struct Net {
 	payload: Vec<u8>,
 	commands: Vec<String>,
 	said: Vec<Said>,
+	/// Where an arriving snapshot is put together before it is committed.
+	///
+	/// One buffer for the endpoint rather than one per peer: a message is read
+	/// to the end before the next one starts, so nothing here outlives the
+	/// block it belongs to.
+	applying: Vec<Slot>,
 	sent: u32,
 	delivered: u32,
 	ignored: u32,
 	strangers: u32,
 	forgotten: u32,
+	/// How many times a world was too big to describe, counted once per peer
+	/// per attempt rather than once per world.
+	crowded: u32,
 }
 
 impl Net {
@@ -457,11 +533,13 @@ impl Net {
 			payload: Vec::new(),
 			commands: Vec::new(),
 			said: Vec::new(),
+			applying: Vec::new(),
 			sent: 0,
 			delivered: 0,
 			ignored: 0,
 			strangers: 0,
 			forgotten: 0,
+			crowded: 0,
 		}
 	}
 
@@ -559,6 +637,59 @@ impl Net {
 	/// How many peers went quiet and were forgotten.
 	pub(crate) const fn forgotten(&self) -> u32 { self.forgotten }
 
+	/// How many worlds were too big to describe in one snapshot.
+	///
+	/// @ref `colby_net::MAX_SNAPSHOT`, whose doc says what happens then: a
+	/// world with more moving parts than a message can hold is not sent in
+	/// halves, it is not sent. This is the count of the times that happened,
+	/// and it is the number that says interest management is owed.
+	pub(crate) const fn crowded(&self) -> u32 { self.crowded }
+
+	/// What one peer has told this endpoint the world looks like.
+	///
+	/// Answered out of the ring rather than kept beside it, which is why this
+	/// takes the endpoint by exclusive reference for what is plainly a read.
+	///
+	/// @param index - which peer
+	/// @return the world as of [`holding`](Self::holding), by slot
+	pub(crate) fn world(&mut self, index: usize) -> &[Slot] {
+		let Some(holding) = self
+			.peers
+			.get(index)
+			.map(|peer| peer.taken.holding)
+		else {
+			return &[];
+		};
+
+		self.peers[index].taken.ring.base(holding).0
+	}
+
+	/// The newest snapshot one peer says *it* holds.
+	///
+	/// Named for the peer rather than for this end, because `Peer::told` right
+	/// beside it is the opposite direction - what was told *to* that peer -
+	/// and the two appear in one log line. What the next difference to it will
+	/// be written against.
+	pub(crate) fn theirs(&self, index: usize) -> u32 {
+		self.peers
+			.get(index)
+			.map_or(NOTHING, |peer| peer.taken.theirs)
+	}
+
+	/// How many whole worlds one peer has had to send, rather than differences.
+	pub(crate) fn baselines(&self, index: usize) -> u32 {
+		self.peers
+			.get(index)
+			.map_or(0, |peer| peer.taken.baselines)
+	}
+
+	/// The newest snapshot taken from one peer.
+	pub(crate) fn holding(&self, index: usize) -> u32 {
+		self.peers
+			.get(index)
+			.map_or(NOTHING, |peer| peer.taken.holding)
+	}
+
 	/// How many datagrams the wire itself refused.
 	pub(crate) fn refused(&self) -> u32 { self.post.refused() }
 
@@ -602,13 +733,18 @@ impl Net {
 	/// Puts one message to every peer on the wire.
 	///
 	/// @param now - how long this endpoint has been running
-	pub(crate) fn send(&mut self, now: Duration) {
+	/// @param world - what to describe, or nothing on a step between snapshots
+	pub(crate) fn send(&mut self, now: Duration, world: Option<&[Slot]>) {
 		for peer in &mut self.peers {
 			self.payload.clear();
-			// @note: the reliable block and nothing else, today. It is written
-			// first because it says where whatever follows it begins, which is
-			// where a snapshot goes when there is one to send.
+			// the reliable block first, because it says where what follows it
+			// begins; then a snapshot block, always, even when it describes
+			// nothing at all.
 			peer.reliable.write(&mut self.payload);
+
+			if !describe(peer, world, &mut self.payload) {
+				self.crowded = self.crowded.saturating_add(1);
+			}
 
 			let address = peer.address;
 			let post = &mut self.post;
@@ -711,7 +847,20 @@ impl Net {
 				let from = peer.address;
 
 				self.delivered = self.delivered.saturating_add(1);
-				Some(take(from, read, &mut self.commands, &mut self.said))
+
+				let used = read.as_ref().ok().copied().unwrap_or(0);
+
+				if !take(from, read, &mut self.commands, &mut self.said) {
+					return Some(false);
+				}
+
+				// the ring said how far it read, so the rest of the message is
+				// the snapshot block. `taken` and `channel` are different
+				// fields, which is what lets this borrow one while the block
+				// is still borrowed from the other.
+				let rest = message.get(used..).unwrap_or(&[]);
+
+				Some(absorb(&mut peer.taken, rest, &mut self.applying))
 			},
 			| Delivery::Fragment => Some(true),
 			| Delivery::Ignored(_) => {
@@ -756,6 +905,16 @@ impl Net {
 	}
 
 	/// Starts a conversation with an address.
+	///
+	/// @note: a *second* conversation with an address that already had one is
+	/// this same function, and everything it makes starts over - the channel's
+	/// sequence at one, both rings numbering from one. The far end does not
+	/// know, so it is still counting from where the last conversation reached
+	/// and still holds its ring. Nothing here can tell the two apart, because
+	/// nothing on the wire says which conversation a datagram belongs to.
+	/// That is the connection handshake's job and it is not written yet;
+	/// @ref the module's note on nothing being authenticated. Until it is, a
+	/// peer that is dropped and comes back is a peer that will not converge.
 	fn add(&mut self, address: SocketAddr, now: Duration) {
 		// a seed of its own, so that two peers do not lose the same datagrams
 		// while the run as a whole is still the same run twice.
@@ -772,9 +931,163 @@ impl Net {
 			reliable: Reliable::new(),
 			link,
 			heard: now,
+			told: Ring::new(),
+			taken: Taken {
+				ring: Ring::new(),
+				holding: NOTHING,
+				theirs: NOTHING,
+				baselines: 0,
+				stranded: false,
+			},
 		});
 		info!(%address, "a peer");
 	}
+}
+
+/// The world as a table of records, for a snapshot to describe.
+///
+/// A slot for every place the body table has, occupied where a body is, so
+/// that a slot number means the same thing on both machines without either of
+/// them saying so. That is the whole of what ties a snapshot to a world.
+///
+/// @param bodies - the body table as the solver left it
+/// @param into - where the records go, emptied first
+pub(crate) fn records(bodies: &Bodies, into: &mut Vec<Slot>) {
+	into.clear();
+	into.resize(bodies.slots(), None);
+
+	for (id, body) in bodies.iter() {
+		let Some(slot) = into.get_mut(id.slot()) else {
+			continue;
+		};
+
+		*slot = Some((id.generation(), Solid::of(body)));
+	}
+}
+
+/// Writes the snapshot block that follows the reliable one.
+///
+/// There is always a block. With a world it is a difference from whatever the
+/// peer last said it had; without one it is a head saying what this end holds
+/// and nothing else, which is the field the far end needs to stop sending
+/// baselines forever.
+///
+/// @param peer - whose conversation this is
+/// @param world - what to describe, or nothing
+/// @param out - the message so far, appended
+/// @return whether the world fitted, which is the one way this can be asked
+/// for something it cannot do
+fn describe(peer: &mut Peer, world: Option<&[Slot]>, out: &mut Vec<u8>) -> bool {
+	let Some(world) = world else {
+		nothing(peer.taken.holding, out);
+
+		return true;
+	};
+
+	let number = peer.told.next();
+	let holding = peer.taken.holding;
+	let (base, against) = peer.told.base(peer.taken.theirs);
+
+	if Snapshot::write(number, against, holding, base, world, out).is_err() {
+		// the world does not fit in one message and there is no continuation:
+		// what goes out instead is the head, so the far end still hears what
+		// this end holds and is not dropped for saying nothing.
+		//
+		// This is not a hiccup. Nothing was kept, so the number does not move
+		// and the peer never learns of a base to answer with - which means the
+		// next attempt is the same baseline and fails the same way, forever.
+		// A counter that names nobody is not enough to find that with.
+		if !peer.taken.stranded {
+			peer.taken.stranded = true;
+			warn!(
+				address = %peer.address,
+				bodies = world.len(),
+				"a world too big to describe in one snapshot, and there is no continuation - \
+				 this peer will be told nothing further until it shrinks"
+			);
+		}
+
+		nothing(holding, out);
+
+		return false;
+	}
+
+	peer.taken.stranded = false;
+
+	peer.told.keep(number, world);
+	true
+}
+
+/// A block that describes nothing and says only what this end holds.
+fn nothing(holding: u32, out: &mut Vec<u8>) {
+	let written = Snapshot::write(NOTHING, NOTHING, holding, &[], &[], out);
+
+	debug_assert!(written.is_ok(), "a block of nothing but a head always fits");
+}
+
+/// Reads the snapshot block at the end of a message into what a peer holds.
+///
+/// @param taken - what this end has made of that peer's side of it
+/// @param bytes - the block, and nothing is expected after it
+/// @param applying - the endpoint's scratch, where the world is put together
+/// @return whether it was something a working peer would have sent
+fn absorb(taken: &mut Taken, bytes: &[u8], applying: &mut Vec<Slot>) -> bool {
+	let Ok((number, against, holding)) = Snapshot::peek(bytes) else {
+		return false;
+	};
+
+	// what the far end holds is news whether or not it described anything,
+	// and it is the only news in a block sent between snapshots.
+	taken.theirs = holding;
+
+	// @note: dropping this changes nothing that can be observed, because the
+	// walk below would find no records, `keep` would refuse nought and what is
+	// held would come back unchanged. It is here so that the message between
+	// snapshots - which is two messages in three - does not touch the ring at
+	// all, and a mutation pass will report its removal surviving forever.
+	if number == NOTHING {
+		return true;
+	}
+
+	// against the world it names rather than the newest one held. `base`
+	// answers with nothing at all for a number that has fallen out of the
+	// ring, which is what makes a baseline land on an empty world.
+	let (base, _) = taken.ring.base(against);
+
+	applying.clear();
+	applying.extend_from_slice(base);
+
+	let Ok((snapshot, _)) = Snapshot::read(applying, bytes) else {
+		return false;
+	};
+
+	for change in &snapshot.changes {
+		let slot = usize::from(change.slot);
+
+		if applying.len() <= slot {
+			applying.resize(slot + 1, None);
+		}
+
+		applying[slot] = change
+			.solid
+			.map(|solid| (change.generation, solid));
+	}
+
+	// whether the ring *took* it, which is not the same question as whether
+	// the ring has it: a peer can name a snapshot old enough to have been
+	// refused and still be sitting in its place, and taking that in would walk
+	// what this end holds backwards. The scratch above is scratch either way.
+	if !taken.ring.keep(number, applying) {
+		return true;
+	}
+
+	taken.holding = number;
+
+	if against == NOTHING {
+		taken.baselines = taken.baselines.saturating_add(1);
+	}
+
+	true
 }
 
 /// Takes what a block turned into, or says why it was nothing.
@@ -950,8 +1263,8 @@ mod tests {
 	fn round(host: &mut Net, client: &mut Net, step: u32) {
 		let now = colby_core::time::STEP * step;
 
-		host.send(now);
-		client.send(now);
+		host.send(now, None);
+		client.send(now, None);
 		host.receive(now);
 		client.receive(now);
 	}
@@ -963,6 +1276,286 @@ mod tests {
 		install(&mut cvars);
 		cvars
 	}
+
+	/// A world of two bodies, the first of them somewhere given.
+	fn world(along: f32) -> Vec<Slot> {
+		let solid = Solid {
+			position: [along, 1.0, 2.0],
+			scale: [1.0, 1.0, 1.0],
+			kind: 2,
+			..Solid::default()
+		};
+
+		vec![Some((1, solid)), None, Some((3, Solid::default()))]
+	}
+
+	#[test]
+	fn a_snapshot_is_read_against_the_world_it_names_and_not_the_newest_one() {
+		// the property the whole receiving-side ring exists for, and the one
+		// nothing but the recorded digest could see before this.
+		//
+		// A host writes against what a peer *said* it had, which is a round
+		// trip old. If a field changed and changed back in between, the writer
+		// sees it as unchanged and does not send it - so a reader decoding
+		// against the newest world it holds would keep the value from halfway
+		// and never be told otherwise. Every other case is forgiving; this one
+		// is not.
+		let mut taken = Taken {
+			ring: Ring::new(),
+			holding: NOTHING,
+			theirs: NOTHING,
+			baselines: 0,
+			stranded: false,
+		};
+		let mut applying = Vec::new();
+		let one = world(1.0);
+		let two = world(2.0);
+		let mut out = Vec::new();
+
+		// snapshot one, a baseline.
+		Snapshot::write(1, NOTHING, NOTHING, &[], &one, &mut out).expect("it fits");
+		assert!(absorb(&mut taken, &out, &mut applying));
+
+		// snapshot two, moved away, taken against one.
+		out.clear();
+		Snapshot::write(2, 1, NOTHING, &one, &two, &mut out).expect("it fits");
+		assert!(absorb(&mut taken, &out, &mut applying));
+		assert_eq!(taken.holding, 2);
+
+		// snapshot three, back where it started - and written against ONE,
+		// because that is the last the sender heard of. Nothing about the
+		// body is in this block at all.
+		out.clear();
+
+		let spoken = Snapshot::write(3, 1, NOTHING, &one, &one, &mut out).expect("it fits");
+
+		assert_eq!(spoken, 0, "the sender sees nothing to say, which is the whole trap");
+		assert!(absorb(&mut taken, &out, &mut applying));
+		assert_eq!(taken.holding, 3);
+		assert_eq!(
+			taken.ring.base(3).0,
+			one.as_slice(),
+			"so the reader has to have gone back to the world the block named"
+		);
+	}
+
+	#[test]
+	fn a_snapshot_older_than_what_is_held_does_not_walk_it_backwards() {
+		// a peer may put any number in a block it likes, and the channel only
+		// refuses a *message* that arrives behind a newer one. A number the
+		// ring has already passed is not news, and taking it in would make
+		// this end advertise a world two snapshots stale.
+		let mut taken = Taken {
+			ring: Ring::new(),
+			holding: NOTHING,
+			theirs: NOTHING,
+			baselines: 0,
+			stranded: false,
+		};
+		let mut applying = Vec::new();
+		let mut out = Vec::new();
+
+		for number in 1..=3 {
+			out.clear();
+			Snapshot::write(number, NOTHING, NOTHING, &[], &world(1.0), &mut out).expect("fits");
+			assert!(absorb(&mut taken, &out, &mut applying));
+		}
+
+		assert_eq!(taken.holding, 3);
+		assert_eq!(taken.baselines, 3);
+
+		// and now snapshot two again, which the ring still has a place for.
+		out.clear();
+		Snapshot::write(2, NOTHING, NOTHING, &[], &world(9.0), &mut out).expect("it fits");
+
+		assert!(absorb(&mut taken, &out, &mut applying), "it is not a fault, only old news");
+		assert_eq!(taken.holding, 3, "and what this end holds did not move");
+		assert_eq!(taken.baselines, 3, "nor did the count of worlds it was sent whole");
+	}
+
+	#[test]
+	fn the_world_is_taken_down_with_its_holes_and_its_generations() {
+		use colby_core::{
+			abi::{Bodies, Body, Transform},
+			glam::Vec3,
+		};
+
+		let mut bodies = Bodies::new();
+		let first = bodies.spawn(Body::default());
+		let one = bodies.spawn(Body::default());
+		let two = bodies.spawn(Body::default());
+
+		// a slot emptied and filled again, so that the table holds a body whose
+		// generation is not one. Every body in a fresh table is generation one,
+		// and a fixture made only of those cannot tell a generation from a
+		// constant.
+		bodies.despawn(one);
+		bodies.despawn(two);
+
+		let again = bodies.spawn(Body {
+			transform: Transform {
+				position: Vec3::new(5.0, 0.0, 0.0),
+				..Transform::default()
+			},
+			..Body::default()
+		});
+		let hole = if again.slot() == one.slot() { two } else { one };
+
+		assert!(again.generation() > 1, "the reused slot is on its second occupant");
+
+		let mut world = Vec::new();
+
+		records(&bodies, &mut world);
+
+		assert_eq!(world.len(), bodies.slots(), "a slot for every place the table has");
+		assert!(world[first.slot()].is_some());
+		assert!(world[hole.slot()].is_none(), "and a hole where a body was taken away");
+		assert_eq!(
+			world[again.slot()].map(|(generation, _)| generation),
+			Some(again.generation()),
+			"each carrying the generation that says which occupant it is"
+		);
+		assert_eq!(world[again.slot()].map(|(_, solid)| solid.position), Some([5.0, 0.0, 0.0]));
+	}
+
+	#[test]
+	fn a_message_with_no_snapshot_block_after_the_ring_is_refused() {
+		// the head is read before anything is chosen to read against, so a
+		// peer that stops after its reliable block hands the reader four bytes
+		// that are not there. It is refused, and the peer goes with it.
+		let wire = Rc::new(RefCell::new(Wire::default()));
+		let (one, two) = (somewhere(1), somewhere(2));
+		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1);
+		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2);
+
+		liar.introduce(one);
+
+		// a reliable block that parses, owing nothing, and then the end of the
+		// message.
+		let mut bare = Vec::new();
+
+		bare.extend_from_slice(&0_u32.to_le_bytes());
+		bare.extend_from_slice(&1_u32.to_le_bytes());
+		bare.extend_from_slice(&0_u16.to_le_bytes());
+
+		liar.hand(one, &bare, Duration::ZERO);
+		host.receive(Duration::ZERO);
+
+		assert_eq!(host.peers(), 0, "a peer that sends half a message is not talked to again");
+		assert_eq!(host.forgotten(), 1);
+	}
+
+	#[test]
+	fn a_snapshot_block_that_is_nonsense_takes_the_peer_with_it() {
+		// the same, for a block with a head that reads and a body that does
+		// not: a count of one and no record after it.
+		let wire = Rc::new(RefCell::new(Wire::default()));
+		let (one, two) = (somewhere(1), somewhere(2));
+		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1);
+		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2);
+
+		liar.introduce(one);
+
+		let mut broken = Vec::new();
+
+		broken.extend_from_slice(&0_u32.to_le_bytes());
+		broken.extend_from_slice(&1_u32.to_le_bytes());
+		broken.extend_from_slice(&0_u16.to_le_bytes());
+		// the snapshot block: number one, against nothing, holding nothing,
+		// and one record that is not there.
+		broken.extend_from_slice(&1_u32.to_le_bytes());
+		broken.extend_from_slice(&NOTHING.to_le_bytes());
+		broken.extend_from_slice(&NOTHING.to_le_bytes());
+		broken.extend_from_slice(&1_u16.to_le_bytes());
+
+		liar.hand(one, &broken, Duration::ZERO);
+		host.receive(Duration::ZERO);
+
+		assert_eq!(host.peers(), 0);
+		assert_eq!(host.forgotten(), 1);
+	}
+
+	#[test]
+	fn each_end_says_what_it_holds_and_neither_says_the_others() {
+		// both ends describing, which is the only arrangement where the two
+		// fields can be told apart: a block carries what its *sender* has
+		// taken, and a reader that echoed what it had been told would look
+		// exactly the same on a wire where only one end ever describes.
+		let (mut host, mut client, _wire) = two();
+
+		round(&mut host, &mut client, 1);
+
+		for step in 2..6 {
+			let now = colby_core::time::STEP * step;
+
+			host.send(now, Some(&world(1.0)));
+			client.send(now, Some(&world(2.0)));
+			host.receive(now);
+			client.receive(now);
+		}
+
+		// each block goes out before that step's arrivals are taken in, so what
+		// a block says its sender holds is exactly one snapshot behind what
+		// the sender holds by the end of the step. That is the lower bound the
+		// ring's doc is about, and here it is as a number.
+		assert!(host.holding(0) > 0, "the host took the client's worlds");
+		assert_eq!(host.theirs(0) + 1, client.holding(0), "a round behind, and no further");
+		assert_eq!(client.theirs(0) + 1, host.holding(0), "each way round");
+		assert_ne!(host.theirs(0), host.holding(0), "and the two fields are not one field");
+	}
+
+	#[test]
+	fn a_world_the_host_describes_is_the_world_the_client_ends_up_with() {
+		let (mut host, mut client, _wire) = two();
+
+		round(&mut host, &mut client, 1);
+
+		for step in 2..8 {
+			let now = colby_core::time::STEP * step;
+
+			host.send(now, Some(&world(f32::from(step_of(step)))));
+			client.send(now, None);
+			host.receive(now);
+			client.receive(now);
+		}
+
+		assert_eq!(client.holding(0), 6, "six snapshots, and it holds the last of them");
+		assert_eq!(client.world(0), world(7.0).as_slice(), "which is the world it was sent");
+	}
+
+	#[test]
+	fn a_message_between_snapshots_still_says_what_this_end_holds() {
+		// the field that flows the other way. Without it a host never learns
+		// that a client took anything, so every snapshot it writes is a
+		// baseline - which works, and costs the whole world every time.
+		let (mut host, mut client, _wire) = two();
+
+		round(&mut host, &mut client, 1);
+
+		let now = colby_core::time::STEP * 2;
+
+		host.send(now, Some(&world(1.0)));
+		client.send(now, None);
+		host.receive(now);
+		client.receive(now);
+
+		assert_eq!(client.holding(0), 1, "the client took the first snapshot");
+
+		// and now a step with no world in it at all, which is where the news
+		// has to travel.
+		let later = colby_core::time::STEP * 3;
+
+		host.send(later, None);
+		client.send(later, None);
+		host.receive(later);
+		client.receive(later);
+
+		assert_eq!(host.theirs(0), 1, "the host has been told which one the client has");
+		assert_eq!(host.holding(0), NOTHING, "while the client has described nothing to it");
+	}
+
+	/// Which snapshot number a step of the loop above produces.
+	fn step_of(step: u32) -> u16 { u16::try_from(step).unwrap_or(0) }
 
 	#[test]
 	fn a_client_finds_a_host_and_a_host_finds_out_who_turned_up() {
@@ -1103,7 +1696,7 @@ mod tests {
 
 		client.introduce(one);
 		stranger.introduce(two);
-		stranger.send(Duration::ZERO);
+		stranger.send(Duration::ZERO, None);
 		client.receive(Duration::ZERO);
 
 		assert_eq!(client.peers(), 1, "still only the host it came for");
@@ -1126,7 +1719,7 @@ mod tests {
 			.collect();
 
 		for client in &mut clients {
-			client.send(Duration::ZERO);
+			client.send(Duration::ZERO, None);
 		}
 
 		host.receive(Duration::ZERO);
@@ -1164,7 +1757,7 @@ mod tests {
 		let mut alone = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), false, 1);
 
 		alone.introduce(somewhere(9));
-		alone.send(Duration::ZERO);
+		alone.send(Duration::ZERO, None);
 
 		assert_eq!(wire.borrow().nowhere(), 1, "there is no inbox at that address");
 	}

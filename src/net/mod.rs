@@ -71,7 +71,8 @@ pub use self::{
 	reliable::{MAX_COMMAND, MAX_COMMANDS, Reliable},
 	ring::{DEPTH, Ring},
 	snapshot::{
-		Change, FIELDS, Fault, MAX_SLOTS, MAX_SNAPSHOT, NOTHING, Slot, Snapshot, Solid, WORDS,
+		Change, EVERY, FIELDS, Fault, MAX_SLOTS, MAX_SNAPSHOT, NOTHING, Slot, Snapshot, Solid,
+		WORDS,
 	},
 };
 
