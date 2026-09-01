@@ -538,7 +538,13 @@ const PICKED_COLOR: Vec3 = Vec3::new(1.0, 0.85, 0.35);
 /// that arrived by a route nobody has written yet.
 const FROZEN_COLOR: Vec3 = Vec3::new(0.55, 0.85, 1.0);
 
-/// The game's own state, kept in the host's arena.
+/// What the world is, which everybody in it shares.
+///
+/// The map, the props, the character, the score. One of three arenas, and the
+/// question every field here had to answer is the one
+/// [`state`](colby_core::abi::state) asks: who would be wrong if this were
+/// copied. Nothing in here would - there is one map however many people are
+/// looking at it.
 ///
 /// Add a field, bump [`STATE_LAYOUT`], save: the arena zeroes itself and the
 /// game starts over, with `colby_core` untouched and the process still running.
@@ -547,18 +553,6 @@ const FROZEN_COLOR: Vec3 = Vec3::new(0.55, 0.85, 1.0);
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
 struct State {
-	/// Where the camera sits, as an orbit around its target.
-	yaw: f32,
-
-	/// Radians above the horizon.
-	pitch: f32,
-
-	/// How far from the target.
-	distance: f32,
-
-	/// The panel the interface is shown in.
-	hud: PanelId,
-
 	/// The map's scene, so that editing the file lays it out again.
 	///
 	/// Two words for thirty entities and thirty-one bodies, because none of
@@ -596,82 +590,11 @@ struct State {
 	/// The rope one of them hangs from.
 	rope: JointId,
 
-	/// The box the player walks around as.
-	player: EntityId,
-
-	/// Its body, which is kinematic: the game moves it and the solver pushes
-	/// props out of its way rather than the other way round.
-	player_body: BodyId,
-
-	/// Whether it was standing on something at the end of the last step. Not a
-	/// `bool` because [`Pod`] wants every bit pattern to be a valid value.
-	player_grounded: u32,
-
-	/// The panel the spawn menu is shown in.
-	menu: PanelId,
-
 	/// How many times a prop has started touching something.
 	///
 	/// Counted from the queue the solver fills, which is the only way to know
 	/// that something *happened* rather than that something is the case.
 	landings: u32,
-
-	/// What the pick ray found, for the readout and the highlight.
-	picked: EntityId,
-
-	/// The body it found, which is not always something with an entity.
-	picked_body: BodyId,
-
-	/// How far away it was, in units.
-	picked_distance: f32,
-
-	/// Where on it the ray landed, in the world.
-	///
-	/// Three floats rather than a `Vec3` because the arena is [`Pod`] and glam
-	/// is built without bytemuck, so nothing holding one can be.
-	picked_at: [f32; 3],
-
-	/// Which way the surface faced there, which is a hinge's axis.
-	picked_normal: [f32; 3],
-
-	/// The joint carrying whatever the gun is holding, or nothing.
-	///
-	/// The gun *is* this joint: there is no second mechanism, no controller and
-	/// no per-step teleport. Letting go is despawning it.
-	hold: JointId,
-
-	/// The body it is holding.
-	held: BodyId,
-
-	/// How far in front of the eye it is being carried.
-	hold_distance: f32,
-
-	/// Where the beam is attached, in the held body's own space.
-	hold_anchor: [f32; 3],
-
-	/// How the prop was turned when it was picked up, xyzw.
-	hold_rest: [f32; 4],
-
-	/// Which way the camera was looking then.
-	///
-	/// A carried prop turns with the player and not with the pitch, which is
-	/// what makes carrying one feel like carrying rather than like aiming.
-	hold_yaw: f32,
-
-	/// Which gun is in the hands. @ref [`PHYSGUN`].
-	gun: u32,
-
-	/// Which of [`TOOLS`] the toolgun is set to.
-	tool: u32,
-
-	/// The body a two-click tool is waiting on, or nothing.
-	tool_first: BodyId,
-
-	/// Where on it the first click landed, in the world.
-	tool_at: [f32; 3],
-
-	/// Which way the surface faced there, for a hinge's axis.
-	tool_normal: [f32; 3],
 
 	/// One entity per piece of the model standing in the yard.
 	///
@@ -703,27 +626,12 @@ struct State {
 	/// parents first. @ref [`CHARACTER_LIMBS`].
 	limbs: [BodyId; RAGDOLL_PARTS],
 
-	/// The ball joints holding those together, one a limb.
-	///
-	/// A limb with nothing above it has [`JointId::NONE`] here. Kept so that
-	/// breaking a ragdoll apart is possible without walking the joint table
-	/// looking for the ones that name a limb.
-	limb_joints: [JointId; RAGDOLL_PARTS],
-
 	/// Whether the bodies are writing the bones rather than the other way
 	/// round.
 	///
 	/// A word rather than a `bool` because the arena is `Pod` and a `bool`
 	/// with a bit pattern other than zero or one is the one thing that is not.
 	limp: u32,
-
-	/// The gun's hum while it is holding something, or nothing.
-	///
-	/// The one voice in this game whose handle is worth keeping: everything
-	/// else is a noise that ends on its own and is never spoken of again. A
-	/// loop has to be stopped by somebody, and this is who. @ref
-	/// [`hum_along`].
-	hum: VoiceId,
 
 	/// The bones every one of those pieces is moved by.
 	///
@@ -739,7 +647,160 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 20;
+const STATE_LAYOUT: u64 = 21;
+
+/// What is true of one person, kept in that peer's own block.
+///
+/// Where they are standing, what they are holding, which tool they picked, and
+/// what their aim is resting on. A second person turning up wants their own
+/// copy of every one of these, which is exactly the test for belonging here.
+///
+/// The host writes them all, its own included: it is the only thing that
+/// simulates, so a client's block is filled on the host and sent to that client
+/// alone. @ref [`state`](colby_core::abi::state).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+struct Player {
+	/// The box the player walks around as.
+	player: EntityId,
+
+	/// Its body, which is kinematic: the game moves it and the solver pushes
+	/// props out of its way rather than the other way round.
+	player_body: BodyId,
+
+	/// Whether it was standing on something at the end of the last step. Not a
+	/// `bool` because [`Pod`] wants every bit pattern to be a valid value.
+	player_grounded: u32,
+
+	/// Which gun is in the hands. @ref [`PHYSGUN`].
+	gun: u32,
+
+	/// Which of [`TOOLS`] the toolgun is set to.
+	tool: u32,
+
+	/// The body a two-click tool is waiting on, or nothing.
+	tool_first: BodyId,
+
+	/// Where on it the first click landed, in the world.
+	tool_at: [f32; 3],
+
+	/// Which way the surface faced there, for a hinge's axis.
+	tool_normal: [f32; 3],
+
+	/// The joint carrying whatever the gun is holding, or nothing.
+	///
+	/// The gun *is* this joint: there is no second mechanism, no controller and
+	/// no per-step teleport. Letting go is despawning it.
+	hold: JointId,
+
+	/// The body it is holding.
+	held: BodyId,
+
+	/// How far in front of the eye it is being carried.
+	hold_distance: f32,
+
+	/// Where the beam is attached, in the held body's own space.
+	hold_anchor: [f32; 3],
+
+	/// How the prop was turned when it was picked up, xyzw.
+	hold_rest: [f32; 4],
+
+	/// Which way the camera was looking then.
+	///
+	/// A carried prop turns with the player and not with the pitch, which is
+	/// what makes carrying one feel like carrying rather than like aiming.
+	hold_yaw: f32,
+
+	/// What the pick ray found, for the readout and the highlight.
+	picked: EntityId,
+
+	/// The body it found, which is not always something with an entity.
+	picked_body: BodyId,
+
+	/// How far away it was, in units.
+	picked_distance: f32,
+
+	/// Where on it the ray landed, in the world.
+	///
+	/// Three floats rather than a `Vec3` because the arena is [`Pod`] and glam
+	/// is built without bytemuck, so nothing holding one can be.
+	picked_at: [f32; 3],
+
+	/// Which way the surface faced there, which is a hinge's axis.
+	picked_normal: [f32; 3],
+}
+
+/// The version of [`Player`]'s layout, bumped like [`STATE_LAYOUT`].
+const PLAYER_LAYOUT: u64 = 1;
+
+/// What is true of one screen, and crosses to nobody.
+///
+/// A camera, two panel handles and a voice. These are the fields where a
+/// *second window onto the same person* would want its own copy, which is the
+/// line between this arena and the one above: two people share a world and do
+/// not share a point of view.
+///
+/// Never sent and never written into a save, so nothing here survives a
+/// restart and nothing here is ever overwritten by somebody else's idea of
+/// where to look from. @ref [`state`](colby_core::abi::state).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+struct Local {
+	/// Where the camera sits, as an orbit around its target.
+	yaw: f32,
+
+	/// Radians above the horizon.
+	pitch: f32,
+
+	/// How far from the target.
+	distance: f32,
+
+	/// The panel the interface is shown in.
+	hud: PanelId,
+
+	/// The panel the spawn menu is shown in.
+	menu: PanelId,
+
+	/// The gun's hum while it is holding something, or nothing.
+	///
+	/// The one voice in this game whose handle is worth keeping: everything
+	/// else is a noise that ends on its own and is never spoken of again. A
+	/// loop has to be stopped by somebody, and this is who. @ref
+	/// [`hum_along`].
+	hum: VoiceId,
+}
+
+/// The version of [`Local`]'s layout, bumped like [`STATE_LAYOUT`].
+const LOCAL_LAYOUT: u64 = 1;
+
+/// The world's own arena, which everybody in it shares.
+///
+/// A one-line forwarder, so that a function wanting one arena reads the way it
+/// did when there was only one. A function wanting *two* does not call two of
+/// these: it borrows the fields of [`World`] directly, which is what lets the
+/// borrow checker see that they are different fields.
+fn shared(world: &mut World) -> &mut State { world.state.get::<State>(STATE_LAYOUT).0 }
+
+/// This process's own block, or nothing if it is nobody yet.
+///
+/// Never nothing today: [`World::peer`] is the host in every world this engine
+/// builds, and the host is in the table from the moment the table exists. It is
+/// an `Option` because that stops being true the first time a client is let in
+/// and has not been told who it is - and a caller that quietly did nothing then
+/// would be a player who cannot move for a reason nobody can see.
+fn played(world: &mut World) -> Option<&mut Player> {
+	let peer = world.peer;
+
+	world
+		.players
+		.get::<Player>(peer, PLAYER_LAYOUT)
+		.map(|(player, _)| player)
+}
+
+/// This screen's own arena, which crosses to nobody.
+fn seen(world: &mut World) -> &mut Local { world.local.get::<Local>(LOCAL_LAYOUT).0 }
 
 /// The module's single exported symbol.
 ///
@@ -861,13 +922,14 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	// build left them, so there is nothing to rebuild on the way back in. The
 	// scene is built only when the arena reports itself fresh, which happens on
 	// the first load and whenever STATE_LAYOUT moves.
+	// @note: three arenas now, and each is claimed where it is written rather
+	// than all three at the top. They are separate fields of `World`, so
+	// holding two at once is legal - but the world's own is written either
+	// side of calls that want the whole world, and a borrow that spans those
+	// is not. Claiming late is what keeps this readable.
 	let (state, fresh) = world.state.get::<State>(STATE_LAYOUT);
+
 	if fresh {
-		(state.yaw, state.pitch, state.distance) = START_ORBIT;
-		// said rather than relied on: a fresh arena is zeroed, and zero happens
-		// to be both guns' and the first tool's number.
-		state.gun = PHYSGUN;
-		state.tool = WELD;
 		// nobody has pinned the blend, and a fresh arena is zeroed, which is
 		// a weight rather than the absence of one.
 		state.blend_pinned = BLEND_FREE;
@@ -903,9 +965,23 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		// ever moves it. `place` deliberately leaves it alone.
 		let mut stance = Transform::at(PLAYER_START);
 		stance.scale = PLAYER_EXTENTS * 2.0;
-		state.player = world.entities.spawn_at(stance);
+
+		let spawned = world.entities.spawn_at(stance);
 
 		world.camera.target = PLAYER_START + Vec3::Y * EYE_LIFT;
+
+		// and now the other two, once the world's own is done being written.
+		let local = seen(world);
+
+		(local.yaw, local.pitch, local.distance) = START_ORBIT;
+
+		if let Some(mine) = played(world) {
+			// said rather than relied on: a fresh arena is zeroed, and zero
+			// happens to be both guns' and the first tool's number.
+			mine.gun = PHYSGUN;
+			mine.tool = WELD;
+			mine.player = spawned;
+		}
 	}
 
 	register_commands(world);
@@ -928,8 +1004,8 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	// showing a document is idempotent by name, so a reload finds the same
 	// panel with the same text still in it rather than stacking a second copy.
 	let hud = world.ui.show(HUD);
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.hud = hud;
+
+	seen(world).hud = hud;
 
 	info!(
 		reloads = world.reloads,
@@ -960,37 +1036,51 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	// the camera with it.
 	let over_interface = world.ui.pointer_over();
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	// two arenas at once, which is legal because they are two fields: the
+	// camera is this screen's and what is being carried is this player's. The
+	// wheel below is the one place in the game where a single knob writes one
+	// or the other, so this is where the split is most visible.
+	let peer = world.peer;
+	let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+	let mine = world
+		.players
+		.get::<Player>(peer, PLAYER_LAYOUT)
+		.map(|(player, _)| player);
 
 	// hold the right button and drag to swing the camera around its target.
 	if input.button_held(Button::Right) && !over_interface {
-		state.yaw = input.cursor_delta[0].mul_add(-DRAG_RATE, state.yaw);
-		state.pitch = input.cursor_delta[1].mul_add(DRAG_RATE, state.pitch);
+		local.yaw = input.cursor_delta[0].mul_add(-DRAG_RATE, local.yaw);
+		local.pitch = input.cursor_delta[1].mul_add(DRAG_RATE, local.pitch);
 	}
 
 	// the wheel moves what is held, or the camera when nothing is. One knob,
 	// two meanings, and which one is obvious from what is in front of you.
-	if state.hold.is_some() {
-		state.hold_distance = input
-			.wheel
-			.mul_add(HOLD_STEP, state.hold_distance)
-			.clamp(HOLD_RANGE.0, HOLD_RANGE.1);
-	} else {
-		state.distance = input
-			.wheel
-			.mul_add(-ZOOM_STEP, state.distance)
-			.clamp(DISTANCE_RANGE.0, DISTANCE_RANGE.1);
+	match mine {
+		| Some(mine) if mine.hold.is_some() => {
+			mine.hold_distance = input
+				.wheel
+				.mul_add(HOLD_STEP, mine.hold_distance)
+				.clamp(HOLD_RANGE.0, HOLD_RANGE.1);
+		},
+		| _ => {
+			local.distance = input
+				.wheel
+				.mul_add(-ZOOM_STEP, local.distance)
+				.clamp(DISTANCE_RANGE.0, DISTANCE_RANGE.1);
+		},
 	}
 
-	let (yaw, pitch, distance) = (state.yaw, state.pitch, state.distance);
+	let (yaw, pitch, distance) = (local.yaw, local.pitch, local.distance);
 
 	walk(world, yaw);
 
 	// the camera watches the player rather than panning on its own. The same
 	// keys cannot mean two things, and the reason to have a controller at all
 	// is that a sandbox is somewhere you are rather than something you look at.
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let standing = state.player;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let standing = mine.player;
 
 	if let Some(&transform) = world.entities.transform(standing) {
 		world.camera.target = transform.position + Vec3::Y * EYE_LIFT;
@@ -1035,8 +1125,10 @@ fn duplicate(world: &mut World, yaw: f32) {
 		return;
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (entity, body) = (state.picked, state.picked_body);
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let (entity, body) = (mine.picked, mine.picked_body);
 
 	// only something the solver owns. Copying the floor, or the crystal the
 	// ring turns around, is a request nobody meant to make - and the copy
@@ -1045,8 +1137,10 @@ fn duplicate(world: &mut World, yaw: f32) {
 		return;
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let held = state.hold;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let held = mine.hold;
 
 	let Some(scene) = cut_out(world, body, held) else {
 		return;
@@ -1128,14 +1222,16 @@ fn keep_build(world: &mut World, name: &str) -> bool {
 	// what is held, or what is aimed at. The same rule the freeze key follows,
 	// and it is the useful one: a contraption you are carrying is a contraption
 	// you have just decided you want.
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let body = if state.held.is_some() {
-		state.held
+	let Some(mine) = played(world) else {
+		return false;
+	};
+	let body = if mine.held.is_some() {
+		mine.held
 	} else {
-		state.picked_body
+		mine.picked_body
 	};
 
-	let held = state.hold;
+	let held = mine.hold;
 
 	let Some(mut piece) = cut_out(world, body, held) else {
 		warn!(name, "nothing held or under the crosshair to keep");
@@ -1213,14 +1309,14 @@ fn catalogue(world: &World) -> Vec<String> {
 ///
 /// @param world - the panel to fill and the tables to add to
 fn menu(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let mut panel = state.menu;
+	let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+	let mut panel = local.menu;
 
 	// re-resolved when it is nothing, for the reason the hud is.
 	if !panel.is_some() {
 		panel = world.ui.show(MENU);
-		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-		state.menu = panel;
+		let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+		local.menu = panel;
 	}
 
 	if !panel.is_some() {
@@ -1296,8 +1392,14 @@ fn spawn_prop(world: &mut World, name: &str) -> bool {
 		return false;
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (player, yaw) = (state.player, state.yaw);
+	// where a prop lands is the dropping player's position and the dropping
+	// screen's yaw. Two arenas for two halves of one question, and the local
+	// half is the one that has to travel in a command once a client can ask.
+	let yaw = seen(world).yaw;
+	let Some(mine) = played(world) else {
+		return false;
+	};
+	let player = mine.player;
 
 	let Some(&standing) = world.entities.transform(player) else {
 		return false;
@@ -1391,9 +1493,11 @@ fn props(world: &World) -> Vec<BodyId> {
 /// @param world - read for input and bodies, written for the player's place
 /// @param yaw - which way the camera is looking, so that "forward" is forward
 fn walk(world: &mut World, yaw: f32) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (player, body) = (state.player, state.player_body);
-	let grounded = state.player_grounded != 0;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let (player, body) = (mine.player, mine.player_body);
+	let grounded = mine.player_grounded != 0;
 
 	let Some(&placed) = world.entities.transform(player) else {
 		return;
@@ -1444,8 +1548,10 @@ fn walk(world: &mut World, yaw: f32) {
 		solid.velocity = moved.velocity;
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.player_grounded = u32::from(moved.grounded);
+	let Some(mine) = played(world) else {
+		return;
+	};
+	mine.player_grounded = u32::from(moved.grounded);
 }
 
 /// Removes whatever has fallen into the hole, and puts the player back.
@@ -1461,8 +1567,12 @@ fn walk(world: &mut World, yaw: f32) {
 ///
 /// @param world - the overlap list to read, and the tables to remove from
 fn swallow(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (pit, player) = (state.pit, state.player_body);
+	let pit = shared(world).pit;
+	// @note: one player's body today, because there is one. The host has every
+	// peer's block, so this becomes a set the moment there is more than one -
+	// and a prop is swallowed for everybody while a player is only rescued for
+	// themselves.
+	let player = played(world).map_or(BodyId::NONE, |mine| mine.player_body);
 
 	if !pit.is_some() {
 		return;
@@ -1515,8 +1625,10 @@ fn swallow(world: &mut World) {
 ///
 /// @param world - the player to move
 fn put_player_back(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let body = state.player_body;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let body = mine.player_body;
 
 	let mut stance = Transform::at(PLAYER_START);
 	stance.scale = PLAYER_EXTENTS * 2.0;
@@ -1529,8 +1641,10 @@ fn put_player_back(world: &mut World) {
 		solid.velocity = Vec3::ZERO;
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.player_grounded = 0;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	mine.player_grounded = 0;
 }
 
 /// Writes what the pick ray found above the thing it found.
@@ -1543,15 +1657,17 @@ fn put_player_back(world: &mut World) {
 ///
 /// @param world - the pick's result, and the table the label goes in
 fn label_pick(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	if !state.picked.is_some() {
+	let Some(mine) = played(world) else {
+		return;
+	};
+	if !mine.picked.is_some() {
 		return;
 	}
 
 	// copied out of the arena, because `named` reads the tables the arena is
 	// borrowed from.
-	let state = *state;
-	let (picked, text) = (state.picked, named(world, &state));
+	let held = *mine;
+	let (picked, text) = (held.picked, named(world, &held));
 	let Some(&transform) = world.entities.transform(picked) else {
 		return;
 	};
@@ -1694,8 +1810,8 @@ fn play_flat(world: &mut World, name: &str, volume: f32) {
 /// @param world - the voice table, and the body to follow
 /// @param at - where the held prop is now
 fn hum_along(world: &mut World, at: Vec3) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let humming = state.hum;
+	let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+	let humming = local.hum;
 
 	if let Some(voice) = world.audio.get_mut(humming) {
 		voice.at = at;
@@ -1712,18 +1828,18 @@ fn hum_along(world: &mut World, at: Vec3) {
 		.map(|voice| voice.looping = true)
 		.is_some();
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.hum = if looped { started } else { VoiceId::NONE };
+	let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+	local.hum = if looped { started } else { VoiceId::NONE };
 }
 
 /// Stops it.
 ///
 /// @param world - the voice table
 fn hush(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let humming = state.hum;
+	let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+	let humming = local.hum;
 
-	state.hum = VoiceId::NONE;
+	local.hum = VoiceId::NONE;
 	world.audio.stop(humming);
 }
 
@@ -1753,17 +1869,20 @@ fn pick(world: &mut World) {
 	let direction = camera.pixel_direction(aim, viewport);
 	let result = world.trace_ray(&TraceInfo::along(camera.position, direction, REACH));
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let moved = state.picked != result.entity || state.picked_body != result.body;
-	state.picked = result.entity;
-	state.picked_body = result.body;
-	state.picked_distance = if result.hit { result.fraction * REACH } else { 0.0 };
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let moved = mine.picked != result.entity || mine.picked_body != result.body;
+	mine.picked = result.entity;
+	mine.picked_body = result.body;
+	mine.picked_distance = if result.hit { result.fraction * REACH } else { 0.0 };
 	// where, not only how far: the physics gun attaches its beam at the point
 	// the ray landed on, which is what makes carrying a long prop by its end
 	// behave like carrying it by its end.
-	state.picked_at = result.end.to_array();
-	state.picked_normal = result.normal.to_array();
-	let state = *state;
+	mine.picked_at = result.end.to_array();
+	mine.picked_normal = result.normal.to_array();
+
+	let held = *mine;
 
 	if moved {
 		// one line per change rather than one per step, so a live run can be
@@ -1771,7 +1890,7 @@ fn pick(world: &mut World) {
 		// and in particular the only way to see it still answering after a
 		// module reload - the table is the host's, and a swap must not disturb
 		// it. @ref the pre-commit audit list.
-		trace!(hit = %named(world, &state), fraction = result.fraction, "pick");
+		trace!(hit = %named(world, &held), fraction = result.fraction, "pick");
 	}
 }
 
@@ -1792,8 +1911,10 @@ fn pick(world: &mut World) {
 fn physgun(world: &mut World, yaw: f32) {
 	let over_interface = world.ui.pointer_over();
 	let input = world.input;
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let carrying = state.gun == PHYSGUN;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let carrying = mine.gun == PHYSGUN;
 
 	if carrying && input.button_pressed(Button::Left) && !over_interface {
 		grab(world, yaw, "");
@@ -1818,13 +1939,15 @@ fn physgun(world: &mut World, yaw: f32) {
 /// @param yaw - which way the camera is looking, remembered for the carry
 /// @param named - a body to take instead of the one under the crosshair
 fn grab(world: &mut World, yaw: f32, named: &str) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let Some(mine) = played(world) else {
+		return;
+	};
 
-	if state.hold.is_some() {
+	if mine.hold.is_some() {
 		return;
 	}
 
-	let (body, distance, at) = (state.picked_body, state.picked_distance, state.picked_at);
+	let (body, distance, at) = (mine.picked_body, mine.picked_distance, mine.picked_at);
 	let at = Vec3::from_array(at);
 
 	// naming one takes it by its middle from wherever the player is standing,
@@ -1894,15 +2017,17 @@ fn grab(world: &mut World, yaw: f32, named: &str) {
 			.capped(weight * HOLD_STRENGTH, weight * HOLD_TWIST),
 	);
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.hold = joint;
-	state.held = body;
-	state.hold_distance = distance.clamp(HOLD_RANGE.0, HOLD_RANGE.1);
-	state.hold_anchor = anchor.to_array();
-	state.hold_rest = rest.to_array();
-	state.hold_yaw = yaw;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	mine.hold = joint;
+	mine.held = body;
+	mine.hold_distance = distance.clamp(HOLD_RANGE.0, HOLD_RANGE.1);
+	mine.hold_anchor = anchor.to_array();
+	mine.hold_rest = rest.to_array();
+	mine.hold_yaw = yaw;
 
-	trace!(body = body.slot(), distance = state.hold_distance, "grabbed");
+	trace!(body = body.slot(), distance = mine.hold_distance, "grabbed");
 }
 
 /// Lets go of whatever is held.
@@ -1912,15 +2037,17 @@ fn grab(world: &mut World, yaw: f32, named: &str) {
 ///
 /// @param world - the joint table
 fn release(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (joint, body) = (state.hold, state.held);
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let (joint, body) = (mine.hold, mine.held);
 
 	if !joint.is_some() {
 		return;
 	}
 
-	state.hold = JointId::NONE;
-	state.held = BodyId::NONE;
+	mine.hold = JointId::NONE;
+	mine.held = BodyId::NONE;
 	world.joints.despawn(joint);
 	// every way of letting go comes through here - the button, swapping guns,
 	// the prop being taken out from under the beam - which is what makes this
@@ -1945,10 +2072,12 @@ fn release(world: &mut World) {
 /// @param world - the joint to move and the table the beam goes in
 /// @param yaw - which way the camera is looking now
 fn carry(world: &mut World, yaw: f32) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (joint, body, distance) = (state.hold, state.held, state.hold_distance);
-	let (rest, held_yaw) = (state.hold_rest, state.hold_yaw);
-	let (player, anchor) = (state.player, state.hold_anchor);
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let (joint, body, distance) = (mine.hold, mine.held, mine.hold_distance);
+	let (rest, held_yaw) = (mine.hold_rest, mine.hold_yaw);
+	let (player, anchor) = (mine.player, mine.hold_anchor);
 
 	if !joint.is_some() {
 		return;
@@ -2024,8 +2153,10 @@ fn toolgun(world: &mut World) {
 		// nothing is driving, and the next click of the *other* gun lets go of
 		// it as a side effect.
 		release(world);
-		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-		state.gun = if state.gun == PHYSGUN { TOOLGUN } else { PHYSGUN };
+		let Some(mine) = played(world) else {
+			return;
+		};
+		mine.gun = if mine.gun == PHYSGUN { TOOLGUN } else { PHYSGUN };
 		forget_first(world);
 	}
 
@@ -2039,22 +2170,26 @@ fn toolgun(world: &mut World) {
 		}
 
 		release(world);
-		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-		state.gun = TOOLGUN;
-		state.tool = u32::try_from(index).unwrap_or(0);
+		let Some(mine) = played(world) else {
+			return;
+		};
+		mine.gun = TOOLGUN;
+		mine.tool = u32::try_from(index).unwrap_or(0);
 		forget_first(world);
 		// flat rather than placed: it is in the player's hands, and the player
 		// is where the ears are.
 		play_flat(world, CLICK, CLICK_VOLUME);
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	if state.gun != TOOLGUN {
+	let Some(mine) = played(world) else {
+		return;
+	};
+	if mine.gun != TOOLGUN {
 		return;
 	}
 
 	if input.button_pressed(Button::Left) && !over_interface {
-		let (body, at, normal) = (state.picked_body, state.picked_at, state.picked_normal);
+		let (body, at, normal) = (mine.picked_body, mine.picked_at, mine.picked_normal);
 		use_tool(world, body, Vec3::from_array(at), Vec3::from_array(normal));
 	}
 
@@ -2073,9 +2208,11 @@ fn toolgun(world: &mut World) {
 /// @param at - where on it, in the world
 /// @param normal - which way the surface faced there
 fn use_tool(world: &mut World, body: BodyId, at: Vec3, normal: Vec3) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let Some(mine) = played(world) else {
+		return;
+	};
 
-	match state.tool {
+	match mine.tool {
 		| REMOVER => {
 			remove_prop(world, body);
 		},
@@ -2099,8 +2236,10 @@ fn use_tool(world: &mut World, body: BodyId, at: Vec3, normal: Vec3) {
 /// @param at - where on it, in the world
 /// @param normal - which way the surface faced there
 fn link(world: &mut World, body: BodyId, at: Vec3, normal: Vec3) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (first, tool) = (state.tool_first, state.tool);
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let (first, tool) = (mine.tool_first, mine.tool);
 
 	if !first.is_some() {
 		// the first end has to be something the solver owns: a joint between
@@ -2109,10 +2248,12 @@ fn link(world: &mut World, body: BodyId, at: Vec3, normal: Vec3) {
 			return;
 		}
 
-		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-		state.tool_first = body;
-		state.tool_at = at.to_array();
-		state.tool_normal = normal.to_array();
+		let Some(mine) = played(world) else {
+			return;
+		};
+		mine.tool_first = body;
+		mine.tool_at = at.to_array();
+		mine.tool_normal = normal.to_array();
 
 		trace!(
 			tool = TOOLS[usize::try_from(tool).unwrap_or(0)],
@@ -2129,8 +2270,8 @@ fn link(world: &mut World, body: BodyId, at: Vec3, normal: Vec3) {
 		return;
 	}
 
-	let started = Vec3::from_array(state.tool_at);
-	let facing = Vec3::from_array(state.tool_normal);
+	let started = Vec3::from_array(mine.tool_at);
+	let facing = Vec3::from_array(mine.tool_normal);
 	let Some(one) = world.bodies.get(first).copied() else {
 		forget_first(world);
 
@@ -2191,16 +2332,20 @@ fn anchor_on(solid: &Body, at: Vec3) -> Vec3 {
 ///
 /// @param world - the arena
 fn forget_first(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.tool_first = BodyId::NONE;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	mine.tool_first = BodyId::NONE;
 }
 
 /// Draws the end a two-click tool is waiting on, and the line it would make.
 ///
 /// @param world - the arena and the table the segments go in
 fn mark_pending(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (first, at, picked) = (state.tool_first, state.tool_at, state.picked_at);
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let (first, at, picked) = (mine.tool_first, mine.tool_at, mine.picked_at);
 
 	if !first.is_some() {
 		return;
@@ -2268,10 +2413,12 @@ fn freezer(world: &mut World) {
 		return;
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let (held, picked) = (state.held, state.picked_body);
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let (held, picked) = (mine.held, mine.picked_body);
 
-	if state.hold.is_some() {
+	if mine.hold.is_some() {
 		freeze(world, held);
 
 		return;
@@ -2307,8 +2454,10 @@ fn freeze(world: &mut World, body: BodyId) -> bool {
 	// it, so that the console and the key mean the same thing. A gun still
 	// holding a kinematic body is a gun pulling on a wall: the joint spends its
 	// whole ceiling every step and nothing moves.
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	if state.held == body {
+	let Some(mine) = played(world) else {
+		return false;
+	};
+	if mine.held == body {
 		release(world);
 	}
 
@@ -2440,8 +2589,10 @@ fn outline(world: &mut World, body: BodyId, color: Vec3) {
 ///
 /// @param world - the picked body and the table the segments go in
 fn outline_picked(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let picked = state.picked_body;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let picked = mine.picked_body;
 
 	outline(world, picked, PICKED_COLOR);
 }
@@ -2454,15 +2605,15 @@ fn outline_picked(world: &mut World) {
 ///
 /// @param world - the interface to write into and the events to read
 fn interface(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let mut hud = state.hud;
+	let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+	let mut hud = local.hud;
 
 	// re-resolved when it is nothing, for the same reason a mesh handle is:
 	// the document may have been compiled after this module was loaded.
 	if !hud.is_some() {
 		hud = world.ui.show(HUD);
-		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-		state.hud = hud;
+		let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+		local.hud = hud;
 	}
 
 	if !hud.is_some() {
@@ -2473,21 +2624,28 @@ fn interface(world: &mut World) {
 	// thirteen: `assets/ui/hud.lua` handles both of them. What is left in Rust
 	// is everything below, which needs the world - a script can see the
 	// interface and nothing else.
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let state = *state;
-	let hit = named(world, &state);
-	let grounded = state.player_grounded != 0;
+	// both arenas, copied out rather than borrowed, because everything below
+	// reads the tables they are borrowed from. What is on the panel is a
+	// mixture on purpose: how many props have landed is the world's, and what
+	// is in your hands is yours.
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let mine = *mine;
+	let state = *shared(world);
+	let hit = named(world, &mine);
+	let grounded = mine.player_grounded != 0;
 	let (time, entities) = (world.time, world.entities.len());
 	let landings = state.landings;
 	let joints = world.joints.len();
 	let contacts = world.contacts;
 	let footing = if grounded { "on the ground" } else { "in the air" };
-	let in_hand = if state.gun == TOOLGUN {
+	let in_hand = if mine.gun == TOOLGUN {
 		let tool = TOOLS
-			.get(usize::try_from(state.tool).unwrap_or(0))
+			.get(usize::try_from(mine.tool).unwrap_or(0))
 			.copied()
 			.unwrap_or(TOOLS[0]);
-		let waiting = if state.tool_first.is_some() { ", one end" } else { "" };
+		let waiting = if mine.tool_first.is_some() { ", one end" } else { "" };
 
 		format!("toolgun: {tool}{waiting}")
 	} else {
@@ -2543,9 +2701,10 @@ fn interface(world: &mut World) {
 ///
 /// @param world - the state to put back
 fn recenter(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	(state.yaw, state.pitch, state.distance) = START_ORBIT;
-	state.swallowed = 0;
+	let local = seen(world);
+
+	(local.yaw, local.pitch, local.distance) = START_ORBIT;
+	shared(world).swallowed = 0;
 
 	// every prop, whatever laid it out: the scene's five, whatever the menu
 	// dropped and whatever was duplicated are one set as far as this is
@@ -2595,8 +2754,8 @@ unsafe extern "C-unwind" fn take(world: *mut World, args: *const Args) {
 	// SAFETY: the host guarantees a live argument list for the call.
 	let named = unsafe { &*args }.rest();
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let yaw = state.yaw;
+	let (local, _) = world.local.get::<Local>(LOCAL_LAYOUT);
+	let yaw = local.yaw;
 
 	grab(world, yaw, &named);
 }
@@ -2619,9 +2778,11 @@ unsafe extern "C-unwind" fn drop_held(world: *mut World, _args: *const Args) {
 /// @param named - a name, or empty for the crosshair
 fn asked_for(world: &mut World, named: &str) -> BodyId {
 	if named.is_empty() {
-		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+		let Some(mine) = played(world) else {
+			return BodyId::NONE;
+		};
 
-		return state.picked_body;
+		return mine.picked_body;
 	}
 
 	world
@@ -2716,9 +2877,13 @@ unsafe extern "C-unwind" fn pick_tool(world: *mut World, args: *const Args) {
 
 	release(world);
 	forget_first(world);
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.gun = TOOLGUN;
-	state.tool = u32::try_from(index).unwrap_or(0);
+
+	let Some(mine) = played(world) else {
+		return;
+	};
+
+	mine.gun = TOOLGUN;
+	mine.tool = u32::try_from(index).unwrap_or(0);
 
 	info!(tool = named, "in hand");
 }
@@ -2746,9 +2911,11 @@ unsafe extern "C-unwind" fn use_it(world: *mut World, args: *const Args) {
 	};
 
 	let (at, normal) = if named.is_empty() {
-		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+		let Some(mine) = played(world) else {
+			return;
+		};
 
-		(Vec3::from_array(state.picked_at), Vec3::from_array(state.picked_normal))
+		(Vec3::from_array(mine.picked_at), Vec3::from_array(mine.picked_normal))
 	} else {
 		(solid.transform.position, Vec3::Y)
 	};
@@ -2819,18 +2986,29 @@ fn sweep_props(world: &mut World) {
 		remove_prop(world, *body);
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let state = shared(world);
+
 	state.props = [EntityId::NONE; PROPS];
 	state.prop_bodies = [BodyId::NONE; PROPS];
 	state.rope = JointId::NONE;
-	state.picked = EntityId::NONE;
-	state.picked_body = BodyId::NONE;
-	// the gun was holding one of them. `carry` notices a body that has gone and
-	// lets go by itself, so this is not load-bearing; it is the difference
-	// between a handle that is stale for a step and one that never is.
-	state.hold = JointId::NONE;
-	state.held = BodyId::NONE;
-	state.tool_first = BodyId::NONE;
+
+	// and every player lets go of what is no longer there. The props are the
+	// world's and being able to see one is not, so this half is per peer - and
+	// it is a loop rather than one block because sweeping is something one
+	// person does to everybody's view of the world.
+	//
+	// `carry` notices a body that has gone and lets go by itself, so this is
+	// not load-bearing; it is the difference between a handle that is stale
+	// for a step and one that never is.
+	let peer = world.peer;
+
+	if let Some((mine, _)) = world.players.get::<Player>(peer, PLAYER_LAYOUT) {
+		mine.picked = EntityId::NONE;
+		mine.picked_body = BodyId::NONE;
+		mine.hold = JointId::NONE;
+		mine.held = BodyId::NONE;
+		mine.tool_first = BodyId::NONE;
+	}
 
 	info!(gone = loose.len(), "props swept");
 }
@@ -3201,7 +3379,6 @@ fn rig_character(world: &mut World) {
 	let stance = character_stance(world);
 	world.pull_ragdoll(pose, stance, &plan);
 
-	let mut joints = [JointId::NONE; RAGDOLL_PARTS];
 	let mut limbs = [BodyId::NONE; RAGDOLL_PARTS];
 
 	for (index, part) in plan.parts.iter().enumerate() {
@@ -3213,13 +3390,18 @@ fn rig_character(world: &mut World) {
 			continue;
 		};
 
-		joints[index] =
-			world.join(Joint::ball(part.body, above.body, (part.anchor, part.parent_anchor)));
+		// @note: the joint is made and its handle dropped. It used to be kept
+		// in the arena, in a field whose doc said it was "kept so that breaking
+		// a ragdoll apart is possible without walking the joint table" -
+		// written once, read nowhere, a hundred and four bytes of it. The split
+		// is where that was noticed, and carrying dead state into a new struct
+		// on purpose is worse than carrying it by accident into an old one. A
+		// commit that breaks a ragdoll apart can put it back, and will know
+		// what shape it wants.
+		world.join(Joint::ball(part.body, above.body, (part.anchor, part.parent_anchor)));
 	}
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.limbs = limbs;
-	state.limb_joints = joints;
+	shared(world).limbs = limbs;
 
 	info!(model = CHARACTER_MODEL, limbs = plan.len(), "the character is rigged");
 }
@@ -3444,8 +3626,10 @@ fn dress(world: &mut World) {
 		.materials
 		.insert("metal", Material::DEFAULT.finished(1.0, 0.25));
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let player = state.player;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let player = mine.player;
 
 	// the props are not here, and neither is the map: what either is made of is
 	// written in its own scene.
@@ -3577,9 +3761,12 @@ fn layer(world: &mut World, body: BodyId, layers: Layers) {
 /// dozen bytes and means a change to its size or its layers takes effect on the
 /// next save rather than on the next restart.
 fn collide(world: &mut World) {
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	let player = state.player;
-	world.bodies.despawn(state.player_body);
+	let Some(mine) = played(world) else {
+		return;
+	};
+	let (player, was) = (mine.player, mine.player_body);
+
+	world.bodies.despawn(was);
 
 	// kinematic rather than dynamic: the controller decides where the player
 	// goes, and the solver's job is only to push props out from under it. A
@@ -3588,13 +3775,15 @@ fn collide(world: &mut World) {
 		world.attach_body(player, BodyKind::Kinematic, Shape::cuboid(Vec3::splat(0.5)));
 	layer(world, player_body, PLAYER_LAYERS);
 
-	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
-	state.player_body = player_body;
+	let Some(mine) = played(world) else {
+		return;
+	};
+	mine.player_body = player_body;
 	// what the ray found is per-load and not worth carrying across one: the
 	// bodies it named are the ones just despawned. Clearing it also means the
 	// first trace of every load says so in the log, which is what makes a live
 	// reload readable.
-	state.picked = EntityId::NONE;
+	mine.picked = EntityId::NONE;
 
 	info!(bodies = world.bodies.len(), "the player has a body");
 }
@@ -3746,23 +3935,23 @@ fn relay_map(world: &mut World) {
 /// nameable and invisible.
 ///
 /// @param world - the tables to ask
-/// @param state - the arena, for what the ray found
-fn named(world: &World, state: &State) -> String {
-	if !state.picked_body.is_some() {
+/// @param mine - the asking player's block, for what their ray found
+fn named(world: &World, mine: &Player) -> String {
+	if !mine.picked_body.is_some() {
 		return "nothing".to_owned();
 	}
 
-	let distance = state.picked_distance;
+	let distance = mine.picked_distance;
 
-	if state.picked == state.player {
+	if mine.picked == mine.player {
 		return format!("player @ {distance:.1}");
 	}
 
 	// the body first, then the entity it drives: a scene names both, and a body
 	// spawned by this module rather than read out of a file has only the
 	// second. Neither is a fact the arena could have held.
-	let name = match world.bodies.name(state.picked_body) {
-		| "" => world.entities.name(state.picked),
+	let name = match world.bodies.name(mine.picked_body) {
+		| "" => world.entities.name(mine.picked),
 		| named => named,
 	};
 
