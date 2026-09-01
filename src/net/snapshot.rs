@@ -6,7 +6,7 @@
 //! did.
 //!
 //! ```text
-//!   Snapshot::write(number, against, &before, &now, &mut out)
+//!   Snapshot::write(number, against, holding, &before, &now, &mut out)
 //!   Snapshot::read(&before, bytes) -> the records, and how far it read
 //! ```
 //!
@@ -22,6 +22,34 @@
 //! entirely zero, which differs from its base in nothing at all. That is why a
 //! record is written for a slot the far end has never heard of even when it has
 //! nothing to say: the record's existence is the news.
+//!
+//! **`against` is obeyed rather than reported**, and for a baseline this is
+//! the one rule the format cannot be sloppy about. A block that says it is
+//! written against [`NOTHING`] is written against nothing, so whatever either
+//! end has lying about is set aside for the length of it. The alternative is
+//! worse than it sounds: a host that has lost a peer's base sends a baseline,
+//! the peer applies it over the stale world it still holds, and every field
+//! that is zero now and was not zero then survives - unsent, because the writer
+//! had nothing to compare it against, and unnoticed, because the record it
+//! belongs to did arrive.
+//!
+//! Forcing the base at both ends settles the *fields*. It does not settle which
+//! slots are occupied, and that half falls to whoever applies the changes:
+//!
+//! **A baseline describes the whole world, so a receiver must empty what it
+//! holds before applying one.** A baseline cannot report a removal - it is
+//! written against nothing, so there is no slot it can see as having emptied,
+//! and a writer that has lost a peer's base does not know what the peer is
+//! holding to begin with. A receiver that merges instead of replacing keeps
+//! every body that vanished during the silence, forever: the host's own copy
+//! has the slot empty, so no later difference ever mentions it again. @ref
+//! [`Snapshot::against`].
+//!
+//! For a block with a real `against` the two ends can still disagree, and
+//! nothing here can stop them. A receiver has to decode against the world it
+//! named, not against the newest one it has - which means the receiving end
+//! needs a memory of what it applied, the same shape as the ring the sending
+//! end keeps. That is not in this commit and is called out where it bites.
 //!
 //! ## The record, and why it is shaped like this
 //!
@@ -155,7 +183,7 @@ const GONE: u8 = u8::MAX;
 pub const NOTHING: u32 = 0;
 
 /// Bytes at the head of a snapshot, before the first record.
-const HEAD: usize = 10;
+const HEAD: usize = 14;
 
 /// The most the reliable ring can ask of one message, in bytes.
 ///
@@ -360,6 +388,13 @@ impl core::fmt::Display for Fault {
 	}
 }
 
+/// What one slot of a world holds, or nothing.
+///
+/// A name for the pair rather than the pair written out at every boundary: it
+/// is the shape a snapshot is written from, read into, and remembered as, and
+/// spelling it out four times is how two of them drift apart.
+pub type Slot = Option<(u32, Solid)>;
+
 /// One slot's worth of a snapshot, as it was read back.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Change {
@@ -381,7 +416,29 @@ pub struct Snapshot {
 	pub number: u32,
 
 	/// Which one it is a difference from, or [`NOTHING`] for a baseline.
+	///
+	/// **A receiver must empty its world before applying a baseline.** The
+	/// fields inside each record are already taken care of - both ends read
+	/// and write one against nothing - but occupancy is not, because a block
+	/// written against nothing has no way to say a slot has emptied. Merging a
+	/// baseline into a world instead of replacing it leaves every body that
+	/// went away during the silence behind, and nothing afterwards removes it.
 	pub against: u32,
+
+	/// The newest snapshot the sender itself holds, or [`NOTHING`] for none.
+	///
+	/// **This is the field that flows the other way**, and it is here because
+	/// nothing else could carry it. A delta has to be written against something
+	/// the far end is known to have, and the channel underneath cannot say
+	/// which of its messages were acknowledged - it counts them and throws the
+	/// numbers away. So a peer says what it holds in the block itself, the way
+	/// the reliable ring says what it has received in its own, and the answer
+	/// comes back as the `against` of the next snapshot.
+	///
+	/// A peer with nothing to send still writes a block for this: an empty one
+	/// is fourteen bytes and it is the only thing that keeps a host's deltas
+	/// from being baselines forever.
+	pub holding: u32,
 
 	/// What changed, in slot order.
 	pub changes: Vec<Change>,
@@ -398,6 +455,8 @@ impl Snapshot {
 	///
 	/// @param number - which snapshot this is
 	/// @param against - which one it is a difference from, or [`NOTHING`]
+	/// @param holding - the newest snapshot this end holds, for the far end to
+	/// write its next difference against
 	/// @param before - what the far end is known to have, by slot
 	/// @param now - what is true, by slot
 	/// @param out - where the bytes go, appended
@@ -409,15 +468,20 @@ impl Snapshot {
 	pub fn write(
 		number: u32,
 		against: u32,
-		before: &[Option<(u32, Solid)>],
-		now: &[Option<(u32, Solid)>],
+		holding: u32,
+		before: &[Slot],
+		now: &[Slot],
 		out: &mut Vec<u8>,
 	) -> Result<usize, Fault> {
 		let began = out.len();
+		// said against nothing means written against nothing, whatever the
+		// caller handed over. @ref the module's note on `against`.
+		let before: &[Slot] = if against == NOTHING { &[] } else { before };
 		let slots = before.len().max(now.len()).min(MAX_SLOTS);
 
 		out.extend_from_slice(&number.to_le_bytes());
 		out.extend_from_slice(&against.to_le_bytes());
+		out.extend_from_slice(&holding.to_le_bytes());
 		// filled in once the records are counted, because a count that has to
 		// be right is better worked out than predicted.
 		out.extend_from_slice(&0_u16.to_le_bytes());
@@ -444,7 +508,7 @@ impl Snapshot {
 
 		let count = u16::try_from(spoken).unwrap_or(u16::MAX);
 
-		out[began + 8..began + HEAD].copy_from_slice(&count.to_le_bytes());
+		out[began + HEAD - 2..began + HEAD].copy_from_slice(&count.to_le_bytes());
 
 		Ok(spoken)
 	}
@@ -460,14 +524,19 @@ impl Snapshot {
 	///
 	/// @ref [`Fault`] - and every one of them is a peer that is broken or
 	/// lying, so there is nothing to salvage from the rest of the message.
-	pub fn read(before: &[Option<(u32, Solid)>], bytes: &[u8]) -> Result<(Self, usize), Fault> {
+	pub fn read(before: &[Slot], bytes: &[u8]) -> Result<(Self, usize), Fault> {
 		if bytes.len() < HEAD {
 			return Err(Fault::Short);
 		}
 
 		let number = u32_at(bytes, 0);
 		let against = u32_at(bytes, 4);
-		let count = usize::from(u16_at(bytes, 8));
+		let holding = u32_at(bytes, 8);
+		let count = usize::from(u16_at(bytes, 12));
+		// the other half of the rule the writer keeps. A baseline arriving at
+		// an end that still holds an older world must land on nothing, or the
+		// fields it did not need to send are inherited from that world.
+		let before: &[Slot] = if against == NOTHING { &[] } else { before };
 
 		if count > MAX_SLOTS {
 			return Err(Fault::TooMany);
@@ -476,8 +545,8 @@ impl Snapshot {
 		// grown rather than reserved. `count` came off the wire, and a vector
 		// sized from it is memory reserved in proportion to a number somebody
 		// sent - which is the one thing this module undertakes not to do, and
-		// a ceiling makes survivable rather than untrue. Ten bytes claiming a
-		// thousand records would otherwise reserve a hundred kilobytes before
+		// a ceiling makes survivable rather than untrue. Fourteen bytes claiming
+		// a thousand records would otherwise reserve a hundred kilobytes before
 		// reading one of them.
 		let mut changes: Vec<Change> = Vec::new();
 		let mut at = HEAD;
@@ -506,7 +575,7 @@ impl Snapshot {
 			}
 		}
 
-		Ok((Self { number, against, changes }, at))
+		Ok((Self { number, against, holding, changes }, at))
 	}
 }
 
@@ -614,11 +683,7 @@ fn put(
 }
 
 /// Reads one record, against whatever the reader already had for that slot.
-fn get(
-	before: &[Option<(u32, Solid)>],
-	bytes: &[u8],
-	at: usize,
-) -> Result<(Change, usize), Fault> {
+fn get(before: &[Slot], bytes: &[u8], at: usize) -> Result<(Change, usize), Fault> {
 	if at + KEY + 1 > bytes.len() {
 		return Err(Fault::Short);
 	}
@@ -706,7 +771,7 @@ mod tests {
 	}
 
 	/// A table of slots, from what is in each of them.
-	fn table(entries: &[(usize, u32, Solid)]) -> Vec<Option<(u32, Solid)>> {
+	fn table(entries: &[(usize, u32, Solid)]) -> Vec<Slot> {
 		let mut out = vec![
 			None;
 			entries
@@ -732,7 +797,7 @@ mod tests {
 	/// both halves, passed an entire suite shaped that way.
 	#[derive(Clone, Debug, Default, PartialEq)]
 	struct Far {
-		held: Vec<Option<(u32, Solid)>>,
+		held: Vec<Slot>,
 	}
 
 	impl Far {
@@ -765,12 +830,16 @@ mod tests {
 
 	/// Writes one snapshot from a receiver's own idea of the world, and gives
 	/// the bytes back.
-	fn tell(far: &Far, now: &[Option<(u32, Solid)>], out: &mut Vec<u8>) -> usize {
-		Snapshot::write(1, NOTHING, &far.held, now, out).expect("it fits")
+	///
+	/// `against` is one rather than [`NOTHING`], because what this writes is a
+	/// difference from what the receiver holds and a block that said otherwise
+	/// would now be written against nothing at all.
+	fn tell(far: &Far, now: &[Slot], out: &mut Vec<u8>) -> usize {
+		Snapshot::write(1, 1, NOTHING, &far.held, now, out).expect("it fits")
 	}
 
 	/// Whether two tables describe the same world, ignoring trailing holes.
-	fn same(left: &[Option<(u32, Solid)>], right: &[Option<(u32, Solid)>]) -> bool {
+	fn same(left: &[Slot], right: &[Slot]) -> bool {
 		let reach = left.len().max(right.len());
 
 		(0..reach)
@@ -783,7 +852,11 @@ mod tests {
 		let mut far = Far::default();
 		let mut out = Vec::new();
 
-		assert_eq!(tell(&far, &now, &mut out), 1, "one slot spoken about");
+		// written by hand rather than through `tell`, which writes a difference:
+		// this one is the baseline, and its base is empty on purpose.
+		let spoken = Snapshot::write(1, NOTHING, NOTHING, &far.held, &now, &mut out);
+
+		assert_eq!(spoken.expect("it fits"), 1, "one slot spoken about");
 
 		let back = far.take(&out).expect("what was written reads");
 
@@ -806,7 +879,7 @@ mod tests {
 
 		assert_eq!(tell(&far, &world, &mut out), 0, "two bodies, neither of them moved");
 		assert_eq!(out.len(), HEAD, "so the snapshot is its own head and nothing else");
-		assert_eq!(u16_at(&out, 8), 0, "with a count of none");
+		assert_eq!(u16_at(&out, HEAD - 2), 0, "with a count of none");
 	}
 
 	#[test]
@@ -823,7 +896,7 @@ mod tests {
 
 		// the whole block: a head, a key, a reach of one, one mask byte and one
 		// word. The other twenty one words are past the reach and cost nothing.
-		assert_eq!(out.len(), HEAD + KEY + 1 + 1 + 4, "twenty two bytes for a step of one axis");
+		assert_eq!(out.len(), HEAD + KEY + 1 + 1 + 4, "twenty six bytes for a step of one axis");
 		// and the bytes themselves, not only how many there are. Nothing else
 		// in this file would notice a mask a byte wide when it should be two,
 		// or the bits written from the wrong end of a byte.
@@ -1028,7 +1101,7 @@ mod tests {
 		// single dropped or wrongly scoped field compounds into a world that has
 		// drifted. Bodies appear, move, come to rest, change hands, wake, are
 		// disowned and are removed.
-		let mut world: Vec<Option<(u32, Solid)>> = vec![None; 12];
+		let mut world: Vec<Slot> = vec![None; 12];
 		let mut far = Far::default();
 		let mut random = crate::Random::new(9);
 
@@ -1039,7 +1112,7 @@ mod tests {
 
 			let mut out = Vec::new();
 
-			Snapshot::write(step + 1, step, &far.held, &world, &mut out).expect("it fits");
+			Snapshot::write(step + 1, step, step, &far.held, &world, &mut out).expect("it fits");
 			far.take(&out).expect("what was written reads");
 
 			assert!(
@@ -1235,7 +1308,7 @@ mod tests {
 
 		tell(&far, &[], &mut out);
 
-		out[8..HEAD].copy_from_slice(
+		out[HEAD - 2..HEAD].copy_from_slice(
 			&u16::try_from(MAX_SLOTS)
 				.unwrap_or(0)
 				.to_le_bytes(),
@@ -1246,7 +1319,7 @@ mod tests {
 			"a count of exactly the ceiling is allowed, and then runs out of block"
 		);
 
-		out[8..HEAD].copy_from_slice(
+		out[HEAD - 2..HEAD].copy_from_slice(
 			&u16::try_from(MAX_SLOTS + 1)
 				.unwrap_or(0)
 				.to_le_bytes(),
@@ -1289,7 +1362,7 @@ mod tests {
 
 	#[test]
 	fn a_snapshot_too_long_to_send_is_refused_rather_than_cut() {
-		let full: Vec<Option<(u32, Solid)>> = (0..=MAX_BASELINE)
+		let full: Vec<Slot> = (0..=MAX_BASELINE)
 			.map(|slot| {
 				Some((1, Solid {
 					kind: u32::try_from(slot).unwrap_or(0),
@@ -1300,7 +1373,7 @@ mod tests {
 		let mut out = vec![0xAB; 3];
 
 		assert_eq!(
-			Snapshot::write(1, NOTHING, &[], &full, &mut out),
+			Snapshot::write(1, NOTHING, NOTHING, &[], &full, &mut out),
 			Err(Fault::TooLong),
 			"one body more than a baseline holds"
 		);
@@ -1309,7 +1382,7 @@ mod tests {
 		// and the one below it goes through, into the same non-empty buffer,
 		// appended rather than written over.
 		assert_eq!(
-			Snapshot::write(1, NOTHING, &[], &full[..MAX_BASELINE], &mut out),
+			Snapshot::write(1, NOTHING, NOTHING, &[], &full[..MAX_BASELINE], &mut out),
 			Ok(MAX_BASELINE),
 			"exactly a baseline's worth fits"
 		);
@@ -1324,7 +1397,7 @@ mod tests {
 		// module will ever produce, and the number the rest is sized against
 		// means nothing.
 		let far = Far { held: Vec::new() };
-		let big: Vec<Option<(u32, Solid)>> = (0..MAX_BASELINE)
+		let big: Vec<Slot> = (0..MAX_BASELINE)
 			.map(|slot| {
 				Some((1, Solid {
 					kind: u32::try_from(slot).unwrap_or(0),
@@ -1335,7 +1408,7 @@ mod tests {
 		// a second baseline over the slots *above* the first, so that the two
 		// spliced together are still in order and still every slot once - only
 		// twice as long as a snapshot may be.
-		let mut above: Vec<Option<(u32, Solid)>> = vec![None; MAX_BASELINE];
+		let mut above: Vec<Slot> = vec![None; MAX_BASELINE];
 
 		above.extend(big.iter().copied());
 
@@ -1348,7 +1421,7 @@ mod tests {
 		let count = u16::try_from(MAX_BASELINE * 2).unwrap_or(u16::MAX);
 
 		out.extend_from_slice(&rest[HEAD..]);
-		out[8..HEAD].copy_from_slice(&count.to_le_bytes());
+		out[HEAD - 2..HEAD].copy_from_slice(&count.to_le_bytes());
 
 		assert!(out.len() > MAX_SNAPSHOT, "the block really is past the ceiling");
 		assert_eq!(Snapshot::read(&far.held, &out), Err(Fault::TooLong));
@@ -1410,5 +1483,78 @@ mod tests {
 			MAX_BASELINE < MAX_SLOTS,
 			"and a world of every slot does not, which is what interest management is for"
 		);
+	}
+
+	#[test]
+	fn a_block_said_to_be_against_nothing_is_read_against_nothing() {
+		// the reader's half. A baseline arriving at an end that still holds an
+		// older world has to land on nothing, or the fields it did not need to
+		// send are inherited from that world instead of from zeroes.
+		let now = table(&[(0, 1, somewhere())]);
+		let mut resting = somewhere();
+		let mut out = Vec::new();
+
+		resting.sleeping = 0;
+		resting.velocity = [0.0, 0.0, 0.0];
+
+		Snapshot::write(1, NOTHING, NOTHING, &[], &table(&[(0, 1, resting)]), &mut out)
+			.expect("it fits");
+
+		let (back, _) = Snapshot::read(&now, &out).expect("what was written reads");
+
+		assert_eq!(
+			back.changes[0].solid,
+			Some(resting),
+			"the words it is at rest in came from zeroes and not from what was held"
+		);
+	}
+
+	#[test]
+	fn a_block_said_to_be_against_nothing_is_written_against_nothing() {
+		// the writer's half of the rule. A caller that names no base and hands
+		// one over anyway gets the baseline it asked for, not a difference
+		// labeled as one - which the far end would read against nothing and
+		// so fill in from the wrong world.
+		let now = table(&[(0, 1, somewhere())]);
+		let mut said = Vec::new();
+		let mut plain = Vec::new();
+
+		Snapshot::write(1, NOTHING, NOTHING, &now, &now, &mut said).expect("it fits");
+		Snapshot::write(1, NOTHING, NOTHING, &[], &now, &mut plain).expect("it fits");
+
+		assert_eq!(said, plain, "the base it was given made no difference to what went out");
+
+		let (back, _) = Snapshot::read(&now, &said).expect("what was written reads");
+
+		assert_eq!(back.changes.len(), 1, "the world is told whole");
+		assert_eq!(
+			back.changes[0].solid,
+			Some(somewhere()),
+			"and every word of it is on the wire rather than assumed"
+		);
+	}
+
+	#[test]
+	fn the_head_says_three_different_numbers_and_keeps_them_apart() {
+		// `holding` is the field that flows the other way, and the three are
+		// all u32 at three offsets - so they are given three values here, and
+		// the bytes are read where they should be as well as through `read`,
+		// because a writer and a reader shifted by the same four bytes agree
+		// with each other and with nothing else.
+		let now = table(&[(0, 1, somewhere())]);
+		let mut out = Vec::new();
+
+		Snapshot::write(9, NOTHING, 4, &[], &now, &mut out).expect("it fits");
+
+		assert_eq!(&out[0..4], &9_u32.to_le_bytes(), "the number is first");
+		assert_eq!(&out[4..8], &NOTHING.to_le_bytes(), "what it is written against is second");
+		assert_eq!(&out[8..12], &4_u32.to_le_bytes(), "what this end holds is third");
+		assert_eq!(&out[12..HEAD], &1_u16.to_le_bytes(), "and the count is last");
+
+		let (back, _) = Snapshot::read(&[], &out).expect("what was written reads");
+
+		assert_eq!(back.number, 9);
+		assert_eq!(back.against, NOTHING);
+		assert_eq!(back.holding, 4, "and the far end is told which one to answer against");
 	}
 }

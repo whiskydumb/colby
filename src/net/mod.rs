@@ -34,6 +34,8 @@
 //!   on this wire nothing is allowed to lose;
 //! - [`snapshot`] - what moved, as a difference from what the far end already
 //!   has;
+//! - [`ring`] - what a host remembers having told one peer, so the next telling
+//!   can be that difference;
 //! - [`random`] - a seeded shift register, so that a run can be repeated;
 //! - [`link`] - a wire made as bad as somebody wants it, which is what there is
 //!   to point a change at when the change is about loss.
@@ -55,6 +57,7 @@ pub mod link;
 pub mod packet;
 pub mod random;
 pub mod reliable;
+pub mod ring;
 pub mod snapshot;
 
 pub use self::{
@@ -66,7 +69,10 @@ pub use self::{
 	},
 	random::Random,
 	reliable::{MAX_COMMAND, MAX_COMMANDS, Reliable},
-	snapshot::{Change, FIELDS, Fault, MAX_SLOTS, MAX_SNAPSHOT, NOTHING, Snapshot, Solid, WORDS},
+	ring::{DEPTH, Ring},
+	snapshot::{
+		Change, FIELDS, Fault, MAX_SLOTS, MAX_SNAPSHOT, NOTHING, Slot, Snapshot, Solid, WORDS,
+	},
 };
 
 #[cfg(test)]
