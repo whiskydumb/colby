@@ -53,13 +53,24 @@
 //! that does: whether pressing stop should hand every prop a client was
 //! holding back to nobody is a question that has an answer, and this is not
 //! it.
+//!
+//! **A peer's own block is written down, and that is not a contradiction of
+//! the paragraph above.** What a peer *is holding* is a claim about who, and a
+//! claim about who is what does not survive; what a peer *knows* is state, and
+//! state is what a description is for. The difference shows in what a wrong
+//! answer costs. An owner that came back wrong would hand a live prop to a
+//! stranger who is standing in the world right now. A block that comes back
+//! for somebody who has since disconnected sits in a slot nobody is in, read
+//! by nothing, until the table is reconciled against who is actually
+//! connected - which is a debt the restorer owes, exactly like the solver's
+//! caches, and is written down as one.
 
 use crate::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
 		MaterialId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind, Transform, World,
-		state::STATE_BYTES,
+		net::MAX_PEERS, state::STATE_BYTES,
 	},
 	err,
 	glam::{Quat, Vec3},
@@ -442,6 +453,26 @@ pub struct SceneData {
 	/// there is nothing an author could put here, and an instantiate would
 	/// have nowhere to put it if there were.
 	pub arena: Option<Arena>,
+
+	/// One arena per peer that was here, each with the slot it sat in.
+	///
+	/// The world's own arena is what everybody shares and this is what was
+	/// true of each person, so a save that carried the first and not the
+	/// second would put a world back with nobody in it holding anything.
+	/// Empty in a scene somebody wrote by hand, for the reason
+	/// [`arena`](Self::arena) is absent from one.
+	///
+	/// **The local arena is deliberately not here at all.** Where somebody was
+	/// looking from is not part of the world, and a save that put a camera
+	/// back would move a second person's view when the first one loaded.
+	pub player_arenas: Vec<(u32, Arena)>,
+
+	/// The generation each peer slot was on, empty ones included.
+	///
+	/// The same rule the other four generation arrays follow, and for the same
+	/// reason: a handle to a peer that had already left when the world was
+	/// written must not match whoever took its slot afterwards.
+	pub peer_generations: Vec<u32>,
 }
 
 impl SceneData {
@@ -608,8 +639,11 @@ impl SceneData {
 			solids: kept,
 			links,
 			// never: the bytes name handles that are not in here. @ref the doc
-			// above, and the same rule `instantiate` follows.
+			// above, and the same rule `instantiate` follows. What a peer was
+			// holding is the same kind of claim, and goes the same way.
 			arena: None,
+			player_arenas: Vec::new(),
+			peer_generations: Vec::new(),
 		}
 	}
 }
@@ -772,6 +806,21 @@ pub fn capture(world: &World) -> SceneData {
 			layout: world.state.layout(),
 			bytes: world.state.raw().to_vec(),
 		}),
+		player_arenas: world
+			.players
+			.iter()
+			.filter_map(|(peer, block)| {
+				let slot = u32::try_from(peer.slot()).ok()?;
+
+				Some((slot, Arena {
+					layout: block.layout(),
+					bytes: block.raw().to_vec(),
+				}))
+			})
+			.collect(),
+		peer_generations: (0..MAX_PEERS)
+			.map(|slot| world.players.generation(slot))
+			.collect(),
 		things,
 		solids,
 	}
@@ -1006,6 +1055,8 @@ static EMPTY: SceneData = SceneData {
 	link_generations: Vec::new(),
 	pose_generations: Vec::new(),
 	arena: None,
+	player_arenas: Vec::new(),
+	peer_generations: Vec::new(),
 };
 
 /// What a restore put back.
@@ -1107,6 +1158,11 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 		world.state.put_raw(&arena.bytes, arena.layout);
 	}
 
+	// after the tables and beside the world's own arena, for the reason that
+	// one is put back here: what a peer was holding is handles into tables
+	// that have only just been rebuilt.
+	restore_players(world, scene);
+
 	stage_world(world, scene.stage);
 
 	Ok(Restored {
@@ -1116,6 +1172,39 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 		posed: poses.iter().filter(|id| id.is_some()).count(),
 		arena: scene.arena.is_some(),
 	})
+}
+
+/// Puts every peer's block back, slot for slot and generation for generation.
+///
+/// A description written before the arena split carries neither list, and this
+/// then does nothing at all rather than emptying the table: a world restored
+/// from an older description keeps whatever peers it had, which is the same
+/// thing an absent world arena means one line above.
+///
+/// @param world - the world being rebuilt
+/// @param scene - the description
+fn restore_players(world: &mut World, scene: &SceneData) {
+	// on the generations alone: they are what says how the table was shaped,
+	// and blocks without them describe occupants of a table that has none. The
+	// pair being *both* absent is the older-description case, and this covers
+	// it; blocks arriving without generations is a description disagreeing
+	// with itself, and doing nothing is better than emptying a live table over
+	// it.
+	if scene.peer_generations.is_empty() {
+		return;
+	}
+
+	let blocks: Vec<(usize, Vec<u8>, u64)> = scene
+		.player_arenas
+		.iter()
+		.map(|(slot, arena)| {
+			(usize::try_from(*slot).unwrap_or(usize::MAX), arena.bytes.clone(), arena.layout)
+		})
+		.collect();
+
+	world
+		.players
+		.restore(&scene.peer_generations, &blocks);
 }
 
 /// Whether the description's arena is one this build can read.
@@ -1642,6 +1731,14 @@ mod tests {
 		MAX_ENTITIES, Material, MeshData, PeerId, Role, mesh,
 		skeleton::{Bone, SkeletonData, SkeletonId},
 	};
+
+	/// Something for an arena to hold, for the tests about the three of them.
+	#[repr(C)]
+	#[derive(Clone, Copy, crate::bytemuck::Pod, crate::bytemuck::Zeroable)]
+	struct Counted {
+		count: u32,
+		pad: u32,
+	}
 
 	/// A world with a mesh, a material and one entity standing on a body.
 	fn furnished() -> World {
@@ -2324,6 +2421,174 @@ mod tests {
 
 		assert_eq!(joint.first, body_id, "the rope holds the restored body");
 		assert_eq!(joint.second, BodyId::NONE, "and a point in the world, as it did");
+	}
+
+	#[test]
+	fn a_capture_carries_every_peer_and_never_the_local_arena() {
+		let mut world = furnished();
+		let peer = world.players.admit();
+
+		world.state.get::<Counted>(1).0.count = 3;
+		world
+			.players
+			.get::<Counted>(peer, 2)
+			.expect("it is here")
+			.0
+			.count = 5;
+		world.local.get::<Counted>(3).0.count = 9;
+
+		let scene = capture(&world);
+
+		assert_eq!(
+			scene.peer_generations.len(),
+			MAX_PEERS,
+			"every slot, empty ones included, exactly as the other four tables"
+		);
+		assert_eq!(scene.player_arenas.len(), 2, "the host and the one that was admitted");
+
+		let host_here = scene
+			.player_arenas
+			.iter()
+			.any(|(slot, _)| *slot == 0);
+		let claimed = scene
+			.player_arenas
+			.iter()
+			.find(|(slot, _)| usize::try_from(*slot) == Ok(peer.slot()))
+			.map(|(_, arena)| arena.layout);
+
+		assert!(host_here, "slot zero is the host's and the host is always here");
+		assert_eq!(claimed, Some(2), "and a peer's block comes with the number it was stamped");
+		assert_eq!(
+			scene.arena.map(|it| it.layout),
+			Some(1),
+			"and the world's own arena is a fourth thing, not one of the blocks"
+		);
+	}
+
+	/// @note: a guard rather than a check, and worth saying so. `SceneData` has
+	/// no local arena in it, so there is no channel for one to travel down and
+	/// no edit to the loaders alone can make this fail. What it guards is
+	/// somebody later deciding a description should carry one.
+	#[test]
+	fn a_restore_leaves_the_local_arena_exactly_where_it_was() {
+		let mut source = furnished();
+		source.players.admit();
+
+		let scene = capture(&source);
+		let mut put_back = furnished();
+
+		put_back.local.get::<Counted>(3).0.count = 9;
+		restore(&mut put_back, &scene).expect("the layouts agree");
+
+		assert_eq!(
+			put_back.local.get::<Counted>(3).0.count,
+			9,
+			"where somebody is looking from is not part of the world being loaded"
+		);
+	}
+
+	#[test]
+	fn a_restore_puts_every_peer_back_slot_for_slot() {
+		let mut source = furnished();
+		let first = source.players.admit();
+		let second = source.players.admit();
+
+		source
+			.players
+			.forget(first)
+			.then_some(())
+			.expect("it was here");
+		source
+			.players
+			.get::<Counted>(second, 4)
+			.expect("it is here")
+			.0
+			.count = 7;
+
+		let scene = capture(&source);
+		let mut put_back = furnished();
+		restore(&mut put_back, &scene).expect("the layouts agree");
+
+		assert!(put_back.players.here(second), "the peer that was here still is");
+		assert!(
+			!put_back.players.here(first),
+			"and the one that had already left is still gone, which is what the 			 generations \
+			 are written down for"
+		);
+		assert_eq!(
+			put_back
+				.players
+				.get::<Counted>(second, 4)
+				.expect("here")
+				.0
+				.count,
+			7,
+			"holding what it held"
+		);
+		assert!(put_back.players.here(PeerId::HOST));
+	}
+
+	#[test]
+	fn an_older_description_leaves_the_peers_alone_rather_than_emptying_them() {
+		let mut world = furnished();
+		let peer = world.players.admit();
+
+		// what a description written before peers had blocks looks like: the
+		// two lists absent rather than empty-because-nobody-was-here.
+		let scene = SceneData { arena: None, ..SceneData::default() };
+
+		restore(&mut world, &scene).expect("no arena to disagree about");
+
+		assert!(world.players.here(peer), "a world loaded from an older file keeps its peers");
+	}
+
+	#[test]
+	fn blocks_arriving_with_no_generations_leave_a_live_table_alone() {
+		let mut world = furnished();
+		let peer = world.players.admit();
+
+		world
+			.players
+			.get::<Counted>(peer, 5)
+			.expect("it is here")
+			.0
+			.count = 6;
+
+		// a description disagreeing with itself: it carries somebody's block
+		// and no account of how the table was shaped. Emptying a live table
+		// over that is worse than doing nothing, and doing nothing is what a
+		// description that says nothing already gets.
+		let scene = SceneData {
+			player_arenas: vec![(1, Arena { layout: 1, bytes: vec![1; 8] })],
+			peer_generations: Vec::new(),
+			..SceneData::default()
+		};
+
+		restore(&mut world, &scene).expect("no arena to disagree about");
+
+		assert!(world.players.here(peer), "the peer that was here still is");
+		assert_eq!(
+			world
+				.players
+				.get::<Counted>(peer, 5)
+				.expect("here")
+				.0
+				.count,
+			6,
+			"holding what it held"
+		);
+	}
+
+	#[test]
+	fn an_instantiate_brings_no_peers_with_it() {
+		let mut source = furnished();
+		source.players.admit();
+
+		let scene = capture(&source);
+		let mut beside = furnished();
+		instantiate(&mut beside, &scene, Vec3::ZERO);
+
+		assert_eq!(beside.players.len(), 1, "a paste adds things to a world, not people to it");
 	}
 
 	#[test]

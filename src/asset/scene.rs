@@ -9,14 +9,16 @@
 //! behind.
 //!
 //! ```text
-//!    0  SceneHeader                      128 bytes
-//!  128  Setting                          112 bytes, one of them
-//!    .  [Stood; stood_count]              72 bytes each
+//!    0  SceneHeader                      160 bytes
+//!  160  Setting                          112 bytes, one of them
+//!    .  [Stood; stood_count]              76 bytes each
 //!    .  [Bulk;  bulk_count]              132 bytes each
-//!    .  [Tie;   tie_count]                84 bytes each
+//!    .  [Tie;   tie_count]               100 bytes each
 //!    .  [Bent;  bent_count]                24 bytes each
 //!    .  [Local; locals_count]              40 bytes each
-//!    .  [u32; stood_slots + bulk_slots + tie_slots + bent_slots]
+//!    .  [u32; stood_slots + bulk_slots + tie_slots + bent_slots + kept_slots]
+//!    .  [Kept; kept_count]                20 bytes each
+//!    .  every peer's arena, back to back
 //!    .  the game's own arena, if there is one
 //!    .  the string blob, NUL-separated UTF-8
 //! ```
@@ -47,6 +49,7 @@ use colby_core::{
 	Result,
 	abi::{
 		BodyKind, Camera, JointKind, Layers, ShapeKind, Transform,
+		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
 	},
@@ -65,13 +68,13 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// Bump it whenever the header or any block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it
 /// agreed.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
 
 /// How big [`SceneHeader`] is, and where the first block starts.
-pub const HEADER_BYTES: usize = 128;
+pub const HEADER_BYTES: usize = 160;
 
 /// The bit in [`SceneHeader::flags`] that says the file carries a game's arena.
 ///
@@ -80,12 +83,20 @@ pub const HEADER_BYTES: usize = 128;
 /// no arena at all" is not the same statement.
 pub const FLAG_ARENA: u32 = 1;
 
+/// The bit that says the file carries a block of arena per peer.
+///
+/// A separate flag from [`FLAG_ARENA`] for the reason that one exists at all:
+/// a world where every peer's block is empty is a different statement from a
+/// world written before peers had blocks, and only the second may be read as
+/// "leave the table alone".
+pub const FLAG_PLAYERS: u32 = 2;
+
 /// Every flag this build knows about.
 ///
 /// A file setting anything outside this is refused rather than read with the
 /// unknown part ignored: the bit is there because some later version needed it
 /// to be understood.
-pub const KNOWN_FLAGS: u32 = FLAG_ARENA;
+pub const KNOWN_FLAGS: u32 = FLAG_ARENA | FLAG_PLAYERS;
 
 /// The largest string blob the reader will accept, in bytes.
 pub const MAX_NAMES: usize = 1 << 20;
@@ -170,8 +181,9 @@ pub struct SceneHeader {
 	/// The same for the pose table.
 	pub bent_slots: u32,
 
-	/// Where the generations start: the three tables' arrays, back to back, in
-	/// the order the three counts above are in.
+	/// Where the generations start: the five tables' arrays, back to back, in
+	/// the order the five counts above are in - entities, bodies, joints,
+	/// poses, peers.
 	pub generations_offset: u32,
 
 	/// The low half of the arena's layout number.
@@ -192,17 +204,37 @@ pub struct SceneHeader {
 	/// How long the string blob is.
 	pub names_length: u32,
 
-	/// Spare, so the header is a round hundred and twenty-eight bytes and
-	/// every block after it inherits the buffer's alignment.
-	pub reserved: [u32; 1],
+	/// How wide one [`Kept`] record is.
+	pub kept_stride: u32,
+
+	/// Where the [`Kept`] records start.
+	pub kept_offset: u32,
+
+	/// How many of them there are: one per peer that was here.
+	pub kept_count: u32,
+
+	/// How many peer slots the table had, for the generations array.
+	pub kept_slots: u32,
+
+	/// Where the peers' arena bytes start, all of them back to back.
+	pub kept_bytes_offset: u32,
+
+	/// How many of those bytes there are.
+	pub kept_bytes_length: u32,
+
+	/// Spare, so the header is a round hundred and sixty bytes and every block
+	/// after it inherits the buffer's alignment.
+	pub reserved: [u32; 3],
 }
 
 // the blocks after the header inherit the buffer's alignment only because the
 // header is a multiple of it, and a field added without shrinking the spare
-// would move all of them without anybody noticing until a cast failed.
+// would move all of them without anybody noticing until a cast failed. The
+// same reasoning is why every block that has to be aligned is laid out before
+// the first one whose length a game chooses. @ref `Places::of`.
 const _: () = assert!(
 	size_of::<SceneHeader>() == HEADER_BYTES,
-	"the header has to stay a hundred and twenty-eight bytes"
+	"the header has to stay a hundred and sixty bytes"
 );
 
 /// The world's own settings: where it looks from, what lights it, how hard it
@@ -315,6 +347,34 @@ pub struct Bent {
 	pub first: u32,
 
 	/// How many bones it has.
+	pub count: u32,
+}
+
+/// One peer's arena, as the file holds it.
+///
+/// Its bytes are not here, for the reason a pose's bones are not in a
+/// [`Bent`]: they vary in length and a record may not, so they are a run in
+/// one block, named by an offset and a length. The layout number is split into
+/// halves like the world arena's and for the same reason: it keeps this record
+/// four-byte business, so where it lands never depends on an eight-byte
+/// value's alignment.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Kept {
+	/// Which peer slot this block belonged to.
+	pub slot: u32,
+
+	/// The low half of the layout number stamped on it.
+	pub layout_low: u32,
+
+	/// The high half of it.
+	pub layout_high: u32,
+
+	/// Where its bytes start, as an index into the block of them.
+	pub first: u32,
+
+	/// How many bytes it has.
 	pub count: u32,
 }
 
@@ -545,7 +605,7 @@ impl SceneFile {
 		self.block(self.header.locals_offset, self.header.locals_count)
 	}
 
-	/// The four generation arrays, back to back.
+	/// The five generation arrays, back to back.
 	#[must_use]
 	pub fn generations(&self) -> &[u32] {
 		let total = self
@@ -553,9 +613,42 @@ impl SceneFile {
 			.stood_slots
 			.saturating_add(self.header.bulk_slots)
 			.saturating_add(self.header.tie_slots)
-			.saturating_add(self.header.bent_slots);
+			.saturating_add(self.header.bent_slots)
+			.saturating_add(self.header.kept_slots);
 
 		self.block(self.header.generations_offset, total)
+	}
+
+	/// The peers' arena records, if the file carries any.
+	#[must_use]
+	pub fn kept(&self) -> &[Kept] {
+		if self.header.flags & FLAG_PLAYERS == 0 {
+			return &[];
+		}
+
+		self.block(self.header.kept_offset, self.header.kept_count)
+	}
+
+	/// One peer's arena, out of the run block.
+	///
+	/// @param kept - the record naming it
+	#[must_use]
+	pub fn block_of(&self, kept: &Kept) -> Arena {
+		let layout = u64::from(kept.layout_low) | (u64::from(kept.layout_high) << u32::BITS);
+		// checked rather than saturating: a saturated offset is a number that
+		// still reads *somewhere*, and somewhere is worse than nowhere.
+		let Some(start) = self
+			.header
+			.kept_bytes_offset
+			.checked_add(kept.first)
+		else {
+			return Arena { layout, bytes: Vec::new() };
+		};
+
+		Arena {
+			layout,
+			bytes: self.block::<u8>(start, kept.count).to_vec(),
+		}
 	}
 
 	/// The game's own arena, if the file carries one.
@@ -614,6 +707,8 @@ impl SceneFile {
 		let tie = usize::try_from(self.header.tie_slots).unwrap_or(0);
 		let bent = usize::try_from(self.header.bent_slots).unwrap_or(0);
 		let after_ties = stood.saturating_add(bulk).saturating_add(tie);
+		let after_poses = after_ties.saturating_add(bent);
+		let kept = usize::try_from(self.header.kept_slots).unwrap_or(0);
 
 		SceneData {
 			stage: stage_of(self.setting()),
@@ -649,8 +744,17 @@ impl SceneFile {
 				.iter()
 				.map(|it| self.pose(it))
 				.collect(),
+			player_arenas: self
+				.kept()
+				.iter()
+				.map(|it| (it.slot, self.block_of(it)))
+				.collect(),
+			peer_generations: generations
+				.get(after_poses..after_poses.saturating_add(kept))
+				.unwrap_or_default()
+				.to_vec(),
 			pose_generations: generations
-				.get(after_ties..after_ties.saturating_add(bent))
+				.get(after_ties..after_poses)
 				.unwrap_or_default()
 				.to_vec(),
 			arena: self.arena(),
@@ -834,16 +938,25 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	generations.extend_from_slice(&data.solid_generations);
 	generations.extend_from_slice(&data.link_generations);
 	generations.extend_from_slice(&data.pose_generations);
+	generations.extend_from_slice(&data.peer_generations);
 
-	let places =
-		Places::of(&stood, &bulk, &tie, &bent, &locals, &generations, data.arena.as_ref());
+	let mut kept_bytes = Vec::new();
+	let kept: Vec<Kept> = data
+		.player_arenas
+		.iter()
+		.map(|(slot, arena)| kept_of(*slot, arena, &mut kept_bytes))
+		.collect();
+
 	let blocks = Blocks {
 		stood: &stood,
 		bulk: &bulk,
 		tie: &tie,
 		bent: &bent,
 		locals: &locals,
+		kept: &kept,
+		kept_bytes: kept_bytes.len(),
 	};
+	let places = Places::of(&blocks, &generations, data.arena.as_ref());
 	let header = head(data, &places, &blocks, names.blob.len())?;
 
 	let mut out = Vec::with_capacity(places.names + names.blob.len());
@@ -855,6 +968,8 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::cast_slice(&bent));
 	out.extend_from_slice(bytemuck::cast_slice(&locals));
 	out.extend_from_slice(bytemuck::cast_slice(&generations));
+	out.extend_from_slice(bytemuck::cast_slice(&kept));
+	out.extend_from_slice(&kept_bytes);
 	if let Some(arena) = data.arena.as_ref() {
 		out.extend_from_slice(&arena.bytes);
 	}
@@ -874,20 +989,23 @@ struct Places {
 	locals: usize,
 	generations: usize,
 	arena: usize,
+	kept: usize,
+	kept_bytes: usize,
 	names: usize,
 }
 
 impl Places {
 	/// Adds the blocks up in the order they are written.
-	fn of(
-		stood: &[Stood],
-		bulk: &[Bulk],
-		tie: &[Tie],
-		bent: &[Bent],
-		locals: &[Local],
-		generations: &[u32],
-		arena: Option<&Arena>,
-	) -> Self {
+	fn of(blocks: &Blocks<'_>, generations: &[u32], arena: Option<&Arena>) -> Self {
+		let Blocks {
+			stood,
+			bulk,
+			tie,
+			bent,
+			locals,
+			kept,
+			kept_bytes,
+		} = *blocks;
 		let setting = HEADER_BYTES;
 		let stood_at = setting + size_of::<Setting>();
 		let bulk_at = stood_at + size_of_val(stood);
@@ -895,7 +1013,15 @@ impl Places {
 		let bent_at = tie_at + size_of_val(tie);
 		let locals_at = bent_at + size_of_val(bent);
 		let generations_at = locals_at + size_of_val(locals);
-		let arena_at = generations_at + size_of_val(generations);
+		// the records come before the arena and not after it. They are
+		// four-byte things and an arena is a run of bytes of any length a game
+		// likes, so putting them after one would make whether this file is
+		// readable depend on how long somebody's game state happened to be.
+		// Everything after the records is bytes, which needs no alignment at
+		// all.
+		let kept_at = generations_at + size_of_val(generations);
+		let kept_bytes_at = kept_at + size_of_val(kept);
+		let arena_at = kept_bytes_at + kept_bytes;
 		let names_at = arena_at + arena.map_or(0, |it| it.bytes.len());
 
 		Self {
@@ -907,6 +1033,8 @@ impl Places {
 			locals: locals_at,
 			generations: generations_at,
 			arena: arena_at,
+			kept: kept_at,
+			kept_bytes: kept_bytes_at,
 			names: names_at,
 		}
 	}
@@ -919,6 +1047,8 @@ struct Blocks<'a> {
 	tie: &'a [Tie],
 	bent: &'a [Bent],
 	locals: &'a [Local],
+	kept: &'a [Kept],
+	kept_bytes: usize,
 }
 
 /// The header, filled from what has already been laid out.
@@ -928,13 +1058,29 @@ fn head(
 	blocks: &Blocks<'_>,
 	names: usize,
 ) -> Result<SceneHeader> {
-	let Blocks { stood, bulk, tie, bent, locals } = *blocks;
+	let Blocks {
+		stood,
+		bulk,
+		tie,
+		bent,
+		locals,
+		kept,
+		kept_bytes,
+	} = *blocks;
 	let layout = data.arena.as_ref().map_or(0, |it| it.layout);
+	let arena_here = if data.arena.is_some() { FLAG_ARENA } else { 0 };
+	// from both lists rather than one of them. The records are written from
+	// `player_arenas` and the generations from `peer_generations`, so a flag
+	// taken from either alone can announce "no peers here" over a file that
+	// carries them - and the reader would then skip records nothing had
+	// validated.
+	let carrying_peers = !data.player_arenas.is_empty() || !data.peer_generations.is_empty();
+	let peers_here = if carrying_peers { FLAG_PLAYERS } else { 0 };
 
 	Ok(SceneHeader {
 		magic: MAGIC,
 		version: FORMAT_VERSION,
-		flags: if data.arena.is_some() { FLAG_ARENA } else { 0 },
+		flags: arena_here | peers_here,
 		setting_stride: width::<Setting>()?,
 		stood_stride: width::<Stood>()?,
 		bulk_stride: width::<Bulk>()?,
@@ -962,8 +1108,33 @@ fn head(
 		arena_length: count(data.arena.as_ref().map_or(0, |it| it.bytes.len()))?,
 		names_offset: count(places.names)?,
 		names_length: count(names)?,
-		reserved: [0; 1],
+		kept_stride: width::<Kept>()?,
+		kept_offset: count(places.kept)?,
+		kept_count: count(kept.len())?,
+		kept_slots: count(data.peer_generations.len())?,
+		kept_bytes_offset: count(places.kept_bytes)?,
+		kept_bytes_length: count(kept_bytes)?,
+		reserved: [0; 3],
 	})
+}
+
+/// One peer's arena, with its bytes appended to the run block.
+///
+/// @param slot - which peer slot it belonged to
+/// @param arena - its bytes and the number stamped on them
+/// @param bytes - the run block every peer's bytes go into
+fn kept_of(slot: u32, arena: &Arena, bytes: &mut Vec<u8>) -> Kept {
+	let first = u32::try_from(bytes.len()).unwrap_or(0);
+
+	bytes.extend_from_slice(&arena.bytes);
+
+	Kept {
+		slot,
+		layout_low: u32::try_from(arena.layout & u64::from(u32::MAX)).unwrap_or(0),
+		layout_high: u32::try_from(arena.layout >> u32::BITS).unwrap_or(0),
+		first,
+		count: u32::try_from(arena.bytes.len()).unwrap_or(0),
+	}
 }
 
 /// One pose, as the file holds it, with its bones appended to the run block.
@@ -1238,9 +1409,16 @@ fn check(bytes: &[u8]) -> std::result::Result<SceneHeader, String> {
 		return Err("this is not a colby scene".to_owned());
 	}
 
+	// @note: the advice differs by where the file came from and this cannot
+	// tell. A compiled scene is recompiled from its source the moment the
+	// version moves, so a person never sees this. A *save* has no source, so
+	// this is the end of it - which is the one way this format differs from
+	// every other one here, and the message says so rather than offering
+	// advice only half its callers can take.
 	if header.version != FORMAT_VERSION {
 		return Err(format!(
-			"this scene is version {} and this build reads version {FORMAT_VERSION}",
+			"this scene is version {} and this build reads version {FORMAT_VERSION}; a compiled \
+			 one is rebuilt from its source, a save is not",
 			header.version
 		));
 	}
@@ -1317,6 +1495,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
 		(header.bent_stride, size_of::<Bent>(), "poses"),
+		(header.kept_stride, size_of::<Kept>(), "peers"),
 	];
 
 	for (written, expected, what) in widths {
@@ -1343,11 +1522,41 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 		));
 	}
 
+	if usize::try_from(header.kept_slots).unwrap_or(usize::MAX) > MAX_PEERS {
+		return Err(format!(
+			"this scene claims {} peer slots and a world holds {MAX_PEERS}",
+			header.kept_slots
+		));
+	}
+
+	// and the *records* are bounded too, which is the check that was missing
+	// beside the other three. One record is twenty bytes and names four
+	// thousand, so an unbounded count is two hundred times the file in memory
+	// before anything downstream gets to throw it away.
+	if usize::try_from(header.kept_count).unwrap_or(usize::MAX) > MAX_PEERS {
+		return Err(format!(
+			"this scene carries {} peer blocks and a world holds {MAX_PEERS}",
+			header.kept_count
+		));
+	}
+
+	// every peer's block is an arena, so the whole run is bounded by what one
+	// arena is times how many there can be. A file claiming more than that is
+	// asking for a reservation rather than describing a world.
+	let room = MAX_PEERS.saturating_mul(STATE_BYTES);
+	if usize::try_from(header.kept_bytes_length).unwrap_or(usize::MAX) > room {
+		return Err(format!(
+			"this scene's peers hold {} bytes between them and there is room for {room}",
+			header.kept_bytes_length
+		));
+	}
+
 	let total = header
 		.stood_slots
 		.checked_add(header.bulk_slots)
 		.and_then(|it| it.checked_add(header.tie_slots))
 		.and_then(|it| it.checked_add(header.bent_slots))
+		.and_then(|it| it.checked_add(header.kept_slots))
 		.ok_or_else(|| "this scene claims more slots than a count holds".to_owned())?;
 
 	fits::<Setting>(bytes, HEADER_BYTES, (header.setting_offset, 1), "settings")?;
@@ -1366,6 +1575,69 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 			(header.arena_offset, header.arena_length),
 			"game state",
 		)?;
+	}
+
+	// a file that does not say it carries peers may not describe any either.
+	// Without this a single word of `kept_slots` on a file with the bit clear
+	// reaches into the block after the generations, comes back as a peer
+	// table, and empties every block in the world it is loaded into.
+	if header.flags & FLAG_PLAYERS == 0
+		&& (header.kept_slots != 0 || header.kept_count != 0 || header.kept_bytes_length != 0)
+	{
+		return Err("this scene describes peers it says it does not carry".to_owned());
+	}
+
+	if header.flags & FLAG_PLAYERS != 0 {
+		fits::<Kept>(bytes, HEADER_BYTES, (header.kept_offset, header.kept_count), "peers")?;
+		fits::<u8>(
+			bytes,
+			HEADER_BYTES,
+			(header.kept_bytes_offset, header.kept_bytes_length),
+			"peer state",
+		)?;
+
+		// and each record's own run has to be inside the block the two fields
+		// above just proved is inside the file. Without this a record naming a
+		// run past the end reads as an empty arena rather than as a refusal,
+		// which is a world quietly missing what somebody was holding.
+		//
+		// @note: read a record at a time rather than cast as a slice. This
+		// takes a plain `&[u8]` and a cast wants the alignment the buffer has
+		// and the argument does not promise.
+		let records = span::<Kept>(header.kept_offset, header.kept_count)
+			.and_then(|range| bytes.get(range))
+			.unwrap_or_default();
+
+		for chunk in records.chunks_exact(size_of::<Kept>()) {
+			let one: Kept = bytemuck::pod_read_unaligned(chunk);
+			let end = one
+				.first
+				.checked_add(one.count)
+				.ok_or_else(|| "a peer's state runs past what a count holds".to_owned())?;
+
+			if end > header.kept_bytes_length {
+				return Err(format!(
+					"a peer's state ends at {end} and the block is {} bytes",
+					header.kept_bytes_length
+				));
+			}
+
+			if usize::try_from(one.count).unwrap_or(usize::MAX) > STATE_BYTES {
+				return Err(format!(
+					"a peer's state is {} bytes and an arena is {STATE_BYTES}",
+					one.count
+				));
+			}
+
+			// refused here rather than dropped four layers down, where a slot
+			// nobody has is silently no peer at all.
+			if usize::try_from(one.slot).unwrap_or(usize::MAX) >= MAX_PEERS {
+				return Err(format!(
+					"a peer's state is for slot {} and a world holds {MAX_PEERS}",
+					one.slot
+				));
+			}
+		}
 	}
 
 	Ok(())
@@ -1533,6 +1805,18 @@ mod tests {
 				layout: 0x0003_0000_0000_000C,
 				bytes: vec![7; STATE_BYTES],
 			}),
+			// two peers in non-adjacent slots, of different lengths and
+			// different layouts: a reader that took the run block at one
+			// stride, or read the slots in order, comes back wrong rather than
+			// plausible.
+			player_arenas: vec![
+				(0, Arena {
+					layout: 0x0000_0005_0000_0001,
+					bytes: vec![3; 16],
+				}),
+				(4, Arena { layout: 9, bytes: vec![8; STATE_BYTES] }),
+			],
+			peer_generations: vec![u32::MAX, 0, 0, 0, 2, 0, 0, 0, 0],
 		}
 	}
 
@@ -1772,6 +2056,214 @@ mod tests {
 		assert_eq!(back.thing_generations, vec![1, 0, 3], "the entity slots");
 		assert_eq!(back.solid_generations, vec![0, 2, 0, 0, 1], "the body slots");
 		assert_eq!(back.link_generations, vec![1], "and the joint slots");
+	}
+
+	#[test]
+	fn every_peers_block_comes_back_at_its_own_slot_and_its_own_length() {
+		let back = round_trip(&sample());
+		let mine = sample();
+
+		assert_eq!(back.player_arenas, mine.player_arenas, "slots, layouts and bytes");
+		assert_eq!(back.peer_generations, mine.peer_generations, "and every slot's generation");
+
+		// the two the sample was built to separate: a reader taking the run
+		// block at one stride, or reading the records in order and assuming
+		// slot equals position, gets past the assertion above only by luck.
+		let lengths: Vec<usize> = back
+			.player_arenas
+			.iter()
+			.map(|(_, arena)| arena.bytes.len())
+			.collect();
+
+		assert_eq!(lengths, vec![16, STATE_BYTES], "two different lengths, in order");
+		assert_eq!(
+			back.player_arenas[1].0, 4,
+			"and the second record is at slot four rather than at slot one"
+		);
+	}
+
+	#[test]
+	fn a_scene_with_no_peers_in_it_says_so_rather_than_carrying_an_empty_block() {
+		let bare = SceneData { player_arenas: Vec::new(), ..sample() };
+		let bytes = encode(&SceneData { peer_generations: Vec::new(), ..bare }).expect("it fits");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("it reads");
+
+		assert_eq!(file.header().flags & FLAG_PLAYERS, 0, "the flag is clear");
+		assert!(file.kept().is_empty(), "and there is nothing to read");
+		assert!(
+			file.to_scene_data().peer_generations.is_empty(),
+			"which is what an older description looks like, and is left alone on a restore"
+		);
+	}
+
+	#[test]
+	fn a_file_claiming_more_peers_than_a_world_holds_is_refused() {
+		let bytes = encode(&sample()).expect("it fits");
+		let mut broken = bytes;
+		let at = offset_of!(SceneHeader, kept_slots);
+
+		broken[at..at + 4].copy_from_slice(
+			&u32::try_from(MAX_PEERS + 1)
+				.unwrap_or(0)
+				.to_le_bytes(),
+		);
+
+		let refused = SceneFile::from_bytes(AlignedBytes::from_slice(&broken))
+			.expect_err("a world has nowhere to put them")
+			.to_string();
+
+		assert!(refused.contains("peer slots"), "and it says what it refused, got {refused}");
+	}
+
+	/// The header fields a hostile file can move on their own, each patched by
+	/// itself on a file that is otherwise entirely valid.
+	fn patched(field: usize, value: u32) -> String {
+		let mut bytes = encode(&sample()).expect("it fits");
+
+		bytes[field..field + 4].copy_from_slice(&value.to_le_bytes());
+
+		SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("it should not read")
+			.to_string()
+	}
+
+	#[test]
+	fn a_file_carrying_more_peer_blocks_than_a_world_holds_is_refused() {
+		let count = u32::try_from(MAX_PEERS + 1).unwrap_or(u32::MAX);
+		let refused = patched(offset_of!(SceneHeader, kept_count), count);
+
+		// twenty bytes of record naming four thousand of arena is two hundred
+		// times the file in memory, so this is the one of the four bounds that
+		// costs something to leave out.
+		assert!(refused.contains("peer blocks"), "got {refused}");
+	}
+
+	#[test]
+	fn a_file_that_says_it_has_no_peers_may_not_describe_any() {
+		let bare = SceneData {
+			player_arenas: Vec::new(),
+			peer_generations: Vec::new(),
+			..sample()
+		};
+		let mut bytes = encode(&bare).expect("it fits");
+		let at = offset_of!(SceneHeader, kept_slots);
+
+		assert_eq!(
+			SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+				.expect("it reads as written")
+				.header()
+				.flags & FLAG_PLAYERS,
+			0,
+			"the flag is clear to begin with"
+		);
+
+		// one word. Without the check this reads a generation out of the block
+		// after the generations, comes back as a peer table, and empties every
+		// block in the world it is loaded into.
+		bytes[at..at + 4].copy_from_slice(&1_u32.to_le_bytes());
+
+		let refused = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("it says it has none")
+			.to_string();
+
+		assert!(refused.contains("says it does not carry"), "got {refused}");
+	}
+
+	#[test]
+	fn a_peers_block_for_a_slot_no_world_has_is_refused() {
+		let bytes = encode(&sample()).expect("it fits");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("it reads");
+		let at = usize::try_from(file.header().kept_offset).unwrap_or(0) + offset_of!(Kept, slot);
+
+		drop(file);
+
+		let mut broken = bytes;
+		let slot = u32::try_from(MAX_PEERS).unwrap_or(u32::MAX);
+
+		broken[at..at + 4].copy_from_slice(&slot.to_le_bytes());
+
+		let refused = SceneFile::from_bytes(AlignedBytes::from_slice(&broken))
+			.expect_err("no world has that slot")
+			.to_string();
+
+		assert!(refused.contains("for slot"), "got {refused}");
+	}
+
+	#[test]
+	fn a_peer_record_of_the_wrong_width_is_refused_like_every_other_record() {
+		let refused = patched(offset_of!(SceneHeader, kept_stride), 4);
+
+		assert!(refused.contains("peers are 4 bytes each"), "got {refused}");
+	}
+
+	#[test]
+	fn a_short_arena_does_not_push_the_peer_records_off_a_boundary() {
+		// the records are laid out before the arena precisely so that this
+		// cannot happen. A five-byte arena is legal - `put_raw` takes a short
+		// slice - and used to leave `kept_offset` one byte off four.
+		let odd = SceneData {
+			arena: Some(Arena { layout: 3, bytes: vec![1; 5] }),
+			..sample()
+		};
+		let back = round_trip(&odd);
+
+		assert_eq!(back.player_arenas, odd.player_arenas, "the peers still read back");
+		assert_eq!(
+			back.arena.map(|it| it.bytes.len()),
+			Some(5),
+			"and so does an arena of a length nothing rounds"
+		);
+	}
+
+	#[test]
+	fn a_peers_block_that_runs_past_the_end_of_the_run_is_refused() {
+		let bytes = encode(&sample()).expect("it fits");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("it reads");
+		let at =
+			usize::try_from(file.header().kept_offset).unwrap_or(0) + offset_of!(Kept, count);
+		let length = file.header().kept_bytes_length;
+
+		drop(file);
+
+		let mut broken = bytes;
+
+		// one byte more than the whole run holds, and deliberately not a number
+		// that overflows: `u32::MAX` would be caught by the addition instead,
+		// and the range check itself would go untested.
+		broken[at..at + 4].copy_from_slice(&length.saturating_add(1).to_le_bytes());
+
+		let refused = SceneFile::from_bytes(AlignedBytes::from_slice(&broken))
+			.expect_err("a record cannot name a run that is not there")
+			.to_string();
+
+		assert!(refused.contains("block is"), "and it says so, got {refused}");
+	}
+
+	#[test]
+	fn a_peers_block_longer_than_an_arena_is_refused() {
+		let bytes = encode(&sample()).expect("it fits");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("it reads");
+		let at =
+			usize::try_from(file.header().kept_offset).unwrap_or(0) + offset_of!(Kept, count);
+		let run = usize::try_from(file.header().kept_bytes_length).unwrap_or(0);
+
+		drop(file);
+
+		// a record inside the run block, and still longer than one arena is.
+		// Two peers of four thousand bytes each leaves room for a record that
+		// fits in the run and could never fit in a `GameState`.
+		assert!(run > STATE_BYTES, "the sample has more than one arena's worth in it");
+
+		let mut broken = bytes;
+		let claimed = u32::try_from(STATE_BYTES + 1).unwrap_or(u32::MAX);
+
+		broken[at..at + 4].copy_from_slice(&claimed.to_le_bytes());
+
+		let refused = SceneFile::from_bytes(AlignedBytes::from_slice(&broken))
+			.expect_err("no arena is that big")
+			.to_string();
+
+		assert!(refused.contains("an arena is"), "and it says so, got {refused}");
 	}
 
 	#[test]

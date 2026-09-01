@@ -57,6 +57,21 @@
 //!   }
 //! ```
 
+/// How many peers one world keeps a block of gameplay state for.
+///
+/// The host and eight clients. The runner's own ceiling is eight *clients* on
+/// one socket, and this is that number seen from the other side, with the
+/// host's own slot added: slot zero is [`PeerId::HOST`]'s and a client is never
+/// given it. Bounded for the reason every table here is bounded, and the cost
+/// of the bound is nine blocks of arena whether or not anybody is in them.
+///
+/// @note: the two numbers agree by arithmetic and nothing more. The runner's
+/// is a private constant in its own crate and there is no import, no
+/// assertion and no test tying the two together, so either can be changed on
+/// its own. The commit that gives a connecting client a slot is where that
+/// has to stop being true.
+pub const MAX_PEERS: usize = 9;
+
 /// A handle to one endpoint of a conversation.
 ///
 /// Generational, like a body's handle and unlike an asset's, and for a
@@ -87,13 +102,15 @@
 /// in the arena, and a zeroed arena has to read back as [`NONE`](Self::NONE)
 /// rather than as something that could resolve.
 ///
-/// **A generation of zero means nobody, and nothing in this file can make that
-/// true.** Every other handle here is guaranteed it by the table that hands it
-/// out - a body's generation is bumped before the handle leaves and lifted to
-/// one where a slot is reused, so zero can never escape. There is no table of
-/// peers yet, so this is a reservation rather than a guarantee, and whoever
-/// writes that table owes the same discipline. `Pod` means it cannot be an
-/// enforcement in any case: any crate can cast eight bytes into one of these.
+/// **A generation of zero means nobody, and nothing in this file makes that
+/// true.** Every handle here is guaranteed it by the table that hands it out -
+/// a body's generation is bumped before the handle leaves and lifted to one
+/// where a slot is reused, so zero can never escape. For a peer that table is
+/// [`Players`](crate::abi::state::Players), which mints nothing at zero and
+/// refuses to seat anybody at a slot whose generation is one. `Pod` means none
+/// of this is an enforcement in any case: any crate can cast eight bytes into
+/// one of these, so a table's checks are a way of not being wrong by accident
+/// rather than a way of stopping somebody being wrong on purpose.
 #[repr(C)]
 #[derive(
 	Clone,
@@ -118,8 +135,10 @@ impl PeerId {
 	/// deliberate and they defend different things.
 	///
 	/// The **slot** is reserved so that a block kept per peer has somewhere to
-	/// put the host's. Nothing in this file enforces that; the table that
-	/// hands slots out owes it, and it does not exist yet.
+	/// put the host's. Nothing in this file enforces it; the table that hands
+	/// slots out does, by seating the host there before anybody can ask and by
+	/// starting its search one slot later. @ref
+	/// [`Players`](crate::abi::state::Players).
 	///
 	/// The **generation** is `u32::MAX` because the tables in this engine all
 	/// mint a handle the same way - take the lowest free slot, add one to its
@@ -182,13 +201,15 @@ impl PeerId {
 	)]
 	pub const fn slot(self) -> usize { self.index as usize }
 
-	/// Some peer at a slot, as the table that hands them out would mint one.
+	/// The peer at a slot, as the table that hands them out sees it.
 	///
-	/// Test-only, and deliberately: a handle is minted by the table that owns
-	/// it, and the table of peers arrives with the arena that is kept per
-	/// peer. Until then this is what lets the rest of the crate check what a
-	/// client's answers are.
-	#[cfg(test)]
+	/// Crate-visible and no wider, which is the arrangement every other handle
+	/// here has: the only thing that may mint one is the table that owns the
+	/// slot, and for a peer that is [`Players`](crate::abi::state::Players). A
+	/// game reads a peer out of the world; it never builds one.
+	///
+	/// @param index - which slot
+	/// @param generation - which occupant of it
 	pub(crate) const fn at(index: u32, generation: u32) -> Self { Self { index, generation } }
 }
 

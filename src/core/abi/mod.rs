@@ -83,7 +83,7 @@ pub use self::{
 	skeleton::{
 		Bone, MAX_BONES, NO_PARENT, Skeleton, SkeletonData, SkeletonId, Skeletons, rests,
 	},
-	state::GameState,
+	state::{GameState, Players},
 	texture::{Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},
 };
@@ -93,7 +93,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 39;
+pub const ABI_VERSION: u32 = 40;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -401,8 +401,33 @@ pub struct World {
 	/// frames are drawn between two steps. @ref [`debug`](crate::abi::debug).
 	pub debug: Debug,
 
-	/// The game's own state. The host allocates it and never looks inside.
+	/// The world's own state, which everybody in it shares.
+	///
+	/// The host allocates it and never looks inside. What goes here is what
+	/// the world *is*: the map, the props, the score. @ref
+	/// [`state`](crate::abi::state) for the three arenas and the rule for
+	/// deciding which one a value belongs in.
 	pub state: GameState,
+
+	/// One block of state per peer, and the peers themselves.
+	///
+	/// What is true of one person rather than of the world: what they are
+	/// holding, which tool they picked. A peer reads its own through
+	/// [`Players::get`](crate::abi::state::Players::get), and the host reads
+	/// everybody's, because the host is the only thing that simulates.
+	///
+	/// Also the table that mints a [`PeerId`]: slot zero is
+	/// [`PeerId::HOST`]'s from the moment the world exists, and
+	/// [`admit`](crate::abi::state::Players::admit) hands out the rest.
+	pub players: Players,
+
+	/// The state of this screen, which crosses to nobody and is never saved.
+	///
+	/// A camera, a panel handle, the voice something is humming with. The one
+	/// arena a snapshot must never overwrite, because two people looking at
+	/// one world are still looking from two places - and the one a save leaves
+	/// alone, because where somebody was looking is not part of the world.
+	pub local: GameState,
 
 	/// The two queries the host answers about [`bodies`](Self::bodies).
 	///
@@ -486,6 +511,8 @@ impl World {
 			ui: Ui::new(),
 			debug: Debug::new(),
 			state: GameState::new(),
+			players: Players::new(),
+			local: GameState::new(),
 			physics: Physics::STUB,
 			blending: Vec::new(),
 			rigging: Vec::new(),

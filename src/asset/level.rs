@@ -93,9 +93,12 @@ pub fn import(text: &str) -> Result<SceneData> {
 		links,
 		posed,
 		// nothing an author could write. A scene laid out by hand is a world
-		// before any game has run in it, and the arena is what a game
-		// remembers about one that has.
+		// before any game has run in it, and an arena is what a game remembers
+		// about one that has - which is as true of a peer's block as of the
+		// world's, so neither is here.
 		arena: None,
+		player_arenas: Vec::new(),
+		peer_generations: Vec::new(),
 	})
 }
 
