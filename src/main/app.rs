@@ -34,7 +34,7 @@ use colby_engine::{
 	},
 };
 use colby_physics::Simulation;
-use colby_script::Scripts;
+use colby_script::Vm;
 use colby_ui::Interface;
 
 #[cfg(feature = "hot_reload")]
@@ -78,7 +78,7 @@ pub(crate) struct App {
 	/// renderer is one: an engine whose scene and interface work and whose
 	/// scripts did not start is still worth looking at, and the log says which
 	/// half is missing.
-	scripts: Option<Scripts>,
+	scripts: Option<Vm>,
 	/// The output device and the mixer feeding it. An `Option` for the same
 	/// reason the scripts are: an engine whose picture works and whose sound
 	/// did not start is worth running, and the log says which half is missing.
@@ -197,7 +197,7 @@ impl App {
 		// would hand it nothing on the first one.
 		self.assets.sync(&mut self.world);
 
-		match Scripts::new() {
+		match Vm::new() {
 			| Ok(scripts) => self.scripts = Some(scripts),
 			| Err(error) =>
 				error!(%error, "no interpreter; documents with a script have no logic"),

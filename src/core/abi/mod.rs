@@ -42,6 +42,7 @@ pub mod pose;
 pub mod ragdoll;
 pub mod registry;
 pub mod scene;
+pub mod script;
 pub mod skeleton;
 pub mod state;
 pub mod texture;
@@ -80,6 +81,7 @@ pub use self::{
 		Arena, Form, Link, Posed, Remap, Restored, Scene, SceneData, SceneId, Scenes, Solid,
 		Stage, Thing,
 	},
+	script::{Script, ScriptData, ScriptId, Scripts},
 	skeleton::{
 		Bone, MAX_BONES, NO_PARENT, Skeleton, SkeletonData, SkeletonId, Skeletons, rests,
 	},
@@ -93,7 +95,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 43;
+pub const ABI_VERSION: u32 = 44;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -416,6 +418,16 @@ pub struct World {
 	/// the way the material table is. @ref [`ui`](crate::abi::ui).
 	pub ui: Ui,
 
+	/// Every program the host has been handed, reached by handle.
+	///
+	/// Filled from the asset tree like the meshes are: an `assets/ui/hud.lua`
+	/// compiles into a `.clua` and lands here under `ui/hud`, and a document
+	/// naming it carries that name rather than the text. Nothing in
+	/// `colby_core` runs one - the interpreter is the host's, which is what
+	/// keeps a program alive across a reload of the game module. @ref
+	/// [`script`](crate::abi::script).
+	pub scripts: Scripts,
+
 	/// Lines, shapes and words to draw over the world.
 	///
 	/// Host-owned plain data anyone with the world may write: the solver
@@ -533,6 +545,7 @@ impl World {
 			materials: Materials::new(),
 			cvars: Cvars::new(),
 			ui: Ui::new(),
+			scripts: Scripts::new(),
 			debug: Debug::new(),
 			state: GameState::new(),
 			players: Players::new(),

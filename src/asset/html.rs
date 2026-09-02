@@ -12,9 +12,14 @@
 //! - **`<link href="theme.css">`** names one that lives beside the document.
 //!   The *compiler* resolves it and hands the result in, so nothing at runtime
 //!   has to find a second file. @ref [`links`].
-//! - **`<script>`** holds Lua, kept verbatim and handed to the host to run;
-//!   **`<script src="hud.lua">`** names a file beside the document and is
-//!   resolved by the compiler the same way a `<link>` is. @ref [`scripts`].
+//! - **`<script src="ui/hud">`** names the program this document's logic is in,
+//!   **by the name it is registered under** rather than by a file beside the
+//!   document - the same way an image names a texture. A program is an asset of
+//!   its own, so there is nothing here to fold in and nothing to resolve; what
+//!   the host does with the name is look it up. A `<script>` with a *body* is
+//!   refused, because a program that lived inside a document could not be
+//!   shared, could not reload on its own, and would be a second kind of
+//!   program.
 //! - **`<img src="textures/construct/floor">`** draws a texture, by the name it
 //!   is registered under. The one part of the interface that was already free.
 //! - **`<body>`** at the top level, if there is one, is the root itself rather
@@ -45,9 +50,6 @@ pub const EXTENSION: &str = "html";
 /// The extension a stylesheet a document links to has.
 pub const STYLESHEET_EXTENSION: &str = "css";
 
-/// The extension a script a document links to has.
-pub const SCRIPT_EXTENSION: &str = "lua";
-
 /// The tag whose body is a script.
 const SCRIPT: &str = "script";
 
@@ -77,18 +79,6 @@ pub struct Parsed {
 /// @return the `href` of each `<link>`, as written
 #[must_use]
 pub fn links(text: &str) -> Vec<String> { referenced(text, "link", "href") }
-
-/// Every script a document links to, in the order they appear.
-///
-/// The same scan [`links`] does, for the same reason: the compiler has to know
-/// what a document is built out of before it decides whether to build it, and a
-/// `.cdoc` older than the `.lua` folded into it is stale however new the
-/// `.html` is.
-///
-/// @param text - the whole document
-/// @return the `src` of each `<script>` that has one, as written
-#[must_use]
-pub fn scripts(text: &str) -> Vec<String> { referenced(text, SCRIPT, "src") }
 
 /// Every file one kind of tag names, without parsing the document.
 ///
@@ -260,20 +250,26 @@ impl Builder {
 			.unwrap_or_default()
 	}
 
-	/// Reads a `<script>` block and everything up to its closing tag.
+	/// Reads a `<script>` tag and everything up to its closing one.
 	///
 	/// Stricter than [`stylesheet`](Self::stylesheet), which treats a block
 	/// nobody closed as running to the end of the file: an unclosed `<style>`
 	/// turns the rest of a document into stylesheet nobody can match, and an
 	/// unclosed `<script>` would turn it into a program. Say so instead.
 	///
-	/// A block with a `src` is one the compiler has already resolved and folded
-	/// in, so its body is empty and there is nothing here to keep.
+	/// What the tag carries is a **name**, not a program: `src` is the name the
+	/// program is registered under, exactly as an image's `src` is the name of
+	/// a texture. A body is refused rather than kept, because a program written
+	/// inside a document could not be shared with a second document, could not
+	/// reload without the document being rebuilt, and would be a second kind of
+	/// program for everything downstream to know about.
 	fn script<'a>(&mut self, tag: &str, rest: &'a str) -> Result<&'a str> {
 		let mut attributes = Attributes::new(tag);
-		let mut linked = false;
-		while let Some((name, _)) = attributes.next_pair() {
-			linked |= name == "src";
+		let mut named = String::new();
+		while let Some((name, value)) = attributes.next_pair() {
+			if name == "src" {
+				named = value;
+			}
 		}
 
 		let Some(end) = find_ignoring_case(rest, SCRIPT_CLOSE) else {
@@ -285,30 +281,33 @@ impl Builder {
 			.get(end + SCRIPT_CLOSE.len()..)
 			.unwrap_or_default();
 
-		// the block's own line, kept before the count moves past it, so that a
-		// warning names where the tag was written rather than where it ended.
+		// the tag's own line, kept before the count moves past it, so that a
+		// complaint names where the tag was written rather than where it ended.
 		let at = self.line;
 		self.line += newlines(body);
 
-		if body.trim().is_empty() {
+		if !body.trim().is_empty() {
+			return Err(err!(Asset(
+				"line {at}: `<script>` has a body; a program is an asset, so put it in a `.lua` \
+				 and name it with `src`"
+			)));
+		}
+
+		if named.is_empty() {
 			return Ok(following);
 		}
 
-		if linked {
-			self.warnings.push(format!(
-				"line {at}: `<script src>` also has a body, which colby does not read"
-			));
-
-			return Ok(following);
+		// one panel shows one document and one document runs one program, so a
+		// second name is a document asking for something this engine has no
+		// answer to rather than a document asking for two of something.
+		if !self.document.program.is_empty() {
+			return Err(err!(Asset(
+				"line {at}: this document already runs `{}`, and a document runs one program",
+				self.document.program
+			)));
 		}
 
-		// several blocks in one document are one program, joined in the order
-		// they were written, which is the order Lua would have run them in.
-		if !self.document.script.is_empty() {
-			self.document.script.push('\n');
-		}
-
-		self.document.script.push_str(body);
+		self.document.program = named;
 
 		Ok(following)
 	}
@@ -754,65 +753,54 @@ mod tests {
 	}
 
 	#[test]
-	fn a_script_block_is_kept_verbatim_and_is_not_a_box() {
-		let parsed = read("<script>if a < b then x = \"</div>\" end</script><div></div>");
+	fn a_script_names_the_program_it_runs_and_is_not_a_box() {
+		let parsed = read("<script src=\"ui/hud\"></script><div></div>");
 
-		assert_eq!(
-			parsed.document.script.trim(),
-			"if a < b then x = \"</div>\" end",
-			"a program is text, not markup: the `<` and the `</div>` in it are its own"
-		);
-		assert_eq!(parsed.document.nodes.len(), 2, "and the block is not a box");
-		assert!(parsed.warnings.is_empty(), "nor is any of it an attribute nobody reads");
-	}
-
-	#[test]
-	fn two_script_blocks_are_one_program() {
-		let parsed = read("<script>local a = 1</script><script>local b = 2</script>");
-
-		assert!(parsed.document.script.contains("local a"), "the first");
-		assert!(parsed.document.script.contains("local b"), "and the second");
-		assert!(
-			parsed
-				.document
-				.script
-				.find("local a")
-				.unwrap_or(usize::MAX)
-				< parsed
-					.document
-					.script
-					.find("local b")
-					.unwrap_or(0),
-			"in the order they were written, because that is the order Lua runs them in"
-		);
-	}
-
-	#[test]
-	fn a_script_with_a_source_is_one_the_compiler_has_already_folded_in() {
-		let parsed = read("<script src=\"hud.lua\"></script>");
-
-		assert!(parsed.document.script.is_empty(), "there is nothing left to keep");
+		assert_eq!(parsed.document.program, "ui/hud", "the name, as written");
+		assert_eq!(parsed.document.nodes.len(), 2, "and the tag is not a box");
 		assert!(
 			parsed.warnings.is_empty(),
-			"and the `src` is not an attribute nobody reads: {:?}",
+			"nor is the `src` an attribute nobody reads: {:?}",
 			parsed.warnings
 		);
 	}
 
 	#[test]
-	fn a_script_that_is_never_closed_is_an_error_rather_than_the_rest_of_the_file() {
-		let error =
-			parse("<script>local a = 1\n<div></div>", &[]).expect_err("nothing closes it");
+	fn a_script_with_a_body_is_refused_rather_than_kept() {
+		// a program that lived inside a document could not be shared with a
+		// second document and could not reload without the document being
+		// rebuilt, so there is one place a program can be and it is a file.
+		let error = parse("<script>local a = 1</script>", &[])
+			.expect_err("a program does not live in a document");
 
-		assert!(error.to_string().contains("script"), "naming the tag: {error}");
+		assert!(error.to_string().contains(".lua"), "saying where to put it: {error}");
 	}
 
 	#[test]
-	fn the_scripts_are_readable_without_reading_the_document() {
-		let found = scripts("<script src=\"hud.lua\"></script><script>local a = 1</script>");
+	fn a_second_program_is_refused_rather_than_quietly_winning() {
+		// one panel shows one document and one document runs one program. The
+		// trap this closes is the *silent* form: taking the last one, so that
+		// a document naming two runs whichever happens to be written second.
+		let error = parse("<script src=\"ui/a\"></script><script src=\"ui/b\"></script>", &[])
+			.expect_err("two is not a number of programs a document may have");
 
-		assert_eq!(found, vec!["hud.lua".to_owned()], "only the ones naming a file");
-		assert!(scripts("<div></div>").is_empty(), "and a document with none has none");
+		assert!(error.to_string().contains("ui/a"), "naming the one it already has: {error}");
+	}
+
+	#[test]
+	fn an_empty_script_tag_names_nothing_and_is_not_an_error() {
+		let parsed = read("<script></script><div></div>");
+
+		assert!(parsed.document.program.is_empty(), "there is nothing to run");
+		assert_eq!(parsed.document.nodes.len(), 2, "and still no box");
+	}
+
+	#[test]
+	fn a_script_that_is_never_closed_is_an_error_rather_than_the_rest_of_the_file() {
+		let error =
+			parse("<script src=\"ui/hud\">\n<div></div>", &[]).expect_err("nothing closes it");
+
+		assert!(error.to_string().contains("script"), "naming the tag: {error}");
 	}
 
 	#[test]

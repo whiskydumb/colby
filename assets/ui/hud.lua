@@ -1,11 +1,13 @@
 -- the demo's interface logic, and the whole of what Lua does in colby today.
 --
 -- Edit this file while the engine is running and the buttons change behavior in
--- the window: the compiler folds it into `ui/hud.cdoc` the same way it folds
--- `theme.css` in, the runner reloads the document, and this program is replaced
--- with the gameplay module never being touched. Nothing here survives that --
--- `holding` below starts false again -- while whatever the program wrote into
--- the panel does, because that is the host's.
+-- the window: the compiler turns it into `ui/hud.clua`, which is an asset of its
+-- own like a mesh, `hud.html` names it with `<script src="ui/hud">` the way an
+-- image names a texture, and this program is replaced with the gameplay module
+-- never being touched. Nothing here survives that -- `swept` below starts at
+-- zero again -- while whatever the program wrote into the panel does, because
+-- that is the host's. Editing `theme.css` beside it does not restart it at all,
+-- which is what the program being its own asset bought.
 --
 -- What is reachable from here is `ui` and one way out, `colby.command`. There
 -- is no entity, no body and no camera in this environment, and no clock either:
@@ -22,8 +24,8 @@ end)
 -- been cleared is this program's business, the words and the color are its
 -- business too, and the only part the game is told about is that the props
 -- should go. Editing this file replaces the program and `swept` starts at zero
--- again; a reload of the *gameplay* module does not, which is the difference
--- the VM living in the host buys.
+-- again; a reload of the *gameplay* module does not, and neither does a change
+-- to the document or the stylesheet beside it.
 local swept = 0
 
 ui.on("cleanup", "click", function()

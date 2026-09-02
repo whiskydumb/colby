@@ -27,12 +27,14 @@ use std::{
 
 use colby_asset::{
 	MeshFile, TextureFile, anim::ClipFile, compile, compile::Kind, document::DocumentFile,
-	font::FontFile, model::ModelFile, scene::SceneFile, skeleton::SkeletonFile, sound::SoundFile,
+	font::FontFile, model::ModelFile, scene::SceneFile, script::ScriptFile,
+	skeleton::SkeletonFile, sound::SoundFile,
 };
 use colby_core::{
 	abi::{
 		ClipData, DocumentData, FontData, Material, MaterialId, MeshData, MeshId, ModelData,
-		Placement, SceneData, SkeletonData, SkeletonId, SoundData, TextureData, TextureId, World,
+		Placement, SceneData, ScriptData, SkeletonData, SkeletonId, SoundData, TextureData,
+		TextureId, World,
 	},
 	debug, info, warn,
 };
@@ -245,6 +247,7 @@ impl Assets {
 			| Kind::Scene => load_scene(world, path, &name),
 			| Kind::Skeleton => load_skeleton(world, path, &name),
 			| Kind::Clip => load_clip(world, path, &name),
+			| Kind::Script => load_script(world, path, &name),
 		}
 	}
 
@@ -280,6 +283,7 @@ impl Assets {
 						.insert(&name, SkeletonData::default()),
 				),
 				| Kind::Clip => drop(world.clips.insert(&name, ClipData::default())),
+				| Kind::Script => drop(world.scripts.insert(&name, ScriptData::empty())),
 			}
 
 			info!(name, ?kind, "asset unloaded; its file is gone");
@@ -457,6 +461,48 @@ fn load_document(world: &mut World, path: &Path, name: &str) {
 	let id = world.ui.insert(name, data);
 
 	info!(name, slot = id.index(), nodes, rules, "document loaded");
+}
+
+/// Reads one `.clua` into the world's script table.
+///
+/// Nothing here runs it or even checks that it parses: the interpreter lives
+/// in the host beside the solver, and the compiler does not link one. A program
+/// with a syntax error in it is therefore a warning the moment something tries
+/// to run it, which is one step later than a misspelled style property and is
+/// the cost of not building a Lua parser into the asset compiler.
+fn load_script(world: &mut World, path: &Path, name: &str) {
+	let file = match ScriptFile::open(path) {
+		| Ok(file) => file,
+		| Err(error) => {
+			warn!(%error, "the script on disk could not be read");
+
+			return;
+		},
+	};
+
+	let data = file.to_script_data();
+	let existing = world.scripts.find(name);
+	if existing.is_some()
+		&& world
+			.scripts
+			.get(existing)
+			.is_some_and(|script| *script.value() == data)
+	{
+		// the same guard the document has, and it matters more here: the
+		// revision moving is what throws a running program away, so rewriting
+		// an entry with the bytes it already holds would restart every program
+		// in the process every time the compiler ran.
+		return;
+	}
+
+	let lines = data.source.lines().count();
+	let id = world.scripts.insert(name, data);
+
+	// "program" rather than "script", because `colby_script` already says
+	// `script loaded` when it *builds* one, and two lines with one wording is a
+	// log nobody can grep. This one is the file arriving; that one is the
+	// program being run.
+	info!(name, slot = id.index(), lines, "program loaded");
 }
 
 /// Reads one `.cscene` into the world's scene table.
@@ -696,7 +742,7 @@ fn mtime(path: &Path) -> std::io::Result<SystemTime> { path.metadata()?.modified
 mod tests {
 	use std::{fs, thread::sleep};
 
-	use colby_core::abi::{Clip, Mesh, Model, Texture};
+	use colby_core::abi::{Clip, Mesh, Model, Script, Texture};
 
 	use super::*;
 
@@ -1246,6 +1292,47 @@ mod tests {
 			&[2],
 			"and the binding moved with the name, rather than staying on the bone that index \
 			 now means"
+		);
+	}
+
+	#[test]
+	fn rewriting_a_program_without_changing_it_does_not_move_its_revision() {
+		// what the revision is for here is stronger than for a mesh: it is what
+		// throws a *running program* away, locals and all. Registering an
+		// identical program again would restart every one of them every time
+		// anything in the tree was rebuilt.
+		let (source, output) = trees("script-quiet");
+
+		put(&source, "scripts/thing.lua", "local a = 1\n");
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+
+		assets.sync(&mut world);
+
+		let id = world.scripts.find("scripts/thing");
+
+		assert!(id.is_some(), "the program was registered under its own path");
+		assert_eq!(world.scripts.get(id).map(Script::revision), Some(0), "loaded once");
+
+		sleep(Duration::from_millis(20));
+		put(&source, "scripts/thing.lua", "local a = 1\n");
+		assets.sync(&mut world);
+
+		assert_eq!(
+			world.scripts.get(id).map(Script::revision),
+			Some(0),
+			"and read again without being registered again, because nothing in it changed"
+		);
+
+		sleep(Duration::from_millis(20));
+		put(&source, "scripts/thing.lua", "local a = 2\n");
+		assets.sync(&mut world);
+
+		assert_eq!(
+			world.scripts.get(id).map(Script::revision),
+			Some(1),
+			"and a program that really was edited does move it"
 		);
 	}
 

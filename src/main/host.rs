@@ -40,7 +40,7 @@ use colby_core::{
 };
 use colby_net::{EVERY, Slot};
 use colby_physics::Simulation;
-use colby_script::Scripts;
+use colby_script::Vm;
 use colby_ui::Interface;
 
 use crate::{assets::Assets, console::Console, game::Game, net::Net, step};
@@ -186,7 +186,7 @@ fn run(end: End) -> Result {
 
 	let mut game = Game::open(&mut world)?;
 	let console = Console::open(&mut world);
-	let mut scripts = Scripts::new()?;
+	let mut scripts = Vm::new()?;
 	let mut interface = Interface::new();
 	let mut input = Input::default();
 	let mut clock = Clock::new();

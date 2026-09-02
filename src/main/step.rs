@@ -15,7 +15,7 @@ use colby_core::{
 	time::STEP_SECONDS,
 };
 use colby_physics::Simulation;
-use colby_script::Scripts;
+use colby_script::Vm;
 use colby_ui::Interface;
 
 use crate::{game::Game, net::Net};
@@ -43,7 +43,7 @@ pub(crate) struct Parts<'a> {
 	pub(crate) interface: &'a mut Interface,
 
 	/// The documents' own interface logic, if Lua came up.
-	pub(crate) scripts: Option<&'a mut Scripts>,
+	pub(crate) scripts: Option<&'a mut Vm>,
 
 	/// The physics, advanced here and queried by the game.
 	pub(crate) simulation: &'a mut Simulation,

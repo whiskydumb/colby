@@ -44,8 +44,8 @@ use std::{
 use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
 use crate::{
-	anim, document, font, format, gltf, html, jpeg, level, model, obj, png, scene, skeleton,
-	sound, texture, ttf, wav,
+	anim, document, font, format, gltf, html, jpeg, level, lua, model, obj, png, scene, script,
+	skeleton, sound, texture, ttf, wav,
 };
 
 /// The directory under a workspace that holds editable sources.
@@ -75,6 +75,7 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
 	gltf::BINARY_EXTENSION,
 	level::EXTENSION,
 	wav::EXTENSION,
+	lua::EXTENSION,
 ];
 
 /// The extensions it writes.
@@ -88,6 +89,7 @@ pub const OUTPUT_EXTENSIONS: &[&str] = &[
 	skeleton::EXTENSION,
 	anim::EXTENSION,
 	sound::EXTENSION,
+	script::EXTENSION,
 ];
 
 /// Which of colby's formats a source compiles into.
@@ -145,6 +147,16 @@ pub enum Kind {
 	/// skeleton has none: a clip comes out of a model beside its meshes. @ref
 	/// [`Self::Skeleton`].
 	Clip,
+
+	/// A `.lua` becomes a `.clua`.
+	///
+	/// The one kind whose compiler does almost nothing, and it is a kind
+	/// anyway: a program has to be walked, named, versioned and pruned like
+	/// anything else, and the alternative - reading `.lua` files off the source
+	/// tree at run time - is a second asset path with none of that. @ref
+	/// [`script`](crate::script) for why the output is text rather than
+	/// bytecode.
+	Script,
 }
 
 impl Kind {
@@ -164,6 +176,7 @@ impl Kind {
 			| html::EXTENSION => Some(Self::Document),
 			| gltf::EXTENSION | gltf::BINARY_EXTENSION => Some(Self::Model),
 			| level::EXTENSION => Some(Self::Scene),
+			| lua::EXTENSION => Some(Self::Script),
 			| _ => None,
 		}
 	}
@@ -181,6 +194,7 @@ impl Kind {
 			| Self::Scene => scene::EXTENSION,
 			| Self::Skeleton => skeleton::EXTENSION,
 			| Self::Clip => anim::EXTENSION,
+			| Self::Script => script::EXTENSION,
 		}
 	}
 
@@ -202,6 +216,7 @@ impl Kind {
 			| scene::EXTENSION => Some(Self::Scene),
 			| skeleton::EXTENSION => Some(Self::Skeleton),
 			| anim::EXTENSION => Some(Self::Clip),
+			| script::EXTENSION => Some(Self::Script),
 			| _ => None,
 		}
 	}
@@ -219,6 +234,7 @@ impl Kind {
 			| Self::Scene => scene::version_of(path),
 			| Self::Skeleton => skeleton::version_of(path),
 			| Self::Clip => anim::version_of(path),
+			| Self::Script => script::version_of(path),
 		}
 	}
 
@@ -235,6 +251,7 @@ impl Kind {
 			| Self::Scene => scene::FORMAT_VERSION,
 			| Self::Skeleton => skeleton::FORMAT_VERSION,
 			| Self::Clip => anim::FORMAT_VERSION,
+			| Self::Script => script::FORMAT_VERSION,
 		}
 	}
 }
@@ -334,6 +351,16 @@ pub enum Produced {
 
 		/// The atlas height.
 		height: u32,
+	},
+
+	/// A program.
+	Script {
+		/// How many lines of it there are.
+		///
+		/// The only thing worth counting about a program that has not been
+		/// parsed, and the compiler deliberately does not parse one: the
+		/// interpreter lives in the host and the compiler does not link it.
+		lines: usize,
 	},
 }
 
@@ -545,6 +572,7 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 
 			(document::encode(&text), produced)
 		},
+		| Kind::Script => compile_script(source)?,
 		| Kind::Scene => {
 			let data = level::import(&fs::read_to_string(source)?)
 				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
@@ -936,14 +964,30 @@ fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
 				return Vec::new();
 			};
 
-			let mut inputs = document::stylesheets(source, &text, root);
-			inputs.extend(document::scripts(source, &text, root));
-
-			inputs
+			// the stylesheets and nothing else. A program a document names is
+			// an asset in its own right, so it goes stale on its own and the
+			// document naming it does not move when it does. That is most of
+			// what making it one bought.
+			document::stylesheets(source, &text, root)
 		},
 		| Kind::Model => gltf::linked(source, root),
 		| _ => Vec::new(),
 	}
+}
+
+/// Turns one `.lua` into the bytes of a `.clua`.
+///
+/// Its own function only because [`compile_file`] is one arm per kind and the
+/// line count is a lint; it is also the arm that reads best out of line,
+/// because the whole of what compiling a program comes to is reading it.
+///
+/// @param source - the `.lua`, in the source tree
+/// @return the file to write and what to report about it
+fn compile_script(source: &Path) -> Result<(Vec<u8>, Produced)> {
+	let text = lua::import(&fs::read_to_string(source)?);
+	let produced = Produced::Script { lines: text.lines().count() };
+
+	Ok((script::encode(&text), produced))
 }
 
 /// A file's modification time.
@@ -997,7 +1041,7 @@ mod tests {
 	/// [`the_list_of_kinds_holds_every_one_there_is`], which indexes into it
 	/// through an exhaustive match: a variant added to [`Kind`] has to be given
 	/// an index, and the only index left over is one this array does not have.
-	const EVERY_KIND: [Kind; 9] = [
+	const EVERY_KIND: [Kind; 10] = [
 		Kind::Mesh,
 		Kind::Texture,
 		Kind::Font,
@@ -1007,6 +1051,7 @@ mod tests {
 		Kind::Scene,
 		Kind::Skeleton,
 		Kind::Clip,
+		Kind::Script,
 	];
 
 	/// Where a kind sits in [`EVERY_KIND`].
@@ -1021,6 +1066,7 @@ mod tests {
 			| Kind::Scene => 6,
 			| Kind::Skeleton => 7,
 			| Kind::Clip => 8,
+			| Kind::Script => 9,
 		}
 	}
 
@@ -1410,13 +1456,17 @@ f 4 1 5 8
 	}
 
 	#[test]
-	fn editing_a_script_a_document_links_to_rebuilds_the_document() {
+	fn editing_a_program_rebuilds_the_program_and_leaves_the_document_alone() {
+		// the point of a program being an asset, and the assertion with teeth
+		// in it is the second one: a document that still listed the program as
+		// something it was built out of would be rebuilt here as well, which is
+		// what used to happen and what made a shared program expensive.
 		let workspace = workspace("script-staleness");
 		put(&workspace, "ui/hud.lua", "local a = 1\n");
-		put(&workspace, "ui/hud.html", "<script src=\"hud.lua\"></script>\n<div></div>\n");
+		put(&workspace, "ui/hud.html", "<script src=\"ui/hud\"></script>\n<div></div>\n");
 
-		assert_eq!(run(&workspace, false).compiled.len(), 1, "the first run compiles it");
-		assert_eq!(run(&workspace, false).unchanged, 1, "and the second has nothing to do");
+		assert_eq!(run(&workspace, false).compiled.len(), 2, "a document and a program");
+		assert_eq!(run(&workspace, false).unchanged, 2, "and the second run has nothing to do");
 
 		// as above: the rule is `newer than`, and two writes in the same
 		// microsecond are not.
@@ -1425,22 +1475,57 @@ f 4 1 5 8
 
 		let report = run(&workspace, false);
 
-		assert_eq!(
-			report.compiled.len(),
-			1,
-			"the program is folded into the document, so editing it makes the document stale \
-			 exactly as editing a stylesheet does"
+		assert_eq!(report.compiled.len(), 1, "the program is rebuilt");
+		assert_eq!(report.unchanged, 1, "and the document is not");
+		assert!(
+			report.compiled[0].name == "ui/hud"
+				&& Kind::of_output(&report.compiled[0].output) == Some(Kind::Script),
+			"and it is the program that was rebuilt rather than the document, which shares its \
+			 name: {:?}",
+			report.compiled[0].output
 		);
 
 		let output = output_root(&workspace)
 			.join("ui")
-			.join("hud.cdoc");
-		let compiled = DocumentFile::open(&output)
-			.expect("it reads")
-			.to_document_data()
-			.expect("and parses");
+			.join("hud.clua");
+		let compiled = script::ScriptFile::open(&output).expect("it reads");
 
-		assert!(compiled.script.contains("local a = 2"), "with the new text in it");
+		assert!(compiled.source().contains("local a = 2"), "with the new text in it");
+	}
+
+	#[test]
+	fn a_document_and_the_program_it_names_are_two_assets_of_one_name() {
+		// they collide in every way but the extension, which is what makes the
+		// pair worth a test: the compiler names an asset by its own path, so
+		// `ui/hud.html` and `ui/hud.lua` are both `ui/hud` and land in two
+		// different tables.
+		let workspace = workspace("script-beside-document");
+		put(&workspace, "ui/hud.lua", "ui.on(\"a\", \"click\", function() end)\n");
+		put(
+			&workspace,
+			"ui/hud.html",
+			"<script src=\"ui/hud\"></script>\n<div id=\"a\"></div>\n",
+		);
+
+		let report = run(&workspace, false);
+		let names: Vec<&str> = report
+			.compiled
+			.iter()
+			.map(|one| one.name.as_str())
+			.collect();
+
+		assert_eq!(names, ["ui/hud", "ui/hud"], "one name, two assets");
+
+		let document = DocumentFile::open(
+			&output_root(&workspace)
+				.join("ui")
+				.join("hud.cdoc"),
+		)
+		.expect("it reads")
+		.to_document_data()
+		.expect("and parses");
+
+		assert_eq!(document.program, "ui/hud", "and the document names the program");
 	}
 
 	#[test]
@@ -1575,96 +1660,113 @@ f 4 1 5 8
 		assert!(!report.compiled.is_empty(), "and there is at least one of them");
 
 		for compiled in &report.compiled {
-			match Kind::of_output(&compiled.output) {
-				| Some(Kind::Mesh) => {
-					let file = MeshFile::open(&compiled.output).expect("the mesh reads back");
+			reads_back(compiled);
+		}
+	}
 
-					assert!(
-						file.header().index_count > 0,
-						"{} compiled to a mesh that draws nothing",
-						compiled.name
-					);
-				},
-				| Some(Kind::Texture) => {
-					let file =
-						TextureFile::open(&compiled.output).expect("the texture reads back");
+	/// Opens one compiled asset with its own reader and asks it for the one
+	/// number that says it is not empty.
+	///
+	/// Lifted out of the loop above because that test is one arm per kind and
+	/// the line count is a lint. It is also the half worth naming: the loop is
+	/// "everything shipped compiles" and this is "and what came out is
+	/// readable".
+	fn reads_back(compiled: &Compiled) {
+		match Kind::of_output(&compiled.output) {
+			| Some(Kind::Mesh) => {
+				let file = MeshFile::open(&compiled.output).expect("the mesh reads back");
 
-					assert!(
-						file.header().levels > 0,
-						"{} compiled to a texture with no levels",
-						compiled.name
-					);
-				},
-				| Some(Kind::Font) => {
-					let file = FontFile::open(&compiled.output).expect("the font reads back");
-
-					assert!(
-						file.header().glyph_count > 0,
-						"{} compiled to a font with no glyphs in it",
-						compiled.name
-					);
-					assert!(
-						file.glyphs()
-							.iter()
-							.any(|glyph| glyph.codepoint == u32::from('Ж')),
-						"{} compiled without Cyrillic, which is half the text anyone here will \
-						 type",
-						compiled.name
-					);
-				},
-				| Some(Kind::Model) => {
-					let file =
-						model::ModelFile::open(&compiled.output).expect("the model reads back");
-
-					assert!(
-						!file.stands().is_empty(),
-						"{} compiled to a model with nothing standing anywhere",
-						compiled.name
-					);
-				},
-				| Some(Kind::Scene) => {
-					let file =
-						scene::SceneFile::open(&compiled.output).expect("the scene reads back");
-
-					assert!(
-						!file.stood().is_empty() || !file.bulk().is_empty(),
-						"{} compiled to a scene with nothing in it at all",
-						compiled.name
-					);
-				},
-				| Some(Kind::Document) => {
-					let file =
-						DocumentFile::open(&compiled.output).expect("the document reads back");
-					let data = file.to_document_data().expect("and parses back");
-
-					assert!(
-						data.nodes.len() > 1,
-						"{} compiled to a document with nothing in it",
-						compiled.name
-					);
-					assert!(
-						compiled.warnings.is_empty(),
-						"{} compiled with complaints: {:?}",
-						compiled.name,
-						compiled.warnings
-					);
-				},
-				| Some(Kind::Sound) => {
-					let file =
-						sound::SoundFile::open(&compiled.output).expect("the sound reads back");
-
-					assert!(
-						!file.samples().is_empty(),
-						"{} compiled to a sound with no samples in it",
-						compiled.name
-					);
-				},
-				| Some(Kind::Skeleton | Kind::Clip) => panic!(
-					"{} compiled straight into a skeleton or a clip, and only a model writes one",
+				assert!(
+					file.header().index_count > 0,
+					"{} compiled to a mesh that draws nothing",
 					compiled.name
-				),
-				| None => panic!("{} compiled to something unrecognized", compiled.name),
-			}
+				);
+			},
+			| Some(Kind::Texture) => {
+				let file = TextureFile::open(&compiled.output).expect("the texture reads back");
+
+				assert!(
+					file.header().levels > 0,
+					"{} compiled to a texture with no levels",
+					compiled.name
+				);
+			},
+			| Some(Kind::Font) => {
+				let file = FontFile::open(&compiled.output).expect("the font reads back");
+
+				assert!(
+					file.header().glyph_count > 0,
+					"{} compiled to a font with no glyphs in it",
+					compiled.name
+				);
+				assert!(
+					file.glyphs()
+						.iter()
+						.any(|glyph| glyph.codepoint == u32::from('Ж')),
+					"{} compiled without Cyrillic, which is half the text anyone here will type",
+					compiled.name
+				);
+			},
+			| Some(Kind::Model) => {
+				let file =
+					model::ModelFile::open(&compiled.output).expect("the model reads back");
+
+				assert!(
+					!file.stands().is_empty(),
+					"{} compiled to a model with nothing standing anywhere",
+					compiled.name
+				);
+			},
+			| Some(Kind::Scene) => {
+				let file =
+					scene::SceneFile::open(&compiled.output).expect("the scene reads back");
+
+				assert!(
+					!file.stood().is_empty() || !file.bulk().is_empty(),
+					"{} compiled to a scene with nothing in it at all",
+					compiled.name
+				);
+			},
+			| Some(Kind::Document) => {
+				let file = DocumentFile::open(&compiled.output).expect("the document reads back");
+				let data = file.to_document_data().expect("and parses back");
+
+				assert!(
+					data.nodes.len() > 1,
+					"{} compiled to a document with nothing in it",
+					compiled.name
+				);
+				assert!(
+					compiled.warnings.is_empty(),
+					"{} compiled with complaints: {:?}",
+					compiled.name,
+					compiled.warnings
+				);
+			},
+			| Some(Kind::Sound) => {
+				let file =
+					sound::SoundFile::open(&compiled.output).expect("the sound reads back");
+
+				assert!(
+					!file.samples().is_empty(),
+					"{} compiled to a sound with no samples in it",
+					compiled.name
+				);
+			},
+			| Some(Kind::Script) => {
+				let file = script::ScriptFile::open(&compiled.output).expect("the program reads");
+
+				assert!(
+					!file.source().trim().is_empty(),
+					"{} compiled to a program with nothing in it",
+					compiled.name
+				);
+			},
+			| Some(Kind::Skeleton | Kind::Clip) => panic!(
+				"{} compiled straight into a skeleton or a clip, and only a model writes one",
+				compiled.name
+			),
+			| None => panic!("{} compiled to something unrecognized", compiled.name),
 		}
 	}
 }

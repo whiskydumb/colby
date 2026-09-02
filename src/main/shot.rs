@@ -21,7 +21,7 @@ use colby_core::{
 };
 use colby_engine::{Capture, Image, Overlay};
 use colby_physics::Simulation;
-use colby_script::Scripts;
+use colby_script::Vm;
 use colby_ui::Interface;
 
 use crate::{assets::Assets, game::Game, step};
@@ -98,7 +98,7 @@ pub(crate) fn take(path: &Path) -> Result {
 	// show what the window shows. Nothing in the environment can read a clock or
 	// a file, so ninety steps of it are the same ninety steps on every machine.
 	// @ref `colby_script`.
-	let mut scripts = Scripts::new()?;
+	let mut scripts = Vm::new()?;
 
 	let mut interface = Interface::new();
 	let viewport = colby_core::glam::Vec2::new(

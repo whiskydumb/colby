@@ -185,16 +185,23 @@ pub struct DocumentData {
 	/// Every rule, in the order they were written.
 	pub rules: Vec<Rule>,
 
-	/// The Lua this document's interface logic is written in, if any.
+	/// The name of the program this document's interface logic is in, or
+	/// empty.
 	///
-	/// One string rather than a list, because several `<script>` blocks in one
-	/// file are one program: the compiler resolves every `<script src>` against
-	/// the source tree and folds the text in here in the order it was written,
-	/// exactly as it folds a linked stylesheet into the rules. Nothing in
-	/// `colby_core` runs it - the host does, once per document, and drops
-	/// everything the program made when this entry's revision moves. @ref
-	/// `colby_script`.
-	pub script: String,
+	/// A **name**, not the text: `<script src="hud.lua">` is resolved by the
+	/// compiler into the name that same file is registered under - `ui/hud` -
+	/// and the program itself lives in
+	/// [`World::scripts`](crate::abi::World::scripts) like any other asset.
+	/// That is what a `<link>` does *not* do, and the difference is deliberate:
+	/// a stylesheet is folded in because rules of equal weight have to be
+	/// applied in the order they were written, while a program is a thing on
+	/// its own that several documents may share and that reloads without any
+	/// of them being rebuilt.
+	///
+	/// One name rather than a list, because one panel runs one program.
+	/// Nothing in `colby_core` runs it - the host does, and drops everything
+	/// the program made when either revision moves. @ref `colby_script`.
+	pub program: String,
 }
 
 impl DocumentData {
@@ -210,7 +217,7 @@ impl DocumentData {
 				..Node::default()
 			}],
 			rules: Vec::new(),
-			script: String::new(),
+			program: String::new(),
 		}
 	}
 

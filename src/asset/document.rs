@@ -15,17 +15,28 @@
 //! ```
 //!
 //! What the compiler *does* do is the part that has to happen offline: it
-//! resolves every `<link href>` and every `<script src>` against the source
-//! tree and folds those stylesheets and scripts into the head of the file. One
-//! output, no second file to find at load time, and no question about what
-//! happens when one of them is missing - that is a compile error naming it. It
-//! also parses the whole thing once, so that a misspelled property is a line in
-//! the log at compile time rather than a box that is silently the wrong size.
+//! resolves every `<link href>` against the source tree and folds those
+//! stylesheets into the head of the file. One output, no second file to find at
+//! load time, and no question about what happens when one is missing - that is
+//! a compile error naming it. It also parses the whole thing once, so that a
+//! misspelled property is a line in the log at compile time rather than a box
+//! that is silently the wrong size.
 //!
-//! A `.css` and a `.lua` are therefore **not assets**: they are inputs to one,
-//! which is what makes editing a shared stylesheet or a shared script recompile
-//! every document naming it instead of changing the picture only for whichever
-//! of them somebody happens to touch next.
+//! A `.css` is therefore **not an asset**: it is an input to one, which is what
+//! makes editing a shared stylesheet recompile every document naming it instead
+//! of changing the picture only for whichever of them somebody happens to touch
+//! next.
+//!
+//! **A `.lua` is not folded in, and is an asset of its own.** The two cases
+//! look alike and are not: a stylesheet has to be folded because rules of equal
+//! weight are applied in the order they were written, so where a sheet lands in
+//! the file is part of what it means, while a program means the same thing
+//! wherever it sits. Making it an asset buys three things folding cannot - a
+//! program several documents share reloads once instead of rebuilding all of
+//! them, editing a stylesheet stops restarting a program that did not change,
+//! and a program belonging to no document has somewhere to live.
+//! `<script src="ui/hud">` therefore names it the way `<img src>` names a
+//! texture. @ref [`script`](crate::script).
 //!
 //! Folding a linked sheet in as a `<style>` block *before* the document keeps
 //! the cascade honest: rules of equal weight are applied in the order they were
@@ -42,7 +53,13 @@ use crate::html;
 pub const MAGIC: [u8; 8] = *b"COLBYDOC";
 
 /// The revision of everything in this module.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// Two since a program stopped being folded in: a file written by version one
+/// holds its program as a `<script>` block with a body, which this build
+/// refuses outright rather than reads differently, so the version has to move
+/// or every document already in an output tree fails to load with a message
+/// about markup.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The extension a compiled document is written with.
 pub const EXTENSION: &str = "cdoc";
@@ -170,17 +187,6 @@ pub fn stylesheets(source: &Path, text: &str, root: &Path) -> Vec<std::path::Pat
 	beside(source, root, &html::links(text))
 }
 
-/// Every script a document links to, as paths beside it.
-///
-/// @param source - the `.html`, in the source tree
-/// @param text - its contents
-/// @param root - the source tree, which a script may not leave
-/// @return one path per `<script src>`, in order
-#[must_use]
-pub fn scripts(source: &Path, text: &str, root: &Path) -> Vec<std::path::PathBuf> {
-	beside(source, root, &html::scripts(text))
-}
-
 /// Resolves what a document names against its own directory, the way a browser
 /// would.
 ///
@@ -242,25 +248,6 @@ pub fn merge(source: &Path, root: &Path) -> Result<String> {
 		merged.push_str("\n</style>\n");
 	}
 
-	for path in scripts(source, &text, root) {
-		let script = read_part(source, &path)?;
-
-		// the one thing folding cannot survive, and it is cheaper to refuse
-		// than to write out a document whose program ends halfway through a
-		// string literal. The same trap exists for `</style>` inside a
-		// stylesheet, where nobody has ever had a reason to type one.
-		if script.contains("</script>") {
-			return Err(err!(Asset(
-				"{} holds `</script>`, which cannot be folded into a document",
-				path.display()
-			)));
-		}
-
-		merged.push_str("<script>\n");
-		merged.push_str(&script);
-		merged.push_str("\n</script>\n");
-	}
-
 	merged.push_str(&text);
 
 	Ok(merged)
@@ -269,7 +256,7 @@ pub fn merge(source: &Path, root: &Path) -> Result<String> {
 /// Reads one of the files a document is built out of.
 ///
 /// @param source - the document that named it, for the error message
-/// @param path - the stylesheet or the script
+/// @param path - the stylesheet
 fn read_part(source: &Path, path: &Path) -> Result<String> {
 	std::fs::read_to_string(path).map_err(|error| {
 		err!(Asset(
@@ -372,65 +359,44 @@ mod tests {
 	}
 
 	#[test]
-	fn a_linked_script_is_folded_in_the_way_a_sheet_is() {
+	fn a_document_carries_the_name_of_its_program_and_not_the_program() {
+		// the whole of what a program becoming an asset changed: nothing is
+		// read off disk beside the document, and what lands in the output is
+		// a name for the host to look up.
 		let root = workspace("script");
 		fs::write(root.join("hud.lua"), "ui.on(\"a\", \"click\", function() end)")
 			.expect("it writes");
 		fs::write(
 			root.join("hud.html"),
-			"<script src=\"hud.lua\"></script>\n<div id=\"a\"></div>",
+			"<script src=\"ui/hud\"></script>\n<div id=\"a\"></div>",
 		)
 		.expect("it writes");
 
-		let merged = merge(&root.join("hud.html"), &root).expect("both parts read");
+		let merged = merge(&root.join("hud.html"), &root).expect("the document reads");
 		let document = DocumentFile::from_bytes(&encode(&merged))
 			.expect("it reads")
 			.to_document_data()
 			.expect("and parses");
 
-		assert!(
-			document.script.contains("ui.on"),
-			"the program is in the document: {}",
-			document.script
-		);
+		assert_eq!(document.program, "ui/hud", "the name, resolved by nobody");
+		assert!(!merged.contains("ui.on"), "and the program itself was never opened: {merged}");
 		assert!(document.find("a").is_some(), "and the boxes are still boxes");
 	}
 
 	#[test]
-	fn a_script_holding_a_closing_script_tag_is_refused_rather_than_folded() {
-		let root = workspace("closing");
-		fs::write(root.join("hud.lua"), "local trap = \"</script>\"").expect("it writes");
-		fs::write(root.join("hud.html"), "<script src=\"hud.lua\"></script>").expect("it writes");
+	fn a_program_beside_a_document_is_not_something_the_document_is_built_out_of() {
+		// the staleness machinery used to track a `.lua` the way it tracks a
+		// `.css`, and a program that is an asset is stale on its own. A
+		// document that still listed one would rebuild every time somebody
+		// edited a program it merely names.
+		let root = workspace("not-an-input");
+		fs::write(root.join("hud.lua"), "local a = 1").expect("it writes");
+		let text = "<link href=\"theme.css\"><script src=\"ui/hud\"></script>";
 
-		let error = merge(&root.join("hud.html"), &root).expect_err("it cannot be folded");
+		let inputs = stylesheets(&root.join("hud.html"), text, &root);
 
-		assert!(
-			error.to_string().contains("hud.lua"),
-			"naming the file to look at rather than writing a document that ends halfway \
-			 through a string: {error}"
-		);
-	}
-
-	#[test]
-	fn the_scripts_a_document_links_to_are_listed_for_the_staleness_check() {
-		let root = workspace("listed-scripts");
-		let text = "<script src=\"hud.lua\"></script><script>local a = 1</script>";
-
-		let found = scripts(&root.join("hud.html"), text, &root);
-
-		assert_eq!(found.len(), 1, "the one that names a file");
-		assert!(found[0].ends_with("hud.lua"), "resolved beside the document");
-	}
-
-	#[test]
-	fn a_script_that_climbs_out_of_the_source_tree_is_not_followed() {
-		let root = workspace("escaping-script");
-		let text = "<script src=\"../../secrets.lua\"></script>";
-
-		assert!(
-			scripts(&root.join("hud.html"), text, &root).is_empty(),
-			"the same rule a stylesheet follows, and for the same reason"
-		);
+		assert_eq!(inputs.len(), 1, "the stylesheet and nothing else");
+		assert!(inputs[0].ends_with("theme.css"), "and it is the stylesheet: {inputs:?}");
 	}
 
 	#[test]

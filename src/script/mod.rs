@@ -1,8 +1,8 @@
 //! Lua for the game's interface, and for nothing else yet.
 //!
-//! A document can carry a program the way it carries a stylesheet:
-//! `<script src="hud.lua">` beside `<link href="theme.css">`, resolved and
-//! folded into the `.cdoc` by the compiler. This crate is what runs it.
+//! A document names the program its logic is in - `<script src="ui/hud">`, the
+//! way an image names a texture - and the program is an asset the compiler
+//! turned a `.lua` into. This crate is what runs it.
 //!
 //! Four decisions are written into the shape of the module, and each was taken
 //! against a plausible alternative.
@@ -14,14 +14,25 @@
 //! applies here. That is the whole reason a script VM is worth having on the
 //! interface first: it is the one surface where it costs nothing.
 //!
-//! **A program belongs to a panel, and is thrown away when its document
-//! reloads.** Nothing new was needed for that - a document is a registry entry,
-//! and the entry's `revision` moves when the compiler rewrites it, which is the
-//! same signal the renderer uses to decide whether to upload a mesh again. When
-//! it moves, the environment goes with everything in it: locals, handlers, all
-//! of it. What the script wrote into the panel - text, classes, style - stays,
-//! because that lives in the host's binds and those already survive a document
-//! reload. Content is replaced; what was laid over it is not.
+//! **A program is an asset, and a panel runs one by name.** A document carries
+//! the name of its program - `ui/hud` - and the program itself is an entry in
+//! [`World::scripts`](colby_core::abi::World::scripts) like a mesh or a
+//! texture. What a panel's program is rebuilt by is therefore the *program's*
+//! entry moving and not the document's: recompiling a stylesheet rewrites the
+//! document and no longer restarts a program that did not change, and a program
+//! two documents share is one entry rather than two copies of the text.
+//!
+//! The handle is watched beside the revision, and that pair is the whole key. A
+//! fresh registry entry starts at revision zero exactly as the null one does,
+//! so a document naming a program the compiler has not written yet resolves to
+//! nothing - and the program arriving a moment later moves the *handle* while
+//! moving no revision at all.
+//!
+//! **A program is thrown away when it is rebuilt.** The environment goes with
+//! everything in it: locals, handlers, all of it. What the script wrote into
+//! the panel - text, classes, style - stays, because that lives in the host's
+//! binds and those already survive a document reload. Content is replaced; what
+//! was laid over it is not.
 //!
 //! **A script runs inside the simulation step**, in `step::run`, right after
 //! the interface has been laid out and hit-tested and before physics and the
@@ -42,7 +53,7 @@ use std::{
 
 use colby_core::{
 	Result,
-	abi::{EventKind, PanelId, World, ui::Event},
+	abi::{EventKind, PanelId, ScriptId, World, ui::Event},
 	err, info, trace, warn,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
@@ -98,8 +109,12 @@ const BASE: [&str; 10] = [
 /// Two more, kept apart only because they are conversions rather than control.
 const CONVERSIONS: [&str; 3] = ["tonumber", "tostring", "type"];
 
-/// Every document's program, and the one interpreter they share.
-pub struct Scripts {
+/// Every running program, and the one interpreter they share.
+///
+/// Named for the machine rather than for what is in it, because
+/// [`Scripts`](colby_core::abi::Scripts) is now the *table* of programs and
+/// this is the thing that runs them.
+pub struct Vm {
 	lua: Lua,
 	tables: api::Tables,
 	loaded: Vec<Loaded>,
@@ -114,19 +129,28 @@ struct Loaded {
 	/// exists - @ref [`Ui::show`](colby_core::abi::Ui::show), which hands the
 	/// same panel back rather than repointing one - so this is the whole key.
 	panel: PanelId,
-	/// The revision of the document entry this was built from. When the
-	/// compiler rewrites the file this moves, and that is the whole reload
-	/// mechanism.
-	revision: u32,
+	/// Which entry of the script table the document named.
+	///
+	/// Kept beside the revision because a fresh entry starts at revision zero,
+	/// exactly like the null one: a document naming a program that had not been
+	/// compiled yet resolves to nothing, and the program arriving afterwards
+	/// moves the *handle* without moving any revision at all. A document
+	/// rewritten to name something else moves it too, which is why nothing
+	/// here watches the document's own revision.
+	program: ScriptId,
+	/// The revision of that entry. Somebody editing the file moves this, and
+	/// nothing else does.
+	program_revision: u32,
 	name: String,
-	/// Its handlers, or `None` for a document with no script at all.
+	/// Its handlers, or `None` for a document with no program at all.
 	handlers: Option<Table>,
 }
 
 /// A document whose program has to be built, or built again.
 struct Pending {
 	panel: PanelId,
-	revision: u32,
+	program: ScriptId,
+	program_revision: u32,
 	name: String,
 	script: String,
 }
@@ -138,7 +162,7 @@ struct Waiting {
 	kind: &'static str,
 }
 
-impl Scripts {
+impl Vm {
 	/// Brings up the interpreter with nothing loaded into it.
 	///
 	/// @return the scripts, or why Lua could not be started
@@ -199,11 +223,16 @@ impl Scripts {
 				continue;
 			};
 
-			let revision = entry.revision();
-			let current = self
-				.loaded
-				.iter()
-				.any(|loaded| loaded.panel == panel && loaded.revision == revision);
+			let named = &entry.value().program;
+			let program = world.scripts.find(named);
+			let found = world.scripts.get(program);
+			let program_revision = found.map_or(0, colby_core::abi::Entry::revision);
+
+			let current = self.loaded.iter().any(|loaded| {
+				loaded.panel == panel
+					&& loaded.program == program
+					&& loaded.program_revision == program_revision
+			});
 
 			if current {
 				continue;
@@ -211,9 +240,15 @@ impl Scripts {
 
 			jobs.push(Pending {
 				panel,
-				revision,
+				program,
+				program_revision,
+				// the *document's* name, because every line about a program is
+				// read by somebody who has the document open. Which file the
+				// program came from is one lookup away and one they can make.
 				name: entry.name().to_owned(),
-				script: entry.value().script.clone(),
+				script: found
+					.map(|entry| entry.value().source.clone())
+					.unwrap_or_default(),
 			});
 		}
 
@@ -308,7 +343,8 @@ impl Scripts {
 
 		let entry = Loaded {
 			panel: job.panel,
-			revision: job.revision,
+			program: job.program,
+			program_revision: job.program_revision,
 			name: job.name.clone(),
 			handlers,
 		};
