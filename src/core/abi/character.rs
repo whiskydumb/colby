@@ -34,9 +34,19 @@
 //! happened. Wiring it to a body is the game's too - the usual shape is a
 //! [`BodyKind::Kinematic`](crate::abi::BodyKind::Kinematic) body written from
 //! the result, so that props rest on the character and triggers notice it.
+//!
+//! **And a fourth, which is why the three above were worth being strict
+//! about.** [`replay`] runs a *run* of commands rather than one move, and
+//! [`Drift`] is what stops a correction being a jump. Between them they are
+//! the whole of what a client needs to move itself and be told it was wrong,
+//! and they are here rather than in the networking crate because they are
+//! arithmetic over a world - the same arithmetic the machine that decides runs,
+//! out of the same file. Two machines that move a player by different code
+//! disagree, and no amount of state fixes that.
 
 use super::{
 	entity::Transform,
+	net::Command,
 	physics::{BodyId, Layers, MAX_IGNORED, TraceInfo, TraceResult},
 };
 use crate::{abi::World, glam::Vec3};
@@ -305,6 +315,247 @@ pub fn move_and_slide(world: &World, motion: &Motion) -> Moved {
 	}
 }
 
+/// The most steps one command may be said to cover.
+///
+/// A command carries the step it was made on, and the difference between two
+/// of them is how long the later one lasts - so a command claiming a step a
+/// long way past the one before it is a command asking to be moved a long way
+/// in one go. **That number is the sender's**, and on the machine that decides
+/// the sender is somebody else, so it is a number to bound rather than
+/// believe: without this a client could ask for one command covering an hour
+/// and arrive on the far side of the map.
+///
+/// Twelve steps is a fifth of a second, which is generous for the case it
+/// exists for - a client whose own frame hitched and made no command for a
+/// moment. Past it the move is cut short rather than refused, because refusing
+/// is the one answer that lets a hitch cost a player their input.
+///
+/// **This bounds one command and nothing bounds a run**, which is worth saying
+/// because the two look like the same guard and are not. A run is whatever the
+/// ring hands over, so at a depth of thirty-two and a ceiling of twelve, one
+/// call can cover three hundred and eighty-four steps - six and a half seconds
+/// of movement in one step of the machine that decides. A client whose
+/// commands really did pile up that far behind is a client that has to be let
+/// catch up, so bounding the *run* would break the case this exists for.
+/// Bounding how far a player may travel per step of the world is a different
+/// question with a different answer - it is the one lag compensation asks, and
+/// it is deferred with the rest of that.
+pub const MAX_CATCH_UP: u16 = 12;
+
+/// How long a wrong guess takes to stop showing, in seconds.
+///
+/// A tenth, which is the default the system this is modeled on ships and is
+/// about as long as a correction can be smeared before the smear itself is
+/// what looks wrong.
+pub const DECAY: f32 = 0.1;
+
+/// Runs a run of commands over a world, threading the state between them.
+///
+/// The whole of what re-running a move costs, and it is deliberately *not* the
+/// whole of a move: what each command means - how fast, how high a jump is
+/// worth, what gravity does, whether crouching is a thing - is the game's, and
+/// arrives as a closure. What is here is the part both machines have to agree
+/// about to the bit: how long each command lasts, and that the result of one
+/// is where the next starts from.
+///
+/// **It is the same function on both machines and that is the point.** A host
+/// walking the commands one client sent, and that client re-running the ones
+/// the host has not confirmed, are the same loop over the same list from a
+/// different starting place. The day they are two loops is the day they
+/// disagree about something nobody can find.
+///
+/// **The first command's length is measured from `since`**, which is the step
+/// the starting state is *as of*. On a host that is the step of the last
+/// command it ran for this peer; on a client it is the step of the last one the
+/// host confirmed. A gap there is a client that made no command for a while,
+/// and it is honored up to [`MAX_CATCH_UP`] and cut short past it.
+///
+/// **There is no previous move for the first command of a run, and `wish` is
+/// told so rather than handed one.** That is the whole reason the argument is
+/// an [`Option`]: a fabricated [`Moved::none`] would say `grounded: false`,
+/// which is indistinguishable from a character that really is in the air, and
+/// the two machines start their runs in different places - a host runs the one
+/// or two commands that just arrived, a client re-runs a whole round trip's
+/// worth. Handing both a made-up airborne predecessor is how a jump comes out
+/// differently on the two machines forever.
+///
+/// What carries *across* a run is the game's to keep, and that is not a
+/// shortcoming: the state a character carries between moves is exactly the
+/// state a snapshot has to replicate anyway, so it belongs in the block the
+/// world keeps per player. The system this is modeled on threads the same fact
+/// through the same place.
+///
+/// @param world - what to move through
+/// @param start - the state to begin from, whose `dt` is one step
+/// @param since - the step that state is as of
+/// @param commands - what to run, oldest first
+/// @param wish - given a command, what came of the one before it *within this
+/// run* or nothing for the first of them, and the motion to fill in, sets the
+/// velocity that command asks for
+/// @return where the last of them ended up, or a move that went nowhere for an
+/// empty run
+pub fn replay<Wish>(
+	world: &World,
+	start: &Motion,
+	since: u64,
+	commands: &[Command],
+	mut wish: Wish,
+) -> Moved
+where
+	Wish: FnMut(&Command, Option<&Moved>, &mut Motion),
+{
+	let mut motion = *start;
+	let mut before: Option<Moved> = None;
+	let mut previous = since;
+
+	for command in commands {
+		// **a step is a number the sender picks and nothing upstream checks
+		// it.** The ring these came out of orders and deduplicates by
+		// `Command::number` alone and never reads the step at all, so two
+		// commands may claim the same moment and one may claim to happen
+		// before the one in front of it. A length of nought is not an answer -
+		// that is a frame of somebody's input dropped in silence - so the
+		// floor is one step.
+		let span = u16::try_from(command.step.saturating_sub(previous))
+			.unwrap_or(MAX_CATCH_UP)
+			.clamp(1, MAX_CATCH_UP);
+
+		motion.dt = start.dt * f32::from(span);
+
+		// the speed the last move ended at rather than the one it was asked
+		// for, so a `wish` that adds to what is there adds to what happened.
+		// Overwritten by almost every `wish`; what it stops is the *raw* value
+		// of the previous ask being carried into the next move by a game that
+		// only sometimes sets it.
+		if let Some(was) = before.as_ref() {
+			motion.velocity = was.velocity;
+		}
+
+		wish(command, before.as_ref(), &mut motion);
+
+		let moved = move_and_slide(world, &motion);
+
+		motion.position = moved.position;
+		before = Some(moved);
+
+		// **never backwards**, which is the guard the step field being the
+		// sender's makes necessary. Letting it go back would not cost the
+		// command that did it - that one is floored at a step - it would cost
+		// the *next* one, whose gap is then measured from the low mark and can
+		// be a full ceiling's worth. Alternating a low step with a high one
+		// would then average six steps a command instead of one, which is the
+		// ceiling defeated by the thing it was written for.
+		previous = previous.max(command.step);
+	}
+
+	before.unwrap_or_else(|| Moved::none(start))
+}
+
+/// The difference between what was drawn and what turned out to be true,
+/// fading.
+///
+/// **A correction is a fact and a jump is a decision**, and this is the one
+/// that keeps the second from following the first. A client guesses where it
+/// is, the machine that decides says otherwise, and the honest thing to do
+/// with the difference is not to teleport a player who did nothing wrong: the
+/// prediction is replaced at once, and what is *drawn* keeps the old place and
+/// slides to the new one over [`DECAY`].
+///
+/// ```text
+///   drift.correct(drawn_last_frame, predicted_now);   // when a correction lands
+///   ..
+///   let show = predicted + drift.offset();            // draw, then let go
+///   drift.advance(world.dt);
+/// ```
+///
+/// The order of those last two is the whole of the bit-exact claim below: read
+/// the offset and *then* advance, and the frame a correction lands on draws
+/// exactly where the frame before it did. Advance first and that frame has
+/// already given up a step's worth, which is a small jump rather than none.
+///
+/// **A correction is smeared however big it is**, which is right for the
+/// ordinary case and wrong for one: a host that teleports a player has not
+/// mispredicted anything, and sliding them across the map over a tenth of a
+/// second is worse than putting them there. Nothing on the wire says which
+/// a change was - the same gap the proxy path has - so the game is the only
+/// thing that can know, and skipping the `correct` is how it says so.
+///
+/// Two things fall out of taking the *drawn* position rather than the previous
+/// prediction. The drawn position already carries whatever was left of an
+/// earlier correction, so a correction arriving on top of one still fading
+/// needs no special case - it absorbs the remainder by construction. And the
+/// picture is continuous across the moment of correction to the bit, which is
+/// the property worth having: a player sees a drift, never a step.
+///
+/// `Pod`, and the fields are an array and a float rather than a `Vec3` and a
+/// `Duration`, because this is a thing a game keeps in its own arena and the
+/// arena is bytes. @ref [`state`](crate::abi::state).
+#[repr(C)]
+#[derive(
+	Clone, Copy, Debug, Default, PartialEq, crate::bytemuck::Pod, crate::bytemuck::Zeroable,
+)]
+pub struct Drift {
+	/// The whole of the error, as it stood when it was noticed.
+	error: [f32; 3],
+
+	/// How much of [`DECAY`] is left, in seconds.
+	left: f32,
+}
+
+// sixteen bytes with no padding, and the number is here so that a field added
+// to a thing a game keeps in a fixed arena is a thing somebody decided.
+const _: () = assert!(size_of::<Drift>() == 16, "a drift is three floats and a clock");
+
+impl Drift {
+	/// Nothing to correct.
+	pub const NONE: Self = Self { error: [0.0; 3], left: 0.0 };
+
+	/// Notes that what was drawn and what is now believed are not the same
+	/// place.
+	///
+	/// @param drawn - where the player was shown last frame, offset and all
+	/// @param predicted - where the replay now says they are
+	pub fn correct(&mut self, drawn: Vec3, predicted: Vec3) {
+		self.error = (drawn - predicted).to_array();
+		self.left = DECAY;
+	}
+
+	/// Lets some of it go.
+	///
+	/// @param dt - how long has passed, in seconds
+	pub fn advance(&mut self, dt: f32) { self.left = (self.left - dt).max(0.0); }
+
+	/// How far from the prediction to draw, right now.
+	///
+	/// [`Vec3::ZERO`] once it has faded, and faded or not it costs a divide, a
+	/// multiply and a compare - which is why nothing here has to be turned off
+	/// when there is no correction to show.
+	#[must_use]
+	pub fn offset(&self) -> Vec3 {
+		// guarded rather than trusted: `DECAY` is a constant today and a
+		// console variable the first time somebody wants to see the smear, and
+		// a division by nought here would put a `NaN` into a transform, which
+		// is the kind of value that spreads.
+		if DECAY <= 0.0 {
+			return Vec3::ZERO;
+		}
+
+		Vec3::from_array(self.error) * (self.left / DECAY)
+	}
+
+	/// Whether a correction is still fading.
+	///
+	/// @note: about the *clock* rather than about the picture, and the two part
+	/// company for a correction of nothing at all - a
+	/// [`correct`](Self::correct) whose two places are the same leaves this
+	/// true for a tenth of a second with a zero offset. Left that way rather
+	/// than comparing an error against nought, because the question worth
+	/// answering cheaply is "is a correction in progress", and a game that
+	/// wants to know whether anything is visible has [`offset`](Self::offset).
+	#[must_use]
+	pub fn showing(&self) -> bool { self.left > 0.0 }
+}
+
 /// What a downward probe found.
 #[derive(Clone, Copy, Debug)]
 struct Ground {
@@ -471,11 +722,498 @@ fn clip(vector: Vec3, normal: Vec3) -> Vec3 {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use super::{super::physics::Physics, *};
 
 	/// A move of a small box, one step long.
 	fn moving(velocity: Vec3) -> Motion {
 		Motion::new(Vec3::ZERO, velocity, Vec3::splat(0.25), 1.0 / 60.0)
+	}
+
+	/// A command, with four numbers that are four different numbers.
+	///
+	/// The step is said rather than derived from the number, because the two
+	/// are different fields and the whole of what `replay` does with them is
+	/// take their difference.
+	fn asked(number: u32, step: u64) -> Command {
+		Command {
+			step,
+			number,
+			buttons: 1 << (number % 5),
+			yaw: 0.25,
+			pitch: -0.75,
+		}
+	}
+
+	/// What one command's move looked like from inside the wish: how long it
+	/// lasted, and the speed the command before it came to.
+	type Seen = (f32, Option<Vec3>);
+
+	/// Where the wall in [`walled`] stands, along x.
+	const WALL: f32 = 6.0;
+
+	/// A trace that reports a wall across x, so a move is really clipped.
+	///
+	/// Every other test in this file runs against [`Physics::STUB`], which
+	/// reports a clean miss - and a move that hits nothing comes back with the
+	/// velocity it was asked for, so a world with no solver in it cannot tell
+	/// "carry what the last move came to" from "carry what the last move was
+	/// asked for". They are the same number until something clips one.
+	///
+	/// # Safety
+	///
+	/// As [`TraceFn`]: both pointers are live for the duration of the call.
+	unsafe extern "C-unwind" fn wall(
+		_context: *mut core::ffi::c_void,
+		_bodies: *const crate::abi::Bodies,
+		info: *const TraceInfo,
+	) -> TraceResult {
+		// SAFETY: the caller hands over a live `TraceInfo` for the call, which
+		// is the whole of this function's contract.
+		let info = unsafe { &*info };
+		let (from, to) = (info.start, info.end);
+		let face = WALL - info.extents.x;
+		let miss = TraceResult {
+			hit: false,
+			start: from,
+			end: to,
+			fraction: 1.0,
+			normal: Vec3::ZERO,
+			started_solid: false,
+			ended_solid: false,
+			body: BodyId::NONE,
+			entity: crate::abi::EntityId::NONE,
+		};
+
+		if from.x >= face || to.x <= face {
+			return miss;
+		}
+
+		let along = to.x - from.x;
+		let fraction = ((face - from.x) / along).clamp(0.0, 1.0);
+
+		TraceResult {
+			hit: true,
+			end: from + (to - from) * fraction,
+			fraction,
+			// pointing back out of it, which is what `clip` takes the motion
+			// into the surface out of.
+			normal: -Vec3::X,
+			..miss
+		}
+	}
+
+	/// A world with that wall in it.
+	fn walled() -> World {
+		let mut world = World::new();
+
+		world.install_physics(Physics::new(core::ptr::null_mut(), wall, wall));
+		world
+	}
+
+	/// Where every replay in these tests begins.
+	///
+	/// Deliberately not the origin and not on an axis, so a run that started
+	/// where it was told and one that started at nought are different answers
+	/// rather than the same one.
+	const FROM: Vec3 = Vec3::new(4.0, -2.0, 7.0);
+
+	/// A replay whose wish is a fixed velocity, and a note of what it saw.
+	///
+	/// Returns where it ended and, for each command, the length of the move and
+	/// the previous result it was handed - which is the only way to see that
+	/// one command's result is where the next starts from, and that the first
+	/// of a run is handed nothing at all.
+	fn ran(commands: &[Command], since: u64, velocity: Vec3) -> (Moved, Vec<Seen>) {
+		let world = World::new();
+		let start = Motion::new(FROM, Vec3::ZERO, Vec3::splat(0.25), 1.0 / 60.0);
+		let mut seen = Vec::new();
+		let moved = replay(&world, &start, since, commands, |_command, before, motion| {
+			seen.push((motion.dt, before.map(|was| was.velocity)));
+			motion.velocity = velocity;
+		});
+
+		(moved, seen)
+	}
+
+	#[test]
+	fn a_run_of_commands_ends_where_the_same_moves_one_at_a_time_would() {
+		// three commands a step apart, at a speed whose product with a step is
+		// not a round number - so a move counted twice or missed once is a
+		// different answer rather than the same one.
+		let commands = [asked(4, 100), asked(5, 101), asked(6, 102)];
+		let (moved, seen) = ran(&commands, 99, Vec3::new(3.0, 0.0, -1.5));
+
+		assert_eq!(seen.len(), 3, "one move per command");
+
+		for (dt, _) in &seen {
+			assert!((dt - 1.0 / 60.0).abs() < 1.0e-7, "each lasts one step, got {dt}");
+		}
+
+		// three steps at three a second along x, and half that back along z,
+		// from where the caller said rather than from the origin.
+		assert!(
+			moved
+				.position
+				.abs_diff_eq(FROM + Vec3::new(3.0 * 3.0 / 60.0, 0.0, -1.5 * 3.0 / 60.0), 1.0e-5),
+			"got {}",
+			moved.position
+		);
+	}
+
+	#[test]
+	fn the_result_of_one_command_is_where_the_next_starts_from() {
+		let commands = [asked(1, 10), asked(2, 11)];
+		let (_, seen) = ran(&commands, 9, Vec3::new(6.0, 0.0, 0.0));
+
+		assert_eq!(
+			seen[0].1, None,
+			"the first of a run is handed nothing, rather than a made-up move that reads as \
+			 airborne"
+		);
+		assert!(
+			seen[1]
+				.1
+				.expect("the second has one")
+				.abs_diff_eq(Vec3::new(6.0, 0.0, 0.0), 1.0e-5),
+			"and it is what the first came to, got {:?}",
+			seen[1].1
+		);
+	}
+
+	#[test]
+	fn a_command_a_way_past_the_one_before_it_lasts_that_much_longer() {
+		// four steps of nothing and then a command: the client made none while
+		// its own frame was busy, and the move it did make covers the gap.
+		let commands = [asked(1, 205)];
+		let (moved, seen) = ran(&commands, 201, Vec3::new(1.0, 0.0, 0.0));
+
+		assert!((seen[0].0 - 4.0 / 60.0).abs() < 1.0e-7, "four steps, got {}", seen[0].0);
+		assert!(
+			moved
+				.position
+				.abs_diff_eq(FROM + Vec3::new(4.0 / 60.0, 0.0, 0.0), 1.0e-5),
+			"and it went four steps' worth, got {}",
+			moved.position
+		);
+	}
+
+	/// A run whose commands are gaps of *different* sizes, which is the only
+	/// shape that can tell a length from a length that compounds.
+	#[test]
+	fn each_command_of_a_run_is_measured_from_the_one_before_rather_than_the_start() {
+		// two steps, then three, then one: no two the same, none of them one
+		// until the last, and their sum is not any of them.
+		let commands = [asked(1, 502), asked(2, 505), asked(3, 506)];
+		let (moved, seen) = ran(&commands, 500, Vec3::new(1.0, 0.0, 0.0));
+		let spans: Vec<f32> = seen.iter().map(|(dt, _)| dt * 60.0).collect();
+
+		assert!(
+			spans
+				.iter()
+				.zip([2.0, 3.0, 1.0])
+				.all(|(got, want)| (got - want).abs() < 1.0e-5),
+			"two then three then one, got {spans:?}"
+		);
+		// six steps altogether at one a second. A length that multiplied into
+		// the one before it would give two, then six, then six.
+		assert!(
+			moved
+				.position
+				.abs_diff_eq(FROM + Vec3::new(6.0 / 60.0, 0.0, 0.0), 1.0e-5),
+			"got {}",
+			moved.position
+		);
+	}
+
+	/// A step that goes backwards must not lend the command after it a run-up.
+	#[test]
+	fn a_step_that_goes_backwards_does_not_stretch_the_command_after_it() {
+		// what a sender picks freely: a high step, then a low one, then high
+		// again. The ring these came out of orders by number and never looks
+		// at the step at all, so all three are taken.
+		let commands = [asked(1, 1000), asked(2, 0), asked(3, 1001)];
+		let (moved, seen) = ran(&commands, 999, Vec3::new(1.0, 0.0, 0.0));
+		let spans: Vec<f32> = seen.iter().map(|(dt, _)| dt * 60.0).collect();
+
+		assert!(
+			spans
+				.iter()
+				.zip([1.0, 1.0, 1.0])
+				.all(|(got, want)| (got - want).abs() < 1.0e-5),
+			"a step each and no run-up, got {spans:?}"
+		);
+		assert!(
+			moved
+				.position
+				.abs_diff_eq(FROM + Vec3::new(3.0 / 60.0, 0.0, 0.0), 1.0e-5),
+			"three steps in three commands, got {}",
+			moved.position
+		);
+	}
+
+	#[test]
+	fn a_command_claiming_an_hour_is_cut_short_rather_than_believed() {
+		// the numbers themselves, because every assertion below spells them
+		// symbolically and would move with them. A ceiling that let a command
+		// cover a second, or a smear that lasted one, is not a failure any of
+		// them could see.
+		assert_eq!(MAX_CATCH_UP, 12, "a fifth of a second at sixty steps a second");
+		assert!((DECAY - 0.1).abs() < f32::EPSILON, "and a tenth of one to stop showing");
+
+		// the far side of the map in one move, which is what a sender who
+		// picks this number freely would ask for.
+		let commands = [asked(1, u64::MAX)];
+		let (moved, seen) = ran(&commands, 0, Vec3::new(1.0, 0.0, 0.0));
+
+		assert!(
+			(seen[0].0 - f32::from(MAX_CATCH_UP) / 60.0).abs() < 1.0e-7,
+			"cut to the ceiling, got {}",
+			seen[0].0
+		);
+		assert!(
+			moved.position.x - FROM.x < 1.0,
+			"so it went nowhere near, got {}",
+			moved.position.x - FROM.x
+		);
+
+		// a gap that fits in the number the span is read into, so what cuts it
+		// is the ceiling rather than the conversion in front of it. A hundred
+		// steps is what a client whose frame stopped for a second and a half
+		// would really ask for.
+		let big = [asked(1, 100)];
+		let (_, seen) = ran(&big, 0, Vec3::X);
+
+		assert!(
+			(seen[0].0 - f32::from(MAX_CATCH_UP) / 60.0).abs() < 1.0e-7,
+			"cut by the ceiling and not by the conversion, got {}",
+			seen[0].0
+		);
+
+		// and the boundary itself is not cut: a gap of exactly the ceiling is
+		// a length the sender really may have, and the one either side of it
+		// says the comparison is the right way round.
+		for gap in [u64::from(MAX_CATCH_UP) - 1, u64::from(MAX_CATCH_UP)] {
+			let inside = [asked(1, gap)];
+			let (_, seen) = ran(&inside, 0, Vec3::X);
+			let want = f32::from(u16::try_from(gap).expect("small")) / 60.0;
+
+			assert!((seen[0].0 - want).abs() < 1.0e-7, "gap {gap}, got {}", seen[0].0);
+		}
+	}
+
+	/// Everything the caller said about the box reaches every move of a run.
+	#[test]
+	fn the_limits_a_caller_set_are_the_limits_every_command_moves_under() {
+		let world = World::new();
+		let mine = BodyId::NONE;
+		let start = Motion::new(FROM, Vec3::ZERO, Vec3::splat(0.25), 1.0 / 60.0)
+			.stepping(0.5)
+			.standing(0.9)
+			.layered(Layers::single(3))
+			.ignoring(mine);
+		let commands = [asked(1, 40), asked(2, 41)];
+		let mut seen = 0;
+
+		replay(&world, &start, 9, &commands, |_command, _before, motion| {
+			seen += 1;
+
+			assert!((motion.step - 0.5).abs() < f32::EPSILON, "the lip it may climb");
+			assert!((motion.ground - 0.9).abs() < f32::EPSILON, "the slope it may stand on");
+			assert_eq!(motion.layers, Layers::single(3), "the layers it is on");
+			assert_eq!(motion.ignored(), &[mine], "and what it is blind to");
+			assert!(
+				motion
+					.extents
+					.abs_diff_eq(Vec3::splat(0.25), 1.0e-6),
+				"and how big it is"
+			);
+		});
+
+		assert_eq!(seen, 2, "on every command rather than the first");
+	}
+
+	#[test]
+	fn a_command_that_did_not_move_the_clock_on_still_lasts_a_step() {
+		// two commands claiming one step, and one claiming a step behind the
+		// state it starts from. Neither is a move of nothing: a length of
+		// nought is a frame of somebody's input dropped in silence.
+		let commands = [asked(1, 50), asked(2, 50), asked(3, 20)];
+		let (_, seen) = ran(&commands, 50, Vec3::X);
+
+		for (index, (dt, _)) in seen.iter().enumerate() {
+			assert!((dt - 1.0 / 60.0).abs() < 1.0e-7, "command {index} lasts a step, got {dt}");
+		}
+	}
+
+	/// The speed carried into a command is what the one before it *came to*,
+	/// not what it was asked for.
+	///
+	/// The two are the same number until something clips one, which is why
+	/// this is the only test in the file with a wall in it.
+	#[test]
+	fn a_command_is_handed_the_speed_the_last_one_came_to() {
+		let world = walled();
+		// a step short of the wall, moving at it fast enough to reach it in
+		// one step and keep going.
+		let start = Motion::new(
+			Vec3::new(WALL - 1.0, 0.0, 0.0),
+			Vec3::ZERO,
+			Vec3::splat(0.25),
+			1.0 / 60.0,
+		);
+		let commands = [asked(1, 10), asked(2, 11)];
+		let mut carried = Vec::new();
+		let asking = Vec3::new(120.0, 0.0, 3.0);
+
+		let moved = replay(&world, &start, 9, &commands, |_command, before, motion| {
+			carried.push(motion.velocity);
+
+			// **added to rather than set**, which is the shape that can tell
+			// the two apart: a game that adds gravity or friction to what is
+			// already there is adding to whatever this carried in.
+			if before.is_none() {
+				motion.velocity = asking;
+			} else {
+				motion.velocity += Vec3::new(0.0, 0.0, 1.0);
+			}
+		});
+
+		assert!(
+			carried[0].abs_diff_eq(Vec3::ZERO, 1.0e-6),
+			"the first is handed the state it was given, got {}",
+			carried[0]
+		);
+		assert!(
+			(carried[1].x).abs() < 1.0e-5,
+			"and the second is handed a speed with the wall taken out of it rather than the \
+			 hundred and twenty that was asked for, got {}",
+			carried[1]
+		);
+		assert!(
+			(carried[1].z - 3.0).abs() < 1.0e-5,
+			"with everything the wall did not stop still on it, got {}",
+			carried[1]
+		);
+		assert!(
+			moved.position.x < WALL,
+			"and the box is on this side of the wall, got {}",
+			moved.position.x
+		);
+	}
+
+	#[test]
+	fn a_run_of_nothing_is_a_move_that_went_nowhere() {
+		let world = World::new();
+		let start = Motion::new(Vec3::new(4.0, 5.0, 6.0), Vec3::X, Vec3::splat(0.25), 1.0 / 60.0);
+		let mut called = 0;
+		let moved = replay(&world, &start, 7, &[], |_, _, _| called += 1);
+
+		assert_eq!(called, 0, "nothing was asked of the game");
+		assert_eq!(moved.position, start.position, "and the state is where it was");
+		assert_eq!(moved.velocity, start.velocity);
+		assert!(!moved.grounded);
+	}
+
+	#[test]
+	fn an_error_fades_rather_than_being_shown_all_at_once() {
+		let mut drift = Drift::NONE;
+
+		assert!(!drift.showing());
+		assert_eq!(drift.offset(), Vec3::ZERO);
+
+		// drawn a way from where the replay now says it is, with all three
+		// components different and none of them nought - a fixture whose z
+		// cancels cannot see a third of the arithmetic.
+		let (drawn, predicted) = (Vec3::new(2.0, -1.0, 0.5), Vec3::new(1.0, 1.0, -3.5));
+
+		drift.correct(drawn, predicted);
+		assert!(drift.showing());
+		assert!(
+			drift
+				.offset()
+				.abs_diff_eq(Vec3::new(1.0, -2.0, 4.0), 1.0e-6),
+			"the whole of it, at first, got {}",
+			drift.offset()
+		);
+		assert!(
+			(predicted + drift.offset()).abs_diff_eq(drawn, 1.0e-6),
+			"so the picture does not move at the moment it is corrected"
+		);
+
+		// a quarter of the way through, and a quarter is not a half or a
+		// whole: a decay that ignored the clock would answer the same.
+		drift.advance(DECAY / 4.0);
+		assert!(
+			drift
+				.offset()
+				.abs_diff_eq(Vec3::new(0.75, -1.5, 3.0), 1.0e-5),
+			"got {}",
+			drift.offset()
+		);
+
+		drift.advance(DECAY);
+		assert!(!drift.showing(), "and it is gone rather than overshooting");
+		assert_eq!(drift.offset(), Vec3::ZERO);
+
+		drift.advance(DECAY * 10.0);
+		assert_eq!(drift.offset(), Vec3::ZERO, "and stays gone");
+	}
+
+	#[test]
+	fn a_correction_on_top_of_one_still_fading_absorbs_what_was_left() {
+		let mut drift = Drift::NONE;
+
+		drift.correct(Vec3::new(10.0, 0.0, 0.0), Vec3::ZERO);
+		drift.advance(DECAY / 2.0);
+
+		// what is on screen right now, which is not the prediction and not the
+		// old drawn position either.
+		let showing = Vec3::ZERO + drift.offset();
+
+		assert!(showing.abs_diff_eq(Vec3::new(5.0, 0.0, 0.0), 1.0e-5), "got {showing}");
+
+		// and now a second correction, against a prediction that has moved on.
+		let predicted = Vec3::new(1.0, 0.0, 0.0);
+
+		drift.correct(showing, predicted);
+		assert!(
+			(predicted + drift.offset()).abs_diff_eq(showing, 1.0e-5),
+			"the picture is still continuous, with no case for it in the code"
+		);
+		assert!(
+			drift
+				.offset()
+				.abs_diff_eq(Vec3::new(4.0, 0.0, 0.0), 1.0e-5),
+			"and the error is the whole gap rather than the new half of it, got {}",
+			drift.offset()
+		);
+	}
+
+	#[test]
+	fn a_drift_is_something_a_game_can_keep_in_its_own_arena() {
+		let mut drift = Drift::NONE;
+
+		drift.correct(Vec3::new(1.0, 2.0, 3.0), Vec3::ZERO);
+
+		let bytes = bytemuck::bytes_of(&drift).to_vec();
+		let back: Drift = bytemuck::pod_read_unaligned(&bytes);
+
+		assert_eq!(bytes.len(), 16);
+		assert_eq!(back, drift, "so it survives a round trip through the arena");
+		// and what came back is the error itself rather than whatever the
+		// round trip happened to agree with: a comparison of a copy against
+		// its own source holds for any content at all.
+		assert!(
+			back.offset()
+				.abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), 1.0e-6),
+			"got {}",
+			back.offset()
+		);
+
+		let zeroed: Drift = bytemuck::pod_read_unaligned(&[0_u8; 16]);
+
+		assert_eq!(zeroed, Drift::NONE, "and a fresh arena reads as nothing to correct");
+		assert!(!zeroed.showing());
 	}
 
 	#[test]

@@ -57,7 +57,7 @@ pub use self::{
 		Voices,
 	},
 	camera::Camera,
-	character::{Motion, Moved},
+	character::{DECAY, Drift, MAX_CATCH_UP, Motion, Moved, replay},
 	cvar::{Args, ConsoleFn, Cvars, Value},
 	debug::{Debug, Label, Line, Pen},
 	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
