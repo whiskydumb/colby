@@ -716,6 +716,8 @@ impl Vm {
 				environment.set("entity", Self::projection(lua, &tables.entities)?)?;
 				environment.set("body", Self::projection(lua, &tables.bodies)?)?;
 				environment.set("input", Self::projection(lua, &tables.input)?)?;
+				environment.set("sound", Self::projection(lua, &tables.sounds)?)?;
+				environment.set("draw", Self::projection(lua, &tables.marks)?)?;
 			},
 		}
 
@@ -857,6 +859,8 @@ impl Vm {
 			entities: lua.create_table()?,
 			bodies: lua.create_table()?,
 			input: lua.create_table()?,
+			sounds: lua.create_table()?,
+			marks: lua.create_table()?,
 			globals,
 		})
 	}

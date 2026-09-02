@@ -501,6 +501,20 @@ impl VoiceId {
 	/// Which occupant of that slot this handle is for.
 	#[must_use]
 	pub const fn generation(self) -> u32 { self.generation }
+
+	/// The handle for one slot, whatever is in it.
+	///
+	/// **Public, and it is not a way to be handed something**, for the reason
+	/// [`EntityId::at`](super::EntityId::at) is: this type is `Pod`, so any
+	/// crate could already turn eight bytes into one, and what this adds is a
+	/// spelling for it - which is what anything carrying a handle outside Rust
+	/// needs. A voice resolves only where the table agrees one is playing.
+	/// @ref [`Voices::alive`].
+	///
+	/// @param index - the slot
+	/// @param generation - which occupant of it
+	#[must_use]
+	pub const fn at(index: u32, generation: u32) -> Self { Self { index, generation } }
 }
 
 /// One sound being played.

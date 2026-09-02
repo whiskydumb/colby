@@ -36,7 +36,7 @@
 //! is refused by name. And **a handle is positive**, so it prints and compares
 //! the way a number is expected to.
 
-use colby_core::abi::{BodyId, EntityId, MAX_BODIES, MAX_ENTITIES};
+use colby_core::abi::{BodyId, EntityId, MAX_BODIES, MAX_ENTITIES, MAX_VOICES, VoiceId};
 
 /// How many bits of the number the slot gets.
 const INDEX_BITS: u32 = 24;
@@ -61,6 +61,7 @@ const PAYLOAD: i64 = (1 << KIND_SHIFT) - 1;
 // apart rather than as a restatement of one of them, so it can actually fail.
 const _: () = assert!(MAX_ENTITIES <= MAX_INDEX, "an entity slot has to fit in the layout");
 const _: () = assert!(MAX_BODIES <= MAX_INDEX, "and so does a body slot");
+const _: () = assert!(MAX_VOICES <= MAX_INDEX, "and so does a voice slot");
 const _: () =
 	assert!(KIND_SHIFT + Kind::BITS < i64::BITS, "and the tag has to fit under the sign bit");
 
@@ -75,6 +76,9 @@ pub(crate) enum Kind {
 
 	/// Something the solver knows about.
 	Body = 2,
+
+	/// Something that is playing.
+	Voice = 3,
 }
 
 impl Kind {
@@ -86,6 +90,7 @@ impl Kind {
 		match self {
 			| Self::Entity => "entity",
 			| Self::Body => "body",
+			| Self::Voice => "sound",
 		}
 	}
 
@@ -94,6 +99,7 @@ impl Kind {
 		match bits >> KIND_SHIFT {
 			| 1 => Some(Self::Entity),
 			| 2 => Some(Self::Body),
+			| 3 => Some(Self::Voice),
 			| _ => None,
 		}
 	}
@@ -172,6 +178,21 @@ impl Handle {
 			generation: id.generation(),
 		}
 	}
+
+	/// The voice it names, whether or not one is playing.
+	pub(crate) const fn voice(self) -> VoiceId { VoiceId::at(self.index, self.generation) }
+
+	/// The handle for one voice.
+	///
+	/// The one table whose slot is already a `u32` rather than an index into a
+	/// slice, so nothing is narrowed here.
+	pub(crate) const fn of_voice(id: VoiceId) -> Self {
+		Self {
+			kind: Kind::Voice,
+			index: id.slot(),
+			generation: id.generation(),
+		}
+	}
 }
 
 /// A slot as the layout carries it.
@@ -205,7 +226,7 @@ mod tests {
 
 	#[test]
 	fn a_handle_written_down_as_a_number_comes_back_itself() {
-		for kind in [Kind::Entity, Kind::Body] {
+		for kind in [Kind::Entity, Kind::Body, Kind::Voice] {
 			let handle = awkward(kind);
 			let back = Handle::from_bits(handle.to_bits()).expect("it is a handle");
 

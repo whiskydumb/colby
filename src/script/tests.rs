@@ -2085,3 +2085,245 @@ fn a_panel_has_no_input_table_either() {
 		"no input, and `colby` is the one table both halves share"
 	);
 }
+
+/// A world with one sound in it, registered under a name a program can use.
+fn audible(script: &str) -> World {
+	let mut world = running(script);
+	listen(&mut world);
+	world
+		.sounds
+		.insert("sounds/thud", colby_core::abi::SoundData {
+			samples: vec![0; 48_000],
+			rate: 48_000,
+			channels: 1,
+		});
+
+	world
+}
+
+#[test]
+fn a_sound_played_somewhere_is_somewhere() {
+	// **checked after the step that plays it and before anything moves it.**
+	// Both calls set the place, so a test that played and then moved could
+	// not tell a broken one from a broken other: whichever of them was left
+	// working would answer for both.
+	let mut world = audible(
+		r#"function tick(dt)
+			if colby.steps() > 1 then return end
+
+			sound.play("sounds/thud", 1, 2, 3, true)
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	world.steps = 1;
+
+	stepped(&mut scripts, &mut world);
+
+	let voice = world
+		.audio
+		.iter()
+		.next()
+		.map(|(id, _)| id)
+		.expect("one voice");
+	let playing = world.audio.get(voice).expect("it is there");
+
+	assert!(playing.looping, "it loops, which is what was asked for");
+	assert!(playing.positioned, "and it is somewhere rather than simply audible");
+	assert!(
+		playing
+			.at
+			.abs_diff_eq(colby_core::glam::Vec3::new(1.0, 2.0, 3.0), 1e-5),
+		"where it was played"
+	);
+}
+
+#[test]
+fn a_sound_that_started_flat_and_was_moved_is_somewhere_afterwards() {
+	// the other half, and the one that needs a voice which was *not*
+	// positioned to begin with: moving one is how a looping sound follows
+	// something, and it has to make a flat voice into a placed one.
+	let mut world = audible(
+		r#"local mine = nil
+
+		function tick(dt)
+			if not mine then
+				mine = sound.play_flat("sounds/thud", true)
+				return
+			end
+
+			sound.move(mine, 9, 9, 9)
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	let voice = world
+		.audio
+		.iter()
+		.next()
+		.map(|(id, _)| id)
+		.expect("one voice");
+
+	assert!(
+		world
+			.audio
+			.get(voice)
+			.is_some_and(|playing| !playing.positioned),
+		"it started simply audible"
+	);
+
+	stepped(&mut scripts, &mut world);
+
+	let playing = world.audio.get(voice).expect("it is still going");
+
+	assert!(playing.positioned, "and moving it put it in the world");
+	assert!(
+		playing
+			.at
+			.abs_diff_eq(colby_core::glam::Vec3::splat(9.0), 1e-5),
+		"where it was moved to"
+	);
+}
+
+#[test]
+fn a_handle_to_a_sound_that_has_ended_turns_nothing_down() {
+	// the reason a voice handle is generational: a program that starts a
+	// footstep and forgets the handle must not, four seconds later, turn down
+	// somebody else's music.
+	let mut world = audible(
+		r#"local mine = nil
+
+		function tick(dt)
+			if not mine then
+				mine = sound.play_flat("sounds/thud")
+				return
+			end
+
+			colby.command("script.said " .. tostring(sound.playing(mine))
+				.. tostring(sound.stop(mine)))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	let voice = world
+		.audio
+		.iter()
+		.next()
+		.map(|(id, _)| id)
+		.expect("one voice");
+	world.audio.stop(voice);
+
+	// the slot is free, and the next sound takes it - which is the trap.
+	let taken = world
+		.audio
+		.play(colby_core::abi::Voice::flat(world.sounds.find("sounds/thud")));
+	assert_eq!(taken.slot(), voice.slot(), "the same slot, which is what makes this a test");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("falsefalse"),
+		"the old handle names nothing and turns nothing off"
+	);
+	assert!(world.audio.alive(taken), "and the new voice is untouched");
+}
+
+#[test]
+fn a_sound_nobody_compiled_is_a_quiet_world_rather_than_a_stopped_one() {
+	// the rule the whole asset side follows: a name the registry does not
+	// answer to is not an error.
+	let mut world = audible(
+		r#"function tick(dt)
+			local it = sound.play_flat("sounds/nothing")
+			colby.command("script.said " .. tostring(it ~= nil))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "a handle came back all the same");
+}
+
+#[test]
+fn what_a_program_draws_lasts_one_step() {
+	// not a countdown: the table is swept at the *top* of the next step, so a
+	// line drawn now survives every frame drawn before then and is gone at the
+	// start of the one after. A program that wants it to stay draws it again.
+	let mut world = running(
+		r#"function tick(dt)
+			draw.line(0, 0, 0, 1, 2, 3, 1, 0, 0)
+			draw.arrow(0, 0, 0, 0, 1, 0, 0, 1, 0)
+			draw.box(1, 1, 1, 0.5, 0.5, 0.5, 0, 0, 1)
+			draw.ball(2, 2, 2, 0.5, 1, 1, 0)
+			draw.label(3, 3, 3, "here", 1, 1, 1)
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	let lines = world.debug.lines().len();
+	let labels = world.debug.labels().len();
+
+	assert!(lines > 1, "a line, an arrow, a box and a ball are many segments: {lines}");
+	assert_eq!(labels, 1, "and words are the one kind that is not a segment");
+	assert!(
+		world
+			.debug
+			.labels()
+			.first()
+			.is_some_and(|label| label.text == "here"),
+		"which says what it was given"
+	);
+
+	// what the top of the next step does.
+	world.debug.begin_step(1.0);
+
+	assert!(world.debug.is_empty(), "and none of it is there a step later");
+}
+
+#[test]
+fn a_line_is_drawn_between_the_two_points_it_was_given() {
+	let mut world = running("function tick(dt) draw.line(1, 2, 3, 4, 5, 6, 0.5, 0, 0) end");
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	let line = world
+		.debug
+		.lines()
+		.first()
+		.copied()
+		.expect("one line");
+
+	assert!(
+		line.from
+			.abs_diff_eq(colby_core::glam::Vec3::new(1.0, 2.0, 3.0), 1e-5),
+		"from where it was told"
+	);
+	assert!(
+		line.to
+			.abs_diff_eq(colby_core::glam::Vec3::new(4.0, 5.0, 6.0), 1e-5),
+		"to where it was told"
+	);
+}
+
+#[test]
+fn a_panel_can_neither_make_a_noise_nor_draw_over_the_world() {
+	let (mut world, panel) =
+		showing(r#"ui.set_text("out", type(sound) .. type(draw) .. type(input))"#);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		written(&world, panel, "out").as_deref(),
+		Some("nilnilnil"),
+		"none of the world's three are in a document's environment"
+	);
+}

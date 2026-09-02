@@ -53,8 +53,8 @@ use std::cell::RefCell;
 use colby_asset::css;
 use colby_core::{
 	abi::{
-		Body, BodyKind, Key, Layers, MaterialId, Renderable, Shape, TraceInfo, Transform, World,
-		console, ui::PanelId,
+		Body, BodyKind, Key, Layers, MaterialId, Renderable, Shape, TraceInfo, Transform, Voice,
+		World, console, ui::PanelId,
 	},
 	glam::{EulerRot, Quat, Vec3},
 	info, warn,
@@ -62,6 +62,10 @@ use colby_core::{
 use mlua::{Function, Result, Scope, Table, Value, Variadic};
 
 use crate::handle::{Handle, Kind};
+
+/// Two points and a color, which is what almost everything drawn over the
+/// world is asked with.
+type Segment = (f32, f32, f32, f32, f32, f32, f32, f32, f32);
 
 /// What a swept box is asked with: from, to, half-extents, and one body to
 /// pretend is not there.
@@ -129,6 +133,12 @@ pub(crate) struct Tables {
 	/// `input` - this machine's keyboard and mouse.
 	pub(crate) input: Table,
 
+	/// `sound` - what a program makes audible.
+	pub(crate) sounds: Table,
+
+	/// `draw` - lines and words over the world, for one step.
+	pub(crate) marks: Table,
+
 	/// What every environment inherits: `string`, `table`, `math`, `print` and
 	/// a handful of base functions.
 	pub(crate) globals: Table,
@@ -164,6 +174,8 @@ where
 	touching(scope, tables, world)?;
 	asking(scope, tables, world)?;
 	typing(scope, tables, world)?;
+	sounding(scope, tables, world)?;
+	marking(scope, tables, world)?;
 
 	Ok(())
 }
@@ -1239,6 +1251,199 @@ where
 
 	tables.input.set("cursor", cursor)?;
 	tables.input.set("wheel", wheel)?;
+
+	Ok(())
+}
+
+/// `sound` - what a program makes audible.
+///
+/// **A voice is a handle the step carries, not the device.** What decides that
+/// a sound has ended is the simulation's own playhead, moved by `dt` at the top
+/// of every step, so a one-second sound lasts the same number of steps on every
+/// machine and a screenshot stays reproducible. Whatever is filling a driver's
+/// buffer is downstream of that and is never allowed to decide anything. @ref
+/// `colby_core::abi::audio`.
+///
+/// The handle is generational, which is what makes a program that starts a
+/// footstep and forgets the handle safe: four seconds later that handle must
+/// not turn down somebody else's music.
+fn sounding<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	// a name nothing answers to plays silence rather than failing, which is
+	// the rule the whole asset side follows: a sound that has not been
+	// compiled yet is a world that is quiet rather than a world that stops.
+	let play = scope.create_function(
+		move |_, (name, x, y, z, looping): (String, f32, f32, f32, Option<bool>)| {
+			let mut world = world.borrow_mut();
+			let sound = world.sounds.find(&name);
+			let mut voice = Voice::at(sound, Vec3::new(x, y, z));
+
+			if looping.unwrap_or(false) {
+				voice = voice.looping();
+			}
+
+			Ok(Handle::of_voice(world.audio.play(voice)).to_bits())
+		},
+	)?;
+
+	let play_flat =
+		scope.create_function(move |_, (name, looping): (String, Option<bool>)| {
+			let mut world = world.borrow_mut();
+			let sound = world.sounds.find(&name);
+			let mut voice = Voice::flat(sound);
+
+			if looping.unwrap_or(false) {
+				voice = voice.looping();
+			}
+
+			Ok(Handle::of_voice(world.audio.play(voice)).to_bits())
+		})?;
+
+	let stop = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Voice)? else {
+			return Ok(false);
+		};
+
+		Ok(world.borrow_mut().audio.stop(handle.voice()))
+	})?;
+
+	let playing = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Voice)? else {
+			return Ok(false);
+		};
+
+		Ok(world.borrow().audio.alive(handle.voice()))
+	})?;
+
+	// what a looping voice following something is: the handle stays and the
+	// place is written every step. The sandbox's own hum does exactly this.
+	let move_to =
+		scope.create_function(move |_, (bits, x, y, z): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Voice)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let Some(voice) = world.audio.get_mut(handle.voice()) else {
+				return Ok(false);
+			};
+
+			voice.at = Vec3::new(x, y, z);
+			voice.positioned = true;
+
+			Ok(true)
+		})?;
+
+	let volume = scope.create_function(move |_, (bits, loudness): (Option<i64>, f32)| {
+		let Some(handle) = taken(bits, Kind::Voice)? else {
+			return Ok(false);
+		};
+
+		let mut world = world.borrow_mut();
+		let Some(voice) = world.audio.get_mut(handle.voice()) else {
+			return Ok(false);
+		};
+
+		voice.volume = loudness;
+
+		Ok(true)
+	})?;
+
+	tables.sounds.set("play", play)?;
+	tables.sounds.set("play_flat", play_flat)?;
+	tables.sounds.set("stop", stop)?;
+	tables.sounds.set("playing", playing)?;
+	tables.sounds.set("move", move_to)?;
+	tables.sounds.set("volume", volume)?;
+
+	Ok(())
+}
+
+/// `draw` - lines and words over the world, for one step.
+///
+/// **Everything here expires the moment it was submitted**, which is not a
+/// countdown: the table is swept at the *top* of the next step rather than the
+/// bottom of this one, because several frames are drawn between two steps and
+/// every one of them draws this. So a program that wants a line to stay draws
+/// it every step, which is also what makes a line that stops appearing say
+/// something.
+///
+/// Refused work is counted rather than lost - the table is bounded like every
+/// other - and the count is on the statistics panel.
+fn marking<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	let line = scope.create_function(move |_, (x1, y1, z1, x2, y2, z2, r, g, b): Segment| {
+		world.borrow_mut().debug.line(
+			Vec3::new(x1, y1, z1),
+			Vec3::new(x2, y2, z2),
+			Vec3::new(r, g, b),
+		);
+
+		Ok(())
+	})?;
+
+	let arrow = scope.create_function(move |_, (x1, y1, z1, x2, y2, z2, r, g, b): Segment| {
+		world.borrow_mut().debug.arrow(
+			Vec3::new(x1, y1, z1),
+			Vec3::new(x2, y2, z2),
+			Vec3::new(r, g, b),
+		);
+
+		Ok(())
+	})?;
+
+	let cuboid = scope.create_function(move |_, (x, y, z, hx, hy, hz, r, g, b): Segment| {
+		world.borrow_mut().debug.cuboid(
+			Vec3::new(x, y, z),
+			Vec3::new(hx, hy, hz),
+			Quat::IDENTITY,
+			Vec3::new(r, g, b),
+		);
+
+		Ok(())
+	})?;
+
+	let ball = scope.create_function(
+		move |_, (x, y, z, radius, r, g, b): (f32, f32, f32, f32, f32, f32, f32)| {
+			world
+				.borrow_mut()
+				.debug
+				.ball(Vec3::new(x, y, z), radius, Vec3::new(r, g, b));
+
+			Ok(())
+		},
+	)?;
+
+	// the one kind that is not a segment, because words are the one thing that
+	// cannot be drawn out of lines.
+	let label = scope.create_function(
+		move |_, (x, y, z, text, r, g, b): (f32, f32, f32, String, f32, f32, f32)| {
+			world
+				.borrow_mut()
+				.debug
+				.label(Vec3::new(x, y, z), &text, Vec3::new(r, g, b));
+
+			Ok(())
+		},
+	)?;
+
+	tables.marks.set("line", line)?;
+	tables.marks.set("arrow", arrow)?;
+	tables.marks.set("box", cuboid)?;
+	tables.marks.set("ball", ball)?;
+	tables.marks.set("label", label)?;
 
 	Ok(())
 }
