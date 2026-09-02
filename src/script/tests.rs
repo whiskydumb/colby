@@ -38,6 +38,29 @@ fn rewritten(world: &mut World, script: &str) {
 		.insert("ui/test", ScriptData { source: script.to_owned() });
 }
 
+/// A world with one program under the world's own directory and no panel at
+/// all.
+fn running(script: &str) -> World {
+	let mut world = World::new();
+	world
+		.scripts
+		.insert("scripts/test", ScriptData { source: script.to_owned() });
+
+	world
+}
+
+/// What a program has left in a console variable, which is the only thing a
+/// world program can write to today.
+fn said(world: &World) -> Option<String> { Some(world.cvars.get("script.said")?.value()?.text()) }
+
+/// Registers the variable a world program writes into, so a test can read
+/// something back out of one.
+fn listen(world: &mut World) {
+	world
+		.cvars
+		.var("script.said", Value::Text(String::new()), "what a test program wrote");
+}
+
 /// A document that names one program and holds nothing else.
 fn document(program: &str) -> DocumentData {
 	DocumentData {
@@ -525,4 +548,185 @@ fn a_script_is_only_run_when_something_it_was_built_from_has_moved() {
 		"eight steps, one load: nothing runs a chunk again until the compiler rewrites it"
 	);
 	assert!(panel.is_some(), "and the panel resolved in the first place");
+}
+
+#[test]
+fn a_program_under_the_world_directory_runs_with_nobody_showing_it() {
+	// nothing loads it: the host walks the table for the prefix. There is no
+	// panel here at all, which is the point - a world program is not a
+	// document's.
+	let mut world = running(r#"colby.command("script.said hello")"#);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	scripts.update(&mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("hello"), "the chunk ran");
+	assert_eq!(scripts.loaded.len(), 1, "and one program is being kept track of");
+}
+
+#[test]
+fn a_program_outside_that_directory_is_not_the_worlds_to_run() {
+	// the whole of the rule. `ui/test` is a program the table holds and
+	// nothing shows, so nothing runs it: a document has to name it.
+	let mut world = World::new();
+	listen(&mut world);
+	world.scripts.insert("ui/test", ScriptData {
+		source: r#"colby.command("script.said anyway")"#.to_owned(),
+	});
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	scripts.update(&mut world);
+
+	assert_eq!(said(&world).as_deref(), Some(""), "nobody ran it");
+	assert!(scripts.loaded.is_empty(), "and there is nothing to keep track of");
+}
+
+#[test]
+fn a_world_program_has_no_panel_to_write_to() {
+	// not refused, and not an error: the environment is built by hand, so a
+	// name nobody declared is `nil` - which is what Lua answers for anything
+	// that is not there. There is no branch anywhere saying no.
+	let mut world = running(r#"colby.command("script.said " .. type(ui))"#);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	scripts.update(&mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("nil"), "there is no `ui` in the environment");
+}
+
+#[test]
+fn editing_a_world_program_runs_it_again() {
+	let mut world = running(r#"colby.command("script.said first")"#);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	scripts.update(&mut world);
+
+	world.scripts.insert("scripts/test", ScriptData {
+		source: r#"colby.command("script.said second")"#.to_owned(),
+	});
+	scripts.update(&mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("second"), "the new one ran");
+	assert_eq!(scripts.loaded.len(), 1, "and replaced the old rather than standing beside it");
+}
+
+#[test]
+fn a_world_program_is_run_once_and_not_every_step() {
+	// the counter is in a console variable rather than in a local, because a
+	// rebuild hands the chunk a fresh environment and a global counter would
+	// read `1` however many times it ran. Same fixture fault the panel tests
+	// had.
+	let mut world = running(
+		r#"local n = tonumber(colby.command) -- deliberately not a number
+		colby.command("script.said " .. (n or "once"))"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	for _ in 0..8 {
+		scripts.update(&mut world);
+	}
+
+	assert_eq!(said(&world).as_deref(), Some("once"), "eight steps, and it ran");
+	assert_eq!(scripts.loaded.len(), 1, "once");
+}
+
+#[test]
+fn touching_a_program_is_what_makes_it_run_again() {
+	// `script.reload` in one line: nothing is read off disk and the source is
+	// the same one, and the revision moving is the whole signal.
+	let mut world = running(r#"colby.command("script.said " .. tostring(colby.command ~= nil))"#);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	scripts.update(&mut world);
+
+	world.cvars.set("script.said", "cleared");
+	scripts.update(&mut world);
+	assert_eq!(said(&world).as_deref(), Some("cleared"), "nothing moved, so nothing ran");
+
+	let id = world.scripts.find("scripts/test");
+	assert!(world.scripts.touch(id), "and now it is asked for again");
+	scripts.update(&mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "so the same source ran a second time");
+}
+
+#[test]
+fn two_programs_do_not_share_the_tables_the_engine_gives_them() {
+	// `Table` is a reference, so handing the same one to every program makes
+	// `colby.command = nil` in one of them everybody's problem until the next
+	// step rebuilds the table. Each program gets a projection instead: reads
+	// fall through, writes land in front.
+	//
+	// The names are chosen so the vandal is walked first - the table is
+	// walked in slot order and both are world programs.
+	let mut world = World::new();
+	listen(&mut world);
+	world.scripts.insert("scripts/first", ScriptData {
+		source: "colby.command = function() end".to_owned(),
+	});
+	world
+		.scripts
+		.insert("scripts/second", ScriptData {
+			source: r#"colby.command("script.said through")"#.to_owned(),
+		});
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	scripts.update(&mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("through"),
+		"the second program reached the engine's own function rather than the first's"
+	);
+}
+
+#[test]
+fn a_world_program_that_will_not_compile_is_reported_and_left_alone() {
+	let mut world = running("function (");
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	scripts.update(&mut world);
+	scripts.update(&mut world);
+
+	assert_eq!(scripts.loaded.len(), 1, "one program, one entry");
+	assert!(scripts.loaded[0].handlers.is_none(), "and nothing was built out of it");
+}
+
+#[test]
+fn a_world_program_files_no_handlers_because_it_has_nowhere_to_file_one() {
+	// `ui.on` is not a name a world program can reach, so an empty table
+	// standing in for its handlers would be a claim the log then repeats.
+	let mut world = running("-- a program that does nothing at all");
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	scripts.update(&mut world);
+
+	assert_eq!(scripts.loaded.len(), 1, "it ran");
+	assert!(scripts.loaded[0].handlers.is_none(), "and filed nothing");
+}
+
+#[test]
+fn a_panel_and_the_world_are_two_programs_even_over_one_name() {
+	// the two halves are keyed differently on purpose: a panel by the panel,
+	// because two panels showing one document are two programs with separate
+	// locals, and the world by the asset, because there is one of each.
+	let mut world = World::new();
+	listen(&mut world);
+	world.scripts.insert("scripts/both", ScriptData {
+		source: r#"colby.command("script.said ran")"#.to_owned(),
+	});
+	world
+		.ui
+		.insert("ui/test", document("scripts/both"));
+	let panel = world.ui.show("ui/test");
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	scripts.update(&mut world);
+
+	assert!(panel.is_some(), "the panel resolved");
+	assert_eq!(scripts.loaded.len(), 2, "one program, two homes: the panel's and the world's");
 }

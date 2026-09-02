@@ -24,6 +24,22 @@
 use super::registry::{Entry, Registry};
 use crate::registry_handle;
 
+/// The directory a program the *world* runs is written in.
+///
+/// A program under `assets/scripts/` is loaded and run by the host on its own;
+/// one anywhere else is run only by whatever names it, which today is a
+/// document. **This is not a new mechanism and not a rule in the compiler** -
+/// the compiler names every asset by its own path, so a file at
+/// `assets/scripts/thruster.lua` is the program `scripts/thruster` and the host
+/// finds it by walking this registry for the prefix. It is the same trick the
+/// prop catalogue is: a directory of `.scene` files that a menu finds by
+/// walking the scene registry for `props/`.
+///
+/// The alternative was a rule keyed on the compiler's directory walk, which
+/// would be the first thing in the asset pipeline that is not decided by an
+/// extension.
+pub const WORLD_PREFIX: &str = "scripts/";
+
 /// The source of one program.
 ///
 /// Text rather than bytecode, which is the same decision `.cdoc` made: what a
@@ -92,6 +108,38 @@ impl Scripts {
 	/// One program, by handle.
 	#[must_use]
 	pub fn get(&self, id: ScriptId) -> Option<&Script> { self.entries.entry(id.index()) }
+
+	/// Says a program has changed without changing it.
+	///
+	/// The revision going up is the whole reload mechanism, so this is how a
+	/// console command asks for a program to be built again: the file on disk
+	/// is fine and nothing has to be read, but whoever is running it should
+	/// start over. Written here rather than as a note the frame loop drains
+	/// because the interpreter is the host's and a
+	/// [`ConsoleFn`](super::ConsoleFn) is handed nothing but a
+	/// [`World`](super::World) - a reload that needed the VM would need the
+	/// note, and this one does not.
+	///
+	/// @param id - the program to mark
+	/// @return whether there was one
+	pub fn touch(&mut self, id: ScriptId) -> bool {
+		self.entries
+			.entry_mut(id.index())
+			.is_some_and(|entry| {
+				// taking it mutably is what moves the revision, and the value
+				// itself is not wanted - @ref
+				// [`Entry::value_mut`](super::registry::Entry::value_mut).
+				let _: &mut ScriptData = entry.value_mut();
+
+				true
+			})
+	}
+
+	/// Whether a name is one the world runs on its own.
+	///
+	/// @param name - the name a program is registered under
+	#[must_use]
+	pub fn is_world(name: &str) -> bool { name.starts_with(WORLD_PREFIX) }
 
 	/// How many programs there are, counting the empty one.
 	#[must_use]
@@ -166,6 +214,39 @@ mod tests {
 		assert!(program("").is_empty());
 		assert!(program("\n\t  \n").is_empty());
 		assert!(!program("-- a comment is a program").is_empty());
+	}
+
+	#[test]
+	fn touching_a_program_moves_its_revision_without_changing_it() {
+		let mut scripts = Scripts::new();
+		let id = scripts.insert("scripts/thruster", program("local a = 1"));
+
+		assert!(scripts.touch(id), "there was one to touch");
+		assert_eq!(
+			scripts.get(id).map(Entry::revision),
+			Some(1),
+			"and whoever is running it is told to start over"
+		);
+		assert_eq!(
+			scripts
+				.get(id)
+				.map(|entry| entry.value().source.as_str()),
+			Some("local a = 1"),
+			"while the program itself is untouched"
+		);
+
+		assert!(!scripts.touch(ScriptId::new(99)), "and a handle to nothing touches nothing");
+	}
+
+	#[test]
+	fn the_world_runs_what_is_under_its_own_directory_and_nothing_else() {
+		// the whole of the rule, and it is a prefix rather than anything the
+		// compiler knows about.
+		assert!(Scripts::is_world("scripts/thruster"));
+		assert!(Scripts::is_world("scripts/deep/thing"));
+		assert!(!Scripts::is_world("ui/hud"), "a document's program is the document's");
+		assert!(!Scripts::is_world("scripts"), "a file called `scripts` is not a directory");
+		assert!(!Scripts::is_world(""), "and the null entry is nobody's");
 	}
 
 	#[test]

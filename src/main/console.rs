@@ -28,7 +28,7 @@ use std::{
 
 use colby_core::{
 	Error,
-	abi::{Args, Cvars, Mix, Sound, Value, Voice, World, console},
+	abi::{Args, Cvars, Mix, Scripts, Sound, Value, Voice, World, console},
 	error, info, warn,
 };
 
@@ -222,6 +222,31 @@ pub(crate) fn install(world: &mut World) {
 	install_scenes(world);
 	install_audio(world);
 	install_net(world);
+	install_scripts(world);
+}
+
+/// The two commands over the programs the host is running.
+///
+/// Split off like the scenes and the volumes, and for the same reason. Both are
+/// pure functions of the world, which is worth noticing: the interpreter itself
+/// is the runner's and a [`ConsoleFn`] is handed nothing but a world, so a
+/// command that had to reach into the VM would need a note the frame loop
+/// drains - the shape `saves.rs` has. Neither of these does. Listing reads the
+/// table, and reloading moves a revision and lets whoever is running the
+/// program notice on its own.
+///
+/// @param world - the table to register into
+fn install_scripts(world: &mut World) {
+	world.cvars.command(
+		"script.list",
+		list_scripts,
+		"report every program the host has loaded and whose it is",
+	);
+	world.cvars.command(
+		"script.reload",
+		reload_script,
+		"build <name> again, or every program if no name is given",
+	);
 }
 
 /// The six numbers that make the wire bad, and the two commands over it.
@@ -733,6 +758,80 @@ unsafe extern "C-unwind" fn load_scene(_world: *mut World, args: *const Args) {
 /// The solver's default pass count, as the number a console variable holds.
 fn passes() -> f32 {
 	f32::from(u16::try_from(colby_physics::VELOCITY_PASSES).unwrap_or(u16::MAX))
+}
+
+/// `script.list` - reports every program the host has loaded.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn list_scripts(world: *mut World, _args: *const Args) {
+	// SAFETY: as help.
+	let world = unsafe { &*world };
+
+	for entry in world.scripts.iter() {
+		if entry.name().is_empty() {
+			continue;
+		}
+
+		info!(
+			name = entry.name(),
+			revision = entry.revision(),
+			lines = entry.value().source.lines().count(),
+			world = Scripts::is_world(entry.name()),
+			"program"
+		);
+	}
+
+	info!(programs = world.scripts.len().saturating_sub(1), "loaded");
+}
+
+/// `script.reload [name]` - asks for a program to be built again.
+///
+/// Nothing is read off disk: the file is fine and what this moves is the
+/// revision, which is the signal whoever is running the program watches. With
+/// no name it moves every one of them, which is the form worth having on a
+/// keyboard.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn reload_script(world: *mut World, args: *const Args) {
+	// SAFETY: as help.
+	let world = unsafe { &mut *world };
+	// SAFETY: as help.
+	let args = unsafe { &*args };
+
+	let Some(name) = args.word(0) else {
+		let names: Vec<String> = world
+			.scripts
+			.iter()
+			.map(|entry| entry.name().to_owned())
+			.collect();
+		let mut moved = 0_usize;
+
+		for name in names {
+			let id = world.scripts.find(&name);
+			if world.scripts.touch(id) {
+				moved += 1;
+			}
+		}
+
+		info!(programs = moved, "every program will be built again");
+
+		return;
+	};
+
+	let id = world.scripts.find(name);
+	if !id.is_some() {
+		warn!(name, "no program of that name is loaded");
+
+		return;
+	}
+
+	if world.scripts.touch(id) {
+		info!(name, "will be built again");
+	}
 }
 
 /// `phys.bodies` - reports what the solver is carrying.

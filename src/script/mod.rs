@@ -1,8 +1,16 @@
-//! Lua for the game's interface, and for nothing else yet.
+//! Lua for the game's interface, and for the world's own programs.
 //!
 //! A document names the program its logic is in - `<script src="ui/hud">`, the
 //! way an image names a texture - and the program is an asset the compiler
 //! turned a `.lua` into. This crate is what runs it.
+//!
+//! **A program under `scripts/` belongs to the world rather than to a panel**,
+//! and nothing has to load it: the host walks the table for that prefix and
+//! runs what it finds, the way the prop catalogue is a walk of the scene table
+//! for `props/`. @ref [`WORLD_PREFIX`](colby_core::abi::WORLD_PREFIX). What
+//! that program can reach is *not* what a panel's can - it has no panel, so it
+//! has no `ui` at all, and a name nobody declared is `nil`, which is Lua's own
+//! answer to being asked for something that is not there.
 //!
 //! Four decisions are written into the shape of the module, and each was taken
 //! against a plausible alternative.
@@ -53,7 +61,7 @@ use std::{
 
 use colby_core::{
 	Result,
-	abi::{EventKind, PanelId, ScriptId, World, ui::Event},
+	abi::{EventKind, PanelId, ScriptId, Scripts, World, ui::Event},
 	err, info, trace, warn,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
@@ -123,13 +131,39 @@ pub struct Vm {
 	spent: Rc<Cell<u32>>,
 }
 
-/// One panel's program, and what it was built from.
+/// What a running program belongs to, which is also how it is found again.
+///
+/// Two kinds and two keys, because the two are counted differently. Two panels
+/// showing one document are **two programs** with separate locals, so the panel
+/// is the key there; the world runs **one** of each program it finds, so the
+/// asset is the key here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Home {
+	/// A panel's, addressed by the panel. A panel shows one document for as
+	/// long as it exists - @ref [`Ui::show`](colby_core::abi::Ui::show), which
+	/// hands the same panel back rather than repointing one.
+	Panel(PanelId),
+
+	/// The world's own, addressed by the program itself.
+	World(ScriptId),
+}
+
+impl Home {
+	/// The panel this writes to, or [`PanelId::NONE`] for a program that has
+	/// none.
+	const fn panel(self) -> PanelId {
+		match self {
+			| Self::Panel(panel) => panel,
+			| Self::World(_) => PanelId::NONE,
+		}
+	}
+}
+
+/// One running program, and what it was built from.
 struct Loaded {
-	/// Which panel it belongs to. A panel shows one document for as long as it
-	/// exists - @ref [`Ui::show`](colby_core::abi::Ui::show), which hands the
-	/// same panel back rather than repointing one - so this is the whole key.
-	panel: PanelId,
-	/// Which entry of the script table the document named.
+	/// Whose it is, and the whole key.
+	home: Home,
+	/// Which entry of the script table it was built from.
 	///
 	/// Kept beside the revision because a fresh entry starts at revision zero,
 	/// exactly like the null one: a document naming a program that had not been
@@ -139,16 +173,17 @@ struct Loaded {
 	/// here watches the document's own revision.
 	program: ScriptId,
 	/// The revision of that entry. Somebody editing the file moves this, and
-	/// nothing else does.
+	/// so does `script.reload`; nothing else does.
 	program_revision: u32,
 	name: String,
-	/// Its handlers, or `None` for a document with no program at all.
+	/// Its handlers, or `None` for a program that registered none - which is
+	/// every world program, since `ui.on` is not something one can reach.
 	handlers: Option<Table>,
 }
 
-/// A document whose program has to be built, or built again.
+/// A program that has to be built, or built again.
 struct Pending {
-	panel: PanelId,
+	home: Home,
 	program: ScriptId,
 	program_revision: u32,
 	name: String,
@@ -213,7 +248,11 @@ impl Vm {
 		self.serve(world, &pending);
 	}
 
-	/// The panels whose program is missing or out of date.
+	/// Every program that is missing or out of date, panels first.
+	///
+	/// Panels first because that is the order the step runs in anyway, and
+	/// within each half it is slot order - the order the compiler walked the
+	/// tree in, which is sorted. Nothing here depends on a hash.
 	fn pending(&self, world: &World) -> Vec<Pending> {
 		let mut jobs = Vec::new();
 
@@ -223,36 +262,69 @@ impl Vm {
 				continue;
 			};
 
-			let named = &entry.value().program;
-			let program = world.scripts.find(named);
-			let found = world.scripts.get(program);
-			let program_revision = found.map_or(0, colby_core::abi::Entry::revision);
+			// the *document's* name, because every line about a panel's
+			// program is read by somebody who has the document open. Which
+			// file the program came from is one lookup away.
+			self.wanted(
+				world,
+				Home::Panel(panel),
+				&entry.value().program,
+				entry.name(),
+				&mut jobs,
+			);
+		}
 
-			let current = self.loaded.iter().any(|loaded| {
-				loaded.panel == panel
-					&& loaded.program == program
-					&& loaded.program_revision == program_revision
-			});
-
-			if current {
+		for entry in world.scripts.iter() {
+			if !Scripts::is_world(entry.name()) {
 				continue;
 			}
 
-			jobs.push(Pending {
-				panel,
-				program,
-				program_revision,
-				// the *document's* name, because every line about a program is
-				// read by somebody who has the document open. Which file the
-				// program came from is one lookup away and one they can make.
-				name: entry.name().to_owned(),
-				script: found
-					.map(|entry| entry.value().source.clone())
-					.unwrap_or_default(),
-			});
+			let name = entry.name().to_owned();
+			let id = world.scripts.find(&name);
+
+			self.wanted(world, Home::World(id), &name, &name, &mut jobs);
 		}
 
 		jobs
+	}
+
+	/// Adds one program to the list if what it was built from has moved.
+	///
+	/// @param home - whose program this is
+	/// @param named - the name of the program to run, which for a panel is what
+	/// its document says and for the world is the program's own
+	/// @param about - the name to put in any line written about it
+	fn wanted(
+		&self,
+		world: &World,
+		home: Home,
+		named: &str,
+		about: &str,
+		jobs: &mut Vec<Pending>,
+	) {
+		let program = world.scripts.find(named);
+		let found = world.scripts.get(program);
+		let program_revision = found.map_or(0, colby_core::abi::Entry::revision);
+
+		let current = self.loaded.iter().any(|loaded| {
+			loaded.home == home
+				&& loaded.program == program
+				&& loaded.program_revision == program_revision
+		});
+
+		if current {
+			return;
+		}
+
+		jobs.push(Pending {
+			home,
+			program,
+			program_revision,
+			name: about.to_owned(),
+			script: found
+				.map(|entry| entry.value().source.clone())
+				.unwrap_or_default(),
+		});
 	}
 
 	/// Opens one scope, loads what has changed and dispatches what happened.
@@ -317,13 +389,17 @@ impl Vm {
 		let built = Self::build(lua, tables, spent, running, job);
 		let slot = loaded
 			.iter()
-			.position(|loaded| loaded.panel == job.panel);
+			.position(|loaded| loaded.home == job.home);
 
 		let handlers = match built {
 			| Ok(handlers) => {
+				// `program` rather than `document`, and it changed when the
+				// world got programs of its own: half of what this line is
+				// written about has no document at all. The panel reads as
+				// nought for those, which is `PanelId::NONE`.
 				info!(
-					document = job.name,
-					panel = job.panel.index(),
+					program = job.name,
+					panel = job.home.panel().index(),
 					handlers = handlers.is_some(),
 					"script loaded"
 				);
@@ -331,7 +407,7 @@ impl Vm {
 				handlers
 			},
 			| Err(error) => {
-				warn!(document = job.name, %error, "the document's script was not loaded");
+				warn!(program = job.name, %error, "the program was not loaded");
 
 				// the revision is recorded anyway, so a file that does not
 				// compile is reported once rather than sixty times a second.
@@ -342,7 +418,7 @@ impl Vm {
 		};
 
 		let entry = Loaded {
-			panel: job.panel,
+			home: job.home,
 			program: job.program,
 			program_revision: job.program_revision,
 			name: job.name.clone(),
@@ -360,8 +436,10 @@ impl Vm {
 
 	/// Runs one chunk in an environment of its own.
 	///
-	/// @return the table its handlers were filed in, or `None` for a document
-	/// that carries no script
+	/// @return the table its handlers were filed in, or `None` for a program
+	/// that has nowhere to file one - which is a document carrying no program
+	/// at all, and every world program, since `ui.on` is not a name one can
+	/// reach
 	fn build(
 		lua: &Lua,
 		tables: &api::Tables,
@@ -377,13 +455,38 @@ impl Vm {
 		let meta = lua.create_table()?;
 		meta.set("__index", tables.globals.clone())?;
 		environment.set_metatable(Some(meta))?;
-		environment.set("ui", tables.ui.clone())?;
-		environment.set("colby", tables.engine.clone())?;
 
-		let handlers = lua.create_table()?;
+		// a **projection** of each table rather than the table, because
+		// `Table` is a reference and handing the same one to every program
+		// makes `colby.command = nil` in one of them everybody's problem for
+		// the rest of the step. Reading falls through to the real table, so a
+		// program still sees the functions this step made; writing lands in
+		// the projection and is that program's own, and writing `nil` puts the
+		// key back to absent, which reads through again.
+		//
+		// This is the trick the one interpreter here built for untrusted code
+		// uses for each script's globals. What it does *not* cover is the
+		// standard libraries: `math`, `string` and `table` are one object
+		// each, shared, and Lua 5.4 has no way to make a table read-only. @ref
+		// `colby-known-gaps`.
+		environment.set("colby", Self::projection(lua, &tables.engine)?)?;
+		if matches!(job.home, Home::Panel(_)) {
+			environment.set("ui", Self::projection(lua, &tables.ui)?)?;
+		}
+
+		// a world program is handed nowhere to file a handler, because there is
+		// no `ui.on` in its environment to file one with. `None` rather than an
+		// empty table so that the line written about it does not claim it has
+		// handlers, and so that dispatch has one thing to check rather than
+		// two.
+		let handlers = match job.home {
+			| Home::Panel(_) => Some(lua.create_table()?),
+			| Home::World(_) => None,
+		};
+
 		*running.borrow_mut() = api::Running {
-			panel: job.panel,
-			handlers: Some(handlers.clone()),
+			panel: job.home.panel(),
+			handlers: handlers.clone(),
 			name: job.name.clone(),
 		};
 		spent.set(0);
@@ -395,7 +498,20 @@ impl Vm {
 			.set_environment(environment)
 			.exec()?;
 
-		Ok(Some(handlers))
+		Ok(handlers)
+	}
+
+	/// An empty table that reads through to another one.
+	///
+	/// @param behind - what a name not found in the projection resolves to
+	fn projection(lua: &Lua, behind: &Table) -> mlua::Result<Table> {
+		let front = lua.create_table()?;
+		let meta = lua.create_table()?;
+
+		meta.set("__index", behind.clone())?;
+		front.set_metatable(Some(meta))?;
+
+		Ok(front)
 	}
 
 	/// Hands one event to the handler that asked for it, if there is one.
@@ -407,7 +523,7 @@ impl Vm {
 	) {
 		let Some(entry) = loaded
 			.iter()
-			.find(|loaded| loaded.panel == event.panel)
+			.find(|loaded| loaded.home == Home::Panel(event.panel))
 		else {
 			return;
 		};

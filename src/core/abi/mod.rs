@@ -81,7 +81,7 @@ pub use self::{
 		Arena, Form, Link, Posed, Remap, Restored, Scene, SceneData, SceneId, Scenes, Solid,
 		Stage, Thing,
 	},
-	script::{Script, ScriptData, ScriptId, Scripts},
+	script::{Script, ScriptData, ScriptId, Scripts, WORLD_PREFIX},
 	skeleton::{
 		Bone, MAX_BONES, NO_PARENT, Skeleton, SkeletonData, SkeletonId, Skeletons, rests,
 	},
