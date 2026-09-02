@@ -126,6 +126,99 @@ pub enum Key {
 	Backquote,
 }
 
+/// Every key's name, in the order the enum declares them.
+///
+/// The one place a key's spelling is written down, so that a console command,
+/// a script and anything else that has to take one from a person all read the
+/// same words. Lowercase, because a name somebody types is not shouted, and
+/// [`Key::named`] lowercases what it is handed before it looks.
+///
+/// Written out rather than derived: the names are a *contract* with whoever
+/// types one, and a name that changed because a variant was renamed would be a
+/// configuration file that stopped working.
+const NAMES: [(&str, Key); Key::COUNT] = [
+	("a", Key::A),
+	("b", Key::B),
+	("c", Key::C),
+	("d", Key::D),
+	("e", Key::E),
+	("f", Key::F),
+	("g", Key::G),
+	("h", Key::H),
+	("i", Key::I),
+	("j", Key::J),
+	("k", Key::K),
+	("l", Key::L),
+	("m", Key::M),
+	("n", Key::N),
+	("o", Key::O),
+	("p", Key::P),
+	("q", Key::Q),
+	("r", Key::R),
+	("s", Key::S),
+	("t", Key::T),
+	("u", Key::U),
+	("v", Key::V),
+	("w", Key::W),
+	("x", Key::X),
+	("y", Key::Y),
+	("z", Key::Z),
+	("0", Key::Digit0),
+	("1", Key::Digit1),
+	("2", Key::Digit2),
+	("3", Key::Digit3),
+	("4", Key::Digit4),
+	("5", Key::Digit5),
+	("6", Key::Digit6),
+	("7", Key::Digit7),
+	("8", Key::Digit8),
+	("9", Key::Digit9),
+	("left", Key::Left),
+	("right", Key::Right),
+	("up", Key::Up),
+	("down", Key::Down),
+	("space", Key::Space),
+	("enter", Key::Enter),
+	("escape", Key::Escape),
+	("tab", Key::Tab),
+	("backspace", Key::Backspace),
+	("delete", Key::Delete),
+	("home", Key::Home),
+	("end", Key::End),
+	("shift", Key::Shift),
+	("control", Key::Control),
+	("alt", Key::Alt),
+	("super", Key::Super),
+	("f1", Key::F1),
+	("f2", Key::F2),
+	("f3", Key::F3),
+	("f4", Key::F4),
+	("f5", Key::F5),
+	("f6", Key::F6),
+	("f7", Key::F7),
+	("f8", Key::F8),
+	("f9", Key::F9),
+	("f10", Key::F10),
+	("f11", Key::F11),
+	("f12", Key::F12),
+	("minus", Key::Minus),
+	("equal", Key::Equal),
+	("bracketleft", Key::BracketLeft),
+	("bracketright", Key::BracketRight),
+	("semicolon", Key::Semicolon),
+	("quote", Key::Quote),
+	("comma", Key::Comma),
+	("period", Key::Period),
+	("slash", Key::Slash),
+	("backslash", Key::Backslash),
+	("backquote", Key::Backquote),
+];
+
+// the table and the count are written down apart, so this can actually fail: a
+// variant added without a name would leave the array one short of its own
+// declared length.
+const _: () = assert!(NAMES.len() == Key::COUNT, "every key has a name");
+
 impl Key {
 	/// How many keys are defined.
 	pub const COUNT: usize = 75;
@@ -138,6 +231,28 @@ impl Key {
 		          impl that says so"
 	)]
 	pub const fn index(self) -> usize { self as usize }
+
+	/// The key somebody means by that name.
+	///
+	/// @param name - what was typed, in any case
+	/// @return the key, or `None` if nothing answers to it
+	#[must_use]
+	pub fn named(name: &str) -> Option<Self> {
+		let wanted = name.to_ascii_lowercase();
+
+		NAMES
+			.iter()
+			.find(|(known, _)| *known == wanted)
+			.map(|(_, key)| *key)
+	}
+
+	/// What this key is called.
+	#[must_use]
+	pub fn name(self) -> &'static str {
+		NAMES
+			.get(self.index())
+			.map_or("", |(name, _)| *name)
+	}
 }
 
 /// Every mouse button colby reports.
@@ -484,6 +599,40 @@ fn pixels(value: f64) -> f32 { value as f32 }
 mod tests {
 	use super::*;
 
+	#[test]
+	fn a_key_answers_to_the_name_it_is_written_down_under() {
+		assert_eq!(Key::named("w"), Some(Key::W));
+		assert_eq!(Key::named("W"), Some(Key::W), "and to it shouted");
+		assert_eq!(Key::named("space"), Some(Key::Space));
+		assert_eq!(Key::named("f12"), Some(Key::F12));
+		assert_eq!(Key::named("5"), Some(Key::Digit5), "a digit is its own digit");
+		assert_eq!(Key::named("bracketleft"), Some(Key::BracketLeft));
+		assert_eq!(Key::named("any"), None, "and a word nobody uses is nobody's key");
+		assert_eq!(Key::named(""), None);
+	}
+
+	#[test]
+	fn a_name_and_the_key_it_names_agree_in_both_directions() {
+		// the table is indexed by the enum's own order, so a row inserted in
+		// the wrong place would give a key somebody else's name - and every
+		// lookup would still answer, just wrongly.
+		for (name, key) in NAMES {
+			assert_eq!(Key::named(name), Some(key), "{name} reads back as itself");
+			assert_eq!(key.name(), name, "and names itself the same way");
+		}
+	}
+
+	#[test]
+	fn every_name_in_the_table_is_a_different_name() {
+		// two rows sharing a spelling would make one of the two keys
+		// unreachable, and the count assertion above cannot see it.
+		let mut seen: Vec<&str> = NAMES.iter().map(|(name, _)| *name).collect();
+		let was = seen.len();
+		seen.sort_unstable();
+		seen.dedup();
+
+		assert_eq!(seen.len(), was, "no name is written twice");
+	}
 	#[test]
 	fn what_was_typed_comes_back_as_it_went_in() {
 		let mut input = Input::default();

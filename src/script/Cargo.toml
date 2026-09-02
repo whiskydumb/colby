@@ -22,5 +22,13 @@ colby_asset.workspace = true
 colby_core.workspace = true
 mlua.workspace = true
 
+# @note: the solver, and only for the tests - the same bargain the renderer has
+# with the asset crate. `World::new` installs a query table whose traces report
+# a clean miss, deliberately, so that a unit test or an offscreen capture
+# answers rather than dereferencing a null; a test *over* tracing would then be
+# a test over that stub. Nothing in the shipping graph links this.
+[dev-dependencies]
+colby_physics.workspace = true
+
 [lints]
 workspace = true

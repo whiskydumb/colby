@@ -382,6 +382,7 @@ version = "0.1.0"
 dependencies = [
  "colby_asset",
  "colby_core",
+ "colby_physics",
  "mlua",
 ]
 

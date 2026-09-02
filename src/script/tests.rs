@@ -1849,3 +1849,239 @@ fn a_program_is_told_what_met_what() {
 
 	assert_eq!(said(&world).as_deref(), Some("true"), "both names, the kind and the point");
 }
+
+/// A world with the solver's own query table installed, which is what makes a
+/// trace answer about anything at all.
+///
+/// Without it `World::new` installs a stub whose queries report a clean miss -
+/// deliberately, so that a unit test or an offscreen capture answers rather
+/// than dereferencing a null - and a test over tracing would then be a test
+/// over the stub.
+fn traced(script: &str) -> (World, Box<colby_physics::Simulation>) {
+	let mut world = running(script);
+	let simulation = Box::new(colby_physics::Simulation::new());
+
+	world.install_physics(simulation.table());
+	listen(&mut world);
+
+	(world, simulation)
+}
+
+#[test]
+fn a_trace_says_what_it_hit_and_where() {
+	let (mut world, mut simulation) = traced(
+		r#"function tick(dt)
+			local hit = colby.trace_ray(0, 10, 0, 0, -10, 0)
+			if not hit then
+				colby.command("script.said missed")
+				return
+			end
+
+			colby.command("script.said " .. tostring(
+				body.name(hit.body) == "floor" and hit.y > 0.9 and hit.y < 1.1 and hit.ny > 0.9
+			))
+		end"#,
+	);
+
+	// a wide flat box whose top is at y = 1, so a ray straight down from ten
+	// stops at a number a person can write in the assertion.
+	let floor = world.bodies.spawn(Body::new(
+		colby_core::abi::BodyKind::Static,
+		Shape::cuboid(colby_core::glam::Vec3::new(10.0, 1.0, 10.0)),
+		Transform::at(colby_core::glam::Vec3::ZERO),
+	));
+	world.bodies.set_name(floor, "floor");
+	simulation.step(&mut world);
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "the name, the height and the normal");
+}
+
+#[test]
+fn a_trace_that_hits_nothing_is_nothing() {
+	let (mut world, _simulation) = traced(
+		r#"function tick(dt)
+			colby.command("script.said " .. tostring(colby.trace_ray(0, 10, 0, 0, -10, 0)))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("nil"),
+		"which is what `if colby.trace_ray(..) then` reads"
+	);
+}
+
+#[test]
+fn a_trace_can_be_told_to_pretend_one_thing_is_not_there() {
+	// the case everybody meets first: a trace from a thing hits the thing.
+	let (mut world, mut simulation) = traced(
+		r#"function tick(dt)
+			local me = body.find("me")
+			local blind = colby.trace_ray(0, 0, 0, 0, -10, 0)
+			local seeing = colby.trace_ray(0, 0, 0, 0, -10, 0, me)
+
+			colby.command("script.said " .. tostring(
+				body.name(blind.body) == "me" and body.name(seeing.body) == "floor"
+			))
+		end"#,
+	);
+
+	let me = world.bodies.spawn(Body::new(
+		colby_core::abi::BodyKind::Static,
+		Shape::ball(1.0),
+		Transform::at(colby_core::glam::Vec3::ZERO),
+	));
+	world.bodies.set_name(me, "me");
+
+	let floor = world.bodies.spawn(Body::new(
+		colby_core::abi::BodyKind::Static,
+		Shape::cuboid(colby_core::glam::Vec3::new(10.0, 1.0, 10.0)),
+		Transform::at(colby_core::glam::Vec3::new(0.0, -6.0, 0.0)),
+	));
+	world.bodies.set_name(floor, "floor");
+	simulation.step(&mut world);
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "one saw itself, the other saw past it");
+}
+
+#[test]
+fn the_three_axes_are_the_way_a_thing_is_actually_turned() {
+	// what gameplay wants out of a rotation is "which way is this facing", and
+	// a quarter turn about y is the one case anybody can check by hand:
+	// forward, which is negative z at rest, becomes negative x.
+	let mut world = running(
+		r#"function tick(dt)
+			local it = entity.find("turned")
+			if not it then return end
+
+			local fx, fy, fz = entity.forward(it)
+			local ux, uy, uz = entity.up(it)
+			local near = function(a, b) return a - b < 0.001 and b - a < 0.001 end
+
+			colby.command("script.said " .. tostring(
+				near(fx, -1) and near(fz, 0) and near(uy, 1)
+			))
+		end"#,
+	);
+	listen(&mut world);
+
+	let turned = world.entities.spawn();
+	world.entities.set_name(turned, "turned");
+	if let Some(at) = world.entities.transform_mut(turned) {
+		at.rotation = colby_core::glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+	}
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "a quarter turn, by hand");
+}
+
+#[test]
+fn the_clock_a_program_reads_is_the_simulations_and_not_the_wall() {
+	// there is deliberately no way to ask what time it really is: a program
+	// that read a real clock would make two runs of a screenshot two
+	// pictures, which is the property the whole interpreter is arranged
+	// around.
+	let mut world = running(
+		r#"function tick(dt)
+			colby.command("script.said " .. colby.time() .. "/" .. colby.steps())
+		end"#,
+	);
+	listen(&mut world);
+	world.time = 1.25;
+	world.steps = 75;
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("1.25/75"), "simulated seconds and steps");
+}
+
+#[test]
+fn a_program_reads_this_machines_keyboard_by_name() {
+	// **the `w` here is held with its edge already gone**, which is what makes
+	// this able to fail: a key pressed this instant is both held and pressed,
+	// so a build that answered the same question twice would agree with a
+	// fixture that only ever asked about one of them.
+	let mut world = running(
+		r#"function tick(dt)
+			colby.command("script.said "
+				.. tostring(input.held("w"))
+				.. tostring(input.pressed("w"))
+				.. tostring(input.pressed("space"))
+				.. tostring(input.released("q"))
+				.. tostring(input.held("escape")))
+		end"#,
+	);
+	listen(&mut world);
+
+	world.input.set_key(colby_core::abi::Key::W, true);
+	world.input.set_key(colby_core::abi::Key::Q, true);
+	// what the step does at the bottom of every one of them: the edges
+	// describe one step and are cleared, while what is held is not.
+	world.input.end_step();
+	world
+		.input
+		.set_key(colby_core::abi::Key::Space, true);
+	world
+		.input
+		.set_key(colby_core::abi::Key::Q, false);
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("truefalsetruetruefalse"),
+		"held without its edge, an edge, a release, and one nobody touched"
+	);
+}
+
+#[test]
+fn a_key_nobody_has_is_refused_rather_than_read_as_false() {
+	// a name nothing answers to would otherwise be a condition that is
+	// quietly never true, which is the worst way for a typo to behave.
+	//
+	// The name here is a real word that is not a key rather than a misspelling
+	// of one: the spell checker reads the strings inside tests too, and a
+	// fixture holding a deliberate misspelling fails the gate.
+	let mut world = running(
+		r#"function tick(dt)
+			local ok, why = pcall(function() return input.held("pedal") end)
+			local named = tostring(why):find("pedal") ~= nil
+			colby.command("script.said " .. tostring(ok) .. tostring(named))
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("falsetrue"), "refused, quoting what was typed");
+}
+
+#[test]
+fn a_panel_has_no_input_table_either() {
+	// the same enforcement as the rest: what a panel's program is given is the
+	// interface, and this machine's keyboard is the world's business.
+	let (mut world, panel) = showing(r#"ui.set_text("out", type(input) .. type(colby.time))"#);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		written(&world, panel, "out").as_deref(),
+		Some("nilfunction"),
+		"no input, and `colby` is the one table both halves share"
+	);
+}

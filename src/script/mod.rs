@@ -715,6 +715,7 @@ impl Vm {
 			| Home::World(_) => {
 				environment.set("entity", Self::projection(lua, &tables.entities)?)?;
 				environment.set("body", Self::projection(lua, &tables.bodies)?)?;
+				environment.set("input", Self::projection(lua, &tables.input)?)?;
 			},
 		}
 
@@ -855,6 +856,7 @@ impl Vm {
 			engine: lua.create_table()?,
 			entities: lua.create_table()?,
 			bodies: lua.create_table()?,
+			input: lua.create_table()?,
 			globals,
 		})
 	}

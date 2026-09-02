@@ -53,8 +53,8 @@ use std::cell::RefCell;
 use colby_asset::css;
 use colby_core::{
 	abi::{
-		Body, BodyKind, Layers, MaterialId, Renderable, Shape, Transform, World, console,
-		ui::PanelId,
+		Body, BodyKind, Key, Layers, MaterialId, Renderable, Shape, TraceInfo, Transform, World,
+		console, ui::PanelId,
 	},
 	glam::{EulerRot, Quat, Vec3},
 	info, warn,
@@ -62,6 +62,14 @@ use colby_core::{
 use mlua::{Function, Result, Scope, Table, Value, Variadic};
 
 use crate::handle::{Handle, Kind};
+
+/// What a swept box is asked with: from, to, half-extents, and one body to
+/// pretend is not there.
+///
+/// A named type because ten arguments in a closure's signature is what the
+/// lint asks to be given a name, and because the order is worth writing down
+/// once rather than reading out of a tuple.
+type Swept = (f32, f32, f32, f32, f32, f32, f32, f32, f32, Option<i64>);
 
 /// Three numbers, or three nothings.
 ///
@@ -118,6 +126,9 @@ pub(crate) struct Tables {
 	/// `body` - the same over the solver's table.
 	pub(crate) bodies: Table,
 
+	/// `input` - this machine's keyboard and mouse.
+	pub(crate) input: Table,
+
 	/// What every environment inherits: `string`, `table`, `math`, `print` and
 	/// a handful of base functions.
 	pub(crate) globals: Table,
@@ -151,6 +162,8 @@ where
 	moving(scope, tables, world)?;
 	resting(scope, tables, world)?;
 	touching(scope, tables, world)?;
+	asking(scope, tables, world)?;
+	typing(scope, tables, world)?;
 
 	Ok(())
 }
@@ -1031,6 +1044,201 @@ where
 	})?;
 
 	tables.bodies.set("touches", touches)?;
+
+	Ok(())
+}
+
+/// `colby.trace_*` and the three axes - what a program asks the world.
+///
+/// A trace hands back a **table**, or nothing at all on a miss. The rule is the
+/// one `touches` follows: a handful of these happen a step rather than
+/// hundreds, and what comes back has six named parts that almost nobody wants
+/// positionally. A miss is `nil` rather than a table saying so, because
+/// `if colby.trace_ray(..) then` is how it reads and because the caller already
+/// has the end point - it passed one in.
+///
+/// **No layer filter yet.** What a trace can be told is one body to pretend is
+/// not there, which is the case everybody meets first: a trace from a thing
+/// hits the thing. Seeing *through* a whole class of things wants the mask, and
+/// that is not here.
+fn asking<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	let ray = scope.create_function(
+		move |lua,
+		      (x1, y1, z1, x2, y2, z2, ignore): (f32, f32, f32, f32, f32, f32, Option<i64>)| {
+			let world = world.borrow();
+			let info =
+				ignoring(TraceInfo::ray(Vec3::new(x1, y1, z1), Vec3::new(x2, y2, z2)), ignore)?;
+
+			reported(lua, &world.trace_ray(&info))
+		},
+	)?;
+
+	let sweep = scope.create_function(
+		move |lua, (x1, y1, z1, x2, y2, z2, hx, hy, hz, ignore): Swept| {
+			let world = world.borrow();
+			let info = ignoring(
+				TraceInfo::swept(
+					Vec3::new(x1, y1, z1),
+					Vec3::new(x2, y2, z2),
+					Vec3::new(hx, hy, hz),
+				),
+				ignore,
+			)?;
+
+			reported(lua, &world.trace_box(&info))
+		},
+	)?;
+
+	// simulated seconds and steps, not the wall clock. There is deliberately
+	// no way to ask what time it is: a program that read a real clock would
+	// make two runs of `--shot` two pictures, which is the property the whole
+	// interpreter is arranged around.
+	let time = scope.create_function(move |_, ()| Ok(world.borrow().time))?;
+	let steps = scope.create_function(move |_, ()| Ok(world.borrow().steps))?;
+	let editing = scope.create_function(move |_, ()| Ok(world.borrow().editing))?;
+
+	tables.engine.set("trace_ray", ray)?;
+	tables.engine.set("trace_box", sweep)?;
+	tables.engine.set("time", time)?;
+	tables.engine.set("steps", steps)?;
+	tables.engine.set("editing", editing)?;
+
+	// the three axes a thing is turned along, which is what gameplay actually
+	// wants out of a rotation: "which way is this facing" rather than "what
+	// four numbers is it". Exact, and three multiplies rather than the trig a
+	// program would otherwise write against the angles.
+	for (name, axis) in [("forward", Vec3::NEG_Z), ("up", Vec3::Y), ("right", Vec3::X)] {
+		let along = scope.create_function(move |_, bits: Option<i64>| {
+			let Some(handle) = taken(bits, Kind::Entity)? else {
+				return Ok(NOTHING);
+			};
+
+			Ok(world
+				.borrow()
+				.entities
+				.transform(handle.entity())
+				.map_or(NOTHING, |at| {
+					let way = at.rotation * axis;
+
+					triple(way.x, way.y, way.z)
+				}))
+		})?;
+
+		tables.entities.set(name, along)?;
+	}
+
+	Ok(())
+}
+
+/// Adds the one body a trace is told to pretend is not there.
+fn ignoring(info: TraceInfo, ignore: Option<i64>) -> Result<TraceInfo> {
+	let Some(handle) = taken(ignore, Kind::Body)? else {
+		return Ok(info);
+	};
+
+	Ok(info.ignoring(handle.body()))
+}
+
+/// What a trace hands back, or nothing at all.
+fn reported(lua: &mlua::Lua, result: &colby_core::abi::TraceResult) -> Result<Option<Table>> {
+	if !result.hit {
+		return Ok(None);
+	}
+
+	let out = lua.create_table()?;
+
+	out.set("body", Handle::of_body(result.body).to_bits())?;
+	out.set("entity", Handle::of_entity(result.entity).to_bits())?;
+	out.set("x", result.end.x)?;
+	out.set("y", result.end.y)?;
+	out.set("z", result.end.z)?;
+	out.set("nx", result.normal.x)?;
+	out.set("ny", result.normal.y)?;
+	out.set("nz", result.normal.z)?;
+	out.set("fraction", result.fraction)?;
+	out.set("inside", result.started_solid)?;
+
+	Ok(Some(out))
+}
+
+/// `input` - this machine's keyboard and mouse, and nobody else's.
+///
+/// **What is here crosses to nothing.** A key held on one machine means nothing
+/// on another, and what a host is told about somebody else's hands is a
+/// `Command` rather than this - so a program that moves a player with these
+/// works on a machine playing alone and on a host, and does nothing at all on a
+/// client, where the host decides. @ref `colby-networking`.
+fn typing<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	// a key is named rather than numbered, and the names are the engine's own
+	// - one spelling in the process, so a program and a config file mean the
+	// same thing by `w`. @ref `colby_core::abi::Key::named`.
+	for (name, ask) in [("held", 0_u8), ("pressed", 1), ("released", 2)] {
+		let asked = scope.create_function(move |_, key: String| {
+			let Some(key) = Key::named(&key) else {
+				return Err(mlua::Error::runtime(format!("`{key}` is not a key colby knows")));
+			};
+
+			let world = world.borrow();
+
+			Ok(match ask {
+				| 0 => world.input.held(key),
+				| 1 => world.input.pressed(key),
+				| _ => world.input.released(key),
+			})
+		})?;
+
+		tables.input.set(name, asked)?;
+	}
+
+	for (name, ask) in [("mouse_held", 0_u8), ("mouse_pressed", 1), ("mouse_released", 2)] {
+		let asked = scope.create_function(move |_, which: String| {
+			let button = match which.as_str() {
+				| "left" => colby_core::abi::Button::Left,
+				| "right" => colby_core::abi::Button::Right,
+				| "middle" => colby_core::abi::Button::Middle,
+				| other => {
+					return Err(mlua::Error::runtime(format!(
+						"`{other}` is not a button; colby has left, right and middle"
+					)));
+				},
+			};
+
+			let world = world.borrow();
+
+			Ok(match ask {
+				| 0 => world.input.button_held(button),
+				| 1 => world.input.button_pressed(button),
+				| _ => world.input.button_released(button),
+			})
+		})?;
+
+		tables.input.set(name, asked)?;
+	}
+
+	let cursor = scope.create_function(move |_, ()| {
+		let world = world.borrow();
+
+		Ok((world.input.cursor[0], world.input.cursor[1]))
+	})?;
+
+	let wheel = scope.create_function(move |_, ()| Ok(world.borrow().input.wheel))?;
+
+	tables.input.set("cursor", cursor)?;
+	tables.input.set("wheel", wheel)?;
 
 	Ok(())
 }
