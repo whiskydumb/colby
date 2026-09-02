@@ -12,6 +12,23 @@
 //! has no `ui` at all, and a name nobody declared is `nil`, which is Lua's own
 //! answer to being asked for something that is not there.
 //!
+//! **The two halves run at two different moments, and that is the whole reason
+//! there are two entry points.** [`Vm::interface`] runs where the interface
+//! does, before the physics and *outside* the edit-mode guard, because laying
+//! out and answering a click is not moving the world. [`Vm::gameplay`] runs
+//! where the game's `update` does, after it and *inside* the guard, because a
+//! world program is gameplay written in Lua and edit mode stops gameplay. A
+//! world program is therefore neither loaded nor ticked while somebody is
+//! editing - which is the same promise the game module already has.
+//!
+//! **A world program is ticked, and a panel's is not.** `function tick(dt)` in
+//! a program under `scripts/` is called once a step; the same function in a
+//! document's program is a complaint at load, because a document that has to
+//! run every step is gameplay that has been put in the wrong place. What the
+//! tick is read from is the program's own environment, once a step, so a
+//! program that writes `tick = nil` stops being ticked - including from inside
+//! its own tick.
+//!
 //! Four decisions are written into the shape of the module, and each was taken
 //! against a plausible alternative.
 //!
@@ -64,7 +81,7 @@ use colby_core::{
 	abi::{EventKind, PanelId, ScriptId, Scripts, World, ui::Event},
 	err, info, trace, warn,
 };
-use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 
 mod api;
 
@@ -179,6 +196,32 @@ struct Loaded {
 	/// Its handlers, or `None` for a program that registered none - which is
 	/// every world program, since `ui.on` is not something one can reach.
 	handlers: Option<Table>,
+	/// The table its chunk ran in, kept so that `tick` can be read out of it
+	/// once a step.
+	///
+	/// Read every step rather than resolved once, which costs one lookup and
+	/// buys a program the ability to stop itself: writing `tick = nil` from
+	/// inside its own tick is a program that ran once and is done.
+	environment: Option<Table>,
+	/// Whether the chunk left a `tick` behind. Only the early return reads
+	/// this - the call itself asks the environment - so it is a hint rather
+	/// than an authority.
+	ticks: bool,
+	/// Whether it has been stopped until it is built again.
+	///
+	/// Set by a tick that spent its whole budget, and by nothing else. An
+	/// ordinary error is cheap and is counted; a budget overrun costs a full
+	/// [`BUDGET`] every step for as long as nobody looks, which is the one
+	/// failure worth switching off. Editing the file or `script.reload` builds
+	/// a fresh entry, and a fresh entry is not muted.
+	muted: bool,
+	/// How many times its tick has failed since it was built.
+	faults: u32,
+	/// Roughly how many instructions its last tick spent.
+	///
+	/// Rounded up to a multiple of [`GRAIN`], because that is how often the
+	/// interpreter stops to count.
+	instructions: u32,
 }
 
 /// A program that has to be built, or built again.
@@ -188,6 +231,18 @@ struct Pending {
 	program_revision: u32,
 	name: String,
 	script: String,
+}
+
+/// What running one chunk left behind.
+struct Built {
+	/// Where `ui.on` filed things, or `None` for a program that has no `ui`.
+	handlers: Option<Table>,
+
+	/// The table the chunk ran in.
+	environment: Table,
+
+	/// Whether it left a `tick` behind.
+	ticks: bool,
 }
 
 /// One event waiting for a handler.
@@ -231,29 +286,53 @@ impl Vm {
 		Ok(Self { lua, tables, loaded: Vec::new(), spent })
 	}
 
-	/// Runs whatever the interface has for the scripts this step.
+	/// Runs whatever the interface has for its programs this step.
 	///
-	/// Loads or reloads any document whose entry has moved, then hands this
+	/// Loads or reloads any panel whose program has moved, then hands this
 	/// step's events to the handlers that asked for them. Called by the host
-	/// from inside the step. @ref the module docs for why it is there.
+	/// from inside the step, before the physics and outside the edit-mode
+	/// guard. @ref the module docs for why it is there.
 	///
 	/// @param world - the interface to serve, and to write through
-	pub fn update(&mut self, world: &mut World) {
-		let pending = self.pending(world);
+	pub fn interface(&mut self, world: &mut World) {
+		let pending = self.pending_panels(world);
 
 		if pending.is_empty() && world.ui.events().is_empty() {
 			return;
 		}
 
-		self.serve(world, &pending);
+		self.serve(world, &pending, false);
 	}
 
-	/// Every program that is missing or out of date, panels first.
+	/// Runs whatever the world has for its own programs this step.
 	///
-	/// Panels first because that is the order the step runs in anyway, and
-	/// within each half it is slot order - the order the compiler walked the
-	/// tree in, which is sorted. Nothing here depends on a hash.
-	fn pending(&self, world: &World) -> Vec<Pending> {
+	/// Loads or reloads any program under `scripts/` that has moved, then ticks
+	/// every one of them that asked to be. Called by the host from inside the
+	/// step, after the game's `update` and inside the edit-mode guard.
+	///
+	/// @param world - the world to run against, and to write through
+	pub fn gameplay(&mut self, world: &mut World) {
+		let pending = self.pending_world(world);
+
+		if pending.is_empty() && !self.anything_ticks() {
+			return;
+		}
+
+		self.serve(world, &pending, true);
+	}
+
+	/// Whether any loaded program would be called if a step ticked now.
+	///
+	/// The early return above, and the reason a tree with no world programs in
+	/// it pays nothing at all for this: no scope is opened and no api is built.
+	fn anything_ticks(&self) -> bool {
+		self.loaded
+			.iter()
+			.any(|loaded| loaded.ticks && !loaded.muted)
+	}
+
+	/// The panels whose program is missing or out of date.
+	fn pending_panels(&self, world: &World) -> Vec<Pending> {
 		let mut jobs = Vec::new();
 
 		for (panel, shown) in world.ui.panels() {
@@ -273,6 +352,17 @@ impl Vm {
 				&mut jobs,
 			);
 		}
+
+		jobs
+	}
+
+	/// The world's own programs that are missing or out of date.
+	///
+	/// Slot order, which is the order the compiler walked the tree in, which is
+	/// sorted. Nothing here depends on a hash, which matters because a
+	/// screenshot runs these.
+	fn pending_world(&self, world: &World) -> Vec<Pending> {
+		let mut jobs = Vec::new();
 
 		for entry in world.scripts.iter() {
 			if !Scripts::is_world(entry.name()) {
@@ -333,9 +423,10 @@ impl Vm {
 	/// script reaches the engine through are made here and destroyed when this
 	/// returns, and making them six times over for six events would be six
 	/// times the work for the same answer.
-	fn serve(&mut self, world: &mut World, pending: &[Pending]) {
+	fn serve(&mut self, world: &mut World, pending: &[Pending], ticking: bool) {
 		let Self { lua, tables, loaded, spent } = self;
-		let events = Self::waiting(world);
+		let events = if ticking { Vec::new() } else { Self::waiting(world) };
+		let dt = world.dt;
 		let world = RefCell::new(world);
 		let running = RefCell::new(api::Running::default());
 
@@ -350,12 +441,132 @@ impl Vm {
 				Self::dispatch(loaded, spent, &running, event);
 			}
 
+			if ticking {
+				Self::tick_all(loaded, spent, &running, dt);
+			}
+
 			Ok(())
 		});
 
 		if let Err(error) = outcome {
-			warn!(%error, "the interface scripts could not be given their api this step");
+			warn!(%error, "the scripts could not be given their api this step");
 		}
+	}
+
+	/// Calls every world program that asked to be called.
+	///
+	/// In the order they are loaded in, which is the order the table was walked
+	/// in, which is sorted by name. A program that fails is counted and told
+	/// about once; one that spends its whole budget is switched off until it is
+	/// built again, because that failure costs the budget every step and an
+	/// ordinary one costs nothing.
+	fn tick_all(
+		loaded: &mut [Loaded],
+		spent: &Cell<u32>,
+		running: &RefCell<api::Running>,
+		dt: f32,
+	) {
+		for entry in loaded.iter_mut() {
+			if entry.muted || !entry.ticks {
+				continue;
+			}
+
+			Self::tick_one(entry, spent, running, dt);
+		}
+	}
+
+	/// Calls one program's tick and records what it cost.
+	///
+	/// Its own function because the two failures want three levels of block
+	/// between them and that is the shape a lint refuses; it is also the half
+	/// worth naming, since the loop above is only "who" and this is "what
+	/// happens to them".
+	fn tick_one(entry: &mut Loaded, spent: &Cell<u32>, running: &RefCell<api::Running>, dt: f32) {
+		let Some(called) = Self::tick_of(entry) else {
+			return;
+		};
+
+		*running.borrow_mut() = api::Running {
+			panel: entry.home.panel(),
+			handlers: entry.handlers.clone(),
+			name: entry.name.clone(),
+		};
+		spent.set(0);
+
+		let outcome = called.call::<()>(dt);
+		entry.instructions = spent.get();
+
+		let Err(error) = outcome else {
+			return;
+		};
+
+		entry.faults = entry.faults.saturating_add(1);
+
+		// **the budget is told apart from an ordinary error by the counter
+		// rather than by the message.** The hook is the only thing that can
+		// push the count past the ceiling, so a count above it means the hook
+		// stopped this call - no string to match and nothing to keep in step
+		// with the message.
+		if entry.instructions > BUDGET {
+			entry.muted = true;
+
+			warn!(
+				program = entry.name,
+				instructions = entry.instructions,
+				"spent its whole budget in one tick and was switched off; edit it or run \
+				 `script.reload` to start it again"
+			);
+		} else if entry.faults == 1 {
+			warn!(program = entry.name, %error, "a tick failed");
+		}
+	}
+
+	/// The function a program wants called this step, if it still wants one.
+	///
+	/// Read out of the environment rather than resolved once at load, which is
+	/// what lets a program stop itself by writing `tick = nil` - including from
+	/// inside its own tick.
+	fn tick_of(entry: &mut Loaded) -> Option<Function> {
+		let environment = entry.environment.as_ref()?;
+
+		match environment.get::<Value>("tick") {
+			| Ok(Value::Function(tick)) => Some(tick),
+			// a program that wrote `tick = nil`, from its own tick or
+			// anywhere else, has said it is done.
+			| Ok(_) => None,
+			| Err(error) => {
+				entry.faults = entry.faults.saturating_add(1);
+				if entry.faults == 1 {
+					warn!(program = entry.name, %error, "the tick could not be read");
+				}
+
+				None
+			},
+		}
+	}
+
+	/// Writes a line per program the interpreter is running.
+	///
+	/// What `script.status` asks for. Written from here rather than from the
+	/// command itself because these numbers are the interpreter's, while a
+	/// [`ConsoleFn`](colby_core::abi::ConsoleFn) is handed nothing but a
+	/// world. So the command leaves a mark and the next step answers it, which
+	/// is the shape a scene load already has.
+	pub fn report(&self) {
+		for entry in &self.loaded {
+			info!(
+				program = entry.name,
+				world = matches!(entry.home, Home::World(_)),
+				ticks = entry.ticks,
+				muted = entry.muted,
+				faults = entry.faults,
+				instructions = entry.instructions,
+				budget = BUDGET,
+				"status"
+			);
+		}
+
+		info!(programs = self.loaded.len(), "running");
 	}
 
 	/// This step's events, in the order they happened.
@@ -391,8 +602,8 @@ impl Vm {
 			.iter()
 			.position(|loaded| loaded.home == job.home);
 
-		let handlers = match built {
-			| Ok(handlers) => {
+		let kept = match built {
+			| Ok(built) => {
 				// `program` rather than `document`, and it changed when the
 				// world got programs of its own: half of what this line is
 				// written about has no document at all. The panel reads as
@@ -400,20 +611,31 @@ impl Vm {
 				info!(
 					program = job.name,
 					panel = job.home.panel().index(),
-					handlers = handlers.is_some(),
+					handlers = built
+						.as_ref()
+						.is_some_and(|built| built.handlers.is_some()),
+					ticks = built.as_ref().is_some_and(|built| built.ticks),
 					"script loaded"
 				);
 
-				handlers
+				built
 			},
 			| Err(error) => {
 				warn!(program = job.name, %error, "the program was not loaded");
 
 				// the revision is recorded anyway, so a file that does not
 				// compile is reported once rather than sixty times a second.
-				// The next edit moves it again and it is tried again.
+				// The next edit moves it again and it is tried again. What the
+				// last build left running is left running, which is what the
+				// shader watcher does with a file the compiler refuses.
 				slot.and_then(|slot| loaded.get(slot))
-					.and_then(|loaded| loaded.handlers.clone())
+					.and_then(|loaded| {
+						Some(Built {
+							handlers: loaded.handlers.clone(),
+							environment: loaded.environment.clone()?,
+							ticks: loaded.ticks,
+						})
+					})
 			},
 		};
 
@@ -422,7 +644,18 @@ impl Vm {
 			program: job.program,
 			program_revision: job.program_revision,
 			name: job.name.clone(),
-			handlers,
+			handlers: kept
+				.as_ref()
+				.and_then(|built| built.handlers.clone()),
+			environment: kept
+				.as_ref()
+				.map(|built| built.environment.clone()),
+			ticks: kept.as_ref().is_some_and(|built| built.ticks),
+			// a fresh entry is never muted, which is what makes editing the
+			// file the way back from a budget somebody blew.
+			muted: false,
+			faults: 0,
+			instructions: 0,
 		};
 
 		match slot {
@@ -436,17 +669,15 @@ impl Vm {
 
 	/// Runs one chunk in an environment of its own.
 	///
-	/// @return the table its handlers were filed in, or `None` for a program
-	/// that has nowhere to file one - which is a document carrying no program
-	/// at all, and every world program, since `ui.on` is not a name one can
-	/// reach
+	/// @return what the chunk left behind, or `None` for a program with nothing
+	/// in it at all
 	fn build(
 		lua: &Lua,
 		tables: &api::Tables,
 		spent: &Cell<u32>,
 		running: &RefCell<api::Running>,
 		job: &Pending,
-	) -> mlua::Result<Option<Table>> {
+	) -> mlua::Result<Option<Built>> {
 		if job.script.trim().is_empty() {
 			return Ok(None);
 		}
@@ -495,10 +726,28 @@ impl Vm {
 		// quoting the whole chunk back at whoever is reading the log.
 		lua.load(job.script.as_str())
 			.set_name(format!("@{}", job.name))
-			.set_environment(environment)
+			.set_environment(environment.clone())
 			.exec()?;
 
-		Ok(handlers)
+		// a panel's program is interface logic and is answered by events; one
+		// that wants a step is gameplay in the wrong place, and saying so at
+		// load is cheaper than a `tick` that is never called and never
+		// explained.
+		let ticks = matches!(environment.get::<Value>("tick"), Ok(Value::Function(_)));
+		if ticks && matches!(job.home, Home::Panel(_)) {
+			warn!(
+				program = job.name,
+				"a document's program is not ticked; a program that has to run every step \
+				 belongs under `{}`",
+				colby_core::abi::WORLD_PREFIX
+			);
+		}
+
+		Ok(Some(Built {
+			handlers,
+			environment,
+			ticks: ticks && matches!(job.home, Home::World(_)),
+		}))
 	}
 
 	/// An empty table that reads through to another one.
@@ -577,7 +826,7 @@ impl Vm {
 		let globals = lua.create_table()?;
 
 		for name in BASE.iter().chain(CONVERSIONS.iter()) {
-			let value: mlua::Value = standard.get(*name)?;
+			let value: Value = standard.get(*name)?;
 			globals.set(*name, value)?;
 		}
 

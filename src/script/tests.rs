@@ -69,6 +69,17 @@ fn document(program: &str) -> DocumentData {
 	}
 }
 
+/// One whole step's worth of the interpreter, which is two calls.
+///
+/// The step drives the two halves at two different moments - the interface
+/// before the physics and the world's own after the game's `update` - and
+/// almost every test here is about what one step does, so this is the fixture
+/// rather than either half on its own.
+fn stepped(scripts: &mut Vm, world: &mut World) {
+	scripts.interface(world);
+	scripts.gameplay(world);
+}
+
 /// Puts one event in the queue, the way the interface does.
 fn happened(world: &mut World, panel: PanelId, node: &str, kind: EventKind) {
 	world
@@ -91,9 +102,9 @@ fn a_document_with_no_script_is_not_a_failure() {
 	let (mut world, panel) = showing("");
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "hold", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(scripts.loaded.len(), 1, "the panel is known, so it is not looked at again");
 	assert!(scripts.loaded[0].handlers.is_none(), "with nothing to hand an event to");
@@ -105,11 +116,11 @@ fn a_click_reaches_the_handler_that_asked_for_it() {
 		showing(r#"ui.on("hold", "click", function() ui.set_text("hold", "holding") end)"#);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	assert_eq!(written(&world, panel, "hold"), None, "nothing has happened yet");
 
 	happened(&mut world, panel, "hold", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "hold").as_deref(),
@@ -127,11 +138,11 @@ fn a_handler_can_read_a_field_back_and_not_only_write_to_it() {
 	);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	world.ui.set_text(panel, "hold", "typed");
 
 	happened(&mut world, panel, "hold", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "hold").as_deref(),
@@ -146,9 +157,9 @@ fn a_handler_answers_only_the_kind_it_registered() {
 		showing(r#"ui.on("hold", "click", function() ui.set_text("hold", "clicked") end)"#);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "hold", EventKind::Press);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "hold"),
@@ -164,9 +175,9 @@ fn the_handler_is_told_which_node_and_which_kind() {
 	);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "a", EventKind::Press);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "out").as_deref(),
@@ -180,7 +191,7 @@ fn editing_the_program_replaces_it() {
 	let (mut world, panel) =
 		showing(r#"ui.on("hold", "click", function() ui.set_text("hold", "first") end)"#);
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	// what the compiler does when the file is edited: the same name, a new
 	// value, and an entry whose revision has moved.
@@ -189,9 +200,9 @@ fn editing_the_program_replaces_it() {
 		r#"ui.on("hold", "click", function() ui.set_text("hold", "second") end)"#,
 	);
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "hold", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "hold").as_deref(),
@@ -216,7 +227,7 @@ fn rewriting_the_document_does_not_restart_a_program_that_did_not_change() {
 	let (mut world, panel) =
 		showing(r#"ui.set_text("out", tostring((tonumber(ui.text("out")) or 0) + 1))"#);
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	// the same name, a different document, a revision that moved.
 	let mut restyled = document("ui/test");
@@ -225,7 +236,7 @@ fn rewriting_the_document_does_not_restart_a_program_that_did_not_change() {
 		.push(colby_core::abi::ui::Rule::default());
 	world.ui.insert("ui/test", restyled);
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "out").as_deref(),
@@ -244,10 +255,10 @@ fn a_document_that_names_something_else_runs_something_else() {
 		source: r#"ui.set_text("out", "the second")"#.to_owned(),
 	});
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	world.ui.insert("ui/test", document("ui/other"));
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "out").as_deref(),
@@ -268,13 +279,13 @@ fn a_program_that_arrives_after_the_document_is_picked_up() {
 	let panel = world.ui.show("ui/test");
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	assert!(written(&world, panel, "out").is_none(), "there was nothing to run");
 
 	world.scripts.insert("ui/late", ScriptData {
 		source: r#"ui.set_text("out", "here")"#.to_owned(),
 	});
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "out").as_deref(),
@@ -288,12 +299,12 @@ fn what_a_script_wrote_outlives_the_document_it_came_from() {
 	let (mut world, panel) =
 		showing(r#"ui.on("score", "click", function() ui.set_text("score", "1200") end)"#);
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "score", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	rewritten(&mut world, "-- nothing at all");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "score").as_deref(),
@@ -308,13 +319,13 @@ fn a_program_that_does_not_compile_leaves_the_last_one_running() {
 	let (mut world, panel) =
 		showing(r#"ui.on("hold", "click", function() ui.set_text("hold", "working") end)"#);
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	rewritten(&mut world, "function (");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	happened(&mut world, panel, "hold", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "hold").as_deref(),
@@ -328,9 +339,9 @@ fn a_broken_program_is_reported_once_rather_than_every_step() {
 	let (mut world, _) = showing("function (");
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	let after = scripts.loaded[0].program_revision;
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(scripts.loaded.len(), 1, "one panel, one entry");
 	assert_eq!(
@@ -350,9 +361,9 @@ fn a_handler_that_will_not_stop_is_stopped() {
 	);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "a", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "a").as_deref(),
@@ -374,9 +385,9 @@ fn a_handler_that_asks_for_more_memory_than_it_may_have_is_stopped() {
 	);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "a", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "a").as_deref(),
@@ -394,7 +405,7 @@ fn a_script_cannot_reach_the_filesystem_or_the_clock() {
 	);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		classes(&world, panel, "out").as_deref(),
@@ -411,7 +422,7 @@ fn a_script_has_the_libraries_it_needs_to_be_useful() {
 	);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "out").as_deref(),
@@ -438,7 +449,7 @@ fn two_documents_do_not_share_their_globals() {
 	let second = world.ui.show("ui/second");
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert!(first != second, "two documents are two panels");
 	assert_eq!(
@@ -456,10 +467,10 @@ fn two_interpreters_roll_the_same_dice() {
 
 	Vm::new()
 		.expect("the interpreter starts")
-		.update(&mut first);
+		.interface(&mut first);
 	Vm::new()
 		.expect("the interpreter starts")
-		.update(&mut second);
+		.interface(&mut second);
 
 	assert_eq!(
 		written(&first, one, "out"),
@@ -478,9 +489,9 @@ fn a_handler_can_ask_the_console_for_something() {
 		.var("test.value", Value::Int(0), "a number for a test to move");
 
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "go", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		world.cvars.int("test.value"),
@@ -498,9 +509,9 @@ fn an_event_nobody_has_is_refused_when_it_is_registered() {
 	);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	happened(&mut world, panel, "a", EventKind::Click);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		written(&world, panel, "a"),
@@ -515,7 +526,7 @@ fn a_style_written_from_a_script_is_read_by_the_same_parser_the_document_uses() 
 	let (mut world, panel) = showing(r#"ui.set_style("fill", "width: 37%")"#);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	let width = world
 		.ui
@@ -539,7 +550,7 @@ fn a_script_is_only_run_when_something_it_was_built_from_has_moved() {
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
 	for _ in 0..8 {
-		scripts.update(&mut world);
+		stepped(&mut scripts, &mut world);
 	}
 
 	assert_eq!(
@@ -559,7 +570,7 @@ fn a_program_under_the_world_directory_runs_with_nobody_showing_it() {
 	listen(&mut world);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(said(&world).as_deref(), Some("hello"), "the chunk ran");
 	assert_eq!(scripts.loaded.len(), 1, "and one program is being kept track of");
@@ -576,7 +587,7 @@ fn a_program_outside_that_directory_is_not_the_worlds_to_run() {
 	});
 
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(said(&world).as_deref(), Some(""), "nobody ran it");
 	assert!(scripts.loaded.is_empty(), "and there is nothing to keep track of");
@@ -591,7 +602,7 @@ fn a_world_program_has_no_panel_to_write_to() {
 	listen(&mut world);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(said(&world).as_deref(), Some("nil"), "there is no `ui` in the environment");
 }
@@ -601,12 +612,12 @@ fn editing_a_world_program_runs_it_again() {
 	let mut world = running(r#"colby.command("script.said first")"#);
 	listen(&mut world);
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	world.scripts.insert("scripts/test", ScriptData {
 		source: r#"colby.command("script.said second")"#.to_owned(),
 	});
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(said(&world).as_deref(), Some("second"), "the new one ran");
 	assert_eq!(scripts.loaded.len(), 1, "and replaced the old rather than standing beside it");
@@ -626,7 +637,7 @@ fn a_world_program_is_run_once_and_not_every_step() {
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
 	for _ in 0..8 {
-		scripts.update(&mut world);
+		stepped(&mut scripts, &mut world);
 	}
 
 	assert_eq!(said(&world).as_deref(), Some("once"), "eight steps, and it ran");
@@ -640,15 +651,15 @@ fn touching_a_program_is_what_makes_it_run_again() {
 	let mut world = running(r#"colby.command("script.said " .. tostring(colby.command ~= nil))"#);
 	listen(&mut world);
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	world.cvars.set("script.said", "cleared");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 	assert_eq!(said(&world).as_deref(), Some("cleared"), "nothing moved, so nothing ran");
 
 	let id = world.scripts.find("scripts/test");
 	assert!(world.scripts.touch(id), "and now it is asked for again");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(said(&world).as_deref(), Some("true"), "so the same source ran a second time");
 }
@@ -674,7 +685,7 @@ fn two_programs_do_not_share_the_tables_the_engine_gives_them() {
 		});
 
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(
 		said(&world).as_deref(),
@@ -689,8 +700,8 @@ fn a_world_program_that_will_not_compile_is_reported_and_left_alone() {
 	listen(&mut world);
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(scripts.loaded.len(), 1, "one program, one entry");
 	assert!(scripts.loaded[0].handlers.is_none(), "and nothing was built out of it");
@@ -703,7 +714,7 @@ fn a_world_program_files_no_handlers_because_it_has_nowhere_to_file_one() {
 	let mut world = running("-- a program that does nothing at all");
 	let mut scripts = Vm::new().expect("the interpreter starts");
 
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert_eq!(scripts.loaded.len(), 1, "it ran");
 	assert!(scripts.loaded[0].handlers.is_none(), "and filed nothing");
@@ -725,8 +736,281 @@ fn a_panel_and_the_world_are_two_programs_even_over_one_name() {
 	let panel = world.ui.show("ui/test");
 
 	let mut scripts = Vm::new().expect("the interpreter starts");
-	scripts.update(&mut world);
+	stepped(&mut scripts, &mut world);
 
 	assert!(panel.is_some(), "the panel resolved");
 	assert_eq!(scripts.loaded.len(), 2, "one program, two homes: the panel's and the world's");
+}
+
+#[test]
+fn a_world_program_is_called_once_a_step() {
+	// the door step thirteen deliberately kept shut, and the whole of this
+	// commit. The counter is in a console variable rather than in a local
+	// because a rebuild would hand the chunk a fresh environment - but here
+	// that is also the assertion, since a program that were rebuilt each step
+	// would count one every time.
+	let mut world = running(
+		r#"local ran = 0
+		function tick(dt)
+			ran = ran + 1
+			colby.command("script.said " .. ran)
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	for _ in 0..5 {
+		stepped(&mut scripts, &mut world);
+	}
+
+	assert_eq!(said(&world).as_deref(), Some("5"), "five steps, five calls, one program");
+}
+
+#[test]
+fn a_tick_is_handed_the_length_of_a_step() {
+	let mut world = running(r#"function tick(dt) colby.command("script.said " .. dt) end"#);
+	listen(&mut world);
+	world.dt = 0.25;
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("0.25"), "which is what the step is on");
+}
+
+#[test]
+fn a_program_that_wants_no_tick_is_not_called_and_costs_nothing() {
+	let mut world = running("-- a program that runs once and is done");
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(scripts.loaded.len(), 1, "it ran");
+	assert!(!scripts.loaded[0].ticks, "and asked for nothing further");
+	assert!(!scripts.anything_ticks(), "so no step opens a scope for it");
+}
+
+#[test]
+fn a_program_can_stop_itself_by_forgetting_its_own_tick() {
+	// what reading the tick out of the environment every step buys, against
+	// resolving it once at load. A program that has finished says so.
+	let mut world = running(
+		r#"function tick(dt)
+			colby.command("script.said once")
+			tick = nil
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+	world.cvars.set("script.said", "cleared");
+
+	for _ in 0..4 {
+		stepped(&mut scripts, &mut world);
+	}
+
+	assert_eq!(said(&world).as_deref(), Some("cleared"), "it was not called again");
+}
+
+#[test]
+fn a_document_that_asks_for_a_tick_is_told_where_a_tick_belongs() {
+	// not refused - the rest of the program is fine and its handlers work -
+	// but not called either, and said out loud rather than left as a function
+	// nobody explains.
+	let (mut world, panel) = showing(r#"function tick(dt) ui.set_text("out", "ticked") end"#);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	for _ in 0..4 {
+		stepped(&mut scripts, &mut world);
+	}
+
+	assert_eq!(scripts.loaded.len(), 1, "the panel's program loaded");
+	assert!(!scripts.loaded[0].ticks, "and is not ticked");
+	assert!(written(&world, panel, "out").is_none(), "so it never ran");
+}
+
+#[test]
+fn a_tick_that_will_not_stop_is_stopped_and_switched_off() {
+	// the one failure worth muting: an ordinary error costs almost nothing and
+	// a runaway costs the whole budget every step for as long as nobody looks.
+	let mut world = running(
+		r#"function tick(dt)
+			colby.command("script.said started")
+			while true do end
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("started"), "it got as far as the loop");
+	assert!(scripts.loaded[0].muted, "and was switched off");
+	assert_eq!(scripts.loaded[0].faults, 1, "with the failure counted");
+	assert!(
+		scripts.loaded[0].instructions > super::BUDGET,
+		"and the count is what tells a budget apart from an ordinary error: {}",
+		scripts.loaded[0].instructions
+	);
+
+	world.cvars.set("script.said", "cleared");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("cleared"), "and is not called again");
+}
+
+#[test]
+fn a_muted_program_starts_again_when_it_is_asked_for() {
+	let mut world = running(
+		r#"function tick(dt)
+			colby.command("script.said ran")
+			while true do end
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+	assert!(scripts.loaded[0].muted, "switched off");
+
+	// `script.reload` in one line: the revision moves, the entry is built
+	// again, and a fresh entry is never muted.
+	let id = world.scripts.find("scripts/test");
+	assert!(world.scripts.touch(id));
+	world.cvars.set("script.said", "cleared");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("ran"), "it was asked for and it ran");
+}
+
+#[test]
+fn a_tick_that_fails_is_counted_and_the_program_goes_on() {
+	// the other half of the rule: an ordinary error is not worth switching a
+	// program off for, because the next step may be fine.
+	let mut world = running(
+		r#"local n = 0
+		function tick(dt)
+			n = n + 1
+			colby.command("script.said " .. n)
+			error("something went wrong")
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	for _ in 0..3 {
+		stepped(&mut scripts, &mut world);
+	}
+
+	assert!(!scripts.loaded[0].muted, "an ordinary error does not switch it off");
+	assert_eq!(scripts.loaded[0].faults, 3, "and every one of them is counted");
+	assert_eq!(said(&world).as_deref(), Some("3"), "and it ran three times");
+}
+
+#[test]
+fn nothing_is_loaded_or_ticked_while_the_world_is_being_edited() {
+	// what the two entry points are for. `gameplay` is the half the step keeps
+	// inside its edit-mode guard, so a test that only drives `interface` is
+	// what a step in edit mode does.
+	//
+	// **There is a panel here, and it is doing something, which is the whole
+	// reason this test can fail.** `interface` returns before it opens a scope
+	// at all when no panel is pending and nothing was clicked, so a world with
+	// no interface in it cannot tell a tick in the wrong half from no tick:
+	// the early return would hide it. A person editing a world still clicks
+	// the buttons on it, and that is the case this drives.
+	let (mut world, panel) = showing(r#"ui.on("go", "click", function() end)"#);
+	listen(&mut world);
+	world.scripts.insert("scripts/test", ScriptData {
+		source: r#"function tick(dt) colby.command("script.said ran") end"#.to_owned(),
+	});
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	for _ in 0..4 {
+		happened(&mut world, panel, "go", EventKind::Click);
+		scripts.interface(&mut world);
+		world.ui.end_step();
+	}
+
+	assert_eq!(said(&world).as_deref(), Some(""), "nothing of the world's ran at all");
+	assert_eq!(scripts.loaded.len(), 1, "and only the panel's program was loaded");
+
+	stepped(&mut scripts, &mut world);
+	assert_eq!(said(&world).as_deref(), Some("ran"), "it starts the moment play resumes");
+
+	// and the half a cold start cannot see: with the program *already* loaded,
+	// editing has to stop it ticking rather than merely stop it loading.
+	world.cvars.set("script.said", "cleared");
+
+	for _ in 0..4 {
+		happened(&mut world, panel, "go", EventKind::Click);
+		scripts.interface(&mut world);
+		world.ui.end_step();
+	}
+
+	assert_eq!(said(&world).as_deref(), Some("cleared"), "and stops again while editing");
+}
+
+#[test]
+fn two_world_programs_are_ticked_in_the_order_the_table_holds_them() {
+	// slot order, which is the order the compiler walked a sorted tree in.
+	// Nothing here may depend on a hash, because a screenshot runs these.
+	let mut world = World::new();
+	listen(&mut world);
+	world.scripts.insert("scripts/a", ScriptData {
+		source: r#"function tick(dt) colby.command("script.said a") end"#.to_owned(),
+	});
+	world.scripts.insert("scripts/b", ScriptData {
+		source: r#"function tick(dt) colby.command("script.said b") end"#.to_owned(),
+	});
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("b"), "the second one wrote last");
+	assert_eq!(
+		scripts
+			.loaded
+			.iter()
+			.map(|one| one.name.as_str())
+			.collect::<Vec<&str>>(),
+		["scripts/a", "scripts/b"],
+		"in slot order"
+	);
+}
+
+#[test]
+fn one_muted_program_does_not_stop_the_others() {
+	// the check inside the loop, which the early return alone cannot stand in
+	// for: with a second program still ticking there *is* work to do this
+	// step, so the loop is entered and every muted entry in it has to be
+	// stepped over one at a time.
+	let mut world = World::new();
+	listen(&mut world);
+	world.scripts.insert("scripts/a", ScriptData {
+		source: r#"function tick(dt)
+			colby.command("script.said runaway")
+			while true do end
+		end"#
+			.to_owned(),
+	});
+	world.scripts.insert("scripts/b", ScriptData {
+		source: r#"function tick(dt) colby.command("script.said healthy") end"#.to_owned(),
+	});
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert!(scripts.loaded[0].muted, "the first one was switched off");
+	assert!(!scripts.loaded[1].muted, "and the second was not");
+
+	// the second still has work, so the step does not return early and the
+	// loop really is walked over the muted one.
+	for _ in 0..3 {
+		stepped(&mut scripts, &mut world);
+	}
+
+	assert_eq!(said(&world).as_deref(), Some("healthy"), "only the healthy one wrote");
+	assert_eq!(scripts.loaded[0].faults, 1, "and the muted one was never called again");
 }

@@ -1,4 +1,4 @@
-//! What a document's script can reach, and deliberately nothing more.
+//! What a program can reach, and deliberately nothing more.
 //!
 //! The environment a script runs in is **built here by hand** rather than being
 //! the standard one with the dangerous parts removed. That is the whole
@@ -6,7 +6,7 @@
 //! table, no body, no camera and no clock anywhere in the process's Lua, so a
 //! script cannot ask for one and no check has to refuse it. `io`, `os`,
 //! `package` and `debug` are never opened at all - @ref
-//! [`Scripts`](crate::Scripts) for which libraries are - and what is left
+//! [`Vm`](crate::Vm) for which libraries are - and what is left
 //! cannot reach the filesystem or the wall clock, which is also what keeps
 //! `--shot` reproducible.
 //!
@@ -34,19 +34,19 @@ pub(crate) const KINDS: [&str; 3] = ["press", "release", "click"];
 
 /// Which program the VM is inside at this instant.
 ///
-/// The api functions are made once per step and shared by every document, so
+/// The api functions are made once per step and shared by every program, so
 /// "which panel does `set_text` write to" cannot be captured when they are
-/// built. This is the answer, written by the runner immediately before it hands
+/// built. This is the answer, written by the VM immediately before it hands
 /// control to Lua and read by the functions when they are called.
 #[derive(Default)]
 pub(crate) struct Running {
-	/// The panel whose script is running.
+	/// The panel whose program is running, or `NONE` for a world program.
 	pub(crate) panel: PanelId,
 
 	/// Where `ui.on` files what it is given.
 	pub(crate) handlers: Option<Table>,
 
-	/// The document's asset name, for anything that is logged.
+	/// The program's own name, for anything that is logged.
 	pub(crate) name: String,
 }
 
@@ -71,7 +71,7 @@ pub(crate) struct Tables {
 /// @param scope - the mlua scope the functions live and die with
 /// @param tables - what a script sees
 /// @param world - the host state the functions write into
-/// @param running - which document is being served, written by the caller
+/// @param running - which program is being served, written by the caller
 pub(crate) fn fill<'scope, 'env, 'world>(
 	scope: &'scope Scope<'scope, 'env>,
 	tables: &Tables,
@@ -177,7 +177,9 @@ where
 			said.push(value.to_string()?);
 		}
 
-		info!(document = running.borrow().name, "{}", said.join("\t"));
+		// `program` rather than `document`: half of what prints has no document,
+		// and a field that is wrong for half its readers is worse than no field.
+		info!(program = running.borrow().name, "{}", said.join("\t"));
 
 		Ok(())
 	})?;

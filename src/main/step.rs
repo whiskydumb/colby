@@ -42,7 +42,13 @@ pub(crate) struct Parts<'a> {
 	/// The game's own interface, laid out and hit-tested here.
 	pub(crate) interface: &'a mut Interface,
 
-	/// The documents' own interface logic, if Lua came up.
+	/// The interpreter, if Lua came up.
+	///
+	/// Driven **twice** in one step and at two different moments: the
+	/// interface's programs before the physics and outside the edit-mode
+	/// guard, the world's own after the game's `update` and inside it. @ref
+	/// `colby_script` for the argument, which is that a world program is
+	/// gameplay and edit mode stops gameplay.
 	pub(crate) scripts: Option<&'a mut Vm>,
 
 	/// The physics, advanced here and queried by the game.
@@ -86,7 +92,7 @@ pub(crate) fn run(
 	let Parts {
 		game,
 		interface,
-		scripts,
+		mut scripts,
 		simulation,
 		audio,
 		wire,
@@ -138,8 +144,8 @@ pub(crate) fn run(
 	// rather than the frame for the same reason the hit test is, plus one this
 	// crate cares about more: `--shot` runs steps, so a screenshot shows what
 	// the window shows. @ref `colby_script`.
-	if let Some(scripts) = scripts {
-		scripts.update(world);
+	if let Some(scripts) = scripts.as_deref_mut() {
+		scripts.interface(world);
 	}
 
 	// and the physics before the game too, and for a related reason: what
@@ -174,6 +180,26 @@ pub(crate) fn run(
 
 		if let Some(game) = game {
 			game.update(world);
+		}
+
+		// and the world's own programs after the game module, in the same
+		// guard and for the same reason: a program under `scripts/` is
+		// gameplay written in Lua. After rather than before, because Rust is
+		// the base layer here and Lua is the one written over it - a program
+		// that reads what `update` decided this step is the common case, and
+		// one that wants to decide first can be a console command the game
+		// calls.
+		if let Some(scripts) = scripts {
+			scripts.gameplay(world);
+
+			// and the answer to `script.status`, written here because these
+			// numbers are the interpreter's and a console command is handed
+			// nothing but a world. The mark is taken whether or not anything
+			// is running, so a question asked while Lua is down is a question
+			// that stops rather than one that waits.
+			if crate::console::wants_script_status() {
+				scripts.report();
+			}
 		}
 
 		// and every command that was in front of this step is done with,

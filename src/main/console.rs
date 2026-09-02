@@ -22,7 +22,10 @@ use std::{
 	io::{BufRead, stdin},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
-	sync::mpsc::{self, Receiver, TryRecvError},
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		mpsc::{self, Receiver, TryRecvError},
+	},
 	thread,
 };
 
@@ -34,6 +37,21 @@ use colby_core::{
 
 /// The file archived variables are kept in.
 const ARCHIVE: &str = "cvars.cfg";
+
+/// Whether somebody has asked what the interpreter is running.
+///
+/// The same note-to-the-frame-loop shape a scene load has, and for the same
+/// reason: a [`ConsoleFn`](colby_core::abi::ConsoleFn) is handed a world and
+/// nothing else, and the numbers this question is about are the interpreter's.
+/// A bool rather than a queue because asking twice before a step runs is
+/// asking once.
+static SCRIPT_STATUS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the step should write out what the interpreter is running, and
+/// clears the mark.
+///
+/// @return whether it was asked for since the last step
+pub(crate) fn wants_script_status() -> bool { SCRIPT_STATUS.swap(false, Ordering::Relaxed) }
 
 /// How many playing voices `snd.list` writes a line for.
 ///
@@ -246,6 +264,11 @@ fn install_scripts(world: &mut World) {
 		"script.reload",
 		reload_script,
 		"build <name> again, or every program if no name is given",
+	);
+	world.cvars.command(
+		"script.status",
+		script_status,
+		"report what each running program cost and whether it has been switched off",
 	);
 }
 
@@ -832,6 +855,20 @@ unsafe extern "C-unwind" fn reload_script(world: *mut World, args: *const Args) 
 	if world.scripts.touch(id) {
 		info!(name, "will be built again");
 	}
+}
+
+/// `script.status` - asks the next step what the interpreter is running.
+///
+/// Leaves a mark rather than answering, because the answer is the
+/// interpreter's and this is handed a world. The line therefore arrives one
+/// step later, which at sixty a second is not something a person notices - and
+/// in a mode with no steps in it there is no console to type this at either.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn script_status(_world: *mut World, _args: *const Args) {
+	SCRIPT_STATUS.store(true, Ordering::Relaxed);
 }
 
 /// `phys.bodies` - reports what the solver is carrying.
