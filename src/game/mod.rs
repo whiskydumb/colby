@@ -14,16 +14,26 @@
 //!
 //! Everything below the entry points is fair game to edit while colby is
 //! running. Save the file and the window changes.
+//!
+//! **The window half of playing over a wire is not wired.** A host runs every
+//! peer's player out of that peer's own ring, and that is verified end to end
+//! over a real socket. A *window* is named by the host and then stops: nothing
+//! seats its own peer in its own `World::players`, so it has no block of its
+//! own, so [`ask`] files no command and [`walk`] and [`correct`] never run
+//! there. Everything on this side of that is written and waiting - the ring,
+//! the replay, the drift - and what is missing is one thing: a window has to be
+//! able to seat the name it was given, which is a table in the engine rather
+//! than anything here.
 
 #![allow(unsafe_code)]
 
 use colby_core::{
 	abi::{
-		ABI_VERSION, Args, Body, BodyId, BodyKind, Build, Button, EntityId, Entry, GameApi,
-		Joint, JointId, Key, Layers, Listener, Material, MaterialId, MeshId, Motion, Node,
-		PanelId, Pose, PoseId, Ragdoll, Renderable, SceneData, SceneId, Segment, Shape,
-		ShapeKind, SkeletonId, Stage, TouchKind, TraceInfo, Transform, Tree, Voice, VoiceId,
-		World, character, console, debug, ragdoll, scene,
+		ABI_VERSION, Args, Body, BodyId, BodyKind, Build, Button, Command, Drift, EntityId,
+		Entry, GameApi, Joint, JointId, Key, Layers, Listener, Material, MaterialId, MeshId,
+		Motion, Moved, Node, PanelId, PeerId, Pose, PoseId, Ragdoll, Renderable, Role, SceneData,
+		SceneId, Segment, Shape, ShapeKind, SkeletonId, Stage, TouchKind, TraceInfo, Transform,
+		Tree, Voice, VoiceId, World, character, console, debug, ragdoll, scene,
 	},
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec2, Vec3},
@@ -52,6 +62,20 @@ const MAP_SCENE: &str = "scenes/construct";
 /// far enough back to see both. Half a unit up because the box is a unit tall
 /// and the floor's surface is zero.
 const PLAYER_START: Vec3 = Vec3::new(2.0, 0.5, -6.0);
+
+/// How far apart two people start, along x.
+///
+/// **Found by driving a real host rather than by thinking about it.** A second
+/// person used to be given exactly [`PLAYER_START`], which put their box inside
+/// the box already standing there - and a swept trace that begins inside
+/// something has nothing to report but the place it began, so the newcomer
+/// walked a tenth of a unit in two seconds and stopped. Two boxes a meter
+/// apart is the smallest fix that is not a spawn system, and a spawn system is
+/// not what a sandbox with a handful of people in it needs.
+///
+/// A little over four half-extents, so there is daylight between them rather
+/// than a shared face.
+const PLAYER_SPACING: f32 = 1.0;
 
 /// Half-extents of the player's box.
 ///
@@ -662,6 +686,20 @@ const STATE_LAYOUT: u64 = 21;
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
 struct Player {
+	/// The step of the last command this end acted on for this player.
+	///
+	/// What [`character::replay`] measures the first command of a run from. On
+	/// the machine that decides it is the last one it ran; on a window it is
+	/// the last one the host confirmed, so a replay of what is still
+	/// unconfirmed starts where the host left off.
+	///
+	/// **First in the block**, because it is the only field here that wants
+	/// eight-byte *alignment* and `Pod` refuses padding: anywhere else it
+	/// would need a hole in front of it. Plenty of the fields below are eight
+	/// bytes long - every handle is two words - and none of them cares where
+	/// it starts.
+	ran: u64,
+
 	/// The box the player walks around as.
 	player: EntityId,
 
@@ -671,7 +709,23 @@ struct Player {
 
 	/// Whether it was standing on something at the end of the last step. Not a
 	/// `bool` because [`Pod`] wants every bit pattern to be a valid value.
+	///
+	/// **This is the state a run of commands carries across its own
+	/// boundary**, and it is in the block the world replicates per player for
+	/// exactly that reason: [`character::replay`] hands the first command of a
+	/// run nothing at all, because a made-up predecessor would read as
+	/// airborne and the two machines start their runs in different places.
 	player_grounded: u32,
+
+	/// The number of the last command this player was given.
+	///
+	/// Counting from one and never reused: it is what the ring orders by and
+	/// what the host acknowledges. Kept here rather than derived from the ring
+	/// because the ring drops its oldest and a count must not go back with it.
+	asked: u32,
+
+	/// How far a wrong guess still has to fade. @ref [`Drift`].
+	drift: Drift,
 
 	/// Which gun is in the hands. @ref [`PHYSGUN`].
 	gun: u32,
@@ -732,7 +786,27 @@ struct Player {
 }
 
 /// The version of [`Player`]'s layout, bumped like [`STATE_LAYOUT`].
-const PLAYER_LAYOUT: u64 = 1;
+const PLAYER_LAYOUT: u64 = 2;
+
+/// The bits a [`Command`]'s buttons mean here.
+///
+/// **The meaning is the game's and nothing outside this file knows it**, which
+/// is why `Command::buttons` is an opaque word at the boundary. Five bits, one
+/// per movement key, and everything else a person can do - the tools, the
+/// guns, freezing, spawning - goes through the console ring instead, because
+/// every one of those was already a named command with an optional target.
+/// That was the discipline the sandbox was written with long before there was
+/// a wire, and it is what makes the command small enough to send sixty times a
+/// second.
+const BUTTON_FORWARD: u32 = 1 << 0;
+/// @ref [`BUTTON_FORWARD`].
+const BUTTON_BACK: u32 = 1 << 1;
+/// @ref [`BUTTON_FORWARD`].
+const BUTTON_LEFT: u32 = 1 << 2;
+/// @ref [`BUTTON_FORWARD`].
+const BUTTON_RIGHT: u32 = 1 << 3;
+/// @ref [`BUTTON_FORWARD`].
+const BUTTON_JUMP: u32 = 1 << 4;
 
 /// What is true of one screen, and crosses to nobody.
 ///
@@ -783,20 +857,50 @@ const LOCAL_LAYOUT: u64 = 1;
 /// borrow checker see that they are different fields.
 fn shared(world: &mut World) -> &mut State { world.state.get::<State>(STATE_LAYOUT).0 }
 
-/// This process's own block, or nothing if it is nobody yet.
+/// One peer's own block, or nothing if the world does not know that peer.
 ///
-/// Never nothing today: [`World::peer`] is the host in every world this engine
-/// builds, and the host is in the table from the moment the table exists. It is
-/// an `Option` because that stops being true the first time a client is let in
-/// and has not been told who it is - and a caller that quietly did nothing then
-/// would be a player who cannot move for a reason nobody can see.
-fn played(world: &mut World) -> Option<&mut Player> {
-	let peer = world.peer;
-
+/// @param world - the table to read
+/// @param peer - whose block
+fn block(world: &mut World, peer: PeerId) -> Option<&mut Player> {
 	world
 		.players
 		.get::<Player>(peer, PLAYER_LAYOUT)
 		.map(|(player, _)| player)
+}
+
+/// This process's own block, or nothing if it is nobody yet.
+///
+/// Nothing exactly when [`World::peer`] names nobody, which is a window that
+/// has opened a socket and has not been told its name. A caller that quietly
+/// did nothing then would be a player who cannot move for a reason nobody can
+/// see, so every one of them says so instead.
+fn played(world: &mut World) -> Option<&mut Player> {
+	let peer = world.peer;
+
+	block(world, peer)
+}
+
+/// Where one peer's player stands when it arrives.
+///
+/// Along x by the slot, which is a number the table hands out and never two
+/// people at once. @ref [`PLAYER_SPACING`].
+///
+/// @param peer - whose player
+fn spawn(peer: PeerId) -> Vec3 {
+	let along = f32::from(u16::try_from(peer.slot()).unwrap_or(0));
+
+	PLAYER_START + Vec3::X * (along * PLAYER_SPACING)
+}
+
+/// Says whose a body is.
+///
+/// @param world - the bodies to change
+/// @param body - which one
+/// @param peer - whose it is
+fn own(world: &mut World, body: BodyId, peer: PeerId) {
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.owner = peer;
+	}
 }
 
 /// This screen's own arena, which crosses to nobody.
@@ -991,7 +1095,7 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	// picked up by this one. The materials the map names are declared in here,
 	// so this has to run before anything is laid out.
 	dress(world);
-	collide(world);
+	collide(world, world.peer);
 
 	if fresh {
 		// only on a fresh arena: a reload should leave the map and the pile
@@ -1072,7 +1176,11 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 
 	let (yaw, pitch, distance) = (local.yaw, local.pitch, local.distance);
 
-	walk(world, yaw);
+	// what this machine's own hands asked for, and then everybody the machine
+	// is deciding for. In that order, so a person's own move is in front of
+	// the step that runs it rather than a step behind.
+	ask(world, yaw, pitch);
+	walk_everybody(world);
 
 	// the camera watches the player rather than panning on its own. The same
 	// keys cannot mean two things, and the reason to have a controller at all
@@ -1482,58 +1590,212 @@ fn props(world: &World) -> Vec<BodyId> {
 		.collect()
 }
 
-/// Walks the player one step and writes where it ended up.
+/// Turns what is under this machine's own hands into a command, and files it.
 ///
-/// The whole of what gameplay owns about a character: which way the keys point,
+/// **The one place the sandbox says what a button means.** Everything on the
+/// far side of this - the wire, the ring, the replay - reads
+/// [`Command::buttons`] as an opaque word, and everything on this side reads
+/// the keyboard. Five bits and two angles is the whole of what one person
+/// asking to move costs, sixty times a second.
+///
+/// Filed into the world's own ring rather than sent from here, because a game
+/// module has no wire: the runner takes whatever is unsettled and puts it in
+/// the next message. On the machine that decides, the same ring is what the
+/// walk below reads, so a host and a window run one path and not two.
+///
+/// @note: a window that has not been told its name has no ring to file into,
+/// and this does nothing until it has one. That is one round trip of a session
+/// in which the person at the keyboard cannot move, and it is the connection
+/// handshake's to remove rather than this file's.
+///
+/// @param world - read for input, written for the ring
+/// @param yaw - which way this screen is looking
+/// @param pitch - and how far up or down
+fn ask(world: &mut World, yaw: f32, pitch: f32) {
+	let peer = world.peer;
+	let input = world.input;
+	let step = world.steps;
+
+	let mut buttons = 0;
+
+	// two sets of movement keys, either of which means the same thing. Summed
+	// as bits rather than as an axis, so that holding both does not walk twice
+	// as fast and so that what crosses is what was pressed rather than what it
+	// came to.
+	for (bit, keys) in [
+		(BUTTON_FORWARD, [Key::W, Key::Up]),
+		(BUTTON_BACK, [Key::S, Key::Down]),
+		(BUTTON_LEFT, [Key::A, Key::Left]),
+		(BUTTON_RIGHT, [Key::D, Key::Right]),
+	] {
+		if keys.iter().any(|key| input.held(*key)) {
+			buttons |= bit;
+		}
+	}
+
+	// an edge rather than a hold, which is what a jump has always been here: a
+	// held space bar is one jump and not sixty.
+	if input.pressed(Key::Space) {
+		buttons |= BUTTON_JUMP;
+	}
+
+	let Some(mine) = block(world, peer) else {
+		return;
+	};
+
+	mine.asked = mine.asked.saturating_add(1);
+
+	let command = Command {
+		step,
+		number: mine.asked,
+		buttons,
+		yaw,
+		pitch,
+	};
+
+	world.commands.push(peer, command);
+}
+
+/// What one command asks of the character, in the numbers gameplay owns.
+///
+/// The whole of what this game decides about moving: which way the keys point,
 /// how fast that is, what a jump is worth, and how gravity gets into the
 /// velocity. Everything geometric - what it runs into, what it slides along,
-/// what it may climb, whether there is ground - is
-/// [`character::move_and_slide`], and this never learns any of it.
+/// what it may climb, whether there is ground - belongs to
+/// [`character::replay`] and this never learns any of it.
 ///
-/// @param world - read for input and bodies, written for the player's place
-/// @param yaw - which way the camera is looking, so that "forward" is forward
-fn walk(world: &mut World, yaw: f32) {
-	let Some(mine) = played(world) else {
-		return;
-	};
-	let (player, body) = (mine.player, mine.player_body);
-	let grounded = mine.player_grounded != 0;
-
-	let Some(&placed) = world.entities.transform(player) else {
-		return;
-	};
-
-	let (input, dt) = (world.input, world.dt);
-
-	// two sets of movement keys, summed and clamped, so holding both does not
-	// walk twice as fast. They point where the camera is looking rather than
-	// along the world axes, so that "left" means left on screen.
-	let sideways =
-		(input.axis(Key::A, Key::D) + input.axis(Key::Left, Key::Right)).clamp(-1.0, 1.0);
-	let forwards = (input.axis(Key::S, Key::W) + input.axis(Key::Down, Key::Up)).clamp(-1.0, 1.0);
+/// **The angles come from the command and not from this screen**, which is the
+/// difference between a game and a game on a wire: the machine that decides is
+/// moving somebody else's player, and where *it* is looking has nothing to do
+/// with which way that player asked to walk.
+///
+/// @param command - what was asked for
+/// @param before - what the command before it in this run came to, or nothing
+/// for the first of a run
+/// @param standing - whether the player was on the ground before the run began
+/// @param gravity - how fast it pulls, in units a second squared
+/// @param motion - the move to fill in
+fn wish(
+	command: &Command,
+	before: Option<&Moved>,
+	standing: bool,
+	gravity: f32,
+	motion: &mut Motion,
+) {
+	let grounded = before.map_or(standing, |was| was.grounded);
+	let sideways = pushed(command, BUTTON_RIGHT) - pushed(command, BUTTON_LEFT);
+	let forwards = pushed(command, BUTTON_FORWARD) - pushed(command, BUTTON_BACK);
+	let yaw = command.yaw;
 	let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
 	let ahead = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
-	let wish = (right * sideways + ahead * forwards).normalize_or_zero() * PLAYER_SPEED;
-
-	let falling = world
-		.bodies
-		.get(body)
-		.map_or(0.0, |body| body.velocity.y);
-	let mut velocity = Vec3::new(wish.x, falling, wish.z);
+	let asked = (right * sideways + ahead * forwards).normalize_or_zero() * PLAYER_SPEED;
+	let mut velocity = Vec3::new(asked.x, motion.velocity.y, asked.z);
 
 	// standing on something is what makes a jump possible and is also what
 	// stops the fall accumulating: without the second line a player who has
 	// stood still for a minute steps off a lip at terminal velocity.
 	if grounded {
-		velocity.y = if input.pressed(Key::Space) { PLAYER_JUMP } else { 0.0 };
+		velocity.y = if command.buttons & BUTTON_JUMP != 0 {
+			PLAYER_JUMP
+		} else {
+			0.0
+		};
 	}
 
-	velocity.y = world.gravity.y.mul_add(dt, velocity.y);
+	velocity.y = gravity.mul_add(motion.dt, velocity.y);
+	motion.velocity = velocity;
+}
 
-	let motion = Motion::new(placed.position, velocity, PLAYER_EXTENTS, dt)
+/// One as a number, so two of them make an axis.
+fn pushed(command: &Command, bit: u32) -> f32 { f32::from(u8::from(command.buttons & bit != 0)) }
+
+/// Notes that a guess and the truth are not the same place, and lets it fade.
+///
+/// **The correction is taken at once, and what is drawn is not smeared yet.**
+/// The player is moved to where the replay says the moment it says it, because
+/// that is where the next command starts from and a window guessing forward
+/// from a place it knows is wrong guesses wrong again. The difference is kept
+/// here and decayed here, and [`Drift::offset`] is what a renderer would add
+/// to draw the slide instead of the jump.
+///
+/// **Nothing adds it.** [`walk`] writes the prediction into the entity and the
+/// camera follows that, so a correction is still a jump on screen. Drawing the
+/// slide means the entity holding one place and the replay starting from
+/// another, which is a second position per player and is the piece that goes
+/// with wiring the window half at all - @ref the module comment. Until then
+/// this keeps the number honest rather than pretending to spend it.
+///
+/// @param world - the block to write and the drift to keep
+/// @param peer - whose player
+/// @param drawn - where it was shown before the replay, if it was anywhere
+/// @param predicted - where the replay says it is
+fn correct(world: &mut World, peer: PeerId, drawn: Option<Vec3>, predicted: Vec3) {
+	let dt = world.dt;
+
+	let Some(mine) = block(world, peer) else {
+		return;
+	};
+	let Some(drawn) = drawn else {
+		return;
+	};
+	let showing = drawn + mine.drift.offset();
+
+	// a hair, because a replay that agreed to the bit is the ordinary case and
+	// restarting the clock on it would smear nothing for a tenth of a second
+	// every step - and because floats do not agree to the bit for long.
+	if showing.distance_squared(predicted) > SNAP * SNAP {
+		mine.drift.correct(showing, predicted);
+	}
+
+	mine.drift.advance(dt);
+}
+
+/// How far out a guess has to be before it is worth showing the correction.
+///
+/// A millimeter. Below it the two answers are the same answer with the last
+/// bits of a float between them, and smearing that would be a player who never
+/// stops sliding.
+const SNAP: f32 = 1.0e-3;
+
+/// Walks one peer's player over every command it has asked for and not been
+/// answered about.
+///
+/// **This is the whole of what a second person costs.** It was one player and
+/// the keyboard; it is one player per peer and a ring each, and the only thing
+/// that changed about the arithmetic is where the buttons come from.
+///
+/// @param world - read for commands and bodies, written for the player's place
+/// @param peer - whose player
+/// @return where the run ended, or nothing if that peer has no player yet
+fn walk(world: &mut World, peer: PeerId) -> Option<Moved> {
+	let mine = block(world, peer)?;
+	let (player, body, since) = (mine.player, mine.player_body, mine.ran);
+	let standing = mine.player_grounded != 0;
+	let &placed = world.entities.transform(player)?;
+	let falling = world
+		.bodies
+		.get(body)
+		.map_or(0.0, |solid| solid.velocity.y);
+	let start = Motion::new(placed.position, Vec3::Y * falling, PLAYER_EXTENTS, world.dt)
 		.ignoring(body)
 		.layered(PLAYER_LAYERS);
-	let moved = character::move_and_slide(world, &motion);
+
+	// both borrows are shared, so the ring and the world it is about can be
+	// read at once - which is what keeps a run of commands from being copied
+	// out of the table before it can be walked.
+	let commands = world.commands.unsettled(peer);
+	let gravity = world.gravity.y;
+
+	if commands.is_empty() {
+		return None;
+	}
+
+	let last = commands
+		.last()
+		.map_or(since, |command| command.step);
+	let moved = character::replay(world, &start, since, commands, |command, before, motion| {
+		wish(command, before, standing, gravity, motion);
+	});
 
 	// the entity first, because the body is kinematic and is written from it at
 	// the top of the next step - and then the body as well, so that a trace
@@ -1548,10 +1810,101 @@ fn walk(world: &mut World, yaw: f32) {
 		solid.velocity = moved.velocity;
 	}
 
-	let Some(mine) = played(world) else {
-		return;
-	};
+	let mine = block(world, peer)?;
+
 	mine.player_grounded = u32::from(moved.grounded);
+	mine.ran = last;
+
+	Some(moved)
+}
+
+/// Gives a peer that has just turned up something to be.
+///
+/// A seated peer arrives with a block of nothing: the world's table hands out
+/// the identity and the block, and what a *player* is in this game - a box, a
+/// body, a gun in the hands - is this file's to say. So the first time a peer
+/// is walked and has no player yet, it gets one, standing where everybody
+/// starts.
+///
+/// Only where this process decides. A window does not invent players for
+/// people it has been told about; their boxes arrive over the wire like every
+/// other body, and a window that spawned its own would have two of everybody.
+///
+/// @param world - the tables to spawn into
+/// @param peer - who has arrived
+/// @return whether anything was made
+fn admit_player(world: &mut World, peer: PeerId) -> bool {
+	if !world.peer.is_host() {
+		return false;
+	}
+
+	if block(world, peer).is_none_or(|mine| mine.player.is_some()) {
+		return false;
+	}
+
+	// spawned along from wherever the last one is, at the size it is: nothing
+	// writes a player's transform afterwards except the controller, which only
+	// ever moves it. @ref [`PLAYER_SPACING`] for why it is not simply
+	// [`PLAYER_START`].
+	let mut stance = Transform::at(spawn(peer));
+
+	stance.scale = PLAYER_EXTENTS * 2.0;
+
+	let spawned = world.entities.spawn_at(stance);
+
+	if let Some(mine) = block(world, peer) {
+		// said rather than relied on: a fresh block is zeroed, and zero happens
+		// to be both guns' and the first tool's number.
+		mine.gun = PHYSGUN;
+		mine.tool = WELD;
+		mine.player = spawned;
+	}
+
+	collide(world, peer);
+	info!(slot = peer.slot(), "somebody else is in the world");
+
+	true
+}
+
+/// Walks everybody the machine that decides is deciding for.
+///
+/// A host runs every peer's player out of that peer's own ring; a window runs
+/// only its own, and what it gets is a guess the host will correct. The two
+/// are one walk over a different list, which is the property the whole
+/// authority model wants.
+///
+/// @param world - the world to move players through
+fn walk_everybody(world: &mut World) {
+	let peer = world.peer;
+
+	if !peer.is_host() {
+		// a window moves its own and nobody else's: everybody else's body is a
+		// proxy and the wire is holding the pen. What it gets is a guess, so
+		// where it was drawn is remembered first and the difference smeared.
+		let standing = block(world, peer).map_or(EntityId::NONE, |mine| mine.player);
+		let drawn = world
+			.entities
+			.transform(standing)
+			.map(|placed| placed.position);
+
+		if let Some(moved) = walk(world, peer) {
+			correct(world, peer, drawn, moved.position);
+		}
+
+		return;
+	}
+
+	// collected because the walk writes the tables the list is read from.
+	let everybody: Vec<PeerId> = world
+		.players
+		.iter()
+		.map(|(peer, _)| peer)
+		.collect();
+
+	for peer in everybody {
+		admit_player(world, peer);
+		walk(world, peer);
+	}
 }
 
 /// Removes whatever has fallen into the hole, and puts the player back.
@@ -1978,7 +2331,7 @@ fn grab(world: &mut World, yaw: f32, named: &str) {
 	// taking hold of a frozen prop lets it go first, which is what the field
 	// does and is the only thing that could be meant: the alternative is a gun
 	// that silently refuses half the props in the yard.
-	if frozen(solid) {
+	if frozen(solid, world.peer) {
 		unfreeze(world, body);
 	}
 
@@ -2395,9 +2748,21 @@ fn remove_prop(world: &mut World, body: BodyId) -> bool {
 /// The layer is part of the question because the player's own box is kinematic
 /// too, and it is not frozen.
 ///
+/// **And so is the role, which is what a wire made necessary.** A body the
+/// machine that decides is simulating arrives here *kinematic* whatever it
+/// really is, because a window may not run a solver over something that is not
+/// its own - so on a window every replicated prop would read as frozen, every
+/// one of them would be outlined, the count on the panel would be wrong, and
+/// an unfreeze would be undone by the next snapshot sixty times a second. A
+/// body this end does not decide about is a body this end cannot say is
+/// frozen, so it says it is not.
+///
 /// @param body - the body to ask about
-fn frozen(body: &Body) -> bool {
-	matches!(body.kind, BodyKind::Kinematic) && on_layer(body, PROP_LAYERS)
+/// @param peer - who this process is, @ref [`World::peer`]
+fn frozen(body: &Body, peer: PeerId) -> bool {
+	body.role(peer) == Role::Authority
+		&& matches!(body.kind, BodyKind::Kinematic)
+		&& on_layer(body, PROP_LAYERS)
 }
 
 /// Freezes and unfreezes, on one key.
@@ -2424,7 +2789,11 @@ fn freezer(world: &mut World) {
 		return;
 	}
 
-	if world.bodies.get(picked).is_some_and(frozen) {
+	if world
+		.bodies
+		.get(picked)
+		.is_some_and(|body| frozen(body, world.peer))
+	{
 		unfreeze(world, picked);
 	} else {
 		freeze(world, picked);
@@ -2486,11 +2855,13 @@ fn freeze(world: &mut World, body: BodyId) -> bool {
 /// @param body - what to release
 /// @return whether anything was thawed
 fn unfreeze(world: &mut World, body: BodyId) -> bool {
+	let peer = world.peer;
+
 	let Some(solid) = world.bodies.get_mut(body) else {
 		return false;
 	};
 
-	if !frozen(solid) {
+	if !frozen(solid, peer) {
 		return false;
 	}
 
@@ -2511,10 +2882,11 @@ fn unfreeze(world: &mut World, body: BodyId) -> bool {
 /// @param world - the bodies to walk
 /// @return how many were let go
 fn thaw(world: &mut World) -> usize {
+	let peer = world.peer;
 	let stuck: Vec<BodyId> = world
 		.bodies
 		.iter()
-		.filter(|(_, body)| frozen(body))
+		.filter(|(_, body)| frozen(body, peer))
 		.map(|(id, _)| id)
 		.collect();
 
@@ -2532,10 +2904,11 @@ fn thaw(world: &mut World) -> usize {
 ///
 /// @param world - the bodies to walk and the table the segments go in
 fn outline_frozen(world: &mut World) {
+	let peer = world.peer;
 	let stuck: Vec<BodyId> = world
 		.bodies
 		.iter()
-		.filter(|(_, body)| frozen(body))
+		.filter(|(_, body)| frozen(body, peer))
 		.map(|(id, _)| id)
 		.collect();
 
@@ -2667,7 +3040,7 @@ fn interface(world: &mut World) {
 	let stuck = world
 		.bodies
 		.iter()
-		.filter(|(_, body)| frozen(body))
+		.filter(|(_, body)| frozen(body, world.peer))
 		.count();
 	let swallowed = state.swallowed;
 
@@ -3760,8 +4133,8 @@ fn layer(world: &mut World, body: BodyId, layers: Layers) {
 /// Rebuilt on every load rather than only on a fresh arena, which costs four
 /// dozen bytes and means a change to its size or its layers takes effect on the
 /// next save rather than on the next restart.
-fn collide(world: &mut World) {
-	let Some(mine) = played(world) else {
+fn collide(world: &mut World, peer: PeerId) {
+	let Some(mine) = block(world, peer) else {
 		return;
 	};
 	let (player, was) = (mine.player, mine.player_body);
@@ -3773,9 +4146,11 @@ fn collide(world: &mut World) {
 	// dynamic one would be a box the player argues with.
 	let player_body =
 		world.attach_body(player, BodyKind::Kinematic, Shape::cuboid(Vec3::splat(0.5)));
-	layer(world, player_body, PLAYER_LAYERS);
 
-	let Some(mine) = played(world) else {
+	layer(world, player_body, PLAYER_LAYERS);
+	own(world, player_body, peer);
+
+	let Some(mine) = block(world, peer) else {
 		return;
 	};
 	mine.player_body = player_body;

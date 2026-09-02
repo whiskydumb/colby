@@ -58,8 +58,8 @@ use std::{
 use colby_core::{
 	Result,
 	abi::{
-		Bodies, BodyId, BodyKind, Command, Cvars, PeerId, Value, World, console, cvar::Owner,
-		net::BACKUP,
+		Bodies, BodyId, BodyKind, Command, Cvars, PeerId, Role, Value, World, console,
+		cvar::Owner, net::BACKUP,
 	},
 	debug, err,
 	glam::Vec3,
@@ -1132,7 +1132,17 @@ impl Net {
 			// the generation is what says this is the same body rather than
 			// the one that took its place, and a wrong answer here would drive
 			// a live body to where a dead one was.
-			if generation != id.generation() || body.role(world.peer).local() {
+			//
+			// **A body this window owns is written too**, which is the one
+			// place the role is *not* the question. It used to be skipped -
+			// `local()` is the two roles that decide, and a window decides
+			// about its own - and that left a client with nothing to be
+			// corrected against: the wire never said where the machine that
+			// decides had actually put it, so a wrong guess was a wrong guess
+			// forever. What the wire writes is the truth as of the last
+			// command the host confirmed, and predicting forward from it is
+			// the game's. @ref `colby_core::abi::character::replay`.
+			if generation != id.generation() || body.role(world.peer) == Role::Authority {
 				continue;
 			}
 
