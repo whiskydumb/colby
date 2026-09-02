@@ -58,8 +58,8 @@ use std::{
 use colby_core::{
 	Result,
 	abi::{
-		Bodies, BodyId, BodyKind, Command, Cvars, PeerId, Role, Value, World, console,
-		cvar::Owner, net::BACKUP,
+		Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, PeerId, Role, Value, World,
+		console, cvar::Owner, net::BACKUP,
 	},
 	debug, err,
 	glam::Vec3,
@@ -275,6 +275,7 @@ fn report(net: &Net) {
 		crowded = net.crowded(),
 		filed = net.filed(),
 		garbled = net.garbled(),
+		dropped = net.dropped(),
 		"the wire"
 	);
 
@@ -373,8 +374,32 @@ pub(crate) fn obey(world: &mut World, net: &Net) {
 			continue;
 		}
 
-		info!(from = %said.from, text = %said.text, "running what a peer asked for");
+		// **a line nobody said is not run.** A peer that has not been seated
+		// has no player for a command to be about, and running it anyway is
+		// what used to make every crossed line act on whoever is at the host's
+		// keyboard.
+		let who = net.whose(said.from);
+
+		if !who.is_some() {
+			warn!(from = %said.from, text = %said.text, "a line from nobody");
+
+			continue;
+		}
+
+		// **and it is run as its sender.** Every command in this game reads
+		// `World::peer` to find out whose player it is about - `played`, the
+		// spawn point in front of somebody, which crosshair a nameless
+		// `game.grab` means. Swapping the field around the call is what turns
+		// the console from the host's keyboard into an RPC layer, which is what
+		// the design said it was for. Put back afterwards whatever the command
+		// did, because a command that ended the process leaves the world half
+		// written and the field has to name this machine again either way.
+		let was = world.peer;
+
+		world.peer = who;
+		info!(from = %said.from, slot = who.slot(), text = %said.text, "running what a peer asked for");
 		crate::console::run(world, &said.text);
+		world.peer = was;
 	}
 }
 
@@ -637,6 +662,24 @@ struct Peer {
 	/// The highest of *ours* they have said they are done with.
 	confirmed: u32,
 
+	/// The same, as it stood in the message that brought the newest world.
+	///
+	/// **Not [`confirmed`](Self::confirmed), and the difference is the whole of
+	/// whether a client's guess fights the host.** A client predicts forward
+	/// from a snapshot, and it has to know which of its commands that snapshot
+	/// already accounts for. Those two facts arrive together - a message
+	/// carries a block of commands and then a block of world - but they do not
+	/// arrive at the same *rate*: a snapshot goes with one message in every
+	/// [`EVERY`](colby_net::EVERY), and an acknowledgement goes with all of
+	/// them.
+	///
+	/// Measuring the newest mark against a world several messages older is
+	/// asking the guess to cover a stretch the base already covers, which reads
+	/// as the player having been in two places and is corrected every time a
+	/// snapshot lands. That was a smear of whole units on a wire with a
+	/// hundred milliseconds on it.
+	stamped: u32,
+
 	/// What was told to this peer, to write the next difference against.
 	told: Ring,
 
@@ -685,7 +728,7 @@ struct Taken {
 /// A command that crossed, and who said it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Said {
-	/// Which peer said it.
+	/// Which address it came from.
 	pub(crate) from: SocketAddr,
 
 	/// The console line, exactly as it was queued.
@@ -696,6 +739,13 @@ pub(crate) struct Said {
 pub(crate) struct Net {
 	post: Box<dyn Post>,
 	peers: Vec<Peer>,
+	/// The address a client went looking for, if it is a client.
+	///
+	/// Kept so that a host which was slow to start, or quiet for longer than
+	/// [`QUIET`], is somebody this end will still listen to. @ref
+	/// [`Net::find`].
+	looking: Option<SocketAddr>,
+
 	/// Whether a datagram from a stranger becomes a peer or is thrown away.
 	hosting: bool,
 	conditions: Conditions,
@@ -727,6 +777,24 @@ pub(crate) struct Net {
 	/// own crate and nothing here may forge one.
 	proxies: Vec<(BodyId, Solid)>,
 
+	/// The newest world a client has been told about, kept beside the blend.
+	///
+	/// Two tables rather than one because a client wants two answers at once:
+	/// where everybody else is a fixed delay ago, and where *it* is right now.
+	/// @ref [`Net::arrive`].
+	freshest: Vec<Slot>,
+
+	/// The world a delay behind the newest, which is where a proxy is drawn.
+	///
+	/// A copy rather than the borrow `Heard::at` hands out, because the walk
+	/// that reads it reads [`Net::freshest`] in the same breath and the two
+	/// come out of the same peer.
+	drawn: Vec<Slot>,
+
+	/// Which bodies the far end has stopped describing, gathered in the same
+	/// walk as the proxies and applied after them.
+	removed: Vec<BodyId>,
+
 	/// Where an arriving snapshot is put together before it is committed.
 	///
 	/// One buffer for the endpoint rather than one per peer: a message is read
@@ -752,6 +820,10 @@ pub(crate) struct Net {
 	/// block on this wire. Named apart from [`Net::refused`], which counts
 	/// datagrams the socket itself would not take. @ref [`Net::next_message`].
 	garbled: u32,
+
+	/// How many bodies were despawned because the far end stopped describing
+	/// them.
+	dropped: u32,
 }
 
 impl Net {
@@ -766,6 +838,7 @@ impl Net {
 			post,
 			peers: Vec::new(),
 			hosting,
+			looking: None,
 			conditions: Conditions::PERFECT,
 			seed,
 			scratch: Box::new([0; MAX_DATAGRAM]),
@@ -776,6 +849,9 @@ impl Net {
 			arrived: Vec::new(),
 			departed: Vec::new(),
 			proxies: Vec::new(),
+			freshest: Vec::new(),
+			drawn: Vec::new(),
+			removed: Vec::new(),
 			applying: Vec::new(),
 			sent: 0,
 			delivered: 0,
@@ -785,6 +861,7 @@ impl Net {
 			crowded: 0,
 			filed: 0,
 			garbled: 0,
+			dropped: 0,
 		}
 	}
 
@@ -803,7 +880,7 @@ impl Net {
 		let ours = socket.address();
 		let mut net = Self::over(Box::new(socket), false, seed);
 
-		net.add(address, Duration::ZERO);
+		net.introduce(address);
 		info!(%ours, %address, "talking to a host");
 		Ok(net)
 	}
@@ -814,7 +891,10 @@ impl Net {
 	/// endpoints that already have a wire - a test, and the two-endpoint run.
 	///
 	/// @param address - where the far end is
-	pub(crate) fn introduce(&mut self, address: SocketAddr) { self.add(address, Duration::ZERO); }
+	pub(crate) fn introduce(&mut self, address: SocketAddr) {
+		self.looking = Some(address);
+		self.add(address, Duration::ZERO);
+	}
 
 	/// Puts one message on the wire as it stands, with no ring in front of it.
 	///
@@ -853,6 +933,25 @@ impl Net {
 	/// Where this endpoint can be reached.
 	pub(crate) fn address(&self) -> SocketAddr { self.post.address() }
 
+	/// Which peer an address is, as this end has it now.
+	///
+	/// **Asked when a line is run rather than stamped when it arrived**, and
+	/// the difference is the very first message somebody sends. A peer is
+	/// given its name by the block of commands in that message, which is read
+	/// *after* the reliable ring in front of it - so a line stamped as it
+	/// crossed would be stamped by a peer that had no name yet, and the first
+	/// thing anybody ever asked for would be the one thing that ran as
+	/// nobody. @ref [`Net::file`], which is where a name is minted.
+	///
+	/// @param address - where it came from
+	/// @return that peer's name, or nobody if the address is nobody's
+	pub(crate) fn whose(&self, address: SocketAddr) -> PeerId {
+		self.peers
+			.iter()
+			.find(|peer| peer.address == address)
+			.map_or(PeerId::NONE, |peer| peer.id)
+	}
+
 	/// How many endpoints this one is talking to.
 	pub(crate) fn peers(&self) -> usize { self.peers.len() }
 
@@ -872,6 +971,10 @@ impl Net {
 
 	/// How many whole messages have arrived.
 	pub(crate) const fn delivered(&self) -> u32 { self.delivered }
+
+	/// How many bodies were taken away because the far end stopped describing
+	/// them.
+	pub(crate) const fn dropped(&self) -> u32 { self.dropped }
 
 	/// How many arriving datagrams were worth nothing.
 	pub(crate) const fn ignored(&self) -> u32 { self.ignored }
@@ -1044,7 +1147,14 @@ impl Net {
 				world.players.seat(world.peer);
 			}
 
+			// **two marks, because a client asks two questions.** What it may
+			// stop re-sending is everything the host has acknowledged, which is
+			// every message. What it may stop *guessing about* is only what the
+			// world it is looking at already accounts for, which is one message
+			// in [`EVERY`](colby_net::EVERY). @ref `Peer::stamped` and
+			// `Commands::base`.
 			world.commands.settle(world.peer, peer.confirmed);
+			world.commands.base(world.peer, peer.stamped);
 
 			return;
 		}
@@ -1142,14 +1252,66 @@ impl Net {
 		let Some(peer) = self.peers.first_mut() else {
 			return;
 		};
-		let told = peer.taken.heard.at(when);
+
+		// **two worlds, not one, and which body reads which is the whole of
+		// what a client draws.** Everybody else's body is drawn a fixed delay
+		// behind the newest, because a proxy drawn at the newest stutters every
+		// time a message is late. This window's *own* body is corrected against
+		// the newest with no delay at all, because it is not drawn from this at
+		// all - it is the base its own prediction runs forward from, and a base
+		// a tenth of a second in the past is a guess that starts a tenth of a
+		// second wrong. @ref `colby_net::Heard::newest`.
+		peer.taken.heard.newest(&mut self.freshest);
+		// copied out rather than borrowed, because the newest above is the
+		// endpoint's own field and the loop below reads both at once.
+		self.drawn.clear();
+		self.drawn
+			.extend_from_slice(peer.taken.heard.at(when));
+
+		let told = &self.drawn;
 
 		self.proxies.clear();
+		self.removed.clear();
+
+		// **a window that has not been told who it is takes nothing away.**
+		// `Role::of` answers `SimulatedProxy` for every body in the world until
+		// this end holds a name - deliberately, @ref `colby_core::abi::Role` -
+		// so a client acting on empty slots before it is seated would delete
+		// its own map on the first snapshot it ever received. Driving proxies
+		// before a name is harmless and useful; removing them is neither.
+		let named = world.peer.is_some();
 
 		for (id, body) in world.bodies.iter() {
-			let Some((generation, solid)) = told.get(id.slot()).copied().flatten() else {
+			// **whether a thing is here at all is asked of the newest, and
+			// where it is of the blend.** They are different questions and the
+			// blend cannot answer the first one: it reaches as far as the
+			// *earlier* of the two snapshots and keeps whatever that one held,
+			// so a body the far end has dropped is present in every blend
+			// forever rather than for a delay. @ref `colby_net::Heard::blend`,
+			// which says so - existence is a fact and not something to
+			// interpolate towards.
+			let Some(here) = self.freshest.get(id.slot()) else {
+				// past the end of what the far end holds, which is a body this
+				// end has and the other has never described. Left alone: it is
+				// not a removal, it is a table that has not caught up.
 				continue;
 			};
+
+			let Some((generation, newest)) = *here else {
+				self.removed
+					.extend(dropping(world.peer, named, id, body));
+
+				continue;
+			};
+
+			// and now where it is: the blend when it has an answer, and the
+			// newest when the blend does not reach this far yet.
+			let solid = told
+				.get(id.slot())
+				.copied()
+				.flatten()
+				.filter(|(was, _)| *was == generation)
+				.map_or(newest, |(_, drawn)| drawn);
 
 			// the generation is what says this is the same body rather than
 			// the one that took its place, and a wrong answer here would drive
@@ -1168,6 +1330,22 @@ impl Net {
 				continue;
 			}
 
+			// and this is where the two worlds part: a body this window owns
+			// takes the newest record of itself when there is one, and falls
+			// back to the delayed blend when the ring is not holding one yet.
+			//
+			// **Whose it is comes from the record and not from the body**, for
+			// the reason the whole field exists: the far end is the authority
+			// on ownership and the copy sitting here is one message stale.
+			// Asking the body would read every one of them as nobody's on the
+			// very first snapshot, which is a window predicting its own player
+			// off the delayed blend until a second message arrived.
+			let solid = if world.peer.is_some() && world.peer == owner(&newest) {
+				newest
+			} else {
+				solid
+			};
+
 			self.proxies.push((id, solid));
 		}
 
@@ -1175,6 +1353,24 @@ impl Net {
 		// is only had by walking the table and the walk borrows it.
 		for (id, solid) in &self.proxies {
 			drive(world, *id, solid);
+		}
+
+		// and the removals last, so that nothing is driven after it is gone.
+		for id in &self.removed {
+			let entity = world
+				.bodies
+				.get(*id)
+				.map_or(EntityId::NONE, |body| body.entity);
+
+			world.joints.forget(*id);
+			world.bodies.despawn(*id);
+			world.entities.despawn(entity);
+		}
+
+		if !self.removed.is_empty() {
+			self.dropped = self
+				.dropped
+				.saturating_add(u32::try_from(self.removed.len()).unwrap_or(u32::MAX));
 		}
 	}
 
@@ -1357,11 +1553,22 @@ impl Net {
 				peer.named = told.yours;
 				peer.confirmed = told.settled;
 
+				// kept before the block behind it is read, because that is
+				// where the two facts are still known to have come out of one
+				// message. @ref [`Peer::stamped`].
+				let settled = told.settled;
+				let held = peer.taken.heard.holding();
+
 				queue(&mut peer.asked, &mut self.arrived);
 
 				let rest = rest.get(told.used..).unwrap_or(&[]);
+				let read = absorb(&mut peer.taken, rest, &mut self.applying, now);
 
-				Some(absorb(&mut peer.taken, rest, &mut self.applying, now))
+				if peer.taken.heard.holding() != held {
+					peer.stamped = settled;
+				}
+
+				Some(read)
 			},
 			| Delivery::Fragment => Some(true),
 			| Delivery::Ignored(_) => {
@@ -1409,7 +1616,23 @@ impl Net {
 			return Some(index);
 		}
 
-		if !self.hosting || self.peers.len() >= MAX_PEERS {
+		// **a host takes a datagram from anybody; a client takes one only from
+		// the address it went looking for.** Which is not the same as taking
+		// none, and used to be: a client whose host had not started yet went
+		// quiet for ten seconds, forgot the only peer it had, and then refused
+		// every datagram the host ever sent because the address was no longer
+		// one it knew. It would sit there for the rest of the process saying
+		// nothing to a host that was answering.
+		//
+		// @note: this makes a *new* conversation with the same address, its
+		// rings numbering from one at this end. That converges when the far end also
+		// gave up on this one and does not when only this end did - which is
+		// the connection handshake's job and is not written. @ref [`Net::add`].
+		let looked = self
+			.looking
+			.is_some_and(|looking| looking == address);
+
+		if (!self.hosting && !looked) || self.peers.len() >= MAX_PEERS {
 			return None;
 		}
 
@@ -1449,6 +1672,7 @@ impl Net {
 			asked: Vec::new(),
 			settled: 0,
 			confirmed: 0,
+			stamped: 0,
 			told: Ring::new(),
 			taken: Taken {
 				heard: Heard::new(),
@@ -1629,6 +1853,40 @@ fn queue(asked: &mut Vec<Command>, arrived: &mut Vec<Command>) {
 	}
 }
 
+/// Whether a body the far end no longer describes is one to take away.
+///
+/// **In range and empty is the far end saying this slot holds nothing.**
+/// Removals have always crossed - a snapshot writes a `GONE` mark for a slot
+/// that emptied - and nothing ever acted on one, so a prop the host cleaned up
+/// stayed on a client forever, kinematic and frozen where the last message left
+/// it.
+///
+/// Nothing at all for a window that has not been told who it is, and nothing
+/// for a body this window has authority over, which on a client is its own
+/// player: neither is somebody else's to remove by saying nothing.
+///
+/// @param peer - who this process is
+/// @param named - whether that is anybody yet
+/// @param id - the body in question
+/// @param body - and the body itself, for its owner
+/// @return the handle to drop, or nothing
+fn dropping(peer: PeerId, named: bool, id: BodyId, body: &Body) -> Option<BodyId> {
+	if !named || body.role(peer) == Role::AutonomousProxy {
+		return None;
+	}
+
+	Some(id)
+}
+
+/// Whose a record says its body is.
+///
+/// The pair of words the wire carries, put back together through the only door
+/// there is: a `PeerId`'s fields are the table's to mint and nothing out here
+/// may forge one. @ref `PeerId::to_bits`, which is the other half.
+fn owner(solid: &Solid) -> PeerId {
+	PeerId::from_bits((u64::from(solid.owner[1]) << 32) | u64::from(solid.owner[0]))
+}
+
 /// Puts one body's share of a world that arrived into the world.
 ///
 /// Its own function because the body and the entity it drives are two writes
@@ -1651,10 +1909,20 @@ fn drive(world: &mut World, id: BodyId, solid: &Solid) {
 	//
 	// @note: what this cannot express is a host-simulated prop, which arrives
 	// as kinematic and is indistinguishable from a frozen one to anything that
-	// reads only the kind - and the sandbox's own `frozen` is exactly that. A
-	// game on a wire has to ask the *role* as well, and teaching it to is the
-	// commit that makes the sandbox two people.
+	// reads only the kind - and the sandbox's own `frozen` is exactly that.
+	// Which is why the owner below is written: with it a game can ask the
+	// *role* instead of the kind, and the two questions part company exactly
+	// here.
 	let was = body.kind;
+
+	// **whose it is, which used to be sent and thrown away.** Every authority
+	// question in the engine is `(World::peer, Body::owner)` and nothing else
+	// (@ref `colby_core::abi::Role`), so a receiver that dropped this left
+	// every body on a client owned by nobody - a client could not tell its own
+	// player from a stranger's, and `Role::of` could only ever answer
+	// `SimulatedProxy`. It is a plain copy because the far end's slot numbering
+	// for peers is the far end's, and it is the one both ends agree on.
+	body.owner = owner(solid);
 
 	body.kind = match solid.kind {
 		| 0 => BodyKind::Static,
@@ -1922,7 +2190,7 @@ pub(crate) fn install(cvars: &mut Cvars) {
 mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
-	use colby_core::abi::{Body, Transform, net::MAX_PEERS as PLAYERS};
+	use colby_core::abi::{Transform, net::MAX_PEERS as PLAYERS};
 	use colby_net::MAX_COMMAND;
 
 	use super::*;
@@ -2141,6 +2409,33 @@ mod tests {
 		world
 	}
 
+	/// The same, saying whose it is.
+	fn owned(body: BodyId, along: f32, owner: PeerId) -> Vec<Slot> {
+		let mut world = told(body, along);
+
+		if let Some(Some((_, solid))) = world.get_mut(body.slot()) {
+			solid.owner = [u32::try_from(owner.slot()).unwrap_or(0), owner.generation()];
+		}
+
+		world
+	}
+
+	/// A peer that is somebody, at a slot nothing in these fixtures sits in.
+	fn somebody() -> PeerId { PeerId::from_bits((7_u64 << 32) | 4) }
+
+	/// Every body a world holds, described where it stands.
+	fn everything(world: &World) -> Vec<Slot> {
+		let mut said = vec![None; world.bodies.slots()];
+
+		for (id, body) in world.bodies.iter() {
+			if let Some(slot) = said.get_mut(id.slot()) {
+				*slot = Some((id.generation(), Solid::of(body)));
+			}
+		}
+
+		said
+	}
+
 	/// What one endpoint's peer was told, put in as though it had arrived.
 	fn arrived(net: &mut Net, number: u32, world: &[Slot], at: Duration) {
 		let mut out = Vec::new();
@@ -2237,7 +2532,7 @@ mod tests {
 
 		assert_eq!(
 			world.bodies.get(alone).map(|it| it.entity),
-			Some(colby_core::abi::EntityId::NONE),
+			Some(EntityId::NONE),
 			"it drives nothing"
 		);
 
@@ -2321,6 +2616,180 @@ mod tests {
 			world.bodies.get(body).map(|it| it.kind),
 			Some(BodyKind::Dynamic),
 			"the body this end does have was not spoken about and was left alone"
+		);
+	}
+
+	#[test]
+	fn a_slot_the_far_end_has_emptied_is_emptied_here_too() {
+		// removals have always crossed - the snapshot writes a mark for a slot
+		// that went from occupied to empty - and nothing ever acted on one, so
+		// a prop the host cleaned up stayed here forever, kinematic and frozen
+		// where the last message left it.
+		let (mut net, mut world, body) = client();
+		let entity = world
+			.bodies
+			.get(body)
+			.map_or(EntityId::NONE, |it| it.entity);
+
+		// **a body behind it in the table**, so that the world which no longer
+		// mentions the one under test still reaches past its slot. A table that
+		// simply stops short is a far end that has not caught up, which is the
+		// other test and the other answer.
+		let behind = world.bodies.spawn(Body::default());
+
+		// named, because a window that does not know who it is takes nothing
+		// away. The slot is one nobody sits in, so nothing here owns anything.
+		world.peer = somebody();
+
+		// **everything this end holds, described**, so that the only slot the
+		// second world empties is the one under test. A fixture that quietly
+		// dropped the fillers as well would pass on a rule that removed
+		// whatever it liked.
+		let all = everything(&world);
+
+		arrived(&mut net, 1, &all, Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+		assert!(world.bodies.get(body).is_some(), "described, so it is here");
+		assert_eq!(net.dropped(), 0, "and nothing else went with it");
+
+		// and now the same world with one slot emptied, which is the far end
+		// saying that one is gone rather than saying nothing.
+		let mut gone = all;
+
+		gone[body.slot()] = None;
+		arrived(&mut net, 2, &gone, colby_core::time::STEP);
+		net.arrive(&mut world, colby_core::time::STEP);
+
+		assert!(world.bodies.get(body).is_none(), "and now it is not");
+		assert!(!world.entities.alive(entity), "the thing it drove went with it");
+		assert!(world.bodies.get(behind).is_some(), "and the one still described stayed");
+		assert_eq!(net.dropped(), 1);
+	}
+
+	#[test]
+	fn a_window_with_no_name_yet_takes_nothing_away() {
+		// **the fixture that matters**: every body reads as somebody else's
+		// until this end has a name, so a client acting on empty slots before
+		// it is seated would delete its own map on the first snapshot.
+		let (mut net, mut world, body) = client();
+
+		assert_eq!(world.peer, PeerId::NONE, "a window is nobody until it is told");
+
+		let behind = world.bodies.spawn(Body::default());
+
+		arrived(&mut net, 1, &told(behind, 1.0), Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert!(world.bodies.get(body).is_some(), "still here");
+		assert_eq!(net.dropped(), 0);
+	}
+
+	#[test]
+	fn a_body_past_the_end_of_what_the_far_end_holds_is_left_alone() {
+		// in range and empty is a removal; past the end is a table that has
+		// not caught up, and the two must not be the same answer.
+		let (mut net, mut world, body) = client();
+
+		world.peer = somebody();
+
+		// a world that stops before this end's body ever begins. One occupied
+		// slot in it, so that what is being tested is the length rather than a
+		// snapshot describing nothing at all. `client` puts three fillers in
+		// front of its body for exactly this: a slot number and an index are
+		// two different numbers here.
+		let short = told(
+			world
+				.bodies
+				.iter()
+				.next()
+				.expect("the fillers are there")
+				.0,
+			5.0,
+		);
+
+		assert!(short.len() <= body.slot(), "the fixture has to stop short to mean anything");
+		arrived(&mut net, 1, &short, Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert!(world.bodies.get(body).is_some(), "not spoken about is not removed");
+		assert_eq!(net.dropped(), 0);
+	}
+
+	#[test]
+	fn a_window_takes_the_newest_word_about_itself_and_the_delayed_one_about_everybody_else() {
+		// what a proxy is drawn at and what an own body is predicted from are
+		// two different questions, and asking one of them twice is either a
+		// stutter or a guess that starts late.
+		let (mut net, mut world, body) = client();
+		let mine = somebody();
+		let entity = world
+			.bodies
+			.get(body)
+			.map_or(EntityId::NONE, |it| it.entity);
+
+		world.peer = mine;
+
+		// two snapshots a step apart, at three and then at nine, both saying
+		// this is the window's own. Asked for the moment of the first, the
+		// blend answers three - and an own body has to answer nine.
+		arrived(&mut net, 1, &owned(body, 3.0, mine), Duration::ZERO);
+		arrived(&mut net, 2, &owned(body, 9.0, mine), colby_core::time::STEP);
+		net.arrive(&mut world, Duration::ZERO);
+
+		// where a driven body is actually written: the solver copies a body it
+		// does not move *from* the entity, so the entity is the write that
+		// lasts. @ref `drive`.
+		let at = world
+			.entities
+			.transform(entity)
+			.map_or(f32::NAN, |it| it.position.x);
+
+		assert!(
+			(at - 9.0).abs() < 1.0e-4,
+			"an own body is corrected against the newest, not the blend: {at}"
+		);
+
+		// and the same wire, the same moment, the same two snapshots - with
+		// the records saying the body belongs to somebody else.
+		let (mut net, mut world, body) = client();
+		let entity = world
+			.bodies
+			.get(body)
+			.map_or(EntityId::NONE, |it| it.entity);
+
+		world.peer = mine;
+		arrived(&mut net, 1, &told(body, 3.0), Duration::ZERO);
+		arrived(&mut net, 2, &told(body, 9.0), colby_core::time::STEP);
+		net.arrive(&mut world, Duration::ZERO);
+
+		let at = world
+			.entities
+			.transform(entity)
+			.map_or(f32::NAN, |it| it.position.x);
+
+		assert!(
+			(at - 3.0).abs() < 1.0e-4,
+			"and everybody else's is drawn where it was a delay ago: {at}"
+		);
+	}
+
+	#[test]
+	fn a_body_arrives_knowing_whose_it_is() {
+		// every authority question in the engine is the pair (this peer, that
+		// owner), so a receiver that dropped the owner left a client unable to
+		// tell its own player from a stranger's.
+		let (mut net, mut world, body) = client();
+		let mine = somebody();
+
+		world.peer = mine;
+		arrived(&mut net, 1, &owned(body, 1.0, mine), Duration::ZERO);
+		net.arrive(&mut world, Duration::ZERO);
+
+		assert_eq!(world.bodies.get(body).map(|it| it.owner), Some(mine));
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.role(mine)),
+			Some(Role::AutonomousProxy),
+			"and so a client can finally tell its own from everybody else's"
 		);
 	}
 
@@ -3167,6 +3636,75 @@ mod tests {
 	}
 
 	#[test]
+	fn a_window_stops_resending_what_was_heard_and_stops_guessing_at_what_was_drawn() {
+		// **the two marks come from two different places and only a wire where
+		// they disagree can tell.** An acknowledgement rides every message and
+		// a world rides one in a handful, so a client that took the newest
+		// acknowledgement as the base for its guess would be running that guess
+		// forward from a picture the acknowledgement has already overtaken -
+		// which is a smear of whole units on any wire with delay on it.
+		let (mut host, mut client, _wire) = two();
+		let (mut served, mut window) = (empty_world(), empty_world());
+
+		joined(&mut window);
+		round(&mut host, &mut client, 1);
+		host.seat(&mut served);
+		round(&mut host, &mut client, 2);
+		client.seat(&mut window);
+
+		for number in 1..=3 {
+			assert!(window.commands.push(window.peer, wanted(number)));
+		}
+
+		client.ask(window.commands.unsettled(window.peer));
+		round(&mut host, &mut client, 3);
+		host.seat(&mut served);
+
+		let peer = seated(&served);
+
+		assert_eq!(served.commands.kept(peer).len(), 3, "all three arrived");
+
+		// the host runs two of them and describes the world it made.
+		assert!(served.commands.settle(peer, 2));
+		host.seat(&mut served);
+
+		let described = vec![None; 4];
+		let at = colby_core::time::STEP * 4;
+
+		host.send(at, Some(&described));
+		client.send(at, None);
+		host.receive(at);
+		client.receive(at);
+		client.seat(&mut window);
+
+		assert_eq!(window.commands.settled(window.peer), 2, "two were heard");
+		assert_eq!(window.commands.based(window.peer), 2, "and the picture shows two");
+
+		// and then it runs the third and says so in a message carrying no
+		// world at all, which is what four messages in five look like.
+		assert!(served.commands.settle(peer, 3));
+		host.seat(&mut served);
+		round(&mut host, &mut client, 5);
+		client.seat(&mut window);
+
+		assert_eq!(window.commands.settled(window.peer), 3, "three were heard");
+		assert_eq!(
+			window.commands.based(window.peer),
+			2,
+			"but the newest picture is still the one that showed two"
+		);
+		assert_eq!(
+			window.commands.unbased(window.peer),
+			&[wanted(3)],
+			"so the third is still a guess"
+		);
+		assert!(
+			window.commands.unsettled(window.peer).is_empty(),
+			"and none of them is worth sending again"
+		);
+	}
+
+	#[test]
 	fn a_block_of_commands_that_is_nonsense_costs_the_message_and_not_the_peer() {
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (one, two) = (somewhere(1), somewhere(2));
@@ -3470,6 +4008,107 @@ mod tests {
 	}
 
 	#[test]
+	fn a_line_that_crossed_runs_as_the_peer_that_said_it() {
+		// **the console is this engine's RPC layer**, and a layer that ran
+		// every call as whoever is at the host's keyboard is not one. Every
+		// command in the sandbox reads `World::peer` to find out whose player
+		// it is about - which crosshair a nameless `game.grab` means, where in
+		// front of somebody a `game.spawn` lands - so this is the difference
+		// between a peer asking for something and a peer making the host do
+		// something to itself.
+		let (mut host, mut client, _wire) = two();
+		let (mut served, mut window) = (empty_world(), empty_world());
+
+		served.cvars.attribute(Owner::Module);
+		served
+			.cvars
+			.command("game.whoami", whoami, "writes down whose the world said it was");
+		served.cvars.attribute(Owner::Engine);
+
+		joined(&mut window);
+		round(&mut host, &mut client, 1);
+		client
+			.say("game.whoami")
+			.expect("the ring took it");
+		round(&mut host, &mut client, 2);
+
+		host.seat(&mut served);
+
+		let named = served
+			.players
+			.iter()
+			.map(|(peer, _)| peer)
+			.find(|peer| !peer.is_host())
+			.expect("the host seated whoever turned up");
+
+		assert!(served.peer.is_host(), "the machine running it is still the host");
+		obey(&mut served, &host);
+
+		let ran =
+			PeerId::from_bits((u64::from(served.owed_steps) << 32) | u64::from(served.contacts));
+
+		assert_eq!(served.steps, 1, "it ran, once");
+		assert_eq!(ran, named, "and as the peer that asked, not as the host");
+		assert!(
+			served.peer.is_host(),
+			"and the field naming this machine is put back afterwards"
+		);
+	}
+
+	#[test]
+	fn a_line_from_a_peer_with_no_name_is_not_run_as_somebody_else() {
+		// a peer is given its name by the block of commands in a message, and
+		// the reliable ring in front of that block is read first - so the very
+		// first thing anybody ever says arrives before they are anybody.
+		// Running it would run it as whoever the host is.
+		let (mut host, mut client, _wire) = two();
+		let mut served = empty_world();
+
+		served.cvars.attribute(Owner::Module);
+		served
+			.cvars
+			.command("game.whoami", whoami, "writes down whose the world said it was");
+		served.cvars.attribute(Owner::Engine);
+
+		round(&mut host, &mut client, 1);
+		client
+			.say("game.whoami")
+			.expect("the ring took it");
+		round(&mut host, &mut client, 2);
+
+		assert_eq!(host.said().len(), 1, "it crossed");
+
+		// and deliberately *not* seated, which is the state the first message
+		// of a conversation arrives in.
+		obey(&mut served, &host);
+		assert_eq!(served.steps, 0, "a line from nobody is not run at all");
+		assert_eq!(served.contacts, 0, "and so leaves no mark of any kind");
+	}
+
+	#[test]
+	fn a_client_still_listens_to_the_host_it_went_looking_for() {
+		// a host that took a moment longer to start than the client did used
+		// to cost the whole process: the client went quiet, forgot the only
+		// peer it had, and then refused every datagram that address ever sent
+		// because it was no longer one it knew.
+		let (mut host, mut client, _wire) = two();
+		let quiet = QUIET + Duration::from_secs(1);
+
+		// they find each other first, so that the host has somebody to answer.
+		round(&mut host, &mut client, 1);
+		assert_eq!(client.peers(), 1, "it found a host");
+
+		client.receive(quiet);
+		assert_eq!(client.peers(), 0, "and gave up on one that then said nothing");
+
+		// and now the host speaks, from the same address as before.
+		host.send(quiet, None);
+		client.receive(quiet);
+
+		assert_eq!(client.peers(), 1, "the address it went looking for is still somebody");
+	}
+
+	#[test]
 	fn a_host_runs_what_a_peer_may_ask_for_and_a_client_runs_nothing() {
 		let (mut host, mut client, _wire) = two();
 		let (mut served, mut window) = (empty_world(), empty_world());
@@ -3500,6 +4139,12 @@ mod tests {
 
 		// what the host does with what a peer asked for.
 		assert_eq!(host.said().len(), 2, "both crossed");
+
+		// seated first, exactly as the loop does it: a line is run *as* the
+		// peer that said it, and a peer with no name has no player for a
+		// command to be about. @ref `crate::host`, where the order is
+		// receive, seat, obey.
+		host.seat(&mut served);
 		obey(&mut served, &host);
 		assert_eq!(served.contacts, MARK, "the one it may run, ran");
 		assert_eq!(served.owed_steps, 0, "and the one it may not, did not");
@@ -3526,6 +4171,29 @@ mod tests {
 		let world = unsafe { &mut *world };
 
 		world.contacts = MARK;
+	}
+
+	/// A console command that writes down whose the world said it was.
+	///
+	/// The whole of what "the console is the RPC layer" means, made into a
+	/// number a test can compare: every command in the game reads
+	/// [`World::peer`] to find out whose player it is about, so a line run with
+	/// the wrong one in place is a line that acted on the wrong person.
+	///
+	/// # Safety
+	///
+	/// As `ConsoleFn`: both pointers are live for the duration of the call.
+	unsafe extern "C-unwind" fn whoami(world: *mut World, _args: *const colby_core::abi::Args) {
+		// SAFETY: as `mark`.
+		let world = unsafe { &mut *world };
+
+		// **and a mark that says it ran at all**, which is separate from the
+		// name it ran under on purpose: a peer of nobody writes zeroes, and a
+		// test that read only those could not tell a line that was refused
+		// from one that ran as nobody. The two are the whole question here.
+		world.steps = world.steps.saturating_add(1);
+		world.contacts = u32::try_from(world.peer.to_bits() & 0xFFFF_FFFF).unwrap_or(0);
+		world.owed_steps = world.peer.generation();
 	}
 
 	/// A console command that does nothing, so the gate has a name to find.

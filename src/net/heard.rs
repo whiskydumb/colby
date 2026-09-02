@@ -100,6 +100,11 @@ impl Heard {
 
 	/// The newest snapshot taken, which is what this end says it holds.
 	///
+	/// Also how a caller tells a message that brought a new world from one that
+	/// brought none: a client's guess is measured forward from a snapshot, and
+	/// the mark saying which commands that snapshot already covers has to be
+	/// the one that came in the same message. @ref `crate::net::Peer::stamped`.
+	///
 	/// @return the number, or [`NOTHING`] if nothing has been taken
 	#[must_use]
 	pub const fn holding(&self) -> u32 { self.holding }
@@ -149,6 +154,30 @@ impl Heard {
 		self.ring.forget();
 		self.holding = NOTHING;
 		self.between.clear();
+	}
+
+	/// The newest world this end has been told about, as it was told.
+	///
+	/// **Not [`at`](Self::at), and the difference is the whole of why this
+	/// exists.** What a far end's bodies are drawn as is a blend a fixed delay
+	/// behind the newest, because a proxy drawn at the newest is a proxy that
+	/// stutters whenever a message is late. What a client's *own* body is
+	/// predicted from is the opposite question: the last thing the machine that
+	/// decides actually said, with no delay added, because a guess that starts
+	/// a tenth of a second in the past is a guess that is a tenth of a second
+	/// wrong before it begins. Both are right about their own body and neither
+	/// is right about the other's.
+	///
+	/// @param into - where the world goes, emptied first
+	/// @return whether anything was written
+	pub fn newest(&self, into: &mut Vec<Slot>) -> bool {
+		if self.holding == NOTHING {
+			into.clear();
+
+			return false;
+		}
+
+		self.ring.world(self.holding, into)
 	}
 
 	/// The world as it was at one moment.

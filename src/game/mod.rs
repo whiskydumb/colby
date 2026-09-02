@@ -664,14 +664,40 @@ struct State {
 	/// wearing one attitude, and two poses would be two attitudes drifting
 	/// apart.
 	character_pose: PoseId,
+
+	/// One box per seat, made when the world is and never destroyed.
+	///
+	/// **Made at load and not when somebody arrives, which is the whole of how
+	/// two machines agree about their body tables.** A body's slot is handed
+	/// out by a free list, so two ends only ever hold the same table if they
+	/// spawn and despawn the same things in the same order - and a host that
+	/// made a box the moment a peer turned up was, by construction, doing
+	/// something no client could copy. Every end now builds the same nine
+	/// boxes before the map, and admitting somebody is claiming one rather than
+	/// making one. @ref [`claim`] and [`release`].
+	///
+	/// An unclaimed seat is on no layer and draws nothing, so a world with
+	/// nobody in it looks and behaves exactly as it did before there were any.
+	seats: [EntityId; SEATS],
+
+	/// Their bodies, in the same order.
+	seat_bodies: [BodyId; SEATS],
 }
+
+/// How many boxes a world keeps standing by, one per seat the table has.
+///
+/// **Not a limit this file chose.** It is the width of
+/// [`Players`](colby_core::abi::state::Players), because a seat here has to
+/// exist for every name that table can hand out - a peer with nowhere to stand
+/// is a peer the game cannot admit.
+const SEATS: usize = colby_core::abi::net::MAX_PEERS;
 
 /// The version of [`State`]'s layout. Bump it whenever the struct changes.
 ///
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 22;
+const STATE_LAYOUT: u64 = 23;
 
 /// What is true of one person, kept in that peer's own block.
 ///
@@ -726,6 +752,40 @@ struct Player {
 
 	/// How far a wrong guess still has to fade. @ref [`Drift`].
 	drift: Drift,
+
+	/// Where the replay says the player is, which is not where it is drawn.
+	///
+	/// **Two positions per player, and the second one is what makes a
+	/// correction a slide instead of a jump.** The replay has to start from
+	/// what it believes, or a guess that begins at a smeared place guesses
+	/// wrong again and the smear never converges; the picture has to be at the
+	/// smeared place, or a correction is a teleport. They are the same point
+	/// only while nothing is being corrected. @ref [`Drift::offset`].
+	place: [f32; 3],
+
+	/// Which way this player was looking on the last command run for them.
+	///
+	/// **Off the wire rather than off a screen.** Every aim in this file used
+	/// to come from `world.camera` and the pointer, which is this process's one
+	/// screen - so a host acting on behalf of somebody else had the wrong
+	/// facing and no way to get the right one. A command carries the two
+	/// angles; this is where they are kept between the run that read them and
+	/// whatever asks later.
+	yaw: f32,
+
+	/// And how far up or down.
+	pitch: f32,
+
+	/// The command number this end last re-based this player's guess at.
+	///
+	/// **Only a client has any use for it, and the use is knowing when the
+	/// truth moved.** A window predicts forward from the last thing the host
+	/// actually confirmed; the moment the host confirms one more, the base has
+	/// changed and the run has to start again from the new one. Comparing this
+	/// against `Commands::settled` is the whole of that test, and keeping it
+	/// here rather than deriving it is what makes "nothing new arrived" a
+	/// cheap answer rather than a replay.
+	settled: u32,
 
 	/// Which gun is in the hands. @ref [`PHYSGUN`].
 	gun: u32,
@@ -786,7 +846,7 @@ struct Player {
 }
 
 /// The version of [`Player`]'s layout, bumped like [`STATE_LAYOUT`].
-const PLAYER_LAYOUT: u64 = 2;
+const PLAYER_LAYOUT: u64 = 3;
 
 /// The bits a [`Command`]'s buttons mean here.
 ///
@@ -837,6 +897,33 @@ struct Local {
 	/// The panel the spawn menu is shown in.
 	menu: PanelId,
 
+	/// Where this screen last drew its own player, offset and all.
+	///
+	/// **Not in [`Player`], and not in the entity.** Not the entity because a
+	/// client's own body is overwritten every step by
+	/// `Net::arrive` before the game runs, so by the time anything could read
+	/// last frame's picture out of it, it is the host's word instead. Not
+	/// `Player` because what was *drawn* is a property of a screen: two windows
+	/// onto one person would each have their own, and none of it may cross a
+	/// wire or reach a save.
+	///
+	/// It is what [`correct`] measures against, and measuring against anything
+	/// else is what made a correction compound rather than fade.
+	drawn: [f32; 3],
+
+	/// Buttons a console line is holding down, on top of the keyboard.
+	///
+	/// **What makes a process with no keyboard drivable.** `colby --join` and
+	/// `colby --host` never write [`World::input`] - there is no window to
+	/// write it - so a client built to be run beside a host by a script could
+	/// connect, be named and file commands, and never take a single step. That
+	/// is the mode's whole purpose defeated by the one thing it cannot have.
+	///
+	/// In [`Local`] rather than [`Player`] because it is a stand-in for a
+	/// keyboard, and a keyboard is a property of a screen and not of a person:
+	/// it must never cross a wire, and it must not survive a save.
+	held_buttons: u32,
+
 	/// The gun's hum while it is holding something, or nothing.
 	///
 	/// The one voice in this game whose handle is worth keeping: everything
@@ -847,7 +934,7 @@ struct Local {
 }
 
 /// The version of [`Local`]'s layout, bumped like [`STATE_LAYOUT`].
-const LOCAL_LAYOUT: u64 = 1;
+const LOCAL_LAYOUT: u64 = 2;
 
 /// The world's own arena, which everybody in it shares.
 ///
@@ -890,6 +977,171 @@ fn spawn(peer: PeerId) -> Vec3 {
 	let along = f32::from(u16::try_from(peer.slot()).unwrap_or(0));
 
 	PLAYER_START + Vec3::X * (along * PLAYER_SPACING)
+}
+
+/// Builds one box per seat, in slot order, before anything else is laid out.
+///
+/// **This is the function that makes two machines agree about a body table.**
+/// A body's slot comes off a free list, so two ends hold the same table only
+/// when they spawn the same things in the same order - and the old arrangement
+/// could not: a host made a player box the moment somebody turned up, at
+/// whatever slot happened to be free by then, and a client had no way to know
+/// which slot that was or to make one to match. Nine boxes made at load by
+/// everybody is the same nine slots at both ends, forever.
+///
+/// A seat nobody is in is on [`Layers::NONE`] and draws nothing, so a world
+/// with one person in it collides, traces, picks and renders exactly as it did
+/// when there was one box and no wire.
+///
+/// @param world - the tables to build into
+fn seat_all(world: &mut World) {
+	for slot in 0..SEATS {
+		let along = f32::from(u16::try_from(slot).unwrap_or(0));
+		let mut stance = Transform::at(PLAYER_START + Vec3::X * (along * PLAYER_SPACING));
+
+		stance.scale = PLAYER_EXTENTS * 2.0;
+
+		let seated = world.entities.spawn_at(stance);
+		// kinematic rather than dynamic: the controller decides where a player
+		// goes and the solver's job is only to push props out from under it. A
+		// dynamic one would be a box the player argues with.
+		let body =
+			world.attach_body(seated, BodyKind::Kinematic, Shape::cuboid(Vec3::splat(0.5)));
+
+		layer(world, body, Layers::NONE);
+
+		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+		if let (Some(one), Some(other)) =
+			(state.seats.get_mut(slot), state.seat_bodies.get_mut(slot))
+		{
+			*one = seated;
+			*other = body;
+		}
+	}
+
+	info!(seats = SEATS, bodies = world.bodies.len(), "seats are standing");
+}
+
+/// The pair standing by for one seat.
+///
+/// @param world - the arena to read
+/// @param peer - whose seat
+/// @return the entity and its body, or a pair of nothings for a peer with no
+/// seat
+fn seat_of(world: &mut World, peer: PeerId) -> (EntityId, BodyId) {
+	let slot = peer.slot();
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+
+	match (state.seats.get(slot), state.seat_bodies.get(slot)) {
+		| (Some(&one), Some(&other)) => (one, other),
+		| _ => (EntityId::NONE, BodyId::NONE),
+	}
+}
+
+/// Puts somebody in their seat: dressed, collidable, owned, and stood at their
+/// spawn.
+///
+/// Idempotent by the block it writes, so calling it every step for a peer that
+/// is already seated costs one comparison.
+///
+/// **Both ends run this**, which is the difference from what it replaced. A
+/// host claims a seat for everybody it has admitted; a client claims exactly
+/// one, its own, the moment the host tells it who it is. Neither makes a body,
+/// so neither can move the other's table.
+///
+/// @param world - the tables to write
+/// @param peer - who is sitting down
+/// @return whether anything changed
+fn claim(world: &mut World, peer: PeerId) -> bool {
+	let (seated, body) = seat_of(world, peer);
+
+	if !seated.is_some() || !body.is_some() {
+		return false;
+	}
+
+	let Some(mine) = block(world, peer) else {
+		return false;
+	};
+
+	if mine.player == seated && mine.player_body == body {
+		return false;
+	}
+
+	// said rather than relied on: a fresh block is zeroed, and zero happens to
+	// be both guns' and the first tool's number.
+	mine.gun = PHYSGUN;
+	mine.tool = WELD;
+	mine.player = seated;
+	mine.player_body = body;
+	mine.picked = EntityId::NONE;
+	mine.drift = Drift::NONE;
+
+	let at = spawn(peer);
+
+	mine.place = at.to_array();
+
+	// and this screen's idea of where it drew them, or the first correction
+	// would be measured against a zeroed arena - which is the middle of the
+	// map, and a smear the whole way back from it.
+	if peer == world.peer {
+		seen(world).drawn = at.to_array();
+	}
+
+	if let Some(transform) = world.entities.transform_mut(seated) {
+		transform.position = at;
+	}
+
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.transform.position = at;
+		solid.velocity = Vec3::ZERO;
+	}
+
+	// dressed and put on a layer here rather than in `dress`, because a seat is
+	// only a player while somebody is in it: an empty one draws nothing and
+	// collides with nothing, so a world nobody has joined is the world it was.
+	wear(world, seated);
+	layer(world, body, PLAYER_LAYERS);
+	own(world, body, peer);
+	world.entities.snap(seated);
+	info!(slot = peer.slot(), "somebody is in the world");
+
+	true
+}
+
+/// Empties a seat again: undressed, on no layer, owned by nobody.
+///
+/// The other half of [`claim`], and deliberately not a despawn: the body has to
+/// go on existing or the slot it holds would be handed to something else and
+/// the two ends would stop agreeing.
+///
+/// @param world - the tables to write
+/// @param slot - which seat
+fn vacate(world: &mut World, slot: usize) {
+	let (state, _) = world.state.get::<State>(STATE_LAYOUT);
+	let (Some(&seated), Some(&body)) = (state.seats.get(slot), state.seat_bodies.get(slot))
+	else {
+		return;
+	};
+
+	let along = f32::from(u16::try_from(slot).unwrap_or(0));
+	let at = PLAYER_START + Vec3::X * (along * PLAYER_SPACING);
+
+	world
+		.entities
+		.set_renderable(seated, Renderable::NOTHING);
+	layer(world, body, Layers::NONE);
+	own(world, body, PeerId::NONE);
+	world.joints.forget(body);
+
+	if let Some(transform) = world.entities.transform_mut(seated) {
+		transform.position = at;
+	}
+
+	if let Some(solid) = world.bodies.get_mut(body) {
+		solid.transform.position = at;
+		solid.velocity = Vec3::ZERO;
+	}
 }
 
 /// Clothes one player's box.
@@ -943,23 +1195,31 @@ fn sweep_players(world: &mut World) {
 	}
 
 	let seated = everybody(world);
-	let gone: Vec<(BodyId, EntityId)> = world
-		.bodies
-		.iter()
-		.filter(|(_, body)| on_layer(body, PLAYER_LAYERS))
-		.filter(|(_, body)| body.owner.is_some() && !seated.contains(&body.owner))
-		.map(|(id, body)| (id, body.entity))
-		.collect();
+	let mut gone = 0;
 
-	for (body, entity) in &gone {
-		// @ref [`sweep_props`] for why the joints go first.
-		world.joints.forget(*body);
-		world.bodies.despawn(*body);
-		world.entities.despawn(*entity);
+	for slot in 0..SEATS {
+		// **the owner on the body is the record of whose it is**, and the only
+		// one left: a peer that leaves has its block zeroed by the table,
+		// handles and all. A seat whose owner is somebody the world no longer
+		// seats is a seat to empty.
+		let Some(&body) = shared(world).seat_bodies.get(slot) else {
+			continue;
+		};
+		let owner = world
+			.bodies
+			.get(body)
+			.map_or(PeerId::NONE, |solid| solid.owner);
+
+		if !owner.is_some() || seated.contains(&owner) {
+			continue;
+		}
+
+		vacate(world, slot);
+		gone += 1;
 	}
 
-	if !gone.is_empty() {
-		info!(gone = gone.len(), "the boxes of people who have left");
+	if gone > 0 {
+		info!(gone, "the seats of people who have left");
 	}
 }
 
@@ -1085,6 +1345,19 @@ fn register_commands(world: &mut World) {
 		who,
 		"report this end's name, its player, and how the body table is laid out",
 	);
+	world.cvars.command(
+		"game.seats",
+		list_seats,
+		"report every seat: who is in it and where it is",
+	);
+	world.cvars.command(
+		"game.hold",
+		hold_keys,
+		"hold movement keys down from a script: forward, back, left, right, jump, or none",
+	);
+	world
+		.cvars
+		.command("game.look", look_at, "point this screen at <yaw> [pitch], in radians");
 }
 
 /// Runs once each time this module is swapped in.
@@ -1144,28 +1417,22 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 		// the same argument the entities above are cleared for.
 		world.poses.clear();
 		state.character_pose = PoseId::NONE;
-		// spawned where it stands and at the size it is, because nothing writes
-		// the player's transform afterwards except the controller, which only
-		// ever moves it. `place` deliberately leaves it alone.
-		let mut stance = Transform::at(PLAYER_START);
-		stance.scale = PLAYER_EXTENTS * 2.0;
-
-		let spawned = world.entities.spawn_at(stance);
-
 		world.camera.target = PLAYER_START + Vec3::Y * EYE_LIFT;
 
 		// and now the other two, once the world's own is done being written.
 		let local = seen(world);
 
 		(local.yaw, local.pitch, local.distance) = START_ORBIT;
+	}
 
-		if let Some(mine) = played(world) {
-			// said rather than relied on: a fresh arena is zeroed, and zero
-			// happens to be both guns' and the first tool's number.
-			mine.gun = PHYSGUN;
-			mine.tool = WELD;
-			mine.player = spawned;
-		}
+	// **before the map and on every end, whoever this process is.** The seats
+	// are what make two body tables the same table: they are built here, in
+	// slot order, by a host and by a client alike, and nothing afterwards ever
+	// makes or destroys one. Outside the `fresh` branch because a hot reload
+	// keeps the arena and therefore keeps the seats, and `seat_all` is a
+	// no-op when they are already standing.
+	if fresh {
+		seat_all(world);
 	}
 
 	register_commands(world);
@@ -1175,7 +1442,14 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	// picked up by this one. The materials the map names are declared in here,
 	// so this has to run before anything is laid out.
 	dress(world);
-	collide(world, world.peer);
+	// **and the seat this process is sitting in is re-dressed**, on a reload as
+	// well as a fresh load. `dress` clothes nothing player-shaped any more -
+	// what a seat looks like is `claim`'s, because a seat is only a player
+	// while somebody is in it - and a hot reload keeps the arena, so the block
+	// still names a seat that is still standing. Without this a reload would
+	// leave a claimed seat wearing a material handle from the build that just
+	// went away. @ref [`claim`], which is idempotent.
+	redress(world);
 
 	if fresh {
 		// only on a fresh arena: a reload should leave the map and the pile
@@ -1282,6 +1556,29 @@ unsafe extern "C-unwind" fn update(world: *mut World) {
 	relay_map(world);
 	relay_props(world);
 	draw_joints(world);
+
+	// **everything below this line makes or destroys something**, and on a
+	// client that is the one thing that must not happen. A body's slot is what
+	// a snapshot record is addressed by, so a window that spawned a prop or
+	// swallowed one would move every slot after it and start driving the wrong
+	// bodies with the host's poses - permanently, because nothing ever puts a
+	// free list back.
+	//
+	// @note: what this costs today is that the guns do nothing at a window at
+	// all. Before, they did something *locally* and the next snapshot stomped
+	// it, which looked like working and was worse. Making them work is a
+	// per-peer channel of intent - either more bits on a command, or a console
+	// line that carries its sender's aim - and it is the next thing rather than
+	// this thing. @ref `Player::yaw`, which is the half of it that has landed.
+	if !world.peer.is_host() {
+		outline_frozen(world);
+		outline_picked(world);
+		label_pick(world);
+		menu(world);
+
+		return;
+	}
+
 	swallow(world);
 	pick(world);
 	physgun(world, yaw);
@@ -1580,14 +1877,19 @@ fn spawn_prop(world: &mut World, name: &str) -> bool {
 		return false;
 	}
 
-	// where a prop lands is the dropping player's position and the dropping
-	// screen's yaw. Two arenas for two halves of one question, and the local
-	// half is the one that has to travel in a command once a client can ask.
-	let yaw = seen(world).yaw;
-	let Some(mine) = played(world) else {
+	// **where a prop lands is the *asking* player's place and the asking
+	// player's facing.** Both used to come from this process's one screen -
+	// `world.camera`'s orbit and `played`, which is whoever is running the
+	// machine - so a client's `game.spawn`, crossing the wire and running on
+	// the host, dropped its prop at the host's feet. The block carries the
+	// angles a command brought with it now (@ref `Player::yaw`), and
+	// `crate::net::obey` puts the sender in `World::peer` before the line runs,
+	// so both halves are the asker's.
+	let peer = world.peer;
+	let Some(mine) = block(world, peer) else {
 		return false;
 	};
-	let player = mine.player;
+	let (player, yaw) = (mine.player, if peer.is_host() { seen(world).yaw } else { mine.yaw });
 
 	let Some(&standing) = world.entities.transform(player) else {
 		return false;
@@ -1600,7 +1902,19 @@ fn spawn_prop(world: &mut World, name: &str) -> bool {
 	let data = world.scenes.data(scene).clone();
 	let put = scene::instantiate(world, &data, at);
 
-	trace!(name, body = put.body(0).slot(), "spawned");
+	// **whose it is, written on the body.** A prop nobody owns is a prop two
+	// people can both take hold of, each of them convinced the other's grab did
+	// not happen - and on a wire the loser's copy is stomped by the next
+	// snapshot without anything ever saying so. Ownership of a prop is not
+	// authority over it, which stays the host's; it is a claim, and it is the
+	// field every later question about a contested prop will be asked of.
+	let made: Vec<BodyId> = put.bodies().collect();
+
+	for body in made {
+		own(world, body, peer);
+	}
+
+	trace!(name, slot = peer.slot(), body = put.body(0).slot(), "spawned");
 
 	true
 }
@@ -1719,6 +2033,11 @@ fn ask(world: &mut World, yaw: f32, pitch: f32) {
 		buttons |= BUTTON_JUMP;
 	}
 
+	// and whatever `game.hold` is holding, which on a process with no window is
+	// the only thing there is. Or-ed rather than replacing, so that typing it
+	// at a window does not take the keyboard away. @ref [`Local::held_buttons`].
+	buttons |= seen(world).held_buttons;
+
 	let Some(mine) = block(world, peer) else {
 		return;
 	};
@@ -1818,13 +2137,16 @@ fn correct(world: &mut World, peer: PeerId, drawn: Option<Vec3>, predicted: Vec3
 	let Some(drawn) = drawn else {
 		return;
 	};
-	let showing = drawn + mine.drift.offset();
 
-	// a hair, because a replay that agreed to the bit is the ordinary case and
-	// restarting the clock on it would smear nothing for a tenth of a second
-	// every step - and because floats do not agree to the bit for long.
-	if showing.distance_squared(predicted) > SNAP * SNAP {
-		mine.drift.correct(showing, predicted);
+	// **`drawn` is where the box was on screen last step, offset and all**, and
+	// it is read out of the entity before the walk for exactly that reason: the
+	// entity is the one place carrying the smear. It used to be the position
+	// the wire had just written, which is not a picture of anything - the
+	// difference against it was a whole run of unconfirmed commands rather than
+	// a wrong guess, and feeding that back through `offset` re-armed the
+	// decay every step and compounded.
+	if drawn.distance_squared(predicted) > SNAP * SNAP {
+		mine.drift.correct(drawn, predicted);
 	}
 
 	mine.drift.advance(dt);
@@ -1848,26 +2170,80 @@ const SNAP: f32 = 1.0e-3;
 /// @param peer - whose player
 /// @return where the run ended, or nothing if that peer has no player yet
 fn walk(world: &mut World, peer: PeerId) -> Option<Moved> {
+	let deciding = world.peer.is_host();
+	let confirmed = world.commands.settled(peer);
 	let mine = block(world, peer)?;
-	let (player, body, since) = (mine.player, mine.player_body, mine.ran);
+	let (player, body) = (mine.player, mine.player_body);
 	let standing = mine.player_grounded != 0;
-	let &placed = world.entities.transform(player)?;
+
+	// **where a run starts, and on a window it is never where the box is
+	// drawn.** The machine that decides walks its players on from wherever
+	// they were: it *is* the truth, so its own last answer is the only base
+	// there is.
+	//
+	// A window does the opposite and does it every step: it throws its guess
+	// away and replays the whole unconfirmed run from the last thing the host
+	// actually said. That is not a choice about tidiness. A window that
+	// carried its guess forward and then replayed the same window of commands
+	// on top of it would apply each of them once per step for as long as they
+	// stayed unconfirmed, and run away from the host at a dozen times the
+	// speed a person walks.
+	mine.settled = confirmed;
+
+	let mut since = mine.ran;
+	let kept = Vec3::from_array(mine.place);
+	// on a window this is the host's word: `Net::arrive` writes it from the
+	// newest snapshot, before the solver and before this. On a host it is where
+	// the walk left it last step. @ref `crate::net::Net::arrive`. The block's
+	// own copy is the fallback for a player whose entity has gone.
+	let from = world
+		.entities
+		.transform(player)
+		.map_or(kept, |placed| placed.position);
+
 	let falling = world
 		.bodies
 		.get(body)
 		.map_or(0.0, |solid| solid.velocity.y);
-	let start = Motion::new(placed.position, Vec3::Y * falling, PLAYER_EXTENTS, world.dt)
+	let start = Motion::new(from, Vec3::Y * falling, PLAYER_EXTENTS, world.dt)
 		.ignoring(body)
 		.layered(PLAYER_LAYERS);
 
-	// both borrows are shared, so the ring and the world it is about can be
+	// **what is replayed is what the far end's picture does not cover**, which
+	// on the machine that decides is what it has not run and on a window is
+	// what the newest snapshot it holds does not include. The two are the same
+	// slice on a host, because a host's picture is its own and always current.
+	// @ref `Commands::unbased`.
+	//
+	// Both borrows are shared, so the ring and the world it is about can be
 	// read at once - which is what keeps a run of commands from being copied
 	// out of the table before it can be walked.
-	let commands = world.commands.unsettled(peer);
+	let commands = if deciding {
+		world.commands.unsettled(peer)
+	} else {
+		world.commands.unbased(peer)
+	};
 	let gravity = world.gravity.y;
 
 	if commands.is_empty() {
 		return None;
+	}
+
+	// **a window measures the run from the command in front of it**, not from
+	// whatever it last ran: the base it just took is the host's state as of
+	// the newest snapshot, and the first command it still has to guess about
+	// is exactly one step past that. Measuring from its own mark instead would
+	// hand the first command of every run a span of nothing, and `replay`
+	// would clamp it up to a dozen steps of catch-up that never happened.
+	//
+	// This is why what the ring settles at a window is the mark that came in
+	// the same message as the world, rather than the newest acknowledgement:
+	// the two have to name the same moment or this is a run starting in one
+	// place and measured from another. @ref `crate::net::Peer::stamped`.
+	if !deciding {
+		since = commands
+			.first()
+			.map_or(since, |command| command.step.saturating_sub(1));
 	}
 
 	// the highest rather than the last, which is the same guard `replay` keeps
@@ -1877,15 +2253,37 @@ fn walk(world: &mut World, peer: PeerId) -> Option<Moved> {
 	let last = commands
 		.iter()
 		.fold(since, |high, command| high.max(command.step));
+	// and where they were looking on the newest of them, which is what a host
+	// acting on somebody else's behalf has no other way to know.
+	let looking = commands
+		.iter()
+		.max_by_key(|command| command.number)
+		.map(|command| (command.yaw, command.pitch));
 	let moved = character::replay(world, &start, since, commands, |command, before, motion| {
 		wish(command, before, standing, gravity, motion);
 	});
 
-	// the entity first, because the body is kinematic and is written from it at
-	// the top of the next step - and then the body as well, so that a trace
-	// taken later in this same update sees where the player is rather than
-	// where it was. @ref [`Body::transform`](colby_core::abi::Body::transform).
-	if let Some(transform) = world.entities.transform_mut(player) {
+	// **the guess into the block and the smear into the entity**, which is the
+	// pair of writes the whole correction exists for. The body follows the
+	// guess rather than the picture: the solver pushes props out of the way of
+	// where the player really is, and shoving them with a fading offset would
+	// be the correction leaking into everybody else's world.
+	let mine = block(world, peer)?;
+
+	mine.player_grounded = u32::from(moved.grounded);
+	mine.ran = last;
+	mine.place = moved.position.to_array();
+
+	if let Some((yaw, pitch)) = looking {
+		mine.yaw = yaw;
+		mine.pitch = pitch;
+	}
+
+	// **only the machine that decides writes the picture here.** A window's is
+	// written by `walk_everybody`, after the correction this run just measured
+	// has been taken - the point of a smear is that it is applied to the answer
+	// that produced it, not to the one before.
+	if deciding && let Some(transform) = world.entities.transform_mut(player) {
 		transform.position = moved.position;
 	}
 
@@ -1894,11 +2292,6 @@ fn walk(world: &mut World, peer: PeerId) -> Option<Moved> {
 		solid.velocity = moved.velocity;
 	}
 
-	let mine = block(world, peer)?;
-
-	mine.player_grounded = u32::from(moved.grounded);
-	mine.ran = last;
-
 	Some(moved)
 }
 
@@ -1906,63 +2299,18 @@ fn walk(world: &mut World, peer: PeerId) -> Option<Moved> {
 ///
 /// A seated peer arrives with a block of nothing: the world's table hands out
 /// the identity and the block, and what a *player* is in this game - a box, a
-/// body, a gun in the hands - is this file's to say. So the first time a peer
-/// is walked and has no player yet, it gets one, standing where everybody
-/// starts.
+/// body, a gun in the hands - is this file's to say.
 ///
-/// Only where this process decides. A window does not invent players for
-/// people it has been told about; their boxes arrive over the wire like every
-/// other body, and a window that spawned its own would have two of everybody.
+/// **It claims a seat rather than making one**, which is the change that lets
+/// two machines share a world at all. @ref [`seat_all`]: every end builds the
+/// same nine boxes before the map, so admitting somebody moves nobody's body
+/// table. It runs at both ends for that reason - a host claims for everybody it
+/// has admitted, a window claims exactly one, and neither invents anything.
 ///
-/// @param world - the tables to spawn into
+/// @param world - the tables to write
 /// @param peer - who has arrived
 /// @return whether anything was made
-fn admit_player(world: &mut World, peer: PeerId) -> bool {
-	if !world.peer.is_host() {
-		return false;
-	}
-
-	// **alive rather than non-zero**, and the difference is a peer that never
-	// comes back. A handle whose entity has been despawned still reads as
-	// somebody - a generation of nought is the only thing `is_some` refuses -
-	// so a player swallowed by the pit, or orphaned by a reload that cleared
-	// the tables, would leave this refusing to make another one for the rest of
-	// the session. The table is the thing that knows.
-	let standing = block(world, peer).map(|mine| mine.player);
-
-	if standing.is_none_or(|player| world.entities.alive(player)) {
-		return false;
-	}
-
-	// spawned along from wherever the last one is, at the size it is: nothing
-	// writes a player's transform afterwards except the controller, which only
-	// ever moves it. @ref [`PLAYER_SPACING`] for why it is not simply
-	// [`PLAYER_START`].
-	let mut stance = Transform::at(spawn(peer));
-
-	stance.scale = PLAYER_EXTENTS * 2.0;
-
-	let spawned = world.entities.spawn_at(stance);
-
-	// dressed here as well as spawned, because `dress` only ever clothes the
-	// box belonging to *this* process's peer and runs from `init`, which is
-	// long over by the time anybody turns up. A player nobody can see is worse
-	// than no player: the solver, the traces and the pick all find it.
-	wear(world, spawned);
-
-	if let Some(mine) = block(world, peer) {
-		// said rather than relied on: a fresh block is zeroed, and zero happens
-		// to be both guns' and the first tool's number.
-		mine.gun = PHYSGUN;
-		mine.tool = WELD;
-		mine.player = spawned;
-	}
-
-	collide(world, peer);
-	info!(slot = peer.slot(), "somebody else is in the world");
-
-	true
-}
+fn admit_player(world: &mut World, peer: PeerId) -> bool { claim(world, peer) }
 
 /// Walks everybody the machine that decides is deciding for.
 ///
@@ -1976,17 +2324,37 @@ fn walk_everybody(world: &mut World) {
 	let peer = world.peer;
 
 	if !peer.is_host() {
-		// a window moves its own and nobody else's: everybody else's body is a
-		// proxy and the wire is holding the pen. What it gets is a guess, so
-		// where it was drawn is remembered first and the difference smeared.
-		let standing = block(world, peer).map_or(EntityId::NONE, |mine| mine.player);
-		let drawn = world
-			.entities
-			.transform(standing)
-			.map(|placed| placed.position);
+		// **a window moves its own and nobody else's**: everybody else's body
+		// is a proxy and the wire is holding the pen. It sits down first,
+		// because the name it was given arrives long after `init` ran and the
+		// seat has been standing empty ever since. @ref [`claim`].
+		claim(world, peer);
 
-		if let Some(moved) = walk(world, peer) {
-			correct(world, peer, drawn, moved.position);
+		// where it was drawn last step, out of this screen's own arena rather
+		// than out of the entity: the wire overwrote the entity a moment ago
+		// with the host's word, which is not a picture of anything. @ref
+		// [`Local::drawn`].
+		let last = Vec3::from_array(seen(world).drawn);
+		let drawn = last.is_finite().then_some(last);
+
+		let Some(moved) = walk(world, peer) else {
+			return;
+		};
+
+		correct(world, peer, drawn, moved.position);
+
+		// and now the picture, with the correction this run just measured: the
+		// offset is a whole error the moment it is taken, so the first frame
+		// after a wrong guess is drawn exactly where the last one was and the
+		// difference is spent over the tenth of a second that follows.
+		let standing = block(world, peer).map_or(EntityId::NONE, |mine| mine.player);
+		let smear = block(world, peer).map_or(Vec3::ZERO, |mine| mine.drift.offset());
+		let shown = moved.position + smear;
+
+		seen(world).drawn = shown.to_array();
+
+		if let Some(transform) = world.entities.transform_mut(standing) {
+			transform.position = shown;
 		}
 
 		return;
@@ -2104,10 +2472,21 @@ fn put_player_back(world: &mut World, peer: PeerId) {
 		solid.velocity = Vec3::ZERO;
 	}
 
-	let Some(mine) = played(world) else {
+	// **that peer's block and not this process's own.** A host putting somebody
+	// else back used to clear its own grounded flag and leave theirs saying
+	// they were still standing on the thing they fell off - so the first
+	// command after a rescue was run as though the fall had never happened,
+	// and the host's own player was told it was in the air for no reason.
+	let Some(mine) = block(world, peer) else {
 		return;
 	};
+
 	mine.player_grounded = 0;
+	mine.place = spawn(peer).to_array();
+	// nothing left of the fall means nothing left of the correction either: a
+	// drift measured against a place the player is no longer anywhere near is
+	// a smear across the whole map.
+	mine.drift = Drift::NONE;
 }
 
 /// Writes what the pick ray found above the thing it found.
@@ -3342,10 +3721,27 @@ unsafe extern "C-unwind" fn who(world: *mut World, _args: *const Args) {
 		.map(|(id, _)| id.slot())
 		.min();
 
-	let (player, body, ran, asked) = played(world)
-		.map_or((EntityId::NONE, BodyId::NONE, 0, 0), |mine| {
-			(mine.player, mine.player_body, mine.ran, mine.asked)
-		});
+	let (player, body, ran, asked, place, smear) = played(world).map_or(
+		(EntityId::NONE, BodyId::NONE, 0, 0, Vec3::ZERO, Vec3::ZERO),
+		|mine| {
+			(
+				mine.player,
+				mine.player_body,
+				mine.ran,
+				mine.asked,
+				Vec3::from_array(mine.place),
+				mine.drift.offset(),
+			)
+		},
+	);
+	// **where it is drawn as well as where it is believed to be.** The two are
+	// the same point only while nothing is being corrected, and the gap between
+	// them is the correction - so a report that showed one of them could not
+	// tell a wrong guess from a wrong picture.
+	let shown = world
+		.entities
+		.transform(player)
+		.map_or(Vec3::ZERO, |placed| placed.position);
 
 	info!(
 		slot = peer.slot(),
@@ -3359,8 +3755,161 @@ unsafe extern "C-unwind" fn who(world: *mut World, _args: *const Args) {
 		live,
 		ran,
 		asked,
+		x = place.x,
+		y = place.y,
+		z = place.z,
+		shown_x = shown.x,
+		shown_z = shown.z,
+		smear = smear.length(),
 		"who this end is"
 	);
+}
+
+/// `game.seats` - every seat, who is in it, and where it stands.
+///
+/// The companion to [`who`], and the one a *host* needs: `game.who` reports
+/// this end's own player, which on a machine deciding for several people is the
+/// least interesting of them. Written to be run at both ends and compared.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn list_seats(world: *mut World, _args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+
+	for slot in 0..SEATS {
+		let state = shared(world);
+		let (Some(&seated), Some(&body)) = (state.seats.get(slot), state.seat_bodies.get(slot))
+		else {
+			continue;
+		};
+		let owner = world
+			.bodies
+			.get(body)
+			.map_or(PeerId::NONE, |solid| solid.owner);
+		let at = world
+			.entities
+			.transform(seated)
+			.map_or(Vec3::ZERO, |placed| placed.position);
+		let ran = block(world, owner).map_or(0, |mine| mine.ran);
+		let waiting = world.commands.unsettled(owner);
+		let held = waiting.len();
+		let (buttons, look, step) = waiting
+			.last()
+			.map_or((0, 0.0, 0), |command| (command.buttons, command.yaw, command.step));
+
+		info!(
+			seat = slot,
+			owner = owner.slot(),
+			generation = owner.generation(),
+			body_slot = body.slot(),
+			x = at.x,
+			y = at.y,
+			z = at.z,
+			ran,
+			held,
+			buttons,
+			look,
+			step,
+			"a seat"
+		);
+	}
+}
+
+/// `game.hold` - holds movement keys down without a keyboard.
+///
+/// **The command that makes a windowless process drivable.** `--host` and
+/// `--join` never write [`World::input`], because there is no window to write
+/// it, so a client started beside a host by a script could connect, be named,
+/// file commands and never take a step. Everything else in this file that a
+/// script needs already had a console command in front of it; movement was the
+/// one thing that did not, because it was the one thing that came from a key.
+///
+/// Takes the names of the directions, in any order, or `none` to let go.
+/// `jump` is included and behaves as a hold, which is not what the space bar
+/// does - a held jump is sixty jumps - so a script that wants one jump sets it
+/// and clears it.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn hold_keys(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let asked = unsafe { &*args }.rest();
+	let mut held = 0;
+	let mut named = 0;
+
+	for word in asked.split_whitespace() {
+		let bit = match word {
+			| "forward" => BUTTON_FORWARD,
+			| "back" => BUTTON_BACK,
+			| "left" => BUTTON_LEFT,
+			| "right" => BUTTON_RIGHT,
+			| "jump" => BUTTON_JUMP,
+			| "none" => 0,
+			| _ => {
+				warn!(word, "not a direction: forward, back, left, right, jump, none");
+
+				return;
+			},
+		};
+
+		held |= bit;
+		named += 1;
+	}
+
+	// **an empty line reports rather than lets go**, because `none` is what
+	// letting go is called and a line somebody mistyped should not silently
+	// stop them walking.
+	if named == 0 {
+		info!(held = seen(world).held_buttons, "holding");
+
+		return;
+	}
+
+	seen(world).held_buttons = held;
+	info!(held, "holding");
+}
+
+/// `game.look` - points this screen somewhere, without a mouse.
+///
+/// The other half of [`hold_keys`]: a direction to walk in is no use without a
+/// way to face one. Radians, because that is what the command carries and what
+/// the camera holds, and a script converting degrees is a script that can print
+/// what it meant.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn look_at(world: *mut World, args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+	// SAFETY: the host guarantees a live argument list for the call.
+	let args = unsafe { &*args };
+
+	let Some(yaw) = args
+		.word(0)
+		.and_then(|word| word.parse::<f32>().ok())
+	else {
+		warn!("game.look takes a yaw in radians, and optionally a pitch");
+
+		return;
+	};
+	let pitch = args
+		.word(1)
+		.and_then(|word| word.parse::<f32>().ok());
+	let local = seen(world);
+
+	local.yaw = yaw;
+
+	if let Some(pitch) = pitch {
+		local.pitch = pitch;
+	}
+
+	info!(yaw = local.yaw, pitch = local.pitch, "looking");
 }
 
 /// `game.thaw` - every one of them at once.
@@ -4163,14 +4712,13 @@ fn dress(world: &mut World) {
 		.materials
 		.insert("metal", Material::DEFAULT.finished(1.0, 0.25));
 
-	let Some(standing) = played(world).map(|mine| mine.player) else {
-		return;
-	};
-
-	// the props are not here, and neither is the map: what either is made of is
-	// written in its own scene.
-	wear(world, standing);
-
+	// **the lamp and the character are the world's, not a player's**, and used
+	// to be behind a check for this process's own player block - so a client,
+	// which has no block until a host answers it, built neither. That was
+	// thirteen ragdoll bodies missing from one end of a wire and present at the
+	// other, which is thirteen slots of disagreement about what every snapshot
+	// record is about. The props and the map are not here for the same reason
+	// they never were: what either is made of is written in its own scene.
 	stand_model(world);
 	stand_character(world);
 }
@@ -4283,45 +4831,33 @@ fn layer(world: &mut World, body: BodyId, layers: Layers) {
 	}
 }
 
-/// Gives the player the box the solver knows it by.
+/// Puts the clothes back on every seat somebody is in.
 ///
-/// The map's own bodies are not here: they are written in `construct.scene`
-/// beside the entities that draw them, which is what a scene format is for.
-/// What is left is the one body no file could describe, because it is made at
-/// the same moment as the entity it drives and lives exactly as long as this
-/// module's idea of a player.
+/// A hot reload keeps the arena, so a seat that was claimed before the swap is
+/// still claimed after it - but the material handles it was wearing belong to
+/// the build that has gone. Re-dressing is idempotent and costs one write per
+/// occupied seat, which is at most nine.
 ///
-/// Rebuilt on every load rather than only on a fresh arena, which costs four
-/// dozen bytes and means a change to its size or its layers takes effect on the
-/// next save rather than on the next restart.
-fn collide(world: &mut World, peer: PeerId) {
-	let Some(mine) = block(world, peer) else {
-		return;
-	};
-	let (player, was) = (mine.player, mine.player_body);
+/// @param world - the seats to look at
+fn redress(world: &mut World) {
+	for peer in everybody(world) {
+		let (seated, body) = seat_of(world, peer);
 
-	world.bodies.despawn(was);
+		if !seated.is_some() || !body.is_some() {
+			continue;
+		}
 
-	// kinematic rather than dynamic: the controller decides where the player
-	// goes, and the solver's job is only to push props out from under it. A
-	// dynamic one would be a box the player argues with.
-	let player_body =
-		world.attach_body(player, BodyKind::Kinematic, Shape::cuboid(Vec3::splat(0.5)));
+		let owner = world
+			.bodies
+			.get(body)
+			.map_or(PeerId::NONE, |solid| solid.owner);
 
-	layer(world, player_body, PLAYER_LAYERS);
-	own(world, player_body, peer);
+		if owner != peer {
+			continue;
+		}
 
-	let Some(mine) = block(world, peer) else {
-		return;
-	};
-	mine.player_body = player_body;
-	// what the ray found is per-load and not worth carrying across one: the
-	// bodies it named are the ones just despawned. Clearing it also means the
-	// first trace of every load says so in the log, which is what makes a live
-	// reload readable.
-	mine.picked = EntityId::NONE;
-
-	info!(bodies = world.bodies.len(), "the player has a body");
+		wear(world, seated);
+	}
 }
 
 /// Draws every joint in the world as a line between its two anchors.

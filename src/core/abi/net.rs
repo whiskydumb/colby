@@ -633,6 +633,24 @@ struct Ring {
 
 	/// The highest number this end is done with. @ref [`Commands::settle`].
 	settled: u32,
+
+	/// The highest number the far end's *picture* of the world accounts for.
+	///
+	/// **A second mark, because a client has two questions and one answer
+	/// cannot serve both.** "Which of my commands has the host got" is about
+	/// what to stop re-sending, and it is answered by every message. "Which of
+	/// my commands is the world I am looking at already the result of" is about
+	/// where a guess starts, and it is answered only by a message that carried
+	/// a world - which is one in [`EVERY`](colby_net::EVERY).
+	///
+	/// Running a guess from a picture while measuring it by the other mark is
+	/// asking the guess to cover ground the picture already covers. It reads as
+	/// the player having been in two places, and the correction that follows is
+	/// a smear of whole units on any wire with real delay on it.
+	///
+	/// Nought on the machine that decides, where the two questions are the same
+	/// question and its own answer is always current. @ref [`Commands::base`].
+	based: u32,
 }
 
 impl Ring {
@@ -649,6 +667,7 @@ impl Ring {
 			owner: PeerId::NONE,
 			kept: Vec::with_capacity(BACKUP),
 			settled: 0,
+			based: 0,
 		}
 	}
 
@@ -766,6 +785,13 @@ impl Commands {
 		if command.number.abs_diff(ring.newest()) > WINDOW {
 			ring.kept.clear();
 			ring.settled = command.number.saturating_sub(1);
+			// **and both marks, not one.** The picture mark names a command,
+			// and after a discontinuity that number names a different command
+			// or none at all - so leaving it standing above a count that has
+			// started again would tell a guess it may skip a run nobody has
+			// run. It goes to the same place and for the same reason.
+			// @ref [`Ring::based`].
+			ring.based = ring.settled;
 		} else if command.number <= ring.newest() {
 			// and the line the redundancy stands on. @ref the type comment.
 			return false;
@@ -862,6 +888,54 @@ impl Commands {
 	/// The highest number this end has settled for a peer.
 	#[must_use]
 	pub fn settled(&self, peer: PeerId) -> u32 { self.ring(peer).map_or(0, |ring| ring.settled) }
+
+	/// Says which command the world this end is looking at already accounts
+	/// for.
+	///
+	/// The same three rules [`settle`](Self::settle) keeps, for the same three
+	/// reasons: never past what has arrived, never backwards, and it says
+	/// whether the mark moved. @ref [`Ring::based`], which is why there are two
+	/// of these rather than one.
+	///
+	/// @param peer - whose ring
+	/// @param number - the highest command the far end's picture includes
+	/// @return whether the mark moved
+	pub fn base(&mut self, peer: PeerId, number: u32) -> bool {
+		let Some(ring) = self.ring_mut(peer) else {
+			return false;
+		};
+
+		let reached = number.min(ring.newest());
+
+		if reached <= ring.based {
+			return false;
+		}
+
+		ring.based = reached;
+
+		true
+	}
+
+	/// The highest number the far end's picture accounts for.
+	#[must_use]
+	pub fn based(&self, peer: PeerId) -> u32 { self.ring(peer).map_or(0, |ring| ring.based) }
+
+	/// Every command the far end's picture does not account for yet.
+	///
+	/// **What a client replays**, where [`unsettled`](Self::unsettled) is what
+	/// it re-sends. The two differ by however many commands the host has
+	/// acknowledged since the last world it described, which is nothing at all
+	/// on a wire with no delay and most of a snapshot interval on a real one.
+	///
+	/// @param peer - whose ring
+	/// @return the run, oldest first, or nothing for a peer with no ring
+	#[must_use]
+	pub fn unbased(&self, peer: PeerId) -> &[Command] {
+		match self.ring(peer) {
+			| Some(ring) => ring.after(ring.based),
+			| None => &[],
+		}
+	}
 
 	/// The highest number held for a peer, or nought if none is.
 	#[must_use]
@@ -1003,6 +1077,107 @@ mod tests {
 			yaw,
 			pitch: yaw * -0.375,
 		}
+	}
+
+	#[test]
+	fn what_is_replayed_and_what_is_resent_are_two_different_runs() {
+		// **the fixture that matters**: the far end has acknowledged more than
+		// its picture accounts for, which is what a real wire always looks
+		// like - an acknowledgement rides every message and a world rides one
+		// in a handful. A test where the two marks agree cannot tell one from
+		// the other, and neither could the code before there were two.
+		let mut commands = Commands::new();
+		let peer = client(3, 1);
+
+		for number in 1..=6 {
+			assert!(commands.push(peer, asked(number)));
+		}
+
+		assert!(commands.settle(peer, 5), "the far end has five of them");
+		assert!(commands.base(peer, 2), "and its picture is the result of two");
+
+		assert_eq!(
+			commands.unsettled(peer),
+			&[asked(6)],
+			"what is still worth re-sending is what it has not acknowledged"
+		);
+		assert_eq!(
+			commands.unbased(peer),
+			&[asked(3), asked(4), asked(5), asked(6)],
+			"and what is still worth guessing about is everything its picture misses"
+		);
+	}
+
+	#[test]
+	fn a_picture_mark_never_walks_backwards_or_past_what_arrived() {
+		// the same three rules the settled mark keeps, and for the same three
+		// reasons: nothing on this wire is authenticated, and a far end that
+		// claimed to have drawn a command nobody has sent would otherwise
+		// silence every command there will ever be.
+		let mut commands = Commands::new();
+		let peer = client(2, 4);
+
+		for number in 1..=3 {
+			assert!(commands.push(peer, asked(number)));
+		}
+
+		assert!(commands.base(peer, 900), "a far end may say anything");
+		assert_eq!(commands.based(peer), 3, "and it is worth what arrived and no more");
+		assert!(commands.unbased(peer).is_empty());
+
+		assert!(!commands.base(peer, 1), "and two that overtook each other");
+		assert_eq!(commands.based(peer), 3, "do not un-draw anything");
+	}
+
+	#[test]
+	fn the_two_marks_do_not_move_each_other() {
+		// they are one field's worth of state apart and it would be easy to
+		// write either one where the other belongs; this is the test that
+		// notices.
+		let mut commands = Commands::new();
+		let peer = client(5, 2);
+
+		for number in 1..=4 {
+			assert!(commands.push(peer, asked(number)));
+		}
+
+		assert!(commands.settle(peer, 3));
+		assert_eq!(commands.based(peer), 0, "settling draws nothing");
+
+		assert!(commands.base(peer, 4));
+		assert_eq!(commands.settled(peer), 3, "and drawing settles nothing");
+	}
+
+	#[test]
+	fn a_ring_a_stray_command_reset_forgets_both_marks_together() {
+		// a stray number empties the ring and starts the count again, so a
+		// mark left standing names a command that no longer exists. **The
+		// stray has to be far *below*** - above it, the mark ends up under the
+		// new number anyway and the test passes whether the reset touches it
+		// or not.
+		let mut commands = Commands::new();
+		let peer = client(1, 1);
+		let high = WINDOW + 40;
+
+		for number in high..high + 4 {
+			assert!(commands.push(peer, asked(number)));
+		}
+
+		assert!(commands.settle(peer, high + 3));
+		assert!(commands.base(peer, high + 3));
+
+		// **and it starts again from ten rather than from one**, so that where
+		// the mark lands is a number and not nought: a fixture restarting at
+		// one cannot tell "put just under the new count" from "thrown away",
+		// because those are the same answer there.
+		assert!(commands.push(peer, asked(10)));
+		assert_eq!(commands.settled(peer), 9, "the settled mark went just under it");
+		assert_eq!(commands.based(peer), 9, "and the picture mark went with it");
+		assert_eq!(
+			commands.unbased(peer),
+			&[asked(10)],
+			"so the one that arrived is one a guess still has to account for"
+		);
 	}
 
 	#[test]
