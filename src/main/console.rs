@@ -468,7 +468,7 @@ fn install_scenes(world: &mut World) {
 /// expected to be wrong sometimes. A panic in one costs a message: unlike a
 /// panic in `update` it does not park the module, because a bad command says
 /// nothing about whether the rest of the build works.
-fn run(world: &mut World, line: &str) {
+pub(crate) fn run(world: &mut World, line: &str) {
 	let result = catch_unwind(AssertUnwindSafe(|| console::run(world, line)));
 
 	if let Err(payload) = result {

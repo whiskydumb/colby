@@ -401,6 +401,12 @@ impl App {
 	/// @return where it stands for the next one
 	fn stepped(&mut self, moment: Duration) -> Duration {
 		if let Some(net) = self.net.as_mut() {
+			// what this end has asked for and not been answered about, which
+			// is the whole window rather than the newest one: every message
+			// carries the lot, and that redundancy is what stands in for
+			// retransmission on a wire that has none. Read fresh each step,
+			// because the host's answer arrives between them.
+			net.ask(self.world.commands.unsettled(self.world.peer));
 			net.send(self.started.elapsed(), None);
 		}
 
@@ -455,6 +461,9 @@ impl App {
 		if let Some(net) = self.net.as_mut() {
 			net.set(crate::net::conditions(&self.world.cvars));
 			net.receive(self.started.elapsed());
+			// which is where this window learns who it is, and where what the
+			// host has already run stops being resent. @ref `Net::seat`.
+			net.seat(&mut self.world);
 		}
 
 		// and the mode's own edge, in the same place and for the same reason:

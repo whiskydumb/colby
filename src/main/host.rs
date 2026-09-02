@@ -127,6 +127,14 @@ pub(crate) fn serve(port: u16) -> Result {
 		// against is everything that had arrived when it started rather than
 		// whatever turned up halfway through. @ref `crate::net`.
 		net.receive(started.elapsed());
+		// and then the world hears about it: whoever turned up is given a
+		// name, and what they asked for is filed under it. Between the drain
+		// and the step, so that a peer's very first message is one the step
+		// after it can act on. @ref `Net::seat`.
+		net.seat(&mut world);
+		// and whatever they typed, if it is theirs to type. @ref
+		// `crate::net::allowed`.
+		crate::net::obey(&mut world, &net);
 
 		let mut ran = false;
 
@@ -171,6 +179,10 @@ pub(crate) fn serve(port: u16) -> Result {
 				crate::net::records(&world.bodies, &mut records);
 			}
 
+			// a host asks nobody for anything, and says so rather than leaving
+			// whatever was there: the window is the endpoint's and a host that
+			// had once been a client would otherwise keep sending its old one.
+			net.ask(&[]);
 			net.send(started.elapsed(), describing.then_some(records.as_slice()));
 			ran = true;
 		}

@@ -175,6 +175,32 @@ pub(crate) fn run(
 		if let Some(game) = game {
 			game.update(world);
 		}
+
+		// and every command that was in front of this step is done with,
+		// whether or not the game looked at one.
+		//
+		// **This is `Input::end_step`'s rule and not a new one.** The host
+		// hands the edges over and clears them afterwards, so that one click
+		// is one click even for a game that never asked; a command is offered
+		// for exactly one step for the same reason. A game that ignored it
+		// does not get it again, and one that ran it cannot run it twice - and
+		// neither promise is something every game has to remember to keep,
+		// which is the whole argument for the mark living in the table.
+		//
+		// Inside the edit-mode guard with the solver and the game, because a
+		// command nothing had a chance to act on is not a command anybody has
+		// finished with.
+		//
+		// Only where this process decides. A client's own ring is settled by
+		// what the host confirms, and a client marking its own commands done
+		// would be a client acknowledging itself.
+		if world.peer.is_host() {
+			for (peer, _) in world.players.iter() {
+				let newest = world.commands.newest(peer);
+
+				world.commands.settle(peer, newest);
+			}
+		}
 	}
 
 	// and last, whatever this step asked not to be interpolated: a teleport, a
@@ -201,7 +227,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{Body, BodyId, EntityId, Key, Shape, SoundData, Transform, Voice, debug},
+		abi::{Body, BodyId, Command, EntityId, Key, Shape, SoundData, Transform, Voice, debug},
 		glam::Vec3,
 	};
 
@@ -283,6 +309,110 @@ mod tests {
 				.interpolated(entity, 0.0)
 				.map(|it| it.position.x),
 		)
+	}
+
+	/// A step with nothing in it but a world, for the questions that are about
+	/// the step body rather than about the wire.
+	fn plain(world: &mut World, simulation: &mut Simulation, editing: bool) {
+		let parts = Parts {
+			game: None,
+			interface: &mut Interface::new(),
+			scripts: None,
+			simulation,
+			audio: None,
+			wire: None,
+		};
+
+		run(world, parts, &mut Input::default(), 0.0, editing);
+	}
+
+	/// A command is offered for one step, whoever does or does not act on it.
+	///
+	/// The same rule the input edges have, and it is the engine's rather than
+	/// every game's: nothing here runs a command, and the mark still moves.
+	#[test]
+	fn a_step_is_done_with_every_command_that_was_in_front_of_it() {
+		let mut simulation = Box::new(Simulation::new());
+		let mut world = Box::<World>::default();
+
+		world.install_physics(simulation.table());
+
+		let peer = world.players.admit();
+
+		// numbers that are neither one nor consecutive with the step count, so
+		// a mark taken from the wrong number is visible.
+		for number in [7_u32, 8, 12] {
+			assert!(world.commands.push(peer, asked(number)));
+		}
+
+		assert_eq!(world.commands.unsettled(peer).len(), 3, "all three are waiting");
+
+		plain(&mut world, &mut simulation, false);
+
+		assert_eq!(world.commands.settled(peer), 12, "the newest that was there");
+		assert!(world.commands.unsettled(peer).is_empty(), "so none is offered twice");
+
+		// and one that arrives afterwards is offered once, on the next step.
+		assert!(world.commands.push(peer, asked(13)));
+		assert_eq!(world.commands.unsettled(peer), &[asked(13)]);
+
+		plain(&mut world, &mut simulation, false);
+		assert_eq!(world.commands.settled(peer), 13);
+	}
+
+	#[test]
+	fn a_world_being_edited_is_not_done_with_anybodys_commands() {
+		let mut simulation = Box::new(Simulation::new());
+		let mut world = Box::<World>::default();
+
+		world.install_physics(simulation.table());
+
+		let peer = world.players.admit();
+
+		assert!(world.commands.push(peer, asked(4)));
+
+		// nothing that moves a world runs while it is being edited, and a
+		// command nobody had a chance to act on is not one anybody is done
+		// with.
+		plain(&mut world, &mut simulation, true);
+		assert_eq!(world.commands.settled(peer), 0, "still waiting");
+		assert_eq!(world.commands.unsettled(peer), &[asked(4)]);
+
+		plain(&mut world, &mut simulation, false);
+		assert_eq!(world.commands.settled(peer), 4, "and offered the moment play resumes");
+	}
+
+	#[test]
+	fn a_client_does_not_mark_its_own_commands_done() {
+		let mut simulation = Box::new(Simulation::new());
+		let mut world = Box::<World>::default();
+
+		world.install_physics(simulation.table());
+
+		let peer = world.players.admit();
+
+		assert!(world.commands.push(peer, asked(4)));
+
+		// this end is not the one that decides, so what it may be holding is
+		// somebody else's to be done with. A client that settled its own ring
+		// would be acknowledging itself and would stop asking for a move the
+		// host never saw.
+		crate::net::joined(&mut world);
+		plain(&mut world, &mut simulation, false);
+
+		assert_eq!(world.commands.settled(peer), 0, "nobody here has run it");
+		assert_eq!(world.commands.unsettled(peer), &[asked(4)]);
+	}
+
+	/// One command, with four numbers that are four different numbers.
+	fn asked(number: u32) -> Command {
+		Command {
+			step: u64::from(number) * 5 + 900,
+			number,
+			buttons: 1 << (number % 6),
+			yaw: f32::from(u16::try_from(number % 11).unwrap_or(0)) * 0.75,
+			pitch: -1.25,
+		}
 	}
 
 	#[test]

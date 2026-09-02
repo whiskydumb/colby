@@ -49,8 +49,8 @@ use std::{
 	time::Duration,
 };
 
-use colby_core::{Result, bytemuck, info, time::STEP, warn};
-use colby_net::{Conditions, EVERY, NOTHING, Slot, Solid};
+use colby_core::{Result, abi::Command, bytemuck, info, time::STEP, warn};
+use colby_net::{Conditions, EVERY, MAX_ASKED, NOTHING, Slot, Solid};
 
 use crate::net::{Loopback, Net, Tally, Wire};
 
@@ -195,6 +195,19 @@ pub(crate) struct Outcome {
 
 	/// How many of the client's snapshots were whole worlds, not differences.
 	pub(crate) baselines: u32,
+
+	/// How many commands the client asked for.
+	pub(crate) asked: u32,
+
+	/// How many of them the host was still holding when the run ended.
+	///
+	/// A queue's depth at the end rather than a count of the run: nothing
+	/// drains it here, so once one whole window has arrived this is the ring's
+	/// depth and stays there. What it says is therefore "something got
+	/// through", and no more - **which of them** got through is the digest's,
+	/// and the digest is folded over the queue's contents rather than its
+	/// length.
+	pub(crate) held_commands: u32,
 }
 
 /// Runs two endpoints against each other and reports what happened.
@@ -236,6 +249,8 @@ pub(crate) fn run(steps: u32) -> Result {
 		nowhere = outcome.nowhere,
 		taken = outcome.taken,
 		baselines = outcome.baselines,
+		asked = outcome.asked,
+		held = outcome.held_commands,
 		agreed = outcome.agreed,
 		digest = format!("{:016x}", outcome.digest),
 		"everything that had to arrive, arrived"
@@ -283,6 +298,12 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 	let mut taken = 0_u32;
 	let mut held = NOTHING;
 	let mut world = Vec::new();
+	// what the client is asking for, kept here because there is no world to
+	// keep it in: the two-endpoint run is deliberately two endpoints and
+	// nothing else. @ref `Net::seat`, which is where a real client's window
+	// comes from.
+	let mut asking: Vec<Command> = Vec::new();
+	let mut asked = 0_u32;
 
 	// a client that has never sent anything is a client the host has never
 	// heard of, so the first thing that happens is the client saying hello.
@@ -311,6 +332,22 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 		// the number of the newest one it has.
 		let telling = step.is_multiple_of(EVERY);
 
+		// and the client asks for something, every step, the way a client
+		// with somebody at its keyboard would. Its window is never settled,
+		// because a host with no world files nothing and settles nothing - so
+		// what this exercises is the redundancy at its widest, which is the
+		// case worth running over a wire that lies.
+		if talking {
+			if asking.len() >= MAX_ASKED {
+				asking.remove(0);
+			}
+
+			asking.push(wanted(step));
+			asked += 1;
+		}
+
+		client.ask(&asking);
+		host.ask(&[]);
 		host.send(now, telling.then_some(world.as_slice()));
 		client.send(now, None);
 		host.receive(now);
@@ -333,10 +370,19 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 		}
 	}
 
+	// what the host ended up holding, folded in whole. A count alone would
+	// move for a message arriving; this moves only if the same commands, in
+	// the same order, with the same words in them, are what got there.
+	for command in host.holding_commands(0) {
+		digest = fold(digest, command.number, 2, &format!("{command:?}"));
+	}
+
 	Outcome {
 		digest,
 		said,
 		heard,
+		asked,
+		held_commands: u32::try_from(host.holding_commands(0).len()).unwrap_or(u32::MAX),
 		host: (host.sent(), host.delivered(), host.ignored()),
 		client: (client.sent(), client.delivered(), client.ignored()),
 		tally: (host.tally(0), client.tally(0)),
@@ -492,6 +538,30 @@ fn tell(net: &mut Net, text: &str) -> u32 {
 	peers
 }
 
+/// What a client asks for on one step.
+///
+/// Numbered from one, on a step of its own, and with a look that is a
+/// *non-linear* function of the step: a run whose commands walked in a
+/// straight line would give the same digest whether they arrived in order,
+/// out of order or halfway, which is the trap this project keeps falling into.
+/// The buttons turn over on a period that shares no factor with the snapshot
+/// cadence, so a command and a snapshot never line up twice the same way.
+///
+/// @param step - which step of the run
+fn wanted(step: u32) -> Command {
+	let turn = f32::from(u16::try_from(step % 97).unwrap_or(0));
+
+	Command {
+		// deliberately not the number: they are two different fields and a
+		// run that could not tell them apart would not notice them swapping.
+		step: u64::from(step) * 3 + 40,
+		number: step,
+		buttons: 1 << (step % 7),
+		yaw: turn * turn,
+		pitch: -turn,
+	}
+}
+
 /// An address on the machine this is running on.
 fn somewhere(port: u16) -> SocketAddr { SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port) }
 
@@ -574,9 +644,34 @@ mod tests {
 		// conditions, the schedule, the format of a block. That is the point:
 		// every one of those invalidates a recorded run, and this is what says
 		// so out loud rather than leaving it to be noticed. It last moved when
-		// the world itself started crossing, and again when two bodies that
-		// change and change back were put into it.
-		assert_eq!(exchange(600, WIRE).digest, 0x769D_BE3F_0C72_BDBA);
+		// the world itself started crossing, again when two bodies that change
+		// and change back were put into it, and again when the client started
+		// asking for things.
+		assert_eq!(exchange(600, WIRE).digest, 0x0A39_E2D3_E5A3_F78D);
+	}
+
+	/// The other direction, which nothing in this run covered until now.
+	#[test]
+	fn what_a_client_asks_for_gets_there_over_a_wire_that_lies() {
+		let outcome = exchange(600, WIRE);
+
+		assert_eq!(outcome.asked, 600, "one a step, which is what a client does");
+		// the queue is a ring's worth and a host with no world empties
+		// nothing, so what is left is the depth rather than the run. That
+		// alone is only "something arrived"; what pins *which* is the digest,
+		// which is folded over the contents of this queue in the run above.
+		assert_eq!(
+			outcome.held_commands,
+			u32::try_from(MAX_ASKED).unwrap_or(0),
+			"a whole window got through, which is what redundancy over a lossy wire buys"
+		);
+
+		// and over a wire that eats everything, nothing arrives - so the
+		// assertion above is about the wire rather than about the queue.
+		let dead = exchange(600, Conditions { loss: 1.0, ..WIRE });
+
+		assert_eq!(dead.asked, 600, "the client still asked");
+		assert_eq!(dead.held_commands, 0, "and the host was never told");
 	}
 
 	#[test]
