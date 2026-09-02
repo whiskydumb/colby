@@ -67,6 +67,25 @@ impl EntityId {
 	)]
 	pub const fn slot(self) -> usize { self.index as usize }
 
+	/// The handle for one slot, whatever is in it.
+	///
+	/// **Public, and it is not a way to be handed something.** This looks like
+	/// the minting the table deliberately keeps to itself, and it is not one:
+	/// [`EntityId`] is [`Pod`], so any crate in the workspace can already turn
+	/// eight bytes into one of these and always could. What this adds is a
+	/// *spelling* for it, which is what anything carrying a handle outside Rust
+	/// needs - a script holds one as a number and has to be able to hand it
+	/// back. What it does not add is a way to reach anything, because a handle
+	/// resolves only where the table agrees somebody is there. @ref
+	/// [`Entities::alive`]. The same argument
+	/// [`PeerId::from_bits`](super::net::PeerId::from_bits) is written down
+	/// with.
+	///
+	/// @param index - the slot
+	/// @param generation - which occupant of it
+	#[must_use]
+	pub const fn at(index: u32, generation: u32) -> Self { Self { index, generation } }
+
 	/// Which occupant of that slot this handle names.
 	#[must_use]
 	pub const fn generation(self) -> u32 { self.generation }

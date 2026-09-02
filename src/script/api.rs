@@ -1,14 +1,21 @@
 //! What a program can reach, and deliberately nothing more.
 //!
-//! The environment a script runs in is **built here by hand** rather than being
-//! the standard one with the dangerous parts removed. That is the whole
-//! enforcement of "this is interface logic, not gameplay": there is no entity
-//! table, no body, no camera and no clock anywhere in the process's Lua, so a
-//! script cannot ask for one and no check has to refuse it. `io`, `os`,
-//! `package` and `debug` are never opened at all - @ref
-//! [`Vm`](crate::Vm) for which libraries are - and what is left
-//! cannot reach the filesystem or the wall clock, which is also what keeps
-//! `--shot` reproducible.
+//! The environment a program runs in is **built here by hand** rather than
+//! being the standard one with the dangerous parts removed. That is the whole
+//! enforcement of the split, and it needs no check anywhere: a panel's program
+//! is given `ui` and no world, a world program is given the world and no `ui`,
+//! and a name nobody declared is `nil`, which is Lua's own answer to being
+//! asked for something that is not there. `io`, `os`, `package` and `debug` are
+//! never opened at all - @ref [`Vm`](crate::Vm) for which libraries are - and
+//! what is left cannot reach the filesystem or the wall clock, which is also
+//! what keeps `--shot` reproducible.
+//!
+//! **What a world program is given so far is a way to name things and no way
+//! to change one.** `find`, `valid`, `name` and `all` over the two tables, and
+//! that is deliberate for one commit: a handle that cannot be kept is not worth
+//! anything to write against, so the value comes first and what can be done
+//! with it comes after. @ref [`handle`](crate::handle) for why a handle is a
+//! tagged number rather than an object.
 //!
 //! Every function here is **scoped**: it is created when a step needs it and
 //! destroyed when that step is over. That is mlua's mechanism for handing a
@@ -27,6 +34,8 @@ use colby_core::{
 	info, warn,
 };
 use mlua::{Function, Result, Scope, Table, Value, Variadic};
+
+use crate::handle::{Handle, Kind};
 
 /// The event names a script may ask for, which are the ones a document can
 /// produce.
@@ -61,18 +70,46 @@ pub(crate) struct Tables {
 	/// `colby` - the one way out to the rest of the engine.
 	pub(crate) engine: Table,
 
+	/// `entity` - what a world program names things in the entity table with.
+	pub(crate) entities: Table,
+
+	/// `body` - the same over the solver's table.
+	pub(crate) bodies: Table,
+
 	/// What every environment inherits: `string`, `table`, `math`, `print` and
 	/// a handful of base functions.
 	pub(crate) globals: Table,
 }
 
-/// Gives the tables their functions for the length of one step.
+/// Gives every table its functions for the length of one step.
+///
+/// Split one function per table below, because one that filled all four would
+/// be a hundred and sixty lines of closures and the only thing shared between
+/// them is the three lifetimes.
 ///
 /// @param scope - the mlua scope the functions live and die with
-/// @param tables - what a script sees
-/// @param world - the host state the functions write into
+/// @param tables - what a program sees
+/// @param world - the host state the functions read and write
 /// @param running - which program is being served, written by the caller
 pub(crate) fn fill<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+	running: &'env RefCell<Running>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	interface(scope, tables, world, running)?;
+	engine(scope, tables, world, running)?;
+	entities(scope, tables, world)?;
+	bodies(scope, tables, world)?;
+
+	Ok(())
+}
+
+/// `ui` - what a panel's program writes through, and the one thing it reads.
+fn interface<'scope, 'env, 'world>(
 	scope: &'scope Scope<'scope, 'env>,
 	tables: &Tables,
 	world: &'env RefCell<&'world mut World>,
@@ -114,10 +151,11 @@ where
 		},
 	)?;
 
-	// the one thing a script can read back, and the field is why: a handler on
-	// a search box that cannot see what was typed into it is a handler that
-	// can do nothing. Everything else here still writes and never reads - what
-	// a script may see is its own panel and nothing beyond it.
+	// the one thing a panel's program can read back, and the field is why: a
+	// handler on a search box that cannot see what was typed into it is a
+	// handler that can do nothing. Everything else here still writes and never
+	// reads - what such a program may see is its own panel and nothing beyond
+	// it.
 	let text_of = scope.create_function(move |_, node: String| {
 		let panel = running.borrow().panel;
 		let found = world.borrow().ui.text(panel, &node).to_owned();
@@ -147,7 +185,7 @@ where
 
 	let set_style = scope.create_function(move |_, (node, text): (String, String)| {
 		// the same parser the `style` attribute goes through, so that
-		// `width: 37%` written from a script means what the identical words
+		// `width: 37%` written from a program means what the identical words
 		// mean in the document. A second way to say it would be a second thing
 		// to keep in step.
 		let mut warnings = Vec::new();
@@ -165,10 +203,33 @@ where
 		Ok(())
 	})?;
 
+	tables.ui.set("on", on)?;
+	tables.ui.set("text", text_of)?;
+	tables.ui.set("set_text", set_text)?;
+	tables.ui.set("set_classes", set_classes)?;
+	tables.ui.set("set_style", set_style)?;
+
+	Ok(())
+}
+
+/// `colby` - what every program has, whichever half it belongs to.
+fn engine<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+	running: &'env RefCell<Running>,
+) -> Result<()>
+where
+	'world: 'env,
+{
 	let command = scope.create_function(move |_, line: String| {
 		console::run(&mut world.borrow_mut(), &line);
 
 		Ok(())
+	})?;
+
+	let describe = scope.create_function(move |_, bits: i64| {
+		Ok(Handle::from_bits(bits).map(|handle| handle.to_string()))
 	})?;
 
 	let print = scope.create_function(move |_, values: Variadic<Value>| {
@@ -184,13 +245,173 @@ where
 		Ok(())
 	})?;
 
-	tables.ui.set("on", on)?;
-	tables.ui.set("text", text_of)?;
-	tables.ui.set("set_text", set_text)?;
-	tables.ui.set("set_classes", set_classes)?;
-	tables.ui.set("set_style", set_style)?;
 	tables.engine.set("command", command)?;
+	tables.engine.set("describe", describe)?;
 	tables.globals.set("print", print)?;
 
 	Ok(())
+}
+
+/// `entity` - naming things in the entity table.
+fn entities<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	let find = scope.create_function(move |_, name: String| {
+		let world = world.borrow();
+		let found = world
+			.entities
+			.iter()
+			.find(|(id, ..)| world.entities.name(*id) == name)
+			.map(|(id, ..)| Handle::of_entity(id).to_bits());
+
+		Ok(found)
+	})?;
+
+	let valid = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(false);
+		};
+
+		Ok(world.borrow().entities.alive(handle.entity()))
+	})?;
+
+	let name_of = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(None);
+		};
+
+		let world = world.borrow();
+		let id = handle.entity();
+
+		Ok(world
+			.entities
+			.alive(id)
+			.then(|| world.entities.name(id).to_owned()))
+	})?;
+
+	// an array rather than an iterator, and in slot order, which is the order
+	// the table hands them over. A program walking a Lua hash instead would
+	// draw in whatever order the interpreter's string seed decided, and two
+	// runs of `--shot` would be two pictures. @ref `colby-known-gaps`.
+	let all = scope.create_function(move |lua, ()| {
+		let world = world.borrow();
+		let handles: Vec<i64> = world
+			.entities
+			.iter()
+			.map(|(id, ..)| Handle::of_entity(id).to_bits())
+			.collect();
+
+		lua.create_sequence_from(handles)
+	})?;
+
+	tables.entities.set("find", find)?;
+	tables.entities.set("valid", valid)?;
+	tables.entities.set("name", name_of)?;
+	tables.entities.set("all", all)?;
+
+	Ok(())
+}
+
+/// `body` - the same over the solver's table.
+fn bodies<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	let find = scope.create_function(move |_, name: String| {
+		let world = world.borrow();
+		let found = world
+			.bodies
+			.iter()
+			.find(|(id, _)| world.bodies.name(*id) == name)
+			.map(|(id, _)| Handle::of_body(id).to_bits());
+
+		Ok(found)
+	})?;
+
+	let valid = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		Ok(world.borrow().bodies.alive(handle.body()))
+	})?;
+
+	let name_of = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(None);
+		};
+
+		let world = world.borrow();
+		let id = handle.body();
+
+		Ok(world
+			.bodies
+			.alive(id)
+			.then(|| world.bodies.name(id).to_owned()))
+	})?;
+
+	let all = scope.create_function(move |lua, ()| {
+		let world = world.borrow();
+		let handles: Vec<i64> = world
+			.bodies
+			.iter()
+			.map(|(id, _)| Handle::of_body(id).to_bits())
+			.collect();
+
+		lua.create_sequence_from(handles)
+	})?;
+
+	tables.bodies.set("find", find)?;
+	tables.bodies.set("valid", valid)?;
+	tables.bodies.set("name", name_of)?;
+	tables.bodies.set("all", all)?;
+
+	Ok(())
+}
+
+/// Reads one argument as a handle into the table that is asking.
+///
+/// **A handle of the wrong kind is an error naming both**, which is the whole
+/// point of the tag: the two tables here are dense and both start at slot
+/// nought generation one, so an entity handle handed to `body.name` would
+/// otherwise be a confident answer about a different thing. A number that is
+/// not a handle at all is refused the same way.
+///
+/// `nil` is neither, and is not an error: it is what `find` answers with when
+/// nothing has that name, and `body.valid(body.find("nope"))` is a chain
+/// somebody will write on the first day.
+///
+/// @param bits - what the program passed
+/// @param wanted - the table doing the asking
+/// @return the handle, or `None` for `nil`
+fn taken(bits: Option<i64>, wanted: Kind) -> Result<Option<Handle>> {
+	let Some(bits) = bits else {
+		return Ok(None);
+	};
+
+	let Some(handle) = Handle::from_bits(bits) else {
+		return Err(mlua::Error::runtime(format!(
+			"{bits} is a number rather than a handle; {}.find gives one",
+			wanted.table()
+		)));
+	};
+
+	if handle.kind() != wanted {
+		return Err(mlua::Error::runtime(format!(
+			"that is {}, and this is the {} table",
+			handle,
+			wanted.table()
+		)));
+	}
+
+	Ok(Some(handle))
 }

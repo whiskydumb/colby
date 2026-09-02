@@ -8,7 +8,7 @@
 //! collided yet.
 
 use colby_core::abi::{
-	ScriptData, Value, World,
+	Body, BodyId, EntityId, ScriptData, Shape, Transform, Value, World,
 	ui::{DocumentData, Event, EventKind, PanelId},
 };
 
@@ -1013,4 +1013,288 @@ fn one_muted_program_does_not_stop_the_others() {
 
 	assert_eq!(said(&world).as_deref(), Some("healthy"), "only the healthy one wrote");
 	assert_eq!(scripts.loaded[0].faults, 1, "and the muted one was never called again");
+}
+
+/// A world with one named entity, one named body and a program over them.
+///
+/// The two are given the *same* slot and generation on purpose: both tables are
+/// dense and both start at slot nought, so this is the arrangement a real world
+/// is in, and it is the one an untagged handle cannot tell apart.
+fn peopled(script: &str) -> (World, EntityId, BodyId) {
+	let mut world = running(script);
+	listen(&mut world);
+
+	let entity = world.entities.spawn();
+	world.entities.set_name(entity, "crate");
+
+	let body = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0).driving(entity));
+	world.bodies.set_name(body, "crate body");
+
+	(world, entity, body)
+}
+
+#[test]
+fn a_program_finds_a_thing_by_the_name_it_was_given() {
+	// **the comparison is done in Lua and one word comes back.** A console
+	// variable is set from the second word of the line, so a value with a
+	// space in it arrives truncated and an assertion over it is an assertion
+	// about its first word. @ref `console::dispatch`.
+	let mut world = World::new();
+	listen(&mut world);
+
+	let entity = world.entities.spawn();
+	world.entities.set_name(entity, "crate");
+	let body = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0).driving(entity));
+	world.bodies.set_name(body, "crate");
+
+	// the same slot and the same generation in two tables, which is the
+	// arrangement a real world is always in and the one an untagged handle
+	// cannot tell apart.
+	assert_eq!(entity.slot(), body.slot(), "the same slot");
+	assert_eq!(entity.generation(), body.generation(), "and the same generation");
+
+	world.scripts.insert("scripts/test", ScriptData {
+		source: format!(
+			r#"function tick(dt)
+				local one = colby.describe(entity.find("crate")) == "entity {slot}:{age}"
+				local two = colby.describe(body.find("crate")) == "body {slot}:{age}"
+				colby.command("script.said " .. tostring(one) .. tostring(two))
+			end"#,
+			slot = entity.slot(),
+			age = entity.generation()
+		),
+	});
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("truetrue"),
+		"one name, two tables, two different handles"
+	);
+}
+
+#[test]
+fn a_name_nothing_answers_to_is_nothing_rather_than_a_handle_to_nothing() {
+	let (mut world, ..) = peopled(
+		r#"function tick(dt)
+			colby.command("script.said " .. tostring(entity.find("nobody")))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("nil"),
+		"which is what `if entity.find(..) then` reads, and a handle to nothing is not"
+	);
+}
+
+#[test]
+fn a_handle_survives_being_kept_from_one_step_to_the_next() {
+	// the whole commit in one test: a program keeps a handle in a local, in a
+	// table, and as a table *key*, and all three still name the same thing
+	// four steps later. A value that had to be made fresh each step could do
+	// none of the three.
+	let (mut world, ..) = peopled(
+		r#"local mine = {}
+		local kept = nil
+		local step = 0
+
+		function tick(dt)
+			step = step + 1
+
+			if step == 1 then
+				kept = entity.find("crate")
+				mine[kept] = "the crate"
+			end
+
+			if step == 4 then
+				colby.command("script.said " .. tostring(mine[kept] ~= nil) .. tostring(entity.valid(kept)))
+			end
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	for _ in 0..4 {
+		stepped(&mut scripts, &mut world);
+	}
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("truetrue"),
+		"it is still the key it was, and still names something alive"
+	);
+}
+
+#[test]
+fn a_handle_to_something_that_has_gone_says_so() {
+	let (mut world, entity, _) = peopled(
+		r#"local kept = nil
+
+		function tick(dt)
+			kept = kept or entity.find("crate")
+			colby.command("script.said " .. tostring(entity.valid(kept)))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+	assert_eq!(said(&world).as_deref(), Some("true"), "alive to start with");
+
+	world.entities.despawn(entity);
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("false"),
+		"and the generation is what says so, rather than the slot being empty"
+	);
+}
+
+#[test]
+fn a_slot_taken_over_by_somebody_else_is_not_the_thing_that_was_there() {
+	// the reason a handle carries a generation at all, and the failure it
+	// exists to stop: the next spawn takes the slot that was just freed.
+	let (mut world, entity, _) = peopled(
+		r#"local kept = nil
+
+		function tick(dt)
+			kept = kept or entity.find("crate")
+			colby.command("script.said " .. tostring(entity.valid(kept)))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+	world.entities.despawn(entity);
+
+	let taken = world.entities.spawn();
+	assert_eq!(taken.slot(), entity.slot(), "the same slot, which is the trap");
+	assert_ne!(taken, entity, "and a different handle");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("false"), "so the old handle names nothing");
+}
+
+#[test]
+fn a_handle_from_the_other_table_is_refused_by_name() {
+	// what the tag buys. Untagged this would be a confident answer about a
+	// different thing, because both tables are dense and both start at slot
+	// nought generation one.
+	//
+	// The message is searched inside Lua and one word comes back, for the
+	// reason the test above says: a console variable keeps the second word of
+	// the line and nothing after it.
+	let (mut world, ..) = peopled(
+		r#"function tick(dt)
+			local ok, why = pcall(function() return body.name(entity.find("crate")) end)
+			local named = tostring(why):find("entity") ~= nil
+			colby.command("script.said " .. tostring(ok) .. tostring(named))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("falsetrue"),
+		"it was refused, and told which table it was really holding"
+	);
+}
+
+#[test]
+fn a_number_that_is_not_a_handle_is_refused_rather_than_read_as_a_slot() {
+	let (mut world, ..) = peopled(
+		r#"function tick(dt)
+			local ok = pcall(function() return entity.name(1) end)
+			colby.command("script.said " .. tostring(ok))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("false"), "one is a number, not slot one");
+}
+
+#[test]
+fn nothing_is_not_an_error_because_finding_nothing_is_ordinary() {
+	let (mut world, ..) = peopled(
+		r#"function tick(dt)
+			colby.command("script.said " .. tostring(body.valid(body.find("nope"))))
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("false"), "the chain everybody writes first");
+}
+
+#[test]
+fn everything_in_a_table_is_handed_over_in_slot_order() {
+	// slot order rather than a Lua hash's, because `--shot` runs these and two
+	// runs have to be one picture. @ref `colby-known-gaps` on `pairs`.
+	let (mut world, ..) = peopled(
+		r#"function tick(dt)
+			local all = entity.all()
+			local names = ""
+			for i = 1, #all do
+				names = names .. tostring(entity.name(all[i]))
+			end
+			colby.command("script.said " .. #all .. names)
+		end"#,
+	);
+
+	for name in ["second", "third"] {
+		let extra = world.entities.spawn();
+		world.entities.set_name(extra, name);
+	}
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("3cratesecondthird"),
+		"three of them, in the order the table holds them"
+	);
+}
+
+#[test]
+fn a_panel_has_no_world_and_a_world_program_has_no_panel() {
+	// the enforcement, and it is the environment rather than a check: what is
+	// not in a program's environment is `nil`, and `nil.find` is a Lua error
+	// nobody had to write.
+	let (mut world, panel) =
+		showing(r#"ui.set_text("out", type(entity) .. type(body) .. type(ui))"#);
+	listen(&mut world);
+	world.scripts.insert("scripts/test", ScriptData {
+		source: r#"colby.command("script.said " .. type(entity) .. type(body) .. type(ui))"#
+			.to_owned(),
+	});
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		written(&world, panel, "out").as_deref(),
+		Some("nilniltable"),
+		"a panel's program has the interface and no world"
+	);
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("tabletablenil"),
+		"and a world program has the world and no interface"
+	);
 }

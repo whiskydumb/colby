@@ -84,6 +84,7 @@ use colby_core::{
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 
 mod api;
+mod handle;
 
 #[cfg(test)]
 mod tests;
@@ -701,8 +702,20 @@ impl Vm {
 		// each, shared, and Lua 5.4 has no way to make a table read-only. @ref
 		// `colby-known-gaps`.
 		environment.set("colby", Self::projection(lua, &tables.engine)?)?;
-		if matches!(job.home, Home::Panel(_)) {
-			environment.set("ui", Self::projection(lua, &tables.ui)?)?;
+
+		// and the half that decides which kind of program this is. A panel's
+		// gets the interface and no world; a world program gets the world and
+		// no interface. Nothing anywhere refuses a call - the name is simply
+		// not there, which is what makes this the enforcement rather than a
+		// check somebody has to remember to write.
+		match job.home {
+			| Home::Panel(_) => {
+				environment.set("ui", Self::projection(lua, &tables.ui)?)?;
+			},
+			| Home::World(_) => {
+				environment.set("entity", Self::projection(lua, &tables.entities)?)?;
+				environment.set("body", Self::projection(lua, &tables.bodies)?)?;
+			},
 		}
 
 		// a world program is handed nowhere to file a handler, because there is
@@ -840,6 +853,8 @@ impl Vm {
 		Ok(api::Tables {
 			ui: lua.create_table()?,
 			engine: lua.create_table()?,
+			entities: lua.create_table()?,
+			bodies: lua.create_table()?,
 			globals,
 		})
 	}
