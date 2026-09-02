@@ -1020,6 +1020,14 @@ impl Net {
 				);
 			} else {
 				world.peer = peer.named;
+				// and the table takes the name as well, which is what gives a
+				// window a block of its own to keep a player in. A host mints
+				// its peers; a window is told, and until it can seat what it
+				// was told it has nowhere to put a command, nothing to be
+				// corrected about, and no player at all. @ref
+				// `Players::seat`, and note this costs nothing on the sixty
+				// messages a second that say the same name again.
+				world.players.seat(world.peer);
 			}
 
 			world.commands.settle(world.peer, peer.confirmed);

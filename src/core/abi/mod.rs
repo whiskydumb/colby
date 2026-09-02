@@ -93,7 +93,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 41;
+pub const ABI_VERSION: u32 = 42;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -194,13 +194,13 @@ pub struct World {
 
 	/// Which endpoint of a conversation this process is.
 	///
-	/// **Nothing writes this yet.** It is [`PeerId::HOST`] from
-	/// [`World::new`](Self::new) onwards in every world this engine currently
-	/// builds, and that is not a placeholder: a process playing on its own
-	/// simulates its own world, so it really is its own authority, and every
-	/// body in it reads back as [`Role::Authority`]. The commit that admits a
-	/// client is the one that starts writing it, and until then the two other
-	/// roles are reachable only from a test.
+	/// [`PeerId::HOST`] from [`World::new`](Self::new) onwards, which is not a
+	/// placeholder: a process playing on its own simulates its own world, so it
+	/// really is its own authority and every body in it reads back as
+	/// [`Role::Authority`]. A window that has gone looking for somebody else's
+	/// world says so once, and is then **nobody until the host names it** -
+	/// the runner writes what the host said, refusing any name at the host's
+	/// own slot. @ref `crate::net::joined` and `Net::seat` in the runner.
 	///
 	/// The value a client is meant to hold before it has been told who it is
 	/// is [`PeerId::NONE`], which owns nothing and decides nothing. That is
@@ -238,10 +238,9 @@ pub struct World {
 	/// its own, sends the last few in every datagram, and re-runs whatever the
 	/// host has not confirmed.
 	///
-	/// **Nothing writes this yet**, the same way nothing wrote
-	/// [`peer`](Self::peer) when it appeared: the commit that fills it is the
-	/// one that teaches the runner to carry a command, and until then every
-	/// ring is empty and reading one costs a bounds check.
+	/// The game fills its own end of it - one command a step, from whatever is
+	/// under that machine's hands - and the runner carries what is unsettled in
+	/// every message and files what arrives under the peer it came from.
 	///
 	/// Not written down by a save, for the reason an owner is not: what
 	/// somebody was asking for a moment ago is a moment rather than a world.

@@ -488,9 +488,12 @@ pub struct Body {
 	/// Meant to be game-written and host-read: who owns a prop is a gameplay
 	/// question - picking one up is what claims it - and what the host does
 	/// with the answer is decide what to send to whom and whose commands may
-	/// move it. **Nothing outside a test writes or reads it yet**; it is here
-	/// from the first commit of the step so that growing into per-object
-	/// ownership later costs no move of the boundary. Nobody's is the ordinary
+	/// move it. **One body carries one today**: the box a game makes for a
+	/// player, stamped with the peer that player belongs to, and `role` is what
+	/// reads it back. Everything else in a world is nobody's, which is what
+	/// makes the map and the props the authority's business. It is here from
+	/// the first commit of the step so that growing into per-object ownership
+	/// later costs no move of the boundary. Nobody's is the ordinary
 	/// case and the default: the map, the props lying about, and every body in
 	/// a world that has never heard of a network.
 	///

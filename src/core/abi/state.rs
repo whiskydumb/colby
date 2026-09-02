@@ -283,6 +283,52 @@ impl Players {
 		PeerId::NONE
 	}
 
+	/// Takes a seat at a name somebody else minted.
+	///
+	/// **The other way a peer gets into this table, and it exists because a
+	/// window cannot mint its own name.** [`admit`](Self::admit) takes the
+	/// lowest free slot and invents an occupant for it, which is exactly right
+	/// on the machine that decides and useless anywhere else: a window is
+	/// *told* who it is by the host, in every message, and until it can put
+	/// that name in its own table it has no block to keep anything in - no
+	/// commands to send, nothing to be corrected about, no player at all.
+	///
+	/// **It does not mint and it does not choose.** Whoever calls this has been
+	/// handed a name by something it trusts, and this table is not the thing
+	/// that decides whether that trust is well placed; what it does is refuse
+	/// the two names nobody may ever hold. The host's slot is one, for
+	/// [`PeerId::HOST`]'s reason - a client that could seat itself there would
+	/// have the world - and nobody is the other.
+	///
+	/// **A different occupant is a different person**, so a slot that was
+	/// holding somebody else is emptied on the way. A slot already holding
+	/// exactly this peer is left alone, which is what makes calling this every
+	/// step cost nothing: a window is told its name sixty times a second.
+	///
+	/// @param peer - the name to take
+	/// @return whether the table holds that peer afterwards
+	pub fn seat(&mut self, peer: PeerId) -> bool {
+		if !peer.is_some() || peer.slot() == PeerId::HOST.slot() {
+			return false;
+		}
+
+		let slot = peer.slot();
+
+		if slot >= MAX_PEERS {
+			return false;
+		}
+
+		if self.generations[slot] == peer.generation() && self.alive[slot] {
+			return true;
+		}
+
+		self.generations[slot] = peer.generation();
+		self.alive[slot] = true;
+		self.blocks[slot].reset();
+
+		true
+	}
+
 	/// Lets a peer go, and forgets what it was holding.
 	///
 	/// The block is cleared rather than left: what a peer had is a claim about
@@ -589,6 +635,89 @@ mod tests {
 			0,
 			"reading what the last occupant left is the thing this prevents"
 		);
+	}
+
+	/// A window cannot mint its own name, so it has to be able to take one.
+	#[test]
+	fn a_table_takes_a_name_it_did_not_mint() {
+		let mut players = Players::new();
+		// what a host would have minted for its second client: not slot one,
+		// and not generation one, so a table that quietly invented its own
+		// answer would give a different one.
+		let told = PeerId::at(4, 3);
+
+		assert!(!players.here(told), "nobody has that name here yet");
+		assert!(players.seat(told));
+		assert!(players.here(told), "and now it is this table's own");
+		assert_eq!(players.generation(4), 3, "at the generation it was told");
+		assert_eq!(players.len(), 2, "the host and the one that was seated");
+
+		players
+			.get::<Example>(told, 1)
+			.expect("it is here")
+			.0
+			.count = 6;
+
+		// said again, which is what sixty messages a second do. The block
+		// survives, or a window would lose whatever it was keeping every step.
+		assert!(players.seat(told));
+		assert_eq!(
+			players
+				.get::<Example>(told, 1)
+				.expect("here")
+				.0
+				.count,
+			6,
+			"being told the same name again costs nothing"
+		);
+	}
+
+	#[test]
+	fn a_seat_at_a_slot_somebody_else_was_in_starts_over() {
+		let mut players = Players::new();
+		let before = PeerId::at(4, 3);
+		let after = PeerId::at(4, 5);
+
+		assert!(players.seat(before));
+		players
+			.get::<Example>(before, 1)
+			.expect("here")
+			.0
+			.count = 6;
+
+		assert!(players.seat(after), "a later occupant of the same slot");
+		assert!(!players.here(before), "and the one before it is gone");
+		assert_eq!(
+			players
+				.get::<Example>(after, 1)
+				.expect("here")
+				.0
+				.count,
+			0,
+			"reading what the last occupant left is the thing this prevents"
+		);
+		assert_eq!(players.len(), 2, "one person in that slot, not two");
+	}
+
+	#[test]
+	fn the_two_names_nobody_may_take_are_refused() {
+		let mut players = Players::new();
+
+		// the host's slot at every generation, including the host's own: a
+		// window that could seat itself there would hold the world.
+		for generation in [1_u32, 2, u32::MAX] {
+			assert!(!players.seat(PeerId::at(0, generation)), "generation {generation}");
+		}
+
+		assert!(!players.seat(PeerId::NONE), "and nobody is nobody");
+		assert!(!players.seat(PeerId::at(3, 0)), "including nobody at a slot that exists");
+		assert_eq!(players.len(), 1, "so the table still holds only the host");
+
+		// the boundary itself, which is the first slot that is not one.
+		let past = u32::try_from(MAX_PEERS).expect("small");
+
+		assert!(!players.seat(PeerId::at(past, 1)));
+		assert!(players.seat(PeerId::at(past - 1, 1)), "and the last real slot is a seat");
 	}
 
 	#[test]

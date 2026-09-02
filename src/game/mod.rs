@@ -671,7 +671,7 @@ struct State {
 /// Forgetting to is not unsound - `State` is `Pod`, so every bit pattern is a
 /// valid `State` - but the values will be yesterday's bytes read through
 /// today's fields.
-const STATE_LAYOUT: u64 = 21;
+const STATE_LAYOUT: u64 = 22;
 
 /// What is true of one person, kept in that peer's own block.
 ///
@@ -890,6 +890,77 @@ fn spawn(peer: PeerId) -> Vec3 {
 	let along = f32::from(u16::try_from(peer.slot()).unwrap_or(0));
 
 	PLAYER_START + Vec3::X * (along * PLAYER_SPACING)
+}
+
+/// Clothes one player's box.
+///
+/// Its own function because there are two callers and one look: `dress` puts
+/// this on the box belonging to this process's own peer at load, and
+/// [`admit_player`] puts it on the box of everybody who turns up afterwards.
+/// A player nobody can see is worse than no player at all - the solver, a
+/// trace and the pick all find it - and the two places drifting apart is
+/// exactly how one of them ends up invisible.
+///
+/// @param world - the entity table to write
+/// @param player - whose box
+fn wear(world: &mut World, player: EntityId) {
+	let plastic = world.materials.find("plastic");
+
+	world
+		.entities
+		.set_renderable(player, Renderable::of(MeshId::CUBE, plastic, PLAYER_COLOR));
+}
+
+/// Every peer the world currently seats.
+///
+/// Collected rather than borrowed, because every caller writes the tables the
+/// list is read out of.
+fn everybody(world: &World) -> Vec<PeerId> {
+	world
+		.players
+		.iter()
+		.map(|(peer, _)| peer)
+		.collect()
+}
+
+/// Clears away the box of anybody the world no longer seats.
+///
+/// **A peer that leaves takes its handles with it and leaves its box.** The
+/// table zeroes a block on the way out, so the entity and the body a departed
+/// player was standing in are remembered by nothing - except the *owner*
+/// stamped on the body, which is the whole reason a body carries one. Without
+/// this the yard fills with the boxes of everybody who has ever connected, and
+/// worse: the next occupant of a freed slot is put at that slot's own spawn
+/// point, which is exactly where the leftover is standing, and a sweep that
+/// begins inside something reports only where it began.
+///
+/// Only where this process decides. A window is told what is in the world.
+///
+/// @param world - the tables to clear
+fn sweep_players(world: &mut World) {
+	if !world.peer.is_host() {
+		return;
+	}
+
+	let seated = everybody(world);
+	let gone: Vec<(BodyId, EntityId)> = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| on_layer(body, PLAYER_LAYERS))
+		.filter(|(_, body)| body.owner.is_some() && !seated.contains(&body.owner))
+		.map(|(id, body)| (id, body.entity))
+		.collect();
+
+	for (body, entity) in &gone {
+		// @ref [`sweep_props`] for why the joints go first.
+		world.joints.forget(*body);
+		world.bodies.despawn(*body);
+		world.entities.despawn(*entity);
+	}
+
+	if !gone.is_empty() {
+		info!(gone = gone.len(), "the boxes of people who have left");
+	}
 }
 
 /// Says whose a body is.
@@ -1790,9 +1861,13 @@ fn walk(world: &mut World, peer: PeerId) -> Option<Moved> {
 		return None;
 	}
 
+	// the highest rather than the last, which is the same guard `replay` keeps
+	// inside one run and this keeps *across* runs: the step is the sender's,
+	// and a run whose last command claims to happen early would drag the mark
+	// back and lend the next run a full ceiling's worth.
 	let last = commands
-		.last()
-		.map_or(since, |command| command.step);
+		.iter()
+		.fold(since, |high, command| high.max(command.step));
 	let moved = character::replay(world, &start, since, commands, |command, before, motion| {
 		wish(command, before, standing, gravity, motion);
 	});
@@ -1838,7 +1913,15 @@ fn admit_player(world: &mut World, peer: PeerId) -> bool {
 		return false;
 	}
 
-	if block(world, peer).is_none_or(|mine| mine.player.is_some()) {
+	// **alive rather than non-zero**, and the difference is a peer that never
+	// comes back. A handle whose entity has been despawned still reads as
+	// somebody - a generation of nought is the only thing `is_some` refuses -
+	// so a player swallowed by the pit, or orphaned by a reload that cleared
+	// the tables, would leave this refusing to make another one for the rest of
+	// the session. The table is the thing that knows.
+	let standing = block(world, peer).map(|mine| mine.player);
+
+	if standing.is_none_or(|player| world.entities.alive(player)) {
 		return false;
 	}
 
@@ -1851,6 +1934,12 @@ fn admit_player(world: &mut World, peer: PeerId) -> bool {
 	stance.scale = PLAYER_EXTENTS * 2.0;
 
 	let spawned = world.entities.spawn_at(stance);
+
+	// dressed here as well as spawned, because `dress` only ever clothes the
+	// box belonging to *this* process's peer and runs from `init`, which is
+	// long over by the time anybody turns up. A player nobody can see is worse
+	// than no player: the solver, the traces and the pick all find it.
+	wear(world, spawned);
 
 	if let Some(mine) = block(world, peer) {
 		// said rather than relied on: a fresh block is zeroed, and zero happens
@@ -1895,13 +1984,15 @@ fn walk_everybody(world: &mut World) {
 	}
 
 	// collected because the walk writes the tables the list is read from.
-	let everybody: Vec<PeerId> = world
-		.players
-		.iter()
-		.map(|(peer, _)| peer)
-		.collect();
+	let seated = everybody(world);
 
-	for peer in everybody {
+	// whoever has gone leaves a box standing exactly where the next occupant
+	// of their slot is put, so the leftovers go first. The *owner* on the body
+	// is the only surviving record of whose it was: a peer that leaves has its
+	// block zeroed by the table, handles and all.
+	sweep_players(world);
+
+	for peer in seated {
 		admit_player(world, peer);
 		walk(world, peer);
 	}
@@ -1921,26 +2012,34 @@ fn walk_everybody(world: &mut World) {
 /// @param world - the overlap list to read, and the tables to remove from
 fn swallow(world: &mut World) {
 	let pit = shared(world).pit;
-	// @note: one player's body today, because there is one. The host has every
-	// peer's block, so this becomes a set the moment there is more than one -
-	// and a prop is swallowed for everybody while a player is only rescued for
-	// themselves.
-	let player = played(world).map_or(BodyId::NONE, |mine| mine.player_body);
 
 	if !pit.is_some() {
 		return;
 	}
+
+	// **every seated peer's body, not this process's own.** A prop that falls
+	// out of the map is swallowed; a *player* that falls is put back. With one
+	// player those were the same list read two ways, and with two they are not:
+	// exempting only the local one meant the pit ate somebody else's player
+	// outright - and permanently, because nothing made them another.
+	let players: Vec<(PeerId, BodyId)> = everybody(world)
+		.into_iter()
+		.filter_map(|peer| block(world, peer).map(|mine| (peer, mine.player_body)))
+		.collect();
 
 	// collected first: removing a body writes the table the overlap list is
 	// read out of.
 	let fallen: Vec<(BodyId, EntityId)> = world
 		.bodies
 		.inside(pit)
-		.filter(|&id| id != player)
+		.filter(|id| !players.iter().any(|(_, body)| body == id))
 		.filter_map(|id| world.bodies.get(id).map(|body| (id, body.entity)))
 		.collect();
-
-	let caught = world.bodies.inside(pit).any(|id| id == player);
+	let caught: Vec<PeerId> = players
+		.iter()
+		.filter(|(_, body)| world.bodies.inside(pit).any(|id| id == *body))
+		.map(|(peer, _)| *peer)
+		.collect();
 
 	for (body, entity) in &fallen {
 		// @ref [`sweep_props`] for why the joints go first.
@@ -1949,12 +2048,12 @@ fn swallow(world: &mut World) {
 		world.entities.despawn(*entity);
 	}
 
-	if caught {
+	for peer in caught {
 		// the only witness there is: the player is put back where it started,
 		// so a picture taken afterwards looks exactly like one taken before the
 		// fall. @ref the pre-commit audit list, which this line belongs on.
-		trace!("the player fell out of the map");
-		put_player_back(world);
+		trace!(slot = peer.slot(), "a player fell out of the map");
+		put_player_back(world, peer);
 	}
 
 	if fallen.is_empty() {
@@ -1977,13 +2076,15 @@ fn swallow(world: &mut World) {
 /// [`teleport_body`](colby_core::abi::World::teleport_body).
 ///
 /// @param world - the player to move
-fn put_player_back(world: &mut World) {
-	let Some(mine) = played(world) else {
+fn put_player_back(world: &mut World, peer: PeerId) {
+	let Some(mine) = block(world, peer) else {
 		return;
 	};
 	let body = mine.player_body;
 
-	let mut stance = Transform::at(PLAYER_START);
+	// their own spawn rather than everybody's, or two people put back at once
+	// land inside each other. @ref [`PLAYER_SPACING`].
+	let mut stance = Transform::at(spawn(peer));
 	stance.scale = PLAYER_EXTENTS * 2.0;
 	world.teleport_body(body, stance);
 
@@ -3083,7 +3184,7 @@ fn recenter(world: &mut World) {
 	// dropped and whatever was duplicated are one set as far as this is
 	// concerned, because they are one layer. @ref [`sweep_props`].
 	sweep_props(world);
-	put_player_back(world);
+	put_player_back(world, world.peer);
 	lay_props(world);
 
 	let (yaw, pitch, distance) = START_ORBIT;
@@ -3990,7 +4091,7 @@ fn dress(world: &mut World) {
 		);
 	}
 
-	let plastic = world
+	world
 		.materials
 		.insert("plastic", Material::DEFAULT.finished(0.0, 0.5));
 	// the props in `scenes/props` name this one, which is the other half of
@@ -3999,16 +4100,13 @@ fn dress(world: &mut World) {
 		.materials
 		.insert("metal", Material::DEFAULT.finished(1.0, 0.25));
 
-	let Some(mine) = played(world) else {
+	let Some(standing) = played(world).map(|mine| mine.player) else {
 		return;
 	};
-	let player = mine.player;
 
 	// the props are not here, and neither is the map: what either is made of is
 	// written in its own scene.
-	world
-		.entities
-		.set_renderable(player, Renderable::of(MeshId::CUBE, plastic, PLAYER_COLOR));
+	wear(world, standing);
 
 	stand_model(world);
 	stand_character(world);
