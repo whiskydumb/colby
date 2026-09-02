@@ -2505,3 +2505,203 @@ fn a_command_is_acted_on_before_the_tick_of_the_step_it_arrives_in() {
 		"the tick of that same step already saw it"
 	);
 }
+
+/// The sandbox's thruster, as it ships.
+///
+/// **The file itself rather than a copy of it.** What this is a test of is the
+/// thing somebody will read and edit, and a paraphrase in here would go on
+/// passing after the real one stopped working. The same bargain the mixer's
+/// tests make with the recording that ships beside them.
+const THRUSTER: &str = include_str!("../../assets/scripts/thruster.lua");
+
+/// A world with one thruster in it, standing at the origin and pointing up.
+fn thrusting() -> (World, BodyId) {
+	let mut world = World::new();
+
+	world
+		.sounds
+		.insert("sounds/hum", colby_core::abi::SoundData {
+			samples: vec![0; 48_000],
+			rate: 48_000,
+			channels: 1,
+		});
+	world
+		.scripts
+		.insert("scripts/thruster", ScriptData { source: THRUSTER.to_owned() });
+
+	let drawn = world.entities.spawn();
+	let it = world.bodies.spawn(
+		Body::dynamic(
+			Shape::cuboid(colby_core::glam::Vec3::splat(0.5)),
+			Transform::IDENTITY,
+			1.0,
+		)
+		.driving(drawn),
+	);
+	world.bodies.set_name(it, "thruster");
+
+	// and something else with a body, so that "every thruster" is a claim
+	// about the ones that are rather than about the table.
+	let other = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0));
+	world.bodies.set_name(other, "crate");
+
+	(world, it)
+}
+
+/// Whether nothing at all has been written.
+///
+/// Exact, and the question really is exact: a thruster nobody has switched on
+/// has written no speed at all, so anything but nought is a write nobody asked
+/// for and a tolerance would hide the smallest of them.
+fn untouched(seen: f32) -> bool { seen == 0.0 }
+
+/// How fast something is going straight up.
+fn rising(world: &World, it: BodyId) -> f32 {
+	world
+		.bodies
+		.get(it)
+		.map_or(0.0, |body| body.velocity.y)
+}
+
+#[test]
+fn the_shipped_thruster_pushes_only_once_it_is_switched_on() {
+	let (mut world, it) = thrusting();
+	let mut scripts = machine();
+
+	world.dt = 1.0 / 60.0;
+	stepped(&mut scripts, &mut world);
+
+	assert!(untouched(rising(&world, it)), "nothing is pushed until somebody says so");
+	assert!(
+		world.cvars.get("thruster.on").is_some()
+			&& world.cvars.get("thruster.off").is_some()
+			&& world.cvars.get("thruster.toggle").is_some(),
+		"and the three commands it publishes are in the console table"
+	);
+
+	scripts.gameplay(&mut world, &typed("thruster.on"));
+
+	let after = rising(&world, it);
+
+	assert!(after > 0.0, "and now it climbs: {after}");
+	assert!(
+		(after - 16.0 / 60.0).abs() < 1e-4,
+		"by its own force over one step, and by nothing else: {after}"
+	);
+}
+
+#[test]
+fn the_shipped_thruster_adds_to_the_speed_a_thing_already_had() {
+	// **a push rather than a set**, and a single tick cannot tell the two
+	// apart: after one step from rest they agree exactly. What separates them
+	// is a thing that was already moving, and a second step.
+	let (mut world, it) = thrusting();
+	let mut scripts = machine();
+
+	world.dt = 1.0 / 60.0;
+	if let Some(body) = world.bodies.get_mut(it) {
+		body.velocity = colby_core::glam::Vec3::new(0.0, 3.0, 0.0);
+	}
+
+	stepped(&mut scripts, &mut world);
+	scripts.gameplay(&mut world, &typed("thruster.on"));
+
+	let once = rising(&world, it);
+
+	assert!(
+		(once - (3.0 + 16.0 / 60.0)).abs() < 1e-4,
+		"the first push is added to what it was already doing: {once}"
+	);
+
+	scripts.gameplay(&mut world, &[]);
+
+	let twice = rising(&world, it);
+
+	assert!(
+		(twice - (3.0 + 2.0 * 16.0 / 60.0)).abs() < 1e-4,
+		"and the second is added to the first: {twice}"
+	);
+}
+
+#[test]
+fn the_shipped_thruster_pushes_along_its_own_up_rather_than_the_worlds() {
+	// what makes a thruster a thruster rather than a lift: turn it over and it
+	// pushes the other way.
+	let (mut world, it) = thrusting();
+	let mut scripts = machine();
+
+	world.dt = 1.0 / 60.0;
+	let drawn = world
+		.bodies
+		.get(it)
+		.map(|body| body.entity)
+		.expect("it drives one");
+
+	if let Some(at) = world.entities.transform_mut(drawn) {
+		at.rotation = colby_core::glam::Quat::from_rotation_x(std::f32::consts::PI);
+	}
+
+	stepped(&mut scripts, &mut world);
+	scripts.gameplay(&mut world, &typed("thruster.on"));
+
+	assert!(
+		rising(&world, it) < -0.2,
+		"upside down, it pushes itself into the floor: {}",
+		rising(&world, it)
+	);
+}
+
+#[test]
+fn the_shipped_thruster_makes_a_noise_while_it_burns_and_stops_when_it_does() {
+	let (mut world, _) = thrusting();
+	let mut scripts = machine();
+
+	world.dt = 1.0 / 60.0;
+	stepped(&mut scripts, &mut world);
+	assert_eq!(world.audio.len(), 0, "silence until it is switched on");
+
+	scripts.gameplay(&mut world, &typed("thruster.on"));
+	assert_eq!(world.audio.len(), 1, "one thruster, one noise");
+
+	// and a second step does not start a second one: the handle is kept in a
+	// table keyed by the body, which is the whole reason a handle is an
+	// ordinary value.
+	scripts.gameplay(&mut world, &[]);
+	assert_eq!(world.audio.len(), 1, "and still one");
+
+	scripts.gameplay(&mut world, &typed("thruster.off"));
+	assert_eq!(world.audio.len(), 0, "and none once it stops");
+}
+
+#[test]
+fn the_shipped_thruster_takes_its_noise_with_it_when_it_is_removed() {
+	// a noise nobody can name is a noise that plays until the process ends.
+	let (mut world, it) = thrusting();
+	let mut scripts = machine();
+
+	world.dt = 1.0 / 60.0;
+	stepped(&mut scripts, &mut world);
+	scripts.gameplay(&mut world, &typed("thruster.on"));
+	assert_eq!(world.audio.len(), 1, "it is making one");
+
+	world.bodies.despawn(it);
+	scripts.gameplay(&mut world, &[]);
+
+	assert_eq!(world.audio.len(), 0, "and it went with the thruster");
+}
+
+#[test]
+fn the_shipped_thruster_draws_itself_while_it_burns() {
+	let (mut world, _) = thrusting();
+	let mut scripts = machine();
+
+	world.dt = 1.0 / 60.0;
+	stepped(&mut scripts, &mut world);
+	assert!(world.debug.is_empty(), "nothing is drawn while it is off");
+
+	scripts.gameplay(&mut world, &typed("thruster.on"));
+
+	assert!(!world.debug.lines().is_empty(), "and an arrow while it is on");
+}
