@@ -25,6 +25,11 @@
 //!   what is stored is the quaternion they make. A quaternion is four numbers
 //!   nobody writes by hand; angles are what a person means and what this
 //!   engine's own camera already is.
+//! - **A spawn takes a table and everything else takes arguments.** A
+//!   constructor with seven optional parts is unreadable positionally and would
+//!   break every caller the day an eighth appeared; a read is called hundreds
+//!   of times a step and must not allocate. Spawning is rare, so it is the one
+//!   place a table is the right shape and the only place one is taken.
 //! - **Making and destroying is refused where this machine is not the
 //!   authority.** Nothing on the wire says a thing appeared - a snapshot is
 //!   matched by slot - so a client that spawned would put every record after it
@@ -47,7 +52,10 @@ use std::cell::RefCell;
 
 use colby_asset::css;
 use colby_core::{
-	abi::{MaterialId, Renderable, World, console, ui::PanelId},
+	abi::{
+		Body, BodyKind, Layers, MaterialId, Renderable, Shape, Transform, World, console,
+		ui::PanelId,
+	},
 	glam::{EulerRot, Quat, Vec3},
 	info, warn,
 };
@@ -140,6 +148,9 @@ where
 	placing(scope, tables, world)?;
 	drawing(scope, tables, world)?;
 	bodies(scope, tables, world)?;
+	moving(scope, tables, world)?;
+	resting(scope, tables, world)?;
+	touching(scope, tables, world)?;
 
 	Ok(())
 }
@@ -660,12 +671,430 @@ where
 		lua.create_sequence_from(handles)
 	})?;
 
+	let set_name = scope.create_function(move |_, (bits, name): (Option<i64>, String)| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		Ok(world
+			.borrow_mut()
+			.bodies
+			.set_name(handle.body(), &name))
+	})?;
+
+	let spawn = scope.create_function(move |_, options: Table| {
+		let mut world = world.borrow_mut();
+		authorized(&world, "spawn a body")?;
+
+		let body = described(&options)?;
+
+		Ok(Handle::of_body(world.bodies.spawn(body)).to_bits())
+	})?;
+
+	let despawn = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		let mut world = world.borrow_mut();
+		authorized(&world, "despawn a body")?;
+
+		Ok(world.bodies.despawn(handle.body()))
+	})?;
+
+	// the entity a body drives, which is the pair a program spends its whole
+	// time going between: the body is what the solver moves and the entity is
+	// what is drawn.
+	let entity_of = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(None);
+		};
+
+		Ok(world
+			.borrow()
+			.bodies
+			.get(handle.body())
+			.map(|body| Handle::of_entity(body.entity).to_bits()))
+	})?;
+
+	// and the way back, which is a walk rather than a field: a body names its
+	// entity and an entity names nothing. The table is bounded at a thousand,
+	// so this is a scan a program may do once and keep the answer to.
+	let of_entity = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(None);
+		};
+
+		let world = world.borrow();
+		let wanted = handle.entity();
+
+		Ok(world
+			.bodies
+			.iter()
+			.find(|(_, body)| body.entity == wanted)
+			.map(|(id, _)| Handle::of_body(id).to_bits()))
+	})?;
+
 	tables.bodies.set("find", find)?;
 	tables.bodies.set("valid", valid)?;
 	tables.bodies.set("name", name_of)?;
 	tables.bodies.set("all", all)?;
+	tables.bodies.set("set_name", set_name)?;
+	tables.bodies.set("spawn", spawn)?;
+	tables.bodies.set("despawn", despawn)?;
+	tables.bodies.set("entity", entity_of)?;
+	tables.bodies.set("of_entity", of_entity)?;
 
 	Ok(())
+}
+
+/// `body` again - where it is, how it is moving, and what moves it.
+fn moving<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	let position = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(NOTHING);
+		};
+
+		Ok(world
+			.borrow()
+			.bodies
+			.get(handle.body())
+			.map_or(NOTHING, |body| {
+				let at = body.transform.position;
+
+				triple(at.x, at.y, at.z)
+			}))
+	})?;
+
+	// **a teleport rather than a write.** Putting a body somewhere has to move
+	// the entity it drives as well and has to say the move was a jump, or the
+	// thing is drawn sliding across the map from where it was. There is one
+	// call in the engine that does all three, and this is it.
+	let teleport =
+		scope.create_function(move |_, (bits, x, y, z): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Body)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let id = handle.body();
+			let Some(at) = world.bodies.get(id).map(|body| body.transform) else {
+				return Ok(false);
+			};
+
+			world.teleport_body(id, Transform { position: Vec3::new(x, y, z), ..at });
+
+			Ok(true)
+		})?;
+
+	let velocity = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(NOTHING);
+		};
+
+		Ok(world
+			.borrow()
+			.bodies
+			.get(handle.body())
+			.map_or(NOTHING, |body| triple(body.velocity.x, body.velocity.y, body.velocity.z)))
+	})?;
+
+	// there is no way to apply a *force* to a body anywhere in this engine, so
+	// what a program pushing something writes is the speed itself. That is an
+	// impulse rather than a force and the difference is real: it ignores the
+	// mass. @ref `colby-direction` on what water is waiting for.
+	let set_velocity =
+		scope.create_function(move |_, (bits, x, y, z): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Body)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let Some(body) = world.bodies.get_mut(handle.body()) else {
+				return Ok(false);
+			};
+
+			body.velocity = Vec3::new(x, y, z);
+			// anything a program pushes has to be awake to be pushed, and a
+			// pile that has settled is asleep. Writing a speed and leaving it
+			// asleep is a push nothing acts on.
+			body.sleeping = false;
+
+			Ok(true)
+		})?;
+
+	let angular = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(NOTHING);
+		};
+
+		Ok(world
+			.borrow()
+			.bodies
+			.get(handle.body())
+			.map_or(NOTHING, |body| triple(body.angular.x, body.angular.y, body.angular.z)))
+	})?;
+
+	let set_angular =
+		scope.create_function(move |_, (bits, x, y, z): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Body)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let Some(body) = world.bodies.get_mut(handle.body()) else {
+				return Ok(false);
+			};
+
+			body.angular = Vec3::new(x, y, z);
+			body.sleeping = false;
+
+			Ok(true)
+		})?;
+
+	tables.bodies.set("position", position)?;
+	tables.bodies.set("teleport", teleport)?;
+	tables.bodies.set("velocity", velocity)?;
+	tables.bodies.set("set_velocity", set_velocity)?;
+	tables.bodies.set("angular", angular)?;
+	tables.bodies.set("set_angular", set_angular)?;
+
+	Ok(())
+}
+
+/// `body` a third time - whether it is being simulated at all.
+///
+/// Its own function because one that filled the whole table would be a
+/// hundred and fifty lines of closures; the split is by subject rather than
+/// by size - where a thing is and how fast it is going, against whether
+/// anything is moving it and which of them it is one of.
+fn resting<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	// freezing is `BodyKind::Kinematic` and there is no flag anywhere: in this
+	// engine kinematic means gameplay owns the transform and the solver leaves
+	// it alone, so nothing writes a frozen thing's position and everything
+	// piles on it as though it were the map. @ref `colby-sandbox`.
+	let frozen = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		Ok(world
+			.borrow()
+			.bodies
+			.get(handle.body())
+			.is_some_and(|body| body.kind == BodyKind::Kinematic))
+	})?;
+
+	let freeze = scope.create_function(move |_, (bits, still): (Option<i64>, bool)| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		let mut world = world.borrow_mut();
+		let Some(body) = world.bodies.get_mut(handle.body()) else {
+			return Ok(false);
+		};
+
+		// a mesh is never dynamic - a triangle soup has no inside, so no mass
+		// distribution and no inertia tensor - so thawing one would be asking
+		// the solver for something it cannot answer.
+		if !still && !matches!(body.shape.kind, colby_core::abi::ShapeKind::Mesh) {
+			body.kind = BodyKind::Dynamic;
+			body.sleeping = false;
+		} else if still {
+			body.kind = BodyKind::Kinematic;
+		}
+
+		Ok(true)
+	})?;
+
+	let sleeping = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		Ok(world
+			.borrow()
+			.bodies
+			.get(handle.body())
+			.is_some_and(|body| body.sleeping))
+	})?;
+
+	let wake = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		let mut world = world.borrow_mut();
+		let Some(body) = world.bodies.get_mut(handle.body()) else {
+			return Ok(false);
+		};
+
+		body.sleeping = false;
+
+		Ok(true)
+	})?;
+
+	// a layer is an identity rather than a filter, which is the rule the whole
+	// sandbox is built on: nothing keeps a list of the props, and "which ones"
+	// is answered by walking the table and asking. @ref `colby-sandbox`.
+	let on_layer = scope.create_function(move |_, (bits, index): (Option<i64>, u32)| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		Ok(world
+			.borrow()
+			.bodies
+			.get(handle.body())
+			.is_some_and(|body| body.layers.layer & Layers::bit(index) != 0))
+	})?;
+
+	let set_layer = scope.create_function(move |_, (bits, index): (Option<i64>, u32)| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(false);
+		};
+
+		let mut world = world.borrow_mut();
+		let Some(body) = world.bodies.get_mut(handle.body()) else {
+			return Ok(false);
+		};
+
+		body.layers.layer = Layers::bit(index);
+
+		Ok(true)
+	})?;
+
+	tables.bodies.set("frozen", frozen)?;
+	tables.bodies.set("freeze", freeze)?;
+	tables.bodies.set("sleeping", sleeping)?;
+	tables.bodies.set("wake", wake)?;
+	tables.bodies.set("on_layer", on_layer)?;
+	tables.bodies.set("set_layer", set_layer)?;
+	Ok(())
+}
+
+/// `body.touches` - what met what during the step that just ran.
+///
+/// A queue the step drains rather than a callback, which is the arrangement
+/// every event in this engine has and for the same three reasons: no function
+/// pointer with a module's lifetime, no gameplay running from inside the
+/// solver, and nothing that would make a screenshot stop being reproducible.
+/// A touch is offered for exactly one step.
+fn touching<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	// a table per touch, which is the one shape that reads: a touch has five
+	// parts and almost every program wants two of them by name. There are a
+	// handful of these a step rather than hundreds, which is what makes the
+	// allocation affordable here and not in `position`.
+	let touches = scope.create_function(move |lua, ()| {
+		let world = world.borrow();
+		let out = lua.create_table()?;
+
+		for (at, touch) in world.bodies.touches().iter().enumerate() {
+			let one = lua.create_table()?;
+
+			one.set("first", Handle::of_body(touch.first).to_bits())?;
+			one.set("second", Handle::of_body(touch.second).to_bits())?;
+			one.set("began", touch.kind == colby_core::abi::TouchKind::Began)?;
+			one.set("x", touch.point.x)?;
+			one.set("y", touch.point.y)?;
+			one.set("z", touch.point.z)?;
+			one.set("nx", touch.normal.x)?;
+			one.set("ny", touch.normal.y)?;
+			one.set("nz", touch.normal.z)?;
+
+			out.set(at + 1, one)?;
+		}
+
+		Ok(out)
+	})?;
+
+	tables.bodies.set("touches", touches)?;
+
+	Ok(())
+}
+
+/// Reads one spawn table into a body.
+///
+/// The one place a table crosses, because a constructor with this many optional
+/// parts is unreadable positionally and would break every caller the day
+/// another appeared. What is required is the shape; everything else has a
+/// default that is the ordinary answer.
+///
+/// @param options - what the program wrote
+fn described(options: &Table) -> Result<Body> {
+	let shape: String = options.get("shape").unwrap_or_default();
+	let mass: f32 = options.get("mass").unwrap_or(1.0);
+
+	let shape = match shape.as_str() {
+		| "box" => Shape::cuboid(Vec3::new(
+			options.get("hx").unwrap_or(0.5),
+			options.get("hy").unwrap_or(0.5),
+			options.get("hz").unwrap_or(0.5),
+		)),
+		| "ball" => Shape::ball(options.get("radius").unwrap_or(0.5)),
+		| other => {
+			return Err(mlua::Error::runtime(format!(
+				"`{other}` is not a shape; colby has box and ball"
+			)));
+		},
+	};
+
+	let at = Transform::at(Vec3::new(
+		options.get("x").unwrap_or(0.0),
+		options.get("y").unwrap_or(0.0),
+		options.get("z").unwrap_or(0.0),
+	));
+
+	let kind: String = options.get("kind").unwrap_or_default();
+	let mut body = match kind.as_str() {
+		| "" | "dynamic" => Body::dynamic(shape, at, mass),
+		| "kinematic" => Body::new(BodyKind::Kinematic, shape, at),
+		| "static" => Body::new(BodyKind::Static, shape, at),
+		| other => {
+			return Err(mlua::Error::runtime(format!(
+				"`{other}` is not a kind; colby has dynamic, kinematic and static"
+			)));
+		},
+	};
+
+	if let Some(bits) = options.get::<Option<i64>>("entity")? {
+		let Some(handle) = taken(Some(bits), Kind::Entity)? else {
+			return Err(mlua::Error::runtime("`entity` is not an entity"));
+		};
+
+		body = body.driving(handle.entity());
+	}
+
+	if let Some(index) = options.get::<Option<u32>>("layer")? {
+		body = body.layered(Layers::single(index));
+	}
+
+	Ok(body.surfaced(
+		options.get("restitution").unwrap_or(0.2),
+		options.get("friction").unwrap_or(0.6),
+	))
 }
 
 /// Reads one argument as a handle into the table that is asking.

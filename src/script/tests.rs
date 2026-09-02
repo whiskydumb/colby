@@ -1553,3 +1553,299 @@ fn drawing_something_keeps_the_color_it_was_given() {
 		"the tint outlived being given a mesh"
 	);
 }
+
+#[test]
+fn a_program_makes_a_body_out_of_a_table_and_it_is_the_one_it_asked_for() {
+	let mut world = running(
+		r#"function tick(dt)
+			if body.find("made") then return end
+
+			local it = entity.spawn()
+			entity.set_name(it, "made")
+
+			local made = body.spawn {
+				entity = it,
+				shape = "ball",
+				radius = 0.75,
+				mass = 3,
+				x = 1, y = 2, z = 3,
+				layer = 4,
+			}
+			body.set_name(made, "made")
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	let made = world
+		.bodies
+		.iter()
+		.find(|(id, _)| world.bodies.name(*id) == "made")
+		.map(|(id, _)| id)
+		.expect("the program made one");
+	let body = world.bodies.get(made).expect("it is there");
+
+	assert!((body.shape.radius - 0.75).abs() < 1e-5, "the radius it asked for");
+	assert!((body.mass - 3.0).abs() < 1e-5, "and the mass");
+	assert!(
+		body.transform
+			.position
+			.abs_diff_eq(colby_core::glam::Vec3::new(1.0, 2.0, 3.0), 1e-5)
+	);
+	assert_eq!(body.layers.layer, colby_core::abi::Layers::bit(4), "and the layer");
+	assert_eq!(body.kind, colby_core::abi::BodyKind::Dynamic, "dynamic, which is the default");
+	assert!(
+		world.entities.name(body.entity).eq("made"),
+		"and it drives the entity it was given"
+	);
+}
+
+#[test]
+fn a_shape_nobody_has_is_refused_by_name() {
+	// the one field with no sensible default: a body with no shape is not a
+	// body, and guessing one would be a program silently getting something
+	// else than it wrote.
+	let mut world = running(
+		r#"function tick(dt)
+			local ok, why = pcall(function() return body.spawn { shape = "cone" } end)
+			local named = tostring(why):find("cone") ~= nil
+			colby.command("script.said " .. tostring(ok) .. tostring(named))
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("falsetrue"), "refused, naming what was asked for");
+	assert_eq!(world.bodies.len(), 0, "and nothing was made");
+}
+
+#[test]
+fn a_client_may_not_make_a_body_either() {
+	let mut world = running(
+		r#"function tick(dt)
+			local ok = pcall(function() return body.spawn { shape = "ball" } end)
+			colby.command("script.said " .. tostring(ok))
+		end"#,
+	);
+	listen(&mut world);
+	joined(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("false"));
+	assert_eq!(world.bodies.len(), 0, "and the table is the one the host built");
+}
+
+#[test]
+fn pushing_something_wakes_it_up() {
+	// a pile that has settled is asleep, and a speed written onto a sleeping
+	// body is a push nothing acts on - which reads as the push not working
+	// rather than as the body being asleep.
+	let mut world = running(
+		r#"function tick(dt)
+			local it = body.find("pushed")
+			if not it then return end
+
+			body.set_velocity(it, 0, 5, 0)
+		end"#,
+	);
+
+	let id = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0));
+	world.bodies.set_name(id, "pushed");
+	if let Some(body) = world.bodies.get_mut(id) {
+		body.sleeping = true;
+	}
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	let body = world.bodies.get(id).expect("it is there");
+
+	assert!((body.velocity.y - 5.0).abs() < 1e-5, "the push landed");
+	assert!(!body.sleeping, "and it is awake to be pushed");
+}
+
+#[test]
+fn a_teleport_moves_the_entity_too_and_says_it_was_a_jump() {
+	// writing the body's transform alone would leave the drawn thing where it
+	// was until the next step copied it, and would then draw it sliding across
+	// the map. One call does all three.
+	let mut world = running(
+		r#"function tick(dt)
+			local it = body.find("moved")
+			if not it then return end
+
+			body.teleport(it, 20, 0, 0)
+		end"#,
+	);
+
+	let entity = world.entities.spawn();
+	let id = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0).driving(entity));
+	world.bodies.set_name(id, "moved");
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	// what the step does at the bottom of every one of them, and what a snap
+	// is *for*: it writes the past to match the present for whatever asked, so
+	// that `lerp(x, x, t)` is `x` for every `t`. Standing in for it here is
+	// what makes the second assertion below able to fail.
+	world.settle();
+
+	assert!(
+		world
+			.entities
+			.transform(entity)
+			.is_some_and(|at| (at.position.x - 20.0).abs() < 1e-5),
+		"the drawn thing went with it"
+	);
+	assert!(
+		world
+			.entities
+			.interpolated(entity, 0.0)
+			.is_some_and(|at| (at.position.x - 20.0).abs() < 1e-5),
+		"and it is drawn arriving rather than sliding, which is what a snap is"
+	);
+}
+
+#[test]
+fn freezing_is_the_kind_rather_than_a_flag() {
+	// in this engine kinematic means gameplay owns the transform and the
+	// solver leaves it alone, so a frozen thing needs no flag anywhere and
+	// everything piles on it as though it were the map.
+	let mut world = running(
+		r#"function tick(dt)
+			local it = body.find("held")
+			if not it then return end
+
+			if body.frozen(it) then
+				colby.command("script.said frozen")
+			else
+				body.freeze(it, true)
+			end
+		end"#,
+	);
+	listen(&mut world);
+
+	let id = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0));
+	world.bodies.set_name(id, "held");
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		world.bodies.get(id).map(|body| body.kind),
+		Some(colby_core::abi::BodyKind::Kinematic),
+		"and it is the kind that changed"
+	);
+
+	stepped(&mut scripts, &mut world);
+	assert_eq!(said(&world).as_deref(), Some("frozen"), "which reads back as frozen");
+}
+
+#[test]
+fn a_layer_is_how_a_program_asks_which_ones() {
+	// the rule the whole sandbox is built on: nothing keeps a list, and
+	// "which of them are props" is a walk of the table asking each one.
+	let mut world = running(
+		r#"function tick(dt)
+			local mine = 0
+			local all = body.all()
+			for i = 1, #all do
+				if body.on_layer(all[i], 2) then mine = mine + 1 end
+			end
+			colby.command("script.said " .. mine)
+		end"#,
+	);
+	listen(&mut world);
+
+	for on in [true, false, true] {
+		let id = world
+			.bodies
+			.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0));
+
+		if let Some(body) = world.bodies.get_mut(id).filter(|_| on) {
+			body.layers = colby_core::abi::Layers::single(2);
+		}
+	}
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("2"), "two of the three answer to it");
+}
+
+#[test]
+fn a_body_and_the_entity_it_drives_are_reachable_from_each_other() {
+	let mut world = running(
+		r#"function tick(dt)
+			local it = body.find("paired")
+			if not it then return end
+
+			local drawn = body.entity(it)
+			local back = body.of_entity(drawn)
+			colby.command("script.said " .. tostring(back == it))
+		end"#,
+	);
+	listen(&mut world);
+
+	let entity = world.entities.spawn();
+	let id = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0).driving(entity));
+	world.bodies.set_name(id, "paired");
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "round trip, both ways");
+}
+
+#[test]
+fn a_program_is_told_what_met_what() {
+	let mut world = running(
+		r#"function tick(dt)
+			local all = body.touches()
+			if #all == 0 then return end
+
+			local one = all[1]
+			colby.command("script.said " .. tostring(
+				body.name(one.first) == "left" and body.name(one.second) == "right"
+					and one.began and one.y == 3
+			))
+		end"#,
+	);
+	listen(&mut world);
+
+	let left = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0));
+	let right = world
+		.bodies
+		.spawn(Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0));
+	world.bodies.set_name(left, "left");
+	world.bodies.set_name(right, "right");
+	world.bodies.touched(colby_core::abi::Touch {
+		first: left,
+		second: right,
+		kind: colby_core::abi::TouchKind::Began,
+		point: colby_core::glam::Vec3::new(1.0, 3.0, 5.0),
+		normal: colby_core::glam::Vec3::Y,
+	});
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	scripts.interface(&mut world);
+	scripts.gameplay(&mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "both names, the kind and the point");
+}
