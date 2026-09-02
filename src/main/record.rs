@@ -157,7 +157,7 @@ pub(crate) fn take(request: &Request) -> Result {
 
 	let mut game = Game::open(&mut world)?;
 	let mut input = Input::default();
-	let mut scripts = Vm::new()?;
+	let mut scripts = Vm::new(crate::console::publisher())?;
 	let mut interface = Interface::new();
 
 	// the viewport a screenshot uses, at a scale of one, and for the same

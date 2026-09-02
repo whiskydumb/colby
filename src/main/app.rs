@@ -197,7 +197,7 @@ impl App {
 		// would hand it nothing on the first one.
 		self.assets.sync(&mut self.world);
 
-		match Vm::new() {
+		match Vm::new(crate::console::publisher()) {
 			| Ok(scripts) => self.scripts = Some(scripts),
 			| Err(error) =>
 				error!(%error, "no interpreter; documents with a script have no logic"),

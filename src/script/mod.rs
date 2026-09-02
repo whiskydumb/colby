@@ -78,10 +78,12 @@ use std::{
 
 use colby_core::{
 	Result,
-	abi::{EventKind, PanelId, ScriptId, Scripts, World, ui::Event},
+	abi::{ConsoleFn, EventKind, PanelId, ScriptId, Scripts, World, ui::Event},
 	err, info, trace, warn,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
+
+pub use crate::api::Asked;
 
 mod api;
 mod handle;
@@ -143,6 +145,12 @@ const CONVERSIONS: [&str; 3] = ["tonumber", "tostring", "type"];
 pub struct Vm {
 	lua: Lua,
 	tables: api::Tables,
+	/// The runner's stand-in for every command a program publishes.
+	///
+	/// Handed in rather than written here: a [`ConsoleFn`] is an unsafe extern
+	/// function and there is none of that in this crate, by design. @ref
+	/// [`Asked`].
+	publish: ConsoleFn,
 	loaded: Vec<Loaded>,
 	/// Instructions the call now running has spent. Shared with the VM's hook,
 	/// which is the only thing that writes it.
@@ -197,6 +205,11 @@ struct Loaded {
 	/// Its handlers, or `None` for a program that registered none - which is
 	/// every world program, since `ui.on` is not something one can reach.
 	handlers: Option<Table>,
+	/// What it published, or `None` for a panel's program, which may not.
+	published: Option<Table>,
+	/// The names it published, so that building it again takes the old ones
+	/// out of the console table before the new ones go in.
+	names: Vec<String>,
 	/// The table its chunk ran in, kept so that `tick` can be read out of it
 	/// once a step.
 	///
@@ -239,6 +252,10 @@ struct Built {
 	/// Where `ui.on` filed things, or `None` for a program that has no `ui`.
 	handlers: Option<Table>,
 
+	/// Where `colby.publish` filed things, or `None` for a panel's program,
+	/// which may not.
+	published: Option<Table>,
+
 	/// The table the chunk ran in.
 	environment: Table,
 
@@ -256,8 +273,11 @@ struct Waiting {
 impl Vm {
 	/// Brings up the interpreter with nothing loaded into it.
 	///
-	/// @return the scripts, or why Lua could not be started
-	pub fn new() -> Result<Self> {
+	/// @param publish - the function every command a program publishes is
+	/// registered with. Its address has to be inside the host, which is never
+	/// unloaded; @ref [`Asked`] for why it is not written here
+	/// @return the interpreter, or why Lua could not be started
+	pub fn new(publish: ConsoleFn) -> Result<Self> {
 		let lua = Lua::new_with(libraries(), LuaOptions::default())
 			.map_err(|error| err!(Script("the interpreter could not be started: {error}")))?;
 
@@ -284,7 +304,13 @@ impl Vm {
 			err!(Script("the script environment could not be built: {error}"))
 		})?;
 
-		Ok(Self { lua, tables, loaded: Vec::new(), spent })
+		Ok(Self {
+			lua,
+			tables,
+			publish,
+			loaded: Vec::new(),
+			spent,
+		})
 	}
 
 	/// Runs whatever the interface has for its programs this step.
@@ -302,7 +328,7 @@ impl Vm {
 			return;
 		}
 
-		self.serve(world, &pending, false);
+		self.serve(world, &pending, None);
 	}
 
 	/// Runs whatever the world has for its own programs this step.
@@ -312,14 +338,16 @@ impl Vm {
 	/// step, after the game's `update` and inside the edit-mode guard.
 	///
 	/// @param world - the world to run against, and to write through
-	pub fn gameplay(&mut self, world: &mut World) {
+	/// @param asked - every command that was typed and belongs to a program,
+	/// which the runner has been collecting since the last step
+	pub fn gameplay(&mut self, world: &mut World, asked: &[Asked]) {
 		let pending = self.pending_world(world);
 
-		if pending.is_empty() && !self.anything_ticks() {
+		if pending.is_empty() && asked.is_empty() && !self.anything_ticks() {
 			return;
 		}
 
-		self.serve(world, &pending, true);
+		self.serve(world, &pending, Some(asked));
 	}
 
 	/// Whether any loaded program would be called if a step ticked now.
@@ -424,22 +452,29 @@ impl Vm {
 	/// script reaches the engine through are made here and destroyed when this
 	/// returns, and making them six times over for six events would be six
 	/// times the work for the same answer.
-	fn serve(&mut self, world: &mut World, pending: &[Pending], ticking: bool) {
-		let Self { lua, tables, loaded, spent } = self;
+	fn serve(&mut self, world: &mut World, pending: &[Pending], asked: Option<&[Asked]>) {
+		let Self { lua, tables, publish, loaded, spent } = self;
+		let ticking = asked.is_some();
 		let events = if ticking { Vec::new() } else { Self::waiting(world) };
 		let dt = world.dt;
 		let world = RefCell::new(world);
 		let running = RefCell::new(api::Running::default());
 
 		let outcome = lua.scope(|scope| {
-			api::fill(scope, tables, &world, &running)?;
+			api::fill(scope, tables, &world, &running, *publish)?;
 
 			for job in pending {
-				Self::reload(lua, tables, loaded, spent, &running, job);
+				Self::reload(lua, tables, loaded, spent, &running, &world, job);
 			}
 
 			for event in &events {
 				Self::dispatch(loaded, spent, &running, event);
+			}
+
+			// before the ticks, so that a command typed between two steps is
+			// acted on by the step that follows rather than by the one after.
+			for one in asked.unwrap_or_default() {
+				Self::obey(loaded, spent, &running, one);
 			}
 
 			if ticking {
@@ -451,6 +486,61 @@ impl Vm {
 
 		if let Err(error) = outcome {
 			warn!(%error, "the scripts could not be given their api this step");
+		}
+	}
+
+	/// Hands one typed command to the program that published it.
+	///
+	/// A command whose program has gone is not an error: the console table is
+	/// swept when a program is built again, but a line already typed and
+	/// waiting was typed while it was still there.
+	fn obey(
+		loaded: &mut [Loaded],
+		spent: &Cell<u32>,
+		running: &RefCell<api::Running>,
+		asked: &Asked,
+	) {
+		let Some(entry) = loaded
+			.iter_mut()
+			.find(|loaded| loaded.names.contains(&asked.name))
+		else {
+			return;
+		};
+
+		let found = entry
+			.published
+			.as_ref()
+			.and_then(|table| {
+				table
+					.get::<Option<Function>>(asked.name.as_str())
+					.ok()
+			})
+			.flatten();
+
+		let Some(handler) = found else {
+			return;
+		};
+
+		*running.borrow_mut() = api::Running {
+			panel: entry.home.panel(),
+			handlers: entry.handlers.clone(),
+			published: entry.published.clone(),
+			name: entry.name.clone(),
+		};
+		spent.set(0);
+
+		trace!(program = entry.name, command = asked.name, "a program was asked for something");
+
+		// **the words go over as separate arguments**, not as one table: a
+		// handler written `function(which)` is what anybody writes first, and a
+		// table arriving where a string was expected is an error inside the
+		// program rather than a message about the call.
+		let words: mlua::Variadic<String> = asked.words.iter().cloned().collect();
+
+		if let Err(error) = handler.call::<()>(words) {
+			entry.faults = entry.faults.saturating_add(1);
+
+			warn!(program = entry.name, command = asked.name, %error, "a command failed");
 		}
 	}
 
@@ -490,6 +580,7 @@ impl Vm {
 		*running.borrow_mut() = api::Running {
 			panel: entry.home.panel(),
 			handlers: entry.handlers.clone(),
+			published: entry.published.clone(),
 			name: entry.name.clone(),
 		};
 		spent.set(0);
@@ -596,12 +687,27 @@ impl Vm {
 		loaded: &mut Vec<Loaded>,
 		spent: &Cell<u32>,
 		running: &RefCell<api::Running>,
+		world: &RefCell<&mut World>,
 		job: &Pending,
 	) {
-		let built = Self::build(lua, tables, spent, running, job);
 		let slot = loaded
 			.iter()
 			.position(|loaded| loaded.home == job.home);
+
+		// **before the chunk runs, not after.** The chunk is what publishes, so
+		// sweeping the old names afterwards would sweep the new ones with them
+		// - they share a name whenever a program keeps a command it already
+		// had, which is the ordinary case.
+		let previously: Vec<String> = slot
+			.and_then(|slot| loaded.get(slot))
+			.map(|loaded| loaded.names.clone())
+			.unwrap_or_default();
+
+		for name in &previously {
+			world.borrow_mut().cvars.forget_script(name);
+		}
+
+		let built = Self::build(lua, tables, spent, running, job);
 
 		let kept = match built {
 			| Ok(built) => {
@@ -633,12 +739,23 @@ impl Vm {
 					.and_then(|loaded| {
 						Some(Built {
 							handlers: loaded.handlers.clone(),
+							published: loaded.published.clone(),
 							environment: loaded.environment.clone()?,
 							ticks: loaded.ticks,
 						})
 					})
 			},
 		};
+
+		let published = kept
+			.as_ref()
+			.and_then(|built| built.published.clone());
+		let names = published.as_ref().map_or_else(Vec::new, |table| {
+			table
+				.pairs::<String, Function>()
+				.filter_map(|pair| pair.ok().map(|(name, _)| name))
+				.collect()
+		});
 
 		let entry = Loaded {
 			home: job.home,
@@ -648,6 +765,8 @@ impl Vm {
 			handlers: kept
 				.as_ref()
 				.and_then(|built| built.handlers.clone()),
+			published,
+			names,
 			environment: kept
 				.as_ref()
 				.map(|built| built.environment.clone()),
@@ -731,9 +850,17 @@ impl Vm {
 			| Home::World(_) => None,
 		};
 
+		// and the other way round: only a world program may publish, because a
+		// panel's program is interface logic and its life is its panel's.
+		let published = match job.home {
+			| Home::Panel(_) => None,
+			| Home::World(_) => Some(lua.create_table()?),
+		};
+
 		*running.borrow_mut() = api::Running {
 			panel: job.home.panel(),
 			handlers: handlers.clone(),
+			published: published.clone(),
 			name: job.name.clone(),
 		};
 		spent.set(0);
@@ -761,6 +888,7 @@ impl Vm {
 
 		Ok(Some(Built {
 			handlers,
+			published,
 			environment,
 			ticks: ticks && matches!(job.home, Home::World(_)),
 		}))
@@ -816,6 +944,7 @@ impl Vm {
 		*running.borrow_mut() = api::Running {
 			panel: event.panel,
 			handlers: Some(handlers.clone()),
+			published: None,
 			name: entry.name.clone(),
 		};
 		spent.set(0);

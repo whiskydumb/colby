@@ -190,7 +190,10 @@ pub(crate) fn run(
 		// one that wants to decide first can be a console command the game
 		// calls.
 		if let Some(scripts) = scripts {
-			scripts.gameplay(world);
+			// what was typed at a program since the last step, handed over
+			// before its tick so a command acts on the step that follows the
+			// line rather than the one after it.
+			scripts.gameplay(world, &crate::console::asked_of_scripts());
 
 			// and the answer to `script.status`, written here because these
 			// numbers are the interpreter's and a console command is handed
@@ -555,7 +558,7 @@ mod tests {
 		// game module: `Game` is a loaded library and there is none in a test.
 		// @ref `NET-7` on the audit list.
 		let (mut world, mut simulation) = falling();
-		let mut scripts = Vm::new().expect("the interpreter starts");
+		let mut scripts = Vm::new(crate::console::publisher()).expect("the interpreter starts");
 		let mut input = Input::default();
 
 		world.cvars.var(

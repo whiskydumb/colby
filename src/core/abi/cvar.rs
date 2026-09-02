@@ -142,13 +142,27 @@ pub type ConsoleFn = unsafe extern "C-unwind" fn(world: *mut World, args: *const
 /// and both sides share one definition of it through `colby_core`.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
+	name: String,
 	words: Vec<String>,
 }
 
 impl Args {
-	/// The words, in order, not counting the command's name.
+	/// One invocation: what was typed, and what followed it.
+	///
+	/// @param name - the command's own name, as it was typed
+	/// @param words - the words after it, in order
 	#[must_use]
-	pub fn new(words: Vec<String>) -> Self { Self { words } }
+	pub fn new(name: String, words: Vec<String>) -> Self { Self { name, words } }
+
+	/// The name this command was called under.
+	///
+	/// **Almost nothing wants this, and one thing cannot work without it.** A
+	/// [`ConsoleFn`] is a bare function pointer with no context, so a single
+	/// function standing in for a whole *table* of commands, the way a
+	/// script's are, has no other way to find out which of them was asked for.
+	/// Everything registered one name at a time can ignore it.
+	#[must_use]
+	pub fn name(&self) -> &str { &self.name }
 
 	/// How many there are.
 	#[must_use]
@@ -189,6 +203,16 @@ pub enum Owner {
 
 	/// The game module. Its commands go when the module does.
 	Module,
+
+	/// A program the interpreter is running. Its commands go when it does.
+	///
+	/// Kept apart from [`Module`](Self::Module) because the two are dropped by
+	/// different things at different moments: a module's commands go before its
+	/// library is unloaded, all at once, while a program's go one program at a
+	/// time as each is built again. The *pointer* is not the reason - a
+	/// program's command is a function inside the host, which is never
+	/// unloaded, so it is the one kind here with no lifetime problem at all.
+	Script,
 }
 
 /// A variable with a value, or a command with a function.
@@ -473,6 +497,25 @@ impl Cvars {
 		}
 	}
 
+	/// Drops one command a program published.
+	///
+	/// Called when the program that published it is built again or goes away,
+	/// so that a name a program no longer registers stops answering. Only a
+	/// script's own commands can go this way: a program may not remove
+	/// `quit`, and a table where anything could remove anything is a table
+	/// nobody can reason about.
+	///
+	/// @param name - what to drop
+	/// @return whether there was one to drop
+	pub fn forget_script(&mut self, name: &str) -> bool {
+		let was = self.entries.len();
+
+		self.entries
+			.retain(|entry| !(entry.name == name && entry.owner == Owner::Script));
+
+		self.entries.len() != was
+	}
+
 	/// Removes what the reloaded module did not register again.
 	///
 	/// Called by the host after the module's `init`. A variable that was there
@@ -553,6 +596,51 @@ mod tests {
 	///
 	/// As [`nothing`].
 	unsafe extern "C-unwind" fn also_nothing(_world: *mut World, _args: *const Args) {}
+
+	#[test]
+	fn a_program_may_take_back_its_own_command_and_nobody_elses() {
+		// the whole reason this is not a general `remove`: a table where
+		// anything can drop anything is a table nobody can reason about, and
+		// the thing being given the ability here is a program somebody wrote
+		// in a text file.
+		let mut cvars = Cvars::new();
+
+		cvars.command("engine.stop", nothing, "the engine's own");
+		cvars.attribute(Owner::Module);
+		cvars.command("game.go", nothing, "the game's own");
+		cvars.attribute(Owner::Script);
+		cvars.command("mine.go", nothing, "a program's own");
+		cvars.attribute(Owner::Engine);
+
+		assert!(!cvars.forget_script("engine.stop"), "the engine's stays");
+		assert!(!cvars.forget_script("game.go"), "and so does the game's");
+		assert!(cvars.get("engine.stop").is_some());
+		assert!(cvars.get("game.go").is_some());
+
+		assert!(cvars.forget_script("mine.go"), "and a program's own goes");
+		assert!(cvars.get("mine.go").is_none());
+
+		assert!(!cvars.forget_script("mine.go"), "and going twice is not going");
+	}
+
+	#[test]
+	fn a_command_knows_which_of_its_names_it_was_called_under() {
+		// what one function standing in for a whole table of commands has to
+		// have. Two names, one function, and the only thing telling them apart
+		// is this.
+		let mut cvars = Cvars::new();
+
+		cvars.command("first", nothing, "one");
+		cvars.command("second", nothing, "two");
+
+		assert_eq!(Args::new("first".to_owned(), Vec::new()).name(), "first");
+		assert_eq!(
+			Args::new("second".to_owned(), vec!["a".to_owned()]).name(),
+			"second",
+			"and the words after it are not part of it"
+		);
+		assert_eq!(Args::new("second".to_owned(), vec!["a".to_owned()]).word(0), Some("a"));
+	}
 
 	#[test]
 	fn a_registered_variable_reads_back_as_what_it_is() {

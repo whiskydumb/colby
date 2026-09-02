@@ -53,8 +53,8 @@ use std::cell::RefCell;
 use colby_asset::css;
 use colby_core::{
 	abi::{
-		Body, BodyKind, Key, Layers, MaterialId, Renderable, Shape, TraceInfo, Transform, Voice,
-		World, console, ui::PanelId,
+		Body, BodyKind, ConsoleFn, Key, Layers, MaterialId, Renderable, Shape, TraceInfo,
+		Transform, Voice, World, console, cvar::Owner, ui::PanelId,
 	},
 	glam::{EulerRot, Quat, Vec3},
 	info, warn,
@@ -95,6 +95,31 @@ const fn triple(x: f32, y: f32, z: f32) -> Triple { (Some(x), Some(y), Some(z)) 
 /// produce.
 pub(crate) const KINDS: [&str; 3] = ["press", "release", "click"];
 
+/// One command that was typed and belongs to a program.
+///
+/// The console hands a command a [`World`] and nothing else, so the one
+/// function standing in for every program's commands cannot reach the
+/// interpreter from inside the call. It writes down what was asked and the step
+/// hands it over - the note-to-the-frame-loop shape a scene load has.
+///
+/// **The function itself is the runner's**, not this crate's: a
+/// [`ConsoleFn`] is an unsafe extern function and there is no `unsafe`
+/// anywhere in here, deliberately. That costs nothing, because the address has
+/// to be inside the host either way - which is what makes a program's command
+/// the one kind with no lifetime problem at all, the exact inverse of a game
+/// module's.
+///
+/// The delay is at most one step: the console is drained just before a step
+/// runs, and the step hands these over before it ticks anything.
+#[derive(Clone, Debug)]
+pub struct Asked {
+	/// The name it was called under.
+	pub name: String,
+
+	/// The words that followed.
+	pub words: Vec<String>,
+}
+
 /// Which program the VM is inside at this instant.
 ///
 /// The api functions are made once per step and shared by every program, so
@@ -111,6 +136,10 @@ pub(crate) struct Running {
 
 	/// The program's own name, for anything that is logged.
 	pub(crate) name: String,
+
+	/// Where `colby.publish` files what it is given, and what a command that
+	/// was typed is looked up in.
+	pub(crate) published: Option<Table>,
 }
 
 /// The tables a script sees, whose fields this module fills.
@@ -154,17 +183,20 @@ pub(crate) struct Tables {
 /// @param tables - what a program sees
 /// @param world - the host state the functions read and write
 /// @param running - which program is being served, written by the caller
+/// @param publish - the runner's stand-in for every command a program
+/// publishes, which is the one thing here this crate cannot write for itself
 pub(crate) fn fill<'scope, 'env, 'world>(
 	scope: &'scope Scope<'scope, 'env>,
 	tables: &Tables,
 	world: &'env RefCell<&'world mut World>,
 	running: &'env RefCell<Running>,
+	publish: ConsoleFn,
 ) -> Result<()>
 where
 	'world: 'env,
 {
 	interface(scope, tables, world, running)?;
-	engine(scope, tables, world, running)?;
+	engine(scope, tables, world, running, publish)?;
 	entities(scope, tables, world)?;
 	placing(scope, tables, world)?;
 	drawing(scope, tables, world)?;
@@ -290,6 +322,7 @@ fn engine<'scope, 'env, 'world>(
 	tables: &Tables,
 	world: &'env RefCell<&'world mut World>,
 	running: &'env RefCell<Running>,
+	publish: ConsoleFn,
 ) -> Result<()>
 where
 	'world: 'env,
@@ -310,6 +343,46 @@ where
 	// never asks still works everywhere except where it would have been wrong.
 	let is_host = scope.create_function(move |_, ()| Ok(world.borrow().peer.is_host()))?;
 
+	// **a program publishing a command is the same discipline the sandbox is
+	// already written in**: every action is a named function with a console
+	// command in front of it and an optional target name. That is what makes
+	// gameplay drivable from a script with no mouse in it, and it is the layer
+	// the wire uses for remote calls - so a program that publishes one is
+	// reachable by everything that already reaches the rest.
+	let publish =
+		scope.create_function(move |_, (name, help, handler): (String, String, Function)| {
+			let running = running.borrow();
+			let Some(filed) = running.published.as_ref() else {
+				return Err(mlua::Error::runtime(
+					"only a program under `scripts/` can publish a command: a document's \
+					 program is interface logic, and its life is its panel's",
+				));
+			};
+
+			let mut world = world.borrow_mut();
+			let taken = world
+				.cvars
+				.get(&name)
+				.is_some_and(|entry| entry.owner() != Owner::Script);
+
+			if taken {
+				return Err(mlua::Error::runtime(format!(
+					"`{name}` is already the engine's or the game's; pick a name of your own"
+				)));
+			}
+
+			// attributed to the interpreter rather than to whatever the host
+			// last set, which while a module is loaded is the module - and a
+			// command dropped when the gameplay dylib reloads is exactly what
+			// this must not be.
+			let was = Owner::Module;
+			world.cvars.attribute(Owner::Script);
+			world.cvars.command(&name, publish, &help);
+			world.cvars.attribute(was);
+
+			filed.set(name, handler)
+		})?;
+
 	let print = scope.create_function(move |_, values: Variadic<Value>| {
 		let mut said = Vec::with_capacity(values.len());
 		for value in values.iter() {
@@ -326,6 +399,7 @@ where
 	tables.engine.set("command", command)?;
 	tables.engine.set("describe", describe)?;
 	tables.engine.set("is_host", is_host)?;
+	tables.engine.set("publish", publish)?;
 	tables.globals.set("print", print)?;
 
 	Ok(())

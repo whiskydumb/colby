@@ -23,6 +23,7 @@ use std::{
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
 	sync::{
+		Mutex,
 		atomic::{AtomicBool, Ordering},
 		mpsc::{self, Receiver, TryRecvError},
 	},
@@ -31,12 +32,68 @@ use std::{
 
 use colby_core::{
 	Error,
-	abi::{Args, Cvars, Mix, Scripts, Sound, Value, Voice, World, console},
+	abi::{Args, ConsoleFn, Cvars, Mix, Scripts, Sound, Value, Voice, World, console},
 	error, info, warn,
 };
+use colby_script::Asked;
 
 /// The file archived variables are kept in.
 const ARCHIVE: &str = "cvars.cfg";
+
+/// Every command a program published that has been typed and not yet handed
+/// over.
+///
+/// A queue rather than a bool, because two of them typed between one pair of
+/// steps are two things asked for. Emptied by the step.
+static PUBLISHED: Mutex<Vec<Asked>> = Mutex::new(Vec::new());
+
+/// The one function every command a program publishes is registered with.
+///
+/// **Its address is inside `colby.exe`, which is never unloaded**, which makes
+/// this the exact inverse of a command a game module registers: those have to
+/// be dropped before `FreeLibrary` because the pointer is an address in the
+/// image about to go, and this one has no lifetime problem at all. What it
+/// does have is no context - a [`ConsoleFn`] is handed a world and nothing
+/// else - so the name it was called under is the only way to tell which of a
+/// program's commands was asked for, and that is what
+/// [`Args::name`](colby_core::abi::Args::name) is for.
+///
+/// It is here rather than in `colby_script` because that crate has no `unsafe`
+/// in it anywhere, deliberately, and this is an unsafe extern function.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn published(_world: *mut World, args: *const Args) {
+	// SAFETY: as help.
+	let args = unsafe { &*args };
+
+	let Ok(mut waiting) = PUBLISHED.lock() else {
+		return;
+	};
+
+	waiting.push(Asked {
+		name: args.name().to_owned(),
+		words: (0..args.len())
+			.filter_map(|at| args.word(at))
+			.map(str::to_owned)
+			.collect(),
+	});
+}
+
+/// The function a program's commands are registered with.
+///
+/// Handed to the interpreter when it comes up, because it cannot write one for
+/// itself. @ref [`published`].
+pub(crate) const fn publisher() -> ConsoleFn { published }
+
+/// Everything a program was asked for since the last time anybody looked.
+pub(crate) fn asked_of_scripts() -> Vec<Asked> {
+	PUBLISHED
+		.lock()
+		.map(|mut waiting| std::mem::take(&mut *waiting))
+		.unwrap_or_default()
+}
 
 /// Whether somebody has asked what the interpreter is running.
 ///

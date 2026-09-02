@@ -98,7 +98,7 @@ pub(crate) fn take(path: &Path) -> Result {
 	// show what the window shows. Nothing in the environment can read a clock or
 	// a file, so ninety steps of it are the same ninety steps on every machine.
 	// @ref `colby_script`.
-	let mut scripts = Vm::new()?;
+	let mut scripts = Vm::new(crate::console::publisher())?;
 
 	let mut interface = Interface::new();
 	let viewport = colby_core::glam::Vec2::new(

@@ -186,7 +186,7 @@ fn run(end: End) -> Result {
 
 	let mut game = Game::open(&mut world)?;
 	let console = Console::open(&mut world);
-	let mut scripts = Vm::new()?;
+	let mut scripts = Vm::new(crate::console::publisher())?;
 	let mut interface = Interface::new();
 	let mut input = Input::default();
 	let mut clock = Clock::new();

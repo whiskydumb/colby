@@ -72,7 +72,7 @@ fn dispatch(world: &mut World, words: &[String]) {
 	// about to be handed the whole world, and nothing may be holding a piece of
 	// it at the time.
 	if let Some(call) = world.cvars.call_of(name) {
-		let args = Args::new(words[1..].to_vec());
+		let args = Args::new(name.to_owned(), words[1..].to_vec());
 
 		invoke(world, call, &args);
 
