@@ -10,12 +10,29 @@
 //! what is left cannot reach the filesystem or the wall clock, which is also
 //! what keeps `--shot` reproducible.
 //!
-//! **What a world program is given so far is a way to name things and no way
-//! to change one.** `find`, `valid`, `name` and `all` over the two tables, and
-//! that is deliberate for one commit: a handle that cannot be kept is not worth
-//! anything to write against, so the value comes first and what can be done
-//! with it comes after. @ref [`handle`](crate::handle) for why a handle is a
-//! tagged number rather than an object.
+//! **A handle is a tagged number** rather than an object - @ref
+//! [`handle`](crate::handle) for the four reasons.
+//!
+//! Three rules the world half is built on, and each one was taken against
+//! something plausible.
+//!
+//! - **A position is three numbers, in and out.** Not a table and not a
+//!   userdata vector, because either allocates once per read and a program that
+//!   walks every body each step reads hundreds of them. `local x, y, z =
+//!   entity.position(h)` costs nothing, and a program that wants arithmetic
+//!   with operators on it can write those nine lines in Lua itself.
+//! - **A rotation is three angles**, in radians, yaw then pitch then roll, and
+//!   what is stored is the quaternion they make. A quaternion is four numbers
+//!   nobody writes by hand; angles are what a person means and what this
+//!   engine's own camera already is.
+//! - **Making and destroying is refused where this machine is not the
+//!   authority.** Nothing on the wire says a thing appeared - a snapshot is
+//!   matched by slot - so a client that spawned would put every record after it
+//!   on the wrong entity, invisibly. It is an error rather than a silent
+//!   nothing, and [`colby.is_host`] is how a program asks first. That is the
+//!   same shape every engine here uses, spelled `if SERVER then` in the oldest
+//!   of them. The refusal goes away when a message that says a thing appeared
+//!   exists; it is `NET-1` on the audit list.
 //!
 //! Every function here is **scoped**: it is created when a step needs it and
 //! destroyed when that step is over. That is mlua's mechanism for handing a
@@ -30,12 +47,29 @@ use std::cell::RefCell;
 
 use colby_asset::css;
 use colby_core::{
-	abi::{World, console, ui::PanelId},
+	abi::{MaterialId, Renderable, World, console, ui::PanelId},
+	glam::{EulerRot, Quat, Vec3},
 	info, warn,
 };
 use mlua::{Function, Result, Scope, Table, Value, Variadic};
 
 use crate::handle::{Handle, Kind};
+
+/// Three numbers, or three nothings.
+///
+/// A tuple of options rather than an option of a tuple, and the difference is
+/// what it costs: this pushes three values straight onto the stack, so
+/// `local x, y, z = entity.position(h)` allocates nothing at all, while
+/// anything returning one value has to build a table or a vector for it. A
+/// handle to something that has gone gives `nil, nil, nil`, so the first name
+/// on the left is `nil` and `if x then` reads the way it should.
+type Triple = (Option<f32>, Option<f32>, Option<f32>);
+
+/// What a handle to something that is not there answers with.
+const NOTHING: Triple = (None, None, None);
+
+/// One vector, as three values.
+const fn triple(x: f32, y: f32, z: f32) -> Triple { (Some(x), Some(y), Some(z)) }
 
 /// The event names a script may ask for, which are the ones a document can
 /// produce.
@@ -103,6 +137,8 @@ where
 	interface(scope, tables, world, running)?;
 	engine(scope, tables, world, running)?;
 	entities(scope, tables, world)?;
+	placing(scope, tables, world)?;
+	drawing(scope, tables, world)?;
 	bodies(scope, tables, world)?;
 
 	Ok(())
@@ -232,6 +268,12 @@ where
 		Ok(Handle::from_bits(bits).map(|handle| handle.to_string()))
 	})?;
 
+	// what a program asks before it makes or destroys anything. The answer is
+	// `true` for a process on its own, which is every screenshot, every
+	// recording and every window nobody has connected to - so a program that
+	// never asks still works everywhere except where it would have been wrong.
+	let is_host = scope.create_function(move |_, ()| Ok(world.borrow().peer.is_host()))?;
+
 	let print = scope.create_function(move |_, values: Variadic<Value>| {
 		let mut said = Vec::with_capacity(values.len());
 		for value in values.iter() {
@@ -247,6 +289,7 @@ where
 
 	tables.engine.set("command", command)?;
 	tables.engine.set("describe", describe)?;
+	tables.engine.set("is_host", is_host)?;
 	tables.globals.set("print", print)?;
 
 	Ok(())
@@ -309,12 +352,259 @@ where
 		lua.create_sequence_from(handles)
 	})?;
 
+	let spawn = scope.create_function(move |_, ()| {
+		let mut world = world.borrow_mut();
+		authorized(&world, "spawn an entity")?;
+
+		Ok(Handle::of_entity(world.entities.spawn()).to_bits())
+	})?;
+
+	let despawn = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(false);
+		};
+
+		let mut world = world.borrow_mut();
+		authorized(&world, "despawn an entity")?;
+
+		Ok(world.entities.despawn(handle.entity()))
+	})?;
+
+	let set_name = scope.create_function(move |_, (bits, name): (Option<i64>, String)| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(false);
+		};
+
+		Ok(world
+			.borrow_mut()
+			.entities
+			.set_name(handle.entity(), &name))
+	})?;
+
 	tables.entities.set("find", find)?;
 	tables.entities.set("valid", valid)?;
 	tables.entities.set("name", name_of)?;
 	tables.entities.set("all", all)?;
+	tables.entities.set("spawn", spawn)?;
+	tables.entities.set("despawn", despawn)?;
+	tables.entities.set("set_name", set_name)?;
 
 	Ok(())
+}
+
+/// `entity` again - where a thing is, and how it is turned and sized.
+///
+/// Its own function because one that filled the whole table would be a
+/// hundred and eighty lines of closures; the split is by what the three
+/// halves are about rather than by size - what a thing *is*, where it *is*,
+/// and how it *looks*.
+fn placing<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	let position = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(NOTHING);
+		};
+
+		Ok(world
+			.borrow()
+			.entities
+			.transform(handle.entity())
+			.map_or(NOTHING, |at| triple(at.position.x, at.position.y, at.position.z)))
+	})?;
+
+	let set_position =
+		scope.create_function(move |_, (bits, x, y, z): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Entity)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let Some(at) = world.entities.transform_mut(handle.entity()) else {
+				return Ok(false);
+			};
+
+			at.position = Vec3::new(x, y, z);
+
+			Ok(true)
+		})?;
+
+	let angles = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(NOTHING);
+		};
+
+		Ok(world
+			.borrow()
+			.entities
+			.transform(handle.entity())
+			.map_or(NOTHING, |at| {
+				let (yaw, pitch, roll) = at.rotation.to_euler(EulerRot::YXZ);
+
+				triple(yaw, pitch, roll)
+			}))
+	})?;
+
+	let set_angles = scope.create_function(
+		move |_, (bits, yaw, pitch, roll): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Entity)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let Some(at) = world.entities.transform_mut(handle.entity()) else {
+				return Ok(false);
+			};
+
+			at.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, roll);
+
+			Ok(true)
+		},
+	)?;
+
+	let scale = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(NOTHING);
+		};
+
+		Ok(world
+			.borrow()
+			.entities
+			.transform(handle.entity())
+			.map_or(NOTHING, |at| triple(at.scale.x, at.scale.y, at.scale.z)))
+	})?;
+
+	let set_scale =
+		scope.create_function(move |_, (bits, x, y, z): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Entity)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let Some(at) = world.entities.transform_mut(handle.entity()) else {
+				return Ok(false);
+			};
+
+			at.scale = Vec3::new(x, y, z);
+
+			Ok(true)
+		})?;
+
+	// the one thing the host cannot work out for itself: a jump. Everything
+	// else is interpolated between where a thing was and where it is, and a
+	// teleport drawn that way is a thing sliding across the map. @ref
+	// `colby_core::abi::entity`.
+	let snap = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(false);
+		};
+
+		Ok(world.borrow_mut().entities.snap(handle.entity()))
+	})?;
+
+	tables.entities.set("position", position)?;
+	tables
+		.entities
+		.set("set_position", set_position)?;
+	tables.entities.set("angles", angles)?;
+	tables.entities.set("set_angles", set_angles)?;
+	tables.entities.set("scale", scale)?;
+	tables.entities.set("set_scale", set_scale)?;
+	tables.entities.set("snap", snap)?;
+	Ok(())
+}
+
+/// `entity` a third time - what it is drawn as.
+///
+/// A mesh and a material are **named**, not handed over: a name is what a
+/// program can write down and a handle into a registry is what the host
+/// resolved it to. A name nothing answers to draws nothing rather than
+/// failing, which is the rule the whole asset side already follows.
+fn drawing<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	let draw = scope.create_function(
+		move |_, (bits, mesh, material): (Option<i64>, String, Option<String>)| {
+			let Some(handle) = taken(bits, Kind::Entity)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let mesh = world.meshes.find(&mesh);
+			let material =
+				material.map_or(MaterialId::DEFAULT, |named| world.materials.find(&named));
+			let id = handle.entity();
+			let color = world
+				.entities
+				.renderable(id)
+				.map_or(Vec3::ONE, |drawn| drawn.color);
+
+			Ok(world.entities.set_renderable(id, Renderable {
+				mesh,
+				material,
+				color,
+				..Renderable::NOTHING
+			}))
+		},
+	)?;
+
+	let set_color =
+		scope.create_function(move |_, (bits, r, g, b): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Entity)? else {
+				return Ok(false);
+			};
+
+			let mut world = world.borrow_mut();
+			let Some(drawn) = world.entities.renderable_mut(handle.entity()) else {
+				return Ok(false);
+			};
+
+			drawn.color = Vec3::new(r, g, b);
+
+			Ok(true)
+		})?;
+
+	tables.entities.set("draw", draw)?;
+	tables.entities.set("set_color", set_color)?;
+	Ok(())
+}
+
+/// Refuses to make or destroy anything where this machine is not the
+/// authority.
+///
+/// **Nothing on the wire says a thing appeared.** A snapshot is a per-slot
+/// record matched by slot, so a client that spawned would move every slot after
+/// it and start driving the wrong things - a failure that is silent, total, and
+/// looks like the network being wrong rather than the program. So the table
+/// this end builds has to be the table the host builds, and the only way to
+/// promise that is to let nobody but the host build one.
+///
+/// A process on its own is [`PeerId::HOST`](colby_core::abi::PeerId::HOST), so
+/// a screenshot, a recording and a window nobody has joined are all unaffected;
+/// only a client refuses. The way to write a program that runs at both ends is
+/// to ask [`colby.is_host`] first.
+///
+/// @param world - the one being asked
+/// @param doing - what was being attempted, for the message
+fn authorized(world: &World, doing: &str) -> Result<()> {
+	if world.peer.is_host() {
+		return Ok(());
+	}
+
+	Err(mlua::Error::runtime(format!(
+		"this end may not {doing}: nothing on the wire says a thing appeared, so only the \
+		 authority may build the table. Ask `colby.is_host()` first"
+	)))
 }
 
 /// `body` - the same over the solver's table.

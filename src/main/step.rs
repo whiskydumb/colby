@@ -543,6 +543,84 @@ mod tests {
 	}
 
 	#[test]
+	fn the_worlds_programs_run_after_the_step_has_moved_the_world() {
+		// **the ordering that had no test until a program could read
+		// something.** The world's programs go after the solver and after the
+		// game module, so what a program reads is the world as this step left
+		// it rather than as the previous one did. Run them earlier and the
+		// number a program sees is one step stale - which is invisible in
+		// every test that only asks whether it ran.
+		//
+		// What this cannot see is the two lines between the solver and the
+		// game module: `Game` is a loaded library and there is none in a test.
+		// @ref `NET-7` on the audit list.
+		let (mut world, mut simulation) = falling();
+		let mut scripts = Vm::new().expect("the interpreter starts");
+		let mut input = Input::default();
+
+		world.cvars.var(
+			"probe.y",
+			colby_core::abi::Value::Float(0.0),
+			"where the program saw the falling thing",
+		);
+		world
+			.scripts
+			.insert("scripts/probe", colby_core::abi::ScriptData {
+				source: r#"function tick(dt)
+					local all = entity.all()
+					local _, y = entity.position(all[1])
+					colby.command("probe.y " .. y)
+				end"#
+					.to_owned(),
+			});
+
+		// twenty rather than three, so that a step's worth of falling is a
+		// number well clear of the tolerance below: three steps move it by a
+		// hundredth of a unit and the two readings would be near enough to
+		// agree by accident.
+		let mut interface = Interface::new();
+		for _ in 0..20 {
+			let parts = Parts {
+				game: None,
+				interface: &mut interface,
+				scripts: Some(&mut scripts),
+				simulation: &mut simulation,
+				audio: None,
+				wire: None,
+			};
+
+			run(&mut world, parts, &mut input, 0.0, false);
+		}
+
+		let entity = world
+			.entities
+			.iter()
+			.next()
+			.map(|(id, ..)| id)
+			.expect("the fixture has one");
+		let fell = world
+			.entities
+			.transform(entity)
+			.map_or(0.0, |at| at.position.y);
+		let seen = world
+			.cvars
+			.get("probe.y")
+			.and_then(colby_core::abi::cvar::Entry::value)
+			.and_then(|value| match *value {
+				| colby_core::abi::Value::Float(y) => Some(y),
+				| _ => None,
+			})
+			.unwrap_or_default();
+
+		assert!(fell < 9.9, "it fell at all: {fell}");
+		assert!(
+			(seen - fell).abs() < 1e-6,
+			"and the program read this step's position rather than the previous step's: it saw \
+			 {seen} and the step ended at {fell}"
+		);
+	}
+
+	#[test]
 	fn nothing_falls_while_the_world_is_being_edited() {
 		let (mut world, mut simulation) = falling();
 		let mut input = Input::default();

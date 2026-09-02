@@ -8,7 +8,7 @@
 //! collided yet.
 
 use colby_core::abi::{
-	Body, BodyId, EntityId, ScriptData, Shape, Transform, Value, World,
+	Body, BodyId, EntityId, PeerId, ScriptData, Shape, Transform, Value, World,
 	ui::{DocumentData, Event, EventKind, PanelId},
 };
 
@@ -1296,5 +1296,260 @@ fn a_panel_has_no_world_and_a_world_program_has_no_panel() {
 		said(&world).as_deref(),
 		Some("tabletablenil"),
 		"and a world program has the world and no interface"
+	);
+}
+
+/// Makes this world one that has joined somebody else's.
+///
+/// A slot and a generation that are not the host's, which is all it takes:
+/// `PeerId::HOST` is slot nought at a generation no allocator ever reaches, so
+/// anything else is somebody who was named by a host.
+fn joined(world: &mut World) { world.peer = PeerId::from_bits((1_u64 << 32) | 1); }
+
+#[test]
+fn a_program_puts_something_in_the_world_and_finds_it_again() {
+	let mut world = running(
+		r#"function tick(dt)
+			if entity.find("made") then return end
+
+			local made = entity.spawn()
+			entity.set_name(made, "made")
+			entity.set_position(made, 1.5, 2.5, -3.5)
+			entity.set_scale(made, 2, 2, 2)
+			entity.draw(made, "cube")
+			entity.set_color(made, 0.25, 0.5, 0.75)
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	let made = world
+		.entities
+		.iter()
+		.find(|(id, ..)| world.entities.name(*id) == "made")
+		.map(|(id, ..)| id)
+		.expect("the program spawned one and named it");
+	let at = world
+		.entities
+		.transform(made)
+		.expect("it is alive");
+
+	assert!(
+		at.position
+			.abs_diff_eq(colby_core::glam::Vec3::new(1.5, 2.5, -3.5), 1e-5)
+	);
+	assert!(
+		at.scale
+			.abs_diff_eq(colby_core::glam::Vec3::splat(2.0), 1e-5)
+	);
+	assert!(
+		world
+			.entities
+			.renderable(made)
+			.is_some_and(|drawn| drawn
+				.color
+				.abs_diff_eq(colby_core::glam::Vec3::new(0.25, 0.5, 0.75), 1e-5)),
+		"and the color it was given"
+	);
+}
+
+#[test]
+fn a_position_read_back_is_the_one_that_was_written() {
+	let mut world = running(
+		r#"function tick(dt)
+			local made = entity.find("made")
+			if not made then
+				made = entity.spawn()
+				entity.set_name(made, "made")
+				entity.set_position(made, 3, 4, 5)
+				return
+			end
+
+			local x, y, z = entity.position(made)
+			colby.command("script.said " .. x .. "," .. y .. "," .. z)
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("3.0,4.0,5.0"), "three values, not a table");
+}
+
+#[test]
+fn a_position_asked_of_something_that_has_gone_is_three_nothings() {
+	// the reason the answer is a tuple of options rather than an option of a
+	// tuple: `local x, y, z = ...` has to leave `x` nil, so `if x then` reads
+	// the way anybody would write it.
+	let mut world = running(
+		r#"local kept = nil
+
+		function tick(dt)
+			if not kept then
+				kept = entity.spawn()
+				return
+			end
+
+			local x, y, z = entity.position(kept)
+			colby.command("script.said " .. tostring(x) .. tostring(y) .. tostring(z))
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+	let made = world
+		.entities
+		.iter()
+		.next()
+		.map(|(id, ..)| id)
+		.expect("the program spawned one");
+	world.entities.despawn(made);
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("nilnilnil"), "and not a zero anybody could use");
+}
+
+#[test]
+fn angles_go_in_and_come_back_out() {
+	// a quaternion is four numbers nobody writes by hand, so what crosses is
+	// three angles and what is stored is the rotation they make.
+	let mut world = running(
+		r#"function tick(dt)
+			local made = entity.find("turned")
+			if not made then
+				made = entity.spawn()
+				entity.set_name(made, "turned")
+				entity.set_angles(made, 0.75, -0.25, 0.5)
+				return
+			end
+
+			local yaw, pitch, roll = entity.angles(made)
+			local near = function(a, b) return a - b < 0.001 and b - a < 0.001 end
+			colby.command("script.said " .. tostring(
+				near(yaw, 0.75) and near(pitch, -0.25) and near(roll, 0.5)
+			))
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "the same three, through a quaternion");
+}
+
+#[test]
+fn a_client_may_not_make_or_destroy_anything() {
+	// nothing on the wire says a thing appeared, so a client that spawned
+	// would move every slot after it and start driving the wrong things. The
+	// refusal is loud rather than silent, because a silent one is exactly the
+	// failure it exists to stop.
+	let mut world = running(
+		r#"function tick(dt)
+			local ok, why = pcall(entity.spawn)
+			local named = tostring(why):find("authority") ~= nil
+			colby.command("script.said " .. tostring(ok) .. tostring(named))
+		end"#,
+	);
+	listen(&mut world);
+	joined(&mut world);
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("falsetrue"), "refused, and told why");
+	assert_eq!(world.entities.len(), 0, "and nothing was made");
+}
+
+#[test]
+fn a_process_on_its_own_is_the_authority_and_is_unaffected() {
+	// which is every screenshot, every recording and every window nobody has
+	// joined: `World::peer` is the host from `World::new` onwards, and that is
+	// a statement rather than a placeholder.
+	let mut world = running(
+		r#"function tick(dt)
+			colby.command("script.said " .. tostring(colby.is_host()))
+			entity.spawn()
+		end"#,
+	);
+	listen(&mut world);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"));
+	assert_eq!(world.entities.len(), 1, "and the spawn went through");
+}
+
+#[test]
+fn a_client_may_still_move_what_the_host_made() {
+	// the refusal is about *building the table*, not about writing into it: a
+	// client drawing a marker over something, or a program deciding a color,
+	// changes no slot and is nobody's business but its own.
+	let mut world = running(
+		r#"function tick(dt)
+			local it = entity.find("theirs")
+			colby.command("script.said " .. tostring(entity.set_position(it, 9, 9, 9)))
+		end"#,
+	);
+	listen(&mut world);
+
+	let theirs = world.entities.spawn();
+	world.entities.set_name(theirs, "theirs");
+	joined(&mut world);
+
+	let mut scripts = Vm::new().expect("the interpreter starts");
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("true"), "it was allowed");
+	assert!(
+		world
+			.entities
+			.transform(theirs)
+			.is_some_and(|at| at.position.x > 8.0),
+		"and it moved"
+	);
+}
+
+#[test]
+fn drawing_something_keeps_the_color_it_was_given() {
+	// the two are separate concerns - what a thing is drawn as, and what tint
+	// is laid over it - so setting one has no business clearing the other.
+	// The order here is the one that can fail: color first, then the mesh.
+	let mut world = running(
+		r#"function tick(dt)
+			local made = entity.find("painted")
+			if not made then
+				made = entity.spawn()
+				entity.set_name(made, "painted")
+				entity.set_color(made, 0.1, 0.2, 0.3)
+				entity.draw(made, "cube")
+			end
+		end"#,
+	);
+	let mut scripts = Vm::new().expect("the interpreter starts");
+
+	stepped(&mut scripts, &mut world);
+
+	let made = world
+		.entities
+		.iter()
+		.find(|(id, ..)| world.entities.name(*id) == "painted")
+		.map(|(id, ..)| id)
+		.expect("it was made");
+
+	assert!(
+		world
+			.entities
+			.renderable(made)
+			.is_some_and(|drawn| drawn
+				.color
+				.abs_diff_eq(colby_core::glam::Vec3::new(0.1, 0.2, 0.3), 1e-5)),
+		"the tint outlived being given a mesh"
 	);
 }
