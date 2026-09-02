@@ -101,6 +101,17 @@ fn run() -> Result {
 		return result;
 	}
 
+	// and so does a client that was asked for without one, which is the same
+	// loop with the endpoint pointed the other way. It is here rather than in
+	// the window path because it never makes a window at all. @ref
+	// `crate::host`.
+	if let Some(address) = host::joining() {
+		let result = host::join(address);
+		finish();
+
+		return result;
+	}
+
 	let event_loop =
 		EventLoop::new().map_err(|error| err!(Graphics("creating the event loop: {error}")))?;
 

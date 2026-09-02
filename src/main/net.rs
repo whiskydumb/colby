@@ -153,18 +153,32 @@ pub(crate) fn wanted() -> Option<SocketAddr> {
 }
 
 /// The same, over arguments already collected.
-fn asked_for(arguments: &[String]) -> Option<SocketAddr> {
+fn asked_for(arguments: &[String]) -> Option<SocketAddr> { after(arguments, CONNECT) }
+
+/// The address after a flag, whichever flag is doing the asking.
+///
+/// **Written once and called twice.** Two modes want a host's address off the
+/// command line - a window and the client with nothing on screen - and they
+/// want it in exactly the same shapes, so a second copy of this would be a
+/// second set of rules about what an address looks like, differing the first
+/// time somebody fixed one of them. @ref `crate::host`, which asks with its
+/// own flag.
+///
+/// @param arguments - the command line, without the executable
+/// @param flag - which flag to look for
+/// @return the first address named after it
+pub(crate) fn after(arguments: &[String], flag: &str) -> Option<SocketAddr> {
 	for (index, argument) in arguments.iter().enumerate() {
-		let text = if let Some(rest) = argument.strip_prefix(&format!("{CONNECT}=")) {
+		let text = if let Some(rest) = argument.strip_prefix(&format!("{flag}=")) {
 			Some(rest.to_owned())
-		} else if argument == CONNECT {
+		} else if argument == flag {
 			arguments.get(index + 1).cloned()
 		} else {
 			continue;
 		};
 
 		let Some(text) = text else {
-			warn!("{CONNECT} needs an address to connect to");
+			warn!("{flag} needs an address to connect to");
 
 			return None;
 		};
@@ -2980,7 +2994,13 @@ mod tests {
 			None,
 			"and with something that is not one"
 		);
-		assert_eq!(asked_for(&["--host".to_owned()]), None, "and not somebody else's flag");
+		// an address after it rather than a port, so that the flag is what
+		// this turns on: a word no reader could parse would refuse either way.
+		assert_eq!(
+			asked_for(&["--join".to_owned(), "127.0.0.1:27015".to_owned()]),
+			None,
+			"and not somebody else's flag"
+		);
 	}
 
 	#[test]

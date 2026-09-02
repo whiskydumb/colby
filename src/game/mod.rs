@@ -1076,6 +1076,15 @@ fn register_commands(world: &mut World) {
 	world
 		.cvars
 		.command("game.stand", stand_up, "put the character back on its feet");
+	// and one that only reports. It is here rather than beside `net.status`
+	// because the engine does not know what a player is: the wire can say how
+	// many peers there are, and only the game can say which body each of them
+	// walks around as. @ref [`who`].
+	world.cvars.command(
+		"game.who",
+		who,
+		"report this end's name, its player, and how the body table is laid out",
+	);
 }
 
 /// Runs once each time this module is swapped in.
@@ -3298,6 +3307,60 @@ unsafe extern "C-unwind" fn let_go(world: *mut World, args: *const Args) {
 	if !unfreeze(world, body) {
 		warn!(name = named, "nothing there to thaw");
 	}
+}
+
+/// `game.who` - what this end thinks it is, and what its table looks like.
+///
+/// **Written to be run at both ends of a wire and compared**, which is the one
+/// thing that has never been possible: a client used to mean a window, so the
+/// two ends of a conversation could not be read side by side while somebody was
+/// at the machine. Everything it prints is something the two ends are supposed
+/// to agree about, and the first thing they turned out not to agree about was
+/// `first`: a body table that starts the map at a different slot at each end
+/// means every record a snapshot carries lands on the wrong body.
+///
+/// @note: reports rather than fixes. Nothing here is called by the step.
+///
+/// # Safety
+///
+/// As [`take`].
+unsafe extern "C-unwind" fn who(world: *mut World, _args: *const Args) {
+	// SAFETY: as init.
+	let world = unsafe { &mut *world };
+
+	let peer = world.peer;
+	let slots = world.bodies.slots();
+	let live = world.bodies.iter().count();
+	// the lowest slot the map is on, which is where the two ends are supposed
+	// to line up and where they do not. Found by layer rather than by counting,
+	// because a layer is an identity here and what sits in front of the map -
+	// limbs, a player - is exactly what differs.
+	let first = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| on_layer(body, WORLD_LAYERS))
+		.map(|(id, _)| id.slot())
+		.min();
+
+	let (player, body, ran, asked) = played(world)
+		.map_or((EntityId::NONE, BodyId::NONE, 0, 0), |mine| {
+			(mine.player, mine.player_body, mine.ran, mine.asked)
+		});
+
+	info!(
+		slot = peer.slot(),
+		generation = peer.generation(),
+		host = peer.is_host(),
+		named = peer.is_some(),
+		player_slot = player.slot(),
+		body_slot = body.slot(),
+		first = first.map_or(-1, |slot| i64::try_from(slot).unwrap_or(-1)),
+		slots,
+		live,
+		ran,
+		asked,
+		"who this end is"
+	);
 }
 
 /// `game.thaw` - every one of them at once.

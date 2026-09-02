@@ -1,11 +1,21 @@
-//! Serving a world to whoever turns up, with nothing on screen.
+//! Being on a wire with nothing on screen, at either end of it.
 //!
-//! `colby --host` is a *mode*, not a build. The same executable, the same game
-//! module, the same step body - it simply opens a socket instead of a window
-//! and never asks for an adapter. That was a decision rather than a default: an
-//! engine whose dedicated server is a second build is an engine with two things
-//! to keep working, and the thing that would justify one is a link-time saving
-//! nobody has measured yet.
+//! `colby --host` and `colby --join` are *modes*, not builds. The same
+//! executable, the same game module, the same step body - they simply open a
+//! socket instead of a window and never ask for an adapter. That was a decision
+//! rather than a default: an engine whose dedicated server is a second build is
+//! an engine with two things to keep working, and the thing that would justify
+//! one is a link-time saving nobody has measured yet.
+//!
+//! **`--join` exists so that two colbys can be run by a script.** A window
+//! takes an adapter, a surface and the focus, so a client that only ran in one
+//! could not be started beside a host and driven while somebody was at the
+//! machine - and everything a client does differently from a host was
+//! therefore being written blind. This is the same loop with the endpoint
+//! pointed the other way: it asks the host for things instead of answering,
+//! and it is told what the world is instead of saying. What it is *not* is a
+//! second client: `--connect` opens a window and runs this same step through
+//! `crate::app`, and the day the two disagree is a bug in one of them.
 //!
 //! It shares its loop with the window path in every way that matters and in one
 //! way that does not: there is no vertical blank to pace against, so a pass
@@ -16,6 +26,7 @@
 //! Everything else about the step is what a window would have run.
 
 use std::{
+	net::SocketAddr,
 	thread,
 	time::{Duration, Instant},
 };
@@ -36,6 +47,9 @@ use crate::{assets::Assets, console::Console, game::Game, net::Net, step};
 
 /// The flag that asks for a host.
 const FLAG: &str = "--host";
+
+/// The flag that asks for a client with nothing on screen.
+const JOIN: &str = "--join";
 
 /// How long a pass that ran no step waits before looking again.
 ///
@@ -62,6 +76,26 @@ pub(crate) fn requested() -> Option<u16> {
 	parse(&arguments)
 }
 
+/// Reads the command line for a client with no window.
+///
+/// Accepts `--join address` and `--join=address`, where an address is whatever
+/// the standard library reads as one - the same shapes `--connect` takes,
+/// because it is the same question asked by a mode that draws nothing.
+///
+/// @return where the host is, if a windowless client was asked for
+#[must_use]
+pub(crate) fn joining() -> Option<SocketAddr> {
+	let arguments: Vec<String> = std::env::args().skip(1).collect();
+
+	address(&arguments)
+}
+
+/// The same, over arguments already collected.
+///
+/// The reading itself is `crate::net`'s, because `--connect` asks the identical
+/// question and an address is an address. @ref `crate::net::after`.
+fn address(arguments: &[String]) -> Option<SocketAddr> { crate::net::after(arguments, JOIN) }
+
 /// The same, over arguments already collected.
 fn parse(arguments: &[String]) -> Option<u16> {
 	for (index, argument) in arguments.iter().enumerate() {
@@ -81,10 +115,42 @@ fn parse(arguments: &[String]) -> Option<u16> {
 	None
 }
 
+/// Which end of a wire a windowless process is.
+///
+/// A two-variant enum rather than a boolean and an address, because the two
+/// carry different things and the pair of them can disagree: a port means
+/// nothing to a client and an address means nothing to a host.
+#[derive(Clone, Copy, Debug)]
+enum End {
+	/// Listens on a port, decides everything, tells everybody.
+	Serving(u16),
+
+	/// Goes looking for a host, decides nothing, asks.
+	Asking(SocketAddr),
+}
+
 /// Brings a world up, opens a socket, and serves until somebody says stop.
 ///
 /// @param port - what to listen on
-pub(crate) fn serve(port: u16) -> Result {
+pub(crate) fn serve(port: u16) -> Result { run(End::Serving(port)) }
+
+/// The same, at the other end: a client with nothing on screen.
+///
+/// @param address - where the host is
+pub(crate) fn join(address: SocketAddr) -> Result { run(End::Asking(address)) }
+
+/// The loop both ends share.
+///
+/// **One body and not two**, which is the whole reason this is worth writing
+/// down: a host and a client differ in four lines - which way the socket is
+/// opened, whether this process stops being the authority, whether the step is
+/// handed the wire, and whether what goes out is a world or a request - and
+/// every other thing they do is the same thing. Two loops would drift, and the
+/// drift would be exactly the sort of difference nobody notices until two
+/// machines disagree about where somebody is standing.
+///
+/// @param end - which end of the wire this process is
+fn run(end: End) -> Result {
 	// boxed and installed before anything else touches the world, for the
 	// reason the window and the screenshot box it: the world keeps this
 	// address.
@@ -102,9 +168,24 @@ pub(crate) fn serve(port: u16) -> Result {
 	// and survive a reload, exactly as the window path does it.
 	crate::console::install(&mut world);
 
+	// **the socket before the module**, and a client says what it is before
+	// the module's `init` reads it. That ordering is the window path's, not a
+	// choice made here: `crate::app` opens its endpoint and calls
+	// `crate::net::joined` before it opens the game, and this mode exists to
+	// behave the way a window does rather than better than one.
+	let seed = crate::net::seed(&world.cvars);
+	let mut net = match end {
+		| End::Serving(port) => Net::host(port, seed)?,
+		| End::Asking(address) => Net::connect(address, seed)?,
+	};
+	let hosting = matches!(end, End::Serving(_));
+
+	if !hosting {
+		crate::net::joined(&mut world);
+	}
+
 	let mut game = Game::open(&mut world)?;
 	let console = Console::open(&mut world);
-	let mut net = Net::host(port, crate::net::seed(&world.cvars))?;
 	let mut scripts = Scripts::new()?;
 	let mut interface = Interface::new();
 	let mut input = Input::default();
@@ -113,7 +194,18 @@ pub(crate) fn serve(port: u16) -> Result {
 	// taken down once a step and sent, rather than allocated per snapshot.
 	let mut records: Vec<Slot> = Vec::new();
 
-	info!(%port, address = %net.address(), "serving");
+	// where the wire's own clock stands for the step about to run. A client
+	// draws the world a delay behind what it was told, and the delay is
+	// measured against this rather than against the wall, so that a pass which
+	// runs four catch-up steps places four moments rather than one. @ref
+	// `crate::app`, which keeps the same number for the same reason.
+	let mut moment = Duration::ZERO;
+
+	if hosting {
+		info!(address = %net.address(), "serving");
+	} else {
+		info!(address = %net.address(), "asking");
+	}
 
 	while !world.quit {
 		clock.tick();
@@ -146,13 +238,15 @@ pub(crate) fn serve(port: u16) -> Result {
 					interface: &mut interface,
 					scripts: Some(&mut scripts),
 					simulation: simulation.as_mut(),
-					// a machine serving a world has nothing to make a noise
-					// into. @ref the module comment.
+					// a machine on a wire with nothing on screen has nothing
+					// to make a noise into. @ref the module comment.
 					audio: None,
-					// and nothing tells a host what its world looks like, so
-					// the endpoint goes nowhere near the step. @ref
-					// `Net::arrive`, which refuses a host anyway.
-					wire: None,
+					// nothing tells a host what its world looks like, so at
+					// that end the endpoint goes nowhere near the step - and
+					// `Net::arrive` refuses a host anyway, so this is which
+					// answer is given rather than whether one is. At the other
+					// end it is the whole point.
+					wire: (!hosting).then_some(step::Wired { net: &mut net, now: moment }),
 				},
 				&mut input,
 				time,
@@ -173,17 +267,26 @@ pub(crate) fn serve(port: u16) -> Result {
 			// it is worth knowing before something does, because a game that
 			// set it back would stop describing the world for a while and
 			// nothing anywhere would say so.
-			let describing = world.steps.is_multiple_of(u64::from(EVERY));
+			let describing = hosting && world.steps.is_multiple_of(u64::from(EVERY));
 
 			if describing {
 				crate::net::records(&world.bodies, &mut records);
 			}
 
-			// a host asks nobody for anything, and says so rather than leaving
-			// whatever was there: the window is the endpoint's and a host that
-			// had once been a client would otherwise keep sending its old one.
-			net.ask(&[]);
+			// a host asks nobody for anything and says so; a client asks for
+			// everything it has not been answered about, which is the window
+			// rather than the newest of them. @ref `Net::ask`.
+			if hosting {
+				net.ask(&[]);
+			} else {
+				net.ask(world.commands.unsettled(world.peer));
+			}
+
 			net.send(started.elapsed(), describing.then_some(records.as_slice()));
+			// and the wire's own clock moves on by exactly one step, after the
+			// message that was about the step just run. @ref `crate::app`,
+			// which advances it in the same place.
+			moment = moment.saturating_add(STEP);
 			ran = true;
 		}
 
@@ -221,6 +324,50 @@ mod tests {
 		assert_eq!(parse(&["--host=9999".to_owned()]), Some(9999));
 		assert_eq!(parse(&["--connect".to_owned()]), None, "and not somebody else's");
 		assert_eq!(parse(&[]), None);
+	}
+
+	#[test]
+	fn an_address_is_read_after_the_other_flag_and_attached_to_it() {
+		let both = address(&["--join".to_owned(), "127.0.0.1:9999".to_owned()]);
+		assert_eq!(both.map(|found| found.port()), Some(9999));
+		assert_eq!(
+			address(&["--join=127.0.0.1:1234".to_owned()]).map(|found| found.port()),
+			Some(1234)
+		);
+		// **an address after the other flag, not a port.** A payload nothing
+		// could read as an address would let this pass whether the flag is
+		// looked at or not, which is a test that cannot fail for the reason it
+		// is about.
+		assert_eq!(
+			address(&["--connect".to_owned(), "127.0.0.1:9999".to_owned()]),
+			None,
+			"and not somebody else's"
+		);
+		assert_eq!(address(&[]), None);
+	}
+
+	#[test]
+	fn a_flag_with_nothing_usable_after_it_asks_for_nothing() {
+		assert_eq!(address(&["--join".to_owned()]), None, "a flag on its own is not an address");
+		assert_eq!(
+			address(&["--join".to_owned(), "not-an-address".to_owned()]),
+			None,
+			"and neither is a word"
+		);
+		assert_eq!(
+			address(&["--join".to_owned(), "127.0.0.1".to_owned()]),
+			None,
+			"a host with no port is not one either, because a wire needs both"
+		);
+	}
+
+	#[test]
+	fn the_two_flags_do_not_read_each_other() {
+		let line = ["--join".to_owned(), "127.0.0.1:9999".to_owned()];
+		assert_eq!(parse(&line), None, "asking to join is not asking to host");
+
+		let line = ["--connect".to_owned(), "127.0.0.1:27015".to_owned()];
+		assert_eq!(address(&line), None, "and opening a window on one is not either");
 	}
 
 	#[test]
