@@ -698,7 +698,7 @@ mod tests {
 
 			// `NOTHING` is this end's own `holding`: the host is being told nothing
 			// by anybody in this test, and the field says what the *sender* has.
-			Snapshot::write(number, against, NOTHING, base, &now, &mut out).expect("it fits");
+			Snapshot::write(number, against, NOTHING, base, &now, &mut out);
 			ring.keep(number, &now);
 
 			// nothing arrives for longer than the ring remembers, so what the

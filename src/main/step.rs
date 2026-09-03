@@ -314,7 +314,7 @@ mod tests {
 			let mut out = Vec::new();
 
 			table[body.slot()] = Some((body.generation(), solid));
-			Snapshot::write(number, NOTHING, NOTHING, &[], &table, &mut out).expect("fits");
+			Snapshot::write(number, NOTHING, NOTHING, &[], &table, &mut out);
 			assert!(net.absorbed(&out, Duration::from_millis(when)));
 		}
 

@@ -683,6 +683,13 @@ struct Peer {
 	/// What was told to this peer, to write the next difference against.
 	told: Ring,
 
+	/// Scratch for what the far end will hold once it has read what was just
+	/// written, so working it out costs no allocation per peer per snapshot.
+	///
+	/// A field rather than a local because it is refilled twenty times a
+	/// second forever, which is the same reason [`Ring`] keeps one.
+	kept: Vec<Slot>,
+
 	/// What was taken *from* it, which is a thing of its own so that reading a
 	/// block can borrow it while the block itself is still borrowed from the
 	/// channel beside it.
@@ -710,10 +717,15 @@ struct Taken {
 	/// to it is written against.
 	theirs: u32,
 
-	/// Whether this peer has already been told about a world that would not
-	/// fit, so that the saying of it happens once rather than twenty times a
-	/// second for the rest of the conversation.
-	stranded: bool,
+	/// How many snapshots in a row have been cut short of the world's end.
+	///
+	/// A cut snapshot is **ordinary**: a world bigger than one block is told
+	/// over several, and the count going up for a moment is a peer catching
+	/// up rather than a peer in trouble. What is not ordinary is the count
+	/// never coming back down, which is the tail of the slot table never being
+	/// reached because the front of it fills every block on its own. @ref
+	/// [`STARVED`].
+	behind: u32,
 
 	/// How many of the snapshots taken were whole worlds rather than
 	/// differences.
@@ -806,8 +818,12 @@ pub(crate) struct Net {
 	ignored: u32,
 	strangers: u32,
 	forgotten: u32,
-	/// How many times a world was too big to describe, counted once per peer
-	/// per attempt rather than once per world.
+	/// How many snapshots went out cut short of the world's end, counted once
+	/// per peer per attempt rather than once per world.
+	///
+	/// Not a fault on its own - a world bigger than one block is told over
+	/// several, and this is how many of those there were. @ref [`STARVED`] for
+	/// the shape of it that is a fault.
 	crowded: u32,
 
 	/// How many commands were filed into a world.
@@ -1674,11 +1690,12 @@ impl Net {
 			confirmed: 0,
 			stamped: 0,
 			told: Ring::new(),
+			kept: Vec::new(),
 			taken: Taken {
 				heard: Heard::new(),
 				theirs: NOTHING,
 				baselines: 0,
-				stranded: false,
+				behind: 0,
 			},
 		});
 		info!(%address, "a peer");
@@ -1706,6 +1723,15 @@ pub(crate) fn records(bodies: &Bodies, into: &mut Vec<Slot>) {
 	}
 }
 
+/// How many snapshots in a row may be cut before it is worth saying so.
+///
+/// Three seconds at twenty a second. Not tidiness: a peer joining a world of
+/// the largest table this engine allows is told it over about a dozen blocks,
+/// and a number under that would report every big join as a fault. Sixty is
+/// comfortably past any honest catch-up and comfortably short of a person
+/// wondering why nothing is arriving.
+const STARVED: u32 = 60;
+
 /// Writes the snapshot block that follows the reliable one.
 ///
 /// There is always a block. With a world it is a difference from whatever the
@@ -1728,42 +1754,52 @@ fn describe(peer: &mut Peer, world: Option<&[Slot]>, out: &mut Vec<u8>) -> bool 
 	let number = peer.told.next();
 	let holding = peer.taken.heard.holding();
 	let (base, against) = peer.told.base(peer.taken.theirs);
+	let written = Snapshot::write(number, against, holding, base, world, out);
+	let reached = written.reached.min(world.len());
+	let whole = written.reached >= world.len();
 
-	if Snapshot::write(number, against, holding, base, world, out).is_err() {
-		// the world does not fit in one message and there is no continuation:
-		// what goes out instead is the head, so the far end still hears what
-		// this end holds and is not dropped for saying nothing.
-		//
-		// This is not a hiccup. Nothing was kept, so the number does not move
-		// and the peer never learns of a base to answer with - which means the
-		// next attempt is the same baseline and fails the same way, forever.
-		// A counter that names nobody is not enough to find that with.
-		if !peer.taken.stranded {
-			peer.taken.stranded = true;
-			warn!(
-				address = %peer.address,
-				bodies = world.len(),
-				"a world too big to describe in one snapshot, and there is no continuation - \
-				 this peer will be told nothing further until it shrinks"
-			);
-		}
+	// **what is kept is what the far end will hold, which is not the same as
+	// what this end wanted to send.** As far up as the block got, that is the
+	// world; above that, it is whatever the peer already had, because a slot
+	// this block never mentioned is a slot nothing about this block changed.
+	//
+	// Keeping the whole world instead would lose a removal for good: the base
+	// would say the peer holds nothing above the cut, so a slot that emptied
+	// up there would never be written as gone and the far end would keep the
+	// body forever. Keeping only the front instead would lose it the same way.
+	peer.kept.clear();
+	peer.kept.extend_from_slice(&world[..reached]);
 
-		nothing(holding, out);
-
-		return false;
+	if let Some(above) = base.get(written.reached..) {
+		peer.kept.extend_from_slice(above);
 	}
 
-	peer.taken.stranded = false;
+	peer.told.keep(number, &peer.kept);
 
-	peer.told.keep(number, world);
-	true
+	// a cut block is ordinary. A run of them that never ends is the tail of
+	// the table never being reached, and that is worth one line by address -
+	// the count is what a person would otherwise have to guess at.
+	peer.taken.behind = if whole { 0 } else { peer.taken.behind.saturating_add(1) };
+
+	if peer.taken.behind == STARVED {
+		warn!(
+			address = %peer.address,
+			bodies = world.len(),
+			told = reached,
+			snapshots = STARVED,
+			"every snapshot to this peer for three seconds has been cut short: the front of \
+			 the body table fills each one on its own and the end is never reached"
+		);
+	}
+
+	whole
 }
 
 /// A block that describes nothing and says only what this end holds.
 fn nothing(holding: u32, out: &mut Vec<u8>) {
 	let written = Snapshot::write(NOTHING, NOTHING, holding, &[], &[], out);
 
-	debug_assert!(written.is_ok(), "a block of nothing but a head always fits");
+	debug_assert_eq!(written.spoken, 0, "a block of nothing speaks about nothing");
 }
 
 /// Names one peer if it has no name, and files what it asked for.
@@ -2191,7 +2227,7 @@ mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
 	use colby_core::abi::{Transform, net::MAX_PEERS as PLAYERS};
-	use colby_net::MAX_COMMAND;
+	use colby_net::{MAX_BASELINE, MAX_COMMAND};
 
 	use super::*;
 
@@ -2216,6 +2252,216 @@ mod tests {
 
 	/// A world with nobody in it but the host.
 	fn empty_world() -> Box<World> { Box::<World>::default() }
+
+	/// One peer with nothing said either way yet.
+	fn fresh_peer() -> Peer {
+		Peer {
+			address: somewhere(7),
+			channel: Channel::new(),
+			reliable: Reliable::new(),
+			link: Link::new(1),
+			heard: Duration::ZERO,
+			id: PeerId::NONE,
+			named: PeerId::NONE,
+			asked: Vec::new(),
+			settled: 0,
+			confirmed: 0,
+			stamped: 0,
+			told: Ring::new(),
+			kept: Vec::new(),
+			taken: Taken {
+				heard: Heard::new(),
+				theirs: NOTHING,
+				baselines: 0,
+				behind: 0,
+			},
+		}
+	}
+
+	/// A world of this many bodies, every one of them different from the last.
+	fn crowd(bodies: usize) -> Vec<Slot> {
+		(0..bodies)
+			.map(|slot| {
+				let along = f32::from(u16::try_from(slot % 500).unwrap_or(0));
+
+				Some((1, Solid {
+					position: [along, 1.5, -along],
+					rotation: [0.5, 0.5, 0.5, 0.5],
+					velocity: [along, -along, 1.0],
+					angular: [1.0, along, 2.0],
+					scale: [1.0, 1.0, 1.0],
+					sleeping: 1,
+					entity: [7, 1],
+					owner: [1, 1],
+					kind: u32::try_from(slot + 1).unwrap_or(1),
+					..Solid::default()
+				}))
+			})
+			.collect()
+	}
+
+	/// Answers one snapshot from a peer's point of view: what it now holds.
+	///
+	/// The receiving half of the conversation, written out here rather than
+	/// stood up as a second `Net`, because what these tests are about is
+	/// whether the *sender's* idea of what the far end holds is the truth.
+	fn applied(held: &mut Vec<Slot>, block: &[u8]) {
+		let (snapshot, _) = Snapshot::read(held, block).expect("what was written reads");
+
+		// a baseline describes the whole world, so what is held is emptied
+		// before it is applied. @ref `colby_net::snapshot`.
+		if snapshot.against == NOTHING {
+			held.clear();
+		}
+
+		for change in &snapshot.changes {
+			let slot = usize::from(change.slot);
+
+			if held.len() <= slot {
+				held.resize(slot + 1, None);
+			}
+
+			held[slot] = change
+				.solid
+				.map(|solid| (change.generation, solid));
+		}
+	}
+
+	/// Whether two tables hold the same bodies, ignoring trailing holes.
+	fn alike(left: &[Slot], right: &[Slot]) -> bool {
+		let reach = left.len().max(right.len());
+
+		(0..reach)
+			.all(|slot| left.get(slot).copied().flatten() == right.get(slot).copied().flatten())
+	}
+
+	#[test]
+	fn a_world_bigger_than_one_snapshot_reaches_a_peer_over_several() {
+		// **the whole of NET-4.** A world past what one block holds used to be
+		// refused whole: the peer was owed a baseline that could never be
+		// written, so it never learned of a base to answer with and every
+		// attempt after it failed the same way, forever.
+		let mut peer = fresh_peer();
+		let world = crowd(MAX_BASELINE * 2 + 7);
+		let mut theirs: Vec<Slot> = Vec::new();
+		let mut blocks = 0;
+
+		while !alike(&theirs, &world) {
+			blocks += 1;
+			assert!(blocks < 10, "it has to converge, and it took {blocks} blocks");
+
+			let mut out = Vec::new();
+			let whole = describe(&mut peer, Some(&world), &mut out);
+
+			applied(&mut theirs, &out);
+			// and the far end says so, which is what moves the base along.
+			// The number just used is one behind the one to come.
+			peer.taken.theirs = peer.told.next().saturating_sub(1);
+
+			assert_eq!(whole, alike(&theirs, &world), "it says whether it got to the end");
+		}
+
+		assert_eq!(blocks, 3, "two baselines and a bit takes three blocks");
+		assert_eq!(peer.taken.behind, 0, "and the count of cut ones is back to nothing");
+	}
+
+	#[test]
+	fn a_body_that_vanishes_above_the_cut_is_still_reported_gone() {
+		// **the trap the carrying over creates and has to answer.** What is
+		// kept is what the far end *will hold*, which is the world as far as
+		// the block got and whatever the peer already had above that. Keeping
+		// only the front instead would say the peer holds nothing up there -
+		// so a slot that emptied above the cut would never be written as gone,
+		// and the far end would keep the body for the rest of the session.
+		let mut peer = fresh_peer();
+		let world = crowd(MAX_BASELINE * 2 + 7);
+		let mut theirs: Vec<Slot> = Vec::new();
+
+		// first, tell it the whole world, however many blocks that takes.
+		for _ in 0..6 {
+			let mut out = Vec::new();
+			describe(&mut peer, Some(&world), &mut out);
+			applied(&mut theirs, &out);
+			peer.taken.theirs = peer.told.next().saturating_sub(1);
+		}
+
+		assert!(alike(&theirs, &world), "the far end has all of it to start with");
+
+		// now empty a slot near the top, and put a **new occupant** in every
+		// slot at the bottom. A new generation is written in full rather than
+		// as a difference, so the block fills long before it reaches the
+		// removal - which is the only arrangement that exercises this at all.
+		// Nudging the bottom bodies instead writes deltas of sixteen bytes,
+		// the whole world fits after all, and the test passes whatever the
+		// code does.
+		let mut shrunk = world.clone();
+		let gone = shrunk.len() - 1;
+		shrunk[gone] = None;
+
+		for slot in &mut shrunk[..MAX_BASELINE + 10] {
+			if let Some((generation, solid)) = slot.as_mut() {
+				*generation = 2;
+				solid.position[1] += 1.0;
+			}
+		}
+
+		for _ in 0..6 {
+			let mut out = Vec::new();
+			describe(&mut peer, Some(&shrunk), &mut out);
+			applied(&mut theirs, &out);
+			peer.taken.theirs = peer.told.next().saturating_sub(1);
+		}
+
+		assert!(
+			theirs.get(gone).copied().flatten().is_none(),
+			"the body that went away above the cut is gone at the far end too"
+		);
+		assert!(alike(&theirs, &shrunk), "and the two ends agree about all of it");
+	}
+
+	#[test]
+	fn a_peer_whose_tail_is_never_reached_is_named_once() {
+		// a cut snapshot is ordinary. A run of them that never ends is the
+		// front of the table filling every block on its own, and that is worth
+		// saying - once, by address, rather than twenty times a second.
+		let mut peer = fresh_peer();
+		let world = crowd(MAX_BASELINE * 3);
+
+		for _ in 0..STARVED {
+			let mut out = Vec::new();
+
+			// never acknowledged, so every block is a baseline and every
+			// baseline is cut at the same place: the shape of a tail nothing
+			// ever reaches.
+			assert!(!describe(&mut peer, Some(&world), &mut out), "cut every time");
+		}
+
+		assert_eq!(peer.taken.behind, STARVED, "counted, and this is the moment it is said");
+
+		// and one whole snapshot puts the count back, so the next run of cut
+		// ones is reported as its own rather than never again.
+		let mut out = Vec::new();
+		describe(&mut peer, Some(&crowd(4)), &mut out);
+
+		assert_eq!(peer.taken.behind, 0, "a whole world clears it");
+	}
+
+	#[test]
+	fn a_world_that_fits_is_told_whole_in_one_block() {
+		// the ordinary case, stated so that a change which cut every snapshot
+		// would be caught rather than merely slower.
+		let mut peer = fresh_peer();
+		let world = crowd(20);
+		let mut out = Vec::new();
+
+		assert!(describe(&mut peer, Some(&world), &mut out), "it fits");
+		assert_eq!(peer.taken.behind, 0, "so nothing was carried over");
+
+		let mut theirs: Vec<Slot> = Vec::new();
+		applied(&mut theirs, &out);
+
+		assert!(alike(&theirs, &world), "and the far end has all of it at once");
+	}
 
 	/// Whoever the host has admitted that is not the host.
 	fn seated(world: &World) -> PeerId {
@@ -2283,7 +2529,7 @@ mod tests {
 			heard: Heard::new(),
 			theirs: NOTHING,
 			baselines: 0,
-			stranded: false,
+			behind: 0,
 		};
 		let mut applying = Vec::new();
 		let one = world(1.0);
@@ -2291,12 +2537,12 @@ mod tests {
 		let mut out = Vec::new();
 
 		// snapshot one, a baseline.
-		Snapshot::write(1, NOTHING, NOTHING, &[], &one, &mut out).expect("it fits");
+		Snapshot::write(1, NOTHING, NOTHING, &[], &one, &mut out);
 		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 
 		// snapshot two, moved away, taken against one.
 		out.clear();
-		Snapshot::write(2, 1, NOTHING, &one, &two, &mut out).expect("it fits");
+		Snapshot::write(2, 1, NOTHING, &one, &two, &mut out);
 		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 		assert_eq!(taken.heard.holding(), 2);
 
@@ -2305,9 +2551,9 @@ mod tests {
 		// body is in this block at all.
 		out.clear();
 
-		let spoken = Snapshot::write(3, 1, NOTHING, &one, &one, &mut out).expect("it fits");
+		let spoken = Snapshot::write(3, 1, NOTHING, &one, &one, &mut out);
 
-		assert_eq!(spoken, 0, "the sender sees nothing to say, which is the whole trap");
+		assert_eq!(spoken.spoken, 0, "the sender sees nothing to say, which is the whole trap");
 		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 		assert_eq!(taken.heard.holding(), 3);
 		assert_eq!(
@@ -2327,14 +2573,14 @@ mod tests {
 			heard: Heard::new(),
 			theirs: NOTHING,
 			baselines: 0,
-			stranded: false,
+			behind: 0,
 		};
 		let mut applying = Vec::new();
 		let mut out = Vec::new();
 
 		for number in 1..=3 {
 			out.clear();
-			Snapshot::write(number, NOTHING, NOTHING, &[], &world(1.0), &mut out).expect("fits");
+			Snapshot::write(number, NOTHING, NOTHING, &[], &world(1.0), &mut out);
 			assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 		}
 
@@ -2343,7 +2589,7 @@ mod tests {
 
 		// and now snapshot two again, which the ring still has a place for.
 		out.clear();
-		Snapshot::write(2, NOTHING, NOTHING, &[], &world(9.0), &mut out).expect("it fits");
+		Snapshot::write(2, NOTHING, NOTHING, &[], &world(9.0), &mut out);
 
 		assert!(
 			absorb(&mut taken, &out, &mut applying, Duration::ZERO),
@@ -2442,7 +2688,7 @@ mod tests {
 		let (base, against) = net.peers[0].taken.heard.base(NOTHING);
 
 		assert_eq!(against, NOTHING);
-		Snapshot::write(number, against, NOTHING, base, world, &mut out).expect("it fits");
+		Snapshot::write(number, against, NOTHING, base, world, &mut out);
 
 		let mut applying = Vec::new();
 

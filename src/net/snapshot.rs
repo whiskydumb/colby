@@ -603,6 +603,27 @@ pub struct Snapshot {
 	pub changes: Vec<Change>,
 }
 
+/// What one call to [`Snapshot::write`] managed to say.
+///
+/// Two numbers rather than one because they answer different questions and the
+/// caller needs both: `spoken` is what went on the wire, and `reached` is what
+/// the far end will hold once it has read it. They are equal only when nothing
+/// was cut and every slot had something to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Written {
+	/// How many slots were spoken about.
+	pub spoken: usize,
+
+	/// How far up the slot table this snapshot got.
+	///
+	/// **The number of slots the far end will hold, not the last slot
+	/// written.** So the caller keeps `&world[..reached]` as what it has told
+	/// them, and everything from `reached` upwards is news the next snapshot
+	/// carries. Equal to the length of the longer of the two tables when
+	/// nothing was cut, which is the ordinary case.
+	pub reached: usize,
+}
+
 impl Snapshot {
 	/// Writes a snapshot as the difference between two sets of records.
 	///
@@ -612,6 +633,16 @@ impl Snapshot {
 	/// both is written as the fields that differ, and if none differ it is not
 	/// written at all.
 	///
+	/// **It stops rather than refuses.** A world that does not fit in one
+	/// snapshot is written as far up the slot table as fits, and
+	/// [`Written::reached`] says how far - because what the caller does with
+	/// that is keep exactly that much as what the far end holds, so the slots
+	/// past it are new the next time round and the rest of the world arrives
+	/// over the snapshots after this one. There is no continuation mark on the
+	/// wire and none is needed: a slot nobody has been told about is a slot
+	/// occupied in `now` and absent from `before`, which is already the one
+	/// thing this format writes in full.
+	///
 	/// @param number - which snapshot this is
 	/// @param against - which one it is a difference from, or [`NOTHING`]
 	/// @param holding - the newest snapshot this end holds, for the far end to
@@ -619,11 +650,8 @@ impl Snapshot {
 	/// @param before - what the far end is known to have, by slot
 	/// @param now - what is true, by slot
 	/// @param out - where the bytes go, appended
-	/// @return how many slots were spoken about
-	///
-	/// # Errors
-	///
-	/// If the result would be longer than [`MAX_SNAPSHOT`].
+	/// @return how many slots were spoken about, and how far up the table this
+	/// snapshot got
 	pub fn write(
 		number: u32,
 		against: u32,
@@ -631,7 +659,7 @@ impl Snapshot {
 		before: &[Slot],
 		now: &[Slot],
 		out: &mut Vec<u8>,
-	) -> Result<usize, Fault> {
+	) -> Written {
 		let began = out.len();
 		// said against nothing means written against nothing, whatever the
 		// caller handed over. @ref the module's note on `against`.
@@ -646,6 +674,7 @@ impl Snapshot {
 		out.extend_from_slice(&0_u16.to_le_bytes());
 
 		let mut spoken = 0;
+		let mut reached = slots;
 
 		for slot in 0..slots {
 			let was = before.get(slot).copied().flatten();
@@ -654,22 +683,31 @@ impl Snapshot {
 				continue;
 			};
 
-			if slotted(index, was, is, out) {
-				spoken += 1;
+			// the record is written and then measured rather than measured and
+			// then written. Predicting a record's length means a second copy of
+			// the arithmetic that decides its reach and its mask, and two
+			// copies of that would disagree the first time either moved.
+			let mark = out.len();
+
+			if !slotted(index, was, is, out) {
+				continue;
 			}
-		}
 
-		if out.len() - began > MAX_SNAPSHOT {
-			out.truncate(began);
+			if out.len() - began > MAX_SNAPSHOT {
+				out.truncate(mark);
+				reached = slot;
 
-			return Err(Fault::TooLong);
+				break;
+			}
+
+			spoken += 1;
 		}
 
 		let count = u16::try_from(spoken).unwrap_or(u16::MAX);
 
 		out[began + HEAD - 2..began + HEAD].copy_from_slice(&count.to_le_bytes());
 
-		Ok(spoken)
+		Written { spoken, reached }
 	}
 
 	/// Reads the head and nothing else.
@@ -1040,7 +1078,7 @@ mod tests {
 	/// difference from what the receiver holds and a block that said otherwise
 	/// would now be written against nothing at all.
 	fn tell(far: &Far, now: &[Slot], out: &mut Vec<u8>) -> usize {
-		Snapshot::write(1, 1, NOTHING, &far.held, now, out).expect("it fits")
+		Snapshot::write(1, 1, NOTHING, &far.held, now, out).spoken
 	}
 
 	/// Whether two tables describe the same world, ignoring trailing holes.
@@ -1059,9 +1097,9 @@ mod tests {
 
 		// written by hand rather than through `tell`, which writes a difference:
 		// this one is the baseline, and its base is empty on purpose.
-		let spoken = Snapshot::write(1, NOTHING, NOTHING, &far.held, &now, &mut out);
+		let written = Snapshot::write(1, NOTHING, NOTHING, &far.held, &now, &mut out);
 
-		assert_eq!(spoken.expect("it fits"), 1, "one slot spoken about");
+		assert_eq!(written.spoken, 1, "one slot spoken about");
 
 		let back = far.take(&out).expect("what was written reads");
 
@@ -1317,7 +1355,7 @@ mod tests {
 
 			let mut out = Vec::new();
 
-			Snapshot::write(step + 1, step, step, &far.held, &world, &mut out).expect("it fits");
+			Snapshot::write(step + 1, step, step, &far.held, &world, &mut out);
 			far.take(&out).expect("what was written reads");
 
 			assert!(
@@ -1566,33 +1604,80 @@ mod tests {
 	}
 
 	#[test]
-	fn a_snapshot_too_long_to_send_is_refused_rather_than_cut() {
-		let full: Vec<Slot> = (0..=MAX_BASELINE)
+	fn a_world_too_big_for_one_snapshot_is_cut_rather_than_refused() {
+		// **the whole of what this stopping is for.** A world past what one
+		// block holds used to be refused whole, which left a peer owed a
+		// baseline that could never be written - so it was never told of a
+		// base to answer with, and every attempt after it failed the same way.
+		// `slot + 1` rather than `slot`, so no record is a word shorter than
+		// the rest for the incidental reason that one of its fields came out
+		// zero. Every record here is the full ninety eight bytes.
+		let full: Vec<Slot> = (0..MAX_BASELINE * 2)
 			.map(|slot| {
 				Some((1, Solid {
-					kind: u32::try_from(slot).unwrap_or(0),
+					kind: u32::try_from(slot + 1).unwrap_or(1),
 					..somewhere()
 				}))
 			})
 			.collect();
 		let mut out = vec![0xAB; 3];
 
-		assert_eq!(
-			Snapshot::write(1, NOTHING, NOTHING, &[], &full, &mut out),
-			Err(Fault::TooLong),
-			"one body more than a baseline holds"
-		);
-		assert_eq!(out, vec![0xAB; 3], "and what was already in the buffer is untouched");
+		let written = Snapshot::write(1, NOTHING, NOTHING, &[], &full, &mut out);
 
-		// and the one below it goes through, into the same non-empty buffer,
-		// appended rather than written over.
-		assert_eq!(
-			Snapshot::write(1, NOTHING, NOTHING, &[], &full[..MAX_BASELINE], &mut out),
-			Ok(MAX_BASELINE),
-			"exactly a baseline's worth fits"
-		);
+		assert_eq!(written.spoken, MAX_BASELINE, "as many bodies as a baseline holds");
+		assert_eq!(written.reached, MAX_BASELINE, "and it says where it stopped");
+		assert!(out.len() - 3 <= MAX_SNAPSHOT, "and what came out is a block somebody can send");
 		assert_eq!(&out[..3], &[0xAB; 3], "after what the caller already had");
-		assert!(out.len() - 3 <= MAX_SNAPSHOT);
+
+		// and it is not merely short - it is a block that reads.
+		let far = Far::default();
+		let (back, _) = Snapshot::read(&far.held, &out[3..]).expect("a cut block still reads");
+
+		assert_eq!(back.changes.len(), MAX_BASELINE, "every record in it is whole");
+	}
+
+	#[test]
+	fn a_world_bigger_than_one_snapshot_arrives_over_several() {
+		// the property the cutting exists to have, and the reason no
+		// continuation mark is needed on the wire: whatever the far end was
+		// not told about is a slot occupied here and absent there, which is
+		// already the one thing this format writes in full.
+		let full: Vec<Slot> = (0..MAX_BASELINE * 2 + 5)
+			.map(|slot| {
+				Some((1, Solid {
+					kind: u32::try_from(slot + 1).unwrap_or(1),
+					..somewhere()
+				}))
+			})
+			.collect();
+
+		let mut far = Far::default();
+		let mut held: Vec<Slot> = Vec::new();
+		let mut blocks: u32 = 0;
+
+		// the loop is over what the *receiver* holds rather than over what the
+		// sender believes it has said, which is the pair that has to agree.
+		while !same(&far.held, &full) {
+			blocks += 1;
+			assert!(blocks < 10, "it has to converge, and it took {blocks} blocks");
+
+			let mut out = Vec::new();
+			let against = if blocks == 1 { NOTHING } else { 1 };
+			let written = Snapshot::write(blocks, against, NOTHING, &held, &full, &mut out);
+
+			// **the sender keeps only what it sent**, which is the whole of
+			// the carrying over. Keeping the world it wanted to send would
+			// leave the far end holding less than the base says it does, and
+			// every difference after that would be written against a world
+			// nobody has.
+			held.clear();
+			held.extend_from_slice(&full[..written.reached.min(full.len())]);
+
+			far.take(&out).expect("what was written reads");
+		}
+
+		assert_eq!(blocks, 3, "a world of two baselines and a bit takes three blocks");
+		assert!(same(&far.held, &full), "and the far end ends up holding all of it");
 	}
 
 	#[test]
@@ -1847,10 +1932,9 @@ mod tests {
 			&table(&[(0, 1, before)]),
 			&table(&[(0, 1, still)]),
 			&mut out,
-		)
-		.expect("it fits");
+		);
 
-		assert_eq!(spoken, 0, "so it is not spoken about");
+		assert_eq!(spoken.spoken, 0, "so it is not spoken about");
 		assert_eq!(out.len(), HEAD, "and the block is a head and nothing else");
 
 		body.transform.position.x = 4.0;
@@ -1866,10 +1950,9 @@ mod tests {
 			&table(&[(0, 1, before)]),
 			&table(&[(0, 1, moved)]),
 			&mut out,
-		)
-		.expect("it fits");
+		);
 
-		assert_eq!(spoken, 1, "and one that moved is");
+		assert_eq!(spoken.spoken, 1, "and one that moved is");
 		assert!(out.len() > HEAD);
 	}
 
@@ -1885,8 +1968,7 @@ mod tests {
 		resting.sleeping = 0;
 		resting.velocity = [0.0, 0.0, 0.0];
 
-		Snapshot::write(1, NOTHING, NOTHING, &[], &table(&[(0, 1, resting)]), &mut out)
-			.expect("it fits");
+		Snapshot::write(1, NOTHING, NOTHING, &[], &table(&[(0, 1, resting)]), &mut out);
 
 		let (back, _) = Snapshot::read(&now, &out).expect("what was written reads");
 
@@ -1907,8 +1989,8 @@ mod tests {
 		let mut said = Vec::new();
 		let mut plain = Vec::new();
 
-		Snapshot::write(1, NOTHING, NOTHING, &now, &now, &mut said).expect("it fits");
-		Snapshot::write(1, NOTHING, NOTHING, &[], &now, &mut plain).expect("it fits");
+		Snapshot::write(1, NOTHING, NOTHING, &now, &now, &mut said);
+		Snapshot::write(1, NOTHING, NOTHING, &[], &now, &mut plain);
 
 		assert_eq!(said, plain, "the base it was given made no difference to what went out");
 
@@ -1932,7 +2014,7 @@ mod tests {
 		let now = table(&[(0, 1, somewhere())]);
 		let mut out = Vec::new();
 
-		Snapshot::write(9, NOTHING, 4, &[], &now, &mut out).expect("it fits");
+		Snapshot::write(9, NOTHING, 4, &[], &now, &mut out);
 
 		assert_eq!(&out[0..4], &9_u32.to_le_bytes(), "the number is first");
 		assert_eq!(&out[4..8], &NOTHING.to_le_bytes(), "what it is written against is second");
