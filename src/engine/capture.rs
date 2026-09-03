@@ -1889,6 +1889,142 @@ f 1 4 5
 		);
 	}
 
+	/// How far above the floor the holed caster hangs, and how wide it is.
+	///
+	/// Three and three: the light comes in at forty-five degrees, so what the
+	/// caster throws lands exactly its own width to `+x` of it - beside itself
+	/// rather than under itself, where an overhead camera can see it and where
+	/// the caster's own holes are not in the way.
+	const CASTER: (f32, f32) = (3.0, 3.0);
+
+	/// How many times the caster's picture repeats across it.
+	///
+	/// Two rather than one, and that is the difference between a test and a
+	/// decoration: at one tile every sample below lands on the same texel
+	/// whether or not the cascade pass multiplies the coordinate by the
+	/// material's scale, so a pass that dropped the multiply entirely would
+	/// pass. At two, the second sample is a hole only if the multiply happened.
+	const TILES: f32 = 2.0;
+
+	/// One frame of a quad wearing [`holed`] hung over the floor, in a mode.
+	///
+	/// A quad rather than a cube, so that the picture's four texels become four
+	/// squares of shadow on the floor and two of them are what the mask is
+	/// supposed to take away.
+	///
+	/// @param blend - how the caster's material reads the picture's alpha
+	/// @return the frame and the world it was shot from, or `None` with no GPU
+	fn cast_by(blend: Blend) -> Option<(Image, World)> {
+		let mut capture = capture()?;
+		let mut world = shadowed_world();
+		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+		world.camera.target = Vec3::ZERO;
+
+		let texture = world.textures.insert("test/holed", holed());
+		let material = world.materials.insert("test/holed", Material {
+			blend,
+			..Material::textured(texture).tiled(TILES)
+		});
+
+		let caster = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, CASTER.0, 0.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(CASTER.1, 1.0, CASTER.1),
+		});
+		world
+			.entities
+			.set_renderable(caster, Renderable::of(MeshId::QUAD, material, Vec3::ONE));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		Some((image, world))
+	}
+
+	#[test]
+	fn a_cutout_casts_a_shadow_with_the_holes_in_it() {
+		let (Some((solid, world)), Some((cut, _))) =
+			(cast_by(Blend::Opaque), cast_by(Blend::Mask))
+		else {
+			return;
+		};
+
+		// the middles of two neighboring cells of the tiled picture, in the
+		// world. The first is opaque and the second is a hole; they are
+		// neighbors at the same height in the same row, so nothing about them
+		// differs but the alpha the cascade pass reads.
+		let cell = CASTER.1 / (2.0 * TILES);
+		let middle = |column: f32| (column + 0.5).mul_add(cell, -CASTER.1 / 2.0);
+		let kept = Vec3::new(middle(0.0), CASTER.0, middle(0.0));
+		let hole = Vec3::new(middle(1.0), CASTER.0, middle(0.0));
+
+		let under_kept = on_screen(&world, beneath(&world, kept), SIZE);
+		let under_hole = on_screen(&world, beneath(&world, hole), SIZE);
+		let beside = on_screen(&world, beneath(&world, kept) + Vec3::new(0.0, 0.0, 4.0), SIZE);
+
+		assert_ne!(under_kept, under_hole, "the two samples are different pixels");
+
+		let lit = brightness(solid.pixel(beside.0, beside.1));
+
+		// the control, and the half of this test that says the shadow reaches
+		// the second point at all: drawn solid, both texels shade the floor.
+		for (name, (x, y)) in [("kept", under_kept), ("hole", under_hole)] {
+			let dark = brightness(solid.pixel(x, y));
+
+			assert!(
+				dark * 2 < lit,
+				"drawn solid, the {name} texel shades the floor at ({x}, {y}): {dark} against \
+				 {lit} beside it"
+			);
+		}
+
+		let still_dark = brightness(cut.pixel(under_kept.0, under_kept.1));
+		let now_lit = brightness(cut.pixel(under_hole.0, under_hole.1));
+
+		assert!(
+			still_dark * 2 < lit,
+			"masked, the texel that is not a hole goes on shading the floor: {still_dark} \
+			 against {lit}"
+		);
+		assert!(
+			now_lit * 10 > lit * 8,
+			"and the one that is a hole lets the light through: {now_lit} against {lit} beside \
+			 it"
+		);
+		// what makes the pair a measurement rather than two coincidences: a
+		// build whose cascades never reached the masked pipeline would shade
+		// both points in both modes, and one that discarded everything would
+		// shade neither.
+		assert!(
+			now_lit > still_dark * 2,
+			"so inside one frame the hole and the solid texel really do differ: {now_lit} \
+			 against {still_dark}"
+		);
+	}
+
+	#[test]
+	fn both_shaders_cut_their_holes_out_at_the_same_place() {
+		// a module cannot include another one, so the constant is written twice
+		// and this is what stops the two drifting: a fence whose shadow had
+		// different holes in it than the fence has is the exact bug that would
+		// follow, and it is invisible on anything but a lit scene.
+		let declaration = "const MASK_CUTOFF: f32 = ";
+		let cutoff = |source: &str, name: &str| {
+			source
+				.split_once(declaration)
+				.and_then(|(_, rest)| rest.split_once(';'))
+				.map(|(value, _)| value.trim().to_owned())
+				.unwrap_or_else(|| panic!("{name} declares no {declaration}"))
+		};
+
+		assert_eq!(
+			cutoff(include_str!("shader.wgsl"), "shader.wgsl"),
+			cutoff(include_str!("shadow.wgsl"), "shadow.wgsl"),
+			"the scene and the cascades have to agree on which texels are holes"
+		);
+	}
+
 	#[test]
 	fn a_prop_far_down_the_view_is_shadowed_by_a_further_cascade() {
 		let Some(mut capture) = capture() else {

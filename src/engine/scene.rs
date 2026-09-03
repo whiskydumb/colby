@@ -344,7 +344,7 @@ impl Scene {
 		// joints as its second group and the scene reads them as its fourth,
 		// so the layout has to exist before either is built.
 		let joints = Joints::new(&device)?;
-		let shadows = Maps::new(&device, joints.layout())?;
+		let shadows = Maps::new(&device, joints.layout(), &material_layout)?;
 		let shader = Shader::new("shader.wgsl", include_str!("shader.wgsl"));
 		let groups =
 			[&globals_layout, &material_layout, shadows.sample_layout(), joints.layout()];
@@ -509,13 +509,18 @@ impl Scene {
 		self.queue.submit([encoder.finish()]);
 	}
 
-	/// Which one draws it into a cascade.
-	const fn casting(&self, skinned: bool) -> &RenderPipeline {
-		if skinned {
-			self.shadows.skinned()
-		} else {
-			self.shadows.pipeline()
-		}
+	/// Which one draws a batch into a cascade.
+	///
+	/// A match rather than a lookup, so that a mode which should not cast at
+	/// all - and blending is exactly that - is a compile error here on the day
+	/// it is added rather than a fence-shaped hole in the light.
+	fn casting(&self, blend: Blend, skinned: bool) -> &RenderPipeline {
+		let masked = match blend {
+			| Blend::Opaque => false,
+			| Blend::Mask => true,
+		};
+
+		self.shadows.casting(masked, skinned)
 	}
 
 	/// Records one cascade's depth pass.
@@ -563,14 +568,22 @@ impl Scene {
 		let mut bound = None;
 
 		for batch in &self.batches {
-			let Some(mesh) = self.meshes.get(batch.mesh) else {
+			let (Some(mesh), Some(material)) =
+				(self.meshes.get(batch.mesh), self.materials.get(batch.material))
+			else {
 				continue;
 			};
 
-			if bound != Some(batch.skinned) {
-				pass.set_pipeline(self.casting(batch.skinned));
-				bound = Some(batch.skinned);
+			let wanted = (batch.blend, batch.skinned);
+			if bound != Some(wanted) {
+				pass.set_pipeline(self.casting(batch.blend, batch.skinned));
+				bound = Some(wanted);
 			}
+
+			// bound for every batch and not only the masked ones: the group is
+			// declared on all four pipelines so that one of them may read it,
+			// and a group a pipeline's layout declares has to be there.
+			pass.set_bind_group(2, &material.bindings, &[]);
 
 			if let Some(skin) = mesh.skin.as_ref() {
 				pass.set_vertex_buffer(2, skin.slice(..));

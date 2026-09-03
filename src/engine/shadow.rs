@@ -42,12 +42,12 @@ use wgpu::{
 	BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Buffer,
 	BufferBinding, BufferBindingType, BufferDescriptor, BufferUsages, CompareFunction,
 	DepthBiasState, DepthStencilState, Device, ErrorFilter, Extent3d, Face, FilterMode,
-	FrontFace, MultisampleState, PipelineCompilationOptions, PipelineLayoutDescriptor,
-	PolygonMode, PrimitiveState, PrimitiveTopology, Queue, RenderPipeline,
-	RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor,
-	ShaderSource, ShaderStages, StencilState, TextureAspect, TextureDescriptor, TextureDimension,
-	TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension,
-	VertexBufferLayout, VertexState, VertexStepMode,
+	FragmentState, FrontFace, MultisampleState, PipelineCompilationOptions,
+	PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, Queue,
+	RenderPipeline, RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor,
+	ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, Texture, TextureAspect,
+	TextureDescriptor, TextureDimension, TextureSampleType, TextureUsages, TextureView,
+	TextureViewDescriptor, TextureViewDimension, VertexBufferLayout, VertexState, VertexStepMode,
 };
 
 use crate::scene::{
@@ -312,20 +312,29 @@ pub(crate) struct Maps {
 	/// Kept so the scene's pipeline can be built again when its shader is.
 	sample_layout: BindGroupLayout,
 
-	pipeline: RenderPipeline,
-
-	/// The same over a third vertex buffer, for geometry bones move.
-	skinned: RenderPipeline,
+	/// One per (whether the picture has to be sampled, whether bones move it).
+	///
+	/// Two axes and four entries, the same shape the scene's table has - but
+	/// keyed on a *bool* rather than on `Blend`, because what a cascade wants
+	/// to know is only whether the surface can have holes in it. A mode that
+	/// does not cast at all has no row here rather than an unused one.
+	pipelines: [RenderPipeline; 4],
 }
 
 impl Maps {
-	/// Builds the array, both pipelines and every group.
+	/// Builds the array, all four pipelines and every group.
 	///
 	/// @param device - the device to build against
 	/// @param joints - the layout of the frame's joint matrices, which the
-	/// skinned pipeline reads as its second group
+	/// skinned pipelines read as their second group
+	/// @param material - the scene's own material layout, declared on every
+	/// pipeline here so that one bind group serves both passes
 	/// @return the maps, or the compiler's complaint about the depth shader
-	pub(crate) fn new(device: &Device, joints: &BindGroupLayout) -> Result<Self> {
+	pub(crate) fn new(
+		device: &Device,
+		joints: &BindGroupLayout,
+		material: &BindGroupLayout,
+	) -> Result<Self> {
 		let cascade_layout = cascade_layout(device);
 		let sample_layout = sample_layout(device);
 		let texture = device.create_texture(&TextureDescriptor {
@@ -356,40 +365,7 @@ impl Maps {
 			})
 			.collect();
 
-		let map = texture.create_view(&TextureViewDescriptor {
-			label: Some("shadow maps"),
-			dimension: Some(TextureViewDimension::D2Array),
-			aspect: TextureAspect::DepthOnly,
-			..TextureViewDescriptor::default()
-		});
-
-		// clamped, because a sample that fell off the edge of a cascade should
-		// read that edge rather than wrap around to the far side of the world.
-		let sampler = device.create_sampler(&SamplerDescriptor {
-			label: Some("shadow"),
-			address_mode_u: AddressMode::ClampToEdge,
-			address_mode_v: AddressMode::ClampToEdge,
-			address_mode_w: AddressMode::ClampToEdge,
-			mag_filter: FilterMode::Linear,
-			min_filter: FilterMode::Linear,
-			compare: Some(CompareFunction::LessEqual),
-			..SamplerDescriptor::default()
-		});
-
-		let sampled = device.create_bind_group(&BindGroupDescriptor {
-			label: Some("shadow maps"),
-			layout: &sample_layout,
-			entries: &[
-				BindGroupEntry {
-					binding: 0,
-					resource: BindingResource::TextureView(&map),
-				},
-				BindGroupEntry {
-					binding: 1,
-					resource: BindingResource::Sampler(&sampler),
-				},
-			],
-		});
+		let sampled = sample_group(device, &sample_layout, &texture);
 
 		let uniforms = device.create_buffer(&BufferDescriptor {
 			label: Some("cascades"),
@@ -416,8 +392,17 @@ impl Maps {
 			.collect();
 
 		let scope = device.push_error_scope(ErrorFilter::Validation);
-		let pipeline = build_pipeline(device, &cascade_layout, joints, false);
-		let skinned = build_pipeline(device, &cascade_layout, joints, true);
+		let groups = Groups {
+			cascade: &cascade_layout,
+			joints,
+			material,
+		};
+		let pipelines = [
+			build_pipeline(device, &groups, false, false),
+			build_pipeline(device, &groups, false, true),
+			build_pipeline(device, &groups, true, false),
+			build_pipeline(device, &groups, true, true),
+		];
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
 			return Err(err!(Graphics("the shadow pipeline: {complaint}")));
@@ -429,8 +414,7 @@ impl Maps {
 			slots,
 			sampled,
 			sample_layout,
-			pipeline,
-			skinned,
+			pipelines,
 		})
 	}
 
@@ -440,11 +424,14 @@ impl Maps {
 	/// The group the scene binds to read every map.
 	pub(crate) const fn bindings(&self) -> &BindGroup { &self.sampled }
 
-	/// The depth-only pipeline every cascade's pass runs.
-	pub(crate) const fn pipeline(&self) -> &RenderPipeline { &self.pipeline }
-
-	/// The same for geometry bones move.
-	pub(crate) const fn skinned(&self) -> &RenderPipeline { &self.skinned }
+	/// The pipeline a cascade's pass runs for one batch.
+	///
+	/// @param masked - whether the surface's picture has to be sampled before
+	/// its depth is allowed to be written
+	/// @param skinned - whether bones move the geometry
+	pub(crate) fn casting(&self, masked: bool, skinned: bool) -> &RenderPipeline {
+		&self.pipelines[usize::from(masked) * 2 + usize::from(skinned)]
+	}
 
 	/// One cascade's layer, to draw into.
 	pub(crate) fn layer(&self, slice: usize) -> Option<&TextureView> { self.layers.get(slice) }
@@ -478,6 +465,52 @@ fn cascade_layout(device: &Device) -> BindGroupLayout {
 	})
 }
 
+/// The group the scene samples every cascade through.
+///
+/// Lifted out of the constructor rather than written inline, which is the shape
+/// this lint wants in renderer code: it is a view, a sampler and a group with
+/// no logic in it at all.
+///
+/// @param device - the device to build against
+/// @param layout - the layout the group is built against
+/// @param maps - the depth array every cascade is one layer of
+fn sample_group(device: &Device, layout: &BindGroupLayout, maps: &Texture) -> BindGroup {
+	let map = maps.create_view(&TextureViewDescriptor {
+		label: Some("shadow maps"),
+		dimension: Some(TextureViewDimension::D2Array),
+		aspect: TextureAspect::DepthOnly,
+		..TextureViewDescriptor::default()
+	});
+
+	// clamped, because a sample that fell off the edge of a cascade should read
+	// that edge rather than wrap around to the far side of the world.
+	let sampler = device.create_sampler(&SamplerDescriptor {
+		label: Some("shadow"),
+		address_mode_u: AddressMode::ClampToEdge,
+		address_mode_v: AddressMode::ClampToEdge,
+		address_mode_w: AddressMode::ClampToEdge,
+		mag_filter: FilterMode::Linear,
+		min_filter: FilterMode::Linear,
+		compare: Some(CompareFunction::LessEqual),
+		..SamplerDescriptor::default()
+	});
+
+	device.create_bind_group(&BindGroupDescriptor {
+		label: Some("shadow maps"),
+		layout,
+		entries: &[
+			BindGroupEntry {
+				binding: 0,
+				resource: BindingResource::TextureView(&map),
+			},
+			BindGroupEntry {
+				binding: 1,
+				resource: BindingResource::Sampler(&sampler),
+			},
+		],
+	})
+}
+
 /// The group the scene reads every map through.
 fn sample_layout(device: &Device) -> BindGroupLayout {
 	device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -508,20 +541,37 @@ fn sample_layout(device: &Device) -> BindGroupLayout {
 	})
 }
 
-/// Builds the depth-only pipeline.
+/// The three group layouts every pipeline here is built against.
 ///
-/// No fragment stage and no color target, over the same two vertex buffers the
-/// scene draws from: the shader reads the position and the model matrix and
-/// lets the pipeline supply the rest.
+/// A struct rather than three arguments, because the pair of flags below is
+/// what a caller varies and the layouts are the same every time. It is also
+/// what keeps the builder under the argument count the lints allow.
+struct Groups<'a> {
+	/// The group holding one cascade's matrix.
+	cascade: &'a BindGroupLayout,
+
+	/// The group holding the frame's joint matrices.
+	joints: &'a BindGroupLayout,
+
+	/// The scene's own material group, which only the masked pipelines read.
+	material: &'a BindGroupLayout,
+}
+
+/// Builds one depth pipeline.
+///
+/// Over the same two vertex buffers the scene draws from: the shader reads the
+/// position, the model matrix and - where the surface can have holes in it -
+/// the texture coordinate, and lets the pipeline supply the rest.
 ///
 /// @param device - the device to build against
-/// @param layout - the group holding one cascade's matrix
-/// @param joints - the group holding the frame's joint matrices
+/// @param groups - the bind group layouts, in group order
+/// @param masked - whether to build the variant that samples the picture and
+/// discards, rather than the one with no fragment stage at all
 /// @param skinned - whether to build the variant that reads bones
 fn build_pipeline(
 	device: &Device,
-	layout: &BindGroupLayout,
-	joints: &BindGroupLayout,
+	groups: &Groups<'_>,
+	masked: bool,
 	skinned: bool,
 ) -> RenderPipeline {
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -529,11 +579,12 @@ fn build_pipeline(
 		source: ShaderSource::Wgsl(include_str!("shadow.wgsl").into()),
 	});
 
-	// the joints are declared on both, so that one bind group serves both
-	// passes and nothing has to be unbound between two batches.
+	// the joints and the material are declared on all four, so that one bind
+	// group of each serves every pass and nothing has to be unbound between two
+	// batches. A pipeline is allowed to declare a group its shader never reads.
 	let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
 		label: Some("shadow"),
-		bind_group_layouts: &[Some(layout), Some(joints)],
+		bind_group_layouts: &[Some(groups.cascade), Some(groups.joints), Some(groups.material)],
 		immediate_size: 0,
 	});
 
@@ -560,11 +611,16 @@ fn build_pipeline(
 	};
 
 	device.create_render_pipeline(&RenderPipelineDescriptor {
-		label: Some(if skinned { "shadow skinned" } else { "shadow" }),
+		label: Some(label_of(masked, skinned)),
 		layout: Some(&pipeline_layout),
 		vertex: VertexState {
 			module: &shader,
-			entry_point: Some(if skinned { "vertex_skinned" } else { "vertex_main" }),
+			entry_point: Some(match (masked, skinned) {
+				| (false, false) => "vertex_main",
+				| (false, true) => "vertex_skinned",
+				| (true, false) => "vertex_masked",
+				| (true, true) => "vertex_masked_skinned",
+			}),
 			compilation_options: PipelineCompilationOptions::default(),
 			buffers,
 		},
@@ -599,10 +655,28 @@ fn build_pipeline(
 			},
 		}),
 		multisample: MultisampleState::default(),
-		fragment: None,
+		// no color target either way. Where there is a stage at all, the only
+		// thing it can do is throw the fragment away, which is the whole point
+		// of it.
+		fragment: masked.then(|| FragmentState {
+			module: &shader,
+			entry_point: Some("fragment_masked"),
+			compilation_options: PipelineCompilationOptions::default(),
+			targets: &[],
+		}),
 		multiview_mask: None,
 		cache: None,
 	})
+}
+
+/// What one of the four is called in a graphics debugger.
+const fn label_of(masked: bool, skinned: bool) -> &'static str {
+	match (masked, skinned) {
+		| (false, false) => "shadow",
+		| (false, true) => "shadow skinned",
+		| (true, false) => "shadow masked",
+		| (true, true) => "shadow masked skinned",
+	}
 }
 
 #[cfg(test)]
