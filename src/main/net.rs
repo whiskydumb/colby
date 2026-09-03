@@ -55,11 +55,15 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use colby_asset::{
+	bytes::AlignedBytes,
+	scene::{SceneFile, encode},
+};
 use colby_core::{
 	Result,
 	abi::{
-		Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, PeerId, Role, Value, World,
-		console, cvar::Owner, net::BACKUP,
+		Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, PeerId, Role, SceneData, Value,
+		World, console, cvar::Owner, net::BACKUP, scene,
 	},
 	debug, err,
 	glam::Vec3,
@@ -360,6 +364,8 @@ fn report(net: &Net) {
 		filed = net.filed(),
 		garbled = net.garbled(),
 		dropped = net.dropped(),
+		appearances = net.appearances(),
+		crowded_out = net.crowded_out(),
 		"the wire"
 	);
 
@@ -702,11 +708,49 @@ impl Post for Loopback {
 /// What one channel has made of a conversation: sent, acknowledged, lost.
 pub(crate) type Tally = (u32, u32, u32);
 
+/// How many bodies one appearance describes at most.
+///
+/// **The reliable ring has no window**: an item that has been queued and not
+/// acknowledged is written into *every* message until it is, so a description
+/// of forty bodies would be forty kilobytes on every message for a round trip.
+/// That is thirty-five datagrams, and a message is lost whole when one of its
+/// datagrams is - so a big description is one that may never arrive, and it
+/// blocks the ring behind it while it fails.
+///
+/// Four bodies is about a kilobyte, which is one item. One appearance goes per
+/// peer per *snapshot* rather than per step, so a world that has diverged by a
+/// hundred bodies is told in five seconds rather than all at once, and the
+/// message grows by an item rather than by forty.
+const APPEARING: usize = 4;
+
+/// How many arrived descriptions may wait for a step to take them.
+///
+/// Generous rather than tight, because a description that is dropped here is a
+/// body that never appears: the ring the far end sent it over has already
+/// counted it delivered, so nothing will say it again. What fills this is a
+/// world nothing is stepping - an edit mode left running while somebody else
+/// builds - and four bodies apiece it is more than a whole table's worth.
+const WAITING: usize = 256;
+
+/// A place in a description's own body table that is not one.
+const NO_SOLID: u32 = u32::MAX;
+
 /// One endpoint's side of a conversation with one other endpoint.
 struct Peer {
 	address: SocketAddr,
 	channel: Channel,
 	reliable: Reliable,
+
+	/// Which body slots this peer has been told the whole of, by generation.
+	///
+	/// Indexed by slot, nil meaning never. A snapshot says where a body *is*
+	/// and this says what it *is*, and the second only has to be said once -
+	/// the ring behind it is what makes once enough. The generation is what
+	/// makes a slot somebody else took a thing that has to be said again.
+	///
+	/// **A conversation that restarts empties it**, because the far end that
+	/// came back is a process that has been told nothing.
+	described: Vec<u32>,
 
 	/// What the ring's items are being put back together into.
 	///
@@ -822,6 +866,7 @@ impl Peer {
 
 		self.channel.forget();
 		self.reliable.forget();
+		self.described.clear();
 		// @note: nothing can observe this one, and it is kept for the reason
 		// the two above it are called at all. The ring writes every item it is
 		// still owed into every message, so a parcel's pieces are always read
@@ -950,13 +995,23 @@ pub(crate) struct Net {
 	items: Vec<Vec<u8>>,
 	said: Vec<Said>,
 
-	/// The descriptions that crossed on the last drain.
+	/// The descriptions that have crossed and not been put into a world yet.
 	///
-	/// Nothing reads one yet. The wire carries them because the message that
-	/// says a thing has appeared is a description of it, and this is where one
-	/// lands; what to *do* with it is the world's, and the world does not have
-	/// it yet.
+	/// A queue rather than a slice cleared on every drain, for the reason
+	/// [`asked`](Peer::asked) is one: the wire is drained where there is no
+	/// world, and what a description does is *make* bodies, which is the one
+	/// thing a world being edited must not have done to it. So they wait here
+	/// until a step takes them. @ref [`appeared`](Self::appeared).
 	described: Vec<Described>,
+
+	/// Which bodies are alive, gathered once rather than once per peer.
+	living: Vec<BodyId>,
+
+	/// How many appearances have been described, ever.
+	appearances: u32,
+
+	/// How many arrived and were dropped for want of anywhere to put them.
+	crowded_out: u32,
 
 	/// What this end is asking for, as of the last step.
 	///
@@ -1057,6 +1112,9 @@ impl Net {
 			items: Vec::new(),
 			said: Vec::new(),
 			described: Vec::new(),
+			living: Vec::new(),
+			appearances: 0,
+			crowded_out: 0,
 			asking: Vec::new(),
 			arrived: Vec::new(),
 			departed: Vec::new(),
@@ -1178,15 +1236,32 @@ impl Net {
 	/// What crossed on the last [`receive`](Self::receive).
 	pub(crate) fn said(&self) -> &[Said] { &self.said }
 
-	/// Which parts of a world were described on the last
-	/// [`receive`](Self::receive).
+	/// Takes the descriptions that have arrived and not been used.
 	///
-	/// @note: nothing in the runner reads this yet, which is why only a test
-	/// calls it. It is here because the wire is what has to carry a
-	/// description before anything can act on one, and a thing that crosses
-	/// and lands nowhere is a thing nobody can check.
+	/// Emptied by taking, because what is done with one is putting bodies into
+	/// a world and that happens in a step rather than where the wire is
+	/// drained. @ref [`land`], which is the only thing that calls this.
+	pub(crate) fn appeared(&mut self) -> Vec<Described> { std::mem::take(&mut self.described) }
+
+	/// Puts a description where one that arrived would be, with no wire.
+	///
+	/// For the step's own harness, which has a world and a solver and no far
+	/// end to hear from. Everything the real path does to one before this is
+	/// tested here.
+	///
+	/// @param from - who is to have said it
+	/// @param bytes - the description
 	#[cfg(test)]
-	pub(crate) fn described(&self) -> &[Described] { &self.described }
+	pub(crate) fn describing(&mut self, from: SocketAddr, bytes: &[u8]) {
+		self.described
+			.push(Described { from, bytes: bytes.to_vec() });
+	}
+
+	/// How many appearances this end has described to somebody.
+	pub(crate) const fn appearances(&self) -> u32 { self.appearances }
+
+	/// How many arrived with nowhere to put them.
+	pub(crate) const fn crowded_out(&self) -> u32 { self.crowded_out }
 
 	/// How many messages have gone out, counting one per peer.
 	pub(crate) const fn sent(&self) -> u32 { self.sent }
@@ -1432,6 +1507,110 @@ impl Net {
 		Ok(())
 	}
 
+	/// Tells every peer what the bodies it has never heard of *are*.
+	///
+	/// **A snapshot says where a body is and this says what it is.** A record
+	/// on the wire carries a transform, a speed and a handful of numbers; it
+	/// carries no shape, no mass, no material and no name, so a far end that
+	/// has never had the body cannot make one out of it. What can is the whole
+	/// description - the same one a scene on disk holds - cut down to the
+	/// bodies in question and left at the numbers this machine keeps them at.
+	/// @ref [`SceneData::piece`](colby_core::abi::SceneData::piece), which is
+	/// the cut that keeps a slot, and `scene::graft`, which is what the far end
+	/// does with it.
+	///
+	/// **Once each, and the ring is what makes once enough.** A description
+	/// goes into the reliable stream, which resends it until the far end says
+	/// it took it, so there is no mark here for "sent but not arrived" - there
+	/// is only "said" and "not said yet".
+	///
+	/// **A peer is told about the whole world, including the part it built for
+	/// itself.** Both ends load the same scenes, so most of what is described
+	/// to a fresh peer lands on slots it already has and is refused there. That
+	/// is waste rather than error - about fifteen kilobytes once per
+	/// conversation for the sandbox - and the alternative, a mark of what every
+	/// end builds for itself, is a guess about somebody else's world. What it
+	/// costs is that a refused graft is the ordinary case rather than a sign
+	/// the two ends disagree.
+	///
+	/// @param world - the world as it now stands
+	pub(crate) fn appear(&mut self, world: &World) {
+		if !self.hosting || self.peers.is_empty() {
+			return;
+		}
+
+		self.living.clear();
+		self.living
+			.extend(world.bodies.iter().map(|(id, _)| id));
+
+		if !self
+			.peers
+			.iter()
+			.any(|peer| owed(peer, &self.living).is_some())
+		{
+			return;
+		}
+
+		// once for every peer rather than once each: a description of the
+		// whole world is the expensive part and the cut is not.
+		let whole = scene::capture(world);
+		let mut index_of = vec![NO_SOLID; world.bodies.slots()];
+
+		for (index, solid) in whole.solids.iter().enumerate() {
+			let (Ok(index), Ok(slot)) = (u32::try_from(index), usize::try_from(solid.slot))
+			else {
+				continue;
+			};
+
+			if let Some(entry) = index_of.get_mut(slot) {
+				*entry = index;
+			}
+		}
+
+		for peer in &mut self.peers {
+			let Some(saying) = owed(peer, &self.living) else {
+				continue;
+			};
+			let cutting: Vec<u32> = saying
+				.iter()
+				.filter_map(|id| index_of.get(id.slot()).copied())
+				.filter(|index| *index != NO_SOLID)
+				.collect();
+
+			if cutting.is_empty() {
+				continue;
+			}
+
+			let Ok(bytes) = encode(&whole.piece(&cutting)) else {
+				warn!(address = %peer.address, "a description of what appeared could not be written");
+
+				continue;
+			};
+
+			// **not queued is not said.** A ring with no room for the whole
+			// parcel takes none of it, and the mark below is what would
+			// otherwise say a body had been described when nothing of it went
+			// out. The next snapshot tries the same bodies again.
+			if let Err(error) = parcel::post(&mut peer.reliable, Kind::Scene, &bytes) {
+				debug!(address = %peer.address, %error, "an appearance waits for room in the ring");
+
+				continue;
+			}
+
+			for id in &saying {
+				mark(&mut peer.described, *id);
+			}
+
+			self.appearances = self.appearances.saturating_add(1);
+			debug!(
+				address = %peer.address,
+				bodies = saying.len(),
+				bytes = bytes.len(),
+				"what appeared, described"
+			);
+		}
+	}
+
 	/// Puts a snapshot block into what the first peer holds, with no wire.
 	///
 	/// For a test in another module that has a world and a step to run but no
@@ -1608,10 +1787,27 @@ impl Net {
 	/// @param now - how long this endpoint has been running
 	pub(crate) fn receive(&mut self, now: Duration) {
 		self.said.clear();
-		self.described.clear();
 		self.drain(now);
 		self.deliver(now);
 		self.forget(now);
+
+		// **a description dropped here is a body that never appears**, because
+		// the ring that carried it has already counted it delivered and
+		// nothing will say it again. So the ceiling is generous and going past
+		// it is said out loud rather than counted quietly.
+		if self.described.len() > WAITING {
+			let over = self.described.len() - WAITING;
+
+			self.described.drain(..over);
+			self.crowded_out = self
+				.crowded_out
+				.saturating_add(u32::try_from(over).unwrap_or(u32::MAX));
+			warn!(
+				waiting = WAITING,
+				dropped = self.crowded_out,
+				"nothing is taking the things that have appeared, and the oldest of them are 				 being thrown away"
+			);
+		}
 	}
 
 	/// Puts one message to every peer on the wire.
@@ -1956,6 +2152,7 @@ impl Net {
 			address,
 			channel: Channel::new(self.session),
 			reliable: Reliable::new(),
+			described: Vec::new(),
 			pieces: Pieces::new(),
 			link,
 			heard: now,
@@ -2005,6 +2202,137 @@ pub(crate) fn hear(net: &mut Net, world: &mut World, now: Duration) {
 	obey(world, net);
 }
 
+/// Puts whatever has appeared elsewhere into this world.
+///
+/// The other end of [`Net::appear`]: a description that crossed is cut back
+/// into the world at the numbers the machine that wrote it uses, so that the
+/// snapshots after it drive the right bodies. @ref
+/// `colby_core::abi::scene::graft`.
+///
+/// **A slot this world already has somebody in is left alone.** For a fresh
+/// peer that is most of what it is sent, because both ends build the same
+/// scenes for themselves and only what happened during play has to cross.
+///
+/// **Only a client puts one in.** A host is the thing that decides what the
+/// world is; a description arriving at one is a peer claiming to have made
+/// something, and there is nothing on this wire that says who may.
+///
+/// @param net - this end's endpoint
+/// @param world - the world to put them into
+/// @return whether anything landed, which is when the solver owes itself a
+/// `forget` - baked collision meshes, the pairs that were touching and the
+/// impulse cache all live outside the world and have never seen these bodies
+pub(crate) fn land(net: &mut Net, world: &mut World) -> bool {
+	let arrived = net.appeared();
+
+	if arrived.is_empty() {
+		return false;
+	}
+
+	if net.hosting() {
+		warn!(
+			count = arrived.len(),
+			"a peer described part of a world at a host, which decides"
+		);
+
+		return false;
+	}
+
+	let mut landed = 0;
+
+	for description in arrived {
+		let piece = match read(&description.bytes) {
+			| Ok(piece) => piece,
+			| Err(error) => {
+				warn!(from = %description.from, %error, "a description that is not one");
+
+				continue;
+			},
+		};
+		let room = make_room(world, &piece);
+		let put = scene::graft(world, &piece);
+
+		landed += put.solids + room;
+		debug!(
+			from = %description.from,
+			entities = put.things,
+			bodies = put.solids,
+			joints = put.links,
+			already = put.taken,
+			replaced = room,
+			"what appeared elsewhere is here"
+		);
+	}
+
+	landed > 0
+}
+
+/// Takes out whatever is standing where a *newer* occupant is about to land.
+///
+/// **A slot only ever moves forward.** Both ends number a slot's occupants the
+/// same way, so a description naming a later generation than the body sitting
+/// in that slot here is a description of the thing that replaced it. Without
+/// this the graft would refuse the slot and nothing would ever say it again -
+/// the ring counts a description delivered whether or not it landed - and the
+/// body sitting there is one the far end no longer has, which a snapshot
+/// cannot take away either: it skips a slot whose generation disagrees rather
+/// than emptying it.
+///
+/// **The other way round is left alone**, and the graft refuses it: a
+/// description older than what is here crossed while something newer took the
+/// slot, and the newer thing is the one to keep.
+///
+/// What goes is what a removal takes: the body, the joints holding it and the
+/// entity it drove. @ref `Net::arrive`, which does the same three where the
+/// far end says a slot has emptied.
+///
+/// @param world - the world about to be grafted into
+/// @param piece - the description
+/// @return how many were taken out
+fn make_room(world: &mut World, piece: &SceneData) -> usize {
+	let mut gone: Vec<BodyId> = Vec::new();
+
+	for (id, _) in world.bodies.iter() {
+		if replaced(piece, id) {
+			gone.push(id);
+		}
+	}
+
+	for id in &gone {
+		let entity = world
+			.bodies
+			.get(*id)
+			.map_or(EntityId::NONE, |body| body.entity);
+
+		world.joints.forget(*id);
+		world.bodies.despawn(*id);
+		world.entities.despawn(entity);
+	}
+
+	gone.len()
+}
+
+/// Whether a description says this body's slot has somebody later in it.
+fn replaced(piece: &SceneData, id: BodyId) -> bool {
+	piece.solids.iter().any(|solid| {
+		usize::try_from(solid.slot).is_ok_and(|slot| slot == id.slot())
+			&& solid.generation > id.generation()
+	})
+}
+
+/// A description, out of the bytes it crossed as.
+///
+/// The wire carries the same format a scene on disk is written in, which is
+/// what makes an appearance cost no serialization of its own - and which is
+/// also why two ends built against different versions of that format cannot
+/// talk. Nothing says so on the wire; the protocol number covers the datagram
+/// and not this.
+///
+/// @param bytes - what arrived
+fn read(bytes: &[u8]) -> Result<SceneData> {
+	Ok(SceneFile::from_bytes(AlignedBytes::from_slice(bytes))?.to_scene_data())
+}
+
 /// Everything one endpoint does with the wire once a step.
 ///
 /// The other half of [`hear`], and out once a step rather than once a frame
@@ -2038,6 +2366,14 @@ pub(crate) fn tell(net: &mut Net, world: &World, into: &mut Vec<Slot>, hz: u16, 
 		net.ask(&[]);
 	} else {
 		net.ask(world.commands.unsettled(world.peer));
+	}
+
+	// **on a snapshot step rather than on every step**, though nothing about a
+	// description needs the cadence: it is what keeps the ring from filling
+	// with appearances faster than the far end can acknowledge them. @ref
+	// `APPEARING`, which is the other half of the same bargain.
+	if telling {
+		net.appear(world);
 	}
 
 	net.send(now, telling.then_some(into.as_slice()));
@@ -2532,6 +2868,43 @@ fn take(taking: Taking<'_>) -> bool {
 	true
 }
 
+/// Which bodies one peer has not been told the whole of.
+///
+/// Nothing when it has been told about all of them, which is almost every
+/// call. That walk is what keeps a description from costing a capture of the
+/// whole world twenty times a second.
+///
+/// @param peer - whose conversation
+/// @param living - every body there is, in slot order
+/// @return at most [`APPEARING`] of them, or nothing when there is nothing to
+/// say
+fn owed(peer: &Peer, living: &[BodyId]) -> Option<Vec<BodyId>> {
+	let saying: Vec<BodyId> = living
+		.iter()
+		.filter(|id| peer.described.get(id.slot()).copied() != Some(id.generation()))
+		.take(APPEARING)
+		.copied()
+		.collect();
+
+	(!saying.is_empty()).then_some(saying)
+}
+
+/// Writes down that a body has been described to somebody.
+///
+/// Its own function because the table has to reach the slot first, and a
+/// growth inside a loop inside a loop is one level deeper than the house rules
+/// allow.
+///
+/// @param described - that peer's marks, by slot
+/// @param id - the body that has now been described
+fn mark(described: &mut Vec<u32>, id: BodyId) {
+	if described.len() <= id.slot() {
+		described.resize(id.slot() + 1, 0);
+	}
+
+	described[id.slot()] = id.generation();
+}
+
 /// How bad the wire is, as the console table has it.
 ///
 /// A function of the table and nothing else, which is what makes it the piece
@@ -2645,7 +3018,7 @@ pub(crate) fn install(cvars: &mut Cvars) {
 mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
-	use colby_core::abi::{Transform, net::MAX_PEERS as PLAYERS};
+	use colby_core::abi::{Shape, ShapeKind, Transform, net::MAX_PEERS as PLAYERS};
 	use colby_net::{MAX_ASKED, MAX_BASELINE, MAX_PARCEL, MAX_SNAPSHOT};
 
 	use super::*;
@@ -2684,6 +3057,7 @@ mod tests {
 			address: somewhere(7),
 			channel: Channel::new(OURS),
 			reliable: Reliable::new(),
+			described: Vec::new(),
 			pieces: Pieces::new(),
 			link: Link::new(1),
 			heard: Duration::ZERO,
@@ -4227,9 +4601,9 @@ mod tests {
 			round(&mut host, &mut client, step);
 			got.extend(
 				client
-					.described()
-					.iter()
-					.map(|described| described.bytes.clone()),
+					.appeared()
+					.into_iter()
+					.map(|described| described.bytes),
 			);
 			assert!(client.said().is_empty(), "and it is not a console line");
 		}
@@ -4283,6 +4657,408 @@ mod tests {
 		assert_eq!(host.forgotten(), 1);
 	}
 
+	/// A world both ends build for themselves: three bodies, each with a thing.
+	fn built() -> Box<World> {
+		let mut world = empty_world();
+
+		for index in 0..3 {
+			let entity = world.entities.spawn();
+
+			world
+				.entities
+				.set_name(entity, &format!("built {index}"));
+
+			let body = world.bodies.spawn(Body {
+				kind: BodyKind::Dynamic,
+				entity,
+				shape: Shape {
+					extents: Vec3::splat(0.5),
+					..Shape::default()
+				},
+				..Body::default()
+			});
+
+			world
+				.bodies
+				.set_name(body, &format!("built {index}"));
+		}
+
+		world
+	}
+
+	/// One body with a shape and a name nothing else in the world has.
+	fn prop(world: &mut World, name: &str, at: f32) -> BodyId {
+		let entity = world.entities.spawn();
+
+		world.entities.set_name(entity, name);
+
+		let body = world.bodies.spawn(Body {
+			kind: BodyKind::Dynamic,
+			entity,
+			shape: Shape {
+				kind: ShapeKind::Sphere,
+				radius: 0.75,
+				..Shape::default()
+			},
+			transform: Transform {
+				position: Vec3::new(at, 2.0, -at),
+				..Transform::IDENTITY
+			},
+			..Body::default()
+		});
+
+		world.bodies.set_name(body, name);
+		body
+	}
+
+	/// Everything alive in a body table, as slot, generation, name and shape.
+	fn shape_of(world: &World) -> Vec<(usize, u32, String, Shape)> {
+		world
+			.bodies
+			.iter()
+			.map(|(id, body)| {
+				(id.slot(), id.generation(), world.bodies.name(id).to_owned(), body.shape)
+			})
+			.collect()
+	}
+
+	/// One round of describing, sending, taking off the wire and putting in.
+	///
+	/// @return whether anything landed on this round
+	fn exchange(
+		host: &mut Net,
+		client: &mut Net,
+		theirs: &World,
+		ours: &mut World,
+		step: u32,
+	) -> bool {
+		let now = colby_core::time::STEP * step;
+
+		host.appear(theirs);
+		host.send(now, None);
+		client.receive(now);
+
+		let put = land(client, ours);
+
+		host.receive(now);
+		client.send(now, None);
+		put
+	}
+
+	#[test]
+	fn a_body_that_appeared_on_a_host_appears_on_a_client() {
+		// the whole of pass C in one run, and the assertion is the one the
+		// design asked for: the client's table is the host's table, slot for
+		// slot, generation for generation, with the shapes and names a
+		// snapshot has no room for.
+		//
+		// The two worlds start alike because both ends build the same scenes
+		// for themselves, which is what the seats reserved at load are. What
+		// crosses is only what happened afterwards.
+		let (mut host, mut client, _wire) = two();
+		let (mut theirs, mut ours) = (built(), built());
+
+		// a window that went looking for a host is not the authority, which is
+		// what makes every body in its world somebody else's. @ref
+		// `App::resumed`.
+		ours.peer = PeerId::NONE;
+		round(&mut host, &mut client, 1);
+		assert_eq!(shape_of(&theirs), shape_of(&ours), "and they start the same");
+
+		// **the world as it stands is described first**, so that every slot
+		// below has a mark on it before anything changes hands. Without that
+		// the run could not tell "this slot has somebody new in it" from "this
+		// slot has never been spoken of".
+		for step in 2..6 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(host.appearances(), 1, "the three it already had, told once");
+		assert_eq!(shape_of(&ours), shape_of(&theirs), "and refused at the far end, all three");
+
+		// and now a slot changes hands: emptied and taken by somebody else,
+		// which is the case a generation is the only thing that tells apart.
+		let second = theirs
+			.bodies
+			.iter()
+			.map(|(id, _)| id)
+			.nth(1)
+			.expect("three of them");
+
+		theirs.bodies.despawn(second);
+
+		let ball = prop(&mut theirs, "ball", 7.0);
+
+		prop(&mut theirs, "crate", -3.0);
+		assert_eq!(
+			(ball.slot(), ball.generation()),
+			(second.slot(), second.generation() + 1),
+			"the fixture has to change a slot's hands or it says nothing about generations"
+		);
+		assert_ne!(shape_of(&theirs), shape_of(&ours), "and now they do not agree");
+
+		let mut put = false;
+
+		for step in 6..12 {
+			put |= exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert!(put, "and the step it landed on is the one that owes the solver a forget");
+		assert_eq!(host.appearances(), 2, "one more appearance said what changed");
+		assert_eq!(shape_of(&ours), shape_of(&theirs), "slot for slot, and the same things");
+
+		// and it is not said again, however long the conversation runs.
+		for step in 12..24 {
+			host.appear(&theirs);
+			host.send(colby_core::time::STEP * step, None);
+			client.receive(colby_core::time::STEP * step);
+			assert!(client.appeared().is_empty(), "nothing more to say at step {step}");
+			host.receive(colby_core::time::STEP * step);
+			client.send(colby_core::time::STEP * step, None);
+		}
+
+		assert_eq!(host.appearances(), 2);
+
+		// and the thing that appeared is then driven by the differences like
+		// anything else, which is the half a description does not do.
+		let mut records = Vec::new();
+
+		theirs
+			.bodies
+			.get_mut(ball)
+			.expect("it is there")
+			.transform
+			.position
+			.x = 12.0;
+		crate::net::records(&theirs.bodies, &mut records);
+		host.send(colby_core::time::STEP * 24, Some(&records));
+		client.receive(colby_core::time::STEP * 24);
+		client.arrive(&mut ours, colby_core::time::STEP * 24);
+
+		let entity = ours
+			.bodies
+			.get(ball)
+			.expect("the same handle, on the other machine")
+			.entity;
+
+		assert_eq!(
+			ours.entities
+				.transform(entity)
+				.map(|it| it.position.x),
+			Some(12.0),
+			"driven to where the host put it, through the entity the solver copies from"
+		);
+		assert_eq!(
+			ours.bodies.get(ball).map(|body| body.kind),
+			Some(BodyKind::Kinematic),
+			"and it is the wire holding the pen, not the solver"
+		);
+	}
+
+	#[test]
+	fn an_appearance_the_ring_had_no_room_for_is_said_again() {
+		// **not queued is not said.** A ring with no room takes none of a
+		// parcel, and a mark written anyway would be a body described to
+		// nobody and never mentioned again.
+		let (mut host, mut client, _wire) = two();
+		let (theirs, mut ours) = (built(), empty_world());
+
+		ours.peer = PeerId::NONE;
+		round(&mut host, &mut client, 1);
+		host.post(Kind::Scene, &vec![0xD1; MAX_PARCEL])
+			.expect("a ringful, and now there is no room for anything");
+		host.appear(&theirs);
+		assert_eq!(host.appearances(), 0, "there was nowhere to put it");
+
+		for step in 2..14 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(host.appearances(), 1, "and once the ring drained it went");
+		assert_eq!(shape_of(&ours), shape_of(&theirs), "with the whole world in it");
+	}
+
+	#[test]
+	fn a_world_that_has_diverged_by_more_than_one_appearance_is_told_over_several() {
+		// the ring has no window, so an appearance is deliberately small and a
+		// big divergence is told a few bodies at a time rather than all at
+		// once. @ref `APPEARING`.
+		let (mut host, mut client, _wire) = two();
+		let (mut theirs, mut ours) = (built(), built());
+
+		ours.peer = PeerId::NONE;
+		round(&mut host, &mut client, 1);
+
+		for index in 0..=APPEARING * 2 {
+			prop(&mut theirs, &format!("prop {index}"), 1.0);
+		}
+
+		// **one round, and count what came of it.** The three the client built
+		// for itself are the first three of the twelve owed, so an appearance
+		// of four leaves it holding four bodies and one of five would leave it
+		// holding five - which is the only assertion here that can tell those
+		// two apart.
+		exchange(&mut host, &mut client, &theirs, &mut ours, 2);
+		assert_eq!(
+			ours.bodies.iter().count(),
+			3 + 1,
+			"the three it had, and the one new body an appearance of four reaches"
+		);
+
+		for step in 3..14 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(shape_of(&ours), shape_of(&theirs), "all of it arrived");
+		assert_eq!(host.appearances(), 3, "in three appearances of four bodies each");
+	}
+
+	#[test]
+	fn room_is_made_for_a_later_occupant_and_not_for_an_earlier_one() {
+		// a slot only ever moves forward, so which of the two generations is
+		// the bigger is the whole of the rule. A fixture where they are equal
+		// or where only one of the two orders is tried cannot show it.
+		let mut described = empty_world();
+		let first = described.bodies.spawn(Body::default());
+
+		described.bodies.despawn(first);
+
+		let second = described.bodies.spawn(Body::default());
+
+		assert_eq!(second.generation(), 2, "the second occupant of the slot");
+
+		let piece = scene::capture(&described);
+		let mut behind = empty_world();
+		let older = behind.bodies.spawn(Body::default());
+
+		// **and a body at a slot the description says nothing about**, whose
+		// generation is just as far behind. Without it the test cannot tell
+		// "the slot this record names" from "any slot at all".
+		for _ in 0..3 {
+			behind.bodies.spawn(Body::default());
+		}
+
+		assert_eq!(make_room(&mut behind, &piece), 1, "the older one at that slot goes");
+		assert!(!behind.bodies.alive(older));
+		assert_eq!(behind.bodies.iter().count(), 3, "and the three elsewhere stay");
+
+		let mut ahead = empty_world();
+		let mut occupant = ahead.bodies.spawn(Body::default());
+
+		for _ in 0..2 {
+			ahead.bodies.despawn(occupant);
+			occupant = ahead.bodies.spawn(Body::default());
+		}
+
+		assert_eq!(occupant.generation(), 3, "one past what the description names");
+		assert_eq!(make_room(&mut ahead, &piece), 0, "and a newer one stays");
+		assert_eq!(ahead.bodies.iter().count(), 1);
+	}
+
+	#[test]
+	fn descriptions_nothing_is_taking_do_not_pile_up_forever() {
+		// a description dropped here is a body that never appears, so the
+		// ceiling is generous and going past it says so. What fills it is a
+		// world nothing is stepping while somebody else builds.
+		let (mut host, mut client, _wire) = two();
+
+		round(&mut host, &mut client, 1);
+
+		for index in 0..WAITING + 3 {
+			client.described.push(Described {
+				from: somewhere(1),
+				bytes: vec![u8::try_from(index % 251).unwrap_or(0)],
+			});
+		}
+
+		client.receive(colby_core::time::STEP * 2);
+		assert_eq!(client.described.len(), WAITING, "the ceiling holds");
+		assert_eq!(client.crowded_out(), 3, "and what went is counted");
+		assert_eq!(
+			client.described[0].bytes,
+			vec![3_u8],
+			"the oldest are what go, so the newest still land"
+		);
+	}
+
+	#[test]
+	fn an_appearance_goes_on_a_snapshot_step_and_not_on_the_others() {
+		// nothing about a description needs the snapshot cadence - the ring
+		// carries it whenever it is queued - and it is held to that cadence
+		// anyway, because it is what keeps appearances from piling into the
+		// ring faster than the far end can take them out.
+		let (mut host, mut client, _wire) = two();
+		let mut theirs = built();
+
+		round(&mut host, &mut client, 1);
+
+		for step in [1_u64, 2, 4, 5] {
+			theirs.steps = step;
+			tell(&mut host, &theirs, &mut Vec::new(), 60, colby_core::time::STEP * 2);
+			assert_eq!(host.appearances(), 0, "step {step} is not one the world goes out on");
+		}
+
+		theirs.steps = 3;
+		tell(&mut host, &theirs, &mut Vec::new(), 60, colby_core::time::STEP * 2);
+		assert_eq!(host.appearances(), 1, "and the third step is");
+	}
+
+	#[test]
+	fn a_client_does_not_describe_and_a_host_does_not_listen() {
+		// the authority rule, both ways round. A client has nothing to say
+		// about what the world is, and a host that is told is being lied to.
+		let (mut host, mut client, _wire) = two();
+		let mut world = built();
+
+		round(&mut host, &mut client, 1);
+		client.appear(&world);
+		assert_eq!(client.appearances(), 0, "a client describes nothing");
+
+		// **a description that would land if nothing refused it**, which is
+		// what makes this about the authority rather than about the bytes: a
+		// real world, encoded the way a host would encode one, of bodies the
+		// host has none of.
+		let mut mine = empty_world();
+
+		// **at a slot this host has nothing in**, or the graft would refuse it
+		// for being occupied and the run would say nothing about the rule it
+		// is named after.
+		for _ in 0..4 {
+			mine.bodies.spawn(Body::default());
+		}
+
+		let made = prop(&mut mine, "a thing a client made up", 5.0);
+
+		assert!(world.bodies.get(made).is_none(), "and nothing of the host's is at it");
+
+		let lie = encode(&scene::capture(&mine).piece(&[4])).expect("a description of it");
+
+		client
+			.post(Kind::Scene, &lie)
+			.expect("the wire carries it all the same");
+		round(&mut host, &mut client, 2);
+
+		let before = shape_of(&world);
+
+		assert!(!land(&mut host, &mut world), "and a host puts none of it in");
+		assert_eq!(shape_of(&world), before, "the world a host decides is untouched");
+	}
+
+	#[test]
+	fn a_description_that_is_not_one_costs_the_conversation_nothing() {
+		let (mut host, mut client, _wire) = two();
+		let mut ours = built();
+		let before = shape_of(&ours);
+
+		round(&mut host, &mut client, 1);
+		host.post(Kind::Scene, b"this is not a compiled scene")
+			.expect("the ring carries bytes");
+		round(&mut host, &mut client, 2);
+		assert!(!land(&mut client, &mut ours), "nothing landed");
+		assert_eq!(shape_of(&ours), before, "and the world is as it was");
+		assert_eq!(client.peers(), 1, "the peer is still one this end talks to");
+	}
+
 	#[test]
 	fn a_message_with_every_block_at_its_worst_still_goes_out() {
 		// the one configuration where the three blocks of a message all want
@@ -4314,7 +5090,7 @@ mod tests {
 
 		client.receive(colby_core::time::STEP * 2);
 		assert_eq!(client.delivered(), 1, "and it arrived whole at the far end");
-		assert_eq!(client.described().len(), 1, "with the world description in it");
+		assert_eq!(client.appeared().len(), 1, "with the world description in it");
 		assert_eq!(client.garbled(), 0, "nothing in it was too long to read");
 		assert!(client.holding(0) > NOTHING, "and a snapshot as well");
 	}
@@ -4352,7 +5128,7 @@ mod tests {
 		host.receive(Duration::ZERO);
 
 		assert!(host.said().is_empty(), "a parcel of no known kind says nothing");
-		assert!(host.described().is_empty());
+		assert!(host.appeared().is_empty());
 		assert_eq!(host.peers(), 0, "and the peer that sent it is not talked to again");
 		assert_eq!(host.forgotten(), 1);
 	}

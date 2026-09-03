@@ -178,6 +178,27 @@ pub(crate) fn run(
 		// same reason: what stops while a world is being edited is everything
 		// that *moves* it, and a wire is a third thing that moves it.
 		if let Some(wire) = wire {
+			// **what a thing *is* before where it is.** A description carries
+			// the shape, the mass and the name a snapshot has no room for, so
+			// a body that appeared elsewhere has to exist here before the
+			// difference that moves it can find it. Both are inside the
+			// edit-mode guard, and for the same reason: making bodies is a
+			// fourth thing that moves a world.
+			if crate::net::land(wire.net, world) {
+				// immediately, and it is this caller's obligation rather than
+				// something a graft can discharge - the same debt
+				// `scene::restore` leaves. @ref `Simulation::forget`.
+				//
+				// @note: nothing after a step can observe this. It drops the
+				// baked colliders, the pairs that were touching and the
+				// impulse cache, and the step below rebuilds all three, so a
+				// world stepped with it and a world stepped without it are the
+				// same world by the time anything can look. It is kept because
+				// the obligation is real: a body that appeared is a body every
+				// one of those caches has never seen.
+				simulation.forget();
+			}
+
 			wire.net.arrive(
 				world,
 				wire.now
@@ -362,6 +383,63 @@ mod tests {
 		};
 
 		run(world, parts, &mut Input::default(), Rate::DEFAULT, 0.0, editing);
+	}
+
+	/// A body that appeared elsewhere is in the world by the end of the step
+	/// that took the description, and is driven by the same step.
+	///
+	/// **The order is the point.** A description says what a thing is and a
+	/// snapshot says where it is; the second is useless until the first has
+	/// happened, and both are in the half of a step that edit mode turns off.
+	#[test]
+	fn a_thing_that_appeared_elsewhere_is_in_the_world_after_a_step() {
+		use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+		use colby_core::abi::scene;
+
+		let (mut net, mut world, mut simulation, _entity, _body) = wired_client();
+		let mut elsewhere = Box::<World>::default();
+
+		// somewhere above where this world's table reaches, so that what lands
+		// is a slot nothing here has rather than one already occupied.
+		for _ in 0..3 {
+			elsewhere.entities.spawn();
+			elsewhere.bodies.spawn(Body::default());
+		}
+
+		let thing = elsewhere.entities.spawn();
+
+		elsewhere
+			.entities
+			.set_name(thing, "a crate somewhere else");
+
+		let made = elsewhere
+			.bodies
+			.spawn(Body::dynamic(Shape::ball(0.25), Transform::IDENTITY, 2.0).driving(thing));
+
+		elsewhere
+			.bodies
+			.set_name(made, "a crate somewhere else");
+		assert!(world.bodies.get(made).is_none(), "this world has nothing at that slot");
+
+		// only the one, which is what a host describing what a peer has not
+		// been told cuts out of the world it is holding.
+		let described = scene::capture(&elsewhere).piece(&[3]);
+		let bytes = colby_asset::scene::encode(&described).expect("a description");
+
+		net.describing(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1), &bytes);
+		stepped_at(&mut net, &mut world, &mut simulation, 0);
+
+		assert_eq!(
+			world.bodies.name(made),
+			"a crate somewhere else",
+			"the same handle, in this world, with the name a snapshot has no room for"
+		);
+		assert_eq!(
+			world.entities.name(thing),
+			"a crate somewhere else",
+			"and the thing it drives with it"
+		);
 	}
 
 	/// A command is offered for one step, whoever does or does not act on it.
