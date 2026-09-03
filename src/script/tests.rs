@@ -2557,6 +2557,18 @@ fn thrusting() -> (World, BodyId) {
 /// for and a tolerance would hide the smallest of them.
 fn untouched(seen: f32) -> bool { seen == 0.0 }
 
+/// How hard something is being pushed straight up, in newtons.
+///
+/// The program writes a *force* now rather than a speed, and no solver runs in
+/// these tests, so this is where its work lands. What the force then does to a
+/// velocity has its own test, with a real solver under it.
+fn pushed(world: &World, it: BodyId) -> f32 {
+	world
+		.bodies
+		.get(it)
+		.map_or(0.0, |body| body.force.y)
+}
+
 /// How fast something is going straight up.
 fn rising(world: &World, it: BodyId) -> f32 {
 	world
@@ -2573,7 +2585,7 @@ fn the_shipped_thruster_pushes_only_once_it_is_switched_on() {
 	world.dt = 1.0 / 60.0;
 	stepped(&mut scripts, &mut world);
 
-	assert!(untouched(rising(&world, it)), "nothing is pushed until somebody says so");
+	assert!(untouched(pushed(&world, it)), "nothing is pushed until somebody says so");
 	assert!(
 		world.cvars.get("thruster.on").is_some()
 			&& world.cvars.get("thruster.off").is_some()
@@ -2583,24 +2595,30 @@ fn the_shipped_thruster_pushes_only_once_it_is_switched_on() {
 
 	scripts.gameplay(&mut world, &typed("thruster.on"));
 
-	let after = rising(&world, it);
+	let after = pushed(&world, it);
 
-	assert!(after > 0.0, "and now it climbs: {after}");
+	assert!(after > 0.0, "and now it pushes: {after}");
 	assert!(
-		(after - 16.0 / 60.0).abs() < 1e-4,
-		"by its own force over one step, and by nothing else: {after}"
+		(after - 16.0).abs() < 1e-4,
+		"by its own sixteen newtons, and by nothing else: {after}"
+	);
+	assert!(
+		untouched(rising(&world, it)),
+		"and it does not write a speed at all any more, which is what makes it obey a mass"
 	);
 }
 
 #[test]
-fn the_shipped_thruster_adds_to_the_speed_a_thing_already_had() {
+fn the_shipped_thruster_adds_to_what_is_already_pushing_rather_than_replacing_it() {
 	// **a push rather than a set**, and a single tick cannot tell the two
-	// apart: after one step from rest they agree exactly. What separates them
-	// is a thing that was already moving, and a second step.
+	// apart: after one from nothing they agree exactly. What separates them is
+	// a second tick with nothing spending what the first left.
 	let (mut world, it) = thrusting();
 	let mut scripts = machine();
 
 	world.dt = 1.0 / 60.0;
+	// something already moving, to say that a force is not a speed: a program
+	// that still wrote a velocity would move this number and this one does not.
 	if let Some(body) = world.bodies.get_mut(it) {
 		body.velocity = colby_core::glam::Vec3::new(0.0, 3.0, 0.0);
 	}
@@ -2608,20 +2626,130 @@ fn the_shipped_thruster_adds_to_the_speed_a_thing_already_had() {
 	stepped(&mut scripts, &mut world);
 	scripts.gameplay(&mut world, &typed("thruster.on"));
 
-	let once = rising(&world, it);
+	let once = pushed(&world, it);
 
-	assert!(
-		(once - (3.0 + 16.0 / 60.0)).abs() < 1e-4,
-		"the first push is added to what it was already doing: {once}"
-	);
+	assert!((once - 16.0).abs() < 1e-4, "one tick is one thruster's worth: {once}");
 
+	// no solver runs here, so nothing spends what was accumulated and a second
+	// tick lands on top of the first. Under a real step the solver clears it
+	// between the two, which is what the test below drives.
 	scripts.gameplay(&mut world, &[]);
 
-	let twice = rising(&world, it);
+	let twice = pushed(&world, it);
 
 	assert!(
-		(twice - (3.0 + 2.0 * 16.0 / 60.0)).abs() < 1e-4,
-		"and the second is added to the first: {twice}"
+		(twice - 32.0).abs() < 1e-4,
+		"and the second is added to the first rather than replacing it: {twice}"
+	);
+	assert!(
+		(rising(&world, it) - 3.0).abs() < 1e-4,
+		"while the speed it was already going is untouched by any of it"
+	);
+}
+
+#[test]
+fn a_program_can_turn_a_body_without_moving_it() {
+	// the two calls are one line apart and take the same three numbers, so
+	// what tells them apart is which field they land in. A test that only
+	// asked whether *something* happened would pass either way round.
+	let mut world = running(
+		r#"function tick(dt)
+			local it = body.find("spun")
+			body.spin(it, 0, 5, 0)
+		end"#,
+	);
+	let drawn = world.entities.spawn();
+	let spun = world.bodies.spawn(
+		Body::dynamic(
+			Shape::cuboid(colby_core::glam::Vec3::splat(0.5)),
+			Transform::IDENTITY,
+			1.0,
+		)
+		.driving(drawn),
+	);
+
+	world.bodies.set_name(spun, "spun");
+	world.dt = 1.0 / 60.0;
+
+	let mut scripts = machine();
+
+	stepped(&mut scripts, &mut world);
+
+	let body = world.bodies.get(spun).expect("it is alive");
+
+	assert!(
+		(body.torque.y - 5.0).abs() < 1e-4,
+		"a spin is a turn, and it is the number the program asked for: {}",
+		body.torque
+	);
+	assert_eq!(body.force, colby_core::glam::Vec3::ZERO, "and nothing is pushing it anywhere");
+}
+
+#[test]
+fn the_shipped_thruster_lifts_a_heavy_prop_slower_than_a_light_one() {
+	// **the whole point of the change, and the one thing no other test here
+	// can see**: what a force does depends on what the thing weighs, and that
+	// only happens where a real solver runs. Two thrusters, one four times the
+	// other's mass, nothing else different.
+	let mut world = World::new();
+	let simulation = &mut Box::new(colby_physics::Simulation::new());
+
+	world.install_physics(simulation.table());
+	world.dt = 1.0 / 60.0;
+	// no gravity, so what is measured is the push rather than the difference
+	// between the push and the fall - at sixteen newtons the heavy one would
+	// not leave the ground at all and the test would be about that instead.
+	world.gravity = colby_core::glam::Vec3::ZERO;
+	world
+		.sounds
+		.insert("sounds/hum", colby_core::abi::SoundData {
+			samples: vec![0; 48_000],
+			rate: 48_000,
+			channels: 1,
+		});
+	world
+		.scripts
+		.insert("scripts/thruster", ScriptData { source: THRUSTER.to_owned() });
+
+	let mut made = |mass: f32, at: f32| {
+		let drawn = world
+			.entities
+			.spawn_at(Transform::at(colby_core::glam::Vec3::new(at, 0.0, 0.0)));
+		let it = world.bodies.spawn(
+			Body::dynamic(
+				Shape::cuboid(colby_core::glam::Vec3::splat(0.5)),
+				Transform::at(colby_core::glam::Vec3::new(at, 0.0, 0.0)),
+				mass,
+			)
+			.driving(drawn),
+		);
+
+		world.bodies.set_name(it, "thruster");
+
+		it
+	};
+
+	let light = made(1.0, -8.0);
+	let heavy = made(4.0, 8.0);
+
+	let mut scripts = machine();
+
+	stepped(&mut scripts, &mut world);
+	scripts.gameplay(&mut world, &typed("thruster.on"));
+
+	for _ in 0..30 {
+		simulation.step(&mut world);
+		world.bodies.end_step();
+		scripts.gameplay(&mut world, &[]);
+	}
+
+	let (quick, slow) = (rising(&world, light), rising(&world, heavy));
+
+	assert!(quick > 0.0, "the light one is climbing, at {quick}");
+	assert!(
+		(quick / slow - 4.0).abs() < 0.05,
+		"and four times as fast as the one four times as heavy, which is what it could not do \
+		 while it wrote a speed: {quick} against {slow}"
 	);
 }
 
@@ -2647,9 +2775,9 @@ fn the_shipped_thruster_pushes_along_its_own_up_rather_than_the_worlds() {
 	scripts.gameplay(&mut world, &typed("thruster.on"));
 
 	assert!(
-		rising(&world, it) < -0.2,
+		pushed(&world, it) < -0.2,
 		"upside down, it pushes itself into the floor: {}",
-		rising(&world, it)
+		pushed(&world, it)
 	);
 }
 

@@ -202,6 +202,7 @@ where
 	drawing(scope, tables, world)?;
 	bodies(scope, tables, world)?;
 	moving(scope, tables, world)?;
+	pushing(scope, tables, world)?;
 	resting(scope, tables, world)?;
 	touching(scope, tables, world)?;
 	asking(scope, tables, world)?;
@@ -964,6 +965,59 @@ where
 	tables.bodies.set("set_velocity", set_velocity)?;
 	tables.bodies.set("angular", angular)?;
 	tables.bodies.set("set_angular", set_angular)?;
+
+	Ok(())
+}
+
+/// `body` a fourth time - what is pushing on it.
+///
+/// Its own function for the reason the three above are: the split in this file
+/// is by subject rather than by size, and a force is a different subject from a
+/// position or a speed. It is also the one of the four that a program cannot
+/// write itself out of a velocity, because what a force does depends on a mass
+/// the table knows and the program does not.
+///
+/// @param scope - the scope every callback is built in
+/// @param tables - the tables to fill
+/// @param world - the world the callbacks reach through
+fn pushing<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	// the two that push rather than *set*. What separates them from
+	// `set_velocity` above is the mass: a speed written straight in is the same
+	// for a feather and for a crate, and a force divided by what a thing weighs
+	// is not. That difference is the whole reason these exist.
+	let push =
+		scope.create_function(move |_, (bits, x, y, z): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Body)? else {
+				return Ok(false);
+			};
+
+			Ok(world
+				.borrow_mut()
+				.bodies
+				.apply_force(handle.body(), Vec3::new(x, y, z)))
+		})?;
+
+	let spin =
+		scope.create_function(move |_, (bits, x, y, z): (Option<i64>, f32, f32, f32)| {
+			let Some(handle) = taken(bits, Kind::Body)? else {
+				return Ok(false);
+			};
+
+			Ok(world
+				.borrow_mut()
+				.bodies
+				.apply_torque(handle.body(), Vec3::new(x, y, z)))
+		})?;
+
+	tables.bodies.set("push", push)?;
+	tables.bodies.set("spin", spin)?;
 
 	Ok(())
 }

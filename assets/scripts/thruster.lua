@@ -11,10 +11,16 @@
 -- Type `thruster.on` at the console with a few of them spawned and frozen into
 -- a shape, and the shape flies.
 
--- How hard one pushes, in units a second squared.
+-- How hard one pushes, in newtons.
 --
--- Well over the world's own 9.81 so that a thruster carrying a crate still
--- climbs, and not so far over that a bare one leaves the map in a second.
+-- **Newtons rather than units a second squared**, which is what this number
+-- was until a body could be handed a force: it is now divided by whatever the
+-- thing weighs, so one thruster lifts its own one-kilogram prop briskly and
+-- two of them are needed to lift it and a crate. That is the point of the
+-- change and it is a change in behavior, not only in units.
+--
+-- Sixteen is well over the 9.81 a kilogram needs to hover, and not so far over
+-- that a bare thruster leaves the map in a second.
 local FORCE = 16.0
 
 -- What the prop's body is called. A prop is a `.scene` of one entity and one
@@ -58,17 +64,16 @@ colby.publish("thruster.toggle", "switch every thruster over", function()
 end)
 
 -- Pushes one thruster along its own up, and says so.
-local function push(it, dt)
+local function push(it)
 	local drawn = body.entity(it)
 	local ux, uy, uz = entity.up(drawn)
 	local px, py, pz = body.position(it)
 
-	-- there is no way to apply a *force* to a body anywhere in this engine, so
-	-- what a push is here is the speed itself, written every step. That is an
-	-- impulse rather than a force and it ignores the mass, which is why a
-	-- thruster lifts a heavy crate exactly as fast as a light one.
-	local vx, vy, vz = body.velocity(it)
-	body.set_velocity(it, vx + ux * FORCE * dt, vy + uy * FORCE * dt, vz + uz * FORCE * dt)
+	-- a force rather than a speed, so what this does depends on what the
+	-- thing weighs. The engine divides by the mass and spends it over the step,
+	-- which is why `dt` is no longer in this line: a force is a rate already.
+	-- @ref `Bodies::apply_force`.
+	body.push(it, ux * FORCE, uy * FORCE, uz * FORCE)
 
 	draw.arrow(px, py, pz, px - ux * ARROW, py - uy * ARROW, pz - uz * ARROW, 1.0, 0.5, 0.1)
 
@@ -98,7 +103,7 @@ function tick(dt)
 			now[#now + 1] = it
 
 			if burning then
-				push(it, dt)
+				push(it)
 			else
 				hush(it)
 			end
