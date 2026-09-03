@@ -1238,6 +1238,67 @@ impl Bodies {
 		handles
 	}
 
+	/// Puts one body into a named slot of a table that is already in use.
+	///
+	/// **The difference from [`restore`](Self::restore) is what is left
+	/// alone.** A restore empties the table and rebuilds it, which is what
+	/// replacing a world means; this puts one record into a world that goes on
+	/// being the world it was, which is what a machine does when it is told
+	/// that a thing has appeared somewhere else. Everything already here keeps
+	/// its slot, its generation and its handle.
+	///
+	/// **The slot is the far end's, not this end's**, and that is the whole
+	/// reason this exists rather than [`spawn`](Self::spawn): a snapshot names
+	/// a body by the slot it is in, so a body put anywhere else would have
+	/// every difference after it drive the wrong thing. The table grows to
+	/// reach the slot when it has to, and the slots it passes on the way are
+	/// pushed onto the free list rather than lost.
+	///
+	/// @param slot - which array index the far end has it in
+	/// @param generation - which occupant of that slot it is; nought is lifted
+	/// to one for the reason [`put`](Self::put) lifts it
+	/// @param body - the record
+	/// @return the handle, or [`BodyId::NONE`] when the slot is past the
+	/// ceiling or is already occupied here
+	pub fn graft(&mut self, slot: usize, generation: u32, body: Body) -> BodyId {
+		if slot >= MAX_BODIES {
+			return BodyId::NONE;
+		}
+
+		while self.bodies.len() <= slot {
+			// grown a slot at a time the way `take_slot` grows it, so the two
+			// cannot disagree about what an empty slot is made of.
+			self.bodies.push(Body::default());
+			self.names.push();
+			self.generations.push(0);
+			self.alive.push(false);
+
+			// every slot passed on the way is free rather than lost: without
+			// this a graft into a far slot would make every spawn afterwards
+			// grow the table again past a hole nothing could reach.
+			let grown = self.bodies.len() - 1;
+
+			if grown != slot
+				&& let Ok(index) = u32::try_from(grown)
+			{
+				self.free.push(index);
+			}
+		}
+
+		if self.alive.get(slot).copied().unwrap_or(true) {
+			return BodyId::NONE;
+		}
+
+		// **taken out of the free list before it is filled**, or the next spawn
+		// hands out a slot this body is in.
+		if let Ok(index) = u32::try_from(slot) {
+			self.free.retain(|free| *free != index);
+		}
+
+		self.generations[slot] = generation;
+		self.put(slot, body)
+	}
+
 	/// Puts one body back into a slot a [`restore`](Self::restore) has just
 	/// sized the table for.
 	fn put(&mut self, slot: usize, body: Body) -> BodyId {

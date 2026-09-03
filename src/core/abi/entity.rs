@@ -646,6 +646,59 @@ impl Entities {
 		handles
 	}
 
+	/// Puts one entity into a named slot of a table that is already in use.
+	///
+	/// The entity half of [`Bodies::graft`](crate::abi::Bodies::graft), and
+	/// the whole of the argument is there: a restore empties the table and
+	/// this does not, because what is being described is one thing that
+	/// appeared rather than a world that was replaced.
+	///
+	/// @param slot - which array index the far end has it in
+	/// @param generation - which occupant of that slot it is
+	/// @param transform - where it is
+	/// @param renderable - what it looks like
+	/// @return the handle, or [`EntityId::NONE`] when the slot is past the
+	/// ceiling or is already occupied here
+	pub fn graft(
+		&mut self,
+		slot: usize,
+		generation: u32,
+		transform: Transform,
+		renderable: Renderable,
+	) -> EntityId {
+		if slot >= MAX_ENTITIES {
+			return EntityId::NONE;
+		}
+
+		while self.alive.len() <= slot {
+			self.transforms.push(Transform::IDENTITY);
+			self.previous.push(Transform::IDENTITY);
+			self.renderables.push(Renderable::NOTHING);
+			self.names.push();
+			self.generations.push(0);
+			self.alive.push(false);
+
+			let grown = self.alive.len() - 1;
+
+			if grown != slot
+				&& let Ok(index) = u32::try_from(grown)
+			{
+				self.free.push(index);
+			}
+		}
+
+		if self.alive.get(slot).copied().unwrap_or(true) {
+			return EntityId::NONE;
+		}
+
+		if let Ok(index) = u32::try_from(slot) {
+			self.free.retain(|free| *free != index);
+		}
+
+		self.generations[slot] = generation;
+		self.put(slot, transform, renderable)
+	}
+
 	/// Puts one entity back into a slot a [`restore`](Self::restore) has just
 	/// sized the table for.
 	///

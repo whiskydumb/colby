@@ -439,6 +439,50 @@ impl Joints {
 		handles
 	}
 
+	/// Puts one joint into a named slot of a table that is already in use.
+	///
+	/// The joint half of [`Bodies::graft`](crate::abi::Bodies::graft). A joint
+	/// grafted before the bodies it holds would name handles that are not
+	/// there yet, so the caller does the bodies first - which is the order a
+	/// restore already uses and for the same reason.
+	///
+	/// @param slot - which array index the far end has it in
+	/// @param generation - which occupant of that slot it is
+	/// @param joint - the record
+	/// @return the handle, or [`JointId::NONE`] when the slot is past the
+	/// ceiling or is already occupied here
+	pub fn graft(&mut self, slot: usize, generation: u32, joint: Joint) -> JointId {
+		if slot >= MAX_JOINTS {
+			return JointId::NONE;
+		}
+
+		while self.joints.len() <= slot {
+			self.joints.push(Joint::default());
+			self.names.push();
+			self.generations.push(0);
+			self.alive.push(false);
+
+			let grown = self.joints.len() - 1;
+
+			if grown != slot
+				&& let Ok(index) = u32::try_from(grown)
+			{
+				self.free.push(index);
+			}
+		}
+
+		if self.alive.get(slot).copied().unwrap_or(true) {
+			return JointId::NONE;
+		}
+
+		if let Ok(index) = u32::try_from(slot) {
+			self.free.retain(|free| *free != index);
+		}
+
+		self.generations[slot] = generation;
+		self.put(slot, joint)
+	}
+
 	/// Puts one joint back into a slot a [`restore`](Self::restore) has just
 	/// sized the table for.
 	fn put(&mut self, slot: usize, joint: Joint) -> JointId {

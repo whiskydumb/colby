@@ -78,8 +78,8 @@ pub use self::{
 	ragdoll::{Build, MAX_PARTS, NO_PART, Part, Ragdoll, Segment},
 	registry::{Entry, Registry},
 	scene::{
-		Arena, Form, Link, Posed, Remap, Restored, Scene, SceneData, SceneId, Scenes, Solid,
-		Stage, Thing,
+		Arena, Form, Grafted, Link, Posed, Remap, Restored, Scene, SceneData, SceneId, Scenes,
+		Solid, Stage, Thing,
 	},
 	script::{Script, ScriptData, ScriptId, Scripts, WORLD_PREFIX},
 	skeleton::{
@@ -95,7 +95,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 48;
+pub const ABI_VERSION: u32 = 49;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";

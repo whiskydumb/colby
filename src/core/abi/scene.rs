@@ -562,7 +562,34 @@ impl SceneData {
 	/// of range or named twice is ignored
 	/// @return a description of them alone
 	#[must_use]
-	pub fn subset(&self, solids: &[u32]) -> Self {
+	pub fn subset(&self, solids: &[u32]) -> Self { self.cut(solids, true) }
+
+	/// The same cut, with every slot and generation left as it was.
+	///
+	/// **What [`subset`](Self::subset) is for is a thing that can be pasted
+	/// anywhere; what this is for is a thing that has to land in the one place
+	/// it already occupies somewhere else.** A snapshot names a body by the
+	/// slot it is in, so a description crossing a wire has to carry the
+	/// numbers the machine that wrote it is using - a copy renumbered from
+	/// nought would land somewhere free and have every difference after it
+	/// drive the wrong body.
+	///
+	/// Everything else is identical, the internal indices included: `first`
+	/// and `second` on a joint, `thing` on a body and `pose` on an entity are
+	/// positions in this description's own tables and are renumbered either
+	/// way. It is only what a table will be *asked for* that differs.
+	///
+	/// @param solids - which of [`solids`](Self::solids) to keep
+	/// @return a description of them alone, at the numbers they are at here
+	#[must_use]
+	pub fn piece(&self, solids: &[u32]) -> Self { self.cut(solids, false) }
+
+	/// Both of the above.
+	///
+	/// @param solids - which of [`solids`](Self::solids) to keep
+	/// @param renumber - whether what comes back is numbered from nought or
+	/// keeps the numbers it has here
+	fn cut(&self, solids: &[u32], renumber: bool) -> Self {
 		let mut keeping: Vec<u32> = Vec::new();
 		for &index in solids {
 			if usize::try_from(index).is_ok_and(|it| it < self.solids.len())
@@ -588,12 +615,17 @@ impl SceneData {
 
 			solid_of[usize::try_from(index).unwrap_or(0)] = count(kept.len());
 			let mut copy = solid.clone();
-			copy.slot = count(kept.len());
-			copy.generation = 1;
+
+			if renumber {
+				copy.slot = count(kept.len());
+				copy.generation = 1;
+			}
+
 			// the entity it drives, if it has not already come along behind
 			// another body. Two bodies naming one entity is legal and is what a
 			// prop with a second collider would be.
-			copy.thing = drag_along(&self.things, solid.thing, &mut thing_of, &mut things);
+			copy.thing =
+				drag_along(&self.things, solid.thing, &mut thing_of, &mut things, renumber);
 
 			kept.push(copy);
 		}
@@ -611,8 +643,12 @@ impl SceneData {
 			}
 
 			let mut copy = link.clone();
-			copy.slot = count(links.len());
-			copy.generation = 1;
+
+			if renumber {
+				copy.slot = count(links.len());
+				copy.generation = 1;
+			}
+
 			copy.first = first;
 			copy.second = second;
 			links.push(copy);
@@ -625,7 +661,7 @@ impl SceneData {
 		let mut posed = Vec::new();
 
 		for thing in &mut things {
-			thing.pose = drag_pose(&self.posed, thing.pose, &mut pose_of, &mut posed);
+			thing.pose = drag_pose(&self.posed, thing.pose, &mut pose_of, &mut posed, renumber);
 		}
 
 		Self {
@@ -676,7 +712,13 @@ fn across(link: &Link, here: u32) -> Option<u32> {
 /// @param moved - old index to new, written
 /// @param kept - the piece's own entities, appended to
 /// @return where the entity now is, or [`NO_INDEX`] if the body drives nothing
-fn drag_along(things: &[Thing], at: u32, moved: &mut [u32], kept: &mut Vec<Thing>) -> u32 {
+fn drag_along(
+	things: &[Thing],
+	at: u32,
+	moved: &mut [u32],
+	kept: &mut Vec<Thing>,
+	renumber: bool,
+) -> u32 {
 	let Ok(at) = usize::try_from(at) else {
 		return NO_INDEX;
 	};
@@ -688,8 +730,12 @@ fn drag_along(things: &[Thing], at: u32, moved: &mut [u32], kept: &mut Vec<Thing
 	if moved[at] == NO_INDEX {
 		moved[at] = count(kept.len());
 		let mut copy = thing.clone();
-		copy.slot = count(kept.len());
-		copy.generation = 1;
+
+		if renumber {
+			copy.slot = count(kept.len());
+			copy.generation = 1;
+		}
+
 		kept.push(copy);
 	}
 
@@ -701,7 +747,13 @@ fn drag_along(things: &[Thing], at: u32, moved: &mut [u32], kept: &mut Vec<Thing
 /// A copy of [`drag_along`] rather than one function generic over the two:
 /// what the records have in common is two words, and a trait to say so would
 /// be more machinery than the second copy is.
-fn drag_pose(posed: &[Posed], at: u32, moved: &mut [u32], kept: &mut Vec<Posed>) -> u32 {
+fn drag_pose(
+	posed: &[Posed],
+	at: u32,
+	moved: &mut [u32],
+	kept: &mut Vec<Posed>,
+	renumber: bool,
+) -> u32 {
 	let Ok(at) = usize::try_from(at) else {
 		return NO_INDEX;
 	};
@@ -713,8 +765,12 @@ fn drag_pose(posed: &[Posed], at: u32, moved: &mut [u32], kept: &mut Vec<Posed>)
 	if moved[at] == NO_INDEX {
 		moved[at] = count(kept.len());
 		let mut copy = pose.clone();
-		copy.slot = count(kept.len());
-		copy.generation = 1;
+
+		if renumber {
+			copy.slot = count(kept.len());
+			copy.generation = 1;
+		}
+
 		kept.push(copy);
 	}
 
@@ -1187,6 +1243,152 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 		posed: poses.iter().filter(|id| id.is_some()).count(),
 		arena: scene.arena.is_some(),
 	})
+}
+
+/// What a graft managed to put into a world.
+///
+/// Counts rather than handles, for the reason [`Restored`] carries counts: the
+/// caller wants to know whether it worked and to say so in a line, and a
+/// handle to something it did not ask for is not useful to it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Grafted {
+	/// How many entities landed.
+	pub things: usize,
+
+	/// How many bodies did.
+	pub solids: usize,
+
+	/// How many joints did.
+	pub links: usize,
+
+	/// How many records named a slot this world already had somebody in.
+	///
+	/// **The number that says the two ends disagree**, and it is worth having
+	/// separately from the three above: a graft that put nothing in because
+	/// everything was already there looks exactly like a graft that put
+	/// nothing in because the description was empty.
+	pub taken: usize,
+}
+
+/// Puts a piece of somebody else's world into this one, at its own numbers.
+///
+/// **The third of the three ways a description becomes a world, and the one
+/// that leaves the rest of the world alone.** [`restore`] replaces everything,
+/// which is what loading a save is; [`instantiate`] renumbers and pastes,
+/// which is what a duplicator and a spawn menu do; this puts records into the
+/// exact slots and generations they name and touches nothing else, which is
+/// what a machine does when it is told that a thing has appeared somewhere
+/// else.
+///
+/// The slots have to be the ones the description names, because that is the
+/// whole point: a snapshot addresses a body by its slot, so a body that landed
+/// anywhere else would have every difference after it drive the wrong thing.
+/// @ref [`SceneData::piece`], which is the cut that keeps them.
+///
+/// **A slot this world already has somebody in is left alone and counted.**
+/// The alternative is throwing away whatever is there on the word of the far
+/// end, and the two ends disagreeing about a slot is a fault to report rather
+/// than one to paper over.
+///
+/// **Poses do not come across**, and an entity that named one lands with none.
+/// A pose is a table of bones a step writes, and what would make a grafted
+/// character move is the half of animation that is out of the wire by
+/// agreement - so carrying the bones and nothing that walks them would be a
+/// character frozen in whatever position it was cut in.
+///
+/// @note: the caller owes the solver a `forget` in exactly the case
+/// [`restore`] owes it one - a body that appeared is a body the derived state
+/// has never seen. `colby_core` does not depend on the solver, so it cannot be
+/// done here.
+///
+/// @param world - the world to put them into
+/// @param piece - the description, at the numbers the machine that wrote it
+/// uses
+/// @return what landed and what was refused
+pub fn graft(world: &mut World, piece: &SceneData) -> Grafted {
+	// nothing here uses the description's generation *vectors*: a graft asks
+	// each record which slot and which occupant it is, because the tables it
+	// is going into are not being sized by this at all. @ref
+	// `SceneData::piece`, which says the vectors of a piece mean nothing.
+	let things = grafted_things(world, piece);
+	let solids = grafted_solids(world, piece, &things);
+	let links = grafted_links(world, piece, &solids);
+
+	for (id, thing) in things.iter().zip(&piece.things) {
+		world.entities.set_name(*id, &thing.name);
+	}
+
+	for (id, solid) in solids.iter().zip(&piece.solids) {
+		world.bodies.set_name(*id, &solid.name);
+	}
+
+	for (id, link) in links.iter().zip(&piece.links) {
+		world.joints.set_name(*id, &link.name);
+	}
+
+	let landed = |taken: usize, wanted: usize| wanted.saturating_sub(taken);
+
+	Grafted {
+		things: things.iter().filter(|id| id.is_some()).count(),
+		solids: solids.iter().filter(|id| id.is_some()).count(),
+		links: links.iter().filter(|id| id.is_some()).count(),
+		taken: landed(things.iter().filter(|id| id.is_some()).count(), piece.things.len())
+			+ landed(solids.iter().filter(|id| id.is_some()).count(), piece.solids.len())
+			+ landed(links.iter().filter(|id| id.is_some()).count(), piece.links.len()),
+	}
+}
+
+/// Every entity of a piece, into the slots it names.
+///
+/// A null handle where the slot was taken, so the list stays the same length
+/// as the description and an index into one is an index into the other.
+fn grafted_things(world: &mut World, piece: &SceneData) -> Vec<EntityId> {
+	piece
+		.things
+		.iter()
+		.map(|thing| {
+			let renderable = Renderable {
+				mesh: world.meshes.find(&thing.mesh),
+				material: material(world, &thing.material),
+				color: thing.color,
+				// deliberately none. @ref `graft`, which says why.
+				pose: PoseId::NONE,
+			};
+
+			world.entities.graft(
+				usize::try_from(thing.slot).unwrap_or(usize::MAX),
+				thing.generation,
+				thing.transform,
+				renderable,
+			)
+		})
+		.collect()
+}
+
+/// Every body of a piece, into the slots it names.
+fn grafted_solids(world: &mut World, piece: &SceneData, things: &[EntityId]) -> Vec<BodyId> {
+	let entries = solid_bodies(world, piece, things);
+
+	entries
+		.iter()
+		.zip(&piece.solids)
+		.map(|(&(slot, body), solid)| world.bodies.graft(slot, solid.generation, body))
+		.collect()
+}
+
+/// Every joint of a piece, into the slots it names.
+///
+/// After the bodies, because a joint names two of them by handle and the
+/// handles only exist once they have landed. A joint whose bodies did not is
+/// refused by the table itself.
+fn grafted_links(world: &mut World, piece: &SceneData, solids: &[BodyId]) -> Vec<JointId> {
+	let entries = link_joints(piece, solids);
+
+	entries
+		.iter()
+		.zip(&piece.links)
+		.map(|(&(slot, joint), link)| world.joints.graft(slot, link.generation, joint))
+		.collect()
 }
 
 /// Puts every peer's block back, slot for slot and generation for generation.
@@ -1766,6 +1968,498 @@ mod tests {
 			.insert("brass", Material::colored(Vec3::new(0.7, 0.5, 0.2)));
 
 		world
+	}
+
+	/// The body called this, or `BodyId::NONE`.
+	///
+	/// A walk rather than a lookup: the table is keyed by handle and a name is
+	/// a label on a slot, which is all a test needs it to be.
+	fn body_called(world: &World, name: &str) -> BodyId {
+		world
+			.bodies
+			.iter()
+			.map(|(id, _)| id)
+			.find(|id| world.bodies.name(*id) == name)
+			.unwrap_or(BodyId::NONE)
+	}
+
+	/// A body in the slot a dead one left, so its generation is not one.
+	///
+	/// **Everything in a fresh world is a first occupant**, and a first
+	/// occupant's generation is one - so a fixture built only out of those
+	/// cannot tell a graft that carries the far end's generation from one that
+	/// invents its own. This is what makes that visible.
+	///
+	/// @param world - the world to make one in
+	/// @param name - what to call it
+	/// @param at - where to put it
+	/// @return the handle, whose generation is two
+	fn second_occupant(world: &mut World, name: &str, at: Vec3) -> BodyId {
+		let first = world.bodies.spawn(Body::default());
+		world.bodies.despawn(first);
+
+		let id = world.bodies.spawn(Body::new(
+			BodyKind::Dynamic,
+			Shape::cuboid(Vec3::ONE),
+			Transform::at(at),
+		));
+
+		world.bodies.set_name(id, name);
+
+		assert_eq!(id.slot(), first.slot(), "it took the slot the dead one left");
+		assert_eq!(id.generation(), 2, "so it is the second occupant of it");
+
+		id
+	}
+
+	/// A world with one named body somewhere, standing on an entity.
+	///
+	/// @param along - where to put it, so two of these are distinguishable
+	/// @param name - what to call the body
+	fn standing(along: f32, name: &str) -> World {
+		let mut world = furnished();
+		let mesh = world.meshes.find("meshes/crystal");
+		let material = world.materials.find("brass");
+		let entity = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(along, 1.0, 2.0)));
+
+		world
+			.entities
+			.set_renderable(entity, Renderable::of(mesh, material, Vec3::X));
+
+		let mut body =
+			Body::new(BodyKind::Dynamic, Shape::cuboid(Vec3::ONE), Transform::IDENTITY);
+		body.entity = entity;
+
+		let id = world.bodies.spawn(body);
+		world.bodies.set_name(id, name);
+		world
+	}
+
+	#[test]
+	fn a_piece_keeps_the_numbers_a_subset_throws_away() {
+		// the one difference between the two cuts, and the whole reason there
+		// are two: a piece has to land where the machine that wrote it has it.
+		let mut world = standing(4.0, "crate");
+
+		// three slots ahead of it, so the numbers are not nought and a cut
+		// that renumbered would be obvious.
+		for _ in 0..3 {
+			world.bodies.spawn(Body::default());
+		}
+
+		let whole = capture(&world);
+		let at = whole
+			.solids
+			.iter()
+			.position(|solid| solid.name == "crate")
+			.expect("it is in there");
+		let seed = u32::try_from(at).expect("a small index");
+
+		let renumbered = whole.subset(&[seed]);
+		let kept = whole.piece(&[seed]);
+		let was = whole.solids[at].slot;
+
+		assert_eq!(renumbered.solids[0].slot, 0, "a subset starts over at nought");
+		assert_eq!(kept.solids[0].slot, was, "and a piece keeps the slot it is at");
+		assert_eq!(
+			kept.solids[0].generation, whole.solids[at].generation,
+			"and the generation with it"
+		);
+		assert_eq!(
+			kept.solids[0].name, renumbered.solids[0].name,
+			"everything else about the two is the same"
+		);
+	}
+
+	#[test]
+	fn a_piece_lands_in_another_world_at_the_slot_it_names() {
+		// **the whole of what a graft is for.** A snapshot addresses a body by
+		// the slot it is in, so a body that landed anywhere else would have
+		// every difference after it drive the wrong thing.
+		let mut host = standing(4.0, "crate");
+
+		for _ in 0..5 {
+			host.bodies.spawn(Body::default());
+		}
+
+		let spawned = second_occupant(&mut host, "late", Vec3::new(9.0, 9.0, 9.0));
+
+		let whole = capture(&host);
+		let at = whole
+			.solids
+			.iter()
+			.position(|solid| solid.name == "late")
+			.expect("it is in there");
+		let piece = whole.piece(&[u32::try_from(at).expect("a small index")]);
+
+		// a world that never saw it, and one body shorter than the host's.
+		let mut window = standing(4.0, "crate");
+		let landed = graft(&mut window, &piece);
+
+		assert_eq!(landed.solids, 1, "one body landed");
+		assert_eq!(landed.taken, 0, "and nothing was refused");
+
+		let there = body_called(&window, "late");
+
+		assert!(there.is_some(), "it is in the window's world now");
+		assert_eq!(there.slot(), spawned.slot(), "at the host's slot");
+		assert_eq!(there.generation(), spawned.generation(), "and its generation");
+		assert_eq!(
+			window
+				.bodies
+				.get(there)
+				.map(|body| body.transform.position),
+			Some(Vec3::new(9.0, 9.0, 9.0)),
+			"with what it was carrying"
+		);
+	}
+
+	#[test]
+	fn a_graft_leaves_everything_else_where_it_was() {
+		// the difference from `restore`, said out loud: a restore replaces the
+		// world and this one adds to it, so a handle somebody was holding has
+		// to still name the thing it named.
+		let mut window = standing(4.0, "crate");
+		let held = body_called(&window, "crate");
+		let entity = window
+			.bodies
+			.get(held)
+			.map(|body| body.entity)
+			.expect("it drives one");
+
+		let mut host = standing(4.0, "crate");
+		let spawned = host.bodies.spawn(Body::new(
+			BodyKind::Dynamic,
+			Shape::cuboid(Vec3::ONE),
+			Transform::IDENTITY,
+		));
+		host.bodies.set_name(spawned, "late");
+
+		let whole = capture(&host);
+		let at = whole
+			.solids
+			.iter()
+			.position(|solid| solid.name == "late")
+			.expect("it is in there");
+
+		graft(&mut window, &whole.piece(&[u32::try_from(at).expect("a small index")]));
+
+		assert!(window.bodies.get(held).is_some(), "the handle still names its body");
+		assert_eq!(window.bodies.name(held), "crate", "and the same body");
+		assert!(window.entities.transform(entity).is_some(), "and so does the entity's");
+		assert_eq!(window.bodies.len(), 2, "with the new one beside it rather than instead");
+	}
+
+	#[test]
+	fn a_slot_somebody_is_already_in_is_left_alone_and_counted() {
+		// two ends disagreeing about a slot is a fault to report rather than
+		// one to paper over: the alternative is throwing away whatever is here
+		// on the word of the far end.
+		let mut window = standing(4.0, "crate");
+		let held = body_called(&window, "crate");
+
+		let mut host = standing(9.0, "crate");
+		let theirs = second_occupant(&mut host, "somebody else", Vec3::new(9.0, 9.0, 9.0));
+
+		// **and at a generation the window's own body is not on**, or a graft
+		// that wrote the far end's number into an occupied slot would be
+		// writing the number that was already there.
+		assert_ne!(theirs.generation(), held.generation(), "the two are different occupants");
+
+		let whole = capture(&host);
+		let at = whole
+			.solids
+			.iter()
+			.position(|solid| solid.name == "somebody else")
+			.expect("it is in there");
+		let mut piece = whole.piece(&[u32::try_from(at).expect("small")]);
+
+		// aimed at the slot the window's own body is in.
+		piece.solids[0].slot = u32::try_from(held.slot()).expect("small");
+
+		let landed = graft(&mut window, &piece);
+
+		assert_eq!(landed.solids, 0, "so nothing landed");
+		assert!(landed.taken > 0, "and it is counted rather than silent");
+		assert_eq!(window.bodies.name(held), "crate", "what was here is untouched");
+		// **the handle, not only the name**, and that is the assertion with
+		// the teeth in it: a graft that wrote the far end's generation into a
+		// slot before finding out it was occupied would leave the body where
+		// it is and make every handle to it stale, which no name could show.
+		assert!(
+			window.bodies.get(held).is_some(),
+			"and a handle somebody was holding still names it"
+		);
+	}
+
+	#[test]
+	fn a_graft_grows_a_table_to_reach_a_far_slot_without_losing_the_ones_it_passes() {
+		// a slot passed on the way is free rather than lost. Without this a
+		// graft into a far slot would make every spawn afterwards grow the
+		// table again past a hole nothing could ever reach.
+		let mut host = World::new();
+
+		for _ in 0..9 {
+			host.bodies.spawn(Body::default());
+		}
+
+		let far = host.bodies.spawn(Body::new(
+			BodyKind::Dynamic,
+			Shape::cuboid(Vec3::ONE),
+			Transform::IDENTITY,
+		));
+		host.bodies.set_name(far, "far");
+
+		let whole = capture(&host);
+		let at = whole
+			.solids
+			.iter()
+			.position(|solid| solid.name == "far")
+			.expect("it is in there");
+
+		let mut window = World::new();
+		let landed = graft(&mut window, &whole.piece(&[u32::try_from(at).expect("small")]));
+
+		assert_eq!(landed.solids, 1, "it landed");
+		assert_eq!(body_called(&window, "far").slot(), far.slot(), "at the slot it named");
+		assert_eq!(window.bodies.len(), 1, "and it is the only body in there");
+		assert_eq!(window.bodies.slots(), far.slot() + 1, "the table reaches it");
+
+		// and the holes are usable: spawning ten takes the nine that were
+		// passed and then grows by one.
+		let mut taken: Vec<usize> = Vec::new();
+
+		for _ in 0..9 {
+			taken.push(window.bodies.spawn(Body::default()).slot());
+		}
+
+		taken.sort_unstable();
+
+		assert_eq!(taken, (0..far.slot()).collect::<Vec<usize>>(), "every hole was reachable");
+		assert_eq!(window.bodies.len(), 10, "and nothing was lost");
+	}
+
+	#[test]
+	fn a_piece_carries_the_joints_between_what_it_keeps() {
+		// which is what makes a contraption cross as one thing rather than as
+		// a pile of bodies that used to be welded together.
+		let mut host = standing(4.0, "crate");
+		let first = body_called(&host, "crate");
+		let second = host.bodies.spawn(Body::new(
+			BodyKind::Dynamic,
+			Shape::cuboid(Vec3::ONE),
+			Transform::IDENTITY,
+		));
+		host.bodies.set_name(second, "welded");
+		host.joints
+			.spawn(Joint::weld(first, second, (Vec3::ZERO, Vec3::ZERO)));
+
+		let whole = capture(&host);
+		let both: Vec<u32> = (0..u32::try_from(whole.solids.len()).expect("small")).collect();
+		let piece = whole.piece(&both);
+
+		assert_eq!(piece.links.len(), 1, "the joint came along");
+
+		let mut window = World::new();
+		let landed = graft(&mut window, &piece);
+
+		assert_eq!(landed.solids, 2, "both bodies landed");
+		assert_eq!(landed.links, 1, "and the joint between them");
+		assert_eq!(window.joints.len(), 1, "in the window's own table");
+	}
+
+	#[test]
+	fn a_graft_into_a_hole_takes_the_hole_off_the_free_list() {
+		// a slot a graft filled must not be handed out again. Without this the
+		// next spawn lands on top of a body that just arrived, and the two ends
+		// disagree about a slot from then on.
+		let mut window = World::new();
+		let mut slots: Vec<BodyId> = Vec::new();
+
+		for _ in 0..4 {
+			slots.push(window.bodies.spawn(Body::default()));
+		}
+
+		let hole = slots[1];
+		window.bodies.despawn(hole);
+
+		let mut host = World::new();
+
+		for _ in 0..4 {
+			host.bodies.spawn(Body::default());
+		}
+
+		let whole = capture(&host);
+		let mut piece = whole.piece(&[1]);
+		piece.solids[0].name = "arrived".to_owned();
+
+		let landed = graft(&mut window, &piece);
+
+		assert_eq!(landed.solids, 1, "it went into the hole");
+		assert_eq!(body_called(&window, "arrived").slot(), hole.slot(), "which is that slot");
+
+		let next = window.bodies.spawn(Body::default());
+
+		assert_ne!(next.slot(), hole.slot(), "and the next spawn does not land on top of it");
+		assert!(
+			window
+				.bodies
+				.get(body_called(&window, "arrived"))
+				.is_some(),
+			"so it is still there"
+		);
+	}
+
+	#[test]
+	fn a_joint_slot_somebody_is_already_in_is_left_alone() {
+		// the joint half of the same rule the bodies have. A joint table is
+		// smaller and quieter than a body table, which is exactly why nothing
+		// would notice this going wrong.
+		let mut window = standing(4.0, "crate");
+		let first = body_called(&window, "crate");
+		let second = window.bodies.spawn(Body::new(
+			BodyKind::Dynamic,
+			Shape::cuboid(Vec3::ONE),
+			Transform::IDENTITY,
+		));
+		let held = window
+			.joints
+			.spawn(Joint::weld(first, second, (Vec3::ZERO, Vec3::ZERO)));
+		window.joints.set_name(held, "mine");
+
+		// a far end with a joint of its own in the same slot.
+		let mut host = standing(4.0, "crate");
+		let theirs = body_called(&host, "crate");
+		let other = host.bodies.spawn(Body::new(
+			BodyKind::Dynamic,
+			Shape::cuboid(Vec3::ONE),
+			Transform::IDENTITY,
+		));
+		// **a second occupant of the slot**, so its generation is not the one
+		// the window's own joint is on. Everything in a fresh table is a first
+		// occupant at generation one, and a graft that wrote the far end's
+		// number into a slot before finding out it was taken would be writing
+		// the number that was there.
+		let dead = host
+			.joints
+			.spawn(Joint::weld(theirs, other, (Vec3::ZERO, Vec3::ZERO)));
+		host.joints.despawn(dead);
+
+		let link = host
+			.joints
+			.spawn(Joint::weld(theirs, other, (Vec3::ZERO, Vec3::ZERO)));
+		host.joints.set_name(link, "theirs");
+
+		assert_eq!(link.slot(), held.slot(), "in the slot the window's own joint is in");
+		assert_ne!(link.generation(), held.generation(), "and at another generation");
+
+		let whole = capture(&host);
+		let both: Vec<u32> = (0..u32::try_from(whole.solids.len()).expect("small")).collect();
+		let landed = graft(&mut window, &whole.piece(&both));
+
+		assert_eq!(landed.links, 0, "the joint slot was taken, so nothing landed in it");
+		assert!(landed.taken > 0, "and it is counted");
+		assert_eq!(window.joints.name(held), "mine", "what was here is untouched");
+		assert!(
+			window.joints.get(held).is_some(),
+			"and a handle to it is still the handle it was"
+		);
+	}
+
+	#[test]
+	fn what_a_graft_refused_is_counted_exactly() {
+		// a number rather than "more than nothing": `taken` is the only thing
+		// that says the two ends disagree, and a count that was merely
+		// non-zero could be one refusal or twenty.
+		let mut window = standing(4.0, "crate");
+		let host = standing(9.0, "crate");
+		let whole = capture(&host);
+		let landed = graft(&mut window, &whole.piece(&[0]));
+
+		assert_eq!(landed.solids, 0, "the body's slot was taken");
+		assert_eq!(landed.things, 0, "and so was its entity's");
+		assert_eq!(landed.taken, 2, "which is two refusals, said as two");
+	}
+
+	#[test]
+	fn a_graft_carries_the_generation_the_far_end_is_on() {
+		// **the whole of what makes a handle mean the same thing at both
+		// ends.** A body grafted at the wrong generation is a body every
+		// handle to it is stale about - and since a fresh slot comes out at
+		// generation one, a graft that invented its own number would look
+		// right for every first occupant there is.
+		let mut host = World::new();
+		let spawned = second_occupant(&mut host, "late", Vec3::new(9.0, 9.0, 9.0));
+
+		assert_eq!(spawned.generation(), 2, "which is the point of the fixture");
+
+		let whole = capture(&host);
+		let at = whole
+			.solids
+			.iter()
+			.position(|solid| solid.name == "late")
+			.expect("it is in there");
+
+		let mut window = World::new();
+
+		graft(&mut window, &whole.piece(&[u32::try_from(at).expect("small")]));
+
+		let there = body_called(&window, "late");
+
+		assert_eq!(there.generation(), spawned.generation(), "the same occupant of the slot");
+		assert_eq!(there, spawned, "so the two ends hold the same handle for it");
+	}
+
+	#[test]
+	fn an_entity_graft_carries_its_generation_too() {
+		// the entity half of the same rule, said on its own because an entity
+		// table grows on its own schedule and nothing else here would notice.
+		let mut host = furnished();
+		let first = host.entities.spawn();
+		host.entities.despawn(first);
+
+		let entity = host
+			.entities
+			.spawn_at(Transform::at(Vec3::new(5.0, 6.0, 7.0)));
+
+		assert_eq!(entity.generation(), 2, "a second occupant, as the fixture intends");
+
+		let mut body =
+			Body::new(BodyKind::Dynamic, Shape::cuboid(Vec3::ONE), Transform::IDENTITY);
+		body.entity = entity;
+
+		let id = host.bodies.spawn(body);
+		host.bodies.set_name(id, "late");
+
+		let whole = capture(&host);
+		let at = whole
+			.solids
+			.iter()
+			.position(|solid| solid.name == "late")
+			.expect("it is in there");
+
+		let mut window = furnished();
+
+		graft(&mut window, &whole.piece(&[u32::try_from(at).expect("small")]));
+
+		let there = body_called(&window, "late");
+		let drives = window
+			.bodies
+			.get(there)
+			.map(|body| body.entity)
+			.expect("it landed");
+
+		assert_eq!(drives, entity, "the entity is the same handle at both ends");
+		assert_eq!(
+			window
+				.entities
+				.transform(drives)
+				.map(|it| it.position),
+			Some(Vec3::new(5.0, 6.0, 7.0)),
+			"and it is where the far end has it"
+		);
 	}
 
 	#[test]
