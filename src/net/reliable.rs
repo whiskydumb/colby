@@ -94,6 +94,15 @@ impl Reliable {
 		}
 	}
 
+	/// Forgets what has been heard, keeping what is still owed.
+	///
+	/// The mirror of [`Channel::forget`](crate::Channel::forget) and the same
+	/// argument: what the far end said belongs to a conversation that is over,
+	/// and its numbering is about to start again - but what this end has
+	/// queued and not had acknowledged is still owed to whoever is there now,
+	/// and its numbering must not go backwards.
+	pub fn forget(&mut self) { self.received = 0; }
+
 	/// Puts one command in the ring, to be resent until it is acknowledged.
 	///
 	/// @param text - the console line, one line and at most [`MAX_COMMAND`]

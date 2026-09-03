@@ -141,15 +141,15 @@ impl Heard {
 		true
 	}
 
-	/// Forgets everything, for a peer that has gone.
+	/// Forgets everything, for a far end that turned out to be a new process.
 	///
-	/// @note: the numbering is not restarted, because [`Ring::forget`] does not
-	/// restart it - a number the last conversation used must not name anything
-	/// in this one. The consequence is that a peer which comes back *counting
-	/// from one again* is refused every snapshot it sends, and nothing here can
-	/// tell that from a peer sending stale numbers. Which conversation a
-	/// datagram belongs to is the connection handshake's question and it is not
-	/// written yet; until it is, a reconnect does not converge either way.
+	/// @note: the numbering **is** restarted, because [`Ring::forget`] restarts
+	/// it. A far end that started again is counting from one, and a ring here
+	/// that carried on would refuse every snapshot it sent until it had caught
+	/// up with a conversation that is over. What makes starting over safe is
+	/// the session in the head of every datagram: a datagram from the
+	/// conversation that ended never reaches this. @ref
+	/// [`Ring::forget`](crate::Ring::forget), which has the argument in full.
 	pub fn forget(&mut self) {
 		self.ring.forget();
 		self.holding = NOTHING;

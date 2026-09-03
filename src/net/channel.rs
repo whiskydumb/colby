@@ -109,17 +109,24 @@ pub struct Channel {
 	lost: u32,
 	delivered: u32,
 	ignored: u32,
-}
 
-impl Default for Channel {
-	fn default() -> Self { Self::new() }
+	/// Which conversation this end is having.
+	///
+	/// Never changes while the process runs: it names the process rather than
+	/// the conversation, which is what lets a far end that restarted be told
+	/// apart from a far end that is merely quiet.
+	session: u32,
 }
 
 impl Channel {
 	/// A channel that has said nothing and heard nothing.
+	///
+	/// @param session - which conversation this end is having, written into
+	/// every datagram it sends. @ref [`Header::session`](crate::Header)
 	#[must_use]
-	pub fn new() -> Self {
+	pub fn new(session: u32) -> Self {
 		Self {
+			session,
 			outgoing: 1,
 			incoming: 0,
 			received: 0,
@@ -132,6 +139,32 @@ impl Channel {
 			lost: 0,
 			delivered: 0,
 			ignored: 0,
+		}
+	}
+
+	/// Forgets everything heard, keeping everything said.
+	///
+	/// For the moment the far end turns out to be a process that started
+	/// again: what it has told this end is worth nothing, and the numbers it
+	/// is about to use start over.
+	///
+	/// **The outgoing sequence carries on**, and getting that wrong is what
+	/// makes a restart a deadlock rather than a hiccup. The far end has heard
+	/// this end counting - if it restarted it has heard nothing and takes
+	/// whatever comes, and if it did not restart it is holding the number this
+	/// end last used. Starting over would be refused for as many messages as
+	/// the conversation before it had, which is the exact fault this whole
+	/// mechanism exists to remove. It is the same rule
+	/// [`Ring::forget`](crate::Ring::forget) follows and for the same reason.
+	pub fn forget(&mut self) {
+		self.incoming = 0;
+		self.received = 0;
+		self.assembly = Assembly::new();
+		self.rtt = Duration::ZERO;
+		self.samples = 0;
+
+		for slot in &mut self.history {
+			*slot = None;
 		}
 	}
 
@@ -173,6 +206,7 @@ impl Channel {
 		for index in 0..pieces {
 			let piece = fragment::piece(payload, index);
 			let header = Header {
+				session: self.session,
 				sequence,
 				ack: self.incoming,
 				ack_bits: self.received,
@@ -390,6 +424,14 @@ fn blend(previous: Duration, sample: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+	/// The two sessions the ends of these conversations are having.
+	///
+	/// Different from each other on purpose: a fixture where both ends used
+	/// one number could not tell a channel writing its own session from one
+	/// writing whatever it last heard.
+	const ONE: u32 = 0x1111_1111;
+	const TWO: u32 = 0x2222_2222;
+
 	use super::*;
 	use crate::packet::{MAX_PAYLOAD, PROTOCOL_VERSION};
 
@@ -451,7 +493,7 @@ mod tests {
 
 	#[test]
 	fn a_message_that_fits_crosses_in_one_datagram() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let sent = wire(&mut host, b"hello", at(0));
 
 		assert_eq!(sent.len(), 1, "five bytes is one datagram");
@@ -462,7 +504,7 @@ mod tests {
 
 	#[test]
 	fn a_message_too_big_for_one_datagram_crosses_in_several_and_comes_back_whole() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let payload = message(MAX_PAYLOAD * 2 + 3);
 		let sent = wire(&mut host, &payload, at(0));
 
@@ -486,7 +528,7 @@ mod tests {
 
 	#[test]
 	fn the_largest_message_there_is_crosses() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let payload = message(MAX_MESSAGE);
 		let got = carry(&mut host, &mut client, &payload, at(0));
 
@@ -497,7 +539,7 @@ mod tests {
 
 	#[test]
 	fn a_message_past_the_ceiling_is_refused_rather_than_cut_up() {
-		let mut host = Channel::new();
+		let mut host = Channel::new(ONE);
 		let payload = vec![0_u8; MAX_MESSAGE + 1];
 		let error = host
 			.send(&payload, at(0), |_| panic!("nothing should go out"))
@@ -510,7 +552,7 @@ mod tests {
 
 	#[test]
 	fn the_sequence_moves_once_a_message_rather_than_once_a_datagram() {
-		let mut host = Channel::new();
+		let mut host = Channel::new(ONE);
 
 		assert_eq!(host.sequence(), 1, "nil is reserved, so the first message is one");
 		lose(&mut host, &message(MAX_PAYLOAD * 3), at(0));
@@ -521,7 +563,7 @@ mod tests {
 
 	#[test]
 	fn every_datagram_of_one_message_carries_the_same_number() {
-		let mut host = Channel::new();
+		let mut host = Channel::new(ONE);
 		let sent = wire(&mut host, &message(MAX_PAYLOAD * 2), at(0));
 		let (first, second) = (head(&sent[0]), head(&sent[1]));
 
@@ -535,7 +577,7 @@ mod tests {
 
 	#[test]
 	fn the_same_message_twice_is_taken_once() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let sent = wire(&mut host, b"once", at(0));
 
 		assert!(matches!(client.receive(&sent[0], at(1)), Delivery::Message(_)));
@@ -550,7 +592,7 @@ mod tests {
 
 	#[test]
 	fn a_message_behind_one_already_handed_over_is_thrown_away() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let first = wire(&mut host, b"one", at(0));
 		let second = wire(&mut host, b"two", at(0));
 
@@ -564,7 +606,7 @@ mod tests {
 
 	#[test]
 	fn a_piece_of_a_newer_message_throws_away_the_one_being_built() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let first = wire(&mut host, &message(MAX_PAYLOAD * 2), at(0));
 		let second = wire(&mut host, b"newer", at(0));
 
@@ -587,7 +629,7 @@ mod tests {
 		// acknowledged is what somebody could actually read. Two are taken
 		// whole first, so that the answer is a field which did not move rather
 		// than a field that was empty either way.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		post(&mut host, &mut client, b"a", at(0));
 		post(&mut host, &mut client, b"b", at(0));
@@ -607,7 +649,7 @@ mod tests {
 	fn the_pieces_of_one_message_may_reach_a_channel_in_any_order() {
 		// the reassembly is checked directly elsewhere; this is the path that
 		// reads the piece index off the wire and hands it over.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let payload = message(MAX_PAYLOAD * 2 + 9);
 		let sent = wire(&mut host, &payload, at(0));
 
@@ -626,7 +668,7 @@ mod tests {
 		// reordering across two messages, neither of them complete - so it is
 		// the message being built rather than the last one handed over that has
 		// to decide. Nothing is delivered until the newer one finishes.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let one = vec![1_u8; MAX_PAYLOAD * 2];
 		let two = vec![2_u8; MAX_PAYLOAD * 2];
 		let first = wire(&mut host, &one, at(0));
@@ -652,7 +694,7 @@ mod tests {
 		// the whole reason four bytes of acknowledgement field are on the wire.
 		// The far end names its newest and repeats the thirty-two before it, so
 		// one answer getting through covers the answers that did not.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		for step in 0..3_u64 {
 			post(&mut host, &mut client, b"x", at(step));
@@ -672,21 +714,96 @@ mod tests {
 	}
 
 	#[test]
+	fn forgetting_drops_what_was_heard_and_keeps_what_was_said() {
+		// **the asymmetry is the whole of it.** A far end that started again
+		// has heard nothing and takes whatever number arrives, so counting on
+		// costs nothing; a far end that did *not* start again is holding the
+		// number this end last used and would refuse everything below it. Only
+		// one of those two is safe, and it is the same rule the snapshot ring
+		// on the sending side follows.
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
+
+		for _ in 0..5 {
+			post(&mut host, &mut client, b"x", at(0));
+			post(&mut client, &mut host, b"y", at(1));
+		}
+
+		let said = host.sequence();
+
+		assert!(said > 5, "five messages each way, so the numbering has moved");
+		assert_eq!(host.incoming(), 5, "and five have arrived");
+
+		host.forget();
+
+		assert_eq!(host.sequence(), said, "what this end says carries on");
+		assert_eq!(host.incoming(), 0, "and what it heard is gone");
+	}
+
+	#[test]
+	fn a_forgotten_channel_takes_a_far_end_counting_from_one_again() {
+		// the fault this exists for, at the size of one channel: a far end
+		// that restarted sends message one, and a channel holding what the
+		// conversation before it reached would refuse that and everything
+		// after it until it had counted back up.
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
+
+		for _ in 0..40 {
+			post(&mut client, &mut host, b"y", at(0));
+		}
+
+		assert_eq!(host.incoming(), 40, "forty messages in");
+
+		// a fresh far end, counting from one, which is what a restart is.
+		let mut again = Channel::new(0x3333_3333);
+		let first = wire(&mut again, b"hello", at(1));
+
+		assert_eq!(
+			host.receive(&first[0], at(1)),
+			Delivery::Ignored(Reason::Stale),
+			"which a channel that remembers the last conversation refuses"
+		);
+
+		host.forget();
+
+		let second = wire(&mut again, b"hello", at(2));
+
+		assert!(
+			matches!(host.receive(&second[0], at(2)), Delivery::Message(_)),
+			"and one that has forgotten takes"
+		);
+	}
+
+	#[test]
+	fn a_channel_writes_its_own_session_into_every_datagram_it_sends() {
+		let mut host = Channel::new(ONE);
+		let sent = wire(&mut host, &message(MAX_PAYLOAD * 3), at(0));
+
+		assert_eq!(sent.len(), 3, "three pieces of one message");
+
+		for piece in &sent {
+			assert_eq!(head(piece).session, ONE, "every piece of it, not only the first");
+		}
+	}
+
+	#[test]
 	fn a_piece_claiming_a_different_division_is_refused() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let sent = wire(&mut host, &message(MAX_PAYLOAD * 2), at(0));
 		let mut forged = sent[1].clone();
 
 		assert_eq!(client.receive(&sent[0], at(1)), Delivery::Fragment);
 
-		// say the same message is three pieces rather than two.
-		forged[14..16].copy_from_slice(&3_u16.to_le_bytes());
+		// say the same message is three pieces rather than two. The piece count
+		// is the last field of the head, named that way rather than by a
+		// number: the head has grown once already and a literal offset here
+		// would have gone on forging a different field in silence.
+		forged[HEADER_BYTES - 2..HEADER_BYTES].copy_from_slice(&3_u16.to_le_bytes());
 		assert_eq!(client.receive(&forged, at(1)), Delivery::Ignored(Reason::Divided));
 	}
 
 	#[test]
 	fn what_arrived_is_written_into_the_acknowledgement_field() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		for _ in 0..3 {
 			post(&mut host, &mut client, b"x", at(0));
@@ -702,7 +819,7 @@ mod tests {
 	fn the_first_message_ever_taken_claims_nothing_before_itself() {
 		// nil in the field means "nothing yet", so the message it displaces has
 		// to be a real one before a bit is set for it.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		post(&mut host, &mut client, b"x", at(0));
 
@@ -714,7 +831,7 @@ mod tests {
 
 	#[test]
 	fn a_message_that_never_arrived_shows_as_a_hole_in_the_field() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		post(&mut host, &mut client, b"a", at(0));
 		lose(&mut host, b"b", at(0));
@@ -732,7 +849,7 @@ mod tests {
 		// jump of exactly its width has to push out. Starting from an empty
 		// field cannot tell a field that was cleared from one that was shifted
 		// by nothing.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		for _ in 0..3 {
 			post(&mut host, &mut client, b"a", at(0));
@@ -759,7 +876,7 @@ mod tests {
 
 	#[test]
 	fn a_jump_past_the_field_clears_it() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		for _ in 0..3 {
 			post(&mut host, &mut client, b"a", at(0));
@@ -781,7 +898,7 @@ mod tests {
 
 	#[test]
 	fn the_first_round_trip_is_the_estimate_and_the_next_ones_move_it_by_an_eighth() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		assert_eq!(host.rtt(), Duration::ZERO, "nothing is known yet");
 		assert_eq!(host.samples(), 0);
@@ -805,7 +922,7 @@ mod tests {
 		// the field carries the same news in every datagram, so a sample per
 		// repeat would drag the estimate towards however long the far end has
 		// been saying the same thing.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		post(&mut host, &mut client, b"a", at(0));
 		post(&mut client, &mut host, b"", at(20));
@@ -825,7 +942,7 @@ mod tests {
 		// large message from the far end arrives over several datagrams, and
 		// waiting for the whole of it before believing the acknowledgement it
 		// carries would hold the estimate back by exactly that long.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		post(&mut host, &mut client, b"a", at(0));
 
@@ -844,7 +961,7 @@ mod tests {
 		// message is sitting where this one was. Without the slot carrying its
 		// own number, a very late acknowledgement would credit whatever it
 		// found there and take a round-trip sample off the wrong send.
-		let mut host = Channel::new();
+		let mut host = Channel::new(ONE);
 
 		lose(&mut host, b"one", at(0));
 
@@ -859,6 +976,8 @@ mod tests {
 		let mut late = [0_u8; HEADER_BYTES];
 
 		Header {
+			// the far end's, because this is a datagram the far end sent.
+			session: TWO,
 			sequence: 1,
 			ack: 1,
 			ack_bits: 0,
@@ -879,7 +998,7 @@ mod tests {
 		// acknowledgement grow together - but a piece of an unfinished message
 		// is the same case and does arrive constantly, and the datagram below
 		// is the smallest way to say the rule.
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		post(&mut host, &mut client, b"a", at(0));
 		post(&mut client, &mut host, b"", at(10));
@@ -890,6 +1009,7 @@ mod tests {
 		let mut stale = [0_u8; HEADER_BYTES];
 
 		Header {
+			session: TWO,
 			sequence: 1,
 			ack: 2,
 			ack_bits: 0,
@@ -908,7 +1028,7 @@ mod tests {
 
 	#[test]
 	fn a_message_the_far_end_never_took_is_counted_lost_when_it_falls_out_of_the_history() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		lose(&mut host, b"gone", at(0));
 		assert_eq!(host.lost(), 0, "it might still be in flight");
@@ -924,7 +1044,7 @@ mod tests {
 
 	#[test]
 	fn what_did_arrive_is_never_counted_lost() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		for step in 0..HISTORY * 2 {
 			let step = u64::try_from(step).unwrap_or(0);
@@ -939,7 +1059,7 @@ mod tests {
 
 	#[test]
 	fn half_the_messages_lost_settles_at_half() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		for step in 0..HISTORY * 2 {
 			let step = u64::try_from(step).unwrap_or(0);
@@ -960,7 +1080,7 @@ mod tests {
 
 	#[test]
 	fn something_that_is_not_ours_is_counted_and_named() {
-		let mut client = Channel::new();
+		let mut client = Channel::new(ONE);
 		let mut stray = vec![0_u8; HEADER_BYTES + 4];
 
 		stray[2..4].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
@@ -972,7 +1092,7 @@ mod tests {
 
 	#[test]
 	fn two_endpoints_talking_to_each_other_agree_on_what_got_through() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		for step in 0..200_u64 {
 			post(&mut host, &mut client, &message(40), at(step * 10));
@@ -992,7 +1112,7 @@ mod tests {
 	fn the_sequence_steps_over_nil_when_it_wraps() {
 		// nil is the reading of "nothing has arrived yet" in the
 		// acknowledgement field, so it is never a real message.
-		let mut host = Channel::new();
+		let mut host = Channel::new(ONE);
 
 		assert_eq!(advance(65_534), 65_535);
 		assert_eq!(advance(65_535), 1, "and the wrap steps over it");
@@ -1004,7 +1124,7 @@ mod tests {
 
 	#[test]
 	fn a_message_sent_across_the_wrap_still_reads_as_newer() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 
 		host.outgoing = 65_535;
 		client.incoming = 65_534;
@@ -1030,7 +1150,7 @@ mod tests {
 
 	#[test]
 	fn a_clock_that_went_backwards_is_a_sample_of_nothing_rather_than_a_panic() {
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(ONE), Channel::new(TWO));
 		let sent = wire(&mut host, b"a", at(100));
 
 		assert!(matches!(client.receive(&sent[0], at(100)), Delivery::Message(_)));
@@ -1048,6 +1168,6 @@ mod tests {
 		// this" rather than "this can no longer be named".
 		assert_eq!(HISTORY, 64);
 		assert!(u16::try_from(HISTORY).is_ok_and(|history| history > ACK_BITS));
-		assert_eq!(Channel::new().history.len(), HISTORY);
+		assert_eq!(Channel::new(ONE).history.len(), HISTORY);
 	}
 }

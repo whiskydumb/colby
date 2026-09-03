@@ -77,6 +77,15 @@ const RATE: Rate = Rate::DEFAULT;
 /// How many steps apart two snapshots are at that rate.
 const EVERY: u16 = every(RATE.hz());
 
+/// The two conversations this run is made of.
+///
+/// Fixed rather than picked, so the digest below is a fact about the wire
+/// rather than about what time it was.
+const HOST_SESSION: u32 = 0x0000_0C01;
+
+/// The client's.
+const CLIENT_SESSION: u32 = 0x0000_0C02;
+
 /// How often the host says something that has to arrive.
 const HOST_EVERY: u32 = 60;
 
@@ -296,8 +305,12 @@ pub(crate) fn run(steps: u32) -> Result {
 pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 	let shared = Rc::new(RefCell::new(Wire::default()));
 	let (one, two) = (somewhere(HOST_AT), somewhere(CLIENT_AT));
-	let mut host = Net::over(Box::new(Loopback::at(one, &shared)), true, 1);
-	let mut client = Net::over(Box::new(Loopback::at(two, &shared)), false, 2);
+	// sessions chosen here rather than off the clock, for the reason the seeds
+	// beside them are: this run has to come out the same on any machine on any
+	// day, and a session off a clock is the one thing in an endpoint that
+	// cannot.
+	let mut host = Net::over(Box::new(Loopback::at(one, &shared)), true, 1, HOST_SESSION);
+	let mut client = Net::over(Box::new(Loopback::at(two, &shared)), false, 2, CLIENT_SESSION);
 
 	// the client knows who it came for; the host learns who turned up.
 	client.set(wire);

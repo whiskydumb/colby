@@ -322,25 +322,33 @@ impl Ring {
 
 	/// Forgets everything, for a peer that has gone.
 	///
-	/// **The numbering does not start over**, which is the whole point and is
-	/// worth saying because starting it over is the obvious thing to write. A
-	/// peer that reconnects into the same place is a different conversation,
-	/// and a snapshot number it remembers from the last one must not name
-	/// anything in this one. Counting on from where the last conversation
-	/// stopped makes every number it used name nothing, forever. Counting from
-	/// one again would do the exact opposite: within [`DEPTH`] ticks each of
-	/// those numbers names a live world that the peer holding it never saw,
-	/// and there is no handshake yet to tell the two conversations apart.
+	/// **The numbering starts over**, and it is worth saying why, because it
+	/// used to do the opposite and the reason it did is gone.
 	///
-	/// @note: a ring whose numbering has run out is not revived by this, so
-	/// that place would take no further peer. It is the same six years as the
-	/// rest of the ceiling and the alternative is worse - reusing the numbers
-	/// is the one thing this method exists to prevent.
+	/// A number this ring has already used must never name a different world,
+	/// or a peer answering with an old number is handed somebody else's. While
+	/// nothing on the wire said which conversation a datagram belonged to, the
+	/// only way to guarantee that was to count on forever and let every number
+	/// the last conversation used name nothing. There is a session in the head
+	/// of every datagram now, and a datagram from the conversation that ended
+	/// is thrown away before it reaches anything that could ask this ring a
+	/// question - so the numbers are free to be used again, and they have to
+	/// be: the far end of a restart is a *fresh* ring counting from one, and a
+	/// ring here that carried on would refuse everything it said until it had
+	/// counted back up to where the conversation before it stopped. That is a
+	/// silence as long as the session that came before, which is exactly the
+	/// fault the session exists to remove.
+	///
+	/// @note: a ring whose numbering had run out is revived by this, which is
+	/// the one behavior that did *not* survive the change. Six years of
+	/// snapshots is what it takes to get there and starting over is the right
+	/// answer to it.
 	pub fn forget(&mut self) {
 		for slot in &mut self.kept {
 			*slot = None;
 		}
 
+		self.next = 1;
 		self.spread.clear();
 	}
 
@@ -501,16 +509,18 @@ mod tests {
 		ring.forget();
 
 		assert!(ring.is_empty());
-		assert!(!ring.has(1), "a number the last conversation used names nothing in this one");
+		assert!(!ring.has(1), "and nothing the conversation before it kept is still here");
 		assert_eq!(ring.base(2).1, NOTHING);
 	}
 
 	#[test]
-	fn a_peer_that_came_back_is_never_told_the_last_conversation_over_again() {
-		// the reason `forget` leaves the numbering alone. Starting it over
-		// would put a live world under every number the peer that left was
-		// still holding, and there is no handshake to tell the two apart - so
-		// a stale word from the old conversation would be believed.
+	fn a_conversation_that_started_again_counts_from_one_again() {
+		// **the rule this used to assert the opposite of.** A ring that
+		// carried its numbering across a restart would refuse every snapshot
+		// the far end sent until it had counted back up to where the last
+		// conversation stopped - a silence as long as the session before it.
+		// What makes starting over safe is that a datagram from the
+		// conversation that ended is thrown away before it reaches this.
 		let mut ring = Ring::new();
 		let old = table(&[(0, 1, somewhere())]);
 		let mut fresh = somewhere();
@@ -520,17 +530,18 @@ mod tests {
 		ring.keep(ring.next(), &old);
 		ring.keep(ring.next(), &old);
 		ring.forget();
+
+		assert_eq!(ring.next(), 1, "the next one is the first one again");
+
 		ring.keep(ring.next(), &table(&[(0, 1, fresh)]));
 
-		assert!(!ring.has(1), "the numbers the peer that left was holding name nothing");
-		assert!(!ring.has(2));
-		assert_eq!(ring.base(2).1, NOTHING, "so it is told everything rather than a difference");
-		assert_eq!(ring.next(), 4, "and this conversation counts on from where that one stopped");
+		assert!(ring.has(1), "and number one names this conversation's world");
 		assert_eq!(
-			ring.base(3).0[0].map(|(_, solid)| solid.kind),
+			ring.base(1).0[0].map(|(_, solid)| solid.kind),
 			Some(77),
-			"while the number this conversation did use names its own world"
+			"which is the new one rather than what the number meant before"
 		);
+		assert!(!ring.has(2), "and nothing else the conversation before it used");
 	}
 
 	#[test]

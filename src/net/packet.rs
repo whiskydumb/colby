@@ -1,15 +1,26 @@
-//! The sixteen bytes at the head of a datagram, and what it takes to be one.
+//! The twenty bytes at the head of a datagram, and what it takes to be one.
 //!
 //! ```text
 //!    0  magic      u16   the two bytes that say this is one of ours
 //!    2  version    u16   the protocol, and a mismatch is refused over it
-//!    4  sequence   u16   which message this datagram is part of
-//!    6  ack        u16   the newest message that has arrived from the far end
-//!    8  ack_bits   u32   which of the thirty-two before `ack` arrived
-//!   12  fragment   u16   which piece of the message this is, counting from nil
-//!   14  fragments  u16   how many pieces the message has, one meaning whole
-//!   16  the piece, up to [`MAX_PAYLOAD`] bytes of it
+//!    4  session    u32   which conversation this is; a new one is a new run
+//!    8  sequence   u16   which message this datagram is part of
+//!   10  ack        u16   the newest message that has arrived from the far end
+//!   12  ack_bits   u32   which of the thirty-two before `ack` arrived
+//!   16  fragment   u16   which piece of the message this is, counting from nil
+//!   18  fragments  u16   how many pieces the message has, one meaning whole
+//!   20  the piece, up to [`MAX_PAYLOAD`] bytes of it
 //! ```
+//!
+//! **The session is what tells one conversation from the next one**, and it is
+//! in every datagram rather than only in a greeting for the reason the field it
+//! is modeled on puts its own equivalent in every packet: an endpoint that
+//! restarted has a far end still holding the old conversation's numbers, and
+//! without this nothing on the wire says the two are not the same talk. A
+//! sequence counts on and never repeats and a snapshot number does the same, so
+//! a restarted end counting from the beginning is refused everything it says
+//! until it counts back past where the last conversation reached - which is a
+//! silence as long as the session that came before it.
 //!
 //! **Every field is written and read a byte at a time, little-endian.** Nothing
 //! here is a `#[repr(C)]` block cast in place the way an asset is, and the
@@ -42,15 +53,18 @@ pub const MAGIC: u16 = u16::from_le_bytes(*b"CN");
 /// Bump it whenever the header, the fragment rules or the reliable block change
 /// shape. A datagram carrying a different number is refused with the number in
 /// the message rather than read as if it agreed.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// Two since the head grew a session.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 const MAGIC_AT: usize = 0;
 const VERSION_AT: usize = 2;
-const SEQUENCE_AT: usize = 4;
-const ACK_AT: usize = 6;
-const ACK_BITS_AT: usize = 8;
-const FRAGMENT_AT: usize = 12;
-const FRAGMENTS_AT: usize = 14;
+const SESSION_AT: usize = 4;
+const SEQUENCE_AT: usize = 8;
+const ACK_AT: usize = 10;
+const ACK_BITS_AT: usize = 12;
+const FRAGMENT_AT: usize = 16;
+const FRAGMENTS_AT: usize = 18;
 
 /// How big the head of a datagram is, and where the piece starts.
 pub const HEADER_BYTES: usize = FRAGMENTS_AT + 2;
@@ -148,6 +162,15 @@ impl fmt::Display for Reason {
 /// nothing to get wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
+	/// Which conversation this datagram belongs to.
+	///
+	/// Chosen once by the endpoint that sent it and the same in every datagram
+	/// it ever sends. What it is *for* is the moment it changes: an endpoint
+	/// hearing a session it has not been hearing from an address it knows is
+	/// hearing from a process that started again, and everything it remembers
+	/// about the conversation before it is worth nothing.
+	pub session: u32,
+
 	/// Which message this datagram is part of. @ref [`after`].
 	pub sequence: u16,
 
@@ -172,7 +195,8 @@ impl Header {
 	/// @param out - where the datagram is being built
 	pub fn write(&self, out: &mut [u8; HEADER_BYTES]) {
 		out[MAGIC_AT..VERSION_AT].copy_from_slice(&MAGIC.to_le_bytes());
-		out[VERSION_AT..SEQUENCE_AT].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+		out[VERSION_AT..SESSION_AT].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+		out[SESSION_AT..SEQUENCE_AT].copy_from_slice(&self.session.to_le_bytes());
 		out[SEQUENCE_AT..ACK_AT].copy_from_slice(&self.sequence.to_le_bytes());
 		out[ACK_AT..ACK_BITS_AT].copy_from_slice(&self.ack.to_le_bytes());
 		out[ACK_BITS_AT..FRAGMENT_AT].copy_from_slice(&self.ack_bits.to_le_bytes());
@@ -209,6 +233,7 @@ impl Header {
 		}
 
 		let header = Self {
+			session: u32_at(datagram, SESSION_AT),
 			sequence: u16_at(datagram, SEQUENCE_AT),
 			ack: u16_at(datagram, ACK_AT),
 			ack_bits: u32_at(datagram, ACK_BITS_AT),
@@ -329,6 +354,7 @@ mod tests {
 
 	fn whole() -> Header {
 		Header {
+			session: 0x0BAD_F00D,
 			sequence: 7,
 			ack: 3,
 			ack_bits: 0b1011,
@@ -340,6 +366,7 @@ mod tests {
 	#[test]
 	fn a_head_survives_the_round_trip_field_for_field() {
 		let header = Header {
+			session: 0x1122_3344,
 			sequence: 0x1234,
 			ack: 0x5678,
 			ack_bits: 0x9ABC_DEF0,
@@ -353,9 +380,9 @@ mod tests {
 	}
 
 	#[test]
-	fn the_head_is_sixteen_bytes_and_the_rest_is_the_piece() {
-		assert_eq!(HEADER_BYTES, 16, "two shorts, a long and two more shorts");
-		assert_eq!(MAX_PAYLOAD, MAX_DATAGRAM - 16, "and the piece is whatever is left");
+	fn the_head_is_twenty_bytes_and_the_rest_is_the_piece() {
+		assert_eq!(HEADER_BYTES, 20, "two shorts, two longs and three more shorts");
+		assert_eq!(MAX_PAYLOAD, MAX_DATAGRAM - 20, "and the piece is whatever is left");
 
 		let bytes = datagram(&whole(), 5);
 
@@ -423,19 +450,23 @@ mod tests {
 		// file writes and reads through the same constants and would not notice
 		// two of them swapping.
 		let header = Header {
-			sequence: 0x0201,
-			ack: 0x0403,
-			ack_bits: 0x0807_0605,
-			fragment: 0x0A09,
-			fragments: 0x0C0B,
+			session: 0x0403_0201,
+			sequence: 0x0605,
+			ack: 0x0807,
+			ack_bits: 0x0C0B_0A09,
+			fragment: 0x0E0D,
+			fragments: 0x100F,
 		};
 		let mut head = [0_u8; HEADER_BYTES];
 
 		header.write(&mut head);
 		assert_eq!(
 			head,
-			[b'C', b'N', 1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0A, 0x0B, 0x0C],
-			"the magic, version one, then the five fields little-endian in order"
+			[
+				b'C', b'N', 2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+				0x10
+			],
+			"the magic, the protocol, then the six fields little-endian in order"
 		);
 	}
 
@@ -557,9 +588,9 @@ mod tests {
 			MAX_DATAGRAM, 1200,
 			"under the smallest transmission unit anything must carry"
 		);
-		assert_eq!(HEADER_BYTES, 16, "two shorts, a long and two more shorts");
+		assert_eq!(HEADER_BYTES, 20, "two shorts, two longs and three more shorts");
 		assert_eq!(MAX_FRAGMENTS, 64, "which is how many bits are used to track them");
 		assert_eq!(ACK_BITS, 32, "and the acknowledgement field is a long");
-		assert_eq!(MAX_MESSAGE, 75_776, "so the largest message is this many bytes");
+		assert_eq!(MAX_MESSAGE, 75_520, "so the largest message is this many bytes");
 	}
 }

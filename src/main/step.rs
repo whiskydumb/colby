@@ -286,7 +286,7 @@ mod tests {
 
 		let at = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 		let shared = Rc::new(RefCell::new(Wire::default()));
-		let mut net = Net::over(Box::new(Loopback::at(at(2), &shared)), false, 2);
+		let mut net = Net::over(Box::new(Loopback::at(at(2), &shared)), false, 2, 0x0000_B001);
 		let simulation = Box::new(Simulation::new());
 		let mut world = Box::<World>::default();
 

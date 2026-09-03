@@ -52,7 +52,7 @@ use std::{
 	net::{SocketAddr, ToSocketAddrs, UdpSocket},
 	rc::Rc,
 	sync::Mutex,
-	time::Duration,
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use colby_core::{
@@ -66,11 +66,51 @@ use colby_core::{
 	info, warn,
 };
 use colby_net::{
-	Block, Channel, Conditions, Delivery, Heard, Link, MAX_DATAGRAM, NOTHING, Reliable, Ring,
-	Slot, Snapshot, Solid,
+	Block, Channel, Conditions, Delivery, Header, Heard, Link, MAX_DATAGRAM, NOTHING, Reliable,
+	Ring, Slot, Snapshot, Solid,
 };
 
-/// The port a host listens on when nobody says otherwise.
+/// A session number no other run of this program will pick.
+///
+/// **Off the wall clock rather than off the seed**, and the difference is the
+/// whole point: the seed is there so a run can be repeated, and a session that
+/// repeated would be a restarted process claiming to be the one that stopped.
+///
+/// A run that has to be reproducible does not call this: `--link` and every
+/// test hand [`Net::over`] a number they chose.
+///
+/// @note: the one line here no test reaches is the clock read. What it does
+/// with what the clock said is [`session_of`], which is checkable and checked.
+///
+/// @return a session for one run of one endpoint
+fn fresh_session() -> u32 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(1, session_of)
+}
+
+/// Folds a moment into a session number.
+///
+/// The low half of the nanosecond count rather than a hash of it: what has to
+/// hold is that two runs of one machine differ, and the bottom bits are the
+/// ones that do - a whole second of them is only four hundred million apart,
+/// so two starts more than about four seconds apart are certain to differ and
+/// two closer than that are astronomically likely to.
+///
+/// Never nought, because nought is a perfectly good session and a fallback
+/// that could produce one would make "the clock failed" indistinguishable from
+/// a working endpoint that happened to start on the second.
+///
+/// @param since - how long ago the epoch was, as the clock has it
+/// @return a session number
+fn session_of(since: Duration) -> u32 {
+	let low = u32::try_from(since.as_nanos() & u128::from(u32::MAX)).unwrap_or(1);
+
+	low.max(1)
+}
+
+/// The port a host listens on when nobody says otherwise./// The port a host
+/// listens on when nobody says otherwise.
 pub(crate) const DEFAULT_PORT: u16 = 27015;
 
 /// How many datagrams one drain takes off the wire before it gives the frame
@@ -680,6 +720,13 @@ struct Peer {
 	/// hundred milliseconds on it.
 	stamped: u32,
 
+	/// Which conversation the far end is having, once it has said one.
+	///
+	/// Set by the first datagram that arrives and compared against every one
+	/// after it. A different number from an address this endpoint knows is a
+	/// process that started again, and everything below is worth nothing.
+	theirs: Option<u32>,
+
 	/// What was told to this peer, to write the next difference against.
 	told: Ring,
 
@@ -694,6 +741,64 @@ struct Peer {
 	/// block can borrow it while the block itself is still borrowed from the
 	/// channel beside it.
 	taken: Taken,
+}
+
+impl Peer {
+	/// Starts the conversation over, keeping the address and the lying link.
+	///
+	/// **Everything numbered is replaced and nothing is carried across.** A
+	/// sequence counts on and never repeats, and so does a snapshot number; the
+	/// far end that just started again is counting from the beginning of both,
+	/// so anything this end remembers would refuse everything it says. That is
+	/// what the two rings' `forget` is for, and this is the only place either
+	/// is called.
+	///
+	/// What is *not* replaced is the address, which is how the peer was found,
+	/// and the link, which is a tool somebody set up rather than anything the
+	/// conversation owns.
+	///
+	/// **What is said carries on and what was heard is dropped**, which is not
+	/// symmetry for its own sake: the far end is a process that has heard
+	/// nothing, so it takes whatever number arrives - and a *third* case, a
+	/// far end that never restarted at all, is holding the number this end
+	/// last used and would refuse everything below it. @ref
+	/// [`Channel::forget`].
+	///
+	/// @param theirs - the session the far end is now having
+	/// @return the seat this peer gave up, or [`PeerId::NONE`] if it had none
+	fn restart(&mut self, theirs: u32) -> PeerId {
+		let gone = self.id;
+
+		self.channel.forget();
+		self.reliable.forget();
+		self.theirs = Some(theirs);
+		// @note: no mutation of this line is caught by anything, and the
+		// reason is written a few hundred lines down in `file`: whether a peer
+		// holds a seat is asked of the *world* rather than of this handle, so
+		// the seat is re-minted on the next pass either way. It is here so
+		// that a message sent between the restart and that pass names nobody
+		// rather than naming a seat that is on its way back.
+		self.id = PeerId::NONE;
+		self.named = PeerId::NONE;
+		self.asked.clear();
+		self.settled = 0;
+		self.confirmed = 0;
+		self.stamped = 0;
+		// @note: and no mutation of *this* line is caught either. The far end
+		// of a restart is a ring that has kept nothing, so it can never name a
+		// number this one is still holding - which makes the clearing memory
+		// and symmetry rather than correctness. It is the other half of
+		// `taken.heard.forget()` below, which *is* load-bearing, and a reader
+		// finding one without the other would have to work out why.
+		self.told.forget();
+		self.kept.clear();
+		self.taken.heard.forget();
+		self.taken.theirs = NOTHING;
+		self.taken.baselines = 0;
+		self.taken.behind = 0;
+
+		gone
+	}
 }
 
 /// What one peer has said about the world, and what this end made of it.
@@ -762,6 +867,13 @@ pub(crate) struct Net {
 	hosting: bool,
 	conditions: Conditions,
 	seed: u64,
+
+	/// Which conversation everything this endpoint says belongs to.
+	///
+	/// Chosen once, written into every datagram, and never changed while the
+	/// process runs. It is what a far end compares against to notice that this
+	/// process is not the one it was talking to a moment ago.
+	session: u32,
 	scratch: Box<[u8; MAX_DATAGRAM]>,
 	payload: Vec<u8>,
 	commands: Vec<String>,
@@ -849,7 +961,10 @@ impl Net {
 	/// @param hosting - whether a datagram from an address this endpoint has
 	/// not heard from becomes a peer
 	/// @param seed - what the lying links start their chance from
-	pub(crate) fn over(post: Box<dyn Post>, hosting: bool, seed: u64) -> Self {
+	/// @param session - which conversation everything this endpoint says
+	/// belongs to. @ref [`fresh_session`], and note that a *test* wants a
+	/// number it chose rather than one the clock did
+	pub(crate) fn over(post: Box<dyn Post>, hosting: bool, seed: u64, session: u32) -> Self {
 		Self {
 			post,
 			peers: Vec::new(),
@@ -857,6 +972,7 @@ impl Net {
 			looking: None,
 			conditions: Conditions::PERFECT,
 			seed,
+			session,
 			scratch: Box::new([0; MAX_DATAGRAM]),
 			payload: Vec::new(),
 			commands: Vec::new(),
@@ -887,14 +1003,14 @@ impl Net {
 		let address = socket.address();
 
 		info!(%address, "listening");
-		Ok(Self::over(Box::new(socket), true, seed))
+		Ok(Self::over(Box::new(socket), true, seed, fresh_session()))
 	}
 
 	/// An endpoint talking to exactly one other, which it already knows.
 	pub(crate) fn connect(address: SocketAddr, seed: u64) -> Result<Self> {
 		let socket = Socket::bind(0)?;
 		let ours = socket.address();
-		let mut net = Self::over(Box::new(socket), false, seed);
+		let mut net = Self::over(Box::new(socket), false, seed, fresh_session());
 
 		net.introduce(address);
 		info!(%ours, %address, "talking to a host");
@@ -1520,6 +1636,59 @@ impl Net {
 	fn next_message(&mut self, index: usize, now: Duration) -> Option<bool> {
 		let peer = &mut self.peers[index];
 		let datagram = peer.link.poll(now)?;
+		// **before the channel sees it.** What the channel would do with a
+		// datagram from a conversation that has ended is refuse it for being
+		// behind, and go on refusing for as long as the conversation before it
+		// ran - which is the whole of the fault this answers.
+		//
+		// Read rather than peeked at, so the magic and the protocol are
+		// checked here too: noise from a stranger must not be able to end a
+		// conversation that is working. What is *not* checked is who sent it,
+		// which is the same thing nothing else on this wire checks.
+		let said = Header::read(datagram)
+			.ok()
+			.map(|head| head.session);
+		// every case written out rather than folded into a condition, because
+		// three of the four do nothing and the fourth ends a conversation.
+		let started_again = match (peer.theirs, said) {
+			// a datagram that is not one of ours at all. The channel below
+			// refuses it and counts it, which is where that belongs.
+			| (_, None) => None,
+
+			// the same conversation, which is almost every datagram there is.
+			| (Some(had), Some(new)) if had == new => None,
+
+			// the first thing this peer has ever said names the conversation.
+			| (None, Some(new)) => {
+				peer.theirs = Some(new);
+
+				None
+			},
+
+			// and a number that is not the one it has been saying.
+			| (Some(_), Some(new)) => Some(new),
+		};
+
+		if let Some(new) = started_again {
+			let address = peer.address;
+			let gone = peer.restart(new);
+
+			// **this datagram is thrown away with the conversation it ended.**
+			// The channel it would go through was made a line ago and has
+			// heard nothing, so letting it through would work - and losing one
+			// message on a wire where everything is said again costs nothing,
+			// while a rule that says "the first datagram of a conversation is
+			// special" costs a reader something forever.
+			warn!(%address, "this peer started again; what it said before is worth nothing");
+
+			if gone.is_some() {
+				self.departed.push(gone);
+			}
+
+			self.forgotten = self.forgotten.saturating_add(1);
+
+			return Some(true);
+		}
 
 		match peer.channel.receive(datagram, now) {
 			| Delivery::Message(message) => {
@@ -1679,7 +1848,7 @@ impl Net {
 		link.set(self.conditions);
 		self.peers.push(Peer {
 			address,
-			channel: Channel::new(),
+			channel: Channel::new(self.session),
 			reliable: Reliable::new(),
 			link,
 			heard: now,
@@ -1689,6 +1858,7 @@ impl Net {
 			settled: 0,
 			confirmed: 0,
 			stamped: 0,
+			theirs: None,
 			told: Ring::new(),
 			kept: Vec::new(),
 			taken: Taken {
@@ -2231,6 +2401,12 @@ mod tests {
 
 	use super::*;
 
+	/// The session this end is having, in every test that needs one named.
+	const OURS: u32 = 0x0000_A001;
+
+	/// And the far end's, deliberately a different number.
+	const THEIRS: u32 = 0x0000_A002;
+
 	/// An address nobody has to be able to reach.
 	fn somewhere(port: u16) -> SocketAddr {
 		SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -2257,7 +2433,7 @@ mod tests {
 	fn fresh_peer() -> Peer {
 		Peer {
 			address: somewhere(7),
-			channel: Channel::new(),
+			channel: Channel::new(OURS),
 			reliable: Reliable::new(),
 			link: Link::new(1),
 			heard: Duration::ZERO,
@@ -2267,6 +2443,7 @@ mod tests {
 			settled: 0,
 			confirmed: 0,
 			stamped: 0,
+			theirs: Some(THEIRS),
 			told: Ring::new(),
 			kept: Vec::new(),
 			taken: Taken {
@@ -2463,6 +2640,148 @@ mod tests {
 		assert!(alike(&theirs, &world), "and the far end has all of it at once");
 	}
 
+	#[test]
+	fn a_host_that_started_again_is_noticed_and_the_client_converges_on_it() {
+		// **the whole of NET-5, at the size of two endpoints.** A sequence
+		// counts on and a snapshot number counts on, so a process that starts
+		// again begins both from the beginning - and a far end holding what
+		// the conversation before it reached refuses everything it says until
+		// it has counted back up. That is a silence as long as the session
+		// that came before, which after an hour's play is an hour.
+		let wire = Rc::new(RefCell::new(Wire::default()));
+		let (at_host, at_client) = (somewhere(1), somewhere(2));
+		let mut host = Net::over(Box::new(Loopback::at(at_host, &wire)), true, 1, 0x0000_1001);
+		let mut client =
+			Net::over(Box::new(Loopback::at(at_client, &wire)), false, 2, 0x0000_2001);
+
+		client.introduce(at_host);
+
+		// long enough that both ends' numbering is well past where a fresh one
+		// starts. Short of this the fault heals on its own and the test says
+		// nothing.
+		for step in 1..=300 {
+			host.send(colby_core::time::STEP * step, Some(&world(1.0)));
+			client.send(colby_core::time::STEP * step, None);
+			host.receive(colby_core::time::STEP * step);
+			client.receive(colby_core::time::STEP * step);
+		}
+
+		let reached = client.holding(0);
+
+		assert!(reached > 50, "the client has been told a great many worlds: {reached}");
+
+		// and now the host is a different process on the same address: a new
+		// session, and everything about it counting from the beginning.
+		let mut again = Net::over(Box::new(Loopback::at(at_host, &wire)), true, 1, 0x0000_1002);
+
+		for step in 301..=340 {
+			again.send(colby_core::time::STEP * step, Some(&world(2.0)));
+			client.send(colby_core::time::STEP * step, None);
+			again.receive(colby_core::time::STEP * step);
+			client.receive(colby_core::time::STEP * step);
+		}
+
+		let now = client.holding(0);
+
+		assert!(now > 0, "the client is being told worlds again");
+		assert!(
+			now < reached,
+			"and by a conversation numbering from the beginning rather than from {reached}: \
+			 {now}"
+		);
+	}
+
+	#[test]
+	fn a_session_is_a_different_number_for_every_moment_it_could_be_taken_at() {
+		// what a restarted process needs of it, and the only half of it a test
+		// can reach: the clock read itself is one line and is not here.
+		let one = Duration::from_nanos(1);
+		let now = Duration::from_secs(1_700_000_000);
+
+		assert_ne!(
+			session_of(now),
+			session_of(now + one),
+			"a nanosecond apart is a different one"
+		);
+		assert_ne!(
+			session_of(now),
+			session_of(now + Duration::from_secs(1)),
+			"and so is a second apart"
+		);
+		assert!(session_of(now) > 0, "and none of them is nought");
+		assert!(session_of(Duration::ZERO) > 0, "not even the one moment that folds to it");
+		assert!(session_of(Duration::MAX) > 0, "whatever the clock says");
+	}
+
+	#[test]
+	fn a_far_end_saying_the_same_session_is_the_same_conversation() {
+		// the ordinary case, said out loud so that a change which restarted on
+		// every datagram would be caught rather than merely slow.
+		let (mut host, mut client, _wire) = two();
+
+		for step in 1..=40 {
+			round(&mut host, &mut client, step);
+		}
+
+		assert_eq!(host.forgotten(), 0, "nothing was thrown away");
+		assert_eq!(client.forgotten(), 0);
+		assert_eq!(host.peers(), 1, "and there is still one conversation");
+	}
+
+	#[test]
+	fn the_first_thing_a_peer_says_names_the_conversation_rather_than_ending_one() {
+		// a peer this endpoint has never heard from has no session to compare
+		// against, so its first datagram must not read as a restart - which
+		// would throw the datagram away and forget a conversation that had not
+		// begun.
+		let (mut host, mut client, _wire) = two();
+
+		round(&mut host, &mut client, 1);
+
+		assert_eq!(host.peers(), 1, "the client is a peer");
+		assert_eq!(host.forgotten(), 0, "and its first word did not end anything");
+		assert!(host.delivered() > 0, "it was heard rather than dropped");
+	}
+
+	#[test]
+	fn a_peer_that_started_again_gives_its_seat_back() {
+		// a host mints a seat for whoever turns up, and a process that started
+		// again is somebody turning up. Without this the world's player table
+		// fills with people who are not there.
+		let wire = Rc::new(RefCell::new(Wire::default()));
+		let (at_host, at_client) = (somewhere(1), somewhere(2));
+		let mut host = Net::over(Box::new(Loopback::at(at_host, &wire)), true, 1, 0x0000_3001);
+		let mut client =
+			Net::over(Box::new(Loopback::at(at_client, &wire)), false, 2, 0x0000_4001);
+		let mut world = empty_world();
+
+		client.introduce(at_host);
+
+		for step in 1..=10 {
+			round(&mut host, &mut client, step);
+			host.seat(&mut world);
+		}
+
+		let first = seated(&world);
+
+		// the same address, a different process.
+		let mut again =
+			Net::over(Box::new(Loopback::at(at_client, &wire)), false, 2, 0x0000_4002);
+
+		again.introduce(at_host);
+
+		for step in 11..=20 {
+			round(&mut host, &mut again, step);
+			host.seat(&mut world);
+		}
+
+		assert_eq!(host.peers(), 1, "one conversation, not two");
+
+		let second = seated(&world);
+
+		assert_ne!(first, second, "and the seat it took is not the one it left");
+	}
+
 	/// Whoever the host has admitted that is not the host.
 	fn seated(world: &World) -> PeerId {
 		world
@@ -2477,8 +2796,8 @@ mod tests {
 	fn two() -> (Net, Net, Rc<RefCell<Wire>>) {
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (one, two) = (somewhere(1), somewhere(2));
-		let host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1);
-		let mut client = Net::over(Box::new(Loopback::at(two, &wire)), false, 2);
+		let host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1, OURS);
+		let mut client = Net::over(Box::new(Loopback::at(two, &wire)), false, 2, THEIRS);
 
 		client.introduce(one);
 		(host, client, wire)
@@ -2607,7 +2926,7 @@ mod tests {
 	/// and a body that was already kinematic could not show that.
 	fn client() -> (Net, World, BodyId) {
 		let wire = Rc::new(RefCell::new(Wire::default()));
-		let mut net = Net::over(Box::new(Loopback::at(somewhere(2), &wire)), false, 2);
+		let mut net = Net::over(Box::new(Loopback::at(somewhere(2), &wire)), false, 2, OURS);
 		let mut world = World::new();
 
 		// something in the slots before it, so that a slot number, a walk's
@@ -3113,7 +3432,7 @@ mod tests {
 		// a client's claim and a host's world. `World::peer` is a public field
 		// a game module writes, so it cannot be the only thing that does.
 		let wire = Rc::new(RefCell::new(Wire::default()));
-		let mut host = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), true, 1);
+		let mut host = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), true, 1, OURS);
 		let mut world = World::new();
 		let entity = world.entities.spawn();
 		let body = world.bodies.spawn(Body {
@@ -3142,7 +3461,7 @@ mod tests {
 		// the world is, so a world arriving at one would be the world
 		// overwriting itself with whatever a client claimed.
 		let wire = Rc::new(RefCell::new(Wire::default()));
-		let mut host = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), true, 1);
+		let mut host = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), true, 1, OURS);
 		let mut world = World::new();
 		let entity = world.entities.spawn();
 		let body = world.bodies.spawn(Body {
@@ -3239,8 +3558,8 @@ mod tests {
 		// commands is what says where the snapshot begins.
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (one, two) = (somewhere(1), somewhere(2));
-		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1);
-		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2);
+		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1, OURS);
+		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2, OURS);
 
 		liar.introduce(one);
 
@@ -3267,8 +3586,8 @@ mod tests {
 		// not: a count of one and no record after it.
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (one, two) = (somewhere(1), somewhere(2));
-		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1);
-		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2);
+		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1, OURS);
+		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2, OURS);
 
 		liar.introduce(one);
 
@@ -3465,8 +3784,8 @@ mod tests {
 		// fault is handed over as though the next message had said it.
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (one, two) = (somewhere(1), somewhere(2));
-		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1);
-		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2);
+		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1, OURS);
+		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2, OURS);
 
 		liar.introduce(one);
 
@@ -3512,8 +3831,8 @@ mod tests {
 	fn a_client_does_not_take_a_stranger_for_a_peer() {
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (one, two, three) = (somewhere(1), somewhere(2), somewhere(3));
-		let mut client = Net::over(Box::new(Loopback::at(two, &wire)), false, 1);
-		let mut stranger = Net::over(Box::new(Loopback::at(three, &wire)), false, 2);
+		let mut client = Net::over(Box::new(Loopback::at(two, &wire)), false, 1, OURS);
+		let mut stranger = Net::over(Box::new(Loopback::at(three, &wire)), false, 2, OURS);
 
 		client.introduce(one);
 		stranger.introduce(two);
@@ -3528,11 +3847,11 @@ mod tests {
 	fn a_host_takes_a_stranger_for_a_peer_and_stops_at_the_ceiling() {
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let host_at = somewhere(1);
-		let mut host = Net::over(Box::new(Loopback::at(host_at, &wire)), true, 1);
+		let mut host = Net::over(Box::new(Loopback::at(host_at, &wire)), true, 1, OURS);
 		let mut clients: Vec<Net> = (0..MAX_PEERS + 2)
 			.map(|index| {
 				let at = somewhere(u16::try_from(100 + index).unwrap_or(100));
-				let mut client = Net::over(Box::new(Loopback::at(at, &wire)), false, 1);
+				let mut client = Net::over(Box::new(Loopback::at(at, &wire)), false, 1, OURS);
 
 				client.introduce(host_at);
 				client
@@ -3575,7 +3894,7 @@ mod tests {
 	#[test]
 	fn a_datagram_addressed_to_nobody_is_thrown_away_and_counted() {
 		let wire = Rc::new(RefCell::new(Wire::default()));
-		let mut alone = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), false, 1);
+		let mut alone = Net::over(Box::new(Loopback::at(somewhere(1), &wire)), false, 1, OURS);
 
 		alone.introduce(somewhere(9));
 		alone.send(Duration::ZERO, None);
@@ -3954,8 +4273,8 @@ mod tests {
 	fn a_block_of_commands_that_is_nonsense_costs_the_message_and_not_the_peer() {
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (one, two) = (somewhere(1), somewhere(2));
-		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1);
-		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2);
+		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1, OURS);
+		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2, OURS);
 
 		liar.introduce(one);
 
@@ -4049,9 +4368,9 @@ mod tests {
 	fn a_restore_reseats_the_peers_that_are_still_here_rather_than_leaving_ghosts() {
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (at_host, at_one, at_two) = (somewhere(1), somewhere(2), somewhere(3));
-		let mut host = Net::over(Box::new(Loopback::at(at_host, &wire)), true, 1);
-		let mut one = Net::over(Box::new(Loopback::at(at_one, &wire)), false, 2);
-		let mut two = Net::over(Box::new(Loopback::at(at_two, &wire)), false, 3);
+		let mut host = Net::over(Box::new(Loopback::at(at_host, &wire)), true, 1, OURS);
+		let mut one = Net::over(Box::new(Loopback::at(at_one, &wire)), false, 2, OURS);
+		let mut two = Net::over(Box::new(Loopback::at(at_two, &wire)), false, 3, OURS);
 		let mut served = empty_world();
 
 		one.introduce(at_host);
@@ -4101,8 +4420,8 @@ mod tests {
 	fn a_window_refuses_a_host_that_says_the_window_is_the_host() {
 		let wire = Rc::new(RefCell::new(Wire::default()));
 		let (at_host, at_window) = (somewhere(1), somewhere(2));
-		let mut liar = Net::over(Box::new(Loopback::at(at_host, &wire)), true, 1);
-		let mut client = Net::over(Box::new(Loopback::at(at_window, &wire)), false, 2);
+		let mut liar = Net::over(Box::new(Loopback::at(at_host, &wire)), true, 1, OURS);
+		let mut client = Net::over(Box::new(Loopback::at(at_window, &wire)), false, 2, OURS);
 		let mut window = empty_world();
 
 		joined(&mut window);

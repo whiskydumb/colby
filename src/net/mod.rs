@@ -98,7 +98,7 @@ mod tests {
 	#[test]
 	fn a_full_ring_of_the_longest_commands_crosses_in_one_message() {
 		let (mut sending, mut receiving) = (Reliable::new(), Reliable::new());
-		let (mut host, mut client) = (Channel::new(), Channel::new());
+		let (mut host, mut client) = (Channel::new(0x1111_1111), Channel::new(0x2222_2222));
 		let longest = "x".repeat(MAX_COMMAND);
 
 		for _ in 0..MAX_COMMANDS {
