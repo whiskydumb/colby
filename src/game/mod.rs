@@ -314,13 +314,6 @@ const CHARACTER_PIECES: usize = 2;
 /// stands the first few and says so.
 const LAMP_PIECES: usize = 8;
 
-/// The interface document the game puts on screen.
-///
-/// An asset, like the crystal: `assets/ui/hud.html` compiles to this name, and
-/// editing that file changes the window without rebuilding this module. The
-/// nodes below are addressed by their `id` attribute for the same reason a mesh
-/// is addressed by name - recompiling the document renumbers its boxes, and a
-/// handle into them would go stale exactly when somebody is editing it.
 /// The document the spawn menu is written in.
 const MENU: &str = "ui/spawn";
 
@@ -351,6 +344,13 @@ const DROP_REACH: f32 = 1.6;
 /// How far above the player's middle.
 const DROP_LIFT: f32 = 0.9;
 
+/// The interface document the game puts on screen.
+///
+/// An asset, like the crystal: `assets/ui/hud.html` compiles to this name, and
+/// editing that file changes the window without rebuilding this module. The
+/// nodes below are addressed by their `id` attribute for the same reason a mesh
+/// is addressed by name - recompiling the document renumbers its boxes, and a
+/// handle into them would go stale exactly when somebody is editing it.
 const HUD: &str = "ui/hud";
 
 /// A slot number no table will ever hand out.
@@ -1030,6 +1030,15 @@ fn seat_all(world: &mut World) {
 			world.attach_body(seated, BodyKind::Kinematic, Shape::cuboid(Vec3::splat(0.5)));
 
 		layer(world, body, Layers::NONE);
+
+		// named so the editor's tree and `game.freeze <name>` can both reach a
+		// seat. A name is not an identity here - two of them may agree and the
+		// handle is what is unique - so numbering by slot is exactly what a
+		// name is for: it is how somebody finds the fourth seat again.
+		let called = format!("player {slot}");
+
+		world.entities.set_name(seated, &called);
+		world.bodies.set_name(body, &called);
 
 		let (state, _) = world.state.get::<State>(STATE_LAYOUT);
 
@@ -4324,13 +4333,19 @@ fn stand_character(world: &mut World) {
 
 	// copied out for the reason the lamp's are: placing them writes the entity
 	// table, which cannot be done while the model is borrowed.
-	let pieces: Vec<(MeshId, MaterialId, SkeletonId, Transform)> = world
+	let pieces: Vec<(MeshId, MaterialId, SkeletonId, Transform, String)> = world
 		.models
 		.placements(id)
 		.iter()
 		.take(CHARACTER_PIECES)
 		.map(|placement| {
-			(placement.mesh, placement.material, placement.skeleton, placement.transform)
+			(
+				placement.mesh,
+				placement.material,
+				placement.skeleton,
+				placement.transform,
+				placement.name.clone(),
+			)
 		})
 		.collect();
 
@@ -4345,7 +4360,7 @@ fn stand_character(world: &mut World) {
 
 	let skeleton = pieces
 		.iter()
-		.map(|(_, _, skeleton, _)| *skeleton)
+		.map(|(_, _, skeleton, ..)| *skeleton)
 		.find(|skeleton| skeleton.is_some())
 		.unwrap_or(SkeletonId::NONE);
 
@@ -4357,7 +4372,7 @@ fn stand_character(world: &mut World) {
 		info!(model = CHARACTER_MODEL, bones = bones.len(), "the character is posed");
 	}
 
-	for (slot, (mesh, material, _, transform)) in slots.into_iter().zip(&pieces) {
+	for (slot, (mesh, material, _, transform, called)) in slots.into_iter().zip(&pieces) {
 		let mut stance = *transform;
 		stance.position += CHARACTER_AT;
 
@@ -4369,6 +4384,7 @@ fn stand_character(world: &mut World) {
 		world
 			.entities
 			.set_renderable(slot, Renderable::of(*mesh, *material, Vec3::ONE).posed(pose));
+		world.entities.set_name(slot, called);
 	}
 
 	for slot in slots.into_iter().skip(pieces.len()) {
@@ -4640,12 +4656,14 @@ fn stand_model(world: &mut World) {
 
 	// copied out because placing them writes the entity table, which is not
 	// something that can be done while the model is borrowed.
-	let pieces: Vec<(MeshId, MaterialId, Transform)> = world
+	let pieces: Vec<(MeshId, MaterialId, Transform, String)> = world
 		.models
 		.placements(id)
 		.iter()
 		.take(LAMP_PIECES)
-		.map(|placement| (placement.mesh, placement.material, placement.transform))
+		.map(|placement| {
+			(placement.mesh, placement.material, placement.transform, placement.name.clone())
+		})
 		.collect();
 
 	if standing > LAMP_PIECES {
@@ -4657,7 +4675,7 @@ fn stand_model(world: &mut World) {
 		);
 	}
 
-	for (slot, (mesh, material, transform)) in slots.into_iter().zip(&pieces) {
+	for (slot, (mesh, material, transform, called)) in slots.into_iter().zip(&pieces) {
 		let mut stance = *transform;
 		stance.position = LAMP_AT + transform.position * LAMP_SCALE;
 		stance.scale *= LAMP_SCALE;
@@ -4670,6 +4688,9 @@ fn stand_model(world: &mut World) {
 		world
 			.entities
 			.set_renderable(slot, Renderable::of(*mesh, *material, Vec3::ONE));
+		// the model already says what each of its pieces is called, so this is
+		// the file's own word rather than a name this function invented.
+		world.entities.set_name(slot, called);
 	}
 
 	// a model that shrank, or one that failed to load at all, leaves slots

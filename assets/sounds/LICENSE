@@ -1,0 +1,59 @@
+The three sounds beside this file - thud.wav, hum.wav and click.wav - are not
+recordings of anything and are nobody's work but this project's. They are
+arithmetic, and they carry the same terms the rest of the repository does: MIT,
+Copyright (c) 2026 whisky, see LICENSE at the root.
+
+They are written down here for the reason the normal maps in
+assets/textures/construct/ are: nothing downstream can tell a generated sound
+from a recorded one, so if it is not said here it is not said anywhere.
+
+Where these descriptions came from, honestly. This file was supposed to go in
+with the sounds on 2026-08-31 and did not - it was named in the audit, the
+handover said to add the directory, and only the .wav files were staged. The
+generator was never in the repository either, by the same rule that keeps the
+Blender scripts out. So the original recipe is gone, and what follows was
+**measured back out of the files themselves** on 2026-09-03 rather than copied
+from anything. It describes what they are; it is not what was typed to make
+them, and a regenerated set will not be sample-identical.
+
+All three are mono, sixteen-bit, 44100 Hz. Nothing in the engine cares about
+the rate - a .csnd keeps whatever its source had, and the mixer resamples - so
+these are 44100 only because that is what they were made at.
+
+  thud.wav    0.3000 s, 13230 frames, peaks at 0.85
+
+      A downward pitch sweep under an exponential decay: the tone falls from
+      about 117 Hz at the start to about 33 Hz at the end, and the amplitude
+      falls by roughly a factor of e^4 over the length, which leaves under two
+      percent of the peak at the end. That is a struck thump rather than a
+      note. Its reference distance in the sandbox was measured rather than
+      chosen and is six units - everything that lands is ten to twenty away.
+
+  hum.wav     0.5000 s, 22050 frames, peaks at 0.55
+
+      Four partials held flat for the whole length, with no envelope at all:
+
+          60 Hz   relative strength 1.00
+          90 Hz                     0.45
+         180 Hz                     0.18
+         270 Hz                     0.07
+
+      **Every one of the four is a whole number of cycles in half a second**,
+      which is the whole reason this loops seamlessly: 30, 45, 90 and 135
+      cycles. Measured across the join, the step is 312 against a largest
+      ordinary adjacent step of 313 - an ordinary step rather than a
+      discontinuity. Change any of those four frequencies to something that is
+      not a multiple of two hertz and the loop will click, once per half
+      second, forever.
+
+  click.wav   0.0300 s, 1323 frames, peaks at 0.70
+
+      Broadband noise under a fast exponential decay - no partial anywhere in
+      the spectrum stands more than about two percent above its neighbors, and
+      the zero crossings sit around eleven kilohertz throughout, which is what
+      noise measures as rather than what any tone does. The amplitude is down
+      to a thousandth of the peak by the end.
+
+What to do if these are ever regenerated: keep the hum's four frequencies on
+whole cycles, keep the file lengths, and re-measure this file afterwards rather
+than trusting it.
