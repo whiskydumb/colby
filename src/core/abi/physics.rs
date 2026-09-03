@@ -502,6 +502,25 @@ pub struct Body {
 	/// collider are all bodies with nothing to draw.
 	pub entity: EntityId,
 
+	/// What is pushing on it this step, in newtons, in world space.
+	///
+	/// **Written by gameplay and consumed by the solver, which then clears
+	/// it.** It is therefore transient the way the touch queue is, and it is
+	/// in no file and on no wire. @ref [`Bodies::apply_force`] for the three
+	/// ways to add to it, and for the one step of lag the step order gives it.
+	///
+	/// Public because everything on this table is, and because a game that
+	/// wants to *replace* what it accumulated rather than add to it has no
+	/// other way to say so.
+	pub force: Vec3,
+
+	/// What is turning it this step, in newton-meters, in world space.
+	///
+	/// The same rules the field above has. Right-handed about the vector: a
+	/// torque along `+y` turns the body the way a right hand's fingers curl
+	/// when its thumb points that way.
+	pub torque: Vec3,
+
 	/// Which peer this belongs to, or [`PeerId::NONE`] for nobody's.
 	///
 	/// Meant to be game-written and host-read: who owns a prop is a gameplay
@@ -561,6 +580,8 @@ impl Body {
 			layers: Layers::DEFAULT,
 			sleeping: false,
 			entity: EntityId::NONE,
+			force: Vec3::ZERO,
+			torque: Vec3::ZERO,
 			owner: PeerId::NONE,
 		}
 	}
@@ -892,6 +913,104 @@ impl Bodies {
 	/// The host's, called beside [`Input::end_step`](super::Input::end_step)
 	/// and [`Ui::end_step`](super::Ui::end_step) and for the same reason: two
 	/// steps in one frame must not see the same event twice.
+	/// Pushes on a body, through its middle.
+	///
+	/// **Four things about this are worth knowing before the first call.**
+	///
+	/// It *accumulates*: two callers in one step both get what they asked for,
+	/// which is the whole reason this is a field rather than an argument to a
+	/// step.
+	///
+	/// It **takes effect on the step after the one that wrote it.** The solver
+	/// runs before the game's `update` in [`step`](crate::time), so a force
+	/// written there is read by the next pass and cleared by it. That is one
+	/// step, and it is the same lag a kinematic body's transform already has.
+	///
+	/// It **wakes the body.** A sleeping body has no inverse mass as far as
+	/// the solver is concerned, so a force on one would otherwise be a silent
+	/// nothing. The engine this borrows its shape from does the opposite and
+	/// tells you to reach for a different call if you want waking; a force
+	/// that does nothing is the wrong default here.
+	///
+	/// And it is refused for anything the solver does not integrate - a dead
+	/// handle, a static or kinematic body, a triangle soup. @ref
+	/// [`Body::movable`].
+	///
+	/// @param id - which body
+	/// @param force - newtons, in world space
+	/// @return whether it landed anywhere
+	pub fn apply_force(&mut self, id: BodyId, force: Vec3) -> bool {
+		let Some(body) = self.get_mut(id).filter(|body| body.movable()) else {
+			return false;
+		};
+
+		body.force += force;
+		body.sleeping = false;
+
+		true
+	}
+
+	/// Pushes on a body somewhere other than its middle.
+	///
+	/// Which is a push through the middle plus a turn, and the turn is what
+	/// makes a crate lifted by one corner rotate rather than rise flat. Both
+	/// engines read for this decompose it in exactly this line.
+	///
+	/// @param id - which body
+	/// @param force - newtons, in world space
+	/// @param at - where the push is applied, in world space
+	/// @return whether it landed anywhere
+	pub fn apply_force_at(&mut self, id: BodyId, force: Vec3, at: Vec3) -> bool {
+		let Some(body) = self.get_mut(id).filter(|body| body.movable()) else {
+			return false;
+		};
+
+		// the body's own position is its center of mass: a shape here is
+		// centered on its transform, which is what lets the solver work an
+		// inertia tensor out of the mass and the shape alone.
+		let turn = (at - body.transform.position).cross(force);
+
+		body.force += force;
+		body.torque += turn;
+		body.sleeping = false;
+
+		true
+	}
+
+	/// Turns a body without pushing it anywhere.
+	///
+	/// @param id - which body
+	/// @param torque - newton-meters, in world space
+	/// @return whether it landed anywhere
+	pub fn apply_torque(&mut self, id: BodyId, torque: Vec3) -> bool {
+		let Some(body) = self.get_mut(id).filter(|body| body.movable()) else {
+			return false;
+		};
+
+		body.torque += torque;
+		body.sleeping = false;
+
+		true
+	}
+
+	/// Forgets what every body was being pushed by.
+	///
+	/// Called by the solver once it has integrated, which is the only place it
+	/// can be: the step runs the solver *before* the game's `update`, so a
+	/// sweep at the bottom of a step beside [`end_step`](Self::end_step) would
+	/// clear what was written for the next one and no force would ever be felt.
+	///
+	/// Unconditional, over every slot rather than over the ones the solver
+	/// touched. A body the solver skips - asleep, static, or a triangle soup -
+	/// would otherwise hoard whatever was pushed at it and spend it all in the
+	/// one step it woke up.
+	pub fn forget_forces(&mut self) {
+		for body in &mut self.bodies {
+			body.force = Vec3::ZERO;
+			body.torque = Vec3::ZERO;
+		}
+	}
+
 	pub fn end_step(&mut self) { self.touches.clear(); }
 
 	/// Every body inside a sensor, as of the top of this step.

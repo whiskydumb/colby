@@ -901,7 +901,13 @@ impl Solver {
 		}
 	}
 
-	/// Applies gravity and damping to everything awake.
+	/// Applies gravity, whatever is pushing, and damping to everything awake.
+	///
+	/// The three in that order, and the order is the argument: gravity is an
+	/// acceleration and needs no mass, a force is divided by one, and damping
+	/// is what the air does to whatever the other two produced. A body that
+	/// ignores gravity does not ignore either of the others - weightless is a
+	/// claim about the ground rather than about being pushed.
 	fn accelerate(&mut self, bodies: &Bodies, gravity: Vec3, dt: f32) {
 		for (id, body) in bodies.iter() {
 			let slot = id.slot();
@@ -913,6 +919,12 @@ impl Solver {
 			if !body.weightless {
 				self.velocity[slot] += gravity * dt;
 			}
+
+			self.velocity[slot] += body.force * self.inverse_mass[slot] * dt;
+			// the one thing here that cannot be done anywhere else: the tensor
+			// is worked out per step from the mass and the shape and is never
+			// stored, so this is the only place a torque can become a spin.
+			self.angular[slot] += self.inverse_inertia[slot] * body.torque * dt;
 
 			self.velocity[slot] *= 1.0 / dt.mul_add(LINEAR_DAMPING, 1.0);
 			self.angular[slot] *= 1.0 / dt.mul_add(ANGULAR_DAMPING, 1.0);

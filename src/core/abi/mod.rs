@@ -95,7 +95,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 47;
+pub const ABI_VERSION: u32 = 48;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -943,6 +943,40 @@ impl World {
 
 		self.bodies
 			.spawn(Body::new(kind, shape, transform).driving(entity))
+	}
+
+	/// Hits a body once, rather than pushing on it for a step.
+	///
+	/// **On `World` rather than on `Bodies`, and that is the whole reason it is
+	/// here**: an impulse is a force times the length of a step, and the length
+	/// of a step is [`dt`](Self::dt) - which the body table cannot see. Reading
+	/// it off the world rather than off a constant is also what keeps this
+	/// right the day the rate stops being one.
+	///
+	/// The conversion is exact rather than approximate. A velocity gains the
+	/// force divided by the mass and multiplied by the step, so a force of one
+	/// impulse per step gains the impulse divided by the mass, and the step
+	/// length cancels.
+	///
+	/// One accumulator therefore serves both, which is what the missing inertia
+	/// tensor forces: nothing outside the solver can turn an angular impulse
+	/// into a spin, because the tensor is worked out per step from the mass and
+	/// the shape and is deliberately never stored.
+	///
+	/// The one thing this is not is an impulse applied *after* the step's
+	/// damping. This one is damped by the step it lands in.
+	///
+	/// @param id - which body
+	/// @param impulse - newton-seconds, in world space
+	/// @param at - where it lands, in world space
+	/// @return whether it landed anywhere
+	pub fn apply_impulse(&mut self, id: BodyId, impulse: Vec3, at: Vec3) -> bool {
+		if self.dt <= 0.0 {
+			return false;
+		}
+
+		self.bodies
+			.apply_force_at(id, impulse / self.dt, at)
 	}
 
 	/// Moves a body and declares that it cut rather than traveled.

@@ -212,6 +212,12 @@ impl Simulation {
 
 		self.solver
 			.run(&mut world.bodies, &world.joints, &manifolds, world.gravity, dt, passes);
+		// and everything that was pushing is spent, here rather than beside
+		// `Bodies::end_step`. The step runs this function *before* the game's
+		// `update`, so a sweep down there would clear what was written for the
+		// next pass and nothing would ever be pushed at all. @ref
+		// [`Bodies::forget_forces`].
+		world.bodies.forget_forces();
 		self.manifolds = manifolds;
 		self.sensed = sensed;
 		world.contacts =
@@ -800,6 +806,341 @@ mod tests {
 		world.install_physics(simulation.table());
 
 		(world, simulation)
+	}
+
+	/// Runs the simulation with something pushing on a body every step.
+	///
+	/// The push goes in *before* each step, which is where a game's own would
+	/// be: `step::run` calls the solver and then `update`, so what `update`
+	/// writes is what the next pass reads.
+	///
+	/// @param world - the world to advance
+	/// @param simulation - the solver
+	/// @param pushing - the body and the newtons on it
+	/// @param steps - how many
+	fn shoved(
+		world: &mut World,
+		simulation: &mut Simulation,
+		pushing: (BodyId, Vec3),
+		steps: usize,
+	) {
+		for _ in 0..steps {
+			world.bodies.apply_force(pushing.0, pushing.1);
+			simulation.step(world);
+			world.bodies.end_step();
+		}
+	}
+
+	/// How fast a body is going now.
+	fn moving(world: &World, id: BodyId) -> Vec3 {
+		world
+			.bodies
+			.get(id)
+			.expect("the body is alive")
+			.velocity
+	}
+
+	/// A dynamic unit box in empty space, of a mass.
+	fn floating(world: &mut World, mass: f32, at: Vec3) -> BodyId {
+		world
+			.bodies
+			.spawn(Body::dynamic(Shape::UNIT, Transform::at(at), mass))
+	}
+
+	#[test]
+	fn one_force_moves_a_light_body_further_than_a_heavy_one() {
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+
+		// four times the mass, and that is the whole fixture: at equal masses
+		// a solver that forgot to divide by one at all would answer the same
+		// for both, which is exactly the defect the thruster has today.
+		let light = floating(&mut world, 1.0, Vec3::new(-4.0, 0.0, 0.0));
+		let heavy = floating(&mut world, 4.0, Vec3::new(4.0, 0.0, 0.0));
+		let push = Vec3::Y * 8.0;
+
+		for _ in 0..30 {
+			world.bodies.apply_force(light, push);
+			world.bodies.apply_force(heavy, push);
+			simulation.step(&mut world);
+			world.bodies.end_step();
+		}
+
+		let (quick, slow) = (moving(&world, light).y, moving(&world, heavy).y);
+
+		assert!(quick > 0.0, "the light one is going up, at {quick}");
+		assert!(
+			(quick / slow - 4.0).abs() < 0.05,
+			"and four times as fast as the one four times as heavy: {quick} against {slow}"
+		);
+	}
+
+	#[test]
+	fn what_pushed_a_body_is_spent_by_the_step_that_felt_it() {
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+
+		let box_id = floating(&mut world, 1.0, Vec3::ZERO);
+
+		world.bodies.apply_force(box_id, Vec3::Y * 10.0);
+		simulation.step(&mut world);
+		world.bodies.end_step();
+
+		let after_one = moving(&world, box_id).y;
+
+		// and again, with nothing pushing. The sign of the change is the whole
+		// assertion: damping can only take speed away, so a second step that
+		// went *faster* is a force that was never cleared.
+		simulation.step(&mut world);
+		world.bodies.end_step();
+
+		let after_two = moving(&world, box_id).y;
+
+		assert!(after_one > 0.0, "the first step felt it, at {after_one}");
+		assert!(
+			after_two < after_one,
+			"and the second felt nothing but the air: {after_two} against {after_one}"
+		);
+		assert_eq!(
+			world
+				.bodies
+				.get(box_id)
+				.expect("it is alive")
+				.force,
+			Vec3::ZERO,
+			"which is what the table says too"
+		);
+	}
+
+	#[test]
+	fn a_body_the_solver_skipped_does_not_hoard_what_was_pushed_at_it() {
+		let (mut world, mut simulation) = wired();
+		let still = world.bodies.spawn(Body::new(
+			BodyKind::Kinematic,
+			Shape::UNIT,
+			Transform::at(Vec3::ZERO),
+		));
+
+		assert!(
+			!world.bodies.apply_force(still, Vec3::Y * 10.0),
+			"a body the solver does not integrate refuses the push"
+		);
+
+		// and written straight into the field, which is the only way to reach
+		// the case: a body the solver steps over is never cleared by the
+		// integrator, so if the sweep were folded in there rather than run over
+		// every slot, this would sit here and be spent the day it woke up.
+		world
+			.bodies
+			.get_mut(still)
+			.expect("it is alive")
+			.force = Vec3::Y * 10.0;
+
+		simulation.step(&mut world);
+		world.bodies.end_step();
+
+		assert_eq!(
+			world
+				.bodies
+				.get(still)
+				.expect("it is alive")
+				.force,
+			Vec3::ZERO,
+			"the sweep is over every slot rather than over the ones that moved"
+		);
+	}
+
+	#[test]
+	fn a_push_wakes_what_had_settled() {
+		let (mut world, mut simulation) = wired();
+		ground(&mut world);
+
+		let resting = world.bodies.spawn(Body::dynamic(
+			Shape::UNIT,
+			Transform::at(Vec3::new(0.0, 0.5, 0.0)),
+			1.0,
+		));
+
+		settle(&mut world, &mut simulation, 600);
+
+		assert!(
+			world
+				.bodies
+				.get(resting)
+				.expect("it is alive")
+				.sleeping,
+			"it has gone to sleep on the floor, which is what this test needs"
+		);
+
+		let before = placed(&world, resting);
+
+		shoved(&mut world, &mut simulation, (resting, Vec3::X * 40.0), 20);
+
+		let after = placed(&world, resting);
+
+		assert!(
+			after.x - before.x > 0.2,
+			"and a push moved it rather than being swallowed: {before} to {after}"
+		);
+	}
+
+	#[test]
+	fn a_torque_spins_a_body_and_a_wider_one_spins_slower() {
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+
+		// the same mass in both, so what differs is only how it is spread: a
+		// solver that used the mass where it wanted the inertia tensor would
+		// answer the same for the two.
+		let narrow = world.bodies.spawn(Body::dynamic(
+			Shape::cuboid(Vec3::splat(0.5)),
+			Transform::at(Vec3::new(-6.0, 0.0, 0.0)),
+			1.0,
+		));
+		let wide = world.bodies.spawn(Body::dynamic(
+			Shape::cuboid(Vec3::splat(1.5)),
+			Transform::at(Vec3::new(6.0, 0.0, 0.0)),
+			1.0,
+		));
+		let turn = Vec3::Y * 2.0;
+
+		for _ in 0..30 {
+			world.bodies.apply_torque(narrow, turn);
+			world.bodies.apply_torque(wide, turn);
+			simulation.step(&mut world);
+			world.bodies.end_step();
+		}
+
+		let spin = |id| {
+			world
+				.bodies
+				.get(id)
+				.expect("it is alive")
+				.angular
+				.y
+		};
+
+		assert!(spin(narrow) > 0.0, "the narrow one is turning, at {}", spin(narrow));
+		assert!(
+			spin(narrow) > spin(wide) * 2.0,
+			"and much faster than the one whose weight is further out: {} against {}",
+			spin(narrow),
+			spin(wide)
+		);
+	}
+
+	#[test]
+	fn a_push_off_center_both_moves_and_turns_what_it_lands_on() {
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+
+		let middle = floating(&mut world, 1.0, Vec3::new(-6.0, 0.0, 0.0));
+		let corner = floating(&mut world, 1.0, Vec3::new(6.0, 0.0, 0.0));
+		// the same box pushed at the same place on itself, standing a long way
+		// off. It is what makes this a measurement rather than a sighting: a
+		// turn worked out about the world's origin rather than about the body's
+		// own middle would still spin the near one, and would spin this one six
+		// times harder.
+		let distant = floating(&mut world, 1.0, Vec3::new(40.0, 0.0, 0.0));
+		let push = Vec3::Y * 8.0;
+
+		for _ in 0..30 {
+			world.bodies.apply_force(middle, push);
+			// a unit box is half a unit across, so each of these is its own
+			// edge.
+			world
+				.bodies
+				.apply_force_at(corner, push, Vec3::new(6.0 + 0.5, 0.0, 0.0));
+			world
+				.bodies
+				.apply_force_at(distant, push, Vec3::new(40.0 + 0.5, 0.0, 0.0));
+			simulation.step(&mut world);
+			world.bodies.end_step();
+		}
+
+		let straight = moving(&world, middle);
+		let tilted = moving(&world, corner);
+
+		assert!(
+			(straight.y - tilted.y).abs() < 1.0e-3,
+			"the push through the middle is the same either way: {straight} against {tilted}"
+		);
+		assert!(
+			world
+				.bodies
+				.get(middle)
+				.expect("it is alive")
+				.angular
+				.length() < 1.0e-4,
+			"and nothing turns the one pushed through its middle"
+		);
+		let spin = |id| {
+			world
+				.bodies
+				.get(id)
+				.expect("it is alive")
+				.angular
+				.z
+		};
+
+		assert!(spin(corner).abs() > 0.1, "while the one pushed at its edge is turning");
+		assert!(
+			(spin(corner) - spin(distant)).abs() < 1.0e-3,
+			"and by the same amount wherever it stands, because what turns it is the offset \
+			 from its own middle: {} against {}",
+			spin(corner),
+			spin(distant)
+		);
+	}
+
+	#[test]
+	fn an_impulse_is_a_force_over_one_step_and_the_step_length_cancels() {
+		let (mut world, mut simulation) = wired();
+		world.gravity = Vec3::ZERO;
+		world.dt = STEP_SECONDS;
+
+		let hit = floating(&mut world, 2.0, Vec3::new(-6.0, 0.0, 0.0));
+		let pushed = floating(&mut world, 2.0, Vec3::new(6.0, 0.0, 0.0));
+		let impulse = Vec3::Y * 3.0;
+
+		assert!(world.apply_impulse(hit, impulse, Vec3::new(-6.0, 0.0, 0.0)));
+		world
+			.bodies
+			.apply_force(pushed, impulse / STEP_SECONDS);
+
+		simulation.step(&mut world);
+		world.bodies.end_step();
+
+		let (struck, shoved_at) = (moving(&world, hit).y, moving(&world, pushed).y);
+
+		assert!(
+			(struck - shoved_at).abs() < 1.0e-4,
+			"the two spellings are one mechanism: {struck} against {shoved_at}"
+		);
+		// and the number itself: three newton-seconds into two kilograms is one
+		// and a half units a second, less whatever one step of air took.
+		assert!(
+			(struck - 1.5).abs() < 0.02,
+			"an impulse over a mass is a speed, and this one is {struck}"
+		);
+	}
+
+	#[test]
+	fn nothing_can_be_pushed_through_a_handle_that_names_nobody() {
+		let (mut world, _) = wired();
+		let gone = world
+			.bodies
+			.spawn(Body::dynamic(Shape::UNIT, Transform::IDENTITY, 1.0));
+
+		world.bodies.despawn(gone);
+
+		assert!(!world.bodies.apply_force(gone, Vec3::Y), "a dead handle takes nothing");
+		assert!(!world.bodies.apply_torque(gone, Vec3::Y), "nor a turn");
+		assert!(!world.apply_impulse(gone, Vec3::Y, Vec3::ZERO), "nor a hit");
+		assert!(
+			!world.bodies.apply_force(BodyId::NONE, Vec3::Y),
+			"and neither does the handle that never named anybody"
+		);
 	}
 
 	#[test]
