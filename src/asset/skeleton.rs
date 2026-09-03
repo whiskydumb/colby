@@ -38,7 +38,7 @@ use colby_core::{
 	glam::{Mat4, Quat, Vec3},
 };
 
-use crate::bytes::{AlignedBytes, span};
+use crate::bytes::{AlignedBytes, Names, count, span, width};
 
 /// The eight bytes every `.cskel` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYSKL";
@@ -277,18 +277,18 @@ pub fn encode(data: &SkeletonData) -> Result<Vec<u8>> {
 		magic: MAGIC,
 		version: FORMAT_VERSION,
 		flags: 0,
-		bone_stride: width::<Limb>()?,
-		bone_count: count(limbs.len())?,
-		bone_offset: count(bone_offset)?,
-		names_offset: count(names_offset)?,
-		names_length: count(names.blob.len())?,
+		bone_stride: width::<Limb>("a skeleton's records")?,
+		bone_count: count(limbs.len(), "a skeleton's records")?,
+		bone_offset: count(bone_offset, "a skeleton's records")?,
+		names_offset: count(names_offset, "a skeleton's records")?,
+		names_length: count(names.blob().len(), "a skeleton's records")?,
 		reserved: [0; 7],
 	};
 
-	let mut out = Vec::with_capacity(names_offset + names.blob.len());
+	let mut out = Vec::with_capacity(names_offset + names.blob().len());
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::cast_slice(&limbs));
-	out.extend_from_slice(&names.blob);
+	out.extend_from_slice(names.blob());
 
 	Ok(out)
 }
@@ -357,7 +357,7 @@ fn check(bytes: &[u8]) -> std::result::Result<SkeletonHeader, String> {
 
 /// Checks that both blocks are inside the file and sit where they can be read.
 fn check_blocks(header: &SkeletonHeader, len: usize) -> std::result::Result<(), String> {
-	if header.bone_stride != width::<Limb>().unwrap_or(0) {
+	if header.bone_stride != width::<Limb>("a skeleton's records").unwrap_or(0) {
 		return Err(format!(
 			"has {}-byte bones, and this build reads {}-byte ones",
 			header.bone_stride,
@@ -441,57 +441,7 @@ fn check_bones(bytes: &[u8], header: &SkeletonHeader) -> std::result::Result<(),
 	Ok(())
 }
 
-/// The size of `T` as a header stores it.
-fn width<T>() -> Result<u32> {
-	u32::try_from(size_of::<T>())
-		.map_err(|_| err!(Asset("a record of {} bytes cannot be described", size_of::<T>())))
-}
-
-/// A count as a header stores it.
-fn count(value: usize) -> Result<u32> {
-	u32::try_from(value).map_err(|_| err!(Asset("{value} is more than a u32 can address")))
-}
-
 /// The blob being built, and where each name already in it starts.
-#[derive(Default)]
-struct Names {
-	blob: Vec<u8>,
-	written: Vec<(String, u32)>,
-}
-
-impl Names {
-	/// Puts a name in, or finds the one already there.
-	///
-	/// The empty name is offset zero and is written once, at the head, because
-	/// that is what a record naming nothing stores and a reader has to find a
-	/// terminator there.
-	fn put(&mut self, name: &str) -> u32 {
-		if self.blob.is_empty() {
-			self.blob.push(0);
-		}
-
-		if name.is_empty() {
-			return 0;
-		}
-
-		if let Some((_, at)) = self
-			.written
-			.iter()
-			.find(|(already, _)| already == name)
-		{
-			return *at;
-		}
-
-		let at = u32::try_from(self.blob.len()).unwrap_or(0);
-
-		self.blob.extend_from_slice(name.as_bytes());
-		self.blob.push(0);
-		self.written.push((name.to_owned(), at));
-
-		at
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;

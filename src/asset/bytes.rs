@@ -21,6 +21,82 @@ use colby_core::{
 	err,
 };
 
+/// A count as a header stores it.
+///
+/// @param value - how many of something there are
+/// @param what - a noun phrase for them, which becomes the message: "a scene's
+/// entities", "the mesh's vertices". The format's own voice is the argument
+/// rather than a copy of the function
+/// @return the count as a `u32`, or an asset error naming it
+pub fn count(value: usize, what: &str) -> Result<u32> {
+	u32::try_from(value)
+		.map_err(|_| err!(Asset("{what} is {value}, more than a u32 can address")))
+}
+
+/// The width of one record as a header stores it.
+///
+/// @param what - a noun phrase for the record, as [`count`]
+/// @return the size of `T` as a `u32`, or an asset error naming it
+pub fn width<T>(what: &str) -> Result<u32> { count(size_of::<T>(), what) }
+
+/// The string blob a compiled format's names live in.
+///
+/// Every one of colby's compiled formats holds fixed-size records, and a name
+/// is not fixed-size, so each of them puts its names in one NUL-separated blob
+/// at the end and stores an offset into it. This is that blob, and it was
+/// written four separate times before it was written here.
+///
+/// **Offset zero is always the empty string.** That is what a record naming
+/// nothing stores, so the blob opens with a terminator nobody asked for and a
+/// reader looking there finds the end of a string immediately.
+///
+/// A name written twice is stored once: the second `put` finds the first and
+/// hands back the same offset, so a picture shared by six materials costs one
+/// copy of its name and six offsets. The lookup is a linear scan, which is the
+/// right shape for the few dozen names a file has and would not be for
+/// thousands.
+#[derive(Clone, Debug, Default)]
+pub struct Names {
+	blob: Vec<u8>,
+	written: Vec<(String, u32)>,
+}
+
+impl Names {
+	/// Puts a name in, or finds the one already there.
+	///
+	/// @param name - what to write down, or the empty string for nothing
+	/// @return where it starts in the blob
+	pub fn put(&mut self, name: &str) -> u32 {
+		if self.blob.is_empty() {
+			self.blob.push(0);
+		}
+
+		if name.is_empty() {
+			return 0;
+		}
+
+		if let Some((_, already)) = self
+			.written
+			.iter()
+			.find(|(written, _)| written == name)
+		{
+			return *already;
+		}
+
+		let at = u32::try_from(self.blob.len()).unwrap_or(0);
+
+		self.blob.extend_from_slice(name.as_bytes());
+		self.blob.push(0);
+		self.written.push((name.to_owned(), at));
+
+		at
+	}
+
+	/// The whole blob, ready to be written at the end of a file.
+	#[must_use]
+	pub fn blob(&self) -> &[u8] { &self.blob }
+}
+
 /// The alignment [`AlignedBytes`] guarantees, in bytes.
 ///
 /// Sixteen rather than four: it covers any `#[repr(C)]` block a future version
@@ -298,5 +374,85 @@ mod tests {
 			Some(16 + 4 * 0xFFFF_FFFF),
 			"the arithmetic itself is exact here, which is what the bounds check then catches"
 		);
+	}
+	#[test]
+	fn a_count_past_what_a_header_can_hold_is_refused_by_name() {
+		assert_eq!(count(7, "a scene's records").ok(), Some(7), "an ordinary one passes");
+
+		// only reachable on a target where a usize is wider than a u32, which
+		// is every one this is built for. The four copies this function
+		// replaced could not be tested here at all: each was private to a
+		// format, and reaching this arm through one of them would have meant
+		// four billion records.
+		if usize::BITS > u32::BITS {
+			let refused = count(usize::MAX, "a scene's records")
+				.expect_err("more than four billion of anything is not a count");
+			let said = format!("{refused}");
+
+			assert!(said.contains("a scene's records"), "the caller's own voice: {said}");
+			assert!(said.contains("more than a u32"), "and what is wrong with it: {said}");
+		}
+	}
+
+	#[test]
+	fn a_record_is_as_wide_as_the_type_that_describes_it() {
+		assert_eq!(width::<u32>("a clip's records").ok(), Some(4));
+		assert_eq!(width::<[u8; 44]>("a model's records").ok(), Some(44));
+	}
+
+	#[test]
+	fn the_blob_opens_with_a_terminator_nobody_wrote() {
+		let mut names = Names::default();
+
+		assert_eq!(names.put(""), 0, "naming nothing is offset zero");
+		assert_eq!(names.blob(), &[0], "and what is there is a terminator to find");
+	}
+
+	#[test]
+	#[expect(
+		clippy::naive_bytecount,
+		reason = "the lint wants a crate for counting three bytes in a blob of forty"
+	)]
+	fn a_name_written_twice_is_stored_once_and_answers_the_same() {
+		let mut names = Names::default();
+		let first = names.put("models/lamp/tiles");
+		let second = names.put("models/lamp/base");
+		let again = names.put("models/lamp/tiles");
+
+		assert_eq!(first, again, "the second asking finds the first copy");
+		assert_ne!(first, second, "and two different names are two places");
+		assert_eq!(
+			names
+				.blob()
+				.iter()
+				.filter(|byte| **byte == 0)
+				.count(),
+			3,
+			"one terminator at the head and one after each of the two names"
+		);
+	}
+
+	#[test]
+	fn an_offset_is_where_a_name_starts_and_the_name_ends_at_a_nul() {
+		let mut names = Names::default();
+		// different lengths, so an offset that pointed at the wrong end of one
+		// would land inside the other rather than on a terminator.
+		let short = names.put("hub");
+		let long = names.put("models/lamp/column");
+
+		for (at, expected) in [(short, "hub"), (long, "models/lamp/column")] {
+			let from = usize::try_from(at).expect("an offset is small");
+			let rest = &names.blob()[from..];
+			let end = rest
+				.iter()
+				.position(|byte| *byte == 0)
+				.expect("every name is terminated");
+
+			assert_eq!(
+				std::str::from_utf8(&rest[..end]).ok(),
+				Some(expected),
+				"reading from {at} gives back what was put there"
+			);
+		}
 	}
 }

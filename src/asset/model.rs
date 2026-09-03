@@ -47,7 +47,7 @@ use colby_core::{
 	glam::{Quat, Vec3},
 };
 
-use crate::bytes::{AlignedBytes, fits, span};
+use crate::bytes::{AlignedBytes, Names, count, fits, span, width};
 
 /// The eight bytes every `.cmodel` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYMDL";
@@ -449,22 +449,22 @@ pub fn encode(data: &ModelData) -> Result<Vec<u8>> {
 		magic: MAGIC,
 		version: FORMAT_VERSION,
 		flags: 0,
-		coat_stride: width::<Coat>()?,
-		stand_stride: width::<Stand>()?,
-		coat_count: count(coats.len())?,
-		stand_count: count(stands.len())?,
-		coat_offset: count(coat_offset)?,
-		stand_offset: count(stand_offset)?,
-		names_offset: count(names_offset)?,
-		names_length: count(names.blob.len())?,
+		coat_stride: width::<Coat>("a model's records")?,
+		stand_stride: width::<Stand>("a model's records")?,
+		coat_count: count(coats.len(), "a model's records")?,
+		stand_count: count(stands.len(), "a model's records")?,
+		coat_offset: count(coat_offset, "a model's records")?,
+		stand_offset: count(stand_offset, "a model's records")?,
+		names_offset: count(names_offset, "a model's records")?,
+		names_length: count(names.blob().len(), "a model's records")?,
 		reserved: [0; 4],
 	};
 
-	let mut out = Vec::with_capacity(names_offset + names.blob.len());
+	let mut out = Vec::with_capacity(names_offset + names.blob().len());
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::cast_slice(&coats));
 	out.extend_from_slice(bytemuck::cast_slice(&stands));
-	out.extend_from_slice(&names.blob);
+	out.extend_from_slice(names.blob());
 
 	Ok(out)
 }
@@ -492,54 +492,6 @@ pub fn version_of(path: &Path) -> Option<u32> {
 }
 
 /// The blob being built, and where each name already in it starts.
-#[derive(Default)]
-struct Names {
-	blob: Vec<u8>,
-	written: Vec<(String, u32)>,
-}
-
-impl Names {
-	/// Puts a name in, or finds the one already there.
-	///
-	/// The empty name is offset zero and is written once, at the head, because
-	/// that is what a record naming nothing stores and a reader has to find a
-	/// terminator there.
-	fn put(&mut self, name: &str) -> u32 {
-		if self.blob.is_empty() {
-			self.blob.push(0);
-		}
-
-		if name.is_empty() {
-			return 0;
-		}
-
-		if let Some((_, already)) = self
-			.written
-			.iter()
-			.find(|(written, _)| written == name)
-		{
-			return *already;
-		}
-
-		let at = u32::try_from(self.blob.len()).unwrap_or(0);
-
-		self.blob.extend_from_slice(name.as_bytes());
-		self.blob.push(0);
-		self.written.push((name.to_owned(), at));
-
-		at
-	}
-}
-
-/// A count that has to fit in the header.
-fn count(value: usize) -> Result<u32> {
-	u32::try_from(value)
-		.map_err(|_| err!(Asset("a model of {value} is more than one file holds")))
-}
-
-/// The width of a record, as the header stores it.
-fn width<T>() -> Result<u32> { count(size_of::<T>()) }
-
 /// Every way a `.cmodel` can be wrong, checked once.
 fn check(bytes: &[u8]) -> std::result::Result<ModelHeader, String> {
 	let head = bytes.get(..HEADER_BYTES).ok_or_else(|| {

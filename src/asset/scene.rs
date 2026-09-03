@@ -58,7 +58,7 @@ use colby_core::{
 	glam::{Quat, Vec3},
 };
 
-use crate::bytes::{AlignedBytes, fits, span};
+use crate::bytes::{AlignedBytes, Names, count, fits, span, width};
 
 /// The eight bytes every `.cscene` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYSCN";
@@ -957,9 +957,9 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		kept_bytes: kept_bytes.len(),
 	};
 	let places = Places::of(&blocks, &generations, data.arena.as_ref());
-	let header = head(data, &places, &blocks, names.blob.len())?;
+	let header = head(data, &places, &blocks, names.blob().len())?;
 
-	let mut out = Vec::with_capacity(places.names + names.blob.len());
+	let mut out = Vec::with_capacity(places.names + names.blob().len());
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::bytes_of(&setting_of(data.stage)));
 	out.extend_from_slice(bytemuck::cast_slice(&stood));
@@ -973,7 +973,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	if let Some(arena) = data.arena.as_ref() {
 		out.extend_from_slice(&arena.bytes);
 	}
-	out.extend_from_slice(&names.blob);
+	out.extend_from_slice(names.blob());
 
 	Ok(out)
 }
@@ -1081,39 +1081,42 @@ fn head(
 		magic: MAGIC,
 		version: FORMAT_VERSION,
 		flags: arena_here | peers_here,
-		setting_stride: width::<Setting>()?,
-		stood_stride: width::<Stood>()?,
-		bulk_stride: width::<Bulk>()?,
-		tie_stride: width::<Tie>()?,
-		bent_stride: width::<Bent>()?,
-		setting_offset: count(places.setting)?,
-		stood_offset: count(places.stood)?,
-		bulk_offset: count(places.bulk)?,
-		tie_offset: count(places.tie)?,
-		bent_offset: count(places.bent)?,
-		locals_offset: count(places.locals)?,
-		stood_count: count(stood.len())?,
-		bulk_count: count(bulk.len())?,
-		tie_count: count(tie.len())?,
-		bent_count: count(bent.len())?,
-		locals_count: count(locals.len())?,
-		stood_slots: count(data.thing_generations.len())?,
-		bulk_slots: count(data.solid_generations.len())?,
-		tie_slots: count(data.link_generations.len())?,
-		bent_slots: count(data.pose_generations.len())?,
-		generations_offset: count(places.generations)?,
+		setting_stride: width::<Setting>("a scene's records")?,
+		stood_stride: width::<Stood>("a scene's records")?,
+		bulk_stride: width::<Bulk>("a scene's records")?,
+		tie_stride: width::<Tie>("a scene's records")?,
+		bent_stride: width::<Bent>("a scene's records")?,
+		setting_offset: count(places.setting, "a scene's records")?,
+		stood_offset: count(places.stood, "a scene's records")?,
+		bulk_offset: count(places.bulk, "a scene's records")?,
+		tie_offset: count(places.tie, "a scene's records")?,
+		bent_offset: count(places.bent, "a scene's records")?,
+		locals_offset: count(places.locals, "a scene's records")?,
+		stood_count: count(stood.len(), "a scene's records")?,
+		bulk_count: count(bulk.len(), "a scene's records")?,
+		tie_count: count(tie.len(), "a scene's records")?,
+		bent_count: count(bent.len(), "a scene's records")?,
+		locals_count: count(locals.len(), "a scene's records")?,
+		stood_slots: count(data.thing_generations.len(), "a scene's records")?,
+		bulk_slots: count(data.solid_generations.len(), "a scene's records")?,
+		tie_slots: count(data.link_generations.len(), "a scene's records")?,
+		bent_slots: count(data.pose_generations.len(), "a scene's records")?,
+		generations_offset: count(places.generations, "a scene's records")?,
 		arena_layout_low: u32::try_from(layout & u64::from(u32::MAX)).unwrap_or(0),
 		arena_layout_high: u32::try_from(layout >> u32::BITS).unwrap_or(0),
-		arena_offset: count(places.arena)?,
-		arena_length: count(data.arena.as_ref().map_or(0, |it| it.bytes.len()))?,
-		names_offset: count(places.names)?,
-		names_length: count(names)?,
-		kept_stride: width::<Kept>()?,
-		kept_offset: count(places.kept)?,
-		kept_count: count(kept.len())?,
-		kept_slots: count(data.peer_generations.len())?,
-		kept_bytes_offset: count(places.kept_bytes)?,
-		kept_bytes_length: count(kept_bytes)?,
+		arena_offset: count(places.arena, "a scene's records")?,
+		arena_length: count(
+			data.arena.as_ref().map_or(0, |it| it.bytes.len()),
+			"a scene's records",
+		)?,
+		names_offset: count(places.names, "a scene's records")?,
+		names_length: count(names, "a scene's records")?,
+		kept_stride: width::<Kept>("a scene's records")?,
+		kept_offset: count(places.kept, "a scene's records")?,
+		kept_count: count(kept.len(), "a scene's records")?,
+		kept_slots: count(data.peer_generations.len(), "a scene's records")?,
+		kept_bytes_offset: count(places.kept_bytes, "a scene's records")?,
+		kept_bytes_length: count(kept_bytes, "a scene's records")?,
 		reserved: [0; 3],
 	})
 }
@@ -1349,54 +1352,6 @@ pub fn version_of(path: &Path) -> Option<u32> {
 }
 
 /// The blob being built, and where each name already in it starts.
-#[derive(Default)]
-struct Names {
-	blob: Vec<u8>,
-	written: Vec<(String, u32)>,
-}
-
-impl Names {
-	/// Puts a name in, or finds the one already there.
-	///
-	/// The empty name is offset zero and is written once, at the head, because
-	/// that is what a record naming nothing stores and a reader has to find a
-	/// terminator there.
-	fn put(&mut self, name: &str) -> u32 {
-		if self.blob.is_empty() {
-			self.blob.push(0);
-		}
-
-		if name.is_empty() {
-			return 0;
-		}
-
-		if let Some((_, already)) = self
-			.written
-			.iter()
-			.find(|(written, _)| written == name)
-		{
-			return *already;
-		}
-
-		let at = u32::try_from(self.blob.len()).unwrap_or(0);
-
-		self.blob.extend_from_slice(name.as_bytes());
-		self.blob.push(0);
-		self.written.push((name.to_owned(), at));
-
-		at
-	}
-}
-
-/// A count that has to fit in the header.
-fn count(value: usize) -> Result<u32> {
-	u32::try_from(value)
-		.map_err(|_| err!(Asset("a scene of {value} is more than one file holds")))
-}
-
-/// The width of a record, as the header stores it.
-fn width<T>() -> Result<u32> { count(size_of::<T>()) }
-
 /// Every way a `.cscene` can be wrong, checked once.
 fn check(bytes: &[u8]) -> std::result::Result<SceneHeader, String> {
 	let head = bytes.get(..HEADER_BYTES).ok_or_else(|| {

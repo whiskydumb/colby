@@ -32,7 +32,7 @@ use colby_core::{
 	err,
 };
 
-use crate::bytes::{AlignedBytes, fits, span};
+use crate::bytes::{AlignedBytes, count, fits, span};
 
 /// The eight bytes every `.csnd` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYSND";
@@ -171,8 +171,8 @@ pub fn encode(data: &SoundData) -> Result<Vec<u8>> {
 		rate: data.rate,
 		channels: data.channels,
 		reserved: 0,
-		sample_count: count(data.samples.len())?,
-		sample_offset: count(HEADER_BYTES)?,
+		sample_count: count(data.samples.len(), "a sound's samples")?,
+		sample_offset: count(HEADER_BYTES, "a sound's samples")?,
 	};
 
 	let mut out = Vec::with_capacity(HEADER_BYTES + size_of_val(data.samples.as_slice()));
@@ -274,11 +274,6 @@ fn check(bytes: &[u8]) -> std::result::Result<SoundHeader, String> {
 	}
 
 	Ok(*header)
-}
-
-/// A count as a header stores it.
-fn count(value: usize) -> Result<u32> {
-	u32::try_from(value).map_err(|_| err!(Asset("{value} is more than a u32 can address")))
 }
 
 #[cfg(test)]

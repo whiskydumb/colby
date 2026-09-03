@@ -59,7 +59,10 @@ use colby_core::{
 	glam::{Quat, Vec3},
 };
 
-use crate::json::{self, Value};
+use crate::{
+	bytes::count,
+	json::{self, Value},
+};
 
 /// The extension a scene source is written with.
 pub const EXTENSION: &str = "scene";
@@ -170,7 +173,7 @@ fn poses(value: Option<&Value>) -> Result<Vec<Posed>> {
 
 		posed.push(Posed {
 			name,
-			slot: count(index)?,
+			slot: count(index, "a scene's records")?,
 			generation: 1,
 			skeleton: text(entry.get("skeleton")),
 			locals: Vec::new(),
@@ -205,12 +208,13 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 					.ok_or_else(|| {
 						err!(Asset("an entity is moved by {moved}, and no pose is that"))
 					})?,
+				"a scene's records",
 			)?
 		};
 
 		things.push(Thing {
 			name,
-			slot: count(index)?,
+			slot: count(index, "a scene's records")?,
 			generation: 1,
 			transform: transform(entry)?,
 			mesh: text(entry.get("mesh")),
@@ -265,6 +269,7 @@ fn bodies(value: Option<&Value>, things: &[Thing]) -> Result<Vec<Solid>> {
 					.ok_or_else(|| {
 						err!(Asset("a body drives {driven}, and no entity is that"))
 					})?,
+				"a scene's records",
 			)?
 		};
 
@@ -277,7 +282,7 @@ fn bodies(value: Option<&Value>, things: &[Thing]) -> Result<Vec<Solid>> {
 
 		solids.push(Solid {
 			name,
-			slot: count(index)?,
+			slot: count(index, "a scene's records")?,
 			generation: 1,
 			kind: body_kind(entry.get("kind"))?,
 			shape: shape(entry.get("shape"))?,
@@ -334,7 +339,7 @@ fn joints(value: Option<&Value>, solids: &[Solid]) -> Result<Vec<Link>> {
 
 		links.push(Link {
 			name,
-			slot: count(index)?,
+			slot: count(index, "a scene's records")?,
 			generation: 1,
 			kind: joint_kind(entry.get("kind"))?,
 			first: held(entry.get("first"), solids)?,
@@ -370,6 +375,7 @@ fn held(value: Option<&Value>, solids: &[Solid]) -> Result<u32> {
 			.iter()
 			.position(|it| it.name == name)
 			.ok_or_else(|| err!(Asset("a joint holds {name}, and no body is that")))?,
+		"a scene's records",
 	)
 }
 
@@ -533,12 +539,6 @@ fn vector(value: Option<&Value>, default: Vec3) -> Vec3 {
 		number(parts.get(1), default.y),
 		number(parts.get(2), default.z),
 	)
-}
-
-/// An index that has to fit in a record.
-fn count(value: usize) -> Result<u32> {
-	u32::try_from(value)
-		.map_err(|_| err!(Asset("a scene of {value} is more than one file holds")))
 }
 
 // -------------------------------------------------------------------------

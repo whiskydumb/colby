@@ -44,7 +44,7 @@ use colby_core::{
 	err,
 };
 
-use crate::bytes::{AlignedBytes, fits, span};
+use crate::bytes::{AlignedBytes, Names, count, fits, span, width};
 
 /// The eight bytes every `.canim` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYANM";
@@ -333,7 +333,7 @@ pub fn encode(data: &ClipData) -> Result<Vec<u8>> {
 				channel: track.channel.code(),
 				interpolation: track.interpolation.code(),
 				reserved: 0,
-				keys: count(track.keys())?,
+				keys: count(track.keys(), "a clip's records")?,
 				time_at: pools.put_times(&track.times)?,
 				value_at: pools.put_values(&track.values)?,
 			})
@@ -348,24 +348,24 @@ pub fn encode(data: &ClipData) -> Result<Vec<u8>> {
 		magic: MAGIC,
 		version: FORMAT_VERSION,
 		flags: 0,
-		track_stride: width::<Curve>()?,
-		track_count: count(curves.len())?,
-		track_offset: count(track_offset)?,
-		time_offset: count(time_offset)?,
-		time_count: count(pools.times.len())?,
-		value_offset: count(value_offset)?,
-		value_count: count(pools.values.len())?,
-		names_offset: count(names_offset)?,
-		names_length: count(names.blob.len())?,
+		track_stride: width::<Curve>("a clip's records")?,
+		track_count: count(curves.len(), "a clip's records")?,
+		track_offset: count(track_offset, "a clip's records")?,
+		time_offset: count(time_offset, "a clip's records")?,
+		time_count: count(pools.times.len(), "a clip's records")?,
+		value_offset: count(value_offset, "a clip's records")?,
+		value_count: count(pools.values.len(), "a clip's records")?,
+		names_offset: count(names_offset, "a clip's records")?,
+		names_length: count(names.blob().len(), "a clip's records")?,
 		reserved: [0; 3],
 	};
 
-	let mut out = Vec::with_capacity(names_offset + names.blob.len());
+	let mut out = Vec::with_capacity(names_offset + names.blob().len());
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::cast_slice(&curves));
 	out.extend_from_slice(bytemuck::cast_slice(&pools.times));
 	out.extend_from_slice(bytemuck::cast_slice(&pools.values));
-	out.extend_from_slice(&names.blob);
+	out.extend_from_slice(names.blob());
 
 	Ok(out)
 }
@@ -434,7 +434,7 @@ fn check(bytes: &[u8]) -> std::result::Result<ClipHeader, String> {
 
 /// Checks that every block is inside the file and sits where it can be read.
 fn check_blocks(bytes: &[u8], header: &ClipHeader) -> std::result::Result<(), String> {
-	if header.track_stride != width::<Curve>().unwrap_or(0) {
+	if header.track_stride != width::<Curve>("a clip's records").unwrap_or(0) {
 		return Err(format!(
 			"has {}-byte tracks, and this build reads {}-byte ones",
 			header.track_stride,
@@ -576,17 +576,6 @@ fn check_curve(
 	Ok(())
 }
 
-/// The size of `T` as a header stores it.
-fn width<T>() -> Result<u32> {
-	u32::try_from(size_of::<T>())
-		.map_err(|_| err!(Asset("a record of {} bytes cannot be described", size_of::<T>())))
-}
-
-/// A count as a header stores it.
-fn count(value: usize) -> Result<u32> {
-	u32::try_from(value).map_err(|_| err!(Asset("{value} is more than a u32 can address")))
-}
-
 /// The two pools being built, and where each run of times already in one
 /// starts.
 ///
@@ -605,7 +594,7 @@ struct Pools {
 impl Pools {
 	/// Puts a run of times in, or finds the one already there.
 	fn put_times(&mut self, times: &[f32]) -> Result<u32> {
-		let wanted = count(times.len())?;
+		let wanted = count(times.len(), "a clip's records")?;
 
 		for (at, length) in &self.runs {
 			if *length != wanted {
@@ -629,7 +618,7 @@ impl Pools {
 			}
 		}
 
-		let at = count(self.times.len())?;
+		let at = count(self.times.len(), "a clip's records")?;
 
 		self.times.extend_from_slice(times);
 		self.runs.push((at, wanted));
@@ -639,7 +628,7 @@ impl Pools {
 
 	/// Puts a run of values in.
 	fn put_values(&mut self, values: &[f32]) -> Result<u32> {
-		let at = count(self.values.len())?;
+		let at = count(self.values.len(), "a clip's records")?;
 
 		self.values.extend_from_slice(values);
 
@@ -648,45 +637,6 @@ impl Pools {
 }
 
 /// The blob being built, and where each name already in it starts.
-#[derive(Default)]
-struct Names {
-	blob: Vec<u8>,
-	written: Vec<(String, u32)>,
-}
-
-impl Names {
-	/// Puts a name in, or finds the one already there.
-	///
-	/// The empty name is offset zero and is written once, at the head, because
-	/// that is what a record naming nothing stores and a reader has to find a
-	/// terminator there.
-	fn put(&mut self, name: &str) -> u32 {
-		if self.blob.is_empty() {
-			self.blob.push(0);
-		}
-
-		if name.is_empty() {
-			return 0;
-		}
-
-		if let Some((_, at)) = self
-			.written
-			.iter()
-			.find(|(already, _)| already == name)
-		{
-			return *at;
-		}
-
-		let at = u32::try_from(self.blob.len()).unwrap_or(0);
-
-		self.blob.extend_from_slice(name.as_bytes());
-		self.blob.push(0);
-		self.written.push((name.to_owned(), at));
-
-		at
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
