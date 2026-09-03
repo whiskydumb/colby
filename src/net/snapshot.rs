@@ -249,16 +249,15 @@ const HEAD: usize = 14;
 
 /// The most the reliable ring can ask of one message, in bytes.
 ///
-/// Every slot full of the longest command there is, **and the block's own
-/// head**. Worked out here rather than guessed, because it is the other half of
-/// what [`MAX_SNAPSHOT`] has to leave room for - and the head is easy to leave
-/// out, which makes the sum ten bytes optimistic exactly when it matters.
+/// Every slot full of the longest item there is, **and the block's own head**.
+/// Worked out here rather than guessed, because it is the other half of what
+/// [`MAX_SNAPSHOT`] has to leave room for - and the head is easy to leave out,
+/// which makes the sum ten bytes optimistic exactly when it matters.
 #[expect(
 	clippy::as_conversions,
 	reason = "a const, where try_from is not available"
 )]
-const RING: usize =
-	crate::reliable::HEAD + crate::MAX_COMMANDS as usize * (2 + crate::MAX_COMMAND);
+const RING: usize = crate::reliable::HEAD + crate::MAX_ITEMS as usize * (2 + crate::MAX_ITEM);
 
 /// Bytes of key at the head of every record: a slot and a generation.
 const KEY: usize = 6;

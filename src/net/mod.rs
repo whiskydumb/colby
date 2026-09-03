@@ -30,8 +30,10 @@
 //!   together, out of order if that is how it turns up;
 //! - [`channel`] - one end of a conversation: sequence numbers, what the far
 //!   end has acknowledged, the round-trip estimate and what was lost;
-//! - [`reliable`] - the ring of numbered console lines that is the only thing
-//!   on this wire nothing is allowed to lose;
+//! - [`reliable`] - the ring of numbered items that is the only thing on this
+//!   wire nothing is allowed to lose;
+//! - [`parcel`] - what one of those items is: a console line, or a piece of
+//!   something far too long for one;
 //! - [`command`] - what a client is asking for, and which of its asks the host
 //!   has run;
 //! - [`snapshot`] - what moved, as a difference from what the far end already
@@ -59,6 +61,7 @@ pub mod fragment;
 pub mod heard;
 pub mod link;
 pub mod packet;
+pub mod parcel;
 pub mod random;
 pub mod reliable;
 pub mod ring;
@@ -73,8 +76,9 @@ pub use self::{
 		ACK_BITS, HEADER_BYTES, Header, MAGIC, MAX_DATAGRAM, MAX_FRAGMENTS, MAX_MESSAGE,
 		MAX_PAYLOAD, PROTOCOL_VERSION, Reason, after, distance,
 	},
+	parcel::{Kind, MAX_PARCEL, MAX_PIECE, MAX_PIECES, Parcel, Pieces},
 	random::Random,
-	reliable::{MAX_COMMAND, MAX_COMMANDS, Reliable},
+	reliable::{MAX_ITEM, MAX_ITEMS, Reliable},
 	ring::{DEPTH, Ring},
 	snapshot::{
 		Change, FIELDS, Fault, MAX_BASELINE, MAX_SLOTS, MAX_SNAPSHOT, NOTHING, SNAPSHOTS, Slot,
@@ -88,20 +92,20 @@ mod tests {
 
 	use super::*;
 
-	/// A full ring of the longest commands there are, through a channel and out
+	/// A full ring of the longest items there are, through a channel and out
 	/// the far side.
 	///
 	/// The only test with both halves of the crate in it, and the one property
-	/// the two of them share: a peer whose commands have piled up as far as
-	/// they can must still be able to send. @ref the assertion the build makes
-	/// about the same thing in [`reliable`].
+	/// the two of them share: a peer whose items have piled up as far as they
+	/// can must still be able to send. @ref the assertion the build makes about
+	/// the same thing in [`reliable`].
 	#[test]
-	fn a_full_ring_of_the_longest_commands_crosses_in_one_message() {
+	fn a_full_ring_of_the_longest_items_crosses_in_one_message() {
 		let (mut sending, mut receiving) = (Reliable::new(), Reliable::new());
 		let (mut host, mut client) = (Channel::new(0x1111_1111), Channel::new(0x2222_2222));
-		let longest = "x".repeat(MAX_COMMAND);
+		let longest = vec![0xA5_u8; MAX_ITEM];
 
-		for _ in 0..MAX_COMMANDS {
+		for _ in 0..MAX_ITEMS {
 			sending
 				.queue(&longest)
 				.expect("the ring takes sixty-four");
@@ -128,13 +132,62 @@ mod tests {
 
 		assert_eq!(arrived, payload, "every byte of the block, out the far side");
 
-		let mut commands = Vec::new();
+		let mut items = Vec::new();
 		let read = receiving
-			.read(&arrived, &mut commands)
+			.read(&arrived, &mut items)
 			.expect("and it reads as a block");
 
 		assert_eq!(read, arrived.len(), "with nothing left over");
-		assert_eq!(commands.len(), 64);
-		assert!(commands.iter().all(|command| *command == longest));
+		assert_eq!(items.len(), 64);
+		assert!(items.iter().all(|item| *item == longest));
+	}
+
+	/// The longest parcel there is, through the same wire, put back together.
+	///
+	/// The other half of the same property, one layer up: a world that fills
+	/// the ring exactly still crosses in one message and comes back byte for
+	/// byte.
+	#[test]
+	fn the_longest_parcel_there_is_crosses_in_one_message() {
+		let (mut sending, mut receiving) = (Reliable::new(), Reliable::new());
+		let (mut host, mut client) = (Channel::new(0x3333_3333), Channel::new(0x4444_4444));
+		let scene: Vec<u8> = (0..MAX_PARCEL)
+			.map(|at| u8::try_from(at * at % 251).expect("a remainder below a byte"))
+			.collect();
+
+		parcel::post(&mut sending, Kind::Scene, &scene).expect("a ringful");
+
+		let mut payload = Vec::new();
+
+		sending.write(&mut payload);
+
+		let mut wire = Vec::new();
+
+		host.send(&payload, Duration::ZERO, |datagram| wire.push(datagram.to_vec()))
+			.expect("the longest parcel is inside the largest message there is");
+
+		let mut arrived = Vec::new();
+
+		for datagram in &wire {
+			if let Delivery::Message(message) = client.receive(datagram, Duration::ZERO) {
+				arrived = message.to_vec();
+			}
+		}
+
+		let mut items = Vec::new();
+
+		receiving
+			.read(&arrived, &mut items)
+			.expect("it reads as a block");
+		assert_eq!(items.len(), usize::from(MAX_PIECES));
+
+		let mut pieces = Pieces::new();
+		let mut whole = None;
+
+		for item in &items {
+			whole = pieces.take(item).expect("a piece");
+		}
+
+		assert_eq!(whole, Some(Parcel::Scene(scene)), "every byte of it, in order");
 	}
 }

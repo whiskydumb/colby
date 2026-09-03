@@ -66,8 +66,8 @@ use colby_core::{
 	info, warn,
 };
 use colby_net::{
-	Block, Channel, Conditions, Delivery, Header, Heard, Link, MAX_DATAGRAM, NOTHING, Reliable,
-	Ring, Slot, Snapshot, Solid, every,
+	Block, Channel, Conditions, Delivery, Header, Heard, Kind, Link, MAX_DATAGRAM, NOTHING,
+	Parcel, Pieces, Reliable, Ring, Slot, Snapshot, Solid, every, parcel,
 };
 
 /// A session number no other run of this program will pick.
@@ -707,6 +707,13 @@ struct Peer {
 	address: SocketAddr,
 	channel: Channel,
 	reliable: Reliable,
+
+	/// What the ring's items are being put back together into.
+	///
+	/// One per conversation, because a parcel is cut across several items and
+	/// which parcel a piece belongs to is a fact about one stream. @ref
+	/// [`colby_net::parcel`].
+	pieces: Pieces,
 	link: Link,
 	heard: Duration,
 
@@ -815,6 +822,13 @@ impl Peer {
 
 		self.channel.forget();
 		self.reliable.forget();
+		// @note: nothing can observe this one, and it is kept for the reason
+		// the two above it are called at all. The ring writes every item it is
+		// still owed into every message, so a parcel's pieces are always read
+		// in one pass and there is never half of one waiting between two
+		// messages - which is a property of the ring rather than of this line,
+		// and the day the ring gets a window is the day this starts to matter.
+		self.pieces.forget();
 		self.theirs = Some(theirs);
 		// @note: no mutation of this line is caught by anything, and the
 		// reason is written a few hundred lines down in `file`: whether a peer
@@ -896,6 +910,16 @@ pub(crate) struct Said {
 	pub(crate) text: String,
 }
 
+/// A description of part of a world that crossed, and who described it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Described {
+	/// Which address it came from.
+	pub(crate) from: SocketAddr,
+
+	/// The bytes of it, exactly as they were queued.
+	pub(crate) bytes: Vec<u8>,
+}
+
 /// One endpoint: a wire, and a conversation with everybody on the far end.
 pub(crate) struct Net {
 	post: Box<dyn Post>,
@@ -920,8 +944,19 @@ pub(crate) struct Net {
 	session: u32,
 	scratch: Box<[u8; MAX_DATAGRAM]>,
 	payload: Vec<u8>,
-	commands: Vec<String>,
+
+	/// Where an arriving block's reliable items are read before they are put
+	/// back together into parcels.
+	items: Vec<Vec<u8>>,
 	said: Vec<Said>,
+
+	/// The descriptions that crossed on the last drain.
+	///
+	/// Nothing reads one yet. The wire carries them because the message that
+	/// says a thing has appeared is a description of it, and this is where one
+	/// lands; what to *do* with it is the world's, and the world does not have
+	/// it yet.
+	described: Vec<Described>,
 
 	/// What this end is asking for, as of the last step.
 	///
@@ -1019,8 +1054,9 @@ impl Net {
 			session,
 			scratch: Box::new([0; MAX_DATAGRAM]),
 			payload: Vec::new(),
-			commands: Vec::new(),
+			items: Vec::new(),
 			said: Vec::new(),
+			described: Vec::new(),
 			asking: Vec::new(),
 			arrived: Vec::new(),
 			departed: Vec::new(),
@@ -1141,6 +1177,16 @@ impl Net {
 
 	/// What crossed on the last [`receive`](Self::receive).
 	pub(crate) fn said(&self) -> &[Said] { &self.said }
+
+	/// Which parts of a world were described on the last
+	/// [`receive`](Self::receive).
+	///
+	/// @note: nothing in the runner reads this yet, which is why only a test
+	/// calls it. It is here because the wire is what has to carry a
+	/// description before anything can act on one, and a thing that crosses
+	/// and lands nowhere is a thing nobody can check.
+	#[cfg(test)]
+	pub(crate) fn described(&self) -> &[Described] { &self.described }
 
 	/// How many messages have gone out, counting one per peer.
 	pub(crate) const fn sent(&self) -> u32 { self.sent }
@@ -1371,9 +1417,16 @@ impl Net {
 	/// Queues a console line for every peer, resent until each of them has it.
 	///
 	/// @param text - one console line
-	pub(crate) fn say(&mut self, text: &str) -> Result {
+	pub(crate) fn say(&mut self, text: &str) -> Result { self.post(Kind::Line, text.as_bytes()) }
+
+	/// Queues a parcel of any kind for every peer, all of it or none of it.
+	///
+	/// @param kind - what the bytes are
+	/// @param bytes - the whole parcel, which is cut into as many reliable
+	/// items as it takes
+	pub(crate) fn post(&mut self, kind: Kind, bytes: &[u8]) -> Result {
 		for peer in &mut self.peers {
-			peer.reliable.queue(text)?;
+			parcel::post(&mut peer.reliable, kind, bytes)?;
 		}
 
 		Ok(())
@@ -1555,6 +1608,7 @@ impl Net {
 	/// @param now - how long this endpoint has been running
 	pub(crate) fn receive(&mut self, now: Duration) {
 		self.said.clear();
+		self.described.clear();
 		self.drain(now);
 		self.deliver(now);
 		self.forget(now);
@@ -1736,14 +1790,22 @@ impl Net {
 
 		match peer.channel.receive(datagram, now) {
 			| Delivery::Message(message) => {
-				let read = peer.reliable.read(message, &mut self.commands);
+				let read = peer.reliable.read(message, &mut self.items);
 				let from = peer.address;
 
 				self.delivered = self.delivered.saturating_add(1);
 
 				let used = read.as_ref().ok().copied().unwrap_or(0);
+				let taking = Taking {
+					from,
+					read,
+					items: &mut self.items,
+					pieces: &mut peer.pieces,
+					said: &mut self.said,
+					described: &mut self.described,
+				};
 
-				if !take(from, read, &mut self.commands, &mut self.said) {
+				if !take(taking) {
 					return Some(false);
 				}
 
@@ -1894,6 +1956,7 @@ impl Net {
 			address,
 			channel: Channel::new(self.session),
 			reliable: Reliable::new(),
+			pieces: Pieces::new(),
 			link,
 			heard: now,
 			id: PeerId::NONE,
@@ -2369,6 +2432,31 @@ fn absorb(taken: &mut Taken, bytes: &[u8], applying: &mut Vec<Slot>, now: Durati
 	true
 }
 
+/// Everything one arriving block of reliable items is read with.
+///
+/// A structure rather than six arguments, which is what the house rules ask
+/// for past five - and it is also what lets one call borrow four fields of two
+/// different structures at once.
+struct Taking<'a> {
+	/// Who said it.
+	from: SocketAddr,
+
+	/// What the ring made of the block.
+	read: Result<usize>,
+
+	/// The items that came out of it, emptied here.
+	items: &'a mut Vec<Vec<u8>>,
+
+	/// That peer's half-built parcel, which the items go into.
+	pieces: &'a mut Pieces,
+
+	/// Where a console line goes.
+	said: &'a mut Vec<Said>,
+
+	/// Where a description goes.
+	described: &'a mut Vec<Described>,
+}
+
 /// Takes what a block turned into, or says why it was nothing.
 ///
 /// Its own function because the branch it holds would otherwise sit four deep
@@ -2376,17 +2464,18 @@ fn absorb(taken: &mut Taken, bytes: &[u8], applying: &mut Vec<Slot>, now: Durati
 /// and they are right to: what this does is one sentence and it reads as one
 /// here.
 ///
-/// @param from - who said it
-/// @param read - what the ring made of the block
-/// @param commands - what came out of it, emptied here
-/// @param said - where it goes
+/// @param taking - the block's items, and everywhere they go
 /// @return whether the block was one at all
-fn take(
-	from: SocketAddr,
-	read: Result<usize>,
-	commands: &mut Vec<String>,
-	said: &mut Vec<Said>,
-) -> bool {
+fn take(taking: Taking<'_>) -> bool {
+	let Taking {
+		from,
+		read,
+		items,
+		pieces,
+		said,
+		described,
+	} = taking;
+
 	if let Err(error) = read {
 		debug!(%from, %error, "a peer said something that is not a block");
 		// whatever was parsed out of it before the fault goes with it: it was
@@ -2397,14 +2486,32 @@ fn take(
 		// given before it fills it and the peer this came from is dropped a
 		// moment later either way. It is kept because it is the one line that
 		// says the leftovers are not somebody else's.
-		commands.clear();
+		items.clear();
 
 		return false;
 	}
 
-	for text in commands.drain(..) {
-		info!(%from, %text, "a command crossed");
-		said.push(Said { from, text });
+	for item in items.drain(..) {
+		// **a parcel that does not parse costs the peer**, which is the ring's
+		// own rule one layer up and for the ring's own reason: the pieces are
+		// numbered by the stream carrying them, so a piece nobody can place
+		// leaves every piece behind it unplaceable too.
+		match pieces.take(&item) {
+			| Ok(Some(Parcel::Line(text))) => {
+				info!(%from, %text, "a command crossed");
+				said.push(Said { from, text });
+			},
+			| Ok(Some(Parcel::Scene(bytes))) => {
+				debug!(%from, bytes = bytes.len(), "a peer described part of a world");
+				described.push(Described { from, bytes });
+			},
+			| Ok(None) => {},
+			| Err(error) => {
+				debug!(%from, %error, "a peer sent a piece of something that is not a parcel");
+
+				return false;
+			},
+		}
 	}
 
 	true
@@ -2524,7 +2631,7 @@ mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
 	use colby_core::abi::{Transform, net::MAX_PEERS as PLAYERS};
-	use colby_net::{MAX_BASELINE, MAX_COMMAND};
+	use colby_net::{MAX_BASELINE, MAX_PARCEL};
 
 	use super::*;
 
@@ -2562,6 +2669,7 @@ mod tests {
 			address: somewhere(7),
 			channel: Channel::new(OURS),
 			reliable: Reliable::new(),
+			pieces: Pieces::new(),
 			link: Link::new(1),
 			heard: Duration::ZERO,
 			id: PeerId::NONE,
@@ -4053,7 +4161,7 @@ mod tests {
 		host.set(Conditions { loss: 1.0, ..Conditions::PERFECT });
 		client.set(Conditions { loss: 1.0, ..Conditions::PERFECT });
 
-		for index in 0..colby_net::MAX_COMMANDS {
+		for index in 0..colby_net::MAX_ITEMS {
 			host.say(&format!("tick {index}"))
 				.expect("the ring takes sixty-four");
 			round(&mut host, &mut client, 2 + index);
@@ -4065,11 +4173,53 @@ mod tests {
 
 	#[test]
 	fn a_command_that_will_not_fit_the_ring_is_refused_rather_than_dropped() {
+		// a line is cut into as many items as it takes, so what caps one is no
+		// longer what an item holds - it is what the ring holds altogether.
 		let (mut host, mut client, _wire) = two();
 
 		round(&mut host, &mut client, 1);
-		host.say(&"x".repeat(MAX_COMMAND + 1))
-			.expect_err("one byte past what a command may be");
+		host.say(&"x".repeat(MAX_PARCEL + 1))
+			.expect_err("one byte past what a parcel may be");
+		host.say(&"x".repeat(MAX_PARCEL))
+			.expect("and exactly a ringful goes");
+	}
+
+	#[test]
+	fn a_description_of_part_of_a_world_crosses_and_is_put_back_together() {
+		// nothing acts on one yet. What this checks is the wire: a thing far
+		// too long for one reliable item crosses a link that loses a tenth of
+		// what it carries and comes back byte for byte, which is what the
+		// message saying a thing has appeared will stand on.
+		let (mut host, mut client, _wire) = two();
+		let lossy = Conditions {
+			loss: 0.1,
+			burst: 3.0,
+			..Conditions::PERFECT
+		};
+		let scene: Vec<u8> = (0..colby_net::MAX_PIECE * 3 + 11)
+			.map(|at| u8::try_from(at * at % 251).expect("a remainder below a byte"))
+			.collect();
+
+		round(&mut host, &mut client, 1);
+		host.set(lossy);
+		client.set(lossy);
+		host.post(Kind::Scene, &scene)
+			.expect("a world goes in the ring like anything else");
+
+		let mut got = Vec::new();
+
+		for step in 2..40 {
+			round(&mut host, &mut client, step);
+			got.extend(
+				client
+					.described()
+					.iter()
+					.map(|described| described.bytes.clone()),
+			);
+			assert!(client.said().is_empty(), "and it is not a console line");
+		}
+
+		assert_eq!(got, [scene], "once, whole, and in order");
 	}
 
 	#[test]
@@ -4114,6 +4264,44 @@ mod tests {
 		host.receive(Duration::ZERO);
 
 		assert!(host.said().is_empty(), "a block that does not parse says nothing");
+		assert_eq!(host.peers(), 0, "and the peer that sent it is not talked to again");
+		assert_eq!(host.forgotten(), 1);
+	}
+
+	#[test]
+	fn a_piece_of_something_that_is_not_a_parcel_costs_the_peer() {
+		// the ring's own rule one layer up. The pieces of a parcel are numbered
+		// by the stream carrying them, so a piece nobody can place leaves every
+		// piece behind it unplaceable too - there is nothing to do with such a
+		// conversation but stop having it.
+		let wire = Rc::new(RefCell::new(Wire::default()));
+		let (one, two) = (somewhere(1), somewhere(2));
+		let mut host = Net::over(Box::new(Loopback::at(one, &wire)), true, 1, OURS);
+		let mut liar = Net::over(Box::new(Loopback::at(two, &wire)), false, 2, OURS);
+
+		liar.introduce(one);
+
+		// a reliable block that parses, carrying one item that parses, whose
+		// bytes are a parcel of a kind nobody knows. Everything after it is
+		// well formed, so the only thing wrong with the message is the parcel.
+		let mut broken = Vec::new();
+
+		broken.extend_from_slice(&0_u32.to_le_bytes());
+		broken.extend_from_slice(&1_u32.to_le_bytes());
+		broken.extend_from_slice(&1_u16.to_le_bytes());
+		broken.extend_from_slice(&6_u16.to_le_bytes());
+		broken.extend_from_slice(&[9, 0, 0, 1, 0, b'x']);
+		broken.extend_from_slice(&[0; 14]);
+		broken.extend_from_slice(&NOTHING.to_le_bytes());
+		broken.extend_from_slice(&NOTHING.to_le_bytes());
+		broken.extend_from_slice(&NOTHING.to_le_bytes());
+		broken.extend_from_slice(&0_u16.to_le_bytes());
+
+		liar.hand(one, &broken, Duration::ZERO);
+		host.receive(Duration::ZERO);
+
+		assert!(host.said().is_empty(), "a parcel of no known kind says nothing");
+		assert!(host.described().is_empty());
 		assert_eq!(host.peers(), 0, "and the peer that sent it is not talked to again");
 		assert_eq!(host.forgotten(), 1);
 	}
