@@ -24,7 +24,7 @@ use colby_core::{
 	abi::{
 		EntityId, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes, SkinVertex, Texel,
 		TextureData, TextureId, Textures, World,
-		material::{MaterialEntry, Wrap},
+		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
 	},
 	bytemuck::{self, Pod, Zeroable},
@@ -188,16 +188,72 @@ struct Batch {
 	/// never half one and half the other: the geometry either carries a skin
 	/// block or it does not.
 	skinned: bool,
+
+	/// How this material's alpha is read, which decides the other axis of the
+	/// same table.
+	///
+	/// A property of the material for the reason above, and the material is
+	/// half of what a batch is keyed on, so a batch is never half one mode and
+	/// half another either.
+	blend: Blend,
 }
 
-/// A device, a pipeline, the resources uploaded so far, and a frame's buffers.
+/// One pipeline per way of drawing the scene.
+///
+/// A table rather than a field each. The two axes are independent - bones do
+/// not care how the alpha is read - and one of them grows, so a pair of named
+/// fields would mean two more of them and a new arm at every call site the next
+/// time a mode is added.
+struct Pipelines {
+	entries: [RenderPipeline; Blend::COUNT * 2],
+}
+
+impl Pipelines {
+	/// Builds every one of them, or reports the first complaint wgpu had.
+	///
+	/// All of them or none: half a table is a world where the crates were drawn
+	/// by the new shader and the fences by the old one.
+	///
+	/// @param device - the device to build against
+	/// @param format - the color format the fragment stage writes
+	/// @param layouts - the bind group layouts, in group order
+	/// @param source - the whole WGSL
+	/// @return the table, or the shader compiler's complaint
+	fn build(
+		device: &Device,
+		format: TextureFormat,
+		layouts: &[&BindGroupLayout],
+		source: &str,
+	) -> Result<Self> {
+		Ok(Self {
+			entries: [
+				compile_pipeline(device, format, layouts, source, Blend::Opaque, false)?,
+				compile_pipeline(device, format, layouts, source, Blend::Opaque, true)?,
+				compile_pipeline(device, format, layouts, source, Blend::Mask, false)?,
+				compile_pipeline(device, format, layouts, source, Blend::Mask, true)?,
+			],
+		})
+	}
+
+	/// Which one draws a batch.
+	///
+	/// Indexed rather than looked up: [`Blend::row`] is a match over the whole
+	/// enum and the array is exactly [`Blend::COUNT`] pairs long, so there is
+	/// no pair this can miss.
+	fn get(&self, blend: Blend, skinned: bool) -> &RenderPipeline {
+		&self.entries[blend.row() * 2 + usize::from(skinned)]
+	}
+}
+
+/// A device, a table of pipelines, the resources uploaded so far, and a
+/// frame's buffers.
 pub struct Scene {
 	device: Device,
 	queue: Queue,
-	pipeline: RenderPipeline,
+	pipelines: Pipelines,
 	globals: Buffer,
 	bindings: BindGroup,
-	/// Kept so the pipeline and the per-material groups can be built again.
+	/// Kept so the pipelines and the per-material groups can be built again.
 	format: TextureFormat,
 	globals_layout: BindGroupLayout,
 	material_layout: BindGroupLayout,
@@ -213,8 +269,6 @@ pub struct Scene {
 	shadowing: bool,
 	/// The debug renderer, drawn into this scene's pass and its depth buffer.
 	lines: Lines,
-	/// The same pipeline over a third vertex buffer, for geometry bones move.
-	skinned: RenderPipeline,
 	/// This frame's joint matrices, and where each pose's run is in them.
 	joints: Joints,
 	/// One per registry slot, in the same order, filled on demand.
@@ -233,7 +287,7 @@ pub struct Scene {
 }
 
 impl Scene {
-	/// Builds the pipeline, the depth buffer and the bind group layouts.
+	/// Builds the pipelines, the depth buffer and the bind group layouts.
 	///
 	/// @param device - the device to build against
 	/// @param queue - the queue every upload goes through
@@ -294,8 +348,7 @@ impl Scene {
 		let shader = Shader::new("shader.wgsl", include_str!("shader.wgsl"));
 		let groups =
 			[&globals_layout, &material_layout, shadows.sample_layout(), joints.layout()];
-		let pipeline = compile_pipeline(&device, format, &groups, shader.source(), false)?;
-		let skinned = compile_pipeline(&device, format, &groups, shader.source(), true)?;
+		let pipelines = Pipelines::build(&device, format, &groups, shader.source())?;
 		let depth = depth_view(&device, width, height);
 		let lines = Lines::new(&device, format, &globals_layout)?;
 
@@ -309,7 +362,7 @@ impl Scene {
 		Ok(Self {
 			device,
 			queue,
-			pipeline,
+			pipelines,
 			globals,
 			bindings,
 			format,
@@ -322,7 +375,6 @@ impl Scene {
 			cascades: Cascades::NONE,
 			shadowing: false,
 			lines,
-			skinned,
 			joints,
 			// nothing is uploaded until a frame says what the world holds: the
 			// registries belong to the host, and a scene built before the host
@@ -342,13 +394,13 @@ impl Scene {
 		self.depth = depth_view(&self.device, width, height);
 	}
 
-	/// Builds the pipeline from new shader source, keeping the old one if the
-	/// new source does not compile.
+	/// Builds the pipelines from new shader source, keeping the ones that work
+	/// if the new source does not compile.
 	///
-	/// The pipeline is only replaced once wgpu has confirmed it is valid, so a
-	/// shader with a typo in it costs a message and nothing else - the same
-	/// bargain a game module that panics gets, and for the same reason: the
-	/// code being edited is expected to be wrong sometimes.
+	/// They are only replaced once wgpu has confirmed every one of them is
+	/// valid, so a shader with a typo in it costs a message and nothing else -
+	/// the same bargain a game module that panics gets, and for the same
+	/// reason: the code being edited is expected to be wrong sometimes.
 	///
 	/// @param source - the whole WGSL
 	/// @return the compiler's complaint, if it had one
@@ -359,13 +411,10 @@ impl Scene {
 			self.shadows.sample_layout(),
 			self.joints.layout(),
 		];
-		// both, and neither is assigned until both have compiled: half a
-		// reload is a world where the crates moved and the characters did not.
-		let pipeline = compile_pipeline(&self.device, self.format, &groups, source, false)?;
-		let skinned = compile_pipeline(&self.device, self.format, &groups, source, true)?;
-
-		self.pipeline = pipeline;
-		self.skinned = skinned;
+		// the whole table, and none of it is assigned until all of it has
+		// compiled: half a reload is a world where the crates moved and the
+		// characters did not.
+		self.pipelines = Pipelines::build(&self.device, self.format, &groups, source)?;
 
 		Ok(())
 	}
@@ -423,7 +472,7 @@ impl Scene {
 		pass.set_bind_group(3, self.joints.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
 
-		// swapped when a batch wants the other one rather than once per batch.
+		// swapped when a batch wants another one rather than once per batch.
 		// The order is by mesh and material, so a world of crates with one
 		// character in it changes pipeline twice however many crates there are.
 		let mut bound = None;
@@ -435,9 +484,10 @@ impl Scene {
 				continue;
 			};
 
-			if bound != Some(batch.skinned) {
-				pass.set_pipeline(self.drawing(batch.skinned));
-				bound = Some(batch.skinned);
+			let wanted = (batch.blend, batch.skinned);
+			if bound != Some(wanted) {
+				pass.set_pipeline(self.pipelines.get(batch.blend, batch.skinned));
+				bound = Some(wanted);
 			}
 
 			if let Some(skin) = mesh.skin.as_ref() {
@@ -459,11 +509,6 @@ impl Scene {
 		self.queue.submit([encoder.finish()]);
 	}
 
-	/// Which pipeline draws a batch into the picture.
-	const fn drawing(&self, skinned: bool) -> &RenderPipeline {
-		if skinned { &self.skinned } else { &self.pipeline }
-	}
-
 	/// Which one draws it into a cascade.
 	const fn casting(&self, skinned: bool) -> &RenderPipeline {
 		if skinned {
@@ -477,9 +522,12 @@ impl Scene {
 	///
 	/// The same batches the scene draws, through a pipeline with no fragment
 	/// stage and no color target, so the whole pass is geometry against depth.
-	/// The material is not bound at all: nothing here is transparent and
-	/// nothing is alpha tested, so what a surface looks like cannot change
-	/// whether it casts.
+	///
+	/// The material is not bound at all, which used to be free and is now a
+	/// known gap: a [`Blend::Mask`] surface casts the shadow of the shape it
+	/// was cut out of rather than the shape that is left, because nothing here
+	/// samples the picture the holes are in. Closing it is a third depth-only
+	/// pipeline with a fragment stage that discards.
 	///
 	/// @param encoder - what to record into
 	/// @param slice - which cascade, nearest first
@@ -885,6 +933,11 @@ impl Scene {
 				first: at,
 				count: 1,
 				skinned,
+				// taken from the same value the numbers above came from rather
+				// than looked up again, so that however a handle resolved, the
+				// mode a batch is drawn under is the mode of the material its
+				// instances were written from.
+				blend: surface.blend,
 			}),
 		}
 	}
@@ -1162,7 +1215,7 @@ fn clear_color(world: &World) -> Color {
 	}
 }
 
-/// Builds the render pipeline and reports whether wgpu accepted it.
+/// Builds one render pipeline and reports whether wgpu accepted it.
 ///
 /// wgpu's default answer to a bad shader is to log the error and hand back a
 /// handle that fails at draw time - which, for source someone is editing while
@@ -1177,16 +1230,18 @@ fn clear_color(world: &World) -> Color {
 /// @param format - the color format the fragment stage writes
 /// @param layouts - the bind group layouts, in group order
 /// @param source - the whole WGSL
+/// @param blend - how the fragment stage reads the albedo's alpha
 /// @param skinned - whether to build the variant that reads bones
 fn compile_pipeline(
 	device: &Device,
 	format: TextureFormat,
 	layouts: &[&BindGroupLayout],
 	source: &str,
+	blend: Blend,
 	skinned: bool,
 ) -> Result<RenderPipeline> {
 	let scope = device.push_error_scope(ErrorFilter::Validation);
-	let pipeline = build_pipeline(device, format, layouts, source, skinned);
+	let pipeline = build_pipeline(device, format, layouts, source, blend, skinned);
 
 	match pollster::block_on(scope.pop()) {
 		| Some(complaint) => Err(err!(Graphics("{complaint}"))),
@@ -1194,18 +1249,34 @@ fn compile_pipeline(
 	}
 }
 
-/// Builds the single render pipeline.
+/// What one of the table's pipelines is called in a graphics debugger.
+///
+/// Written out rather than formatted, because a label is borrowed for the
+/// length of the call and building one would mean a `String` per pipeline for
+/// the sake of a name nothing reads at run time.
+const fn label_of(blend: Blend, skinned: bool) -> &'static str {
+	match (blend, skinned) {
+		| (Blend::Opaque, false) => "scene",
+		| (Blend::Opaque, true) => "scene skinned",
+		| (Blend::Mask, false) => "scene masked",
+		| (Blend::Mask, true) => "scene masked skinned",
+	}
+}
+
+/// Builds one of them, without checking whether wgpu liked it.
 ///
 /// @param device - the device to build against
 /// @param format - the color format the fragment stage writes
 /// @param layouts - the bind group layouts, in group order
 /// @param source - the whole WGSL
+/// @param blend - how the fragment stage reads the albedo's alpha
 /// @param skinned - whether to bind a third vertex buffer and read bones
 fn build_pipeline(
 	device: &Device,
 	format: TextureFormat,
 	layouts: &[&BindGroupLayout],
 	source: &str,
+	blend: Blend,
 	skinned: bool,
 ) -> RenderPipeline {
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -1247,7 +1318,7 @@ fn build_pipeline(
 	};
 
 	device.create_render_pipeline(&RenderPipelineDescriptor {
-		label: Some(if skinned { "scene skinned" } else { "scene" }),
+		label: Some(label_of(blend, skinned)),
 		layout: Some(&layout),
 		vertex: VertexState {
 			module: &shader,
@@ -1278,7 +1349,10 @@ fn build_pipeline(
 		multisample: MultisampleState::default(),
 		fragment: Some(FragmentState {
 			module: &shader,
-			entry_point: Some("fragment_main"),
+			entry_point: Some(match blend {
+				| Blend::Opaque => "fragment_main",
+				| Blend::Mask => "fragment_masked",
+			}),
 			compilation_options: PipelineCompilationOptions::default(),
 			targets: &[Some(ColorTargetState {
 				format,

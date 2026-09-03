@@ -1,7 +1,11 @@
-// One pipeline, one draw call per (mesh, material) pair, one instance per
-// entity. The mesh supplies geometry, the instance supplies a model matrix and
-// the material's numbers, group 1 supplies the albedo texture, and the globals
-// supply the camera and the light.
+// One draw call per (mesh, material) pair, one instance per entity. The mesh
+// supplies geometry, the instance supplies a model matrix and the material's
+// numbers, group 1 supplies the albedo texture, and the globals supply the
+// camera and the light.
+//
+// There are four entry points and not two of each kind by accident: bones and
+// alpha are independent axes, and a pipeline's vertex buffers and its early
+// depth test are both fixed when it is built, so neither can be a branch.
 //
 // Shading is metallic-roughness: Cook-Torrance specular with GGX, Smith
 // visibility and Schlick's Fresnel, over a Lambert diffuse. One directional
@@ -345,12 +349,41 @@ fn fresnel_ambient(normal_dot_view: f32, f0: vec3<f32>, roughness: f32) -> vec3<
     return f0 + (ceiling - f0) * pow(clamp(1.0 - normal_dot_view, 0.0, 1.0), 5.0);
 }
 
+// How much alpha a texel needs before a masked surface draws it at all.
+//
+// A constant rather than a number on the material: moving the picture's own
+// alpha does the same job, and this is the same half that alpha to coverage
+// falls back to on hardware without it. @ref `colby_core::abi::material::Blend`.
+const MASK_CUTOFF: f32 = 0.5;
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // the texture is sRGB, so this is already linear by the time it is a float.
     // A material with no image samples the one white texel and multiplies by
     // one, which is why there is no branch here.
+    return shade(input, textureSample(albedo, surface_sampler, input.uv));
+}
+
+// The same, for a surface whose picture has holes in it.
+//
+// A separate entry point rather than a branch, and it is the argument the two
+// vertex entry points make arriving from the other end of the pipeline: a
+// `discard` anywhere in a fragment shader stops the hardware throwing a
+// fragment away before it is shaded, whether the branch is taken or not. One
+// shared shader would therefore cost every solid surface in the world the early
+// depth test it is passing today.
+@fragment
+fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
     let sampled = textureSample(albedo, surface_sampler, input.uv);
+    if (sampled.a < MASK_CUTOFF) {
+        discard;
+    }
+
+    return shade(input, sampled);
+}
+
+// Everything both entry points do once the albedo has been sampled.
+fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec4<f32> {
     let base_color = input.tint * sampled.rgb;
 
     let metallic = clamp(input.surface.x, 0.0, 1.0);

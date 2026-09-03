@@ -49,6 +49,55 @@ impl Wrap {
 	pub const fn code(self) -> u32 { self as u32 }
 }
 
+/// How a surface's alpha is read.
+///
+/// Two things wear the word "transparent" and they are different mechanisms
+/// rather than different arithmetic. A *mask* either throws a texel away or
+/// keeps it whole, so the geometry goes on writing depth, goes on casting, and
+/// is never sorted against anything - which is what a fence, a grate and a leaf
+/// want. Blending wants all three of those the other way round, and is not
+/// here yet.
+///
+/// A mode rather than a flag, because a flag cannot say which of the two is
+/// meant, and every renderer that has this at all has between five and seven
+/// values of it.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Blend {
+	/// The alpha is not read at all and the surface is solid.
+	#[default]
+	Opaque = 0,
+
+	/// A texel whose alpha is below half is not drawn; every other texel is
+	/// drawn exactly as [`Opaque`](Self::Opaque) would draw it.
+	///
+	/// The threshold lives in the shader rather than on the material, because
+	/// moving the picture's own alpha does the same job and a knob nobody can
+	/// turn is worse than no knob. It is the same half that alpha to coverage
+	/// falls back to where the hardware has none.
+	Mask = 1,
+}
+
+impl Blend {
+	/// How many rows there are, which is how wide that table is.
+	///
+	/// @note: a mode added above has to be counted here as well - nothing in
+	/// the language can do it, and the test below is what notices.
+	pub const COUNT: usize = 2;
+
+	/// The row of the renderer's pipeline table this mode is built into.
+	///
+	/// A match rather than a cast of the discriminant, so that a mode added
+	/// above is a compile error here rather than a row nobody built.
+	#[must_use]
+	pub const fn row(self) -> usize {
+		match self {
+			| Self::Opaque => 0,
+			| Self::Mask => 1,
+		}
+	}
+}
+
 /// How rough an unspecified surface is.
 ///
 /// Not zero: a perfectly smooth dielectric is a mirror, which is a strange
@@ -107,6 +156,15 @@ pub struct Material {
 	/// under the same unwrap, and a normal map that tiled differently from the
 	/// color over it would be a bug with no use.
 	pub wrap: Wrap,
+
+	/// How the albedo's alpha is read.
+	///
+	/// Here rather than on the entity because it is a property of what the
+	/// surface is *made of*: the same crate is solid or is a grate depending on
+	/// its material, and two entities sharing one material can never disagree
+	/// about it. It is also what the renderer already batches by, so a mode
+	/// here costs it no second lookup.
+	pub blend: Blend,
 }
 
 impl Material {
@@ -119,6 +177,7 @@ impl Material {
 		normal: TextureId::FLAT_NORMAL,
 		uv_scale: Vec2::ONE,
 		wrap: Wrap::Repeat,
+		blend: Blend::Opaque,
 	};
 
 	/// A material in a color, with nothing else set.
@@ -163,6 +222,15 @@ impl Material {
 	/// The same material, with its textures held at their edges.
 	#[must_use]
 	pub const fn clamped(self) -> Self { Self { wrap: Wrap::Clamp, ..self } }
+
+	/// The same material, with the holes in its picture left as holes.
+	///
+	/// @note: what decides is the *albedo texture's* alpha, so a material with
+	/// no picture is masked against one white texel and nothing is ever cut out
+	/// of it. That is the same rule [`textured`](Self::textured) already relies
+	/// on, read the other way round.
+	#[must_use]
+	pub const fn masked(self) -> Self { Self { blend: Blend::Mask, ..self } }
 }
 
 impl Default for Material {
@@ -290,6 +358,47 @@ mod tests {
 			Material::DEFAULT.bumped(TextureId::new(7)).normal,
 			TextureId::new(7),
 			"and a handle that names something is left alone"
+		);
+	}
+
+	#[test]
+	fn a_material_nobody_configured_reads_no_alpha_at_all() {
+		assert_eq!(
+			Material::DEFAULT.blend,
+			Blend::Opaque,
+			"a surface is solid until something says otherwise"
+		);
+		assert_eq!(Blend::default(), Blend::Opaque, "and the enum's own default agrees");
+	}
+
+	#[test]
+	fn masking_a_material_changes_that_and_nothing_else() {
+		let plain = Material::textured(TextureId::new(4)).finished(0.25, 0.3);
+		let masked = plain.masked();
+
+		assert_eq!(masked.blend, Blend::Mask, "the mode is set");
+		assert_eq!(
+			Material { blend: Blend::Opaque, ..masked },
+			plain,
+			"and putting the mode back gives the material it was made from"
+		);
+	}
+
+	#[test]
+	fn every_mode_has_a_row_of_its_own_and_together_they_fill_the_table() {
+		let mut taken = vec![None; Blend::COUNT];
+
+		for mode in [Blend::Opaque, Blend::Mask] {
+			let row = mode.row();
+
+			assert!(row < Blend::COUNT, "{mode:?} names row {row}, which is past the table");
+			assert_eq!(taken[row], None, "{mode:?} shares row {row} with {:?}", taken[row]);
+			taken[row] = Some(mode);
+		}
+
+		assert!(
+			taken.iter().all(Option::is_some),
+			"a row no mode names is a pipeline built for nobody: {taken:?}"
 		);
 	}
 

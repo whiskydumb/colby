@@ -288,6 +288,7 @@ mod tests {
 			Material, MeshData, MeshId, Pose, PoseId, Renderable, SkinVertex, Texel, TextureData,
 			Transform,
 			cvar::Value,
+			material::Blend,
 			mesh,
 			skeleton::{Bone, SkeletonData},
 		},
@@ -1307,6 +1308,122 @@ f 1 4 5
 			"the fourth texel is white, so no channel wins: {white:?}"
 		);
 		assert!(white[0] > 200, "and it is bright: {white:?}");
+	}
+
+	/// A two-by-two picture in one color, half of whose texels are holes.
+	///
+	/// One color rather than four, so that what a test over this measures is
+	/// the alpha and not which texel a sample landed on. The two alphas
+	/// straddle the cutoff by a wide margin on both sides, so nothing here
+	/// depends on where exactly the cutoff sits - only that it is between them.
+	fn holed() -> TextureData {
+		const SOLID: u8 = 0xFF;
+		const HOLE: u8 = 0x11;
+		let base = vec![
+			0xFF, 0x22, 0x22, SOLID, // near
+			0xFF, 0x22, 0x22, HOLE, //
+			0xFF, 0x22, 0x22, HOLE, //
+			0xFF, 0x22, 0x22, SOLID, //
+		];
+
+		TextureData {
+			width: 2,
+			height: 2,
+			texel: Texel::Rgba8Srgb,
+			levels: colby_asset::texture::build_chain(2, 2, base, Texel::Rgba8Srgb)
+				.expect("the chain builds"),
+		}
+	}
+
+	/// Shoots one square frame of a floor quad wearing [`holed`], in a mode.
+	///
+	/// The camera is overhead and the quad is sized so that each quarter of the
+	/// frame is the middle of one texel, which is the arrangement
+	/// [`a_texture_reaches_the_screen_the_way_up_its_coordinates_say`] works
+	/// out and for the same reason: off center the sampler blends with the
+	/// neighbor it wraps around to, and the test would be measuring the filter.
+	///
+	/// @param blend - how the material reads the picture's alpha
+	/// @return the frame, or `None` on a machine with no GPU
+	fn shot_of(blend: Blend) -> Option<Image> {
+		let mut capture = (match Capture::new(SQUARE, SQUARE) {
+			| Ok(capture) => capture,
+			| Err(error) => panic!("building the capture failed: {error}"),
+		})?;
+
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(1.0);
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+
+		let texture = world.textures.insert("test/holed", holed());
+		let material = world
+			.materials
+			.insert("test/holed", Material { blend, ..Material::textured(texture) });
+
+		let across = (world.camera.fov_y / 2.0).tan() * HEIGHT * 2.0;
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(MeshId::QUAD, material, Vec3::ONE));
+
+		Some(
+			capture
+				.shoot(&mut world)
+				.expect("the capture renders"),
+		)
+	}
+
+	#[test]
+	fn a_masked_material_leaves_the_holes_in_its_picture_unfilled() {
+		let (Some(solid), Some(cut)) = (shot_of(Blend::Opaque), shot_of(Blend::Mask)) else {
+			return;
+		};
+
+		// the two texels whose alpha is high, and the two whose alpha is low.
+		// The picture is one color, so what tells these apart is nothing but
+		// the mode the material was drawn in.
+		let kept = [(SQUARE / 4, SQUARE / 4), (SQUARE * 3 / 4, SQUARE * 3 / 4)];
+		let holes = [(SQUARE * 3 / 4, SQUARE / 4), (SQUARE / 4, SQUARE * 3 / 4)];
+
+		for (x, y) in kept {
+			let (before, after) = (solid.pixel(x, y), cut.pixel(x, y));
+
+			assert_eq!(dominant(after), 0, "a kept texel is the picture's red: {after:?}");
+			assert!(after[0] > 120, "and it is lit: {after:?}");
+			// the half that says the discard is about the alpha rather than
+			// about the pipeline: a shader that threw every fragment away
+			// would pass every assertion below and fail this one.
+			assert!(
+				distance(before, after) <= 1,
+				"and masking changed nothing where there is no hole: {before:?} became {after:?}"
+			);
+		}
+
+		// the quad is sized to fill the frame, so there is no corner of clear
+		// color to compare against - and none is needed: the world clears to a
+		// blue and every texel of the picture is a red, so which channel wins
+		// says which of the two is there.
+		for (x, y) in holes {
+			let (before, after) = (solid.pixel(x, y), cut.pixel(x, y));
+
+			assert_eq!(dominant(before), 0, "the same texel drawn solid is the red: {before:?}");
+			assert_eq!(
+				dominant(after),
+				2,
+				"and drawn masked there is nothing there but the clear: {after:?}"
+			);
+			// what makes the pair above a measurement rather than two
+			// coincidences: a build that never reached the masked pipeline
+			// would hand back one picture twice.
+			assert!(
+				distance(before, after) > 20,
+				"so the two modes really do differ here: {before:?} against {after:?}"
+			);
+		}
 	}
 
 	#[test]
