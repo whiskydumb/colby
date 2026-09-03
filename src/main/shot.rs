@@ -17,7 +17,7 @@ use colby_core::{
 	Err, Result,
 	abi::{Input, World},
 	info,
-	time::STEP,
+	time::{Rate, STEP},
 };
 use colby_engine::{Capture, Image, Overlay};
 use colby_physics::Simulation;
@@ -140,6 +140,7 @@ pub(crate) fn take(path: &Path) -> Result {
 				wire: None,
 			},
 			&mut input,
+			Rate::DEFAULT,
 			time,
 			// a screenshot always plays. There is no console in this path to
 			// ask for anything else, and a picture of a world nobody stepped

@@ -641,7 +641,7 @@ struct Ring {
 	/// what to stop re-sending, and it is answered by every message. "Which of
 	/// my commands is the world I am looking at already the result of" is about
 	/// where a guess starts, and it is answered only by a message that carried
-	/// a world - which is one in [`EVERY`](colby_net::EVERY).
+	/// a world - which is one in [`every`](colby_net::every) of them.
 	///
 	/// Running a guess from a picture while measuring it by the other mark is
 	/// asking the guess to cover ground the picture already covers. It reads as

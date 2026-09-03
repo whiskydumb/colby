@@ -32,7 +32,7 @@
 //! sends is the whole world. @ref [`colby_net::Snapshot`].
 //!
 //! **A world goes out twenty times a second and is stepped sixty.** The
-//! cadence is [`colby_net::EVERY`] and the decision is the caller's: `send`
+//! cadence is [`colby_net::every`] and the decision is the caller's: `send`
 //! describes the world it is handed and says only what it holds when it is
 //! handed none. That keeps the rule about *when* out of the endpoint, which has
 //! no clock of its own and no idea what a step is.
@@ -670,7 +670,7 @@ struct Peer {
 	/// already accounts for. Those two facts arrive together - a message
 	/// carries a block of commands and then a block of world - but they do not
 	/// arrive at the same *rate*: a snapshot goes with one message in every
-	/// [`EVERY`](colby_net::EVERY), and an acknowledgement goes with all of
+	/// [`every`](colby_net::every) of them, and an acknowledgement with all of
 	/// them.
 	///
 	/// Measuring the newest mark against a world several messages older is
@@ -1151,7 +1151,7 @@ impl Net {
 			// stop re-sending is everything the host has acknowledged, which is
 			// every message. What it may stop *guessing about* is only what the
 			// world it is looking at already accounts for, which is one message
-			// in [`EVERY`](colby_net::EVERY). @ref `Peer::stamped` and
+			// in [`every`](colby_net::every). @ref `Peer::stamped` and
 			// `Commands::base`.
 			world.commands.settle(world.peer, peer.confirmed);
 			world.commands.base(world.peer, peer.stamped);

@@ -1,6 +1,6 @@
 //! The pace the simulation runs at.
 //!
-//! The engine simulates at a constant rate and draws whenever it can, which are
+//! The engine simulates at a fixed rate and draws whenever it can, which are
 //! two different rates. [`Clock`] is what keeps them apart: real time goes in
 //! through [`tick`](Clock::tick), whole steps come out through
 //! [`step`](Clock::step), and whatever is left over is
@@ -8,18 +8,21 @@
 //! drawn sits between the last two simulated states.
 //!
 //! This is in `colby_core` rather than in the engine because none of it is
-//! graphics: [`STEP_SECONDS`] is what a game reads as
+//! graphics: a [`Rate`]'s [`seconds`](Rate::seconds) is what a game reads as
 //! [`World::dt`](crate::abi::World::dt), so the step length is part of the
 //! host/game contract, and a dedicated server would want the loop without
 //! wanting wgpu. It is deliberately *not* under `abi` - a game never sees a
 //! `Clock`, only the numbers the host writes into the world.
 //!
-//! @note: the rate is a constant on purpose. Reading it from a per-project
-//! manifest once before the loop starts is a knob that cannot actually be
-//! turned; colby's moves into the manifest when there is a CVar system to turn
-//! it with.
+//! @note: the rate is a number somebody can turn, and it is turned while the
+//! process runs rather than only before it starts. [`Rate`] is what carries it
+//! and [`Clock::set_rate`] is how it moves; the constants below are only the
+//! value nobody has said anything about.
 
 use std::time::{Duration, Instant};
+
+/// How many nanoseconds a second holds.
+const NANOS_A_SECOND: u64 = 1_000_000_000;
 
 /// How long one simulation step is, in nanoseconds.
 ///
@@ -29,7 +32,7 @@ use std::time::{Duration, Instant};
 /// nothing here can measure.
 const STEP_NANOS: u64 = 16_666_667;
 
-/// How long one simulation step is.
+/// How long one simulation step is, unless somebody says otherwise.
 pub const STEP: Duration = Duration::from_nanos(STEP_NANOS);
 
 /// The same step, in seconds, which is what a game reads as `World::dt`.
@@ -40,24 +43,113 @@ pub const STEP: Duration = Duration::from_nanos(STEP_NANOS);
 pub const STEP_SECONDS: f32 = 1.0 / 60.0;
 
 /// How many steps of arrears one frame is allowed to carry.
-pub const MAX_ARREARS_STEPS: u64 = 4;
-
-/// The most real time one frame may owe the simulation.
-///
-/// Anything past this is dropped rather than queued, which is the difference
-/// between a process that stalls and then runs slow for a moment and a process
-/// that stalls and then spends the rest of its life catching up. Because a
-/// frame always drains the accumulator below [`STEP`] before it returns, this
-/// one clamp is also what bounds the number of steps a frame can run - at most
-/// [`MAX_ARREARS_STEPS`] plus the one the remainder pays for. No second cap is
-/// needed, and a second cap would only be able to fire where nothing was wrong.
-pub const MAX_ARREARS: Duration = Duration::from_nanos(STEP_NANOS * MAX_ARREARS_STEPS);
+pub const MAX_ARREARS_STEPS: u32 = 4;
 
 /// The fastest simulated time is allowed to run against real time.
 ///
 /// Not taste: at a scale of N a frame runs N times as many steps, and there is
 /// a number past which asking for more is asking the loop not to return.
 pub const MAX_SPEED: f32 = 16.0;
+
+/// How long a simulation step is, in the two forms anybody wants it in.
+///
+/// One value rather than a number passed around, because the three fields have
+/// to agree and there is exactly one arithmetic that makes them agree. A rate
+/// is built from a whole number of hertz or it is [`DEFAULT`](Self::DEFAULT);
+/// there is no third way to make one, so the invariant holds by construction.
+///
+/// It is `Copy` and tiny on purpose: the host hands it to every simulation
+/// step, and a step that had to reach for it would be a step with an opinion
+/// about where it is kept.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rate {
+	/// Steps a second, which is the number a person types.
+	hz: u16,
+
+	/// How long one of them is.
+	step: Duration,
+
+	/// The same, in seconds, which is what a game reads as `World::dt`.
+	seconds: f32,
+}
+
+impl Rate {
+	/// Sixty a second: the rate everything in this engine was tuned at.
+	///
+	/// Written out of the two constants rather than through
+	/// [`from_hz`](Self::from_hz) so that it is a `const`. The two agree bit
+	/// for bit and there is a test that says so.
+	pub const DEFAULT: Self = Self {
+		hz: 60,
+		step: STEP,
+		seconds: STEP_SECONDS,
+	};
+	/// The fastest.
+	///
+	/// Taste rather than safety, and the safety is what makes taste enough:
+	/// the arrears clamp bounds how many steps a frame may run, so a rate too
+	/// high for the machine makes simulated time fall behind real time rather
+	/// than making the loop stop returning. A thousand is where a step is a
+	/// round million nanoseconds and asking for more stops meaning anything on
+	/// a clock this process can read.
+	pub const MAX_HZ: u16 = 1000;
+	/// The slowest rate that can be asked for.
+	///
+	/// Under one a step is longer than the whole arrears window, so a frame
+	/// could owe time it is never allowed to pay. Zero would be a division by
+	/// it.
+	pub const MIN_HZ: u16 = 1;
+
+	/// The rate that runs this many steps a second.
+	///
+	/// The step is rounded to the nearest nanosecond rather than truncated,
+	/// which is what makes sixty come out at exactly [`STEP`] rather than one
+	/// nanosecond short of it.
+	///
+	/// @param hz - steps a second, clamped into the range from
+	/// [`MIN_HZ`](Self::MIN_HZ) to [`MAX_HZ`](Self::MAX_HZ)
+	/// @return the rate, with its three fields in agreement
+	#[must_use]
+	pub fn from_hz(hz: u16) -> Self {
+		let hz = hz.clamp(Self::MIN_HZ, Self::MAX_HZ);
+		let divisor = u64::from(hz);
+
+		Self {
+			hz,
+			step: Duration::from_nanos((NANOS_A_SECOND + divisor / 2) / divisor),
+			seconds: 1.0 / f32::from(hz),
+		}
+	}
+
+	/// How many steps a second this is.
+	#[must_use]
+	pub const fn hz(self) -> u16 { self.hz }
+
+	/// How long one step is.
+	#[must_use]
+	pub const fn step(self) -> Duration { self.step }
+
+	/// The same, in seconds, which is what the host writes into `World::dt`.
+	#[must_use]
+	pub const fn seconds(self) -> f32 { self.seconds }
+
+	/// The most real time one frame may owe the simulation.
+	///
+	/// Anything past this is dropped rather than queued, which is the
+	/// difference between a process that stalls and then runs slow for a
+	/// moment and a process that stalls and then spends the rest of its life
+	/// catching up. Because a frame always drains the accumulator below one
+	/// step before it returns, this one clamp is also what bounds the number
+	/// of steps a frame can run - at most [`MAX_ARREARS_STEPS`] plus the one
+	/// the remainder pays for. No second cap is needed, and a second cap would
+	/// only be able to fire where nothing was wrong.
+	#[must_use]
+	pub const fn arrears(self) -> Duration { self.step.saturating_mul(MAX_ARREARS_STEPS) }
+}
+
+impl Default for Rate {
+	fn default() -> Self { Self::DEFAULT }
+}
 
 /// Whether the simulation is keeping up with real time.
 ///
@@ -69,7 +161,7 @@ pub enum Pace {
 	/// Real time is being kept.
 	Keeping,
 
-	/// This frame owed more than [`MAX_ARREARS`] and the excess was dropped.
+	/// This frame owed more than [`Rate::arrears`] and the excess was dropped.
 	/// The frame before it was keeping up.
 	FellBehind,
 
@@ -94,6 +186,9 @@ pub struct Clock {
 	/// Real time that has arrived but not yet been simulated.
 	accumulator: Duration,
 
+	/// How long one step is, and how much may be owed before it is dropped.
+	rate: Rate,
+
 	/// Time the simulation has actually run. Behind real time by whatever the
 	/// stalls dropped, and by whatever is in the accumulator.
 	simulated: Duration,
@@ -102,7 +197,7 @@ pub struct Clock {
 	/// while paused, and whatever `sim.speed` says otherwise.
 	speed: f32,
 
-	/// How many frames have been over [`MAX_ARREARS`].
+	/// How many frames have been over [`Rate::arrears`].
 	stalls: u64,
 
 	/// Whether the previous frame was one of them.
@@ -116,6 +211,7 @@ impl Clock {
 		Self {
 			previous: Instant::now(),
 			accumulator: Duration::ZERO,
+			rate: Rate::DEFAULT,
 			simulated: Duration::ZERO,
 			speed: 1.0,
 			stalls: 0,
@@ -151,6 +247,22 @@ impl Clock {
 	#[must_use]
 	pub const fn speed(&self) -> f32 { self.speed }
 
+	/// Sets how long a step is from here on.
+	///
+	/// **Nothing is converted, and that is the whole reason this is safe to
+	/// call between two steps.** The accumulator holds *real* time that has
+	/// arrived and not been simulated, which is a quantity with no step length
+	/// in it, and `simulated` holds elapsed simulated time, which is a
+	/// quantity with no step count in it. Neither means anything different
+	/// after the rate moves; only how much of the first one buys a step does.
+	///
+	/// @param rate - the new step length
+	pub const fn set_rate(&mut self, rate: Rate) { self.rate = rate; }
+
+	/// How long a step is on this clock.
+	#[must_use]
+	pub const fn rate(&self) -> Rate { self.rate }
+
 	/// Adds simulated time that nobody spent.
 	///
 	/// The console's single step. Deliberately not subject to the arrears
@@ -185,10 +297,11 @@ impl Clock {
 		// behind is a property of the process, not of how fast the game was
 		// asked to run. Scaling afterwards is what keeps `sim.speed 8` from
 		// being capped at the arrears clamp and quietly running at four.
-		let over = delta > MAX_ARREARS;
+		let arrears = self.rate.arrears();
+		let over = delta > arrears;
 		self.accumulator = self
 			.accumulator
-			.saturating_add(delta.min(MAX_ARREARS).mul_f32(self.speed));
+			.saturating_add(delta.min(arrears).mul_f32(self.speed));
 
 		if over {
 			self.stalls = self.stalls.saturating_add(1);
@@ -211,12 +324,14 @@ impl Clock {
 	/// @return the simulated time after that step, in seconds, or `None` when
 	/// the accumulator is short of a whole step
 	pub fn step(&mut self) -> Option<f32> {
-		if self.accumulator < STEP {
+		let step = self.rate.step;
+
+		if self.accumulator < step {
 			return None;
 		}
 
-		self.accumulator = self.accumulator.saturating_sub(STEP);
-		self.simulated = self.simulated.saturating_add(STEP);
+		self.accumulator = self.accumulator.saturating_sub(step);
+		self.simulated = self.simulated.saturating_add(step);
 
 		Some(self.simulated.as_secs_f32())
 	}
@@ -229,7 +344,7 @@ impl Clock {
 	#[must_use]
 	pub fn interpolation(&self) -> f32 {
 		self.accumulator
-			.div_duration_f32(STEP)
+			.div_duration_f32(self.rate.step)
 			.clamp(0.0, 1.0)
 	}
 
@@ -264,6 +379,197 @@ mod tests {
 		}
 
 		ran
+	}
+
+	/// Takes every whole step a clock is already holding, without ticking it.
+	///
+	/// @param clock - the clock to drain
+	/// @return how many steps came out
+	fn drained(clock: &mut Clock) -> u32 {
+		let mut ran = 0;
+		while clock.step().is_some() {
+			ran += 1;
+		}
+
+		ran
+	}
+
+	#[test]
+	fn sixty_hertz_is_the_default_rate_bit_for_bit() {
+		let built = Rate::from_hz(60);
+
+		// the whole reason `from_hz` rounds rather than truncates. A step one
+		// nanosecond short of `STEP` would move every screenshot this project
+		// has ever taken, and it would move them by an amount too small to see
+		// and too large to ignore.
+		assert_eq!(built.step(), Rate::DEFAULT.step(), "the same step");
+		assert_eq!(
+			built.seconds().to_bits(),
+			Rate::DEFAULT.seconds().to_bits(),
+			"and the same number of seconds, to the bit"
+		);
+		assert_eq!(built.hz(), 60, "and it remembers what it was asked for");
+	}
+
+	#[test]
+	fn a_rate_agrees_with_itself_in_both_forms() {
+		for hz in [1_u16, 20, 30, 50, 60, 64, 120, 128, 240, 1000] {
+			let rate = Rate::from_hz(hz);
+			let apart = (rate.step().as_secs_f32() - rate.seconds()).abs();
+			// half a nanosecond of rounding in the step, and one f32 ulp in
+			// the seconds. Anything wider than that is the two being computed
+			// from different numbers rather than from the same one.
+			let allowed = rate.seconds().mul_add(f32::EPSILON, 1.0e-9);
+
+			assert!(
+				apart <= allowed,
+				"{hz} hertz: a step of {:?} against {} seconds",
+				rate.step(),
+				rate.seconds()
+			);
+		}
+	}
+
+	#[test]
+	fn a_rate_outside_the_range_is_pulled_back_into_it() {
+		assert_eq!(Rate::from_hz(0).hz(), Rate::MIN_HZ, "nothing divides by zero");
+		assert_eq!(
+			Rate::from_hz(u16::MAX).hz(),
+			Rate::MAX_HZ,
+			"and nothing runs at sixty-five thousand"
+		);
+	}
+
+	#[test]
+	fn a_faster_rate_runs_more_steps_for_the_same_real_time() {
+		// a hundred and twenty five and two hundred and fifty rather than
+		// sixty and a hundred and twenty, because the steps of those two are
+		// whole milliseconds: the count then says something about the rate
+		// rather than about which side of a nanosecond the rounding fell.
+		let mut slow = Clock::new();
+		let mut fast = Clock::new();
+		slow.set_rate(Rate::from_hz(125));
+		fast.set_rate(Rate::from_hz(250));
+
+		let mut slow_ran = 0;
+		let mut fast_ran = 0;
+		for _ in 0..250 {
+			slow_ran += frame(&mut slow, Duration::from_millis(4));
+			fast_ran += frame(&mut fast, Duration::from_millis(4));
+		}
+
+		assert_eq!(slow_ran, 125, "a second at a hundred and twenty five is that many steps");
+		assert_eq!(fast_ran, 250, "and the same second at twice the rate is twice as many");
+	}
+
+	#[test]
+	fn the_blend_between_two_steps_is_a_fraction_of_the_step_it_is_between() {
+		// what the renderer draws with, and it is a fraction rather than a
+		// duration - so a clock that measured it against a step it is not
+		// running would hand the renderer a number between nought and one that
+		// meant something else entirely, and the picture would lag or lead
+		// with nothing anywhere reporting a fault.
+		let mut clock = Clock::new();
+		let fast = Rate::from_hz(240);
+		clock.set_rate(fast);
+
+		clock.tick_with(fast.step() / 2);
+
+		let blend = clock.interpolation();
+		assert!(
+			(blend - 0.5).abs() < 1.0e-3,
+			"half a step of the rate being run is half way between two of them, got {blend}"
+		);
+	}
+
+	#[test]
+	fn what_a_stalled_frame_may_owe_is_measured_against_the_rate_being_run() {
+		// four steps of arrears at two hundred and forty is a sixtieth of a
+		// second, not the fifteenth it would be at sixty. A clock that clamped
+		// against the wrong one would take a frame that really did stall,
+		// count it as keeping up, and run seven steps to catch up on it.
+		let mut clock = Clock::new();
+		let fast = Rate::from_hz(240);
+		clock.set_rate(fast);
+
+		let pace = clock.tick_with(fast.step() * 8);
+
+		assert_eq!(pace, Pace::FellBehind, "eight steps of arrears is a stall at this rate");
+		assert_eq!(clock.stalls(), 1, "and it is counted");
+		assert_eq!(
+			drained(&mut clock),
+			MAX_ARREARS_STEPS,
+			"and what is left to run is the window rather than what arrived"
+		);
+	}
+
+	#[test]
+	fn the_arrears_window_follows_the_rate() {
+		let slow = Rate::from_hz(30);
+		let fast = Rate::from_hz(120);
+
+		assert_eq!(
+			slow.arrears(),
+			slow.step() * MAX_ARREARS_STEPS,
+			"four steps, whatever a step is"
+		);
+		assert!(fast.arrears() < slow.arrears(), "and a shorter step is a shorter window");
+	}
+
+	#[test]
+	fn changing_the_rate_neither_loses_nor_duplicates_what_is_owed() {
+		let mut clock = Clock::new();
+
+		// three quarters of a step at sixty: not enough to run, and the whole
+		// of what the clock is holding.
+		clock.tick_with(STEP * 3 / 4);
+		assert!(clock.step().is_none(), "three quarters of a step is not a step");
+
+		// the same real time is a step and a half at twice the rate, so
+		// exactly one step comes out and a quarter of the old one is still
+		// owed. If the accumulator were cleared, or measured in steps rather
+		// than in time, this would be nothing at all.
+		clock.set_rate(Rate::from_hz(120));
+		assert!(clock.step().is_some(), "what was owed is still owed, and now buys a step");
+		assert!(clock.step().is_none(), "but only the one");
+
+		assert!(
+			clock.interpolation() > 0.0,
+			"and the remainder is still there, as a fraction of a shorter step"
+		);
+	}
+
+	#[test]
+	fn simulated_time_carries_across_a_rate_change() {
+		let mut clock = Clock::new();
+
+		for _ in 0..60 {
+			frame(&mut clock, STEP);
+		}
+
+		let before = clock.simulated();
+		clock.set_rate(Rate::from_hz(240));
+
+		// to the bit on purpose: turning the rate must not touch this number
+		// at all, and a tolerance here would let a small restatement through.
+		assert_eq!(
+			clock.simulated().to_bits(),
+			before.to_bits(),
+			"the seconds already run are not restated"
+		);
+
+		for _ in 0..240 {
+			frame(&mut clock, Rate::from_hz(240).step());
+		}
+
+		// one second at sixty and one at two hundred and forty is two seconds,
+		// and it is two seconds because the clock counts time rather than
+		// steps.
+		assert!(
+			(clock.simulated() - 2.0).abs() < 1.0e-3,
+			"two seconds of simulated time, got {}",
+			clock.simulated()
+		);
 	}
 
 	#[test]
@@ -324,7 +630,7 @@ mod tests {
 		let ran = frame(&mut clock, Duration::from_secs(10));
 
 		assert!(
-			u64::from(ran) <= MAX_ARREARS_STEPS + 1,
+			ran <= MAX_ARREARS_STEPS + 1,
 			"ten seconds of stall must not become six hundred steps, got {ran}"
 		);
 		assert_eq!(clock.stalls(), 1, "and it is counted rather than hidden");
@@ -388,7 +694,7 @@ mod tests {
 		let mut clock = Clock::new();
 		let mut real = Duration::ZERO;
 
-		// deliberately uneven, and deliberately all under MAX_ARREARS: frames
+		// deliberately uneven, and deliberately all under the arrears cap: frames
 		// well above the step rate, frames well below it, and frames that land
 		// on it. Nothing here is a stall, so nothing here is allowed to lose
 		// time.

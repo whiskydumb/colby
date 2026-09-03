@@ -141,29 +141,51 @@ use colby_core::{
 
 use crate::packet::{u16_at, u32_at};
 
-/// How many simulation steps there are between snapshots.
+/// How many snapshots a second an endpoint aims to send.
 ///
-/// Twenty a second at the simulation's sixty, which is the rate the systems
-/// this is modeled on settle on. [`DEPTH`](crate::ring::DEPTH) was chosen
-/// before this and against memory rather than against a rate; what this number
-/// does is settle what that depth *buys*, which is one and a half seconds of
-/// history rather than half of one.
+/// Twenty, which is the rate the systems this is modeled on settle on.
+/// [`DEPTH`](crate::ring::DEPTH) was chosen before this and against memory
+/// rather than against a rate; what this number does is settle what that depth
+/// *buys*, which is one and a half seconds of history rather than half of one.
 ///
-/// **A step is not a snapshot and this is why.** The world is stepped sixty
-/// times a second because that is what makes a stack of boxes stand up; it is
-/// *described* twenty times a second because that is what a far end can be
-/// told without the description costing more than the simulation.
-///
-/// @note: this is a count of steps, not a rate, so the two are not independent
-/// after all - change the tick and the snapshot rate moves with it. That is
-/// the right coupling while the tick is a constant and the wrong one the day
-/// it is not, and it is the same open question the tick rate itself has.
+/// **A step is not a snapshot and this is why.** The world is stepped as often
+/// as it takes to make a stack of boxes stand up; it is *described* twenty
+/// times a second because that is what a far end can be told without the
+/// description costing more than the simulation. The two were one number
+/// divided by three for as long as the tick was a constant, and the moment the
+/// tick stopped being one they had to be told apart - or a world stepped twice
+/// as often would have silently sent twice as much.
 ///
 /// @note: a peer still hears from this end every step. What a snapshot's
 /// cadence gates is whether a message carries a *description*; a message with
 /// none is still fourteen bytes of head saying what this end holds, which is
 /// what keeps the far end's differences from being baselines forever.
-pub const EVERY: u32 = 3;
+pub const SNAPSHOTS: u16 = 20;
+
+/// How many simulation steps there are between snapshots at this rate.
+///
+/// Rounded to the nearest whole step, because a cadence is a step counter and
+/// a step counter cannot hold a fraction. So what comes out is [`SNAPSHOTS`] a
+/// second only when the tick divides by it: sixty gives every third step and
+/// exactly twenty, thirty gives every second step and fifteen. Never less than
+/// one - more snapshots than steps is not a thing that can be sent, because
+/// there is nothing new to say between two steps.
+///
+/// @param hz - how many simulation steps a second the world is running; a rate
+/// nothing could run at is saturated rather than wrapped, so the answer is
+/// always a cadence somebody could have meant
+/// @return how many steps apart two snapshots are
+#[must_use]
+pub const fn every(hz: u16) -> u16 {
+	let steps = hz.saturating_add(SNAPSHOTS / 2) / SNAPSHOTS;
+
+	if steps == 0 { 1 } else { steps }
+}
+
+/// Sixty a second is every third step, which is what it was when it was a
+/// constant. Every hash this project keeps was taken at that cadence, so this
+/// is the one value of [`every`] that is not free to move.
+const _: () = assert!(every(60) == 3, "the default rate keeps the cadence it had");
 
 /// How many bodies one snapshot can speak about.
 ///
@@ -905,6 +927,26 @@ fn get(before: &[Slot], bytes: &[u8], at: usize) -> Result<(Change, usize), Faul
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_cadence_is_the_nearest_whole_number_of_steps_to_twenty_a_second() {
+		assert_eq!(every(60), 3, "sixty, and this is the one that must not move");
+		assert_eq!(every(20), 1, "twenty a second is a snapshot a step");
+		assert_eq!(every(120), 6, "twice the tick is twice the gap, not twice the wire");
+		assert_eq!(every(240), 12, "and four times");
+		assert_eq!(every(50), 3, "fifty rounds up to three, so sixteen and two thirds a second");
+		assert_eq!(every(30), 2, "thirty rounds to two, so fifteen a second rather than twenty");
+	}
+
+	#[test]
+	fn a_cadence_is_never_shorter_than_a_step() {
+		for hz in [0_u16, 1, 5, 9, 10, 11] {
+			assert!(every(hz) >= 1, "{hz} hertz must still name a whole step");
+		}
+
+		assert_eq!(every(1), 1, "a world stepped once a second is described once a second");
+		assert_eq!(every(u16::MAX), 3276, "and nothing wraps on the way to an answer");
+	}
 
 	/// A body somewhere, with **every** word set to something a zero is not.
 	///

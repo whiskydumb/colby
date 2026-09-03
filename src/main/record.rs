@@ -24,7 +24,7 @@ use colby_core::{
 	Result,
 	abi::{Input, SoundData, World},
 	err, info,
-	time::STEP,
+	time::{Rate, STEP},
 };
 use colby_physics::Simulation;
 use colby_script::Vm;
@@ -49,9 +49,16 @@ const RATE: u32 = 48_000;
 
 /// How many steps there are in a second.
 ///
-/// The rate the whole engine is fixed at. @ref `colby_core::time::STEP`, which
-/// is the same number as a duration.
+/// The rate a recording is pinned at, whatever a console was told: a `.wav`
+/// this mode wrote has to be comparable against one written before the rate
+/// was turnable. @ref [`Rate::DEFAULT`], which is the same number, and the
+/// assertion below, which is what says so.
 const STEPS_A_SECOND: u32 = 60;
+
+const _: () = assert!(
+	Rate::DEFAULT.hz() == 60,
+	"a recording is written at the default rate, so the two have to be the same number"
+);
 
 /// How many frames one simulation step is worth.
 #[expect(
@@ -198,6 +205,7 @@ pub(crate) fn take(request: &Request) -> Result {
 				wire: None,
 			},
 			&mut input,
+			Rate::DEFAULT,
 			time,
 			false,
 		);

@@ -106,8 +106,9 @@ use crate::snapshot::{MAX_SLOTS, NOTHING, Slot, Solid};
 /// What bounds it is memory against tolerance. Depth multiplies by peers, so
 /// every step costs eight worlds; and it buys how far behind a peer may fall
 /// and still be sent a difference rather than the whole world. At
-/// [`EVERY`](crate::snapshot::EVERY) that is **one and a half seconds** of
-/// history, which is the number to hold this against: a peer whose round trip
+/// [`SNAPSHOTS`](crate::snapshot::SNAPSHOTS) a second that is **one and a half
+/// seconds** of history, whatever the tick rate is, which is the number to hold
+/// this against: a peer whose round trip
 /// is worse than that is sent a baseline every time. Being inside it is not a
 /// promise of the opposite - a peer whose own word about what it holds is lost
 /// for long enough falls out of the ring just the same - but it is the

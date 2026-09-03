@@ -36,9 +36,9 @@ use colby_core::{
 	abi::{Input, World},
 	glam::Vec2,
 	info,
-	time::{Clock, STEP},
+	time::Clock,
 };
-use colby_net::{EVERY, Slot};
+use colby_net::{Slot, every};
 use colby_physics::Simulation;
 use colby_script::Vm;
 use colby_ui::Interface;
@@ -211,6 +211,18 @@ fn run(end: End) -> Result {
 		clock.tick();
 		assets.poll(&mut world);
 		console.poll(&mut world);
+		// the tick rate, read where a window reads it. A serving end is the
+		// authority and runs what it was told; an asking one takes the rate
+		// every host runs, because nothing on the wire says what this host
+		// chose. @ref `crate::app::paced`, which is where both halves of that
+		// are checked.
+		//
+		// @note: no test reaches this line, and a mutation that made a serving
+		// end follow instead of lead is not caught by anything. The whole of
+		// this loop is like that - a socket, a module and a console stand
+		// between it and any harness - and that is `NET-7` rather than
+		// something this line can fix on its own.
+		clock.set_rate(crate::app::paced(&world.cvars, !hosting));
 		crate::saves::serve(&mut world, &mut simulation);
 		crate::net::serve(Some(&mut net));
 		net.set(crate::net::conditions(&world.cvars));
@@ -229,6 +241,9 @@ fn run(end: End) -> Result {
 		crate::net::obey(&mut world, &net);
 
 		let mut ran = false;
+		// once for the pass, so two steps of one iteration are the same length
+		// as each other whatever a console said between them.
+		let rate = clock.rate();
 
 		while let Some(time) = clock.step() {
 			step::run(
@@ -249,6 +264,7 @@ fn run(end: End) -> Result {
 					wire: (!hosting).then_some(step::Wired { net: &mut net, now: moment }),
 				},
 				&mut input,
+				rate,
 				time,
 				false,
 			);
@@ -257,19 +273,15 @@ fn run(end: End) -> Result {
 			// has to mean "this is where things stand at this moment".
 			//
 			// The world itself goes with one message in every
-			// [`EVERY`](colby_net::EVERY): a step is what makes a stack of
-			// boxes stand up and a snapshot is what a far end can be told, and
-			// they are not the same rate. The messages in between still go,
-			// carrying what this end holds and whatever the reliable ring is
-			// still owed.
-			// @note: `World::steps` is public and a game module writes it, so
-			// the cadence is on a clock the game can move. Nothing does today;
-			// it is worth knowing before something does, because a game that
-			// set it back would stop describing the world for a while and
-			// nothing anywhere would say so.
-			let describing = hosting && world.steps.is_multiple_of(u64::from(EVERY));
+			// [`every`](colby_net::every) of them: a step is what makes a
+			// stack of boxes stand up and a snapshot is what a far end can be
+			// told, and they are not the same rate - which is why the cadence
+			// is worked out from the rate rather than fixed beside it. The messages in
+			// between still go, carrying what this end holds and whatever the reliable
+			// ring is still owed.
+			let telling = describing(hosting, world.steps, rate.hz());
 
-			if describing {
+			if telling {
 				crate::net::records(&world.bodies, &mut records);
 			}
 
@@ -282,11 +294,11 @@ fn run(end: End) -> Result {
 				net.ask(world.commands.unsettled(world.peer));
 			}
 
-			net.send(started.elapsed(), describing.then_some(records.as_slice()));
+			net.send(started.elapsed(), telling.then_some(records.as_slice()));
 			// and the wire's own clock moves on by exactly one step, after the
 			// message that was about the step just run. @ref `crate::app`,
 			// which advances it in the same place.
-			moment = moment.saturating_add(STEP);
+			moment = moment.saturating_add(rate.step());
 			ran = true;
 		}
 
@@ -310,12 +322,61 @@ fn run(end: End) -> Result {
 	Ok(())
 }
 
+/// Whether the step just run is one the world goes out with.
+///
+/// A function rather than three lines in the loop because it is the only
+/// arithmetic in that loop, and the loop itself has nothing that can be run in
+/// a test - a socket, a module and a console between it and anything. What is
+/// checkable is pulled out here, and what is left up there is plumbing.
+///
+/// @note: `World::steps` is public and a game module writes it, so the cadence
+/// is on a clock the game can move. Nothing does today; it is worth knowing
+/// before something does, because a game that set it back would stop
+/// describing the world for a while and nothing anywhere would say so.
+///
+/// @param hosting - whether this end owns the world; only an authority
+/// describes one
+/// @param steps - how many steps this end has run
+/// @param hz - how many of them there are in a second
+/// @return whether this step's message carries a description
+fn describing(hosting: bool, steps: u64, hz: u16) -> bool {
+	hosting && steps.is_multiple_of(u64::from(every(hz)))
+}
+
 /// How long one step is, for whoever is reading the loop above.
-const _: () = assert!(STEP.as_nanos() > 0, "a step has to take some time");
+const _: () = assert!(
+	colby_core::time::Rate::DEFAULT.step().as_nanos() > 0,
+	"a step has to take some time"
+);
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_world_is_described_twenty_times_a_second_at_any_rate() {
+		// the property the cadence exists for, stated as a count rather than
+		// as a gap: what has to hold when the tick moves is that the *wire*
+		// does not, and a gap in steps is not that until it is divided back
+		// out by the rate.
+		for hz in [20_u16, 60, 120, 240] {
+			let described = (1..=u64::from(hz))
+				.filter(|steps| describing(true, *steps, hz))
+				.count();
+
+			assert_eq!(described, 20, "{hz} a second is still twenty descriptions of it");
+		}
+	}
+
+	#[test]
+	fn only_an_authority_describes_a_world() {
+		// a client's blocks carry the number of the newest snapshot it holds
+		// and nothing else. An asking end that described one would be telling
+		// the host what the host already decided.
+		assert!(describing(true, 3, 60), "a serving end, on the cadence");
+		assert!(!describing(false, 3, 60), "an asking one, on the same step");
+		assert!(!describing(true, 4, 60), "and a serving one off it");
+	}
 
 	#[test]
 	fn the_flag_is_read_on_its_own_and_with_a_port() {

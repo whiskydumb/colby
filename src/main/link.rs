@@ -49,8 +49,8 @@ use std::{
 	time::Duration,
 };
 
-use colby_core::{Result, abi::Command, bytemuck, info, time::STEP, warn};
-use colby_net::{Conditions, EVERY, MAX_ASKED, NOTHING, Slot, Solid};
+use colby_core::{Result, abi::Command, bytemuck, info, time::Rate, warn};
+use colby_net::{Conditions, MAX_ASKED, NOTHING, Slot, Solid, every};
 
 use crate::net::{Loopback, Net, Tally, Wire};
 
@@ -65,6 +65,17 @@ const DEFAULT_STEPS: u32 = 600;
 
 /// The most steps one run may be.
 const MAX_STEPS: u32 = 100_000;
+
+/// The rate a two-endpoint run is pinned at.
+///
+/// This mode opens no console - it loads no module and binds no socket - so
+/// nothing here could turn the number even if it wanted to. Naming it is what
+/// says the digest this run prints stays comparable against the ones printed
+/// before the rate was turnable at all.
+const RATE: Rate = Rate::DEFAULT;
+
+/// How many steps apart two snapshots are at that rate.
+const EVERY: u16 = every(RATE.hz());
 
 /// How often the host says something that has to arrive.
 const HOST_EVERY: u32 = 60;
@@ -310,7 +321,7 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 	connect(&mut client, one);
 
 	for step in 1..=steps.saturating_add(SETTLE) {
-		let now = STEP * step;
+		let now = RATE.step() * step;
 		let talking = step <= steps;
 
 		if talking && step.is_multiple_of(HOST_EVERY) {
@@ -330,7 +341,7 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 		// twenty a second out of sixty, and only from the host: a snapshot is
 		// what an authority sends, and the client's blocks carry nothing but
 		// the number of the newest one it has.
-		let telling = step.is_multiple_of(EVERY);
+		let telling = step.is_multiple_of(u32::from(EVERY));
 
 		// and the client asks for something, every step, the way a client
 		// with somebody at its keyboard would. Its window is never settled,
@@ -454,7 +465,7 @@ fn describe(step: u32, into: &mut Vec<Slot>) {
 
 	// on and off every other snapshot, so that a snapshot written against the
 	// one before last sees them exactly as they were.
-	let back = (step / EVERY).is_multiple_of(2);
+	let back = (step / u32::from(EVERY)).is_multiple_of(2);
 
 	into[5] = Some((1, body(4, if back { [3.0, 0.0, 0.0] } else { [0.0, 3.0, 0.0] })));
 	into[6] = Some((1, Solid {
@@ -729,7 +740,7 @@ mod tests {
 		// a wire that loses nothing every one of them arrives whole.
 		let clean = exchange(600, Conditions::PERFECT);
 
-		assert_eq!(clean.taken, (600 + SETTLE) / EVERY, "every one of them");
+		assert_eq!(clean.taken, (600 + SETTLE) / u32::from(EVERY), "every one of them");
 		assert!(clean.agreed);
 	}
 

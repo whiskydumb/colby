@@ -12,7 +12,7 @@ use std::time::Duration;
 use colby_audio::Device;
 use colby_core::{
 	abi::{Input, World},
-	time::STEP_SECONDS,
+	time::Rate,
 };
 use colby_physics::Simulation;
 use colby_script::Vm;
@@ -79,6 +79,10 @@ pub(crate) struct Parts<'a> {
 /// @param parts - the subsystems this step drives
 /// @param input - everything that has arrived since the previous step; the
 /// edges in it are consumed here
+/// @param rate - how long this step is; the deterministic modes hand over
+/// [`Rate::DEFAULT`] rather than whatever a console was told, which is what
+/// keeps a picture, a recording and a two-endpoint digest comparable against
+/// the ones before them
 /// @param time - the simulated time this step ends at, in seconds
 /// @param editing - whether the world is being edited rather than played, in
 /// which case neither the solver nor the game runs. @ref `crate::mode`
@@ -86,6 +90,7 @@ pub(crate) fn run(
 	world: &mut World,
 	parts: Parts<'_>,
 	input: &mut Input,
+	rate: Rate,
 	time: f32,
 	editing: bool,
 ) {
@@ -104,7 +109,11 @@ pub(crate) fn run(
 	world.advance();
 
 	world.time = time;
-	world.dt = STEP_SECONDS;
+	// the one place the length of a step becomes a number a game can read, and
+	// the reason nothing downstream has to know the rate is turnable: every
+	// consumer already integrates against `World::dt` rather than against a
+	// constant, and this is what that field is.
+	world.dt = rate.seconds();
 	world.steps = world.steps.saturating_add(1);
 	// written here rather than once a frame, so that whatever reads it inside
 	// a step reads what this step is actually doing.
@@ -124,7 +133,7 @@ pub(crate) fn run(
 	// argument - time goes on while a world is being edited, and ambience that
 	// stopped the moment somebody pressed F5 would be a bug rather than a
 	// feature. @ref `colby_core::abi::audio`.
-	world.audio.advance(&world.sounds, STEP_SECONDS);
+	world.audio.advance(&world.sounds, world.dt);
 
 	// hand the accumulated input over, then clear the parts that describe one
 	// step only. A second step in the same frame therefore sees what is held
@@ -323,7 +332,7 @@ mod tests {
 			wire: Some(Wired { net, now: Duration::from_millis(now) }),
 		};
 
-		run(world, parts, &mut Input::default(), 0.0, false);
+		run(world, parts, &mut Input::default(), Rate::DEFAULT, 0.0, false);
 	}
 
 	/// Where an entity is, and where it is drawn coming from.
@@ -352,7 +361,7 @@ mod tests {
 			wire: None,
 		};
 
-		run(world, parts, &mut Input::default(), 0.0, editing);
+		run(world, parts, &mut Input::default(), Rate::DEFAULT, 0.0, editing);
 	}
 
 	/// A command is offered for one step, whoever does or does not act on it.
@@ -541,7 +550,7 @@ mod tests {
 				wire: None,
 			};
 
-			run(world, parts, input, time, editing);
+			run(world, parts, input, Rate::DEFAULT, time, editing);
 		}
 	}
 
@@ -592,7 +601,7 @@ mod tests {
 				wire: None,
 			};
 
-			run(&mut world, parts, &mut input, 0.0, false);
+			run(&mut world, parts, &mut input, Rate::DEFAULT, 0.0, false);
 		}
 
 		let entity = world
@@ -693,6 +702,57 @@ mod tests {
 	}
 
 	#[test]
+	fn the_step_writes_the_length_it_was_handed_into_the_world() {
+		// **the one place a rate becomes a number gameplay can read.** Every
+		// consumer downstream integrates against `World::dt` and none of them
+		// knows where it came from, so a step that wrote a constant here would
+		// leave the solver, the character controller, the interpreter and the
+		// mixer all running at sixty while the clock ran at something else.
+		for hz in [30_u16, 60, 120, 240] {
+			let rate = Rate::from_hz(hz);
+			let (mut world, mut simulation) = falling();
+			let mut interface = Interface::new();
+			let sound = world.sounds.insert("sounds/test", SoundData {
+				samples: vec![0; 100_000],
+				rate: 1000,
+				channels: 1,
+			});
+			let voice = world.audio.play(Voice::flat(sound));
+
+			for _ in 0..6 {
+				let parts = Parts {
+					game: None,
+					interface: &mut interface,
+					scripts: None,
+					simulation: &mut simulation,
+					audio: None,
+					wire: None,
+				};
+
+				run(&mut world, parts, &mut Input::default(), rate, 0.0, false);
+			}
+
+			assert_eq!(
+				world.dt.to_bits(),
+				rate.seconds().to_bits(),
+				"{hz} a second is what a game is told a step is"
+			);
+
+			// and the playhead is the proof that something downstream of the
+			// field actually used it rather than reaching for the constant.
+			let head = world
+				.audio
+				.get(voice)
+				.map_or(0.0, |playing| playing.head);
+
+			assert!(
+				6.0_f32.mul_add(-rate.seconds(), head).abs() < 1e-6,
+				"{hz} a second: six steps in, the playhead is six of them along: {head}"
+			);
+		}
+	}
+
+	#[test]
 	fn the_step_carries_the_playheads_in_either_mode() {
 		// audio goes with the debug sweep rather than with the solver: time
 		// goes on while a world is being edited, and ambience that stopped the
@@ -716,7 +776,9 @@ mod tests {
 				.map_or(0.0, |playing| playing.head);
 
 			assert!(
-				6.0_f32.mul_add(-STEP_SECONDS, head).abs() < 1e-6,
+				6.0_f32
+					.mul_add(-Rate::DEFAULT.seconds(), head)
+					.abs() < 1e-6,
 				"editing={editing}: six steps in, the playhead is six steps along: {head}"
 			);
 

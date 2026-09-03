@@ -226,6 +226,17 @@ pub(crate) fn install(world: &mut World) {
 	world
 		.cvars
 		.command("sim.step", step, "run this many simulation steps, paused or not");
+	// **saved, unlike the two above it.** Pausing and scaling are things
+	// somebody does for a minute and stops doing; a tick rate is a property of
+	// the project, and coming back to a world running at a rate other than the
+	// one it was left at is the surprise rather than the setting. It takes
+	// effect from the frame after it is typed - a rate that could be
+	// configured and not turned would be the worst of both.
+	world.cvars.saved(
+		crate::app::RATE,
+		Value::Int(i64::from(colby_core::time::Rate::DEFAULT.hz())),
+		"how many simulation steps there are in a second",
+	);
 	world.cvars.var(
 		crate::mode::EDIT,
 		Value::Bool(false),
@@ -1014,6 +1025,18 @@ mod tests {
 		world
 	}
 
+	/// A table with everything the host registers, as a running engine has it.
+	///
+	/// The whole of `install` rather than the piece under test, because what
+	/// several of these ask is whether a variable is registered *at all* - and
+	/// a fixture that registered it itself would answer that for the fixture.
+	fn engine() -> World {
+		let mut world = World::new();
+		install(&mut world);
+
+		world
+	}
+
 	#[test]
 	fn a_table_nobody_has_touched_reads_as_full_volume() {
 		assert_eq!(volumes(&table().cvars), Mix::FULL, "silence is not a sensible default");
@@ -1052,7 +1075,7 @@ mod tests {
 	fn the_volumes_are_written_into_the_config_and_the_debug_variables_are_not() {
 		// somebody who turned the sound down meant it. Somebody who turned the
 		// collision outlines on did not mean to find them on tomorrow.
-		let world = table();
+		let world = engine();
 		let archived: Vec<&str> = world
 			.cvars
 			.iter()
@@ -1065,9 +1088,60 @@ mod tests {
 			colby_audio::EFFECTS,
 			colby_audio::MUSIC,
 			colby_audio::INTERFACE,
+			// and the tick rate, which is the same kind of thing: a property
+			// of the project rather than a knob somebody turned for a minute.
+			crate::app::RATE,
 		] {
 			assert!(archived.contains(&name), "{name} should survive a restart");
 		}
+
+		for name in [crate::app::PAUSE, crate::app::SPEED] {
+			assert!(
+				!archived.contains(&name),
+				"{name} is a thing somebody does for a minute, not a setting"
+			);
+		}
+	}
+
+	#[test]
+	fn the_rate_a_console_asks_for_is_the_rate_the_clock_is_given() {
+		let cases = [
+			("60", 60),
+			("120", 120),
+			("30", 30),
+			// both ends of the range, and both of the ways past it. A console
+			// takes what it is typed, so every number a person can type has to
+			// come out as a rate somebody could have meant.
+			("1", 1),
+			("1000", 1000),
+			("0", 1),
+			("-9", 1),
+			("99999", 1000),
+			("9223372036854775807", 1000),
+		];
+
+		for (typed, expected) in cases {
+			let mut world = engine();
+			console::run(&mut world, &format!("{} {typed}", crate::app::RATE));
+
+			assert_eq!(
+				crate::app::rate(&world.cvars).hz(),
+				expected,
+				"typing {typed} should run at {expected} a second"
+			);
+		}
+	}
+
+	#[test]
+	fn a_rate_that_is_not_a_number_leaves_the_one_that_was_there() {
+		// the variable is an integer, so the table refuses the word rather
+		// than taking it, and what a refusal has to leave behind is the rate
+		// the world was already running at.
+		let mut world = engine();
+		console::run(&mut world, &format!("{} 120", crate::app::RATE));
+		console::run(&mut world, &format!("{} soon", crate::app::RATE));
+
+		assert_eq!(crate::app::rate(&world.cvars).hz(), 120, "the word changed nothing");
 	}
 
 	#[test]

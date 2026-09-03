@@ -13,11 +13,11 @@ use std::{
 use colby_audio::Device;
 use colby_core::{
 	Error, Result,
-	abi::{Input, Mix, World},
+	abi::{Input, Mix, World, cvar::Cvars},
 	debug, err, error,
 	glam::{Vec2, Vec3},
 	info,
-	time::{Clock, Pace, STEP},
+	time::{Clock, Pace, Rate},
 	warn,
 };
 #[cfg(feature = "editor")]
@@ -53,11 +53,75 @@ pub(crate) const PAUSE: &str = "sim.pause";
 /// The variable that scales simulated time against real time.
 pub(crate) const SPEED: &str = "sim.speed";
 
+/// The variable that says how many simulation steps there are in a second.
+pub(crate) const RATE: &str = "sim.rate";
+
 /// The variable that says how hard everything falls.
 pub(crate) const GRAVITY: &str = "phys.gravity";
 
 /// How hard everything falls unless somebody says otherwise.
 pub(crate) const PULL: f32 = 9.81;
+
+/// What the console says the simulation rate is.
+///
+/// **Clamped on the way out rather than refused on the way in.** A config file
+/// holding a rate this build will not run at should start the engine at the
+/// nearest rate it will, rather than stop it: the variable is an integer and a
+/// console takes what it is typed, so every number a person can type has to
+/// mean something. @ref [`Rate::from_hz`], which is where the clamp lives, so
+/// there is one of it rather than two.
+///
+/// @param cvars - the table [`RATE`] was registered into
+/// @return the rate to run at; [`Rate::DEFAULT`] when nothing was said
+pub(crate) fn rate(cvars: &Cvars) -> Rate {
+	let default = i64::from(Rate::DEFAULT.hz());
+	let asked = cvars
+		.int(RATE)
+		.unwrap_or(default)
+		.clamp(i64::from(Rate::MIN_HZ), i64::from(Rate::MAX_HZ));
+
+	Rate::from_hz(u16::try_from(asked).unwrap_or(Rate::DEFAULT.hz()))
+}
+
+/// Hands the clock whatever the console asked for on top of real time.
+///
+/// Taken rather than read: an owed step is owed once. Clamped because the field
+/// is a public one, and a game that writes four billion into it should cost a
+/// wrong number of steps rather than a loop that never comes back.
+///
+/// **In steps of whatever a step currently is**, which is the whole reason
+/// this is a function anybody can call: `sim.step 8` has to be eight steps at
+/// any rate, and a clock told to owe eight sixtieths of a second would run
+/// sixteen of them at a hundred and twenty.
+///
+/// @param world - the world carrying `owed_steps`
+/// @param clock - the clock to owe them to
+fn pay(world: &mut World, clock: &mut Clock) {
+	let owed = std::mem::take(&mut world.owed_steps)
+		.min(u32::try_from(crate::console::MAX_STEP).unwrap_or(u32::MAX));
+
+	if owed > 0 {
+		clock.owe(clock.rate().step() * owed);
+	}
+}
+
+/// The rate an endpoint actually runs at.
+///
+/// **The rate is the authority's, and a client is not one.** A client replays
+/// its own unacknowledged moves at its own `World::dt` and the host applied
+/// them at the host's, so two ends on different rates integrate the same
+/// commands differently and the difference reads as a player being corrected
+/// forever. Nothing on the wire says what rate the far end is running, so the
+/// only answer that costs nothing is for every client to run the one rate
+/// every host runs - which is what a host running anything else is then
+/// choosing, knowingly.
+///
+/// @param cvars - the table [`RATE`] was registered into
+/// @param client - whether this end takes its world from somebody else
+/// @return the rate to put on the clock
+pub(crate) fn paced(cvars: &Cvars, client: bool) -> Rate {
+	if client { Rate::DEFAULT } else { rate(cvars) }
+}
 
 /// Every piece of state in the process.
 pub(crate) struct App {
@@ -240,6 +304,19 @@ impl App {
 		// the config is read last of the three, because a line in it may name a
 		// variable the game registered a moment ago.
 		self.console = Some(Console::open(&mut self.world));
+
+		// after the config, because that is where a rate somebody asked for
+		// arrives, and before the first step, because that is the last moment
+		// saying anything about it is useful. @ref `set_pace` for why a client
+		// does not get its own rate.
+		if self.net.is_some() && rate(&self.world.cvars) != Rate::DEFAULT {
+			warn!(
+				asked = rate(&self.world.cvars).hz(),
+				running = Rate::DEFAULT.hz(),
+				"a window that connected runs at the host's rate, not its own"
+			);
+		}
+
 		self.start_watching()?;
 
 		// everything above took as long as it took: a window, an adapter, a
@@ -398,8 +475,9 @@ impl App {
 	/// moment.
 	///
 	/// @param moment - where the wire's clock stood for the step just run
+	/// @param rate - how long that step was
 	/// @return where it stands for the next one
-	fn stepped(&mut self, moment: Duration) -> Duration {
+	fn stepped(&mut self, moment: Duration, rate: Rate) -> Duration {
 		if let Some(net) = self.net.as_mut() {
 			// what this end has asked for and not been answered about, which
 			// is the whole window rather than the newest one: every message
@@ -410,7 +488,7 @@ impl App {
 			net.send(self.started.elapsed(), None);
 		}
 
-		moment.saturating_add(STEP)
+		moment.saturating_add(rate.step())
 	}
 
 	fn frame(&mut self) -> Result {
@@ -473,15 +551,7 @@ impl App {
 		self.mode
 			.follow(&mut self.world, &mut self.simulation, editing);
 
-		// whatever the console asked for on top of real time. Taken rather than
-		// read: an owed step is owed once. Clamped because the field is a public
-		// one, and a game that writes four billion into it should cost a wrong
-		// number of steps rather than a loop that never comes back.
-		let owed = std::mem::take(&mut self.world.owed_steps)
-			.min(u32::try_from(crate::console::MAX_STEP).unwrap_or(u32::MAX));
-		if owed > 0 {
-			self.clock.owe(STEP * owed);
-		}
+		pay(&mut self.world, &mut self.clock);
 
 		let asked = self.world.cvars.float(GRAVITY).unwrap_or(-PULL);
 		if (asked - self.gravity).abs() > f32::EPSILON {
@@ -518,6 +588,11 @@ impl App {
 		}
 
 		let mut moment = self.moment();
+		// read once for the whole pass rather than per step: a rate that moved
+		// between two steps of the same frame would make the second one a
+		// different length from the first, which is the one thing a fixed step
+		// is for not being.
+		let rate = self.clock.rate();
 
 		while let Some(time) = self.clock.step() {
 			step::run(
@@ -533,11 +608,12 @@ impl App {
 					wire: Self::wired(self.net.as_mut(), moment),
 				},
 				&mut self.input,
+				rate,
 				time,
 				editing,
 			);
 
-			moment = self.stepped(moment);
+			moment = self.stepped(moment, rate);
 		}
 
 		self.frames = self.frames.saturating_add(1);
@@ -589,6 +665,11 @@ impl App {
 		let paused = self.world.cvars.bool(PAUSE).unwrap_or(false);
 		let speed = self.world.cvars.float(SPEED).unwrap_or(1.0);
 
+		// a window can never be the authority - it has no way to host - so a
+		// window with a socket is a client and takes the host's rate. @ref
+		// `paced`.
+		self.clock
+			.set_rate(paced(&self.world.cvars, self.net.is_some()));
 		self.clock
 			.set_speed(if paused { 0.0 } else { speed });
 	}
@@ -780,6 +861,74 @@ impl ApplicationHandler for App {
 mod tests {
 	use super::*;
 
+	/// How many steps a clock has ready.
+	fn drain(clock: &mut Clock) -> u32 {
+		let mut ran = 0;
+		while clock.step().is_some() {
+			ran += 1;
+		}
+
+		ran
+	}
+
+	#[test]
+	fn a_step_the_console_asked_for_is_a_step_at_whatever_the_rate_is() {
+		for hz in [30_u16, 60, 120, 240] {
+			let mut world = World::new();
+			let mut clock = Clock::new();
+			clock.set_rate(Rate::from_hz(hz));
+			world.owed_steps = 8;
+
+			pay(&mut world, &mut clock);
+
+			assert_eq!(
+				drain(&mut clock),
+				8,
+				"eight steps at {hz} a second, not eight of somebody else's"
+			);
+			assert_eq!(world.owed_steps, 0, "and asked for once");
+		}
+	}
+
+	#[test]
+	fn a_console_cannot_ask_for_more_steps_than_the_ceiling() {
+		let mut world = World::new();
+		let mut clock = Clock::new();
+		world.owed_steps = u32::MAX;
+
+		pay(&mut world, &mut clock);
+
+		assert_eq!(
+			u64::from(drain(&mut clock)),
+			u64::try_from(crate::console::MAX_STEP)
+				.expect("the ceiling is a small positive number"),
+			"four billion steps is a loop that does not come back"
+		);
+	}
+
+	#[test]
+	fn an_end_that_takes_its_world_from_somebody_runs_the_rate_every_host_runs() {
+		// the rate is the authority's. A client that ran its own would replay
+		// its unacknowledged moves over a different step from the one the host
+		// applied them over, and that is a correction on every snapshot rather
+		// than an error anybody could see in a log.
+		let mut world = World::new();
+		crate::console::install(&mut world);
+		crate::console::run(&mut world, &format!("{RATE} 240"));
+
+		assert_eq!(rate(&world.cvars).hz(), 240, "the console was heard");
+		assert_eq!(
+			paced(&world.cvars, false).hz(),
+			240,
+			"an end that owns its world runs what it was told"
+		);
+		assert_eq!(
+			paced(&world.cvars, true).hz(),
+			Rate::DEFAULT.hz(),
+			"and one that does not, does not"
+		);
+	}
+
 	#[test]
 	fn the_wires_clock_moves_by_exactly_one_step_a_step() {
 		// what the renderer's own blend between two steps assumes, and the
@@ -789,10 +938,28 @@ mod tests {
 		// asked to cover both.
 		let mut app = App::new();
 		let began = Duration::from_secs(7);
-		let after = app.stepped(began);
+		let step = Rate::DEFAULT.step();
+		let after = app.stepped(began, Rate::DEFAULT);
 
-		assert_eq!(after, began + STEP, "one step on, whatever the clock says");
-		assert_eq!(app.stepped(after), began + STEP * 2, "and again");
+		assert_eq!(after, began + step, "one step on, whatever the clock says");
+		assert_eq!(app.stepped(after, Rate::DEFAULT), began + step * 2, "and again");
+	}
+
+	#[test]
+	fn the_wires_clock_moves_by_the_step_it_was_told_about() {
+		// and not by the one this file was compiled with. Two peers on the
+		// same wire place a world against a moment each, and a moment that
+		// advanced by a constant while the world advanced by something else
+		// would be a delay nobody could measure.
+		let mut app = App::new();
+		let fast = Rate::from_hz(240);
+		let began = Duration::from_secs(1);
+
+		assert_eq!(
+			app.stepped(began, fast),
+			began + fast.step(),
+			"a quarter of the usual step moves the wire a quarter as far"
+		);
 	}
 
 	#[test]
