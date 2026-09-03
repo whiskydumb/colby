@@ -40,7 +40,7 @@ use wgpu::{
 	DepthBiasState, DepthStencilState, Device, ErrorFilter, Extent3d, Face, FilterMode,
 	FragmentState, FrontFace, IndexFormat, LoadOp, MipmapFilterMode, MultisampleState,
 	Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode,
-	PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment,
+	PrimitiveState, PrimitiveTopology, Queue, RenderPass, RenderPassColorAttachment,
 	RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
 	RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
 	ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, StoreOp,
@@ -145,6 +145,19 @@ struct GpuMesh {
 	skin: Option<Buffer>,
 	index_count: u32,
 	revision: u32,
+
+	/// The middle of the mesh's bounds, in the shape it was modeled in.
+	///
+	/// Kept here rather than asked for per frame because
+	/// [`MeshData::bounds`](colby_core::abi::MeshData::bounds) walks every
+	/// vertex, and what wants it - sorting the blended half of a frame - would
+	/// ask once per entity per frame. It is worked out once per upload
+	/// instead, which is once per asset reload.
+	///
+	/// The middle rather than the origin, which is what the two engines that
+	/// publish their sort key both use: a floor slab modeled from a corner
+	/// would otherwise sort as though it were at that corner.
+	center: Vec3,
 }
 
 /// One texture, uploaded, with its whole mip chain.
@@ -174,6 +187,68 @@ struct GpuMaterial {
 	material_revision: u32,
 	albedo: Bound,
 	normal: Bound,
+}
+
+/// How finely a blended surface's distance is measured before it is sorted.
+///
+/// A thousandth of a world unit, which is [`Fyrox`]-shaped: fine enough that
+/// two panes a hand apart never tie, coarse enough that a row of identical
+/// props at one distance does tie and stays one batch. The sort is by distance
+/// first and by mesh and material second, so a tie is the only thing that can
+/// give the blended half any instancing at all.
+///
+/// [`Fyrox`]: https://fyrox.rs
+const DEPTH_GRAIN: f32 = 1000.0;
+
+/// One entity, in the order it is going to be written into the frame.
+///
+/// Sorted by everything in it, in this order, which is what makes one pass over
+/// the sorted list produce both halves of the frame with every batch
+/// contiguous. @ref [`Scene::group`].
+#[derive(Clone, Copy)]
+struct Sorted {
+	/// Nought for the solid half and one for the blended one, so everything
+	/// solid is written first and nothing has to be walked twice.
+	///
+	/// @note: what this really buys is that each list's placements are one run
+	/// of the instance buffer, because a batch is a `first` and a `count` into
+	/// it. Nothing else guarantees that - and **no test reaches the case**,
+	/// because in every world anybody has built the blended half is in front of
+	/// the camera and so has a negative key, which puts it before the solid
+	/// half's nought anyway. It bites for a blended surface at or behind the
+	/// eye, where the two would interleave and a batch would draw its
+	/// neighbor's instances.
+	pass: u8,
+
+	/// Minus the view depth in thousandths, so that ascending is far to near.
+	///
+	/// Always nought in the solid half, which is not sorted by distance at all:
+	/// the depth buffer settles that, and sorting it would cost the batching
+	/// for nothing.
+	depth: i32,
+
+	mesh: u32,
+	material: u32,
+
+	/// Its slot decides nothing but the order of two entities a frame could not
+	/// otherwise tell apart, which is what keeps a frame the same picture
+	/// twice - an unstable sort may put equal keys either way round.
+	entity: EntityId,
+
+	/// Worked out once here and used for both the pass and the batch, so the
+	/// list an entity is in and the pipeline its batch is drawn with can never
+	/// be two different answers.
+	blend: Blend,
+}
+
+impl Sorted {
+	/// What the list is ordered on, in order of priority.
+	///
+	/// The mode is not in it and does not have to be: `pass` is a function of
+	/// it and comes first, so the two halves are already apart.
+	const fn key(&self) -> (u8, i32, u32, u32, usize) {
+		(self.pass, self.depth, self.mesh, self.material, self.entity.slot())
+	}
 }
 
 /// A run of instances that share both a mesh and a material.
@@ -231,6 +306,8 @@ impl Pipelines {
 				compile_pipeline(device, format, layouts, source, Blend::Opaque, true)?,
 				compile_pipeline(device, format, layouts, source, Blend::Mask, false)?,
 				compile_pipeline(device, format, layouts, source, Blend::Mask, true)?,
+				compile_pipeline(device, format, layouts, source, Blend::Alpha, false)?,
+				compile_pipeline(device, format, layouts, source, Blend::Alpha, true)?,
 			],
 		})
 	}
@@ -278,12 +355,18 @@ pub struct Scene {
 	instances: Buffer,
 	/// Scratch the instance buffer is built in, kept so it allocates once.
 	placements: Vec<Placement>,
-	/// Which run of `placements` belongs to which mesh and material.
+	/// Which run of `placements` belongs to which mesh and material, for
+	/// everything that writes depth.
 	batches: Vec<Batch>,
-	/// `(mesh slot, material slot, entity)`, sorted to find the runs. Sorting
-	/// sixteen-byte keys and looking the entities up again beats sorting the
-	/// hundred-and-twelve-byte placements.
-	order: Vec<(u32, u32, EntityId)>,
+	/// The same for what does not, drawn after it and in its own order.
+	///
+	/// A second list rather than a flag on the first, because the two are
+	/// sorted on different keys and only one of them casts - so a single list
+	/// would have to be split again at both of the places that walk it.
+	blended: Vec<Batch>,
+	/// Every drawn entity, sorted. Sorting twenty-byte keys and looking the
+	/// entities up again beats sorting the hundred-and-twelve-byte placements.
+	order: Vec<Sorted>,
 }
 
 impl Scene {
@@ -385,6 +468,7 @@ impl Scene {
 			instances,
 			placements: Vec::with_capacity(MAX_ENTITIES),
 			batches: Vec::new(),
+			blended: Vec::new(),
 			order: Vec::with_capacity(MAX_ENTITIES),
 		})
 	}
@@ -472,12 +556,40 @@ impl Scene {
 		pass.set_bind_group(3, self.joints.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
 
+		self.draw(&mut pass, &self.batches);
+
+		// then, into the same pass and therefore against the same depth buffer:
+		// whether a debug line is hidden by a wall is the most useful thing it
+		// has to say, and an overlay is handed the color target alone.
+		self.lines.draw(&mut pass, &self.bindings);
+
+		// and last of all, over a finished picture. Anything blended composites
+		// with what is already in the target, so everything that could be
+		// behind it has to be there first - the debug lines included, which is
+		// what makes a line seen through glass read as being behind it.
+		self.draw(&mut pass, &self.blended);
+
+		drop(pass);
+		self.queue.submit([encoder.finish()]);
+	}
+
+	/// Records one list of batches into a pass that is already set up.
+	///
+	/// Both halves of a frame go through this: what differs between them is the
+	/// order they were sorted in and the pipelines their materials name, and
+	/// neither of those is visible from here.
+	///
+	/// @param pass - the pass to record into, with groups nought, two and three
+	/// already bound
+	/// @param batches - the runs to draw, in order
+	fn draw(&self, pass: &mut RenderPass<'_>, batches: &[Batch]) {
 		// swapped when a batch wants another one rather than once per batch.
-		// The order is by mesh and material, so a world of crates with one
-		// character in it changes pipeline twice however many crates there are.
+		// The solid half is ordered by mesh and material, so a world of crates
+		// with one character in it changes pipeline twice however many crates
+		// there are.
 		let mut bound = None;
 
-		for batch in &self.batches {
+		for batch in batches {
 			let (Some(mesh), Some(material)) =
 				(self.meshes.get(batch.mesh), self.materials.get(batch.material))
 			else {
@@ -499,28 +611,27 @@ impl Scene {
 			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
 			pass.draw_indexed(0..mesh.index_count, 0, batch.first..batch.first + batch.count);
 		}
-
-		// last, into the same pass and therefore against the same depth buffer:
-		// whether a debug line is hidden by a wall is the most useful thing it
-		// has to say, and an overlay is handed the color target alone.
-		self.lines.draw(&mut pass, &self.bindings);
-
-		drop(pass);
-		self.queue.submit([encoder.finish()]);
 	}
 
 	/// Which one draws a batch into a cascade.
 	///
-	/// A match rather than a lookup, so that a mode which should not cast at
-	/// all - and blending is exactly that - is a compile error here on the day
-	/// it is added rather than a fence-shaped hole in the light.
-	fn casting(&self, blend: Blend, skinned: bool) -> &RenderPipeline {
+	/// A match rather than a lookup, so that a mode nobody has thought about
+	/// yet is a compile error here on the day it is added rather than a
+	/// fence-shaped hole in the light.
+	///
+	/// @return the pipeline, or nothing for a surface that does not cast
+	fn casting(&self, blend: Blend, skinned: bool) -> Option<&RenderPipeline> {
 		let masked = match blend {
 			| Blend::Opaque => false,
 			| Blend::Mask => true,
+			// this is the second of two places that say a blended surface casts
+			// nothing - the first being which list `group` filed it in, which
+			// is why this pass never actually meets one. It is kept because it
+			// is the line a reader comes here looking for.
+			| Blend::Alpha => return None,
 		};
 
-		self.shadows.casting(masked, skinned)
+		Some(self.shadows.casting(masked, skinned))
 	}
 
 	/// Records one cascade's depth pass.
@@ -528,11 +639,10 @@ impl Scene {
 	/// The same batches the scene draws, through a pipeline with no fragment
 	/// stage and no color target, so the whole pass is geometry against depth.
 	///
-	/// The material is not bound at all, which used to be free and is now a
-	/// known gap: a [`Blend::Mask`] surface casts the shadow of the shape it
-	/// was cut out of rather than the shape that is left, because nothing here
-	/// samples the picture the holes are in. Closing it is a third depth-only
-	/// pipeline with a fragment stage that discards.
+	/// Walks the solid half of the frame only. A blended surface writes no
+	/// depth and so has nothing to say about what a light can reach, which is
+	/// what every engine checked does with one; here it is not a rule anywhere
+	/// but a consequence of which list [`group`](Self::group) filed it in.
 	///
 	/// @param encoder - what to record into
 	/// @param slice - which cascade, nearest first
@@ -574,9 +684,13 @@ impl Scene {
 				continue;
 			};
 
+			let Some(pipeline) = self.casting(batch.blend, batch.skinned) else {
+				continue;
+			};
+
 			let wanted = (batch.blend, batch.skinned);
 			if bound != Some(wanted) {
-				pass.set_pipeline(self.casting(batch.blend, batch.skinned));
+				pass.set_pipeline(pipeline);
 				bound = Some(wanted);
 			}
 
@@ -851,6 +965,8 @@ impl Scene {
 	/// of the handful of pairs a scene actually uses.
 	fn group(&mut self, world: &World) {
 		let (meshes, materials) = (world.meshes.len(), world.materials.len());
+		let camera = world.render_camera();
+		let forward = (camera.target - camera.position).normalize_or(Vec3::NEG_Z);
 
 		self.order.clear();
 		for (id, _, renderable) in world.entities.iter() {
@@ -867,14 +983,34 @@ impl Scene {
 				continue;
 			};
 
-			self.order.push((mesh, material, id));
+			let blend = world
+				.materials
+				.get(renderable.material)
+				.map_or(Material::DEFAULT.blend, |surface| surface.blend);
+			let blended = blend == Blend::Alpha;
+
+			self.order.push(Sorted {
+				pass: u8::from(blended),
+				// worked out only for the half that is sorted on it. The solid
+				// half would pay a matrix multiply per entity per frame for a
+				// number nothing then reads.
+				depth: if blended {
+					-grain(self.view_depth(world, id, mesh, camera.position, forward))
+				} else {
+					0
+				},
+				mesh,
+				material,
+				entity: id,
+				blend,
+			});
 		}
 
-		self.order
-			.sort_unstable_by_key(|(mesh, material, _)| (*mesh, *material));
+		self.order.sort_unstable_by_key(Sorted::key);
 
 		self.placements.clear();
 		self.batches.clear();
+		self.blended.clear();
 		self.joints.begin(world);
 
 		for index in 0..self.order.len() {
@@ -882,10 +1018,45 @@ impl Scene {
 		}
 	}
 
+	/// How far along the view a mesh's middle stands.
+	///
+	/// The same quantity the cascades are cut on and the shader picks a slice
+	/// with - a projection onto the direction the camera looks, rather than the
+	/// distance to it. Two panes side by side are then at one depth, which is
+	/// what somebody looking at them would say.
+	///
+	/// @param world - the transforms to draw with
+	/// @param id - the entity being measured
+	/// @param mesh - its uploaded geometry's slot
+	/// @param eye - where the camera is this frame
+	/// @param forward - the direction it looks, of unit length
+	/// @return how far in front of the eye the mesh's middle is
+	fn view_depth(
+		&self,
+		world: &World,
+		id: EntityId,
+		mesh: u32,
+		eye: Vec3,
+		forward: Vec3,
+	) -> f32 {
+		let Some(transform) = world.render_transform(id) else {
+			return 0.0;
+		};
+
+		let center = usize::try_from(mesh)
+			.ok()
+			.and_then(|slot| self.meshes.get(slot))
+			.map_or(Vec3::ZERO, |uploaded| uploaded.center);
+
+		(transform.matrix().transform_point3(center) - eye).dot(forward)
+	}
+
 	/// Writes one entity of the sorted order into the instance buffer, opening
 	/// a new batch when its pair differs from the one before it.
 	fn place(&mut self, world: &World, index: usize) {
-		let Some((mesh, material, id)) = self.order.get(index).copied() else {
+		let Some(Sorted { mesh, material, entity: id, blend, .. }) =
+			self.order.get(index).copied()
+		else {
 			return;
 		};
 
@@ -910,8 +1081,11 @@ impl Scene {
 
 		self.placements.push(Placement {
 			model: transform.matrix().to_cols_array_2d(),
+			// the fourth channel is the material's opacity, which only the
+			// blended pipeline's fragment stage reads. @ref
+			// [`Material::opacity`].
 			tint: (renderable.color * surface.base_color)
-				.extend(1.0)
+				.extend(surface.opacity)
 				.to_array(),
 			surface: [
 				surface.metallic,
@@ -938,19 +1112,25 @@ impl Scene {
 			.get(mesh)
 			.is_some_and(|uploaded| uploaded.skin.is_some());
 
-		match self.batches.last_mut() {
+		// the list the sort already put this entity in. Reading the mode again
+		// here rather than taking the one `group` decided on would be two
+		// answers to one question, and the day they differed a batch would be
+		// drawn in a pass its neighbors are not in.
+		let batches = if blend == Blend::Alpha {
+			&mut self.blended
+		} else {
+			&mut self.batches
+		};
+
+		match batches.last_mut() {
 			| Some(batch) if batch.mesh == mesh && batch.material == material => batch.count += 1,
-			| _ => self.batches.push(Batch {
+			| _ => batches.push(Batch {
 				mesh,
 				material,
 				first: at,
 				count: 1,
 				skinned,
-				// taken from the same value the numbers above came from rather
-				// than looked up again, so that however a handle resolved, the
-				// mode a batch is drawn under is the mode of the material its
-				// instances were written from.
-				blend: surface.blend,
+				blend,
 			}),
 		}
 	}
@@ -1077,6 +1257,11 @@ fn upload_mesh(device: &Device, queue: &Queue, data: &MeshData, revision: u32) -
 		}),
 		index_count: u32::try_from(data.indices.len()).unwrap_or(0),
 		revision,
+		center: {
+			let (low, high) = data.bounds();
+
+			(low + high) * 0.5
+		},
 	}
 }
 
@@ -1228,6 +1413,26 @@ fn clear_color(world: &World) -> Color {
 	}
 }
 
+/// A distance as a whole number of thousandths, for a sort key.
+///
+/// Saturating rather than wrapping: something two thousand units away is
+/// further than anything a sort has to tell apart, and a wrap would put it in
+/// front of everything.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	reason = "held inside the range of the target on the line above the cast, which is the \
+	          check 	          the cast itself would not make"
+)]
+fn grain(depth: f32) -> i32 {
+	let scaled = depth * DEPTH_GRAIN;
+	if scaled.is_nan() {
+		return 0;
+	}
+
+	scaled.clamp(f32::from(i16::MIN) * DEPTH_GRAIN, f32::from(i16::MAX) * DEPTH_GRAIN) as i32
+}
+
 /// Builds one render pipeline and reports whether wgpu accepted it.
 ///
 /// wgpu's default answer to a bad shader is to log the error and hand back a
@@ -1273,6 +1478,8 @@ const fn label_of(blend: Blend, skinned: bool) -> &'static str {
 		| (Blend::Opaque, true) => "scene skinned",
 		| (Blend::Mask, false) => "scene masked",
 		| (Blend::Mask, true) => "scene masked skinned",
+		| (Blend::Alpha, false) => "scene blended",
+		| (Blend::Alpha, true) => "scene blended skinned",
 	}
 }
 
@@ -1354,7 +1561,11 @@ fn build_pipeline(
 		},
 		depth_stencil: Some(DepthStencilState {
 			format: DEPTH_FORMAT,
-			depth_write_enabled: Some(true),
+			// a blended surface reads the depth buffer and does not write it,
+			// which is the whole of what "sorted back to front" is for: two
+			// panes one behind the other both have to survive, and a written
+			// depth would let whichever was drawn first hold the other out.
+			depth_write_enabled: Some(blend != Blend::Alpha),
 			depth_compare: Some(CompareFunction::Less),
 			stencil: StencilState::default(),
 			bias: DepthBiasState::default(),
@@ -1365,11 +1576,20 @@ fn build_pipeline(
 			entry_point: Some(match blend {
 				| Blend::Opaque => "fragment_main",
 				| Blend::Mask => "fragment_masked",
+				| Blend::Alpha => "fragment_blended",
 			}),
 			compilation_options: PipelineCompilationOptions::default(),
 			targets: &[Some(ColorTargetState {
 				format,
-				blend: Some(BlendState::REPLACE),
+				// straight rather than premultiplied alpha, which is what the
+				// interface already blends with and what a person authoring a
+				// picture in any editor produces. The target is an sRGB format,
+				// so the hardware does the blend in linear light.
+				blend: Some(if blend == Blend::Alpha {
+					BlendState::ALPHA_BLENDING
+				} else {
+					BlendState::REPLACE
+				}),
 				write_mask: ColorWrites::ALL,
 			})],
 		}),
@@ -1522,6 +1742,33 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_distance_is_measured_in_thousandths_and_never_wraps() {
+		assert_eq!(grain(1.0), 1000, "one unit is a thousand of them");
+		assert_eq!(grain(-1.0), -1000, "and it keeps its sign");
+		assert_eq!(
+			grain(4.0),
+			grain(4.0004),
+			"two surfaces less than a thousandth apart tie, which is what keeps a row of 			 \
+			 identical props one batch"
+		);
+		assert_ne!(grain(4.0), grain(4.002), "and two further apart than that do not");
+
+		// the half that matters: a wrap would put the furthest thing in the
+		// world in front of everything, which is the one answer worse than
+		// being unsorted. Past the range it saturates, so two absurd distances
+		// stop being told apart - which is the trade, and it happens tens of
+		// thousands of units out.
+		assert!(grain(f32::MAX) > 0, "something absurdly far is still in front, not behind");
+		assert!(grain(-f32::MAX) < 0, "and something absurdly behind is still behind");
+		assert_eq!(
+			grain(f32::MAX),
+			grain(f32::MAX / 2.0),
+			"two of them past the range are one number rather than a wrapped one"
+		);
+		assert_eq!(grain(f32::NAN), 0, "and a number that is not one sorts as no distance");
+	}
 
 	#[test]
 	fn the_buffers_are_sized_for_what_goes_in_them() {

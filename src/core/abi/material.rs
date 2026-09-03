@@ -55,10 +55,11 @@ impl Wrap {
 /// rather than different arithmetic. A *mask* either throws a texel away or
 /// keeps it whole, so the geometry goes on writing depth, goes on casting, and
 /// is never sorted against anything - which is what a fence, a grate and a leaf
-/// want. Blending wants all three of those the other way round, and is not
-/// here yet.
+/// want. Blending wants all three of those the other way round: it writes no
+/// depth, casts nothing, and has to be drawn after everything solid and in the
+/// right order, or it composites over a picture that is not finished yet.
 ///
-/// A mode rather than a flag, because a flag cannot say which of the two is
+/// A mode rather than a flag, because a flag cannot say which of the three is
 /// meant, and every renderer that has this at all has between five and seven
 /// values of it.
 #[repr(u32)]
@@ -76,6 +77,16 @@ pub enum Blend {
 	/// turn is worse than no knob. It is the same half that alpha to coverage
 	/// falls back to where the hardware has none.
 	Mask = 1,
+
+	/// The alpha says how much of what is behind the surface still shows
+	/// through, which is glass, water and a beam of light.
+	///
+	/// Three things follow and none of them is optional: the depth buffer is
+	/// read and not written, so what is drawn later is not held out by it; the
+	/// surface is drawn in a second pass after everything solid, sorted far to
+	/// near; and it casts no shadow at all, which is what every engine checked
+	/// does with a surface that writes no depth.
+	Alpha = 2,
 }
 
 impl Blend {
@@ -83,7 +94,7 @@ impl Blend {
 	///
 	/// @note: a mode added above has to be counted here as well - nothing in
 	/// the language can do it, and the test below is what notices.
-	pub const COUNT: usize = 2;
+	pub const COUNT: usize = 3;
 
 	/// The row of the renderer's pipeline table this mode is built into.
 	///
@@ -94,6 +105,7 @@ impl Blend {
 		match self {
 			| Self::Opaque => 0,
 			| Self::Mask => 1,
+			| Self::Alpha => 2,
 		}
 	}
 }
@@ -165,6 +177,18 @@ pub struct Material {
 	/// about it. It is also what the renderer already batches by, so a mode
 	/// here costs it no second lookup.
 	pub blend: Blend,
+
+	/// How much of this surface there is, from nothing to all of it.
+	///
+	/// Multiplied by the albedo texture's own alpha, so a pane of frosted glass
+	/// is a picture with an alpha channel and a material at one, and a whole
+	/// wall fading out is a picture with none and a material that moves.
+	///
+	/// **Read only where [`blend`](Self::blend) is [`Blend::Alpha`]**, and
+	/// deliberately: a surface that is solid is solid whatever somebody typed
+	/// here, which is what every renderer with an alpha mode does with the
+	/// number in its other modes.
+	pub opacity: f32,
 }
 
 impl Material {
@@ -178,6 +202,7 @@ impl Material {
 		uv_scale: Vec2::ONE,
 		wrap: Wrap::Repeat,
 		blend: Blend::Opaque,
+		opacity: 1.0,
 	};
 
 	/// A material in a color, with nothing else set.
@@ -231,6 +256,14 @@ impl Material {
 	/// on, read the other way round.
 	#[must_use]
 	pub const fn masked(self) -> Self { Self { blend: Blend::Mask, ..self } }
+
+	/// The same material, with what is behind it showing through.
+	///
+	/// @param opacity - how much of the surface there is, one being all of it
+	#[must_use]
+	pub const fn translucent(self, opacity: f32) -> Self {
+		Self { blend: Blend::Alpha, opacity, ..self }
+	}
 }
 
 impl Default for Material {
@@ -372,6 +405,33 @@ mod tests {
 	}
 
 	#[test]
+	fn a_material_nobody_configured_is_all_there() {
+		assert!(
+			(Material::DEFAULT.opacity - 1.0).abs() < f32::EPSILON,
+			"a surface is whole until something fades it, got {}",
+			Material::DEFAULT.opacity
+		);
+	}
+
+	#[test]
+	fn fading_a_material_sets_the_mode_that_reads_the_number() {
+		let plain = Material::colored(Vec3::X).finished(0.25, 0.3);
+		let faded = plain.translucent(0.4);
+
+		assert_eq!(faded.blend, Blend::Alpha, "an opacity nothing reads would be a lie");
+		assert!((faded.opacity - 0.4).abs() < f32::EPSILON, "and the number is set");
+		assert_eq!(
+			Material {
+				blend: Blend::Opaque,
+				opacity: 1.0,
+				..faded
+			},
+			plain,
+			"and putting both back gives the material it was made from"
+		);
+	}
+
+	#[test]
 	fn masking_a_material_changes_that_and_nothing_else() {
 		let plain = Material::textured(TextureId::new(4)).finished(0.25, 0.3);
 		let masked = plain.masked();
@@ -388,7 +448,7 @@ mod tests {
 	fn every_mode_has_a_row_of_its_own_and_together_they_fill_the_table() {
 		let mut taken = vec![None; Blend::COUNT];
 
-		for mode in [Blend::Opaque, Blend::Mask] {
+		for mode in [Blend::Opaque, Blend::Mask, Blend::Alpha] {
 			let row = mode.row();
 
 			assert!(row < Blend::COUNT, "{mode:?} names row {row}, which is past the table");

@@ -3,9 +3,11 @@
 // numbers, group 1 supplies the albedo texture, and the globals supply the
 // camera and the light.
 //
-// There are four entry points and not two of each kind by accident: bones and
-// alpha are independent axes, and a pipeline's vertex buffers and its early
-// depth test are both fixed when it is built, so neither can be a branch.
+// There are two vertex entry points and three fragment ones, and that is not a
+// coincidence: bones and alpha are independent axes, and a pipeline's vertex
+// buffers, its early depth test and its blending are all fixed when it is
+// built, so none of the three can be a branch. Six pipelines come out of the
+// six pairs.
 //
 // Shading is metallic-roughness: Cook-Torrance specular with GGX, Smith
 // visibility and Schlick's Fresnel, over a Lambert diffuse. One directional
@@ -135,7 +137,9 @@ fn skinning(skin: SkinInput, at: u32, count: u32) -> mat4x4<f32> {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) normal: vec3<f32>,
-    @location(1) tint: vec3<f32>,
+    // rgb is the material's color times the entity's; a is the material's
+    // opacity, which only the blended entry point reads.
+    @location(1) tint: vec4<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) world_position: vec3<f32>,
     @location(4) surface: vec2<f32>,
@@ -191,7 +195,7 @@ fn place(vertex: VertexInput, instance: InstanceInput, model: mat4x4<f32>) -> Ve
         (model * vec4<f32>(vertex.tangent.xyz, 0.0)).xyz,
         vertex.tangent.w,
     );
-    output.tint = instance.tint.rgb;
+    output.tint = instance.tint;
     output.uv = vertex.uv * instance.surface.zw;
     output.world_position = world_position.xyz;
     output.surface = instance.surface.xy;
@@ -361,7 +365,11 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // the texture is sRGB, so this is already linear by the time it is a float.
     // A material with no image samples the one white texel and multiplies by
     // one, which is why there is no branch here.
-    return shade(input, textureSample(albedo, surface_sampler, input.uv));
+    //
+    // One, not the tint's own alpha: a surface this pipeline draws is solid
+    // whatever the material says, which is what every renderer with an alpha
+    // mode does with the number in its other modes.
+    return vec4<f32>(shade(input, textureSample(albedo, surface_sampler, input.uv)), 1.0);
 }
 
 // The same, for a surface whose picture has holes in it.
@@ -379,12 +387,30 @@ fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    return shade(input, sampled);
+    return vec4<f32>(shade(input, sampled), 1.0);
 }
 
-// Everything both entry points do once the albedo has been sampled.
-fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec4<f32> {
-    let base_color = input.tint * sampled.rgb;
+// And for a surface what is behind still shows through.
+//
+// The alpha is the picture's times the material's, so frosted glass is a
+// picture with an alpha channel at a material of one and a whole pane fading
+// out is a flat picture at a material that moves. The pipeline blends it over
+// what is already there; the depth buffer is read and not written, and the pass
+// this runs in is sorted far to near, both of which are the pipeline's doing
+// rather than anything this file can see.
+@fragment
+fn fragment_blended(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+
+    return vec4<f32>(shade(input, sampled), sampled.a * input.tint.a);
+}
+
+// Everything all three entry points do once the albedo has been sampled.
+//
+// Returns the color alone. What goes in the alpha channel is the one thing the
+// three disagree about, so it is theirs rather than this function's.
+fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
+    let base_color = input.tint.rgb * sampled.rgb;
 
     let metallic = clamp(input.surface.x, 0.0, 1.0);
     // clamped away from zero: a perfect mirror makes the GGX denominator
@@ -435,8 +461,8 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec4<f32> {
     let color = direct + indirect;
 
     if (globals.shadow.w > 0.5) {
-        return vec4<f32>(color * cascade_color(slice), 1.0);
+        return color * cascade_color(slice);
     }
 
-    return vec4<f32>(color, 1.0);
+    return color;
 }

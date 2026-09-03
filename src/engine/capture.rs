@@ -288,7 +288,7 @@ mod tests {
 			Material, MeshData, MeshId, Pose, PoseId, Renderable, SkinVertex, Texel, TextureData,
 			Transform,
 			cvar::Value,
-			material::Blend,
+			material::{Blend, MaterialId},
 			mesh,
 			skeleton::{Bone, SkeletonData},
 		},
@@ -1194,9 +1194,9 @@ f 1 4 5
 		// whatever the entity asked for. Decisive, and it proves the swap
 		// reached the GPU rather than merely being accepted.
 		let source = include_str!("shader.wgsl")
-			.replace("return vec4<f32>(color, 1.0);", "return vec4<f32>(0.0, 0.0, 1.0, 1.0);");
+			.replace("return color;", "return vec3<f32>(0.0, 0.0, 1.0);");
 		assert!(
-			source.contains("0.0, 0.0, 1.0, 1.0"),
+			source.contains("0.0, 0.0, 1.0"),
 			"the line this test edits is still in the shader"
 		);
 
@@ -1316,14 +1316,22 @@ f 1 4 5
 	/// the alpha and not which texel a sample landed on. The two alphas
 	/// straddle the cutoff by a wide margin on both sides, so nothing here
 	/// depends on where exactly the cutoff sits - only that it is between them.
-	fn holed() -> TextureData {
+	fn holed() -> TextureData { holed_in([0xFF, 0x22, 0x22]) }
+
+	/// The same, in a color of somebody's choosing.
+	///
+	/// Only a test that puts the picture *over* something needs this: what a
+	/// mask does is measured against the clear color, and what blending does
+	/// has to be measured against whatever is behind it, which then has to be a
+	/// different color from the picture or neither can be told from the other.
+	fn holed_in(color: [u8; 3]) -> TextureData {
 		const SOLID: u8 = 0xFF;
 		const HOLE: u8 = 0x11;
 		let base = vec![
-			0xFF, 0x22, 0x22, SOLID, // near
-			0xFF, 0x22, 0x22, HOLE, //
-			0xFF, 0x22, 0x22, HOLE, //
-			0xFF, 0x22, 0x22, SOLID, //
+			color[0], color[1], color[2], SOLID, // near
+			color[0], color[1], color[2], HOLE, //
+			color[0], color[1], color[2], HOLE, //
+			color[0], color[1], color[2], SOLID, //
 		];
 
 		TextureData {
@@ -2022,6 +2030,396 @@ f 1 4 5
 			cutoff(include_str!("shader.wgsl"), "shader.wgsl"),
 			cutoff(include_str!("shadow.wgsl"), "shadow.wgsl"),
 			"the scene and the cascades have to agree on which texels are holes"
+		);
+	}
+
+	/// How much of a pane there is, where a test does not care about the exact
+	/// number.
+	///
+	/// A half rather than anything nearer an end: at nothing the pane is not
+	/// there and at one it is a wall, and either of those is a picture a build
+	/// that never blended anything would also produce.
+	const HALF: f32 = 0.5;
+
+	/// Puts a horizontal pane over the origin and hands back its handle.
+	///
+	/// Horizontal and lit by the ambient alone, so what comes out is the color
+	/// it was given rather than something a light angle decided.
+	///
+	/// @param world - where to put it
+	/// @param name - what to register its material as, which also orders two of
+	/// them: the registry hands out slots in the order it is asked
+	/// @param color - its base color
+	/// @param height - how far above the origin it hangs
+	/// @param blend - how its alpha is read
+	fn pane(world: &mut World, name: &str, color: Vec3, height: f32, blend: Blend) -> MaterialId {
+		let material = world.materials.insert(name, Material {
+			blend,
+			opacity: HALF,
+			..Material::colored(color)
+		});
+
+		let entity = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, height, 0.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(3.0, 1.0, 3.0),
+		});
+		world
+			.entities
+			.set_renderable(entity, Renderable::of(MeshId::QUAD, material, Vec3::ONE));
+
+		material
+	}
+
+	/// A world lit by nothing but a full ambient, seen from above.
+	///
+	/// The panes below are horizontal and the light travels sideways, so every
+	/// surface here is lit by the ambient term alone and comes out the color it
+	/// was given. That is what makes a channel comparison mean the compositing
+	/// rather than the shading.
+	fn overhead_world() -> World {
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(1.0);
+		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+		world.camera.target = Vec3::ZERO;
+
+		world
+	}
+
+	#[test]
+	fn a_blended_surface_lets_what_is_behind_it_through() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut shot = |blend, cube_under: bool| {
+			let mut world = overhead_world();
+
+			if cube_under {
+				let cube = world.entities.spawn_at(Transform {
+					position: Vec3::ZERO,
+					rotation: Quat::IDENTITY,
+					scale: Vec3::splat(2.0),
+				});
+				world
+					.entities
+					.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.05, 0.05)));
+			}
+
+			pane(&mut world, "test/pane", rgb(0.05, 0.9, 0.05), 2.0, blend);
+
+			capture
+				.shoot(&mut world)
+				.expect("the capture renders")
+				.pixel(SIZE.0 / 2, SIZE.1 / 2)
+		};
+
+		// the pane over nothing at all, which is the only honest reading of
+		// "the cube did not show through": the pane's own color has some red in
+		// it, and guessing a number for how much would be a test of the sRGB
+		// curve rather than of the compositing.
+		let bare = shot(Blend::Opaque, false);
+		let hidden = shot(Blend::Opaque, true);
+		let through = shot(Blend::Alpha, true);
+
+		assert_eq!(dominant(bare), 1, "the pane is the green it was given: {bare:?}");
+		assert_eq!(
+			bare[3], 255,
+			"and the frame it left behind is opaque: a surface this pipeline draws is solid 			 \
+			 whatever opacity the material carries, which is {HALF}"
+		);
+		assert!(
+			distance(hidden, bare) <= 1,
+			"drawn solid it hides the cube completely: {hidden:?} against {bare:?} with nothing 			 under it"
+		);
+		assert!(
+			u32::from(through[0]) > u32::from(hidden[0]) + 40,
+			"drawn blended the cube shows through it: {through:?} against {hidden:?}"
+		);
+		assert!(
+			through[1] > bare[1] / 2,
+			"and the pane is still there rather than gone: {through:?} against {bare:?}"
+		);
+	}
+
+	#[test]
+	fn the_nearer_of_two_panes_is_the_one_on_top() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the same two panes twice, with nothing swapped but how high each
+		// hangs. The red one is registered first both times, so a build that
+		// did not sort at all would draw them in that order in both frames and
+		// answer the same way twice.
+		let mut shot = |red: f32, green: f32| {
+			let mut world = overhead_world();
+			pane(&mut world, "test/red", rgb(0.9, 0.05, 0.05), red, Blend::Alpha);
+			pane(&mut world, "test/green", rgb(0.05, 0.9, 0.05), green, Blend::Alpha);
+
+			capture
+				.shoot(&mut world)
+				.expect("the capture renders")
+				.pixel(SIZE.0 / 2, SIZE.1 / 2)
+		};
+
+		let red_above = shot(5.0, 3.0);
+		let green_above = shot(3.0, 5.0);
+
+		assert_eq!(
+			dominant(red_above),
+			0,
+			"with the red pane nearer the camera, red is what is on top: {red_above:?}"
+		);
+		assert_eq!(
+			dominant(green_above),
+			1,
+			"and with the green one nearer, green is: {green_above:?}"
+		);
+	}
+
+	#[test]
+	fn a_pane_is_sorted_by_where_its_geometry_is_and_not_by_its_origin() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// every built-in primitive is centered on its own origin, so a test
+		// built out of them cannot tell the two apart at all. This one is a
+		// quad lifted two units inside its own mesh, and the entity carrying it
+		// hangs *lower* than the plain pane beside it - so the two answers are
+		// opposite rather than merely different.
+		let mut world = overhead_world();
+		let mut lifted = mesh::quad();
+		for vertex in &mut lifted.vertices {
+			vertex.position[1] += 2.0;
+		}
+		let high = world.meshes.insert("test/lifted", lifted);
+
+		let below = pane(&mut world, "test/red", rgb(0.9, 0.05, 0.05), 5.0, Blend::Alpha);
+		assert!(below.is_some(), "the plain pane's material is registered");
+
+		let green = world.materials.insert("test/green", Material {
+			blend: Blend::Alpha,
+			opacity: HALF,
+			..Material::colored(rgb(0.05, 0.9, 0.05))
+		});
+		let entity = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, 4.0, 0.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(3.0, 1.0, 3.0),
+		});
+		world
+			.entities
+			.set_renderable(entity, Renderable::of(high, green, Vec3::ONE));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let middle = image.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		// the green pane's entity is at four and the red one's at five, so by
+		// origin the red one is nearer the overhead camera; but the green one's
+		// geometry stands at six, so by geometry it is.
+		assert_eq!(
+			dominant(middle),
+			1,
+			"the pane whose triangles are nearer is the one on top, whatever its origin says: \
+			 {middle:?}"
+		);
+	}
+
+	#[test]
+	fn two_panes_at_one_distance_do_not_hold_each_other_out() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the same height, so the sort has nothing to say about which comes
+		// first and the order falls to the registry: red was asked for first.
+		// This is the one arrangement where the depth rule is the only thing
+		// left, and it is what the rule exists for - a surface that wrote depth
+		// would take the second pane away entirely rather than blend under it.
+		let mut world = overhead_world();
+		pane(&mut world, "test/red", rgb(0.9, 0.05, 0.05), 4.0, Blend::Alpha);
+		pane(&mut world, "test/green", rgb(0.05, 0.9, 0.05), 4.0, Blend::Alpha);
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let middle = image.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert_eq!(
+			dominant(middle),
+			1,
+			"the second pane is composited over the first rather than failing a depth test \
+			 against it: {middle:?}"
+		);
+		assert!(
+			middle[0] > 40,
+			"and the first is still under it rather than replaced: {middle:?}"
+		);
+	}
+
+	#[test]
+	fn a_pane_of_glass_casts_no_shadow() {
+		let (Some((solid, world)), Some((glass, _))) =
+			(cast_by(Blend::Opaque), cast_by(Blend::Alpha))
+		else {
+			return;
+		};
+
+		let cell = CASTER.1 / (2.0 * TILES);
+		let middle = |column: f32| (column + 0.5).mul_add(cell, -CASTER.1 / 2.0);
+		let under = Vec3::new(middle(0.0), CASTER.0, middle(0.0));
+
+		let shaded = on_screen(&world, beneath(&world, under), SIZE);
+		let beside = on_screen(&world, beneath(&world, under) + Vec3::new(0.0, 0.0, 4.0), SIZE);
+
+		let lit = brightness(solid.pixel(beside.0, beside.1));
+		let dark = brightness(solid.pixel(shaded.0, shaded.1));
+		let through = brightness(glass.pixel(shaded.0, shaded.1));
+
+		// the control: the same caster drawn solid does shade that spot, so
+		// what is measured below is the mode and not the geometry.
+		assert!(dark * 2 < lit, "drawn solid the caster shades the floor: {dark} against {lit}");
+		assert!(
+			through * 10 > lit * 8,
+			"and drawn blended it casts nothing at all: {through} against {lit} beside it"
+		);
+	}
+
+	#[test]
+	fn a_blended_surface_reads_its_picture_and_its_opacity_both() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// a green pane over a red cube, so that which of the two a pixel is
+		// mostly made of is a channel comparison rather than a threshold
+		// somebody guessed.
+		let mut shot = |opacity: f32| {
+			let mut world = overhead_world();
+
+			let cube = world.entities.spawn_at(Transform {
+				position: Vec3::ZERO,
+				rotation: Quat::IDENTITY,
+				scale: Vec3::new(4.0, 2.0, 4.0),
+			});
+			world
+				.entities
+				.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.05, 0.05)));
+
+			let texture = world
+				.textures
+				.insert("test/holed green", holed_in([0x22, 0xFF, 0x22]));
+			let material = world.materials.insert("test/glass", Material {
+				blend: Blend::Alpha,
+				opacity,
+				..Material::textured(texture)
+			});
+			let pane = world.entities.spawn_at(Transform {
+				position: Vec3::new(0.0, 2.0, 0.0),
+				rotation: Quat::IDENTITY,
+				scale: Vec3::new(3.0, 1.0, 3.0),
+			});
+			world
+				.entities
+				.set_renderable(pane, Renderable::of(MeshId::QUAD, material, Vec3::ONE));
+
+			let image = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			// two quadrants of the picture, one solid and one nearly a hole.
+			// Same material, same opacity, same cube under both: the alpha
+			// channel is the only thing between them.
+			let quarter = 3.0 / 4.0;
+			let solid = on_screen(&world, Vec3::new(-quarter, 2.0, -quarter), SIZE);
+			let thin = on_screen(&world, Vec3::new(quarter, 2.0, -quarter), SIZE);
+
+			(image.pixel(solid.0, solid.1), image.pixel(thin.0, thin.1))
+		};
+
+		let (over_solid, over_thin) = shot(0.8);
+
+		assert_eq!(
+			dominant(over_solid),
+			1,
+			"where the picture is solid the pane is what is seen: {over_solid:?}"
+		);
+		assert_eq!(
+			dominant(over_thin),
+			0,
+			"and where it is nearly a hole the cube under it is: {over_thin:?}"
+		);
+
+		// the same texel of the same picture at a different opacity. Without
+		// the material's own number in the alpha, these two would be one pixel.
+		let (fainter, _) = shot(0.35);
+
+		assert!(
+			distance(over_solid, fainter) > 20,
+			"and the material's opacity moves the same texel: {over_solid:?} against 			 \
+			 {fainter:?}"
+		);
+		assert!(
+			u32::from(fainter[0]) > u32::from(over_solid[0]) + 20,
+			"the fainter pane letting more of the cube through: {fainter:?} against 			 \
+			 {over_solid:?}"
+		);
+	}
+
+	#[test]
+	fn a_debug_segment_behind_glass_is_seen_through_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// a pane between the camera and the segment, which is at the origin.
+		// The segment writes depth and the pane does not, so what decides the
+		// picture is only which of the two is recorded into the pass first.
+		let mut glassed = with_a_line(0.0, false);
+		let material = glassed.materials.insert("test/glass", Material {
+			blend: Blend::Alpha,
+			opacity: HALF,
+			..Material::colored(rgb(0.9, 0.05, 0.05))
+		});
+		let sheet = glassed.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, 0.0, 2.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(8.0, 8.0, 0.05),
+		});
+		glassed
+			.entities
+			.set_renderable(sheet, Renderable::of(MeshId::CUBE, material, Vec3::ONE));
+
+		let behind = capture
+			.shoot(&mut glassed)
+			.expect("the capture renders");
+
+		let mut bare = with_a_line(0.0, false);
+		let alone = capture
+			.shoot(&mut bare)
+			.expect("the second capture renders");
+
+		let row = (SIZE.1 / 2 - 6..=SIZE.1 / 2 + 6)
+			.max_by_key(|y| alone.pixel(SIZE.0 / 2, *y)[1])
+			.expect("the range is not empty");
+		let (through, clear) = (behind.pixel(SIZE.0 / 2, row), alone.pixel(SIZE.0 / 2, row));
+
+		assert!(
+			clear[1] > 100,
+			"the segment is on that row with nothing in front of it: {clear:?}"
+		);
+		assert!(
+			u32::from(through[1]) * 10 < u32::from(clear[1]) * 8,
+			"and behind the pane it is dimmed by it rather than drawn over it: {through:?} \
+			 against {clear:?}"
+		);
+		assert!(
+			u32::from(through[0]) > u32::from(clear[0]) + 40,
+			"which is the pane's own color arriving on top of it: {through:?} against {clear:?}"
 		);
 	}
 
