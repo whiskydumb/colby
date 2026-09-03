@@ -9,6 +9,7 @@
 # `just shot` writes when nobody names a path.
 /cvars.cfg
 /colby.png
+/saves/
 
 # secrets and local overrides
 .env

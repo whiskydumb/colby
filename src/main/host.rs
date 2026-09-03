@@ -38,7 +38,7 @@ use colby_core::{
 	info,
 	time::Clock,
 };
-use colby_net::{Slot, every};
+use colby_net::Slot;
 use colby_physics::Simulation;
 use colby_script::Vm;
 use colby_ui::Interface;
@@ -73,7 +73,7 @@ const VIEWPORT: Vec2 = Vec2::new(1280.0, 720.0);
 pub(crate) fn requested() -> Option<u16> {
 	let arguments: Vec<String> = std::env::args().skip(1).collect();
 
-	parse(&arguments)
+	port_after(&arguments, FLAG)
 }
 
 /// Reads the command line for a client with no window.
@@ -97,11 +97,21 @@ pub(crate) fn joining() -> Option<SocketAddr> {
 fn address(arguments: &[String]) -> Option<SocketAddr> { crate::net::after(arguments, JOIN) }
 
 /// The same, over arguments already collected.
-fn parse(arguments: &[String]) -> Option<u16> {
+/// The port after a flag, whichever flag is doing the asking.
+///
+/// **Written once and called twice**, the same way an address is: two modes
+/// want a port off the command line - a windowless end and a window that
+/// serves - and a second copy of these rules would differ the first time
+/// somebody fixed one of them. @ref `crate::net::serving`.
+///
+/// @param arguments - the command line, without the program's own name
+/// @param flag - which flag to look for
+/// @return the port after it, or the default when it stands alone
+pub(crate) fn port_after(arguments: &[String], flag: &str) -> Option<u16> {
 	for (index, argument) in arguments.iter().enumerate() {
-		let port = if let Some(rest) = argument.strip_prefix(&format!("{FLAG}=")) {
+		let port = if let Some(rest) = argument.strip_prefix(&format!("{flag}=")) {
 			rest.parse::<u16>().ok()
-		} else if argument == FLAG {
+		} else if argument == flag {
 			arguments
 				.get(index + 1)
 				.and_then(|next| next.parse::<u16>().ok())
@@ -225,20 +235,9 @@ fn run(end: End) -> Result {
 		clock.set_rate(crate::app::paced(&world.cvars, !hosting));
 		crate::saves::serve(&mut world, &mut simulation);
 		crate::net::serve(Some(&mut net));
-		net.set(crate::net::conditions(&world.cvars));
-
-		// off the wire before any step, so that what a step is about to run
-		// against is everything that had arrived when it started rather than
-		// whatever turned up halfway through. @ref `crate::net`.
-		net.receive(started.elapsed());
-		// and then the world hears about it: whoever turned up is given a
-		// name, and what they asked for is filed under it. Between the drain
-		// and the step, so that a peer's very first message is one the step
-		// after it can act on. @ref `Net::seat`.
-		net.seat(&mut world);
-		// and whatever they typed, if it is theirs to type. @ref
-		// `crate::net::allowed`.
-		crate::net::obey(&mut world, &net);
+		// everything the wire wants once a frame, in the one place it is
+		// written. @ref `crate::net::hear`, which a window calls too.
+		crate::net::hear(&mut net, &mut world, started.elapsed());
 
 		let mut ran = false;
 		// once for the pass, so two steps of one iteration are the same length
@@ -269,35 +268,9 @@ fn run(end: End) -> Result {
 				false,
 			);
 
-			// and out once a step rather than once a pass, because a message
-			// has to mean "this is where things stand at this moment".
-			//
-			// The world itself goes with one message in every
-			// [`every`](colby_net::every) of them: a step is what makes a
-			// stack of boxes stand up and a snapshot is what a far end can be
-			// told, and they are not the same rate - which is why the cadence
-			// is worked out from the rate rather than fixed beside it. The messages in
-			// between still go, carrying what this end holds and whatever the reliable
-			// ring is still owed.
-			let telling = describing(hosting, world.steps, rate.hz());
-
-			if telling {
-				crate::net::records(&world.bodies, &mut records);
-			}
-
-			// a host asks nobody for anything and says so; a client asks for
-			// everything it has not been answered about, which is the window
-			// rather than the newest of them. @ref `Net::ask`.
-			if hosting {
-				net.ask(&[]);
-			} else {
-				net.ask(world.commands.unsettled(world.peer));
-			}
-
-			net.send(started.elapsed(), telling.then_some(records.as_slice()));
-			// and the wire's own clock moves on by exactly one step, after the
-			// message that was about the step just run. @ref `crate::app`,
-			// which advances it in the same place.
+			// everything the wire wants once a step, in the one place it is
+			// written. @ref `crate::net::tell`, which a window calls too.
+			crate::net::tell(&mut net, &world, &mut records, rate.hz(), started.elapsed());
 			moment = moment.saturating_add(rate.step());
 			ran = true;
 		}
@@ -322,27 +295,6 @@ fn run(end: End) -> Result {
 	Ok(())
 }
 
-/// Whether the step just run is one the world goes out with.
-///
-/// A function rather than three lines in the loop because it is the only
-/// arithmetic in that loop, and the loop itself has nothing that can be run in
-/// a test - a socket, a module and a console between it and anything. What is
-/// checkable is pulled out here, and what is left up there is plumbing.
-///
-/// @note: `World::steps` is public and a game module writes it, so the cadence
-/// is on a clock the game can move. Nothing does today; it is worth knowing
-/// before something does, because a game that set it back would stop
-/// describing the world for a while and nothing anywhere would say so.
-///
-/// @param hosting - whether this end owns the world; only an authority
-/// describes one
-/// @param steps - how many steps this end has run
-/// @param hz - how many of them there are in a second
-/// @return whether this step's message carries a description
-fn describing(hosting: bool, steps: u64, hz: u16) -> bool {
-	hosting && steps.is_multiple_of(u64::from(every(hz)))
-}
-
 /// How long one step is, for whoever is reading the loop above.
 const _: () = assert!(
 	colby_core::time::Rate::DEFAULT.step().as_nanos() > 0,
@@ -353,30 +305,8 @@ const _: () = assert!(
 mod tests {
 	use super::*;
 
-	#[test]
-	fn a_world_is_described_twenty_times_a_second_at_any_rate() {
-		// the property the cadence exists for, stated as a count rather than
-		// as a gap: what has to hold when the tick moves is that the *wire*
-		// does not, and a gap in steps is not that until it is divided back
-		// out by the rate.
-		for hz in [20_u16, 60, 120, 240] {
-			let described = (1..=u64::from(hz))
-				.filter(|steps| describing(true, *steps, hz))
-				.count();
-
-			assert_eq!(described, 20, "{hz} a second is still twenty descriptions of it");
-		}
-	}
-
-	#[test]
-	fn only_an_authority_describes_a_world() {
-		// a client's blocks carry the number of the newest snapshot it holds
-		// and nothing else. An asking end that described one would be telling
-		// the host what the host already decided.
-		assert!(describing(true, 3, 60), "a serving end, on the cadence");
-		assert!(!describing(false, 3, 60), "an asking one, on the same step");
-		assert!(!describing(true, 4, 60), "and a serving one off it");
-	}
+	/// The port `--host` asks for, over arguments already collected.
+	fn parse(arguments: &[String]) -> Option<u16> { port_after(arguments, FLAG) }
 
 	#[test]
 	fn the_flag_is_read_on_its_own_and_with_a_port() {

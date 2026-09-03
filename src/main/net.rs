@@ -67,7 +67,7 @@ use colby_core::{
 };
 use colby_net::{
 	Block, Channel, Conditions, Delivery, Header, Heard, Link, MAX_DATAGRAM, NOTHING, Reliable,
-	Ring, Slot, Snapshot, Solid,
+	Ring, Slot, Snapshot, Solid, every,
 };
 
 /// A session number no other run of this program will pick.
@@ -178,22 +178,66 @@ const MAX_MILLIS: f32 = 60_000.0;
 /// The flag that asks a window to talk to a host.
 const CONNECT: &str = "--connect";
 
-/// Reads the command line for a host to talk to.
+/// The flag that asks a window to *be* one.
 ///
-/// Accepts `--connect address` and `--connect=address`, where an address is
-/// anything the standard library reads as one - `127.0.0.1:27015`, a name and a
-/// port, or a bracketed address of the longer kind.
+/// A window that serves as well as playing, which is what the field calls a
+/// listen server. It is a flag of its own rather than a window-shaped `--host`
+/// because the two are genuinely different modes and one of them has to open
+/// no window at all: a dedicated end is what a machine nobody is at runs, and
+/// what everything checking this engine drives.
+const LISTEN: &str = "--listen";
+
+/// Where a window stands on a wire, as the command line asked for it.
 ///
-/// @return where the host is, if one was named
+/// Three answers rather than two options, because the pair of them can
+/// disagree and the third is the ordinary case: a port means nothing to a
+/// window that connects, an address means nothing to one that serves, and most
+/// windows are neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+	/// No socket at all.
+	Alone,
+
+	/// Listen on a port and be the authority - a window that serves as well as
+	/// playing, which is what the field calls a listen server.
+	Serving(u16),
+
+	/// Talk to a host that is somewhere else.
+	Talking(SocketAddr),
+}
+
+/// Reads the command line for what this window is on the wire.
+///
+/// Accepts `--listen`, `--listen port` and `--listen=port` in the shapes
+/// `--host` accepts them, and `--connect address` in the shapes the windowless
+/// client accepts it.
+///
+/// @return which end of a wire this window is, if either
 #[must_use]
-pub(crate) fn wanted() -> Option<SocketAddr> {
+pub(crate) fn standing() -> Standing {
 	let arguments: Vec<String> = std::env::args().skip(1).collect();
 
-	asked_for(&arguments)
+	standing_in(&arguments)
 }
 
 /// The same, over arguments already collected.
-fn asked_for(arguments: &[String]) -> Option<SocketAddr> { after(arguments, CONNECT) }
+///
+/// **Serving wins when both are named**, and it is a rule rather than an
+/// accident: a window cannot be both ends of a wire, and of the two claims the
+/// stronger one is being the authority. Refusing to start over it would be
+/// worse - a person who typed both meant one of them, and the engine can say
+/// which it took.
+fn standing_in(arguments: &[String]) -> Standing {
+	if let Some(port) = crate::host::port_after(arguments, LISTEN) {
+		return Standing::Serving(port);
+	}
+
+	if let Some(address) = after(arguments, CONNECT) {
+		return Standing::Talking(address);
+	}
+
+	Standing::Alone
+}
 
 /// The address after a flag, whichever flag is doing the asking.
 ///
@@ -1874,6 +1918,89 @@ impl Net {
 
 /// The world as a table of records, for a snapshot to describe.
 ///
+/// Everything one endpoint does with the wire once a frame.
+///
+/// **Written once and called twice**, which is the whole reason it is here: a
+/// window and a windowless end do the same four things in the same order, and
+/// the last of them was in only one of the two copies for as long as there
+/// were two - a window that connected never ran a console line that crossed.
+///
+/// The order is not taste. What arrives is drained before anything steps, so a
+/// step runs against what had come when it started rather than against
+/// whatever turned up halfway through; seating comes next, because a peer's
+/// very first message arrives in the pass that admits it; and obeying comes
+/// last, because a line can only be run as somebody once that somebody has a
+/// name.
+///
+/// @param net - this end's endpoint
+/// @param world - the world it is about
+/// @param now - how long this process has been running
+pub(crate) fn hear(net: &mut Net, world: &mut World, now: Duration) {
+	net.set(conditions(&world.cvars));
+	net.receive(now);
+	net.seat(world);
+	obey(world, net);
+}
+
+/// Everything one endpoint does with the wire once a step.
+///
+/// The other half of [`hear`], and out once a step rather than once a frame
+/// because a message has to mean "this is where things stand at this moment"
+/// and a frame rate is not a moment.
+///
+/// The world itself goes with one message in every
+/// [`every`](colby_net::every) of them: a step is what makes a stack of boxes
+/// stand up and a snapshot is what a far end can be told, and they are not the
+/// same rate - which is why the cadence is worked out from the rate rather
+/// than fixed beside it. The messages in between still go, carrying what this
+/// end holds and whatever the reliable ring is still owed.
+///
+/// @param net - this end's endpoint
+/// @param world - the world to describe, as the step left it
+/// @param into - scratch for the records, so a snapshot costs no allocation
+/// @param hz - how many steps a second, which sets the snapshot cadence
+/// @param now - how long this process has been running
+pub(crate) fn tell(net: &mut Net, world: &World, into: &mut Vec<Slot>, hz: u16, now: Duration) {
+	let hosting = net.hosting();
+	let telling = describing(hosting, world.steps, hz);
+
+	if telling {
+		records(&world.bodies, into);
+	}
+
+	// a host asks nobody for anything and says so; a client asks for
+	// everything it has not been answered about, which is the window rather
+	// than the newest of them. @ref `Net::ask`.
+	if hosting {
+		net.ask(&[]);
+	} else {
+		net.ask(world.commands.unsettled(world.peer));
+	}
+
+	net.send(now, telling.then_some(into.as_slice()));
+}
+
+/// Whether the step just run is one the world goes out with.
+///
+/// A function rather than three lines in a loop because it is the only
+/// arithmetic in either of them, and neither loop has anything that can be run
+/// in a test - a socket, a module and a console between it and any harness.
+/// What is checkable is pulled out here and what is left up there is plumbing.
+///
+/// @note: `World::steps` is public and a game module writes it, so the cadence
+/// is on a clock the game can move. Nothing does today; it is worth knowing
+/// before something does, because a game that set it back would stop
+/// describing the world for a while and nothing anywhere would say so.
+///
+/// @param hosting - whether this end owns the world; only an authority
+/// describes one
+/// @param steps - how many steps this end has run
+/// @param hz - how many of them there are in a second
+/// @return whether this step's message carries a description
+pub(crate) fn describing(hosting: bool, steps: u64, hz: u16) -> bool {
+	hosting && steps.is_multiple_of(u64::from(every(hz)))
+}
+
 /// A slot for every place the body table has, occupied where a body is, so
 /// that a slot number means the same thing on both machines without either of
 /// them saying so. That is the whole of what ties a snapshot to a world.
@@ -2711,6 +2838,189 @@ mod tests {
 		assert!(session_of(now) > 0, "and none of them is nought");
 		assert!(session_of(Duration::ZERO) > 0, "not even the one moment that folds to it");
 		assert!(session_of(Duration::MAX) > 0, "whatever the clock says");
+	}
+
+	#[test]
+	fn a_world_is_described_twenty_times_a_second_at_any_rate() {
+		// the property the cadence exists for, stated as a count rather than
+		// as a gap: what has to hold when the tick moves is that the *wire*
+		// does not, and a gap in steps is not that until it is divided back
+		// out by the rate.
+		for hz in [20_u16, 60, 120, 240] {
+			let described = (1..=u64::from(hz))
+				.filter(|steps| describing(true, *steps, hz))
+				.count();
+
+			assert_eq!(described, 20, "{hz} a second is still twenty descriptions of it");
+		}
+	}
+
+	#[test]
+	fn only_an_authority_describes_a_world() {
+		// a client's blocks carry the number of the newest snapshot it holds
+		// and nothing else. An asking end that described one would be telling
+		// the host what the host already decided.
+		assert!(describing(true, 3, 60), "a serving end, on the cadence");
+		assert!(!describing(false, 3, 60), "an asking one, on the same step");
+		assert!(!describing(true, 4, 60), "and a serving one off it");
+	}
+
+	#[test]
+	fn an_end_that_serves_describes_a_world_and_one_that_asks_is_told_it() {
+		// **the whole of what a window gains by being able to host**, driven
+		// through the two functions a window now calls rather than through a
+		// window: `hear` once a frame and `tell` once a step. Neither cares
+		// whether anything is drawn, which is the property that made this
+		// possible at all - and what is left in `app.rs` afterwards is a flag
+		// and a constructor.
+		let (mut host, mut client, _wire) = two();
+		let mut served = empty_world();
+		let mut window = empty_world();
+		let mut records: Vec<Slot> = Vec::new();
+		let mut nothing: Vec<Slot> = Vec::new();
+
+		// something for the serving end to have an opinion about.
+		for along in 0_u8..4 {
+			let entity = served.entities.spawn();
+
+			served.bodies.spawn(Body {
+				kind: BodyKind::Dynamic,
+				entity,
+				transform: Transform {
+					position: Vec3::new(f32::from(along), 1.0, 2.0),
+					..Transform::IDENTITY
+				},
+				..Body::default()
+			});
+		}
+
+		for step in 1..=30 {
+			let now = colby_core::time::STEP * step;
+
+			hear(&mut host, &mut served, now);
+			hear(&mut client, &mut window, now);
+			served.steps = u64::from(step);
+			window.steps = u64::from(step);
+			// a serving end describes what it holds; an asking one has no
+			// opinion about a world at all. @ref `tell`, which reads
+			// `Net::hosting` to decide which of the two it is doing.
+			tell(&mut host, &served, &mut records, 60, now);
+			tell(&mut client, &window, &mut nothing, 60, now);
+		}
+
+		assert!(client.holding(0) > 0, "the asking end has been told a world");
+		assert!(host.theirs(0) > 0, "and the serving end has been told which one it holds");
+		assert_eq!(
+			host.holding(0),
+			0,
+			"while nothing came the other way: only an authority describes a world"
+		);
+		assert!(!records.is_empty(), "so the serving end wrote records");
+		assert!(nothing.is_empty(), "and the asking end wrote none at all");
+	}
+
+	#[test]
+	fn hearing_is_all_four_things_and_the_last_of_them_is_obeying() {
+		// **`hear` is four things in an order, and the last was in only one of
+		// the two copies for as long as there were two**: a window that
+		// connected never ran a console line that crossed, though the function
+		// that runs one was tested and worked. What makes it one function now
+		// is exactly that.
+		let (mut host, mut client, _wire) = two();
+		let (mut served, mut window) = (empty_world(), empty_world());
+
+		served.cvars.attribute(Owner::Module);
+		served
+			.cvars
+			.command("game.whoami", whoami, "writes down whose the world said it was");
+		served.cvars.attribute(Owner::Engine);
+
+		joined(&mut window);
+
+		for step in 1..=2 {
+			let now = colby_core::time::STEP * step;
+
+			hear(&mut host, &mut served, now);
+			hear(&mut client, &mut window, now);
+			tell(&mut host, &served, &mut Vec::new(), 60, now);
+			tell(&mut client, &window, &mut Vec::new(), 60, now);
+
+			if step == 1 {
+				client
+					.say("game.whoami")
+					.expect("the ring took it");
+			}
+		}
+
+		// one more pass, so the line that was said on the first has arrived and
+		// been heard.
+		let now = colby_core::time::STEP * 3;
+
+		hear(&mut host, &mut served, now);
+
+		let named = served
+			.players
+			.iter()
+			.map(|(peer, _)| peer)
+			.find(|peer| !peer.is_host())
+			.expect("hearing seated whoever turned up");
+		let ran =
+			PeerId::from_bits((u64::from(served.owed_steps) << 32) | u64::from(served.contacts));
+
+		assert_eq!(served.steps, 1, "hearing ran the line that crossed, once");
+		assert_eq!(ran, named, "and as the peer that asked, not as the host");
+		assert!(served.peer.is_host(), "and the field naming this machine is put back");
+	}
+
+	#[test]
+	fn an_asking_end_asks_and_a_serving_one_does_not() {
+		// the branch in `tell` that decides which of the two this end is. A
+		// serving end has nobody to ask, and an asking one that asked for
+		// nothing would never have a command of its own run anywhere.
+		let (mut host, mut client, _wire) = two();
+		let (mut served, mut window) = (empty_world(), empty_world());
+
+		joined(&mut window);
+		// **and the serving end has a command of its own that nothing has
+		// settled**, which is the only state in which the two branches differ
+		// at all: a host runs its own commands in its own step, so asking for
+		// what it has not been answered about is almost always asking for
+		// nothing, and a fixture without this could not tell the branches
+		// apart.
+		served.commands.push(served.peer, wanted(9));
+
+		for step in 1..=4 {
+			let now = colby_core::time::STEP * step;
+
+			hear(&mut host, &mut served, now);
+			hear(&mut client, &mut window, now);
+
+			// something for the window to be asking about, put in the way the
+			// step puts one there.
+			window.commands.push(window.peer, wanted(step));
+
+			tell(&mut host, &served, &mut Vec::new(), 60, now);
+			tell(&mut client, &window, &mut Vec::new(), 60, now);
+		}
+
+		assert!(host.filed() > 0, "the serving end filed what the asking one asked for");
+		assert_eq!(client.filed(), 0, "and nothing came the other way");
+		assert!(
+			client.holding_commands(0).is_empty(),
+			"because a serving end asks for nothing at all, its own commands included"
+		);
+	}
+
+	#[test]
+	fn only_a_serving_end_puts_a_world_on_the_wire() {
+		// said on its own because the branch it turns on is one line in `tell`
+		// and a change that described from both ends would look like it worked.
+		let (host, client, _wire) = two();
+
+		assert!(host.hosting(), "one of them decides");
+		assert!(!client.hosting(), "and the other does not");
+		assert!(describing(host.hosting(), 3, 60), "so only one of them describes");
+		assert!(!describing(client.hosting(), 3, 60));
 	}
 
 	#[test]
@@ -4015,25 +4325,78 @@ mod tests {
 		assert_eq!(seed(&cvars), 12_345);
 	}
 
+	/// The command line, as words.
+	fn words(line: &[&str]) -> Vec<String> {
+		line.iter()
+			.map(|word| (*word).to_owned())
+			.collect()
+	}
+
 	#[test]
 	fn a_host_named_on_the_command_line_is_read_and_a_word_that_is_not_one_is_not() {
 		assert_eq!(
-			asked_for(&["--connect".to_owned(), "127.0.0.1:27015".to_owned()]),
-			Some(somewhere(27_015))
+			standing_in(&words(&["--connect", "127.0.0.1:27015"])),
+			Standing::Talking(somewhere(27_015))
 		);
-		assert_eq!(asked_for(&["--connect=127.0.0.1:1".to_owned()]), Some(somewhere(1)));
-		assert_eq!(asked_for(&["--connect".to_owned()]), None, "with nothing after it");
 		assert_eq!(
-			asked_for(&["--connect".to_owned(), "not an address".to_owned()]),
-			None,
+			standing_in(&words(&["--connect=127.0.0.1:1"])),
+			Standing::Talking(somewhere(1))
+		);
+		assert_eq!(standing_in(&words(&["--connect"])), Standing::Alone, "with nothing after it");
+		assert_eq!(
+			standing_in(&words(&["--connect", "not an address"])),
+			Standing::Alone,
 			"and with something that is not one"
 		);
 		// an address after it rather than a port, so that the flag is what
 		// this turns on: a word no reader could parse would refuse either way.
 		assert_eq!(
-			asked_for(&["--join".to_owned(), "127.0.0.1:27015".to_owned()]),
-			None,
+			standing_in(&words(&["--join", "127.0.0.1:27015"])),
+			Standing::Alone,
 			"and not somebody else's flag"
+		);
+	}
+
+	#[test]
+	fn a_window_asked_to_listen_serves_on_the_port_it_was_given() {
+		assert_eq!(
+			standing_in(&words(&["--listen"])),
+			Standing::Serving(DEFAULT_PORT),
+			"on its own it is the usual port"
+		);
+		assert_eq!(standing_in(&words(&["--listen", "9999"])), Standing::Serving(9999));
+		assert_eq!(standing_in(&words(&["--listen=9999"])), Standing::Serving(9999));
+	}
+
+	#[test]
+	fn a_window_told_nothing_about_a_wire_has_no_socket() {
+		// the ordinary case, and the one a change that opened a socket by
+		// accident would break in silence.
+		assert_eq!(standing_in(&[]), Standing::Alone);
+		assert_eq!(standing_in(&words(&["--shot", "colby.png"])), Standing::Alone);
+		// and the windowless flags are not this window's business: a process
+		// given either of those never reaches the window path at all.
+		assert_eq!(standing_in(&words(&["--host"])), Standing::Alone, "a dedicated end");
+		assert_eq!(
+			standing_in(&words(&["--join", "127.0.0.1:1"])),
+			Standing::Alone,
+			"and a windowless client"
+		);
+	}
+
+	#[test]
+	fn a_window_told_to_do_both_serves() {
+		// a window cannot be both ends of a wire, and of the two claims the
+		// stronger one is being the authority. Refusing to start over it would
+		// be worse than picking and saying which was picked.
+		assert_eq!(
+			standing_in(&words(&["--connect", "127.0.0.1:1", "--listen", "9999"])),
+			Standing::Serving(9999)
+		);
+		assert_eq!(
+			standing_in(&words(&["--listen", "--connect", "127.0.0.1:1"])),
+			Standing::Serving(DEFAULT_PORT),
+			"whichever order they were typed in"
 		);
 	}
 

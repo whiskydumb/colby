@@ -33,13 +33,22 @@ use colby_engine::{
 		window::{Window, WindowId},
 	},
 };
+use colby_net::Slot;
 use colby_physics::Simulation;
 use colby_script::Vm;
 use colby_ui::Interface;
 
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
-use crate::{assets::Assets, console::Console, game::Game, input, mode::Mode, net::Net, step};
+use crate::{
+	assets::Assets,
+	console::Console,
+	game::Game,
+	input,
+	mode::Mode,
+	net::{Net, Standing},
+	step,
+};
 
 /// The window title.
 const TITLE: &str = "colby";
@@ -147,10 +156,15 @@ pub(crate) struct App {
 	/// reason the scripts are: an engine whose picture works and whose sound
 	/// did not start is worth running, and the log says which half is missing.
 	audio: Option<Device>,
-	/// The socket and the conversation over it, if `--connect` named a host.
+	/// The socket and the conversation over it, if this window was told to
+	/// connect to a host or to be one.
 	/// An `Option` for the third time and the third same reason: an engine
 	/// whose window works and whose socket did not bind is worth running.
 	net: Option<Net>,
+
+	/// The world as a snapshot describes it, taken down once a step rather
+	/// than allocated per snapshot. Empty in a window that serves nobody.
+	records: Vec<Slot>,
 	/// When this process started, which is the clock the wire is on.
 	///
 	/// Real time rather than simulated: a round-trip estimate measured in
@@ -209,6 +223,7 @@ impl App {
 			scripts: None,
 			audio: None,
 			net: None,
+			records: Vec::new(),
 			started: Instant::now(),
 			simulation,
 			assets: Assets::new(&crate::workspace()),
@@ -282,19 +297,31 @@ impl App {
 		crate::console::install(&mut self.world);
 
 		// after them, because how bad the wire is is a console variable and the
-		// seed for it is one too. A window that was not told to connect to
-		// anything simply has no socket, which is the ordinary case.
-		if let Some(address) = crate::net::wanted() {
-			match Net::connect(address, crate::net::seed(&self.world.cvars)) {
-				| Ok(net) => {
-					self.net = Some(net);
-					// and this process stops being the authority, which is
-					// the one thing about a window that connected that
-					// nothing else could work out. @ref `crate::net::joined`.
-					crate::net::joined(&mut self.world);
-				},
-				| Err(error) => error!(%error, "no socket; this window is on its own"),
-			}
+		// seed for it is one too. A window that was told neither to connect
+		// nor to serve simply has no socket, which is the ordinary case.
+		//
+		// **A window can be either end of a wire**, and which one it is has to
+		// be decided here rather than later: a window that serves stays the
+		// authority its world already thinks it is, and one that connects
+		// stops being it before the game module ever reads the field.
+		let seed = crate::net::seed(&self.world.cvars);
+		let opened = match crate::net::standing() {
+			| Standing::Serving(port) => Some((Net::host(port, seed), true)),
+			| Standing::Talking(address) => Some((Net::connect(address, seed), false)),
+			| Standing::Alone => None,
+		};
+
+		match opened {
+			| None => {},
+			| Some((Err(error), _)) => error!(%error, "no socket; this window is on its own"),
+			| Some((Ok(net), true)) => self.net = Some(net),
+			| Some((Ok(net), false)) => {
+				self.net = Some(net);
+				// and this process stops being the authority, which is the one
+				// thing about a window that connected that nothing else could
+				// work out. @ref `crate::net::joined`.
+				crate::net::joined(&mut self.world);
+			},
 		}
 
 		self.start_editor();
@@ -309,7 +336,12 @@ impl App {
 		// arrives, and before the first step, because that is the last moment
 		// saying anything about it is useful. @ref `set_pace` for why a client
 		// does not get its own rate.
-		if self.net.is_some() && rate(&self.world.cvars) != Rate::DEFAULT {
+		let following = self
+			.net
+			.as_ref()
+			.is_some_and(|net| !net.hosting());
+
+		if following && rate(&self.world.cvars) != Rate::DEFAULT {
 			warn!(
 				asked = rate(&self.world.cvars).hz(),
 				running = Rate::DEFAULT.hz(),
@@ -479,13 +511,13 @@ impl App {
 	/// @return where it stands for the next one
 	fn stepped(&mut self, moment: Duration, rate: Rate) -> Duration {
 		if let Some(net) = self.net.as_mut() {
-			// what this end has asked for and not been answered about, which
-			// is the whole window rather than the newest one: every message
-			// carries the lot, and that redundancy is what stands in for
-			// retransmission on a wire that has none. Read fresh each step,
-			// because the host's answer arrives between them.
-			net.ask(self.world.commands.unsettled(self.world.peer));
-			net.send(self.started.elapsed(), None);
+			crate::net::tell(
+				net,
+				&self.world,
+				&mut self.records,
+				rate.hz(),
+				self.started.elapsed(),
+			);
 		}
 
 		moment.saturating_add(rate.step())
@@ -537,11 +569,13 @@ impl App {
 		crate::net::serve(self.net.as_mut());
 
 		if let Some(net) = self.net.as_mut() {
-			net.set(crate::net::conditions(&self.world.cvars));
-			net.receive(self.started.elapsed());
-			// which is where this window learns who it is, and where what the
-			// host has already run stops being resent. @ref `Net::seat`.
-			net.seat(&mut self.world);
+			// which is where this window learns who it is, where what the host
+			// has already run stops being resent, and where a line somebody
+			// else typed is run. @ref `crate::net::hear`, which a windowless
+			// end calls too - and which is one function because the last of
+			// those four was missing from this copy for as long as there were
+			// two.
+			crate::net::hear(net, &mut self.world, self.started.elapsed());
 		}
 
 		// and the mode's own edge, in the same place and for the same reason:
@@ -665,11 +699,15 @@ impl App {
 		let paused = self.world.cvars.bool(PAUSE).unwrap_or(false);
 		let speed = self.world.cvars.float(SPEED).unwrap_or(1.0);
 
-		// a window can never be the authority - it has no way to host - so a
-		// window with a socket is a client and takes the host's rate. @ref
-		// `paced`.
+		// a window that serves is the authority and runs what it was told; one
+		// that connected takes the rate every host runs. @ref `paced`.
+		let following = self
+			.net
+			.as_ref()
+			.is_some_and(|net| !net.hosting());
+
 		self.clock
-			.set_rate(paced(&self.world.cvars, self.net.is_some()));
+			.set_rate(paced(&self.world.cvars, following));
 		self.clock
 			.set_speed(if paused { 0.0 } else { speed });
 	}
