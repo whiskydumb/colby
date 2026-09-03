@@ -31,6 +31,9 @@
 		{ "name": "hangar roof", "at": [13, 6.2, 11], "scale": [18, 0.4, 18],
 		  "mesh": "cube", "material": "construct/wall", "color": [0.68, 0.65, 0.59] },
 
+		{ "name": "hangar glass", "at": [9, 3.5, 19.75], "scale": [3, 2, 0.1],
+		  "mesh": "cube", "material": "construct/glass" },
+
 		{ "name": "mezzanine", "at": [13, 1.9, 16.5], "scale": [18, 0.4, 7],
 		  "mesh": "cube", "material": "construct/metal", "color": [0.62, 0.64, 0.68] },
 		{ "name": "mezzanine rail", "at": [12.75, 2.55, 13.15], "scale": [8.5, 0.9, 0.3],
@@ -87,6 +90,7 @@
 		{ "name": "hangar pier mid", "entity": "hangar pier mid", "kind": "static" },
 		{ "name": "hangar pier east", "entity": "hangar pier east", "kind": "static" },
 		{ "name": "hangar roof", "entity": "hangar roof", "kind": "static" },
+		{ "name": "hangar glass", "entity": "hangar glass", "kind": "static" },
 
 		{ "name": "mezzanine", "entity": "mezzanine", "kind": "static", "friction": 0.8 },
 		{ "name": "mezzanine rail", "entity": "mezzanine rail", "kind": "static" },

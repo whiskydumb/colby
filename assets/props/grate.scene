@@ -1,0 +1,12 @@
+{
+	"entities": [
+		{ "name": "grate", "at": [0, 0, 0], "scale": [1.6, 1.6, 0.08],
+		  "mesh": "cube", "material": "construct/grate" }
+	],
+
+	"bodies": [
+		{ "name": "grate", "entity": "grate", "kind": "dynamic",
+		  "shape": { "kind": "box" },
+		  "mass": 2.4, "restitution": 0.1, "friction": 0.7, "layer": 1 }
+	]
+}

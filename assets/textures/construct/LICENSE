@@ -39,3 +39,29 @@ because nothing downstream can tell a measured normal from a guessed one:
 
 It is a guess about shape made from a photograph of color, and it is right only
 in so far as darker means deeper on these particular surfaces.
+
+grate.png is not the author's work either, and is not a photograph of anything.
+It is arithmetic, written down here for the reason above - nothing downstream
+can tell a generated picture from a scanned one, and this is the only place the
+recipe can live:
+
+    128 by 128, RGBA. Bars 12 pixels wide on a 64-pixel pitch, offset by half a
+    bar, so a texel is inside a bar when either (x + 6) % 64 < 12 or
+    (y + 6) % 64 < 12. Alpha is 255 there and 0 everywhere else, which is a
+    third of the image solid. The offset is what makes one tile of this a
+    closed grid: without it the bars start at a tile's edge, so a face wearing
+    one tile shows two sides of a frame and not four.
+
+    The color is a painted steel, (150, 155, 164) in sRGB, multiplied by a
+    shade that runs from 0.72 at a bar's edge to 1.28 down its middle - a
+    triangle across the bar's width rather than a flat slab, which is what
+    makes a bar read as round rather than as a stripe. Where two bars cross,
+    the larger of the two shades wins.
+
+Two things about it are worth knowing before it is changed. The alpha is
+binary rather than feathered, because what reads it is a cutoff at a half and a
+feathered edge would only move where that cutoff lands. And a third of the
+image being solid means the *mip chain* averages towards an alpha of about 87,
+which is under the cutoff - so far enough away this grate thins out and
+disappears rather than filling in. That is the opposite of the usual complaint
+about cutouts and it has the same one cause.

@@ -11,7 +11,11 @@
 		{ "name": "door", "at": [6.00, 1.60, 2.20], "scale": [2.60, 3.00, 0.14],
 		  "mesh": "cube", "material": "plastic", "color": [0.72, 0.42, 0.28] },
 		{ "name": "ball loose", "at": [1.00, 1.90, -8.50], "scale": [0.52, 0.52, 0.52],
-		  "mesh": "sphere", "material": "metal",   "color": [0.35, 0.95, 0.85] }
+		  "mesh": "sphere", "material": "metal",   "color": [0.35, 0.95, 0.85] },
+		{ "name": "pane", "at": [3.00, 0.95, -8.60], "scale": [2.00, 1.90, 0.10],
+		  "mesh": "cube", "material": "construct/glass" },
+		{ "name": "grate", "at": [4.90, 0.86, -8.20], "scale": [1.60, 1.72, 0.08],
+		  "mesh": "cube", "material": "construct/grate" }
 	],
 
 	"bodies": [
@@ -33,7 +37,13 @@
 		{ "name": "ball loose", "entity": "ball loose", "kind": "dynamic",
 		  "shape": { "kind": "sphere", "radius": 0.5 },
 		  "mass": 1.0, "restitution": 0.22, "friction": 0.62, "layer": 1,
-		  "weightless": true }
+		  "weightless": true },
+		{ "name": "pane", "entity": "pane", "kind": "kinematic",
+		  "shape": { "kind": "box" },
+		  "mass": 4.0, "restitution": 0.05, "friction": 0.55, "layer": 1 },
+		{ "name": "grate", "entity": "grate", "kind": "kinematic",
+		  "shape": { "kind": "box" },
+		  "mass": 2.4, "restitution": 0.1, "friction": 0.7, "layer": 1 }
 	],
 
 	"joints": [

@@ -158,6 +158,27 @@ const NORMALS: &str = "_normal";
 /// How rough a surface is when nothing says otherwise.
 const ROUGH: f32 = 0.7;
 
+/// The color the hangar's window glass takes what is behind it in.
+///
+/// Green rather than neutral, and barely: it is what soda-lime glass does to
+/// the light through it, and a pane with no tint at all reads as a smear rather
+/// than as a surface.
+const GLASS_TINT: Vec3 = Vec3::new(0.70, 0.95, 0.88);
+
+/// How much of that pane there is.
+///
+/// Low enough to see the yard through, high enough that the pane's own
+/// highlight has something to sit on. It is the number to move first if the
+/// window reads as a haze.
+const GLASS_OPACITY: f32 = 0.45;
+
+/// The picture the grate prop is cut out of.
+///
+/// A lattice with real holes in its alpha, generated rather than drawn; the
+/// recipe is beside it in that directory's license, the way the map's normal
+/// maps and the sandbox's noises have theirs.
+const GRATE_TEXTURE: &str = "textures/construct/grate";
+
 /// The model the scene stands in the far corner.
 ///
 /// A whole file's worth of geometry, materials and pictures reached by one
@@ -4706,6 +4727,26 @@ fn dress(world: &mut World) {
 	world
 		.materials
 		.insert("plastic", Material::DEFAULT.finished(0.0, 0.5));
+	// the two the transparency step added, and they are the two halves of it.
+	// Neither is in `SURFACES`, because that table is for the map's five tiled
+	// stone-and-metal surfaces and both of these say something about the alpha
+	// that the table has no column for.
+	world.materials.insert(
+		"construct/glass",
+		Material::colored(GLASS_TINT)
+			// not a mirror, and that is a readability decision rather than a
+			// physical one: at a roughness a real pane deserves, the only thing
+			// this renderer has to draw on it is a highlight so tight that it
+			// catches at the edges alone, and a pane reads as a wireframe.
+			.finished(0.0, 0.16)
+			.translucent(GLASS_OPACITY),
+	);
+	world.materials.insert(
+		"construct/grate",
+		Material::textured(world.textures.find(GRATE_TEXTURE))
+			.finished(0.0, 0.55)
+			.masked(),
+	);
 	// the props in `scenes/props` name this one, which is the other half of
 	// the rule at the top of this function. @ref [`lay_props`].
 	world
