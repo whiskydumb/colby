@@ -37,7 +37,7 @@ use std::path::PathBuf;
 
 use colby_core::{
 	abi::{
-		material::Wrap,
+		material::{Blend, MASK_CUTOFF, Wrap},
 		texture::{Texel, TextureData},
 	},
 	glam::Vec3,
@@ -101,6 +101,12 @@ pub struct Surface {
 
 	/// What happens past the edge of both.
 	pub wrap: Wrap,
+
+	/// How its alpha is read.
+	pub blend: Blend,
+
+	/// How much of the surface there is, where the mode above reads it.
+	pub opacity: f32,
 }
 
 impl Default for Surface {
@@ -110,6 +116,8 @@ impl Default for Surface {
 			base_color: Vec3::ONE,
 			metallic: 1.0,
 			roughness: 1.0,
+			blend: Blend::Opaque,
+			opacity: 1.0,
 			albedo: None,
 			normal: None,
 			wrap: Wrap::Repeat,
@@ -202,7 +210,57 @@ impl Reading<'_> {
 			albedo,
 			normal,
 			wrap,
+			blend: self.blend(&entry),
+			// the fourth channel of the same factor the color came from. The
+			// exchange format says it is ignored outside the blended mode, and
+			// so does everything that reads it; it is carried across anyway,
+			// because a mode changed later should find the number already
+			// there rather than at one.
+			opacity: opacity(pbr.get("baseColorFactor")),
 		}
+	}
+
+	/// How a material says its alpha should be read.
+	///
+	/// The exchange format's three modes are colby's three, which is not a
+	/// coincidence: both took the set that the hardware actually distinguishes.
+	/// A word this reader does not know is a warning and an opaque surface,
+	/// which is the answer that draws something rather than nothing.
+	fn blend(&mut self, entry: &Value) -> Blend {
+		let written = entry
+			.get("alphaMode")
+			.and_then(Value::as_str)
+			.unwrap_or("OPAQUE");
+		let mode = match written {
+			| "OPAQUE" => Blend::Opaque,
+			| "MASK" => Blend::Mask,
+			| "BLEND" => Blend::Alpha,
+			| _ => {
+				self.note(&format!("reads its alpha as {written}, which is not a mode"));
+
+				Blend::Opaque
+			},
+		};
+
+		// the format's own default is the half colby cuts at, so a mask that
+		// says nothing about it imports exactly. One that says something else
+		// cannot: the threshold is a constant in the shader rather than a
+		// number on the material. @ref `colby-pre-commit-audit`, TR-2.
+		if mode == Blend::Mask {
+			let cutoff = entry
+				.get("alphaCutoff")
+				.and_then(Value::as_f32)
+				.unwrap_or(MASK_CUTOFF);
+
+			if (cutoff - MASK_CUTOFF).abs() > 1.0e-6 {
+				self.note(&format!(
+					"cuts its holes out at {cutoff} and colby cuts every one of them at \
+					 {MASK_CUTOFF}"
+				));
+			}
+		}
+
+		mode
 	}
 
 	/// The name a material registers under.
@@ -419,14 +477,6 @@ impl Reading<'_> {
 			}
 		}
 
-		if entry
-			.get("alphaMode")
-			.and_then(Value::as_str)
-			.is_some_and(|mode| mode != "OPAQUE")
-		{
-			self.note("is not opaque, and every material colby draws is");
-		}
-
 		if entry.get("normalTexture").is_some_and(|texture| {
 			texture
 				.get("scale")
@@ -461,6 +511,14 @@ fn number(pbr: &Value, name: &str) -> f32 {
 }
 
 /// The first three of four numbers, or white.
+/// The fourth channel of a base color factor, or all of it.
+fn opacity(written: Option<&Value>) -> f32 {
+	written
+		.map(Value::as_array)
+		.and_then(|cells| cells.get(3).and_then(Value::as_f32))
+		.unwrap_or(1.0)
+}
+
 fn color(written: Option<&Value>) -> Vec3 {
 	let Some(cells) = written.map(Value::as_array) else {
 		return Vec3::ONE;
@@ -719,16 +777,112 @@ mod tests {
 			 0, \"texCoord\": 1 } } } ]",
 		);
 
+		// what it says about its alpha is *not* in the list below any more, and
+		// that is the whole of this commit read from the other end: the file
+		// asks to be blended and colby now blends it.
+		assert_eq!(coats.surfaces[0].blend, Blend::Alpha, "the mode came across");
+
 		for about in [
 			"a metallic and roughness picture",
 			"an occlusion picture",
 			"an emissive color",
-			"is not opaque",
 			"scales its normal map",
 			"a second set of texture coordinates",
 		] {
 			assert!(complained(&coats, about), "nothing said {about}: {:?}", coats.warnings);
 		}
+	}
+
+	#[test]
+	fn the_three_words_a_material_can_say_about_its_alpha_are_the_three_modes() {
+		let coats = document(
+			"\"materials\": [ { \"alphaMode\": \"OPAQUE\" }, { \"alphaMode\": \"MASK\" }, { \
+			 \"alphaMode\": \"BLEND\" }, { } ]",
+		);
+		let modes: Vec<Blend> = coats
+			.surfaces
+			.iter()
+			.map(|surface| surface.blend)
+			.collect();
+
+		assert_eq!(
+			modes,
+			vec![Blend::Opaque, Blend::Mask, Blend::Alpha, Blend::Opaque],
+			"and a material that says nothing is opaque, which is what the format says"
+		);
+		assert!(coats.warnings.is_empty(), "none of them is a complaint: {:?}", coats.warnings);
+	}
+
+	#[test]
+	fn a_word_this_reader_does_not_know_is_named_and_drawn_solid() {
+		let coats = document("\"materials\": [ { \"alphaMode\": \"STOCHASTIC\" } ]");
+
+		assert_eq!(
+			coats.surfaces[0].blend,
+			Blend::Opaque,
+			"drawing it solid is the answer that draws something"
+		);
+		assert!(complained(&coats, "STOCHASTIC"), "and it is named: {:?}", coats.warnings);
+	}
+
+	#[test]
+	fn the_fourth_channel_of_a_base_color_is_how_much_of_the_surface_there_is() {
+		let coats = document(
+			"\"materials\": [ { \"alphaMode\": \"BLEND\", \"pbrMetallicRoughness\": { \
+			 \"baseColorFactor\": [ 0.2, 0.4, 0.6, 0.25 ] } }, { \"pbrMetallicRoughness\": { \
+			 \"baseColorFactor\": [ 1, 1, 1 ] } }, { } ]",
+		);
+
+		assert!((coats.surfaces[0].opacity - 0.25).abs() < 1e-6, "the alpha the file wrote");
+		assert!(
+			coats.surfaces[0]
+				.base_color
+				.abs_diff_eq(Vec3::new(0.2, 0.4, 0.6), 1e-6),
+			"and the three channels beside it are untouched by reading it"
+		);
+		assert!(
+			(coats.surfaces[1].opacity - 1.0).abs() < 1e-6,
+			"a factor of three numbers has no alpha in it, so the surface is all there"
+		);
+		assert!((coats.surfaces[2].opacity - 1.0).abs() < 1e-6, "and so has no factor at all");
+	}
+
+	#[test]
+	fn a_mask_that_cuts_somewhere_else_is_named_rather_than_quietly_moved() {
+		let quiet = document("\"materials\": [ { \"alphaMode\": \"MASK\" } ]");
+
+		assert!(
+			quiet.warnings.is_empty(),
+			"the format's own default is the half colby cuts at, so saying nothing is exact: \
+			 {:?}",
+			quiet.warnings
+		);
+
+		let stated =
+			document("\"materials\": [ { \"alphaMode\": \"MASK\", \"alphaCutoff\": 0.5 } ]");
+
+		assert!(stated.warnings.is_empty(), "and so is saying it: {:?}", stated.warnings);
+
+		let moved =
+			document("\"materials\": [ { \"alphaMode\": \"MASK\", \"alphaCutoff\": 0.9 } ]");
+
+		assert_eq!(moved.surfaces[0].blend, Blend::Mask, "it is still a mask");
+		assert!(
+			complained(&moved, "0.9"),
+			"and the number it wanted is named: {:?}",
+			moved.warnings
+		);
+
+		// the same number on a material that is not a mask says nothing about
+		// anything, and the format says so outright.
+		let elsewhere =
+			document("\"materials\": [ { \"alphaMode\": \"BLEND\", \"alphaCutoff\": 0.9 } ]");
+
+		assert!(
+			elsewhere.warnings.is_empty(),
+			"a cutoff outside a mask is not a cutoff: {:?}",
+			elsewhere.warnings
+		);
 	}
 
 	#[test]

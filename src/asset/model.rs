@@ -9,7 +9,7 @@
 //!
 //! ```text
 //!   0  ModelHeader                      64 bytes
-//!  64  [Coat;  material_count]          36 bytes each
+//!  64  [Coat;  material_count]          44 bytes each
 //!   .  [Stand; placement_count]         56 bytes each
 //!   .  the string blob, NUL-separated UTF-8
 //! ```
@@ -38,7 +38,10 @@ use std::path::Path;
 
 use colby_core::{
 	Result,
-	abi::{Transform, material::Wrap},
+	abi::{
+		Transform,
+		material::{Blend, Wrap},
+	},
 	bytemuck::{self, Pod, Zeroable},
 	err,
 	glam::{Quat, Vec3},
@@ -53,7 +56,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYMDL";
 ///
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The extension a compiled model is written with.
 pub const EXTENSION: &str = "cmodel";
@@ -153,6 +156,15 @@ pub struct Coat {
 
 	/// Zero is a mirror, one is chalk.
 	pub roughness: f32,
+
+	/// How its alpha is read, as [`Blend::code`].
+	///
+	/// A code rather than a flag, so a build that meets one it does not know
+	/// refuses the file - @ref [`Blend::from_code`] and [`check`].
+	pub blend: u32,
+
+	/// How much of the surface there is, where the mode above reads it.
+	pub opacity: f32,
 }
 
 /// One piece of a model standing somewhere.
@@ -219,6 +231,12 @@ pub struct Material {
 
 	/// What happens past the edge of its pictures.
 	pub wrap: Wrap,
+
+	/// How its alpha is read.
+	pub blend: Blend,
+
+	/// How much of the surface there is, where the mode above reads it.
+	pub opacity: f32,
 }
 
 /// One piece of a model, and where it stands.
@@ -342,6 +360,11 @@ impl ModelFile {
 					} else {
 						Wrap::Repeat
 					},
+					// unwrapped rather than defaulted: `check` refused the file
+					// if any coat named a mode this build does not know, so by
+					// here every one of them resolves.
+					blend: Blend::from_code(coat.blend).unwrap_or_default(),
+					opacity: coat.opacity,
 				})
 				.collect(),
 			placements: self
@@ -401,6 +424,8 @@ pub fn encode(data: &ModelData) -> Result<Vec<u8>> {
 			base_color: material.base_color.to_array(),
 			metallic: material.metallic,
 			roughness: material.roughness,
+			blend: material.blend.code(),
+			opacity: material.opacity,
 		})
 		.collect();
 	let stands: Vec<Stand> = data
@@ -553,14 +578,51 @@ fn check(bytes: &[u8]) -> std::result::Result<ModelHeader, String> {
 	}
 
 	fits::<Coat>(bytes, HEADER_BYTES, (header.coat_offset, header.coat_count), "materials")?;
+
+	// the one field in either record that is a *code*, and the only thing here
+	// that has to be looked at rather than measured: a wrap that is not one is
+	// read as the ordinary answer, because it has two values and both are
+	// sensible, while a mode this build does not know has nothing smaller to
+	// fall back to. @ref `colby-scene-format` for the same line drawn in the
+	// other format that has both.
+	unknown_blend(bytes, &header)?;
 	fits::<Stand>(bytes, HEADER_BYTES, (header.stand_offset, header.stand_count), "placements")?;
 	fits::<u8>(bytes, HEADER_BYTES, (header.names_offset, header.names_length), "names")?;
 
 	Ok(header)
 }
 
+/// Refuses a file naming an alpha mode this build does not have.
+///
+/// @param bytes - the whole file
+/// @param header - its already-checked header
+/// @return nothing, or which coat named what
+fn unknown_blend(bytes: &[u8], header: &ModelHeader) -> std::result::Result<(), String> {
+	let Some(range) = span::<Coat>(header.coat_offset, header.coat_count) else {
+		return Ok(());
+	};
+	let coats: &[Coat] = bytes
+		.get(range)
+		.and_then(|slice| bytemuck::try_cast_slice(slice).ok())
+		.unwrap_or(&[]);
+
+	for (index, coat) in coats.iter().enumerate() {
+		if Blend::from_code(coat.blend).is_none() {
+			return Err(format!(
+				"material {index} of this model reads its alpha in mode {}, which this build \
+				 does not have",
+				coat.blend
+			));
+		}
+	}
+
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+	use core::mem::offset_of;
+
 	use super::*;
 
 	/// Half of a quarter turn, in the two places a unit quaternion holds it.
@@ -578,6 +640,13 @@ mod tests {
 					metallic: 1.0,
 					roughness: 0.25,
 					wrap: Wrap::Clamp,
+					// the two below are deliberately different from each other
+					// and from the default in both records: a round trip that
+					// dropped either field, or wrote one material's answer to
+					// both, would come back equal to a fixture where they
+					// matched.
+					blend: Blend::Mask,
+					opacity: 1.0,
 				},
 				Material {
 					name: "models/lamp/glass".to_owned(),
@@ -588,6 +657,8 @@ mod tests {
 					metallic: 0.0,
 					roughness: 0.1,
 					wrap: Wrap::Repeat,
+					blend: Blend::Alpha,
+					opacity: 0.35,
 				},
 			],
 			placements: vec![
@@ -716,6 +787,33 @@ mod tests {
 			ModelFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("it still reads");
 
 		assert_eq!(file.to_model_data().materials[0].wrap, Wrap::Repeat);
+	}
+
+	#[test]
+	fn a_mode_this_build_does_not_know_is_refused_rather_than_read_as_the_nearest_one() {
+		// the field right after `wrap` in the record, which is what the test
+		// above pokes. A *code* and a *flag* are treated differently on
+		// purpose: the wrap above falls back because both of its answers are
+		// sensible, and this one cannot, because a mode nobody here has means
+		// a surface nobody here can draw.
+		let mut bytes = encode(&sample()).expect("it writes");
+		let at = HEADER_BYTES + offset_of!(Coat, blend);
+
+		bytes[at] = 0x7F;
+
+		let refused = ModelFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("a mode of 127 is not one of three");
+
+		assert!(format!("{refused}").contains("127"), "and the message names it, got {refused}");
+
+		// the half that says the check is about the value rather than about the
+		// byte having been touched at all.
+		bytes[at] = u8::try_from(Blend::Alpha.code()).expect("two fits in a byte");
+
+		assert!(
+			ModelFile::from_bytes(AlignedBytes::from_slice(&bytes)).is_ok(),
+			"a mode this build does have reads"
+		);
 	}
 
 	#[test]

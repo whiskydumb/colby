@@ -697,6 +697,8 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 				metallic: surface.metallic,
 				roughness: surface.roughness,
 				wrap: surface.wrap,
+				blend: surface.blend,
+				opacity: surface.opacity,
 			})
 			.collect(),
 		placements: imported
@@ -1995,6 +1997,54 @@ mod model_tests {
 
 		assert_eq!(column.mesh, "models/lamp/column");
 		assert_eq!(column.material, "models/lamp/stone");
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn what_a_document_says_about_its_alpha_reaches_the_compiled_model() {
+		let dir = workspace("alpha");
+
+		// the shipped fixture with one material asked to blend, which is the
+		// one link in the chain from a file on disk to a record in a `.cmodel`
+		// that nothing else here walks: the importer is tested against
+		// documents it builds itself, and the format against records it builds
+		// itself, and this is the seam between the two.
+		let written = std::str::from_utf8(LOOSE).expect("the fixture is text");
+		let asked =
+			written.replace("\"name\":\"brass\",", "\"name\":\"brass\",\"alphaMode\":\"BLEND\",");
+
+		assert!(
+			asked.contains("\"alphaMode\":\"BLEND\""),
+			"the line this test edits is still in the fixture"
+		);
+		assert!(
+			!written.contains("alphaMode"),
+			"and the fixture did not already say it, which would make this test say nothing"
+		);
+
+		put(&dir, "models/lamp.gltf", asked.as_bytes());
+		put(&dir, "models/model.bin", BUFFER);
+		put(&dir, "models/tiles.png", COLOR);
+		put(&dir, "models/tiles_normal.png", BUMP);
+
+		let report = run(&dir, false);
+
+		assert!(report.failed.is_empty(), "{:?}", report.failed);
+
+		let data = compiled(&dir);
+
+		assert_eq!(data.materials[0].name, "models/lamp/brass", "the one that was asked");
+		assert_eq!(
+			data.materials[0].blend,
+			colby_core::abi::material::Blend::Alpha,
+			"and it blends on the far side"
+		);
+		assert_eq!(
+			data.materials[1].blend,
+			colby_core::abi::material::Blend::Opaque,
+			"while the one beside it, which said nothing, is solid"
+		);
 
 		drop(fs::remove_dir_all(&dir));
 	}

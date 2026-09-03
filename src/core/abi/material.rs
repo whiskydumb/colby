@@ -108,7 +108,49 @@ impl Blend {
 			| Self::Alpha => 2,
 		}
 	}
+
+	/// The number a file writes this mode down as.
+	///
+	/// The same shape [`Wrap::code`] has and for the same reason: a format has
+	/// to name a mode with something that does not move when the enum is
+	/// reordered.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "a fieldless repr(u32) enum casts to its own discriminant"
+	)]
+	pub const fn code(self) -> u32 { self as u32 }
+
+	/// The mode a file wrote down, or nothing if this build does not know it.
+	///
+	/// An `Option` rather than a fallback, because this is a *code* and not a
+	/// flag: it says which of several things a record is and has nothing
+	/// smaller to fall back to, so a build meeting one it does not know has to
+	/// refuse the file rather than guess. The other format that has both draws
+	/// the same line in the same place.
+	#[must_use]
+	pub const fn from_code(code: u32) -> Option<Self> {
+		match code {
+			| 0 => Some(Self::Opaque),
+			| 1 => Some(Self::Mask),
+			| 2 => Some(Self::Alpha),
+			| _ => None,
+		}
+	}
 }
+
+/// How much alpha a texel needs before [`Blend::Mask`] draws it at all.
+///
+/// **Written down three times and it has to stay one number**: here, in the
+/// scene's shader and in the cascade pass's, because a shader module cannot
+/// include another one and neither can read a constant out of Rust. What keeps
+/// them level is a test rather than anybody's memory - a fence whose shadow had
+/// different holes in it than the fence has is invisible except on a lit scene.
+///
+/// A constant rather than a number on the material, for the reason written on
+/// [`Blend::Mask`]. It is also the exchange format's own default, so a masked
+/// material exported from anywhere imports exactly.
+pub const MASK_CUTOFF: f32 = 0.5;
 
 /// How rough an unspecified surface is.
 ///
@@ -441,6 +483,23 @@ mod tests {
 			Material { blend: Blend::Opaque, ..masked },
 			plain,
 			"and putting the mode back gives the material it was made from"
+		);
+	}
+
+	#[test]
+	fn a_mode_survives_being_written_down_as_a_number() {
+		for mode in [Blend::Opaque, Blend::Mask, Blend::Alpha] {
+			assert_eq!(
+				Blend::from_code(mode.code()),
+				Some(mode),
+				"{mode:?} comes back as itself"
+			);
+		}
+
+		assert_eq!(
+			Blend::from_code(u32::try_from(Blend::COUNT).unwrap_or(u32::MAX)),
+			None,
+			"and a code this build does not know is refused rather than guessed at"
 		);
 	}
 

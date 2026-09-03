@@ -578,6 +578,8 @@ fn load_model(world: &mut World, path: &Path, name: &str) {
 		world.materials.insert(&material.name, Material {
 			base_color: material.base_color,
 			wrap: material.wrap,
+			blend: material.blend,
+			opacity: material.opacity,
 			..Material::textured(albedo)
 				.bumped(normal)
 				.finished(material.metallic, material.roughness)

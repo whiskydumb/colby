@@ -2013,10 +2013,12 @@ f 1 4 5
 
 	#[test]
 	fn both_shaders_cut_their_holes_out_at_the_same_place() {
-		// a module cannot include another one, so the constant is written twice
-		// and this is what stops the two drifting: a fence whose shadow had
-		// different holes in it than the fence has is the exact bug that would
-		// follow, and it is invisible on anything but a lit scene.
+		// a module cannot include another one and neither can read a constant
+		// out of Rust, so the number is written three times and this is what
+		// stops the three drifting. A fence whose shadow had different holes in
+		// it than the fence has is the exact bug that would follow, and it is
+		// invisible on anything but a lit scene; the importer reading the third
+		// copy would quietly warn about files that are in fact exact.
 		let declaration = "const MASK_CUTOFF: f32 = ";
 		let cutoff = |source: &str, name: &str| {
 			source
@@ -2026,10 +2028,17 @@ f 1 4 5
 				.unwrap_or_else(|| panic!("{name} declares no {declaration}"))
 		};
 
+		let scene = cutoff(include_str!("shader.wgsl"), "shader.wgsl");
+
 		assert_eq!(
-			cutoff(include_str!("shader.wgsl"), "shader.wgsl"),
+			scene,
 			cutoff(include_str!("shadow.wgsl"), "shadow.wgsl"),
 			"the scene and the cascades have to agree on which texels are holes"
+		);
+		assert_eq!(
+			scene.parse::<f32>().ok(),
+			Some(colby_core::abi::material::MASK_CUTOFF),
+			"and so does the one the importer measures a file's own cutoff against"
 		);
 	}
 
