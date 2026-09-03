@@ -280,7 +280,7 @@ mod tests {
 			rc::Rc,
 		};
 
-		use colby_net::{NOTHING, Snapshot, Solid};
+		use colby_net::{MAX_SNAPSHOT, NOTHING, Snapshot, Solid};
 
 		use crate::net::{Loopback, Wire};
 
@@ -314,7 +314,7 @@ mod tests {
 			let mut out = Vec::new();
 
 			table[body.slot()] = Some((body.generation(), solid));
-			Snapshot::write(number, NOTHING, NOTHING, &[], &table, &mut out);
+			Snapshot::write(number, NOTHING, NOTHING, &[], &table, MAX_SNAPSHOT, &mut out);
 			assert!(net.absorbed(&out, Duration::from_millis(when)));
 		}
 

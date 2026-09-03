@@ -81,8 +81,8 @@ pub use self::{
 	reliable::{MAX_ITEM, MAX_ITEMS, Reliable},
 	ring::{DEPTH, Ring},
 	snapshot::{
-		Change, FIELDS, Fault, MAX_BASELINE, MAX_SLOTS, MAX_SNAPSHOT, NOTHING, SNAPSHOTS, Slot,
-		Snapshot, Solid, WORDS, Written, every,
+		Change, FIELDS, Fault, LEAST_BASELINE, LEAST_ROOM, MAX_BASELINE, MAX_SLOTS, MAX_SNAPSHOT,
+		NOTHING, SNAPSHOTS, Slot, Snapshot, Solid, WORDS, Written, every,
 	},
 };
 

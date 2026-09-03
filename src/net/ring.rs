@@ -5,7 +5,7 @@
 //!   let number = ring.next();
 //!   let (base, against) = ring.base(what_the_peer_says_it_holds);
 //!
-//!   Snapshot::write(number, against, ours, base, now, out)?;
+//!   Snapshot::write(number, against, ours, base, now, room, out)?;
 //!   ring.keep(number, now);
 //! ```
 //!
@@ -378,7 +378,7 @@ impl Default for Ring {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::snapshot::{Change, Snapshot};
+	use crate::snapshot::{Change, MAX_SNAPSHOT, Snapshot};
 
 	/// A body somewhere, with every word set to something a zero is not.
 	fn somewhere() -> Solid {
@@ -709,7 +709,7 @@ mod tests {
 
 			// `NOTHING` is this end's own `holding`: the host is being told nothing
 			// by anybody in this test, and the field says what the *sender* has.
-			Snapshot::write(number, against, NOTHING, base, &now, &mut out);
+			Snapshot::write(number, against, NOTHING, base, &now, MAX_SNAPSHOT, &mut out);
 			ring.keep(number, &now);
 
 			// nothing arrives for longer than the ring remembers, so what the

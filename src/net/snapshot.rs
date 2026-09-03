@@ -6,7 +6,7 @@
 //! did.
 //!
 //! ```text
-//!   Snapshot::write(number, against, holding, &before, &now, &mut out)
+//!   Snapshot::write(number, against, holding, &before, &now, room, MAX_SNAPSHOT, &mut out)
 //!   Snapshot::read(&before, bytes) -> the records, and how far it read
 //! ```
 //!
@@ -139,7 +139,7 @@ use colby_core::{
 	glam::{Quat, Vec3},
 };
 
-use crate::packet::{u16_at, u32_at};
+use crate::packet::{MAX_MESSAGE, MAX_PAYLOAD, u16_at, u32_at};
 
 /// How many snapshots a second an endpoint aims to send.
 ///
@@ -195,43 +195,59 @@ pub const MAX_SLOTS: usize = colby_core::abi::MAX_BODIES;
 
 /// The largest a written snapshot may be, in bytes.
 ///
-/// Not [`MAX_MESSAGE`](crate::MAX_MESSAGE), and the difference matters. A
-/// message carries the reliable ring *and* a snapshot, the ring may be sixty
-/// four commands of a kilobyte each, and a channel that is handed a message too
-/// long **refuses the whole thing** rather than trimming it. So a snapshot
-/// sized against the message ceiling would, exactly when a peer has stopped
-/// acknowledging and the ring has filled, throw the ring away with itself. This
-/// is what is left over once the ring has all it can ask for, rounded down
-/// hard.
+/// **As much as eight datagrams carry, and the unit is the point.** A message
+/// is lost whole when one of its pieces is, so a snapshot cut into eight gets
+/// through a wire that loses a tenth of what it carries about two times in
+/// five, and one cut into sixty-four about one time in a thousand. What decides
+/// how big a snapshot may be is therefore not how much room a message has: it
+/// is how many pieces are worth risking at once, and past that a bigger block
+/// arrives less often rather than more. A world too big for one is told over
+/// the snapshots after it, which is what [`write`](Snapshot::write) stopping
+/// rather than refusing bought.
 ///
-/// **This is a ceiling on how many bodies can be described at once, and the
-/// number is [`MAX_BASELINE`].** A world with more moving parts than that
-/// cannot be sent in full at all: there is no continuation and no resume, so a
-/// baseline either fits or is refused. That is not an oversight to be fixed
-/// here - deciding *which* bodies a given peer is told about is what answers
-/// it, and until something decides that, sending all of them is the only thing
-/// on offer.
+/// It is not [`MAX_MESSAGE`](crate::MAX_MESSAGE) for a second reason as well: a
+/// message carries the reliable ring *and* a block of commands *and* this, and
+/// a channel handed a message too long **refuses the whole thing** rather than
+/// trimming it. What keeps that from happening is not this number - it is the
+/// room `write` is given, which is what the other two blocks left. @ref
+/// [`LEAST_ROOM`].
+pub const MAX_SNAPSHOT: usize = MAX_PAYLOAD * 8;
+
+/// The least room a snapshot is ever given, in bytes.
 ///
-/// **The number is eighty three, and that is closer than it sounds.** The
-/// sandbox's map is fifty one bodies before a player has built anything, and
-/// its prop ceiling is ninety six, so a world past this limit is a few minutes
-/// of play rather than a hypothetical. What happens then is worse than a
-/// dropped frame: a peer with no base is owed a baseline, the baseline does
-/// not fit, nothing is kept, so the peer never learns of a base to answer
-/// with - and every attempt after it is the same baseline failing the same
-/// way. The endpoint that discovers this says so once, by address.
-/// @ref `crate::MAX_BASELINE`, which is the worst case; a record with fields
-/// it does not need to send is smaller and the real wall is higher.
-pub const MAX_SNAPSHOT: usize = 8192;
+/// What is left of a message with the reliable ring full to its worst case and
+/// a block of commands full to its. **That worst case is eighty-seven percent
+/// of a message and does not happen**, which is why the room is worked out per
+/// message rather than reserved - but it is what a promise has to be made
+/// against, so everything the build undertakes about a snapshot is undertaken
+/// at this number and not at [`MAX_SNAPSHOT`].
+pub const LEAST_ROOM: usize = MAX_MESSAGE - RING - crate::command::MAX_BLOCK;
+
+/// How many bytes a record takes when nothing about it can be left out.
+///
+/// Its key, its reach, a full mask and every word, which is what a slot the far
+/// end has never heard of costs.
+const WHOLE: usize = KEY + 1 + WORDS.div_ceil(8) + WORDS * 4;
 
 /// How many bodies one snapshot can carry when every one of them is new.
 ///
-/// The number [`MAX_SNAPSHOT`] really means, worked out rather than guessed:
-/// a record nothing can be delta'd against carries its key, its reach, a full
-/// mask and every word. Below this a baseline always fits; above it, a baseline
-/// is impossible rather than merely large, which is why the number is worth
-/// having a name and a test.
-pub const MAX_BASELINE: usize = (MAX_SNAPSHOT - HEAD) / (KEY + 1 + WORDS.div_ceil(8) + WORDS * 4);
+/// The number [`MAX_SNAPSHOT`] really means, worked out rather than guessed: a
+/// record nothing can be delta'd against carries its key, its reach, a full
+/// mask and every word.
+///
+/// **A world with more moving parts than this is not refused.** It is written
+/// as far up the slot table as fits and the rest arrives over the snapshots
+/// after it, so what this number says is how *fast* a big world is told rather
+/// than whether it can be. It is the worst case as well - a record with fields
+/// it does not need to send is shorter, and the wall that was measured is
+/// nearly half again as high.
+pub const MAX_BASELINE: usize = (MAX_SNAPSHOT - HEAD) / WHOLE;
+
+/// The same, with the ring as full as it can be.
+///
+/// The one there is a promise about: however much of a message the blocks in
+/// front have taken, a snapshot can still speak about this many new bodies.
+pub const LEAST_BASELINE: usize = (LEAST_ROOM - HEAD) / WHOLE;
 
 /// A slot that has emptied since the last snapshot, in place of a field count.
 ///
@@ -487,20 +503,25 @@ const _: () = {
 	reason = "a const, where try_from is not available"
 )]
 const _: () = assert!(WORDS < GONE as usize, "the removal mark is out of the table's range");
-// and the three ceilings have to fit in one message together, because all
-// three blocks go in every message and a channel refuses a message too long
-// whole rather than trimming it: a full reliable ring, a full snapshot and a
-// full block of commands at once must still be something that can be sent.
-//
-// no `+ HEAD`: `MAX_SNAPSHOT` is measured over the whole block, its own head
-// included, because that is what `write` compares against. @ref
-// `crate::command`, whose own ceiling is the third term and which points back
-// here rather than repeating the sum.
+// all three blocks go in every message and a channel refuses a message too
+// long whole rather than trimming it, so the three ceilings used to have to
+// add up to less than a message between them. They do not any more: a snapshot
+// takes what the other two left, so the sum cannot be wrong. What has to be
+// checked instead is that the leftover is worth having - a full ring and a
+// full block of commands must still leave room for a snapshot's head and a
+// whole record under it, or a peer whose ring has filled stops being told
+// anything about the world at all.
 const _: () = assert!(
-	MAX_SNAPSHOT + RING + crate::command::MAX_BLOCK < crate::MAX_MESSAGE,
-	"a full ring, a full snapshot and a full block of commands have to fit in one message"
+	LEAST_BASELINE > 0,
+	"a full reliable ring has to leave room for a snapshot with a body in it"
 );
-const _: () = assert!(MAX_BASELINE > 0, "a snapshot has to be able to carry at least one body");
+// and the ceiling has to sit above that floor, or the room a message has left
+// would never be the smaller of the two and the clamp in `write` would be a
+// line nothing could reach.
+const _: () = assert!(
+	MAX_SNAPSHOT > LEAST_ROOM,
+	"a snapshot's own ceiling is what bites when the message it goes in is not full"
+);
 
 /// What was wrong with a snapshot somebody sent.
 ///
@@ -642,12 +663,22 @@ impl Snapshot {
 	/// occupied in `now` and absent from `before`, which is already the one
 	/// thing this format writes in full.
 	///
+	/// **What it fits into is said by the caller**, because a snapshot is the
+	/// last block of a message and what it may take is what the blocks in front
+	/// of it left. That is the whole of how three ceilings that cannot all be
+	/// paid at once stop having to add up.
+	///
 	/// @param number - which snapshot this is
 	/// @param against - which one it is a difference from, or [`NOTHING`]
 	/// @param holding - the newest snapshot this end holds, for the far end to
 	/// write its next difference against
 	/// @param before - what the far end is known to have, by slot
 	/// @param now - what is true, by slot
+	/// @param room - the most this block may take, which is what the message it
+	/// is going into has left, and never more than [`MAX_SNAPSHOT`] whatever
+	/// the caller says. A head is written whether or not there is room for one:
+	/// a block with no head in it is not something the far end can read past,
+	/// and no caller can produce that anyway - @ref [`LEAST_ROOM`]
 	/// @param out - where the bytes go, appended
 	/// @return how many slots were spoken about, and how far up the table this
 	/// snapshot got
@@ -657,9 +688,11 @@ impl Snapshot {
 		holding: u32,
 		before: &[Slot],
 		now: &[Slot],
+		room: usize,
 		out: &mut Vec<u8>,
 	) -> Written {
 		let began = out.len();
+		let room = room.min(MAX_SNAPSHOT);
 		// said against nothing means written against nothing, whatever the
 		// caller handed over. @ref the module's note on `against`.
 		let before: &[Slot] = if against == NOTHING { &[] } else { before };
@@ -692,7 +725,7 @@ impl Snapshot {
 				continue;
 			}
 
-			if out.len() - began > MAX_SNAPSHOT {
+			if out.len() - began > room {
 				out.truncate(mark);
 				reached = slot;
 
@@ -1077,7 +1110,7 @@ mod tests {
 	/// difference from what the receiver holds and a block that said otherwise
 	/// would now be written against nothing at all.
 	fn tell(far: &Far, now: &[Slot], out: &mut Vec<u8>) -> usize {
-		Snapshot::write(1, 1, NOTHING, &far.held, now, out).spoken
+		Snapshot::write(1, 1, NOTHING, &far.held, now, MAX_SNAPSHOT, out).spoken
 	}
 
 	/// Whether two tables describe the same world, ignoring trailing holes.
@@ -1096,7 +1129,8 @@ mod tests {
 
 		// written by hand rather than through `tell`, which writes a difference:
 		// this one is the baseline, and its base is empty on purpose.
-		let written = Snapshot::write(1, NOTHING, NOTHING, &far.held, &now, &mut out);
+		let written =
+			Snapshot::write(1, NOTHING, NOTHING, &far.held, &now, MAX_SNAPSHOT, &mut out);
 
 		assert_eq!(written.spoken, 1, "one slot spoken about");
 
@@ -1354,7 +1388,7 @@ mod tests {
 
 			let mut out = Vec::new();
 
-			Snapshot::write(step + 1, step, step, &far.held, &world, &mut out);
+			Snapshot::write(step + 1, step, step, &far.held, &world, MAX_SNAPSHOT, &mut out);
 			far.take(&out).expect("what was written reads");
 
 			assert!(
@@ -1621,7 +1655,7 @@ mod tests {
 			.collect();
 		let mut out = vec![0xAB; 3];
 
-		let written = Snapshot::write(1, NOTHING, NOTHING, &[], &full, &mut out);
+		let written = Snapshot::write(1, NOTHING, NOTHING, &[], &full, MAX_SNAPSHOT, &mut out);
 
 		assert_eq!(written.spoken, MAX_BASELINE, "as many bodies as a baseline holds");
 		assert_eq!(written.reached, MAX_BASELINE, "and it says where it stopped");
@@ -1662,7 +1696,8 @@ mod tests {
 
 			let mut out = Vec::new();
 			let against = if blocks == 1 { NOTHING } else { 1 };
-			let written = Snapshot::write(blocks, against, NOTHING, &held, &full, &mut out);
+			let written =
+				Snapshot::write(blocks, against, NOTHING, &held, &full, MAX_SNAPSHOT, &mut out);
 
 			// **the sender keeps only what it sent**, which is the whole of
 			// the carrying over. Keeping the world it wanted to send would
@@ -1761,17 +1796,97 @@ mod tests {
 
 	#[test]
 	fn a_baseline_holds_the_number_of_bodies_it_says_it_does() {
-		// the ceiling is a real limit on how big a world may be, so the number
-		// is written down and checked rather than left to be discovered by a
-		// world that quietly stopped being sendable.
+		// the ceiling is a real limit on how fast a big world can be told, so
+		// the number is written down and checked rather than left to be
+		// discovered by a world that quietly takes six snapshots to arrive.
 		let record = KEY + 1 + WORDS.div_ceil(8) + WORDS * 4;
 
+		assert_eq!(WHOLE, record);
 		assert_eq!(MAX_BASELINE, (MAX_SNAPSHOT - HEAD) / record);
-		assert!(MAX_BASELINE >= 51, "the sandbox has fifty one bodies and has to fit");
+		assert_eq!(LEAST_BASELINE, (LEAST_ROOM - HEAD) / record);
+		assert!(LEAST_BASELINE >= 51, "the sandbox has fifty one bodies and has to fit");
 		assert!(
 			MAX_BASELINE < MAX_SLOTS,
 			"and a world of every slot does not, which is what interest management is for"
 		);
+	}
+
+	#[test]
+	fn the_numbers_the_budget_is_made_of_are_the_ones_it_uses() {
+		// each of these is a decision with an argument above it, and every
+		// other test here writes and reads through the same constants and
+		// would not notice any of them moving.
+		assert_eq!(MAX_SNAPSHOT, 9440, "as much as eight datagrams carry");
+		assert_eq!(LEAST_ROOM, 9064, "and what is left with the ring as full as it goes");
+		assert_eq!(WHOLE, 98, "a record with nothing left out of it");
+		assert_eq!(MAX_BASELINE, 96);
+		assert_eq!(LEAST_BASELINE, 92);
+		assert_eq!(RING, 65_674, "which is eighty-seven percent of a message");
+		assert_eq!(
+			RING + crate::command::MAX_BLOCK + LEAST_ROOM,
+			MAX_MESSAGE,
+			"the three of them are a message exactly, which is what makes the third a remainder"
+		);
+	}
+
+	#[test]
+	fn a_snapshot_takes_no_more_than_the_room_it_was_given() {
+		// the clamp is what stops the three blocks of a message having to add
+		// up: what a snapshot may take is what the ring and the commands in
+		// front of it left, and a channel refuses a message too long whole.
+		// every record the full ninety eight bytes, the way the cutting test
+		// above builds one: a world whose bodies only nudge one field fits
+		// whole and never has to be cut at all.
+		let full: Vec<Slot> = (0..MAX_BASELINE * 2)
+			.map(|slot| {
+				Some((1, Solid {
+					kind: u32::try_from(slot + 1).unwrap_or(1),
+					..somewhere()
+				}))
+			})
+			.collect();
+		let mut roomy = Vec::new();
+		let mut tight = Vec::new();
+
+		let wide = Snapshot::write(1, NOTHING, NOTHING, &[], &full, MAX_SNAPSHOT, &mut roomy);
+		let narrow = Snapshot::write(1, NOTHING, NOTHING, &[], &full, 2000, &mut tight);
+
+		assert_eq!(wide.spoken, MAX_BASELINE, "as many as the ceiling holds");
+		assert!(roomy.len() <= MAX_SNAPSHOT);
+		assert!(narrow.spoken < wide.spoken, "and fewer when there is less room");
+		assert!(tight.len() <= 2000, "which is the room it was given");
+		assert!(narrow.spoken > 0, "but not so few that nothing crosses");
+
+		// and a caller offering more than the ceiling does not get more.
+		let mut greedy = Vec::new();
+		let over = Snapshot::write(1, NOTHING, NOTHING, &[], &full, MAX_MESSAGE, &mut greedy);
+
+		assert_eq!(over.spoken, MAX_BASELINE, "the ceiling is the ceiling");
+		assert_eq!(greedy, roomy, "byte for byte what the ceiling itself gave");
+
+		// room for exactly twenty whole records and its head, which is the one
+		// length that tells "as much as fits" from "less than fits". Every
+		// record here is the full ninety eight bytes, so the sum is exact.
+		let mut exact = Vec::new();
+		let level =
+			Snapshot::write(1, NOTHING, NOTHING, &[], &full, HEAD + 20 * WHOLE, &mut exact);
+
+		assert_eq!(level.spoken, 20, "a block that fills its room exactly is not cut");
+		assert_eq!(exact.len(), HEAD + 20 * WHOLE);
+	}
+
+	#[test]
+	fn a_snapshot_with_no_room_at_all_is_still_a_head() {
+		// no caller can produce this - the build assertion says a full ring
+		// still leaves nine thousand bytes - but `write` is public and a block
+		// without a head in it is not something the far end can read past.
+		let now = table(&[(0, 1, somewhere())]);
+		let mut out = Vec::new();
+		let written = Snapshot::write(7, NOTHING, 3, &[], &now, 0, &mut out);
+
+		assert_eq!(out.len(), HEAD, "the head and not one record");
+		assert_eq!(written.spoken, 0);
+		assert_eq!(Snapshot::peek(&out).expect("a head"), (7, NOTHING, 3));
 	}
 
 	#[test]
@@ -1930,6 +2045,7 @@ mod tests {
 			NOTHING,
 			&table(&[(0, 1, before)]),
 			&table(&[(0, 1, still)]),
+			MAX_SNAPSHOT,
 			&mut out,
 		);
 
@@ -1948,6 +2064,7 @@ mod tests {
 			NOTHING,
 			&table(&[(0, 1, before)]),
 			&table(&[(0, 1, moved)]),
+			MAX_SNAPSHOT,
 			&mut out,
 		);
 
@@ -1967,7 +2084,15 @@ mod tests {
 		resting.sleeping = 0;
 		resting.velocity = [0.0, 0.0, 0.0];
 
-		Snapshot::write(1, NOTHING, NOTHING, &[], &table(&[(0, 1, resting)]), &mut out);
+		Snapshot::write(
+			1,
+			NOTHING,
+			NOTHING,
+			&[],
+			&table(&[(0, 1, resting)]),
+			MAX_SNAPSHOT,
+			&mut out,
+		);
 
 		let (back, _) = Snapshot::read(&now, &out).expect("what was written reads");
 
@@ -1988,8 +2113,8 @@ mod tests {
 		let mut said = Vec::new();
 		let mut plain = Vec::new();
 
-		Snapshot::write(1, NOTHING, NOTHING, &now, &now, &mut said);
-		Snapshot::write(1, NOTHING, NOTHING, &[], &now, &mut plain);
+		Snapshot::write(1, NOTHING, NOTHING, &now, &now, MAX_SNAPSHOT, &mut said);
+		Snapshot::write(1, NOTHING, NOTHING, &[], &now, MAX_SNAPSHOT, &mut plain);
 
 		assert_eq!(said, plain, "the base it was given made no difference to what went out");
 
@@ -2013,7 +2138,7 @@ mod tests {
 		let now = table(&[(0, 1, somewhere())]);
 		let mut out = Vec::new();
 
-		Snapshot::write(9, NOTHING, 4, &[], &now, &mut out);
+		Snapshot::write(9, NOTHING, 4, &[], &now, MAX_SNAPSHOT, &mut out);
 
 		assert_eq!(&out[0..4], &9_u32.to_le_bytes(), "the number is first");
 		assert_eq!(&out[4..8], &NOTHING.to_le_bytes(), "what it is written against is second");

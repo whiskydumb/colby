@@ -66,8 +66,8 @@ use colby_core::{
 	info, warn,
 };
 use colby_net::{
-	Block, Channel, Conditions, Delivery, Header, Heard, Kind, Link, MAX_DATAGRAM, NOTHING,
-	Parcel, Pieces, Reliable, Ring, Slot, Snapshot, Solid, every, parcel,
+	Block, Channel, Conditions, Delivery, Header, Heard, Kind, Link, MAX_DATAGRAM, MAX_MESSAGE,
+	NOTHING, Parcel, Pieces, Reliable, Ring, Slot, Snapshot, Solid, every, parcel,
 };
 
 /// A session number no other run of this program will pick.
@@ -2099,6 +2099,13 @@ const STARVED: u32 = 60;
 /// and nothing else, which is the field the far end needs to stop sending
 /// baselines forever.
 ///
+/// **What room it has is what the message has left**, which is the whole of
+/// why the three block ceilings no longer have to add up to less than a
+/// message. The reliable ring and the block of commands are already written by
+/// the time this runs, so what they took is a fact rather than a worst case -
+/// and the worst case, a ring full of the longest items there are, is
+/// eighty-seven percent of a message and does not happen.
+///
 /// @param peer - whose conversation this is
 /// @param world - what to describe, or nothing
 /// @param out - the message so far, appended
@@ -2113,8 +2120,9 @@ fn describe(peer: &mut Peer, world: Option<&[Slot]>, out: &mut Vec<u8>) -> bool 
 
 	let number = peer.told.next();
 	let holding = peer.taken.heard.holding();
+	let room = left(out);
 	let (base, against) = peer.told.base(peer.taken.theirs);
-	let written = Snapshot::write(number, against, holding, base, world, out);
+	let written = Snapshot::write(number, against, holding, base, world, room, out);
 	let reached = written.reached.min(world.len());
 	let whole = written.reached >= world.len();
 
@@ -2157,10 +2165,17 @@ fn describe(peer: &mut Peer, world: Option<&[Slot]>, out: &mut Vec<u8>) -> bool 
 
 /// A block that describes nothing and says only what this end holds.
 fn nothing(holding: u32, out: &mut Vec<u8>) {
-	let written = Snapshot::write(NOTHING, NOTHING, holding, &[], &[], out);
+	let written = Snapshot::write(NOTHING, NOTHING, holding, &[], &[], left(out), out);
 
 	debug_assert_eq!(written.spoken, 0, "a block of nothing speaks about nothing");
 }
+
+/// How many bytes of a message are still to be had.
+///
+/// A function of one line because it is the sentence the budget rests on: a
+/// snapshot is the last block of a message, so what it may take is what the
+/// blocks in front of it did not.
+fn left(out: &[u8]) -> usize { MAX_MESSAGE.saturating_sub(out.len()) }
 
 /// Names one peer if it has no name, and files what it asked for.
 ///
@@ -2631,7 +2646,7 @@ mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
 	use colby_core::abi::{Transform, net::MAX_PEERS as PLAYERS};
-	use colby_net::{MAX_BASELINE, MAX_PARCEL};
+	use colby_net::{MAX_ASKED, MAX_BASELINE, MAX_PARCEL, MAX_SNAPSHOT};
 
 	use super::*;
 
@@ -3274,12 +3289,12 @@ mod tests {
 		let mut out = Vec::new();
 
 		// snapshot one, a baseline.
-		Snapshot::write(1, NOTHING, NOTHING, &[], &one, &mut out);
+		Snapshot::write(1, NOTHING, NOTHING, &[], &one, MAX_SNAPSHOT, &mut out);
 		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 
 		// snapshot two, moved away, taken against one.
 		out.clear();
-		Snapshot::write(2, 1, NOTHING, &one, &two, &mut out);
+		Snapshot::write(2, 1, NOTHING, &one, &two, MAX_SNAPSHOT, &mut out);
 		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 		assert_eq!(taken.heard.holding(), 2);
 
@@ -3288,7 +3303,7 @@ mod tests {
 		// body is in this block at all.
 		out.clear();
 
-		let spoken = Snapshot::write(3, 1, NOTHING, &one, &one, &mut out);
+		let spoken = Snapshot::write(3, 1, NOTHING, &one, &one, MAX_SNAPSHOT, &mut out);
 
 		assert_eq!(spoken.spoken, 0, "the sender sees nothing to say, which is the whole trap");
 		assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
@@ -3317,7 +3332,7 @@ mod tests {
 
 		for number in 1..=3 {
 			out.clear();
-			Snapshot::write(number, NOTHING, NOTHING, &[], &world(1.0), &mut out);
+			Snapshot::write(number, NOTHING, NOTHING, &[], &world(1.0), MAX_SNAPSHOT, &mut out);
 			assert!(absorb(&mut taken, &out, &mut applying, Duration::ZERO));
 		}
 
@@ -3326,7 +3341,7 @@ mod tests {
 
 		// and now snapshot two again, which the ring still has a place for.
 		out.clear();
-		Snapshot::write(2, NOTHING, NOTHING, &[], &world(9.0), &mut out);
+		Snapshot::write(2, NOTHING, NOTHING, &[], &world(9.0), MAX_SNAPSHOT, &mut out);
 
 		assert!(
 			absorb(&mut taken, &out, &mut applying, Duration::ZERO),
@@ -3425,7 +3440,7 @@ mod tests {
 		let (base, against) = net.peers[0].taken.heard.base(NOTHING);
 
 		assert_eq!(against, NOTHING);
-		Snapshot::write(number, against, NOTHING, base, world, &mut out);
+		Snapshot::write(number, against, NOTHING, base, world, MAX_SNAPSHOT, &mut out);
 
 		let mut applying = Vec::new();
 
@@ -4266,6 +4281,42 @@ mod tests {
 		assert!(host.said().is_empty(), "a block that does not parse says nothing");
 		assert_eq!(host.peers(), 0, "and the peer that sent it is not talked to again");
 		assert_eq!(host.forgotten(), 1);
+	}
+
+	#[test]
+	fn a_message_with_every_block_at_its_worst_still_goes_out() {
+		// the one configuration where the three blocks of a message all want
+		// their ceiling at once: a reliable ring full of the longest items
+		// there are, a full window of commands, and a world too big to
+		// describe. A channel handed a message too long refuses the whole
+		// thing, so what makes this send at all is the snapshot being given
+		// what the other two left rather than a number of its own.
+		let (mut host, mut client, _wire) = two();
+		let asked: Vec<Command> = (0..MAX_ASKED)
+			.map(|index| Command {
+				step: 1,
+				number: u32::try_from(index + 1).unwrap_or(1),
+				buttons: 1,
+				yaw: 0.0,
+				pitch: 0.0,
+			})
+			.collect();
+
+		round(&mut host, &mut client, 1);
+		host.post(Kind::Scene, &vec![0xC5; MAX_PARCEL])
+			.expect("a ringful");
+		host.ask(&asked);
+
+		let sent = host.sent();
+
+		host.send(colby_core::time::STEP * 2, Some(&crowd(MAX_BASELINE * 2)));
+		assert_eq!(host.sent(), sent + 1, "the message was something that could be cut up");
+
+		client.receive(colby_core::time::STEP * 2);
+		assert_eq!(client.delivered(), 1, "and it arrived whole at the far end");
+		assert_eq!(client.described().len(), 1, "with the world description in it");
+		assert_eq!(client.garbled(), 0, "nothing in it was too long to read");
+		assert!(client.holding(0) > NOTHING, "and a snapshot as well");
 	}
 
 	#[test]
