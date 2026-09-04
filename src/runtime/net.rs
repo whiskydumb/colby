@@ -49,7 +49,7 @@ use std::{
 	cell::RefCell,
 	collections::VecDeque,
 	io::ErrorKind,
-	net::{SocketAddr, ToSocketAddrs, UdpSocket},
+	net::{SocketAddr, UdpSocket},
 	rc::Rc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -179,26 +179,15 @@ pub(crate) const DEFAULT_SEED: u64 = 1;
 /// hold by ending the process.
 const MAX_MILLIS: f32 = 60_000.0;
 
-/// The flag that asks a window to talk to a host.
-const CONNECT: &str = "--connect";
-
-/// The flag that asks a window to *be* one.
-///
-/// A window that serves as well as playing, which is what the field calls a
-/// listen server. It is a flag of its own rather than a window-shaped `--host`
-/// because the two are genuinely different modes and one of them has to open
-/// no window at all: a dedicated end is what a machine nobody is at runs, and
-/// what everything checking this engine drives.
-const LISTEN: &str = "--listen";
-
 /// Where a window stands on a wire, as the command line asked for it.
 ///
 /// Three answers rather than two options, because the pair of them can
 /// disagree and the third is the ordinary case: a port means nothing to a
 /// window that connects, an address means nothing to one that serves, and most
-/// windows are neither.
+/// windows are neither. The reading is `crate::launch`'s, with every other
+/// flag's; what is here is the answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Standing {
+pub enum Standing {
 	/// No socket at all.
 	Alone,
 
@@ -208,77 +197,6 @@ pub(crate) enum Standing {
 
 	/// Talk to a host that is somewhere else.
 	Talking(SocketAddr),
-}
-
-/// Reads the command line for what this window is on the wire.
-///
-/// Accepts `--listen`, `--listen port` and `--listen=port` in the shapes
-/// `--host` accepts them, and `--connect address` in the shapes the windowless
-/// client accepts it.
-///
-/// **Serving wins when both are named**, and it is a rule rather than an
-/// accident: a window cannot be both ends of a wire, and of the two claims the
-/// stronger one is being the authority. Refusing to start over it would be
-/// worse - a person who typed both meant one of them, and the engine can say
-/// which it took.
-/// @param arguments - the command line, without the program's own name
-/// @return which end of a wire this window is, if either
-#[must_use]
-pub(crate) fn standing(arguments: &[String]) -> Standing {
-	if let Some(port) = crate::host::port_after(arguments, LISTEN) {
-		return Standing::Serving(port);
-	}
-
-	if let Some(address) = after(arguments, CONNECT) {
-		return Standing::Talking(address);
-	}
-
-	Standing::Alone
-}
-
-/// The address after a flag, whichever flag is doing the asking.
-///
-/// **Written once and called twice.** Two modes want a host's address off the
-/// command line - a window and the client with nothing on screen - and they
-/// want it in exactly the same shapes, so a second copy of this would be a
-/// second set of rules about what an address looks like, differing the first
-/// time somebody fixed one of them. @ref `crate::host`, which asks with its
-/// own flag.
-///
-/// @param arguments - the command line, without the executable
-/// @param flag - which flag to look for
-/// @return the first address named after it
-pub(crate) fn after(arguments: &[String], flag: &str) -> Option<SocketAddr> {
-	for (index, argument) in arguments.iter().enumerate() {
-		let text = if let Some(rest) = argument.strip_prefix(&format!("{flag}=")) {
-			Some(rest.to_owned())
-		} else if argument == flag {
-			arguments.get(index + 1).cloned()
-		} else {
-			continue;
-		};
-
-		let Some(text) = text else {
-			warn!("{flag} needs an address to connect to");
-
-			return None;
-		};
-
-		return match text.to_socket_addrs() {
-			| Ok(mut found) => found.next().or_else(|| {
-				warn!(%text, "that address is nowhere");
-
-				None
-			}),
-			| Err(error) => {
-				warn!(%text, %error, "that is not an address");
-
-				None
-			},
-		};
-	}
-
-	None
 }
 
 /// `net.say <text>` - queues a console line for every peer.
@@ -6121,78 +6039,6 @@ mod tests {
 
 		assert!(cvars.set(SEED, "12345"), "the variable is there");
 		assert_eq!(seed(&cvars), 12_345);
-	}
-
-	/// The command line, as words.
-	fn words(line: &[&str]) -> Vec<String> {
-		line.iter()
-			.map(|word| (*word).to_owned())
-			.collect()
-	}
-
-	#[test]
-	fn a_host_named_on_the_command_line_is_read_and_a_word_that_is_not_one_is_not() {
-		assert_eq!(
-			standing(&words(&["--connect", "127.0.0.1:27015"])),
-			Standing::Talking(somewhere(27_015))
-		);
-		assert_eq!(standing(&words(&["--connect=127.0.0.1:1"])), Standing::Talking(somewhere(1)));
-		assert_eq!(standing(&words(&["--connect"])), Standing::Alone, "with nothing after it");
-		assert_eq!(
-			standing(&words(&["--connect", "not an address"])),
-			Standing::Alone,
-			"and with something that is not one"
-		);
-		// an address after it rather than a port, so that the flag is what
-		// this turns on: a word no reader could parse would refuse either way.
-		assert_eq!(
-			standing(&words(&["--join", "127.0.0.1:27015"])),
-			Standing::Alone,
-			"and not somebody else's flag"
-		);
-	}
-
-	#[test]
-	fn a_window_asked_to_listen_serves_on_the_port_it_was_given() {
-		assert_eq!(
-			standing(&words(&["--listen"])),
-			Standing::Serving(DEFAULT_PORT),
-			"on its own it is the usual port"
-		);
-		assert_eq!(standing(&words(&["--listen", "9999"])), Standing::Serving(9999));
-		assert_eq!(standing(&words(&["--listen=9999"])), Standing::Serving(9999));
-	}
-
-	#[test]
-	fn a_window_told_nothing_about_a_wire_has_no_socket() {
-		// the ordinary case, and the one a change that opened a socket by
-		// accident would break in silence.
-		assert_eq!(standing(&[]), Standing::Alone);
-		assert_eq!(standing(&words(&["--shot", "colby.png"])), Standing::Alone);
-		// and the windowless flags are not this window's business: a process
-		// given either of those never reaches the window path at all.
-		assert_eq!(standing(&words(&["--host"])), Standing::Alone, "a dedicated end");
-		assert_eq!(
-			standing(&words(&["--join", "127.0.0.1:1"])),
-			Standing::Alone,
-			"and a windowless client"
-		);
-	}
-
-	#[test]
-	fn a_window_told_to_do_both_serves() {
-		// a window cannot be both ends of a wire, and of the two claims the
-		// stronger one is being the authority. Refusing to start over it would
-		// be worse than picking and saying which was picked.
-		assert_eq!(
-			standing(&words(&["--connect", "127.0.0.1:1", "--listen", "9999"])),
-			Standing::Serving(9999)
-		);
-		assert_eq!(
-			standing(&words(&["--listen", "--connect", "127.0.0.1:1"])),
-			Standing::Serving(DEFAULT_PORT),
-			"whichever order they were typed in"
-		);
 	}
 
 	/// A world with the two wire commands registered the way the host does,

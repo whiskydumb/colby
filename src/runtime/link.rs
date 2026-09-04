@@ -60,17 +60,14 @@ use colby_net::{Conditions, MAX_ASKED, NOTHING, Slot, Solid, every};
 
 use crate::net::{Loopback, Net, Said, Tally, Wire};
 
-/// The flag that asks for a two-endpoint run.
-const FLAG: &str = "--link";
-
 /// How many steps to run when nobody says.
 ///
 /// Ten seconds at the fixed step, which is long enough for a burst of losses to
 /// happen several times over and for the round-trip estimate to settle.
-const DEFAULT_STEPS: u32 = 600;
+pub(crate) const DEFAULT_STEPS: u32 = 600;
 
 /// The most steps one run may be.
-const MAX_STEPS: u32 = 100_000;
+pub(crate) const MAX_STEPS: u32 = 100_000;
 
 /// The rate a two-endpoint run is pinned at.
 ///
@@ -148,36 +145,6 @@ const HOST_AT: u16 = 27015;
 
 /// The other one.
 const CLIENT_AT: u16 = 40000;
-
-/// Reads the command line for a two-endpoint run.
-///
-/// Accepts `--link` on its own, `--link steps` and `--link=steps`.
-///
-/// @param arguments - the command line, without the program's own name
-/// @return how many steps to run, if a run was asked for
-#[must_use]
-pub(crate) fn requested(arguments: &[String]) -> Option<u32> { parse(arguments) }
-
-/// The same, over arguments already collected.
-///
-/// Split out so that it can be tested, which the environment cannot be.
-fn parse(arguments: &[String]) -> Option<u32> {
-	for (index, argument) in arguments.iter().enumerate() {
-		let steps = if let Some(rest) = argument.strip_prefix(&format!("{FLAG}=")) {
-			rest.parse::<u32>().ok()
-		} else if argument == FLAG {
-			arguments
-				.get(index + 1)
-				.and_then(|next| next.parse::<u32>().ok())
-		} else {
-			continue;
-		};
-
-		return Some(steps.unwrap_or(DEFAULT_STEPS).clamp(1, MAX_STEPS));
-	}
-
-	None
-}
 
 /// What one run came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -696,30 +663,6 @@ fn fold(hash: u64, step: u32, side: u8, text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn the_flag_is_read_on_its_own_and_with_a_count() {
-		assert_eq!(parse(&["--link".to_owned()]), Some(DEFAULT_STEPS));
-		assert_eq!(parse(&["--link".to_owned(), "120".to_owned()]), Some(120));
-		assert_eq!(parse(&["--link=120".to_owned()]), Some(120));
-		assert_eq!(parse(&["--shot".to_owned()]), None, "and not somebody else's flag");
-		assert_eq!(parse(&[]), None);
-	}
-
-	#[test]
-	fn a_count_of_nil_or_a_silly_one_is_clamped_rather_than_taken() {
-		assert_eq!(parse(&["--link=0".to_owned()]), Some(1));
-		assert_eq!(parse(&["--link=99999999".to_owned()]), Some(MAX_STEPS));
-	}
-
-	#[test]
-	fn a_flag_that_is_not_a_count_after_the_word_is_not_eaten() {
-		assert_eq!(
-			parse(&["--link".to_owned(), "--shot".to_owned()]),
-			Some(DEFAULT_STEPS),
-			"the next word is only a count when it is one"
-		);
-	}
 
 	#[test]
 	fn everything_that_had_to_arrive_arrives_over_a_wire_that_loses_a_tenth() {

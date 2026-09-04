@@ -14,11 +14,14 @@
 //! read from the environment, and they go when a project replaces the
 //! checkout as the thing being run.
 //!
-//! Six modes, and four of them open no window. `--shot` writes a picture,
-//! `--record` a sound, `--link` runs two endpoints against each other and
-//! prints a hash, `--host` and `--join` are the two windowless ends of a wire,
-//! and everything else is a window. @ref [`run`], which is where the six are
-//! told apart.
+//! **One state, one stand-up, one parser.** [`Runtime`] is the state a world
+//! needs to run and [`Runtime::open`] the one order it is brought up in, with
+//! a [`Front`] saying what kind of process this is; [`Launch`] is the command
+//! line read once. Six runs, and four of them open no window: `--shot` writes
+//! a picture, `--record` a sound, `--link` runs two endpoints against each
+//! other and prints a hash, `--host` and `--join` are the two windowless ends
+//! of a wire, and everything else is a window. @ref [`run`], which is where
+//! the six are told apart.
 
 // @note: crate-wide opt-in to the workspace `unsafe-code = "deny"`. Every unsafe
 // block in this crate is a call across the module boundary or the resolution of
@@ -34,10 +37,12 @@ mod console;
 mod game;
 mod host;
 mod input;
+mod launch;
 mod link;
 mod mode;
 mod net;
 mod record;
+mod runtime;
 mod saves;
 mod shot;
 mod step;
@@ -46,10 +51,13 @@ mod watch;
 
 use std::path::PathBuf;
 
-use colby_core::{Result, err, log};
-use colby_engine::winit::event_loop::{ControlFlow, EventLoop};
+use colby_core::{Result, log};
 
-use crate::app::App;
+pub use crate::{
+	launch::Launch,
+	net::Standing,
+	runtime::{Front, Runtime, VIEWPORT},
+};
 
 /// The few facts a running process cannot work out for itself.
 ///
@@ -87,7 +95,7 @@ pub struct Build {
 	pub package: String,
 }
 
-/// Brings the process up, runs whichever mode was asked for, and takes it back
+/// Brings the process up, runs whichever run was asked for, and takes it back
 /// down in order.
 ///
 /// @param arguments - the command line, without the program's own name
@@ -95,72 +103,39 @@ pub struct Build {
 pub fn run(arguments: &[String], build: Build) -> Result {
 	log::init()?;
 
-	// before anything else, including the check that this process is laid out
-	// for hot-reload: a two-endpoint run loads no module, opens no window and
-	// opens no socket. The wire between the two is a pair of inboxes, so the
-	// answer is the same on a machine with a network and one without, and in
-	// any build. @ref `crate::link`.
-	if let Some(steps) = link::requested(arguments) {
+	let launch = Launch::parse(arguments);
+
+	// a two-endpoint run before anything else, including the check that this
+	// process is laid out for hot-reload: it loads no module, opens no window
+	// and opens no socket. The wire between the two is a pair of inboxes, so
+	// the answer is the same on a machine with a network and one without, and
+	// in any build. @ref `crate::link`.
+	if let Launch::Link(steps) = launch {
 		return link::run(steps);
 	}
 
 	prepare()?;
 
-	// a screenshot never opens a window, so it takes its own way out.
-	if let Some(path) = shot::requested(arguments) {
-		let result = shot::take(&path, &build.workspace);
-		finish();
-
-		return result;
-	}
-
-	// and neither does a recording, which additionally opens no device: what
-	// it writes has to be the same file on a machine with speakers and one
-	// without.
-	if let Some(request) = record::requested(arguments) {
-		let result = record::take(&request, &build.workspace);
-		finish();
-
-		return result;
-	}
-
-	// and a host opens a socket instead of a window, which is a mode rather
-	// than a build: the same executable, the same module, the same step.
-	if let Some(port) = host::requested(arguments) {
-		let result = host::serve(port, &build.workspace);
-		finish();
-
-		return result;
-	}
-
-	// and so does a client that was asked for without one, which is the same
-	// loop with the endpoint pointed the other way. It is here rather than in
-	// the window path because it never makes a window at all. @ref
-	// `crate::host`.
-	if let Some(address) = host::joining(arguments) {
-		let result = host::join(address, &build.workspace);
-		finish();
-
-		return result;
-	}
-
-	let event_loop =
-		EventLoop::new().map_err(|error| err!(Graphics("creating the event loop: {error}")))?;
-
-	// @note: `Poll` rather than `Wait`. The frame is paced by the surface's
-	// vsync, not by the event loop, and a game keeps simulating whether or not
-	// the window has anything to say.
-	event_loop.set_control_flow(ControlFlow::Poll);
-
-	let mut app = App::new(build, net::standing(arguments));
-	let result = event_loop
-		.run_app(&mut app)
-		.map_err(|error| err!(Graphics("running the event loop: {error}")));
+	let result = match launch {
+		// answered above, before `prepare`; here so that the match is
+		// exhaustive rather than wildcarded.
+		| Launch::Link(_) => Ok(()),
+		// a screenshot never opens a window, so it takes its own way out; and
+		// neither does a recording, which additionally opens no device, because
+		// what it writes has to be the same file on a machine with speakers and
+		// one without.
+		| Launch::Shot(path) => shot::take(&path, &build.workspace),
+		| Launch::Record { path, steps } => record::take(&path, steps, &build.workspace),
+		// a socket instead of a window, which is a run rather than a build: the
+		// same executable, the same module, the same step. @ref `crate::host`.
+		| Launch::Host(port) => host::run(Front::Host(port), &build.workspace),
+		| Launch::Join(address) => host::run(Front::Join(address), &build.workspace),
+		| Launch::Window(standing) => app::run(build, standing),
+	};
 
 	finish();
-	result?;
 
-	app.into_result()
+	result
 }
 
 /// Verifies the process is laid out for hot-reload, and clears `%TEMP%`.

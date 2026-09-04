@@ -1,20 +1,18 @@
 //! The window, and the loop that drives everything else.
 //!
-//! `App` is the one place the whole process's state sits: the world, the clock,
-//! the loaded game, the renderer and the file watcher. Nothing here lives
-//! inside the hot-reloaded module, which is why swapping the module is allowed
-//! to be a two-line operation in the middle of a frame.
+//! `App` is the window's half of the process: the runtime, the clock that
+//! paces it off the vertical blank, the renderer, the editor and the file
+//! watcher. Everything a world needs to run is in the runtime and is the same
+//! for a window as for a socket or a picture - @ref [`Runtime`] - and nothing
+//! here lives inside the hot-reloaded module, which is why swapping the module
+//! is allowed to be a two-line operation in the middle of a frame.
 
-use std::{
-	sync::Arc,
-	time::{Duration, Instant},
-};
+use std::sync::Arc;
 
-use colby_audio::Device;
 use colby_core::{
 	Error, Result,
-	abi::{Input, Mix, World, console, cvar::Cvars},
-	debug, err, error,
+	abi::{Input, Mix, World, cvar::Cvars},
+	err, error,
 	glam::{Vec2, Vec3},
 	info,
 	time::{Clock, Pace, Rate},
@@ -28,28 +26,15 @@ use colby_engine::{
 		application::ApplicationHandler,
 		dpi::LogicalSize,
 		event::{ElementState, KeyEvent, WindowEvent},
-		event_loop::ActiveEventLoop,
+		event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
 		keyboard::{Key, NamedKey},
 		window::{Window, WindowId},
 	},
 };
-use colby_net::Slot;
-use colby_physics::Simulation;
-use colby_script::Vm;
-use colby_ui::Interface;
 
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
-use crate::{
-	Build,
-	assets::Assets,
-	console::Console,
-	game::Game,
-	input,
-	mode::Mode,
-	net::{Net, Standing},
-	step,
-};
+use crate::{Build, Front, Runtime, input, mode::Mode, net::Standing};
 
 /// The window title.
 const TITLE: &str = "colby";
@@ -133,54 +118,42 @@ pub(crate) fn paced(cvars: &Cvars, client: bool) -> Rate {
 	if client { Rate::DEFAULT } else { rate(cvars) }
 }
 
-/// Every piece of state in the process.
+/// Opens a window on a world and runs it until somebody closes it.
+///
+/// @param build - what the build script of the executable knew
+/// @param standing - which end of a wire this window is, if either
+pub(crate) fn run(build: Build, standing: Standing) -> Result {
+	let event_loop =
+		EventLoop::new().map_err(|error| err!(Graphics("creating the event loop: {error}")))?;
+
+	// @note: `Poll` rather than `Wait`. The frame is paced by the surface's
+	// vsync, not by the event loop, and a game keeps simulating whether or not
+	// the window has anything to say.
+	event_loop.set_control_flow(ControlFlow::Poll);
+
+	let mut app = App::new(build, standing)?;
+
+	event_loop
+		.run_app(&mut app)
+		.map_err(|error| err!(Graphics("running the event loop: {error}")))?;
+
+	app.into_result()
+}
+
+/// The window's half of the process.
 pub(crate) struct App {
-	/// Boxed: the entity table alone is tens of kilobytes, and this is handed
-	/// across the module boundary by pointer anyway.
-	world: Box<World>,
+	/// Everything a world needs to run, which is the same for a window as for
+	/// anything else. @ref [`Runtime`].
+	runtime: Runtime,
 	clock: Clock,
 	/// Frames drawn. Not the same number as `world.steps`, which is the point
 	/// of the whole arrangement.
 	frames: u64,
 	input: Input,
-	game: Option<Game>,
 	renderer: Option<Renderer>,
-	/// The game's own interface. Always present, and only able to draw once a
-	/// device exists to attach it to.
-	interface: Interface,
-	/// The interface's own logic, in Lua. An `Option` for the same reason the
-	/// renderer is one: an engine whose scene and interface work and whose
-	/// scripts did not start is still worth looking at, and the log says which
-	/// half is missing.
-	scripts: Option<Vm>,
-	/// The output device and the mixer feeding it. An `Option` for the same
-	/// reason the scripts are: an engine whose picture works and whose sound
-	/// did not start is worth running, and the log says which half is missing.
-	audio: Option<Device>,
-	/// The socket and the conversation over it, if this window was told to
-	/// connect to a host or to be one.
-	/// An `Option` for the third time and the third same reason: an engine
-	/// whose window works and whose socket did not bind is worth running.
-	net: Option<Net>,
-
-	/// The world as a snapshot describes it, taken down once a step rather
-	/// than allocated per snapshot. Empty in a window that serves nobody.
-	records: Vec<Slot>,
-	/// When this process started, which is the clock the wire is on.
-	///
-	/// Real time rather than simulated: a round-trip estimate measured in
-	/// simulated seconds would shrink whenever the machine stalled, and the
-	/// number is about the wire rather than about the world.
-	started: Instant,
-	/// The physics. Boxed because the world holds its address: the table of
-	/// queries installed into `world` points here, and a value that moved
-	/// would leave that pointer behind. @ref `colby_physics`.
-	simulation: Box<Simulation>,
-	assets: Assets,
 	/// Whether the world is being played or edited, and the world play started
 	/// from. @ref `crate::mode`.
 	mode: Mode,
-	console: Option<Console>,
 	#[cfg(feature = "editor")]
 	editor: Option<Editor>,
 	#[cfg(feature = "hot_reload")]
@@ -199,63 +172,68 @@ pub(crate) struct App {
 	/// something last wins, and nobody says anything by standing still.
 	gravity: f32,
 	/// What the build script knew, handed down to the watcher.
+	#[cfg(feature = "hot_reload")]
 	build: Build,
-	/// Which end of a wire this window is, if either.
-	///
-	/// Read off the command line by whoever made the process, and decided
-	/// before the game module ever reads `World::peer`. @ref `start`.
-	standing: Standing,
 	failure: Option<Error>,
 }
 
 impl App {
-	/// An application that has not opened its window yet.
+	/// A world brought up, waiting for its window.
+	///
+	/// The runtime is opened here, before the event loop exists: a module is
+	/// loaded and its `init` run against a world with no screen yet, which is
+	/// what a socket and a picture do too. The window, the renderer and
+	/// everything that needs a device come in [`start`](Self::start), a moment
+	/// later.
 	///
 	/// @param build - what the build script of the executable knew
 	/// @param standing - which end of a wire this window is, if either
-	pub(crate) fn new(build: Build, standing: Standing) -> Self {
-		let simulation = Box::new(Simulation::new());
-		let mut world = Box::<World>::default();
+	#[cfg_attr(
+		not(feature = "hot_reload"),
+		expect(
+			clippy::needless_pass_by_value,
+			reason = "with hot-reload built in the facts are kept for the watcher; without it \
+			          they are read once here, and the two have to agree on a signature"
+		)
+	)]
+	pub(crate) fn new(build: Build, standing: Standing) -> Result<Self> {
+		let runtime = Runtime::open(Front::Window(standing), &build.workspace)?;
 
-		// once, here, and never again. The pointers in the table address this
-		// executable rather than the game module, so no reload disturbs them -
-		// which is the whole difference between this and a console command, and
-		// is why one has to be forgotten on unload and the other does not.
-		world.install_physics(simulation.table());
+		// after the config, because that is where a rate somebody asked for
+		// arrives, and before the first step, because that is the last moment
+		// saying anything about it is useful. @ref `set_pace` for why a client
+		// does not get its own rate.
+		if runtime.following() && rate(&runtime.world.cvars) != Rate::DEFAULT {
+			warn!(
+				asked = rate(&runtime.world.cvars).hz(),
+				running = Rate::DEFAULT.hz(),
+				"a window that connected runs at the host's rate, not its own"
+			);
+		}
 
-		Self {
-			world,
+		Ok(Self {
+			runtime,
 			clock: Clock::new(),
 			frames: 0,
 			input: Input::default(),
-			game: None,
 			renderer: None,
-			interface: Interface::new(),
-			scripts: None,
-			audio: None,
-			net: None,
-			records: Vec::new(),
-			started: Instant::now(),
-			simulation,
-			assets: Assets::new(&build.workspace),
 			mode: Mode::new(),
-			console: None,
 			#[cfg(feature = "editor")]
 			editor: None,
 			#[cfg(feature = "hot_reload")]
 			watch: None,
 			mix: Mix::FULL,
 			gravity: -PULL,
+			#[cfg(feature = "hot_reload")]
 			build,
-			standing,
 			failure: None,
-		}
+		})
 	}
 
 	/// The reason the loop stopped, if it was not asked to.
 	pub(crate) fn into_result(self) -> Result { self.failure.map_or(Ok(()), Err) }
 
-	/// Opens the window, brings up the renderer and loads the game.
+	/// Opens the window and brings up everything that needs a device.
 	fn start(&mut self, event_loop: &ActiveEventLoop) -> Result {
 		let attributes = Window::default_attributes()
 			.with_title(TITLE)
@@ -268,11 +246,12 @@ impl App {
 		let renderer = Renderer::new(Arc::new(window))?;
 		let (width, height) = renderer.size();
 
-		self.world.aspect = renderer.aspect();
+		self.runtime.world.aspect = renderer.aspect();
 		self.input
 			.set_viewport(f64::from(width), f64::from(height));
 
 		if let Err(error) = self
+			.runtime
 			.interface
 			.attach(renderer.device(), renderer.format())
 		{
@@ -283,91 +262,14 @@ impl App {
 		}
 
 		self.renderer = Some(renderer);
-
-		// before the game, not after: `init` is where a game resolves the
-		// meshes it wants by name, and a registry that fills up one frame later
-		// would hand it nothing on the first one.
-		self.assets.sync(&mut self.world);
-
-		match Vm::new(console::defer) {
-			| Ok(scripts) => self.scripts = Some(scripts),
-			| Err(error) =>
-				error!(%error, "no interpreter; documents with a script have no logic"),
-		}
-
-		// after the assets rather than before them, so the first copy into the
-		// mixer's bank finds a registry that is already full.
-		match Device::open() {
-			| Ok(mut device) => {
-				device.load(&self.world.sounds);
-				self.audio = Some(device);
-			},
-			| Err(error) => error!(%error, "no output device; nothing will make a sound"),
-		}
-
-		// and the host's console variables before *that*, so they belong to the
-		// engine rather than to the module and survive a reload.
-		crate::console::install(&mut self.world);
-
-		// after them, because how bad the wire is is a console variable and the
-		// seed for it is one too. A window that was told neither to connect
-		// nor to serve simply has no socket, which is the ordinary case.
-		//
-		// **A window can be either end of a wire**, and which one it is has to
-		// be decided here rather than later: a window that serves stays the
-		// authority its world already thinks it is, and one that connects
-		// stops being it before the game module ever reads the field.
-		let seed = crate::net::seed(&self.world.cvars);
-		let opened = match self.standing {
-			| Standing::Serving(port) => Some((Net::host(port, seed), true)),
-			| Standing::Talking(address) => Some((Net::connect(address, seed), false)),
-			| Standing::Alone => None,
-		};
-
-		match opened {
-			| None => {},
-			| Some((Err(error), _)) => error!(%error, "no socket; this window is on its own"),
-			| Some((Ok(net), true)) => self.net = Some(net),
-			| Some((Ok(net), false)) => {
-				self.net = Some(net);
-				// and this process stops being the authority, which is the one
-				// thing about a window that connected that nothing else could
-				// work out. @ref `crate::net::joined`.
-				crate::net::joined(&mut self.world);
-			},
-		}
-
 		self.start_editor();
-
-		self.game = Some(Game::open(&mut self.world)?);
-
-		// the config is read last of the three, because a line in it may name a
-		// variable the game registered a moment ago.
-		self.console = Some(Console::open(&mut self.world, &self.build.workspace));
-
-		// after the config, because that is where a rate somebody asked for
-		// arrives, and before the first step, because that is the last moment
-		// saying anything about it is useful. @ref `set_pace` for why a client
-		// does not get its own rate.
-		let following = self
-			.net
-			.as_ref()
-			.is_some_and(|net| !net.hosting());
-
-		if following && rate(&self.world.cvars) != Rate::DEFAULT {
-			warn!(
-				asked = rate(&self.world.cvars).hz(),
-				running = Rate::DEFAULT.hz(),
-				"a window that connected runs at the host's rate, not its own"
-			);
-		}
-
 		self.start_watching()?;
 
-		// everything above took as long as it took: a window, an adapter, a
-		// shader, the asset tree and a LoadLibrary. The clock has been running
-		// since `new`, and without this the first frame would arrive owing the
-		// simulation a second of catch-up it never actually missed.
+		// everything above and everything in `new` took as long as it took: a
+		// module, the asset tree, a window, an adapter and a shader. The clock
+		// has been running since `new`, and without this the first frame would
+		// arrive owing the simulation a second of catch-up it never actually
+		// missed.
 		self.clock.reset();
 
 		info!("colby is running; escape or the window close button stops it");
@@ -377,12 +279,11 @@ impl App {
 
 	/// Brings up the editor against the window and the device.
 	///
-	/// Its variables are registered here rather than in `Editor::new` so that
-	/// they exist whether or not the editor was built.
+	/// Its variables were registered when the runtime opened, before the game
+	/// module, so that they exist whether or not the editor was built and
+	/// belong to the engine rather than to the module.
 	#[cfg(feature = "editor")]
 	fn start_editor(&mut self) {
-		Editor::install(&mut self.world);
-
 		let Some(renderer) = self.renderer.as_ref() else {
 			return;
 		};
@@ -401,7 +302,7 @@ impl App {
 	/// state that is about to be drawn rather than the one before it.
 	#[cfg(feature = "editor")]
 	fn run_editor(&mut self) {
-		if !Editor::shown(&self.world) {
+		if !Editor::shown(&self.runtime.world) {
 			return;
 		}
 
@@ -416,7 +317,7 @@ impl App {
 		};
 
 		if let Some(editor) = self.editor.as_mut() {
-			editor.run(&window, &mut self.world, &self.clock, self.frames);
+			editor.run(&window, &mut self.runtime.world, &self.clock, self.frames);
 		}
 	}
 
@@ -432,7 +333,7 @@ impl App {
 	/// closing the window.
 	#[cfg(feature = "editor")]
 	fn editor_took(&mut self, event: &WindowEvent) -> bool {
-		if !Editor::shown(&self.world) {
+		if !Editor::shown(&self.runtime.world) {
 			return false;
 		}
 
@@ -483,59 +384,6 @@ impl App {
 	/// hitch - and a picture either way, because what makes the motion smooth
 	/// is where the frame sits between two steps rather than how many of them
 	/// it ran.
-	/// The moment the next step is at, on the clock the wire is on.
-	///
-	/// Read once a frame and advanced a step at a time by the caller, rather
-	/// than read again inside the step loop: what the wire is asked for has to
-	/// move by exactly one step per step, or the renderer's own blend between
-	/// two steps is asked to cover a gap that is not one step wide - and a
-	/// body would be drawn speeding up and slowing down on a wire doing
-	/// nothing of the kind. @ref `step::Wired`.
-	///
-	/// @return how long this process has been running
-	fn moment(&self) -> Duration { self.started.elapsed() }
-
-	/// The endpoint and the moment, for the step about to run.
-	///
-	/// Its own function so that *which* clock the moment comes from is
-	/// something a test can ask about. It comes from the caller, which read it
-	/// once for the frame; reading it here would put a real-time sample inside
-	/// the step loop, and two steps in one frame would then be microseconds
-	/// apart where the renderer's blend assumes a step. @ref `step::Wired`.
-	///
-	/// @param net - the endpoint, if this process has one
-	/// @param moment - where the wire's clock stands for this step
-	/// @return the pair, or nothing when this process is on no wire
-	fn wired(net: Option<&mut Net>, moment: Duration) -> Option<step::Wired<'_>> {
-		let net = net?;
-
-		Some(step::Wired { net, now: moment })
-	}
-
-	/// Puts a message out for the step that has just run, and moves the wire's
-	/// own clock on by one step.
-	///
-	/// Out once a step rather than once a frame, because a message has to mean
-	/// "this is where things stand at this moment" and a frame rate is not a
-	/// moment.
-	///
-	/// @param moment - where the wire's clock stood for the step just run
-	/// @param rate - how long that step was
-	/// @return where it stands for the next one
-	fn stepped(&mut self, moment: Duration, rate: Rate) -> Duration {
-		if let Some(net) = self.net.as_mut() {
-			crate::net::tell(
-				net,
-				&self.world,
-				&mut self.records,
-				rate.hz(),
-				self.started.elapsed(),
-			);
-		}
-
-		moment.saturating_add(rate.step())
-	}
-
 	fn frame(&mut self) -> Result {
 		// reading two variables is not the kind of work that moves the clock
 		// sample around, and the pace has to be set before the time it applies
@@ -551,63 +399,29 @@ impl App {
 
 		self.reload_if_stale();
 
-		// the mixer keeps its own copy of every sound, so a pass over the tree
-		// is also when it has to be told. Only when the pass really ran: four
-		// times a second rather than sixty, which is what keeps the lock the
-		// audio callback wants out of its way.
-		if self.assets.poll(&mut self.world)
-			&& let Some(audio) = self.audio.as_mut()
-		{
-			let copied = audio.load(&self.world.sounds);
-			if copied > 0 {
-				debug!(copied, samples = audio.samples(), "sounds copied into the mixer");
-			}
-		}
-
-		if let Some(console) = self.console.as_ref() {
-			console.poll(&mut self.world);
-		}
-
-		// and every config file somebody asked for, resolved against the
-		// workspace this runtime was handed. @ref `crate::console::serve`.
-		crate::console::serve(&mut self.world, &self.build.workspace);
-
-		// and whatever a command asked to be done with a scene, immediately
-		// after it was typed and before any step runs: a load replaces every
-		// table in the world, and doing that halfway through one would leave
-		// the rest of the step running against a world its first half never
-		// saw. @ref `crate::saves`.
-		crate::saves::serve(&mut self.world, &mut self.simulation, &self.build.workspace);
-
-		// and whatever a command asked of the wire, beside it and for the same
-		// reason. Then everything the socket is holding, before any step: what
-		// a step runs against is what had arrived when it started rather than
-		// whatever turned up halfway through. @ref `crate::net`.
-		crate::net::serve(&mut self.world, self.net.as_mut());
-
-		if let Some(net) = self.net.as_mut() {
-			// which is where this window learns who it is, where what the host
-			// has already run stops being resent, and where a line somebody
-			// else typed is run. @ref `crate::net::hear`, which a windowless
-			// end calls too - and which is one function because the last of
-			// those four was missing from this copy for as long as there were
-			// two.
-			crate::net::hear(net, &mut self.world, self.started.elapsed());
-		}
+		// the asset trees, the terminal, every line a command left waiting, and
+		// the socket - all of it before any step, and all of it the runtime's.
+		// @ref `Runtime::poll` for the order and the reasons.
+		self.runtime.poll();
 
 		// and the mode's own edge, in the same place and for the same reason:
 		// stopping play replaces every table in the world, so it happens
 		// between steps rather than inside one.
-		let editing = crate::mode::wanted(&self.world);
+		let editing = crate::mode::wanted(&self.runtime.world);
 		self.mode
-			.follow(&mut self.world, &mut self.simulation, editing);
+			.follow(&mut self.runtime.world, &mut self.runtime.simulation, editing);
 
-		pay(&mut self.world, &mut self.clock);
+		pay(&mut self.runtime.world, &mut self.clock);
 
-		let asked = self.world.cvars.float(GRAVITY).unwrap_or(-PULL);
+		let asked = self
+			.runtime
+			.world
+			.cvars
+			.float(GRAVITY)
+			.unwrap_or(-PULL);
 		if (asked - self.gravity).abs() > f32::EPSILON {
 			self.gravity = asked;
-			self.world.gravity = Vec3::new(0.0, asked, 0.0);
+			self.runtime.world.gravity = Vec3::new(0.0, asked, 0.0);
 		}
 
 		self.hear();
@@ -616,7 +430,7 @@ impl App {
 			// before the steps rather than after them: gameplay asking how
 			// wide the window is should not be told last frame's answer, four
 			// times in a row.
-			self.world.aspect = renderer.aspect();
+			self.runtime.world.aspect = renderer.aspect();
 
 			let (width, height) = renderer.size();
 			#[expect(
@@ -626,19 +440,27 @@ impl App {
 			)]
 			let scale = renderer.window().scale_factor() as f32;
 
-			self.world.ui.set_viewport(
+			self.runtime.world.ui.set_viewport(
 				Vec2::new(
 					f32::from(u16::try_from(width).unwrap_or(u16::MAX)),
 					f32::from(u16::try_from(height).unwrap_or(u16::MAX)),
 				),
 				scale,
 			);
-			self.world
+			self.runtime
+				.world
 				.ui
 				.set_pointer(Vec2::from(self.input.cursor));
 		}
 
-		let mut moment = self.moment();
+		// the moment the next step is at, on the clock the wire is on. Read
+		// once a frame and advanced a step at a time by the runtime, rather
+		// than read again inside the step loop: what the wire is asked for has
+		// to move by exactly one step per step, or the renderer's own blend
+		// between two steps is asked to cover a gap that is not one step wide
+		// - and a body would be drawn speeding up and slowing down on a wire
+		// doing nothing of the kind. @ref `Runtime::step`.
+		let mut moment = self.runtime.now();
 		// read once for the whole pass rather than per step: a rate that moved
 		// between two steps of the same frame would make the second one a
 		// different length from the first, which is the one thing a fixed step
@@ -646,31 +468,15 @@ impl App {
 		let rate = self.clock.rate();
 
 		while let Some(time) = self.clock.step() {
-			step::run(
-				&mut self.world,
-				step::Parts {
-					game: self.game.as_mut(),
-					interface: &mut self.interface,
-					scripts: self.scripts.as_mut(),
-					simulation: self.simulation.as_mut(),
-					audio: self.audio.as_mut(),
-					// the endpoint and the clock it is on, so that a world a
-					// host described lands in this one. @ref `Net::arrive`.
-					wire: Self::wired(self.net.as_mut(), moment),
-				},
-				&mut self.input,
-				rate,
-				time,
-				editing,
-			);
-
-			moment = self.stepped(moment, rate);
+			moment = self
+				.runtime
+				.step(&mut self.input, rate, time, editing, moment);
 		}
 
 		self.frames = self.frames.saturating_add(1);
 		// the mode has a say in this: a world being edited is drawn as it
 		// stands rather than blended. @ref `Mode::interpolation`.
-		self.world.set_interpolation(
+		self.runtime.world.set_interpolation(
 			self.mode
 				.interpolation(self.clock.interpolation()),
 		);
@@ -678,22 +484,25 @@ impl App {
 		// the interface is laid out again here rather than reused from the step:
 		// the window may have been resized since, and a document that is a share
 		// of the screen should be the share the screen is now.
-		self.interface.run(&self.world);
+		self.runtime.interface.run(&self.runtime.world);
 
 		if let Some(renderer) = self.renderer.as_ref() {
-			self.interface
-				.prepare(renderer.device(), renderer.queue(), &self.world);
+			self.runtime.interface.prepare(
+				renderer.device(),
+				renderer.queue(),
+				&self.runtime.world,
+			);
 		}
 
 		self.run_editor();
 
 		#[cfg(feature = "editor")]
-		let shown = Editor::shown(&self.world);
+		let shown = Editor::shown(&self.runtime.world);
 
 		// disjoint borrows: the renderer is one field, the interface another and
 		// the editor a third, which is what lets the frame be handed to all of
 		// them.
-		let mut overlays: Vec<&mut dyn Overlay> = vec![&mut self.interface];
+		let mut overlays: Vec<&mut dyn Overlay> = vec![&mut self.runtime.interface];
 
 		#[cfg(feature = "editor")]
 		if shown && let Some(editor) = self.editor.as_mut() {
@@ -704,7 +513,7 @@ impl App {
 			return Ok(());
 		};
 
-		renderer.render(&self.world, &mut overlays)
+		renderer.render(&self.runtime.world, &mut overlays)
 	}
 
 	/// Puts the console's pacing variables onto the clock.
@@ -713,18 +522,14 @@ impl App {
 	/// of zero - which is what makes unpausing free of a lurch: no time
 	/// accumulated while it was held, so there is nothing owed on the way out.
 	fn set_pace(&mut self) {
-		let paused = self.world.cvars.bool(PAUSE).unwrap_or(false);
-		let speed = self.world.cvars.float(SPEED).unwrap_or(1.0);
+		let cvars = &self.runtime.world.cvars;
+		let paused = cvars.bool(PAUSE).unwrap_or(false);
+		let speed = cvars.float(SPEED).unwrap_or(1.0);
 
 		// a window that serves is the authority and runs what it was told; one
 		// that connected takes the rate every host runs. @ref `paced`.
-		let following = self
-			.net
-			.as_ref()
-			.is_some_and(|net| !net.hosting());
-
 		self.clock
-			.set_rate(paced(&self.world.cvars, following));
+			.set_rate(paced(cvars, self.runtime.following()));
 		self.clock
 			.set_speed(if paused { 0.0 } else { speed });
 	}
@@ -735,11 +540,11 @@ impl App {
 	/// last wins, and standing still says nothing. Four numbers rather than
 	/// one, so the comparison is over the whole struct.
 	fn hear(&mut self) {
-		let asked = crate::console::volumes(&self.world.cvars);
+		let asked = crate::console::volumes(&self.runtime.world.cvars);
 
 		if asked != self.mix {
 			self.mix = asked;
-			self.world.mix = asked;
+			self.runtime.world.mix = asked;
 		}
 	}
 
@@ -772,8 +577,8 @@ impl App {
 			return;
 		}
 
-		if let Some(game) = self.game.as_mut()
-			&& let Err(error) = game.reload(&mut self.world)
+		if let Some(game) = self.runtime.game.as_mut()
+			&& let Err(error) = game.reload(&mut self.runtime.world)
 		{
 			error!(%error, "reload failed; the game is parked until the next build");
 		}
@@ -812,12 +617,12 @@ impl App {
 		match key {
 			| NamedKey::Escape => event_loop.exit(),
 			#[cfg(feature = "editor")]
-			| NamedKey::F1 => Editor::toggle(&mut self.world),
+			| NamedKey::F1 => Editor::toggle(&mut self.runtime.world),
 			// under the same feature as F1, and for the same reason: play and
 			// stop is a tool's gesture. A build with no editor in it still has
 			// the variable, and nothing in it presses this.
 			#[cfg(feature = "editor")]
-			| NamedKey::F5 => crate::mode::toggle(&mut self.world),
+			| NamedKey::F5 => crate::mode::toggle(&mut self.runtime.world),
 			| _ => {},
 		}
 	}
@@ -867,7 +672,7 @@ impl ApplicationHandler for App {
 			| WindowEvent::RedrawRequested => {
 				if let Err(error) = self.frame() {
 					self.fail(event_loop, error);
-				} else if self.world.quit {
+				} else if self.runtime.world.quit {
 					// asked for by the `quit` command, or by the game itself.
 					// The same way out as the close button, so `exiting` runs
 					// and the config is written.
@@ -886,27 +691,17 @@ impl ApplicationHandler for App {
 	}
 
 	fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-		// before the game is shut down, while its variables are still in the
-		// table to be written out.
-		if let Some(console) = self.console.as_ref() {
-			console.close(&self.world);
-		}
-
-		if let Some(game) = self.game.as_mut() {
-			game.close(&mut self.world);
-		}
-
-		// order matters: the game goes first because it may still be running
-		// code from the module, then the renderer, whose surface borrows the
-		// window it is holding the last share of.
-		self.game = None;
+		// the config and then the game, and the module dropped with it: it may
+		// still be running code from the image, so it goes before the renderer,
+		// whose surface borrows the window it is holding the last share of.
+		self.runtime.close();
 		self.renderer = None;
 
 		info!(
 			frames = self.frames,
-			steps = self.world.steps,
+			steps = self.runtime.world.steps,
 			stalls = self.clock.stalls(),
-			reloads = self.world.reloads,
+			reloads = self.runtime.world.reloads,
 			"colby stopped"
 		);
 	}
@@ -915,17 +710,6 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	/// What a build script would have said, for a process nothing built.
-	fn build() -> Build {
-		Build {
-			workspace: std::env::temp_dir(),
-			cargo: "cargo".to_owned(),
-			profile: "dev".to_owned(),
-			rustflags: String::new(),
-			package: "colby".to_owned(),
-		}
-	}
 
 	/// How many steps a clock has ready.
 	fn drain(clock: &mut Clock) -> u32 {
@@ -992,65 +776,6 @@ mod tests {
 			paced(&world.cvars, true).hz(),
 			Rate::DEFAULT.hz(),
 			"and one that does not, does not"
-		);
-	}
-
-	#[test]
-	fn the_wires_clock_moves_by_exactly_one_step_a_step() {
-		// what the renderer's own blend between two steps assumes, and the
-		// only thing that says the moment is not re-read from the real clock
-		// inside the loop: two steps in one frame would then be microseconds
-		// apart, and two a frame apart a whole frame apart, with one blend
-		// asked to cover both.
-		let mut app = App::new(build(), Standing::Alone);
-		let began = Duration::from_secs(7);
-		let step = Rate::DEFAULT.step();
-		let after = app.stepped(began, Rate::DEFAULT);
-
-		assert_eq!(after, began + step, "one step on, whatever the clock says");
-		assert_eq!(app.stepped(after, Rate::DEFAULT), began + step * 2, "and again");
-	}
-
-	#[test]
-	fn the_wires_clock_moves_by_the_step_it_was_told_about() {
-		// and not by the one this file was compiled with. Two peers on the
-		// same wire place a world against a moment each, and a moment that
-		// advanced by a constant while the world advanced by something else
-		// would be a delay nobody could measure.
-		let mut app = App::new(build(), Standing::Alone);
-		let fast = Rate::from_hz(240);
-		let began = Duration::from_secs(1);
-
-		assert_eq!(
-			app.stepped(began, fast),
-			began + fast.step(),
-			"a quarter of the usual step moves the wire a quarter as far"
-		);
-	}
-
-	#[test]
-	fn the_moment_a_step_is_given_is_the_one_it_was_handed() {
-		// and not one this process read for itself. A window with no socket
-		// gets no wire at all, which is the ordinary case.
-		let mut app = App::new(build(), Standing::Alone);
-		let asked = Duration::from_secs(3);
-
-		assert!(App::wired(app.net.as_mut(), asked).is_none(), "no socket, no wire");
-
-		app.net = Some(Net::over(
-			Box::new(crate::net::Loopback::at(
-				std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1),
-				&std::rc::Rc::new(std::cell::RefCell::new(crate::net::Wire::default())),
-			)),
-			false,
-			1,
-			1,
-		));
-
-		assert_eq!(
-			App::wired(app.net.as_mut(), asked).map(|it| it.now),
-			Some(asked),
-			"the moment is the caller's, not a fresh reading"
 		);
 	}
 }

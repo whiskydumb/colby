@@ -1,10 +1,10 @@
 //! Recording what a run sounds like, instead of what it looks like.
 //!
-//! `colby --record sound.wav` is the exact mirror of `--shot`: it loads the
-//! game module the window path does, runs it for a fixed number of simulation
-//! steps, and writes what came out. No window, no output device, and no clock -
-//! the mixer is asked for exactly one step's worth of samples after every step,
-//! so the same build produces the same file on every machine.
+//! `colby --record sound.wav` is the exact mirror of `--shot`: it brings the
+//! world up the way the window path does, runs it for a fixed number of
+//! simulation steps, and writes what came out. No window, no output device, and
+//! no clock - the mixer is asked for exactly one step's worth of samples after
+//! every step, so the same build produces the same file on every machine.
 //!
 //! **That is the whole point.** A screenshot is how anybody reviewing a change
 //! to the renderer sees the result without being at the machine; there was no
@@ -16,30 +16,21 @@
 //! `just shot` and `just hear` describe the same second and a half of the same
 //! world - one as a picture and one as a sound.
 
-use std::{
-	fs,
-	path::{Path, PathBuf},
-};
+use std::{fs, path::Path, time::Duration};
 
 use colby_asset::wav;
 use colby_audio::{Bank, CHANNELS, Mixer, Snapshot};
 use colby_core::{
 	Result,
-	abi::{Input, SoundData, World, console},
+	abi::{Input, SoundData},
 	err, info,
 	time::{Rate, STEP},
 };
-use colby_physics::Simulation;
-use colby_script::Vm;
-use colby_ui::Interface;
 
-use crate::{assets::Assets, game::Game, step};
-
-/// The flag that asks for a recording.
-const FLAG: &str = "--record";
+use crate::{Front, Runtime};
 
 /// Where the sound goes when the flag is given without a path.
-const DEFAULT_PATH: &str = "colby.wav";
+pub(crate) const DEFAULT_PATH: &str = "colby.wav";
 
 /// How many frames a second the file holds.
 ///
@@ -79,7 +70,7 @@ const _: () = assert!(
 /// How many steps to run when nobody says.
 ///
 /// The same ninety a screenshot takes, so the two describe the same moment.
-const DEFAULT_STEPS: u32 = 90;
+pub(crate) const DEFAULT_STEPS: u32 = 90;
 
 /// The most steps one recording may be.
 ///
@@ -87,134 +78,47 @@ const DEFAULT_STEPS: u32 = 90;
 /// the sample cap a sound may have is what this is derived from: about three
 /// minutes of stereo at this rate. Past it the encoder would refuse the whole
 /// thing after doing all the work.
-const MAX_STEPS: u32 = 10_000;
-
-/// What the command line asked for.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Request {
-	/// Where to write the file.
-	pub(crate) path: PathBuf,
-
-	/// How many simulation steps to run.
-	pub(crate) steps: u32,
-}
-
-/// Reads the command line for a recording request.
-///
-/// Accepts `--record` on its own, `--record path`, `--record=path`, and either
-/// of the last two followed by a number of steps.
-///
-/// @param arguments - the command line, without the program's own name
-/// @return what to record, if anything was asked for
-#[must_use]
-pub(crate) fn requested(arguments: &[String]) -> Option<Request> { parse(arguments) }
-
-/// The same, over arguments already collected.
-///
-/// Split out so that it can be tested, which the environment cannot be.
-fn parse(arguments: &[String]) -> Option<Request> {
-	for (index, argument) in arguments.iter().enumerate() {
-		let path = if let Some(rest) = argument.strip_prefix(&format!("{FLAG}=")) {
-			Some(PathBuf::from(rest))
-		} else if argument == FLAG {
-			arguments
-				.get(index + 1)
-				.filter(|next| !next.starts_with('-'))
-				.map(PathBuf::from)
-		} else {
-			continue;
-		};
-
-		let Some(path) = path else {
-			return Some(Request {
-				path: PathBuf::from(DEFAULT_PATH),
-				steps: DEFAULT_STEPS,
-			});
-		};
-
-		// a number after the path, and only if it is one: `--record out.wav`
-		// followed by another flag must not eat it.
-		let steps = arguments
-			.get(index + if argument == FLAG { 2 } else { 1 })
-			.and_then(|word| word.parse::<u32>().ok())
-			.unwrap_or(DEFAULT_STEPS);
-
-		return Some(Request { path, steps: steps.clamp(1, MAX_STEPS) });
-	}
-
-	None
-}
+pub(crate) const MAX_STEPS: u32 = 10_000;
 
 /// Runs the game for a moment and writes what came out of the mixer.
 ///
-/// @param request - where to write and how long for
+/// @param path - where to write the file
+/// @param steps - how many simulation steps to run
 /// @param workspace - the checkout the runner was built from
 /// @return `Ok` once the file is on disk
-pub(crate) fn take(request: &Request, workspace: &Path) -> Result {
-	// boxed and installed before anything else touches the world, for the same
-	// reason the window and the screenshot box it: the world keeps this
-	// address.
-	let mut simulation = Box::new(Simulation::new());
-	let mut world = Box::<World>::default();
-	world.install_physics(simulation.table());
-
-	// assets first, so the game's `init` resolves its meshes and its sounds by
-	// name. A recording that skipped this would be a recording of a game that
-	// found nothing to play.
-	Assets::new(workspace).sync(&mut world);
-
-	let mut game = Game::open(&mut world)?;
+pub(crate) fn take(path: &Path, steps: u32, workspace: &Path) -> Result {
+	// no console and no device here either, for the screenshot's reasons and
+	// one more: what replaces the device is the two lines after every step
+	// below, which are what a device's callback would have done. The runtime
+	// lays the interface out against the picture's size at a scale of one, so
+	// a document laid out against another size does not put its buttons
+	// somewhere else and a script that reacts to one does not react
+	// differently. Nothing here draws it. @ref `Front::Fixed`.
+	let mut runtime = Runtime::open(Front::Fixed, workspace)?;
 	let mut input = Input::default();
-	let mut scripts = Vm::new(console::defer)?;
-	let mut interface = Interface::new();
-
-	// the viewport a screenshot uses, at a scale of one, and for the same
-	// reason: a document laid out against another size would put its buttons
-	// somewhere else, and a script that reacts to one would react differently.
-	// Nothing here draws it.
-	let viewport = colby_core::glam::Vec2::new(1280.0, 720.0);
-	world.ui.set_viewport(viewport, 1.0);
-	world.aspect = viewport.x / viewport.y;
 
 	let mut bank = Bank::new();
 	let mut mixer = Mixer::new(RATE);
 	let mut snapshot = Snapshot::new();
 	let mut block = vec![0.0_f32; FRAMES_PER_STEP * CHANNELS];
 	let mut samples: Vec<i16> = Vec::with_capacity(
-		usize::try_from(request.steps)
+		usize::try_from(steps)
 			.unwrap_or(0)
 			.saturating_mul(FRAMES_PER_STEP)
 			.saturating_mul(CHANNELS),
 	);
 
-	for number in 1..=request.steps {
+	for number in 1..=steps {
 		// the simulated time this step ends at, computed rather than
 		// accumulated, exactly as a screenshot does it.
 		let time = (STEP * number).as_secs_f32();
 
-		step::run(
-			&mut world,
-			step::Parts {
-				game: Some(&mut game),
-				interface: &mut interface,
-				scripts: Some(&mut scripts),
-				simulation: simulation.as_mut(),
-				// no device here either. What replaces it is the two lines
-				// below, which are what a device's callback would have done.
-				audio: None,
-				// no wire either, for the same reason.
-				wire: None,
-			},
-			&mut input,
-			Rate::DEFAULT,
-			time,
-			false,
-		);
+		runtime.step(&mut input, Rate::DEFAULT, time, false, Duration::ZERO);
 
 		// a game may register a sound of its own, and this is the only place
 		// that would notice. It is a scan over a handful of revisions.
-		bank.sync(&world.sounds);
-		snapshot.take(&world);
+		bank.sync(&runtime.world.sounds);
+		snapshot.take(&runtime.world);
 		mixer.render(&bank, &snapshot, &mut block);
 		samples.extend(block.iter().map(|sample| quantize(*sample)));
 	}
@@ -227,23 +131,22 @@ pub(crate) fn take(request: &Request, workspace: &Path) -> Result {
 	let (peak, loudness) = measure(&data.samples);
 	let bytes = wav::encode(&data)?;
 
-	if let Some(parent) = request
-		.path
+	if let Some(parent) = path
 		.parent()
 		.filter(|it| !it.as_os_str().is_empty())
 	{
 		fs::create_dir_all(parent)?;
 	}
 
-	fs::write(&request.path, &bytes)
-		.map_err(|error| err!(Asset("writing {}: {error}", request.path.display())))?;
-	game.close(&mut world);
+	fs::write(path, &bytes)
+		.map_err(|error| err!(Asset("writing {}: {error}", path.display())))?;
+	runtime.close();
 
 	// peak and loudness in the line, because they are what somebody asks next
 	// and because a file of silence and a file of noise are the same size.
 	info!(
-		path = %request.path.display(),
-		steps = request.steps,
+		path = %path.display(),
+		steps,
 		seconds = data.seconds(),
 		rate = RATE,
 		peak,
@@ -299,94 +202,6 @@ fn measure(samples: &[i16]) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	/// The command line, as strings.
-	fn line(words: &[&str]) -> Vec<String> {
-		words
-			.iter()
-			.map(|word| (*word).to_owned())
-			.collect()
-	}
-
-	#[test]
-	fn a_command_line_with_no_flag_asks_for_nothing() {
-		assert_eq!(parse(&line(&["--shot", "picture.png"])), None);
-		assert_eq!(parse(&line(&[])), None);
-	}
-
-	#[test]
-	fn the_flag_on_its_own_writes_where_it_says_it_will() {
-		assert_eq!(
-			parse(&line(&["--record"])),
-			Some(Request {
-				path: PathBuf::from(DEFAULT_PATH),
-				steps: DEFAULT_STEPS,
-			})
-		);
-	}
-
-	#[test]
-	fn a_path_is_taken_either_way_round() {
-		for words in [&["--record", "out.wav"][..], &["--record=out.wav"][..]] {
-			assert_eq!(
-				parse(&line(words)),
-				Some(Request {
-					path: PathBuf::from("out.wav"),
-					steps: DEFAULT_STEPS,
-				}),
-				"{words:?}"
-			);
-		}
-	}
-
-	#[test]
-	fn a_number_after_the_path_is_a_step_count() {
-		for words in [&["--record", "out.wav", "300"][..], &["--record=out.wav", "300"][..]] {
-			assert_eq!(
-				parse(&line(words)),
-				Some(Request {
-					path: PathBuf::from("out.wav"),
-					steps: 300,
-				}),
-				"{words:?}"
-			);
-		}
-	}
-
-	#[test]
-	fn a_flag_after_the_path_is_not_a_step_count() {
-		assert_eq!(
-			parse(&line(&["--record", "out.wav", "--other"])),
-			Some(Request {
-				path: PathBuf::from("out.wav"),
-				steps: DEFAULT_STEPS,
-			}),
-			"a word that is not a number leaves the default alone"
-		);
-	}
-
-	#[test]
-	fn a_flag_where_the_path_would_be_is_not_a_path() {
-		// `--record --shot out.png` asks for a recording with no path and a
-		// screenshot, not for a recording called `--shot`.
-		assert_eq!(
-			parse(&line(&["--record", "--shot", "out.png"])),
-			Some(Request {
-				path: PathBuf::from(DEFAULT_PATH),
-				steps: DEFAULT_STEPS,
-			})
-		);
-	}
-
-	#[test]
-	fn a_step_count_nothing_could_hold_is_clamped_rather_than_refused() {
-		assert_eq!(
-			parse(&line(&["--record", "out.wav", "9999999"])).map(|it| it.steps),
-			Some(MAX_STEPS),
-			"the encoder would refuse the whole thing after doing all the work"
-		);
-		assert_eq!(parse(&line(&["--record", "out.wav", "0"])).map(|it| it.steps), Some(1));
-	}
 
 	#[test]
 	fn a_step_is_a_whole_number_of_frames() {
