@@ -483,20 +483,24 @@ pub(crate) fn obey(world: &mut World, net: &Net) {
 			continue;
 		}
 
-		// **and it is run as its sender.** Every command in this game reads
-		// `World::peer` to find out whose player it is about - `played`, the
-		// spawn point in front of somebody, which crosshair a nameless
-		// `game.grab` means. Swapping the field around the call is what turns
-		// the console from the host's keyboard into an RPC layer, which is what
-		// the design said it was for. Put back afterwards whatever the command
-		// did, because a command that ended the process leaves the world half
-		// written and the field has to name this machine again either way.
-		let was = world.peer;
-
-		world.peer = who;
-		info!(from = %said.from, slot = who.slot(), text = %said.text, "running what a peer asked for");
-		crate::console::run(world, &said.text);
-		world.peer = was;
+		// **and it is run as its sender, pointing where its sender was.**
+		// Every command in this game reads `World::peer` to find out whose
+		// player it is about, and one that acts on what a crosshair is on
+		// reads `World::aim` to find out where that crosshair was - which this
+		// end cannot work out, because a client's camera and pointer are in
+		// the one arena that crosses to nobody. @ref
+		// `crate::console::run_as`, which is where the two are swapped and put
+		// back.
+		info!(
+			from = %said.from,
+			slot = who.slot(),
+			text = %said.text,
+			pointing = said.aim.is_some(),
+			origin = ?said.aim.origin,
+			direction = ?said.aim.direction,
+			"running what a peer asked for"
+		);
+		crate::console::run_as(world, who, said.aim, &said.text);
 	}
 }
 
@@ -6758,6 +6762,58 @@ mod tests {
 	}
 
 	#[test]
+	fn a_line_that_crossed_runs_pointing_where_its_sender_was() {
+		// **the other half of the RPC layer, and the half two angles could not
+		// reach.** A client's camera and its pointer are in the one arena that
+		// crosses to nobody, so a host has no way to work out what a client was
+		// pointing at - only what it was facing. A command that acts on
+		// whatever the crosshair is on therefore reads a ray the line brought
+		// with it, and this is the check that the ray it reads is the sender's
+		// rather than the host's own.
+		let (mut host, mut client, _wire) = two();
+		let (mut served, mut window) = (empty_world(), empty_world());
+		// six numbers that are six different numbers, and nothing an empty
+		// world's camera would produce.
+		let theirs = Aim {
+			origin: [-4.0, 0.5, 12.0],
+			direction: [0.6, -0.8, 0.25],
+		};
+
+		served.cvars.attribute(Owner::Module);
+		served
+			.cvars
+			.command("game.whence", whence, "writes down where its caller was pointing");
+		served.cvars.attribute(Owner::Engine);
+
+		joined(&mut window);
+		round(&mut host, &mut client, 1);
+		client
+			.say(theirs, "game.whence")
+			.expect("the ring took it");
+		round(&mut host, &mut client, 2);
+		host.seat(&mut served);
+		assert!(
+			!served
+				.pointing()
+				.start()
+				.abs_diff_eq(theirs.start(), 1e-3),
+			"the host's own screen points somewhere else, or this proves nothing"
+		);
+		obey(&mut served, &host);
+
+		assert_eq!(served.steps, 1, "it ran, once");
+		assert!(
+			served.clear.abs_diff_eq(theirs.start(), 1e-6),
+			"and it began where the sender's ray began"
+		);
+		assert!(
+			served.light.abs_diff_eq(theirs.forward(), 1e-6),
+			"and went where the sender's ray went"
+		);
+		assert!(!served.aim.is_some(), "and the field is nobody's again once the line has run");
+	}
+
+	#[test]
 	fn a_line_from_a_peer_with_no_name_is_not_run_as_somebody_else() {
 		// a peer is given its name by the block of commands in a message, and
 		// the reliable ring in front of that block is read first - so the very
@@ -6901,6 +6957,30 @@ mod tests {
 		world.steps = world.steps.saturating_add(1);
 		world.contacts = u32::try_from(world.peer.to_bits() & 0xFFFF_FFFF).unwrap_or(0);
 		world.owed_steps = world.peer.generation();
+	}
+
+	/// A console command that writes down where the world said its caller was
+	/// pointing.
+	///
+	/// The other half of what [`whoami`] is for. A command that acts on
+	/// whatever a crosshair is on reads [`World::aim`], so a line run with the
+	/// host's own ray in place is a line that acted on the wrong thing
+	/// entirely. The ray goes into two vectors nothing else in these tests
+	/// writes, so that all six numbers survive to be compared.
+	///
+	/// # Safety
+	///
+	/// As `ConsoleFn`: both pointers are live for the duration of the call.
+	unsafe extern "C-unwind" fn whence(world: *mut World, _args: *const colby_core::abi::Args) {
+		// SAFETY: as `mark`.
+		let world = unsafe { &mut *world };
+
+		// the mark that says it ran at all, for `whoami`'s reason: a line that
+		// was refused and a line that ran pointing nowhere write the same
+		// zeroes into the two vectors.
+		world.steps = world.steps.saturating_add(1);
+		world.clear = Vec3::from_array(world.aim.origin);
+		world.light = Vec3::from_array(world.aim.direction);
 	}
 
 	/// A console command that does nothing, so the gate has a name to find.

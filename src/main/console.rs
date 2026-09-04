@@ -32,7 +32,9 @@ use std::{
 
 use colby_core::{
 	Error,
-	abi::{Args, ConsoleFn, Cvars, Mix, Scripts, Sound, Value, Voice, World, console},
+	abi::{
+		Aim, Args, ConsoleFn, Cvars, Mix, PeerId, Scripts, Sound, Value, Voice, World, console,
+	},
 	error, info, warn,
 };
 use colby_script::Asked;
@@ -578,14 +580,54 @@ fn install_scenes(world: &mut World) {
 	);
 }
 
-/// Runs one line, containing anything it throws.
+/// Runs one line as this machine, pointing where this screen points.
+///
+/// The ordinary way in, and the one every caller but the wire uses. @ref
+/// [`run_as`] for what a line that came from somewhere else goes through.
+///
+/// @param world - the world the line is run against
+/// @param line - one console line
+pub(crate) fn run(world: &mut World, line: &str) {
+	let (peer, aim) = (world.peer, world.pointing());
+
+	run_as(world, peer, aim, line);
+}
+
+/// Runs one line as somebody, pointing wherever they were, containing anything
+/// it throws.
+///
+/// **Two fields swapped around one call, and they are the whole of what makes
+/// the console an RPC layer.** [`World::peer`] is who is asking - every
+/// gameplay command reads it to find out whose player a nameless request is
+/// about - and [`World::aim`] is where they were pointing, which is the thing
+/// two angles could not say. A line that arrived from a peer is run with that
+/// peer's pair; a line typed here is run with this machine's, which is what
+/// makes a command written once mean the same thing on both paths.
+///
+/// **Both are put back afterwards, whatever happened.** A command that ended
+/// the process leaves the world half written and the fields have to name this
+/// machine again either way, and a command that panicked has not said anything
+/// about who the next one is from.
 ///
 /// A command can come from the game module, and gameplay code is code that is
 /// expected to be wrong sometimes. A panic in one costs a message: unlike a
 /// panic in `update` it does not park the module, because a bad command says
 /// nothing about whether the rest of the build works.
-pub(crate) fn run(world: &mut World, line: &str) {
+///
+/// @param world - the world the line is run against
+/// @param peer - who is asking
+/// @param aim - where they were pointing, or [`Aim::NONE`]
+/// @param line - one console line
+pub(crate) fn run_as(world: &mut World, peer: PeerId, aim: Aim, line: &str) {
+	let (was_peer, was_aim) = (world.peer, world.aim);
+
+	world.peer = peer;
+	world.aim = aim;
+
 	let result = catch_unwind(AssertUnwindSafe(|| console::run(world, line)));
+
+	world.peer = was_peer;
+	world.aim = was_aim;
 
 	if let Err(payload) = result {
 		let failure = Error::from_panic(&*payload);
@@ -1021,9 +1063,118 @@ unsafe extern "C-unwind" fn step(world: *mut World, args: *const Args) {
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::SoundData;
+	use colby_core::{
+		abi::SoundData,
+		glam::{Vec2, Vec3},
+	};
 
 	use super::*;
+
+	/// A console command that writes down where the world said its caller was
+	/// pointing, and then throws if it was told to.
+	///
+	/// The ray goes into two vectors nothing else here writes, so that all six
+	/// numbers survive to be compared rather than a summary of them.
+	///
+	/// # Safety
+	///
+	/// As `ConsoleFn`: both pointers are live for the duration of the call.
+	unsafe extern "C-unwind" fn whence(world: *mut World, args: *const Args) {
+		// SAFETY: the console hands over a live world for the duration of the
+		// call.
+		let world = unsafe { &mut *world };
+		// SAFETY: and live arguments beside it. Two blocks because two
+		// dereferences in one is a lint.
+		let args = unsafe { &*args };
+
+		world.clear = Vec3::from_array(world.aim.origin);
+		world.light = Vec3::from_array(world.aim.direction);
+
+		assert!(args.rest() != "throw", "asked to");
+	}
+
+	/// A world with `whence` registered and a camera somewhere particular.
+	fn asked() -> World {
+		let mut world = World::new();
+
+		world.camera.position = Vec3::new(3.0, 5.0, 9.0);
+		world.camera.target = Vec3::new(1.0, 0.5, 0.0);
+		world
+			.ui
+			.set_viewport(Vec2::new(1280.0, 720.0), 1.0);
+		world
+			.cvars
+			.command("whence", whence, "writes down where its caller was pointing");
+
+		world
+	}
+
+	#[test]
+	fn a_line_typed_here_is_run_pointing_where_this_screen_points() {
+		let mut world = asked();
+		let pointing = world.pointing();
+
+		assert!(pointing.is_some(), "this screen points somewhere, or this proves nothing");
+		run(&mut world, "whence");
+		assert!(
+			world.clear.abs_diff_eq(pointing.start(), 1e-6)
+				&& world.light.abs_diff_eq(pointing.forward(), 1e-6),
+			"the command saw this screen's own ray"
+		);
+		assert!(!world.aim.is_some(), "and the field is nobody's again once the line has run");
+	}
+
+	#[test]
+	fn a_line_run_as_somebody_else_is_run_with_their_aim_and_their_name() {
+		let mut world = asked();
+		// slot three, third occupant, said the way a runner has to say one:
+		// minting is the world's and `PeerId::at` is not public.
+		let mine = PeerId::from_bits((7 << 32) | 3);
+		// deliberately not what this screen points along, and six numbers that
+		// are six different numbers.
+		let theirs = Aim {
+			origin: [-4.0, 0.5, 12.0],
+			direction: [0.6, -0.8, 0.25],
+		};
+
+		assert!(
+			!world
+				.pointing()
+				.start()
+				.abs_diff_eq(theirs.start(), 1e-3),
+			"the two rays differ, or this test cannot tell them apart"
+		);
+		run_as(&mut world, mine, theirs, "whence");
+		assert!(
+			world.clear.abs_diff_eq(theirs.start(), 1e-6)
+				&& world.light.abs_diff_eq(theirs.forward(), 1e-6),
+			"the command saw the ray it was run with rather than this screen's"
+		);
+		assert!(world.peer.is_host(), "and this machine is itself again");
+		assert!(!world.aim.is_some(), "pointing nowhere again");
+	}
+
+	#[test]
+	fn a_command_that_panicked_does_not_leave_its_callers_aim_behind() {
+		// the reason the two fields are put back before the panic is reported
+		// rather than after: a line that threw has said nothing about who the
+		// next one is from, and a world left holding a departed peer's ray
+		// would hand it to whatever ran next.
+		let mut world = asked();
+
+		run_as(
+			&mut world,
+			PeerId::from_bits((5 << 32) | 2),
+			Aim {
+				origin: [1.0; 3],
+				direction: [0.0, 1.0, 0.0],
+			},
+			"whence throw",
+		);
+		assert!(world.clear.abs_diff_eq(Vec3::ONE, 1e-6), "it ran, and it saw the aim");
+		assert!(world.peer.is_host(), "and this machine is itself again");
+		assert!(!world.aim.is_some(), "and pointing nowhere, though the command threw");
+	}
 
 	/// A table with the four volumes registered, as `install_audio` leaves it.
 	fn table() -> World {
