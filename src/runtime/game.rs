@@ -211,9 +211,9 @@ impl Game {
 
 #[cfg(not(feature = "hot_reload"))]
 impl Game {
-	/// Binds the game linked into this executable.
+	/// Binds the game linked into this executable: the Blank fixture's.
 	fn swap_in(&mut self, world: &mut World) -> Result {
-		let api = colby_game::colby_game_api();
+		let api = blank_game::colby_game_api();
 
 		if api.abi_version != ABI_VERSION {
 			let found = api.abi_version;

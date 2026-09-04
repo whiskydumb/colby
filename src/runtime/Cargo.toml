@@ -18,16 +18,18 @@ hot_reload = ["colby_core/hot_reload"]
 editor = ["dep:colby_editor"]
 # links the game straight into the library instead of loading it. This is what
 # a shipped build looks like, and it is also the check that the boundary really
-# is just a table of function pointers.
-static_game = ["dep:colby_game"]
+# is just a table of function pointers. The game it links is the Blank
+# fixture's, because an optional dependency names one crate; a shipped build
+# of some other project's game is a decision for later.
+static_game = ["dep:blank_game"]
 
 [dependencies]
+blank_game = { workspace = true, optional = true }
 colby_asset.workspace = true
 colby_audio.workspace = true
 colby_core.workspace = true
 colby_editor = { workspace = true, optional = true }
 colby_engine.workspace = true
-colby_game = { workspace = true, optional = true }
 colby_net.workspace = true
 colby_physics.workspace = true
 colby_script.workspace = true

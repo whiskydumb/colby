@@ -18,6 +18,12 @@ hot_profile := "hot"
 hot_flags := "-Cprefer-dynamic"
 hot_dir := "target" / hot_profile
 
+# the project every recipe that runs the engine opens: the Blank fixture, the
+# one project that always lives in this tree. The engine checkout is not a
+# project itself, so a run from here has to name one; pass another on the
+# command line - `just project=../elsewhere shot` - to run that one instead.
+project := "projects/blank"
+
 # list available recipes
 default:
     @just --list
@@ -75,7 +81,7 @@ dist:
 # engine, and for looking at what a source turned into: pass --force to
 # recompile everything, --help for the rest.
 assets *args:
-    cargo run --quiet --package colby_assetc {{locked}} -- {{args}}
+    cargo run --quiet --package colby_assetc {{locked}} -- --project "{{project}}" {{args}}
 
 # build every crate for hot-reload, with a shared std and a shared colby_core
 hot-build:
@@ -83,11 +89,11 @@ hot-build:
 
 # run the engine with hot-reload enabled
 hot: hot-build
-    ./{{hot_dir}}/colby.exe
+    ./{{hot_dir}}/colby.exe --project "{{project}}"
 
 # render one frame of the game to a png, without opening a window
 shot path="colby.png": hot-build
-    ./{{hot_dir}}/colby.exe --shot "{{path}}"
+    ./{{hot_dir}}/colby.exe --project "{{project}}" --shot "{{path}}"
 
 # record what a run sounds like, into a wav
 #
@@ -96,7 +102,7 @@ shot path="colby.png": hot-build
 # no output device: the same build writes the same file on every machine, which
 # is what makes a hash of it worth comparing. Pass a step count for longer.
 hear path="colby.wav" steps="90": hot-build
-    ./{{hot_dir}}/colby.exe --record "{{path}}" {{steps}}
+    ./{{hot_dir}}/colby.exe --project "{{project}}" --record "{{path}}" {{steps}}
 
 # run two endpoints against each other over a wire that lies
 #
@@ -118,7 +124,7 @@ setup:
     rustup toolchain install {{nightly}} --profile minimal --component rustfmt
     cargo install typos-cli --locked
 
-# remove build artifacts, the compiled assets among them
+# remove build artifacts, the project's compiled assets among them
 clean:
     cargo clean
-    if (Test-Path .colby) { Remove-Item -Recurse -Force .colby }
+    if (Test-Path "{{project}}/.colby") { Remove-Item -Recurse -Force "{{project}}/.colby" }

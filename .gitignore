@@ -2,17 +2,19 @@
 /target
 **/*.rs.bk
 
-# what running the engine leaves behind. The console archive is a user file
-# rather than a derived one, which is why it stays in the project root and out
-# of the derived directories: cargo clean should not take somebody's settings.
-# Saved scenes are the same kind of thing and are there for the same reason.
-# colby.png is what `just shot` writes when nobody names a path. `.colby/` is
-# what the engine derives for a project - the compiled assets - and
-# `just clean` takes it.
-/settings.cfg
+# what running the engine leaves behind, under whichever project it was run
+# on. The console archive is a user file rather than a derived one, which is
+# why it stays in the project's root and out of the derived directory: cargo
+# clean should not take somebody's settings. Saved scenes are the same kind of
+# thing and are there for the same reason. `.colby/` is what the engine derives
+# for a project - the compiled assets - and `just clean` takes it. colby.png
+# and colby.wav are what `just shot` and `just hear` write when nobody names a
+# path, and they land wherever the command was run from.
+settings.cfg
+saves/
+.colby/
 /colby.png
-/saves/
-/.colby/
+/colby.wav
 
 # mounts of projects that live elsewhere, made by the runtime so that their
 # game crates are built in this workspace. @ref src/runtime/mount.rs. The one

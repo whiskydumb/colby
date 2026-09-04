@@ -20,6 +20,13 @@ license = "MIT"
 # Dependencies
 #
 
+# @note: the Blank fixture's game crate, and the one game the runtime can link
+# in statically: an optional dependency has to name one crate, and this is the
+# crate that is always in the tree. A shipped build of some other project is a
+# decision for later. @ref src/runtime/Cargo.toml.
+[workspace.dependencies.blank_game]
+path = "projects/blank/game"
+
 [workspace.dependencies.colby_asset]
 path = "src/asset"
 

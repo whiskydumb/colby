@@ -3,12 +3,12 @@
 //! Three entry points that do nothing but say so. It exists for three reasons:
 //! it is the game crate of the Blank project, which is what a new project
 //! starts from; it is what the loader, the `static_game` check and the
-//! hot-reload check have to load once the sandbox has left the tree; and it is
-//! the one member the workspace's `projects/*/game` glob always matches,
+//! hot-reload check have to load, the tree carrying no game of its own; and it
+//! is the one member the workspace's `projects/*/game` glob always matches,
 //! without which cargo refuses the pattern outright.
 //!
-//! Everything a Blank project shows comes from its scenes and its programs. A
-//! game that wants more than that adds it here, exactly as the sandbox did.
+//! Everything a Blank project shows comes from its scenes and its programs,
+//! and a new one has neither. A game that wants more than that adds it here.
 
 // @note: the workspace denies unsafe code; the three entry points are the whole
 // of what a module cannot avoid, and each is a pointer the host promised.
@@ -16,8 +16,15 @@
 
 use colby_core::{
 	abi::{ABI_VERSION, GameApi, World},
-	info,
+	info, mod_ctor, mod_dtor,
 };
+
+// @note: the two hooks every module declares, and neither is decoration. The
+// second is where the unload canary is reported from: without it the host
+// reads every swap of this module as a module that failed to leave the
+// process, and says so on every reload. @ref `colby_core::mods::canary`.
+mod_ctor! {}
+mod_dtor! {}
 
 /// The one symbol the host resolves.
 ///
