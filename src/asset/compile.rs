@@ -37,7 +37,7 @@
 
 use std::{
 	fs,
-	path::{Path, PathBuf},
+	path::{Component, Path, PathBuf},
 	time::SystemTime,
 };
 
@@ -431,6 +431,60 @@ pub fn output_root(workspace: &Path) -> PathBuf {
 	OUTPUT_DIR
 		.iter()
 		.fold(workspace.to_path_buf(), |path, part| path.join(part))
+}
+
+/// Where a file a source names is, if it stays inside the source tree.
+///
+/// The one rule for a stylesheet a document links, a buffer or a picture a
+/// model names, and anything else a source reaches for beside itself: a file
+/// from outside the tree is one the staleness check cannot see, so it is not
+/// followed. Resolved lexically - `.` and `..` folded without touching the
+/// filesystem, because the file may not exist yet - and compared against the
+/// tree resolved the same way, because `Path::starts_with` compares components
+/// and would let `assets/ui/../../secrets.css` through as starting with
+/// `assets`.
+///
+/// @note: a step up over nothing is kept rather than dropped. A tree named
+/// `../project/assets` has to keep its shape on both sides of the comparison;
+/// folding that step away on one side is what once made every stylesheet of a
+/// project opened by a relative path fall silently out of its documents.
+///
+/// @param path - the file as the source named it, joined onto the source's own
+/// directory
+/// @param root - the source tree, which a reference may not leave
+/// @return the resolved path, or nothing when it climbs out of the tree
+#[must_use]
+pub(crate) fn within(path: &Path, root: &Path) -> Option<PathBuf> {
+	let path = lexical(path);
+
+	path.starts_with(lexical(root)).then_some(path)
+}
+
+/// Resolves `.` and `..` without touching the filesystem.
+///
+/// @ref [`within`] for why a step up over nothing stays a step up.
+fn lexical(path: &Path) -> PathBuf {
+	let mut out = PathBuf::new();
+
+	for part in path.components() {
+		match part {
+			| Component::CurDir => {},
+			| Component::ParentDir => step_up(&mut out),
+			| other => out.push(other),
+		}
+	}
+
+	out
+}
+
+/// A step up: over a name it takes the name away, over nothing or over another
+/// step up it stays a step up.
+fn step_up(path: &mut PathBuf) {
+	if matches!(path.components().next_back(), Some(Component::Normal(_))) {
+		path.pop();
+	} else {
+		path.push("..");
+	}
 }
 
 /// The name a source compiles to.
@@ -1292,6 +1346,44 @@ f 4 1 5 8
 		assert!(
 			asset_name(root, Path::new("C:/elsewhere/thing.obj")).is_err(),
 			"and a file outside the tree has no name here"
+		);
+	}
+
+	#[test]
+	fn a_reference_stays_inside_a_tree_named_by_a_climbing_path() {
+		// the fault this guards against: folding `..` by popping drops a step
+		// up over nothing, so a tree named `../project/assets` came out as
+		// `project/assets` and nothing inside it was inside it any more -
+		// which was every stylesheet of a project opened by a relative path
+		// falling silently out of its documents.
+		let root = Path::new("../project/assets");
+
+		assert_eq!(
+			within(&root.join("ui").join("theme.css"), root),
+			Some(root.join("ui").join("theme.css")),
+			"a file beside a document is inside the tree the document is in"
+		);
+		assert_eq!(
+			within(
+				&root
+					.join("ui")
+					.join("..")
+					.join("..")
+					.join("secrets.css"),
+				root
+			),
+			None,
+			"and one that climbs out of it is still outside, however the tree was named"
+		);
+		assert_eq!(
+			within(Path::new("../../project/assets/x.css"), root),
+			None,
+			"two steps up are not one"
+		);
+		assert_eq!(
+			within(&root.join("ui").join(".").join("theme.css"), root),
+			Some(root.join("ui").join("theme.css")),
+			"and a step nowhere is folded away"
 		);
 	}
 

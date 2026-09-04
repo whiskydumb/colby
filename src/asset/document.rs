@@ -45,9 +45,9 @@
 
 use std::path::Path;
 
-use colby_core::{Result, abi::ui::DocumentData, err};
+use colby_core::{Result, abi::ui::DocumentData, err, warn};
 
-use crate::html;
+use crate::{compile, html};
 
 /// The eight bytes every `.cdoc` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYDOC";
@@ -192,7 +192,8 @@ pub fn stylesheets(source: &Path, text: &str, root: &Path) -> Vec<std::path::Pat
 ///
 /// Anything that climbs out of the source tree is dropped rather than followed:
 /// an asset that reads a file from somewhere else is not something the
-/// compiler's staleness check can see.
+/// compiler's staleness check can see. @ref [`compile::within`], which is the
+/// rule.
 ///
 /// @param source - the `.html`, in the source tree
 /// @param root - the source tree, which a reference may not leave
@@ -204,31 +205,8 @@ fn beside(source: &Path, root: &Path, named: &[String]) -> Vec<std::path::PathBu
 
 	named
 		.iter()
-		.map(|href| normalize(&directory.join(href)))
-		.filter(|path| path.starts_with(root))
+		.filter_map(|href| compile::within(&directory.join(href), root))
 		.collect()
-}
-
-/// Resolves `.` and `..` without touching the filesystem.
-///
-/// Lexical rather than canonical on purpose: the file may not exist yet, and
-/// `Path::starts_with` compares components, so `assets/ui/../../secrets.css`
-/// still starts with `assets` as far as it is concerned. Without this the check
-/// above lets exactly the paths it exists to refuse through.
-fn normalize(path: &Path) -> std::path::PathBuf {
-	let mut out = std::path::PathBuf::new();
-
-	for part in path.components() {
-		match part {
-			| std::path::Component::CurDir => {},
-			| std::path::Component::ParentDir => {
-				out.pop();
-			},
-			| other => out.push(other),
-		}
-	}
-
-	out
 }
 
 /// Reads a document and everything it links to, ready to be written out.
@@ -238,9 +216,22 @@ fn normalize(path: &Path) -> std::path::PathBuf {
 /// @return the merged text, or why one of its parts could not be read
 pub fn merge(source: &Path, root: &Path) -> Result<String> {
 	let text = std::fs::read_to_string(source)?;
+	let named = html::links(&text);
+	let sheets = beside(source, root, &named);
 	let mut merged = String::new();
 
-	for path in stylesheets(source, &text, root) {
+	// a link that was dropped is a document that draws unstyled, and this is
+	// the one moment anybody can be told: the staleness check asks for the
+	// same list four times a second and is no place for a warning.
+	if sheets.len() < named.len() {
+		warn!(
+			document = %source.display(),
+			dropped = named.len() - sheets.len(),
+			"a stylesheet outside the source tree is not followed"
+		);
+	}
+
+	for path in sheets {
 		let sheet = read_part(source, &path)?;
 
 		merged.push_str("<style>\n");
@@ -355,6 +346,24 @@ mod tests {
 			found.is_empty(),
 			"the compiler cannot watch a file outside the tree it walks, so following one would \
 			 be a stale output nobody could explain"
+		);
+	}
+
+	#[test]
+	fn a_link_is_followed_when_the_source_tree_itself_is_named_by_a_climbing_path() {
+		// a project opened as `--project ../elsewhere` names its tree with a
+		// step up in it, and every one of its documents lost its stylesheet
+		// to a guard that folded that step away on one side of the comparison
+		// and not the other.
+		let root = Path::new("../elsewhere/assets");
+		let document = root.join("ui").join("hud.html");
+
+		let found = stylesheets(&document, "<link href=\"theme.css\">", root);
+
+		assert_eq!(found, vec![root.join("ui").join("theme.css")], "beside the document");
+		assert!(
+			stylesheets(&document, "<link href=\"../../secrets.css\">", root).is_empty(),
+			"and a link that climbs out of that tree is still refused"
 		);
 	}
 

@@ -36,11 +36,14 @@
 //!                    integers(3) -> [u32] x 42      (an index buffer)
 //! ```
 
-use std::path::{self, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use colby_core::{Result, err};
 
-use crate::json::{self, Value};
+use crate::{
+	compile,
+	json::{self, Value},
+};
 
 mod clip;
 mod geometry;
@@ -161,9 +164,8 @@ impl Gltf {
 	#[must_use]
 	pub fn beside(&self, uri: &str) -> Option<PathBuf> {
 		let named = unescape(uri)?;
-		let path = lexical(&self.source.parent()?.join(named));
 
-		path.starts_with(&self.root).then_some(path)
+		compile::within(&self.source.parent()?.join(named), &self.root)
 	}
 
 	/// The source tree this file was read from inside.
@@ -655,11 +657,7 @@ pub fn linked(source: &Path, root: &Path) -> Vec<PathBuf> {
 		})
 		.filter_map(|entry| entry.get("uri").and_then(Value::as_str))
 		.filter(|uri| !uri.starts_with(DATA_PREFIX))
-		.filter_map(|uri| {
-			let path = lexical(&directory.join(unescape(uri)?));
-
-			path.starts_with(root).then_some(path)
-		})
+		.filter_map(|uri| compile::within(&directory.join(unescape(uri)?), root))
 		.collect()
 }
 
@@ -838,34 +836,10 @@ fn read_beside(uri: &str, source: &Path, root: &Path) -> std::result::Result<Vec
 	let directory = source
 		.parent()
 		.ok_or_else(|| format!("{uri} has nothing to be beside"))?;
-	let path = lexical(&directory.join(named));
-
-	if !path.starts_with(root) {
-		return Err(format!("{uri} is outside the asset tree"));
-	}
+	let path = compile::within(&directory.join(named), root)
+		.ok_or_else(|| format!("{uri} is outside the asset tree"))?;
 
 	std::fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))
-}
-
-/// Resolves `.` and `..` without touching the filesystem.
-///
-/// The same reasoning a document's links follow: the check above compares
-/// components, so a path that still holds a `..` passes it while pointing
-/// somewhere else entirely.
-fn lexical(path: &Path) -> PathBuf {
-	let mut out = PathBuf::new();
-
-	for part in path.components() {
-		match part {
-			| path::Component::CurDir => {},
-			| path::Component::ParentDir => {
-				out.pop();
-			},
-			| other => out.push(other),
-		}
-	}
-
-	out
 }
 
 /// The bytes a `data:` address carries, when it carries them as base64.
