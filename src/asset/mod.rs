@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! assets/meshes/crystal.obj  --[obj::import]-->  MeshData
-//!                            --[format::encode]-->  target/assets/meshes/crystal.cmesh
+//!                            --[format::encode]-->  .colby/assets/meshes/crystal.cmesh
 //!                            --[format::MeshFile]-->  World::meshes["meshes/crystal"]
 //! ```
 //!

@@ -1763,7 +1763,7 @@ fn freezing_is_the_kind_rather_than_a_flag() {
 
 #[test]
 fn a_layer_is_how_a_program_asks_which_ones() {
-	// the rule the whole sandbox is built on: nothing keeps a list, and
+	// the rule a sandbox is built on: nothing keeps a list, and
 	// "which of them are props" is a walk of the table asking each one.
 	let mut world = running(
 		r#"function tick(dt)
@@ -2353,7 +2353,7 @@ fn typed(line: &str) -> Vec<Asked> {
 
 #[test]
 fn a_program_publishes_a_command_and_is_asked_for_it() {
-	// **the discipline the sandbox is already written in**: every action is a
+	// **the discipline a sandbox is written in**: every action is a
 	// named function with a console command in front of it and an optional
 	// target. That is what makes gameplay drivable with no mouse in it, and it
 	// is the layer the wire already uses for remote calls.
@@ -2511,13 +2511,15 @@ fn a_command_is_acted_on_before_the_tick_of_the_step_it_arrives_in() {
 	);
 }
 
-/// The sandbox's thruster, as it ships.
+/// A thruster: the fixture every test of the world-program API below runs.
 ///
-/// **The file itself rather than a copy of it.** What this is a test of is the
-/// thing somebody will read and edit, and a paraphrase in here would go on
-/// passing after the real one stopped working. The same bargain the mixer's
-/// tests make with the recording that ships beside them.
-const THRUSTER: &str = include_str!("../../assets/scripts/thruster.lua");
+/// **A file rather than a string in here**, so that a mutation driver can
+/// point at it and so that it reads the way a program somebody writes reads. It
+/// began as a game's own prop, which is why it is a complete program rather
+/// than a probe: a force along its own up, a noise while it burns, an arrow,
+/// and three commands it publishes. The same bargain the mixer's tests make
+/// with the recording beside them.
+const THRUSTER: &str = include_str!("fixtures/thruster.lua");
 
 /// A world with one thruster in it, standing at the origin and pointing up.
 fn thrusting() -> (World, BodyId) {
@@ -2583,7 +2585,7 @@ fn rising(world: &World, it: BodyId) -> f32 {
 }
 
 #[test]
-fn the_shipped_thruster_pushes_only_once_it_is_switched_on() {
+fn the_thruster_pushes_only_once_it_is_switched_on() {
 	let (mut world, it) = thrusting();
 	let mut scripts = machine();
 
@@ -2614,7 +2616,7 @@ fn the_shipped_thruster_pushes_only_once_it_is_switched_on() {
 }
 
 #[test]
-fn the_shipped_thruster_adds_to_what_is_already_pushing_rather_than_replacing_it() {
+fn the_thruster_adds_to_what_is_already_pushing_rather_than_replacing_it() {
 	// **a push rather than a set**, and a single tick cannot tell the two
 	// apart: after one from nothing they agree exactly. What separates them is
 	// a second tick with nothing spending what the first left.
@@ -2691,7 +2693,7 @@ fn a_program_can_turn_a_body_without_moving_it() {
 }
 
 #[test]
-fn the_shipped_thruster_lifts_a_heavy_prop_slower_than_a_light_one() {
+fn the_thruster_lifts_a_heavy_prop_slower_than_a_light_one() {
 	// **the whole point of the change, and the one thing no other test here
 	// can see**: what a force does depends on what the thing weighs, and that
 	// only happens where a real solver runs. Two thrusters, one four times the
@@ -2759,7 +2761,7 @@ fn the_shipped_thruster_lifts_a_heavy_prop_slower_than_a_light_one() {
 }
 
 #[test]
-fn the_shipped_thruster_pushes_along_its_own_up_rather_than_the_worlds() {
+fn the_thruster_pushes_along_its_own_up_rather_than_the_worlds() {
 	// what makes a thruster a thruster rather than a lift: turn it over and it
 	// pushes the other way.
 	let (mut world, it) = thrusting();
@@ -2787,7 +2789,7 @@ fn the_shipped_thruster_pushes_along_its_own_up_rather_than_the_worlds() {
 }
 
 #[test]
-fn the_shipped_thruster_makes_a_noise_while_it_burns_and_stops_when_it_does() {
+fn the_thruster_makes_a_noise_while_it_burns_and_stops_when_it_does() {
 	let (mut world, _) = thrusting();
 	let mut scripts = machine();
 
@@ -2809,7 +2811,7 @@ fn the_shipped_thruster_makes_a_noise_while_it_burns_and_stops_when_it_does() {
 }
 
 #[test]
-fn the_shipped_thruster_takes_its_noise_with_it_when_it_is_removed() {
+fn the_thruster_takes_its_noise_with_it_when_it_is_removed() {
 	// a noise nobody can name is a noise that plays until the process ends.
 	let (mut world, it) = thrusting();
 	let mut scripts = machine();
@@ -2826,7 +2828,7 @@ fn the_shipped_thruster_takes_its_noise_with_it_when_it_is_removed() {
 }
 
 #[test]
-fn the_shipped_thruster_draws_itself_while_it_burns() {
+fn the_thruster_draws_itself_while_it_burns() {
 	let (mut world, _) = thrusting();
 	let mut scripts = machine();
 

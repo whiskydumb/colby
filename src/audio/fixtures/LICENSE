@@ -1,0 +1,28 @@
+thud.wav beside this file is not a recording of anything and is nobody's work
+but this project's. It is arithmetic, and it carries the same terms the rest
+of the repository does: MIT, Copyright (c) 2026 whisky, see LICENSE at the
+root.
+
+It is written down here because nothing downstream can tell a generated sound
+from a recorded one, so if it is not said here it is not said anywhere. The
+description was measured back out of the file on 2026-09-03 rather than copied
+from a generator - the generator was never in the repository - so it says what
+the file is, not what was typed to make it, and a regenerated file will not be
+sample-identical.
+
+Mono, sixteen-bit, 44100 Hz. Nothing in the engine cares about the rate - a
+.csnd keeps whatever its source had, and the mixer resamples - and the tests
+beside this file are about exactly that: what the mixer does to a real
+recording at a rate that is not the recording's own.
+
+  thud.wav    0.3000 s, 13230 frames, peaks at 0.85
+
+      A downward pitch sweep under an exponential decay: the tone falls from
+      about 117 Hz at the start to about 33 Hz at the end, and the amplitude
+      falls by roughly a factor of e^4 over the length, which leaves under two
+      percent of the peak at the end. That is a struck thump rather than a
+      note. The decay's time constant is about seventy milliseconds, and the
+      envelope test in real.rs reads that number off this file.
+
+What to do if it is ever regenerated: keep the length and the decay, and
+re-measure this file afterwards rather than trusting it.

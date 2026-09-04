@@ -5,7 +5,7 @@
 //! of them is a name that has to be taken apart before anything can be played.
 //! A clip is written beside the meshes of the model it came out of, under that
 //! model's own directory, so `assets/models/hero.glb` holding a walk becomes
-//! `target/assets/models/hero/walk.canim` and registers as `models/hero/walk`.
+//! `.colby/assets/models/hero/walk.canim` and registers as `models/hero/walk`.
 //!
 //! ```text
 //!   0  ClipHeader                       64 bytes

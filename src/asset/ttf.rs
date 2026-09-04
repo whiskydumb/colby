@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! assets/fonts/hack.ttf  --[ttf::import]-->  FontData
-//!                        --[font::encode]-->  target/assets/fonts/hack.cfont
+//!                        --[font::encode]-->  .colby/assets/fonts/hack.cfont
 //! ```
 
 use ab_glyph_rasterizer::{Rasterizer, point};
@@ -559,19 +559,10 @@ mod tests {
 
 	/// The font every test here bakes.
 	///
-	/// Read from the toolchain's own copy rather than committed: these tests
-	/// are about the baking, not about a particular typeface, and the assets
-	/// directory is for what the engine ships with.
-	fn face() -> Option<Vec<u8>> {
-		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-			.join("..")
-			.join("..")
-			.join("assets")
-			.join("fonts")
-			.join("hack.ttf");
-
-		std::fs::read(path).ok()
-	}
+	/// A fixture beside this crate rather than anything a project ships: these
+	/// tests are about the baking, not about a typeface, and the engine's own
+	/// tree carries no assets. Hack, under the MIT license beside it.
+	const fn face() -> &'static [u8] { include_bytes!("fixtures/hack.ttf") }
 
 	#[test]
 	fn a_file_that_is_not_a_font_is_refused_with_a_sentence() {
@@ -585,11 +576,9 @@ mod tests {
 
 	#[test]
 	fn a_baked_font_has_metrics_a_line_can_be_laid_out_with() {
-		let Some(bytes) = face() else {
-			return;
-		};
+		let bytes = face();
 
-		let font = import(&bytes).expect("the font in assets/ bakes");
+		let font = import(bytes).expect("the font beside this crate bakes");
 
 		assert!(font.ascent > 0.0, "letters reach above the baseline");
 		assert!(font.descent > 0.0, "and descenders below it");
@@ -603,11 +592,9 @@ mod tests {
 
 	#[test]
 	fn every_glyph_lands_inside_the_atlas_it_was_packed_into() {
-		let Some(bytes) = face() else {
-			return;
-		};
+		let bytes = face();
 
-		let font = import(&bytes).expect("the font in assets/ bakes");
+		let font = import(bytes).expect("the font beside this crate bakes");
 
 		for glyph in &font.glyphs {
 			let right = u32::from(glyph.atlas_x) + u32::from(glyph.atlas_width);
@@ -631,11 +618,9 @@ mod tests {
 
 	#[test]
 	fn glyphs_come_out_in_codepoint_order_so_a_lookup_is_a_search() {
-		let Some(bytes) = face() else {
-			return;
-		};
+		let bytes = face();
 
-		let font = import(&bytes).expect("the font in assets/ bakes");
+		let font = import(bytes).expect("the font beside this crate bakes");
 
 		assert!(
 			font.glyphs
@@ -647,11 +632,9 @@ mod tests {
 
 	#[test]
 	fn the_letters_a_person_types_are_all_there() {
-		let Some(bytes) = face() else {
-			return;
-		};
+		let bytes = face();
 
-		let font = import(&bytes).expect("the font in assets/ bakes");
+		let font = import(bytes).expect("the font beside this crate bakes");
 
 		for character in "Hg0 ,.:xY".chars() {
 			assert!(
@@ -668,11 +651,9 @@ mod tests {
 
 	#[test]
 	fn a_space_has_an_advance_and_no_picture() {
-		let Some(bytes) = face() else {
-			return;
-		};
+		let bytes = face();
 
-		let font = import(&bytes).expect("the font in assets/ bakes");
+		let font = import(bytes).expect("the font beside this crate bakes");
 		let space = font
 			.glyph(u32::from(' '))
 			.expect("every font has a space");
@@ -683,11 +664,9 @@ mod tests {
 
 	#[test]
 	fn a_letter_is_solid_in_the_middle_and_empty_outside_it() {
-		let Some(bytes) = face() else {
-			return;
-		};
+		let bytes = face();
 
-		let font = import(&bytes).expect("the font in assets/ bakes");
+		let font = import(bytes).expect("the font beside this crate bakes");
 		let glyph = font
 			.glyph(u32::from('H'))
 			.expect("every font has an H");
@@ -713,11 +692,9 @@ mod tests {
 
 	#[test]
 	fn the_baked_size_is_what_the_metrics_are_in() {
-		let Some(bytes) = face() else {
-			return;
-		};
+		let bytes = face();
 
-		let font = import(&bytes).expect("the font in assets/ bakes");
+		let font = import(bytes).expect("the font beside this crate bakes");
 
 		assert!(
 			(font.pixel_size - PIXEL_SIZE).abs() < f32::EPSILON,

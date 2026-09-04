@@ -14,3 +14,5 @@ Cargo.lock text linguist-generated=true
 *.woff2 binary
 *.glb   binary
 *.bin   binary
+*.ttf   binary
+*.wav   binary

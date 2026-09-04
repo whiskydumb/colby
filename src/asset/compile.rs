@@ -1,10 +1,10 @@
 //! The compiler: a source tree in, a tree of `.cmesh` out.
 //!
 //! Two directories, mirrored. `assets/` holds what a person edits and
-//! `target/assets/` holds what the engine loads, at the same relative paths
+//! `.colby/assets/` holds what the engine loads, at the same relative paths
 //! with the extension swapped. A mesh's **name** is that relative path without
 //! its extension and with forward slashes - `assets/meshes/crystal.obj`
-//! compiles to `target/assets/meshes/crystal.cmesh` and registers as
+//! compiles to `.colby/assets/meshes/crystal.cmesh` and registers as
 //! `meshes/crystal`. Names are paths rather than bare stems so that two
 //! directories may hold a `wall.obj` without one quietly winning.
 //!
@@ -1037,7 +1037,7 @@ mod tests {
 	use std::{thread::sleep, time::Duration};
 
 	use super::*;
-	use crate::{document::DocumentFile, font::FontFile, format::MeshFile, texture::TextureFile};
+	use crate::{document::DocumentFile, format::MeshFile, texture::TextureFile};
 
 	/// Every kind the compiler knows about.
 	///
@@ -1642,136 +1642,6 @@ f 4 1 5 8
 			.expect_err("a typo in the path should not look like an empty project");
 
 		assert!(error.to_string().contains("nowhere"), "{error}");
-	}
-
-	#[test]
-	fn the_assets_that_ship_with_the_workspace_all_compile() {
-		let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-			.ancestors()
-			.nth(2)
-			.expect("the crate sits two directories below the workspace root");
-
-		let root = source_root(repository);
-		if !root.is_dir() {
-			eprintln!("no {} directory; skipping", root.display());
-			return;
-		}
-
-		let out = workspace("shipped").join("out");
-		let report = compile_dir(&root, &out, true).expect("the shipped tree compiles");
-
-		assert!(report.failed.is_empty(), "every shipped asset compiles: {:?}", report.failed);
-		assert!(!report.compiled.is_empty(), "and there is at least one of them");
-
-		for compiled in &report.compiled {
-			reads_back(compiled);
-		}
-	}
-
-	/// Opens one compiled asset with its own reader and asks it for the one
-	/// number that says it is not empty.
-	///
-	/// Lifted out of the loop above because that test is one arm per kind and
-	/// the line count is a lint. It is also the half worth naming: the loop is
-	/// "everything shipped compiles" and this is "and what came out is
-	/// readable".
-	fn reads_back(compiled: &Compiled) {
-		match Kind::of_output(&compiled.output) {
-			| Some(Kind::Mesh) => {
-				let file = MeshFile::open(&compiled.output).expect("the mesh reads back");
-
-				assert!(
-					file.header().index_count > 0,
-					"{} compiled to a mesh that draws nothing",
-					compiled.name
-				);
-			},
-			| Some(Kind::Texture) => {
-				let file = TextureFile::open(&compiled.output).expect("the texture reads back");
-
-				assert!(
-					file.header().levels > 0,
-					"{} compiled to a texture with no levels",
-					compiled.name
-				);
-			},
-			| Some(Kind::Font) => {
-				let file = FontFile::open(&compiled.output).expect("the font reads back");
-
-				assert!(
-					file.header().glyph_count > 0,
-					"{} compiled to a font with no glyphs in it",
-					compiled.name
-				);
-				assert!(
-					file.glyphs()
-						.iter()
-						.any(|glyph| glyph.codepoint == u32::from('Ж')),
-					"{} compiled without Cyrillic, which is half the text anyone here will type",
-					compiled.name
-				);
-			},
-			| Some(Kind::Model) => {
-				let file =
-					model::ModelFile::open(&compiled.output).expect("the model reads back");
-
-				assert!(
-					!file.stands().is_empty(),
-					"{} compiled to a model with nothing standing anywhere",
-					compiled.name
-				);
-			},
-			| Some(Kind::Scene) => {
-				let file =
-					scene::SceneFile::open(&compiled.output).expect("the scene reads back");
-
-				assert!(
-					!file.stood().is_empty() || !file.bulk().is_empty(),
-					"{} compiled to a scene with nothing in it at all",
-					compiled.name
-				);
-			},
-			| Some(Kind::Document) => {
-				let file = DocumentFile::open(&compiled.output).expect("the document reads back");
-				let data = file.to_document_data().expect("and parses back");
-
-				assert!(
-					data.nodes.len() > 1,
-					"{} compiled to a document with nothing in it",
-					compiled.name
-				);
-				assert!(
-					compiled.warnings.is_empty(),
-					"{} compiled with complaints: {:?}",
-					compiled.name,
-					compiled.warnings
-				);
-			},
-			| Some(Kind::Sound) => {
-				let file =
-					sound::SoundFile::open(&compiled.output).expect("the sound reads back");
-
-				assert!(
-					!file.samples().is_empty(),
-					"{} compiled to a sound with no samples in it",
-					compiled.name
-				);
-			},
-			| Some(Kind::Script) => {
-				let file = script::ScriptFile::open(&compiled.output).expect("the program reads");
-
-				assert!(
-					!file.source().trim().is_empty(),
-					"{} compiled to a program with nothing in it",
-					compiled.name
-				);
-			},
-			| Some(Kind::Skeleton | Kind::Clip) => panic!(
-				"{} compiled straight into a skeleton or a clip, and only a model writes one",
-				compiled.name
-			),
-			| None => panic!("{} compiled to something unrecognized", compiled.name),
-		}
 	}
 }
 
