@@ -13,7 +13,7 @@ use std::{
 use colby_audio::Device;
 use colby_core::{
 	Error, Result,
-	abi::{Input, Mix, World, cvar::Cvars},
+	abi::{Input, Mix, World, console, cvar::Cvars},
 	debug, err, error,
 	glam::{Vec2, Vec3},
 	info,
@@ -276,7 +276,7 @@ impl App {
 		// would hand it nothing on the first one.
 		self.assets.sync(&mut self.world);
 
-		match Vm::new(crate::console::publisher()) {
+		match Vm::new(console::defer) {
 			| Ok(scripts) => self.scripts = Some(scripts),
 			| Err(error) =>
 				error!(%error, "no interpreter; documents with a script have no logic"),
@@ -566,7 +566,7 @@ impl App {
 		// reason. Then everything the socket is holding, before any step: what
 		// a step runs against is what had arrived when it started rather than
 		// whatever turned up halfway through. @ref `crate::net`.
-		crate::net::serve(self.net.as_mut());
+		crate::net::serve(&mut self.world, self.net.as_mut());
 
 		if let Some(net) = self.net.as_mut() {
 			// which is where this window learns who it is, where what the host

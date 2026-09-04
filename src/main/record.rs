@@ -22,7 +22,7 @@ use colby_asset::wav;
 use colby_audio::{Bank, CHANNELS, Mixer, Snapshot};
 use colby_core::{
 	Result,
-	abi::{Input, SoundData, World},
+	abi::{Input, SoundData, World, console},
 	err, info,
 	time::{Rate, STEP},
 };
@@ -164,7 +164,7 @@ pub(crate) fn take(request: &Request) -> Result {
 
 	let mut game = Game::open(&mut world)?;
 	let mut input = Input::default();
-	let mut scripts = Vm::new(crate::console::publisher())?;
+	let mut scripts = Vm::new(console::defer)?;
 	let mut interface = Interface::new();
 
 	// the viewport a screenshot uses, at a scale of one, and for the same

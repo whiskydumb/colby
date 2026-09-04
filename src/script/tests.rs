@@ -8,11 +8,11 @@
 //! collided yet.
 
 use colby_core::abi::{
-	Body, BodyId, EntityId, PeerId, ScriptData, Shape, Transform, Value, World,
+	Aim, Asked, Body, BodyId, EntityId, PeerId, ScriptData, Shape, Transform, Value, World,
 	ui::{DocumentData, Event, EventKind, PanelId},
 };
 
-use super::{Asked, Vm};
+use super::Vm;
 
 /// A world showing one document, with this program registered under its name.
 ///
@@ -2343,7 +2343,12 @@ fn typed(line: &str) -> Vec<Asked> {
 		return Vec::new();
 	};
 
-	vec![Asked { name, words: words.collect() }]
+	vec![Asked {
+		name,
+		words: words.collect(),
+		peer: PeerId::HOST,
+		aim: Aim::NONE,
+	}]
 }
 
 #[test]

@@ -97,29 +97,6 @@ pub(crate) const KINDS: [&str; 3] = ["press", "release", "click"];
 
 /// One command that was typed and belongs to a program.
 ///
-/// The console hands a command a [`World`] and nothing else, so the one
-/// function standing in for every program's commands cannot reach the
-/// interpreter from inside the call. It writes down what was asked and the step
-/// hands it over - the note-to-the-frame-loop shape a scene load has.
-///
-/// **The function itself is the runner's**, not this crate's: a
-/// [`ConsoleFn`] is an unsafe extern function and there is no `unsafe`
-/// anywhere in here, deliberately. That costs nothing, because the address has
-/// to be inside the host either way - which is what makes a program's command
-/// the one kind with no lifetime problem at all, the exact inverse of a game
-/// module's.
-///
-/// The delay is at most one step: the console is drained just before a step
-/// runs, and the step hands these over before it ticks anything.
-#[derive(Clone, Debug)]
-pub struct Asked {
-	/// The name it was called under.
-	pub name: String,
-
-	/// The words that followed.
-	pub words: Vec<String>,
-}
-
 /// Which program the VM is inside at this instant.
 ///
 /// The api functions are made once per step and shared by every program, so

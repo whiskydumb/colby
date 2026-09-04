@@ -24,8 +24,89 @@ use std::{fs, path::Path};
 use super::{
 	World,
 	cvar::{Args, Entry, Value},
+	net::{Aim, PeerId},
 };
 use crate::{error, info, warn};
+
+/// A line a command put off, waiting for whoever can answer it.
+///
+/// A [`ConsoleFn`](super::ConsoleFn) is handed a world and nothing else, and
+/// some of what a console asks for is not in one: putting a saved world back
+/// needs the solver, `net.say` needs the socket, a program's command needs the
+/// interpreter, and all three are the runner's. A command like that leaves its
+/// line on [`World::asked`] and whoever owns the thing it needs takes the line
+/// off again and does the work.
+///
+/// **Who registered the name decides who takes the line.** The table already
+/// says whose every entry is (@ref [`Owner`](super::cvar::Owner)): the frame
+/// loop takes the engine's, the interpreter takes a program's, and a game
+/// module's are left where they are for the game's own `update` to read. That
+/// is the rule the wire uses for what a peer may run, and it turned out to be
+/// the same line.
+///
+/// [`peer`](Self::peer) and [`aim`](Self::aim) are what the line was run with,
+/// the two fields the runner swaps around a call. A line that waited is taken
+/// up with the same pair, so a line from a peer stays that peer's rather than
+/// becoming the host's for having waited a frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Asked {
+	/// The name it was called under.
+	pub name: String,
+
+	/// The words that followed.
+	pub words: Vec<String>,
+
+	/// Who asked.
+	pub peer: PeerId,
+
+	/// Where they were pointing, or [`Aim::NONE`].
+	pub aim: Aim,
+}
+
+/// How many lines may wait on a world at once.
+///
+/// Small on purpose. What waits is what was typed, said by a peer or asked by
+/// a program since the previous frame, which is a handful; a name registered
+/// with [`defer`] that nothing answers for would otherwise grow the queue for
+/// as long as the process ran. Past this a line is refused with a message
+/// naming it, which is how such a name gets found.
+pub const MAX_WAITING: usize = 256;
+
+/// The one command every line that has to wait is registered with.
+///
+/// Writes down what was asked, and who asked, and returns; @ref [`Asked`] for
+/// who takes the line up. Its address is inside `colby_core`, which every
+/// module shares and nothing unloads, so a name registered with it from
+/// anywhere - the runner, a program, a game module - has no lifetime problem.
+///
+/// # Safety
+///
+/// As any [`ConsoleFn`](super::ConsoleFn): both pointers are live for the
+/// duration of the call.
+pub unsafe extern "C-unwind" fn defer(world: *mut World, args: *const Args) {
+	// SAFETY: the console hands over a live world for the duration of the call.
+	let world = unsafe { &mut *world };
+	// SAFETY: and a live argument list beside it.
+	let args = unsafe { &*args };
+
+	if world.asked.len() >= MAX_WAITING {
+		warn!(
+			name = args.name(),
+			waiting = world.asked.len(),
+			"refused: too many lines are waiting, so something registered to wait is never \
+			 answered"
+		);
+
+		return;
+	}
+
+	world.asked.push(Asked {
+		name: args.name().to_owned(),
+		words: args.words().to_vec(),
+		peer: world.peer,
+		aim: world.aim,
+	});
+}
 
 /// Runs every statement in a line, a paste, or a whole file.
 ///
@@ -398,5 +479,70 @@ mod tests {
 	fn nothing_is_not_a_statement() {
 		assert!(statements("").is_empty(), "an empty line");
 		assert!(statements("   \n\n  ;  ").is_empty(), "or one with nothing but separators");
+	}
+
+	/// A world with one command in it that waits rather than acting.
+	fn waiting() -> World {
+		let mut world = World::new();
+		world
+			.cvars
+			.command("scene.later", defer, "leaves its line for the frame loop");
+
+		world
+	}
+
+	#[test]
+	fn a_line_put_off_is_on_the_world_with_who_said_it_and_where_they_pointed() {
+		let mut world = waiting();
+		// somebody in particular, pointing somewhere in particular: the two
+		// fields a runner swaps around a call are what a line that waited has
+		// to carry, or it is run later as whoever happens to be asking then.
+		let somebody = PeerId::from_bits((3 << 32) | 2);
+		let there = Aim {
+			origin: [1.0, 2.0, 3.0],
+			direction: [0.0, 0.0, -1.0],
+		};
+
+		world.peer = somebody;
+		world.aim = there;
+		run(&mut world, "scene.later one two");
+
+		assert_eq!(world.asked, [Asked {
+			name: "scene.later".to_owned(),
+			words: vec!["one".to_owned(), "two".to_owned()],
+			peer: somebody,
+			aim: there,
+		}]);
+		assert!(!world.quit, "and nothing else happened");
+	}
+
+	#[test]
+	fn lines_wait_in_the_order_they_were_asked() {
+		let mut world = waiting();
+
+		run(&mut world, "scene.later first; scene.later second");
+
+		let names: Vec<&str> = world
+			.asked
+			.iter()
+			.map(|asked| asked.words[0].as_str())
+			.collect();
+
+		assert_eq!(names, ["first", "second"], "a queue rather than a slot");
+	}
+
+	#[test]
+	fn a_queue_nobody_drains_stops_taking_lines_rather_than_growing() {
+		let mut world = waiting();
+
+		for _ in 0..MAX_WAITING + 8 {
+			run(&mut world, "scene.later");
+		}
+
+		assert_eq!(
+			world.asked.len(),
+			MAX_WAITING,
+			"the ceiling holds, and the lines past it are refused rather than kept"
+		);
 	}
 }

@@ -22,95 +22,69 @@ use std::{
 	io::{BufRead, stdin},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
-	sync::{
-		Mutex,
-		atomic::{AtomicBool, Ordering},
-		mpsc::{self, Receiver, TryRecvError},
-	},
+	sync::mpsc::{self, Receiver, TryRecvError},
 	thread,
 };
 
 use colby_core::{
 	Error,
 	abi::{
-		Aim, Args, ConsoleFn, Cvars, Mix, PeerId, Scripts, Sound, Value, Voice, World, console,
+		Aim, Args, Asked, Cvars, Mix, PeerId, Scripts, Sound, Value, Voice, World, console,
+		cvar::Owner,
 	},
 	error, info, warn,
 };
-use colby_script::Asked;
 
 /// The file archived variables are kept in.
 const ARCHIVE: &str = "cvars.cfg";
 
-/// Every command a program published that has been typed and not yet handed
-/// over.
-///
-/// A queue rather than a bool, because two of them typed between one pair of
-/// steps are two things asked for. Emptied by the step.
-static PUBLISHED: Mutex<Vec<Asked>> = Mutex::new(Vec::new());
+/// The name `script.status` waits under.
+pub(crate) const SCRIPT_STATUS: &str = "script.status";
 
-/// The one function every command a program publishes is registered with.
+/// Takes every waiting line that was asked under one of these names.
 ///
-/// **Its address is inside `colby.exe`, which is never unloaded**, which makes
-/// this the exact inverse of a command a game module registers: those have to
-/// be dropped before `FreeLibrary` because the pointer is an address in the
-/// image about to go, and this one has no lifetime problem at all. What it
-/// does have is no context - a [`ConsoleFn`] is handed a world and nothing
-/// else - so the name it was called under is the only way to tell which of a
-/// program's commands was asked for, and that is what
-/// [`Args::name`](colby_core::abi::Args::name) is for.
+/// **The frame loop's half of a line that waited.** A command that needs
+/// something the runner owns - the solver, the socket, the interpreter - is
+/// registered with [`console::defer`] and leaves its line on the world; each
+/// of the runner's subsystems then asks for its own names here, once a frame,
+/// and does the work with what it has. @ref [`Asked`] for the whole
+/// arrangement, and [`of_scripts`] for the one taker that goes by owner rather
+/// than by name.
 ///
-/// It is here rather than in `colby_script` because that crate has no `unsafe`
-/// in it anywhere, deliberately, and this is an unsafe extern function.
-///
-/// # Safety
-///
-/// As [`help`].
-unsafe extern "C-unwind" fn published(_world: *mut World, args: *const Args) {
-	// SAFETY: as help.
-	let args = unsafe { &*args };
-
-	let Ok(mut waiting) = PUBLISHED.lock() else {
-		return;
-	};
-
-	waiting.push(Asked {
-		name: args.name().to_owned(),
-		words: (0..args.len())
-			.filter_map(|at| args.word(at))
-			.map(str::to_owned)
-			.collect(),
-	});
+/// @param world - where the lines wait
+/// @param names - which of them to take
+/// @return the lines, in the order they were asked
+pub(crate) fn take(world: &mut World, names: &[&str]) -> Vec<Asked> {
+	world
+		.asked
+		.extract_if(.., |asked| names.contains(&asked.name.as_str()))
+		.collect()
 }
 
-/// The function a program's commands are registered with.
+/// Takes every waiting line that is a program's to answer.
 ///
-/// Handed to the interpreter when it comes up, because it cannot write one for
-/// itself. @ref [`published`].
-pub(crate) const fn publisher() -> ConsoleFn { published }
+/// By who registered the name rather than by what it is: the interpreter
+/// attributes what a program publishes to itself, so a program's command is
+/// whatever the table says is a program's. A name nothing is registered under
+/// any more was a program's that has since been built again, and goes with
+/// them - the interpreter answers one of those by doing nothing, deliberately.
+/// What is left is the engine's, which the frame loop takes by name, and a
+/// module's, which stay for the game's own `update` to read.
+///
+/// @param world - where the lines wait
+/// @return the lines, in the order they were asked
+pub(crate) fn of_scripts(world: &mut World) -> Vec<Asked> {
+	let cvars = &world.cvars;
 
-/// Everything a program was asked for since the last time anybody looked.
-pub(crate) fn asked_of_scripts() -> Vec<Asked> {
-	PUBLISHED
-		.lock()
-		.map(|mut waiting| std::mem::take(&mut *waiting))
-		.unwrap_or_default()
+	world
+		.asked
+		.extract_if(.., |asked| {
+			cvars
+				.get(&asked.name)
+				.is_none_or(|entry| entry.owner() == Owner::Script)
+		})
+		.collect()
 }
-
-/// Whether somebody has asked what the interpreter is running.
-///
-/// The same note-to-the-frame-loop shape a scene load has, and for the same
-/// reason: a [`ConsoleFn`](colby_core::abi::ConsoleFn) is handed a world and
-/// nothing else, and the numbers this question is about are the interpreter's.
-/// A bool rather than a queue because asking twice before a step runs is
-/// asking once.
-static SCRIPT_STATUS: AtomicBool = AtomicBool::new(false);
-
-/// Whether the step should write out what the interpreter is running, and
-/// clears the mark.
-///
-/// @return whether it was asked for since the last step
-pub(crate) fn wants_script_status() -> bool { SCRIPT_STATUS.swap(false, Ordering::Relaxed) }
 
 /// How many playing voices `snd.list` writes a line for.
 ///
@@ -313,15 +287,14 @@ pub(crate) fn install(world: &mut World) {
 	install_scripts(world);
 }
 
-/// The two commands over the programs the host is running.
+/// The three commands over the programs the host is running.
 ///
-/// Split off like the scenes and the volumes, and for the same reason. Both are
-/// pure functions of the world, which is worth noticing: the interpreter itself
-/// is the runner's and a [`ConsoleFn`] is handed nothing but a world, so a
-/// command that had to reach into the VM would need a note the frame loop
-/// drains - the shape `saves.rs` has. Neither of these does. Listing reads the
-/// table, and reloading moves a revision and lets whoever is running the
-/// program notice on its own.
+/// Split off like the scenes and the volumes, and for the same reason. Two of
+/// them are pure functions of the world, which is worth noticing: listing
+/// reads the table, and reloading moves a revision and lets whoever is running
+/// the program notice on its own. The third asks what the interpreter is
+/// running, and the interpreter is the runner's, so its line waits for the
+/// step - which at sixty a second is not something a person notices.
 ///
 /// @param world - the table to register into
 fn install_scripts(world: &mut World) {
@@ -336,8 +309,8 @@ fn install_scripts(world: &mut World) {
 		"build <name> again, or every program if no name is given",
 	);
 	world.cvars.command(
-		"script.status",
-		script_status,
+		SCRIPT_STATUS,
+		console::defer,
 		"report what each running program cost and whether it has been switched off",
 	);
 }
@@ -349,18 +322,24 @@ fn install_scripts(world: &mut World) {
 /// numbers themselves are registered by the subsystem that reads them back, so
 /// that the name and its meaning are written down once.
 ///
+/// Both commands wait for the frame: the endpoint they want is the runner's,
+/// like the renderer and the output device. @ref [`crate::net::serve`], which
+/// takes them up.
+///
 /// @param world - the table to register into
 fn install_net(world: &mut World) {
 	crate::net::install(&mut world.cvars);
 
 	world.cvars.command(
-		"net.say",
-		say,
+		crate::net::SAY,
+		console::defer,
 		"send the rest of the line to every peer, resent until each has it",
 	);
-	world
-		.cvars
-		.command("net.status", status, "report the wire and every peer on it");
+	world.cvars.command(
+		crate::net::STATUS,
+		console::defer,
+		"report the wire and every peer on it",
+	);
 }
 
 /// The four volumes and the three commands over the voice table.
@@ -554,28 +533,31 @@ unsafe extern "C-unwind" fn list_sounds(world: *mut World, _args: *const Args) {
 /// The four that read or write a file.
 ///
 /// Split off for the lint rather than for the shape, and the shape is better
-/// for it: these are the only commands in the table that do not answer inside
-/// the frame they were typed in. Every one of them leaves a note for the frame
-/// loop instead. @ref [`crate::saves`].
+/// for it: putting a world back replaces every table in it and needs the
+/// solver, which a command cannot reach, so every one of these waits for the
+/// frame loop rather than answering inside the line. @ref [`crate::saves`],
+/// which takes them up and is where the four names are written down.
 ///
 /// @param world - the table to register into
 fn install_scenes(world: &mut World) {
-	world
-		.cvars
-		.command("scene.save", save_scene, "write the world into saves/<name>.cscene");
 	world.cvars.command(
-		"scene.write",
-		write_scene,
+		crate::saves::SAVE,
+		console::defer,
+		"write the world into saves/<name>.cscene",
+	);
+	world.cvars.command(
+		crate::saves::WRITE,
+		console::defer,
 		"write the world into assets/scenes/<name>.scene, which the compiler picks up",
 	);
 	world.cvars.command(
-		"scene.load",
-		load_scene,
+		crate::saves::LOAD,
+		console::defer,
 		"put saves/<name>.cscene back, replacing this world",
 	);
 	world.cvars.command(
-		"scene.prop",
-		write_prop,
+		crate::saves::PROP,
+		console::defer,
 		"write the scene registered as props/<name> into assets/props/<name>.scene",
 	);
 }
@@ -711,48 +693,6 @@ unsafe extern "C-unwind" fn echo(_world: *mut World, args: *const Args) {
 	info!("{}", args.rest());
 }
 
-/// `net.say <text>` - queues a console line for every peer.
-///
-/// The only way to put something through the reliable ring from a live run, and
-/// therefore the cheapest end-to-end check there is: one line reaches the ring,
-/// the channel, the socket, the far end's link, its channel and its ring. What
-/// the far end does with the line is nothing, deliberately - @ref `crate::net`
-/// for why a peer may not run commands here yet.
-///
-/// # Safety
-///
-/// As [`help`].
-unsafe extern "C-unwind" fn say(world: *mut World, args: *const Args) {
-	// SAFETY: as help.
-	let args = unsafe { &*args };
-	// SAFETY: as help, and a second block because two dereferences in one is
-	// a lint.
-	let world = unsafe { &*world };
-	let text = args.rest();
-
-	if text.is_empty() {
-		warn!("net.say needs something to say");
-
-		return;
-	}
-
-	// **where this screen is pointing, now.** A line is the one thing on this
-	// wire that crosses because somebody did something, so it is the one thing
-	// that can say where they were pointing when they did it - and the moment
-	// to ask is this one, not the frame that gets round to sending it. @ref
-	// `World::pointing`, and `crate::net::obey` for the end that reads it.
-	crate::net::ask(crate::net::Request::Say(world.pointing(), text));
-}
-
-/// `net.status` - reports the wire and every peer on it.
-///
-/// # Safety
-///
-/// As [`help`].
-unsafe extern "C-unwind" fn status(_world: *mut World, _args: *const Args) {
-	crate::net::ask(crate::net::Request::Status);
-}
-
 /// `exec <path>` - runs a config file.
 ///
 /// # Safety
@@ -835,67 +775,6 @@ unsafe extern "C-unwind" fn clear_debug(world: *mut World, _args: *const Args) {
 	info!("debug geometry cleared");
 }
 
-/// `scene.save <name>` - writes the world out.
-///
-/// Both of these leave a note rather than doing the work: a load has to happen
-/// between frames and needs the solver, which a command cannot reach. @ref
-/// [`crate::saves`] for why that is the shape rather than an accident.
-///
-/// # Safety
-///
-/// As [`help`].
-unsafe extern "C-unwind" fn save_scene(_world: *mut World, args: *const Args) {
-	// SAFETY: as help.
-	let args = unsafe { &*args };
-
-	crate::saves::ask(crate::saves::Request::Save(args.rest()));
-}
-
-/// `scene.prop <name>` - writes one registered scene out as a prop.
-///
-/// The half of saving a contraption that needs a filesystem. The other half is
-/// the game's: it cuts the piece out and registers it, because what is under
-/// somebody's crosshair is not something the host can see. @ref
-/// [`crate::saves::Request::Prop`].
-///
-/// # Safety
-///
-/// As [`help`].
-unsafe extern "C-unwind" fn write_prop(_world: *mut World, args: *const Args) {
-	// SAFETY: as help.
-	let args = unsafe { &*args };
-
-	crate::saves::ask(crate::saves::Request::Prop(args.rest()));
-}
-
-/// `scene.write <name>` - writes the world out as a source somebody can edit.
-///
-/// The other end of the editor's work, and the one that goes back into the
-/// repository rather than beside it. @ref [`crate::saves`] for the difference
-/// between the two files this and `scene.save` produce.
-///
-/// # Safety
-///
-/// As [`help`].
-unsafe extern "C-unwind" fn write_scene(_world: *mut World, args: *const Args) {
-	// SAFETY: as help.
-	let args = unsafe { &*args };
-
-	crate::saves::ask(crate::saves::Request::Write(args.rest()));
-}
-
-/// `scene.load <name>` - puts a saved world back.
-///
-/// # Safety
-///
-/// As [`help`].
-unsafe extern "C-unwind" fn load_scene(_world: *mut World, args: *const Args) {
-	// SAFETY: as help.
-	let args = unsafe { &*args };
-
-	crate::saves::ask(crate::saves::Request::Load(args.rest()));
-}
-
 /// The solver's default pass count, as the number a console variable holds.
 fn passes() -> f32 {
 	f32::from(u16::try_from(colby_physics::VELOCITY_PASSES).unwrap_or(u16::MAX))
@@ -973,20 +852,6 @@ unsafe extern "C-unwind" fn reload_script(world: *mut World, args: *const Args) 
 	if world.scripts.touch(id) {
 		info!(name, "will be built again");
 	}
-}
-
-/// `script.status` - asks the next step what the interpreter is running.
-///
-/// Leaves a mark rather than answering, because the answer is the
-/// interpreter's and this is handed a world. The line therefore arrives one
-/// step later, which at sixty a second is not something a person notices - and
-/// in a mode with no steps in it there is no console to type this at either.
-///
-/// # Safety
-///
-/// As [`help`].
-unsafe extern "C-unwind" fn script_status(_world: *mut World, _args: *const Args) {
-	SCRIPT_STATUS.store(true, Ordering::Relaxed);
 }
 
 /// `phys.bodies` - reports what the solver is carrying.

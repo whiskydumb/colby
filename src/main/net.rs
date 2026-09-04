@@ -51,7 +51,6 @@ use std::{
 	io::ErrorKind,
 	net::{SocketAddr, ToSocketAddrs, UdpSocket},
 	rc::Rc,
-	sync::Mutex,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -62,8 +61,8 @@ use colby_asset::{
 use colby_core::{
 	Result,
 	abi::{
-		Aim, Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, JointId, PeerId, Role,
-		SceneData, Value, World, console, cvar::Owner, net::BACKUP, scene,
+		Aim, Asked, Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, JointId, PeerId,
+		Role, SceneData, Value, World, console, cvar::Owner, net::BACKUP, scene,
 	},
 	debug, err,
 	glam::Vec3,
@@ -289,13 +288,24 @@ pub(crate) fn after(arguments: &[String], flag: &str) -> Option<SocketAddr> {
 	None
 }
 
-/// What a console line asked the wire to do, waiting for a frame to do it.
+/// `net.say <text>` - queues a console line for every peer.
 ///
-/// The same arrangement scene commands have, and for the same two reasons: a
-/// command runs on a thread reading the terminal, and the endpoint it wants is
-/// not reachable from a `World` - it is the runner's, like the renderer and the
-/// output device. @ref `crate::saves`, which is where this shape came from.
-static ASKED: Mutex<Vec<Request>> = Mutex::new(Vec::new());
+/// The only way to put something through the reliable ring from a live run, and
+/// therefore the cheapest end-to-end check there is: one line reaches the ring,
+/// the channel, the socket, the far end's link, its channel and its ring. What
+/// the far end does with it is decided there, @ref [`obey`].
+pub(crate) const SAY: &str = "net.say";
+
+/// `net.status` - reports the wire and every peer on it.
+pub(crate) const STATUS: &str = "net.status";
+
+/// The two names this module answers for, as they wait on the world.
+///
+/// Both wait rather than answering inside the line, and for the same two
+/// reasons scene commands do: a command runs on a thread reading the
+/// terminal, and the endpoint it wants is not reachable from a `World` - it is
+/// the runner's, like the renderer and the output device.
+const NAMES: &[&str] = &[SAY, STATUS];
 
 /// One thing a console line asked of the wire.
 /// @note: `PartialEq` and not `Eq`, because an [`Aim`] is floats.
@@ -303,35 +313,52 @@ static ASKED: Mutex<Vec<Request>> = Mutex::new(Vec::new());
 pub(crate) enum Request {
 	/// Queue a console line for every peer, with the aim of whoever typed it.
 	///
-	/// The aim is taken when the line is typed rather than when it is sent,
-	/// which is a frame later and is the wrong moment: what a tool acts on is
-	/// where the person was pointing when they asked, not where the camera had
-	/// drifted to by the time the wire got round to it.
+	/// The aim is the one the line was run with rather than where the camera
+	/// stands when the wire gets round to sending it, which is a frame later
+	/// and is the wrong moment: what a tool acts on is where the person was
+	/// pointing when they asked. @ref `World::pointing`, which is what a line
+	/// typed here is run with, and [`obey`] for the end that reads it.
 	Say(Aim, String),
 
 	/// Report what the endpoint is carrying.
 	Status,
 }
 
-/// Leaves a request for the next frame.
-pub(crate) fn ask(request: Request) {
-	if let Ok(mut waiting) = ASKED.lock() {
-		waiting.push(request);
+impl Request {
+	/// What one waiting line asks for, if it is one of this module's.
+	///
+	/// @param asked - a line the frame loop took off the world
+	/// @return the request, or `None` for a name that is not the wire's or a
+	/// `net.say` with nothing to say
+	fn of(asked: &Asked) -> Option<Self> {
+		match asked.name.as_str() {
+			| SAY => {
+				let text = asked.words.join(" ");
+
+				if text.is_empty() {
+					warn!("net.say needs something to say");
+
+					return None;
+				}
+
+				Some(Self::Say(asked.aim, text))
+			},
+			| STATUS => Some(Self::Status),
+			| _ => None,
+		}
 	}
 }
 
-/// Does whatever was asked, and empties the queue either way.
+/// Does whatever was asked of the wire, and takes the lines off either way.
 ///
 /// Called once a frame, before anything is sent. A request made in a build with
 /// no endpoint is answered with a line saying so rather than kept: a command
 /// typed at a process that is not on a wire has been answered.
 ///
+/// @param world - where the lines wait
 /// @param net - the endpoint, if this process has one
-pub(crate) fn serve(net: Option<&mut Net>) {
-	let asked: Vec<Request> = match ASKED.lock() {
-		| Ok(mut waiting) => std::mem::take(&mut waiting),
-		| Err(_) => return,
-	};
+pub(crate) fn serve(world: &mut World, net: Option<&mut Net>) {
+	let asked = crate::console::take(world, NAMES);
 
 	if asked.is_empty() {
 		return;
@@ -343,7 +370,7 @@ pub(crate) fn serve(net: Option<&mut Net>) {
 		return;
 	};
 
-	for request in asked {
+	for request in asked.iter().filter_map(Request::of) {
 		match request {
 			| Request::Say(aim, text) =>
 				if let Err(error) = net.say(aim, &text) {
@@ -6178,16 +6205,68 @@ mod tests {
 		);
 	}
 
+	/// A world with the two wire commands registered the way the host does,
+	/// and a camera pointed somewhere in particular.
+	fn typing() -> Box<World> {
+		let mut world = empty_world();
+
+		for name in NAMES {
+			world.cvars.command(name, console::defer, "");
+		}
+
+		world.camera.position = Vec3::new(2.0, 3.0, 4.0);
+		world.camera.target = Vec3::new(0.0, 1.0, 0.0);
+		world
+			.ui
+			.set_viewport(colby_core::glam::Vec2::new(1280.0, 720.0), 1.0);
+
+		world
+	}
+
 	#[test]
 	fn a_request_made_with_no_wire_is_answered_rather_than_kept() {
 		// a command typed at a process that is not on a wire has been answered,
 		// and keeping it would mean it fired the moment one appeared.
-		ask(Request::Status);
-		serve(None);
+		let mut world = typing();
 
-		let waiting = ASKED.lock().map(|held| held.len()).unwrap_or(1);
+		console::run(&mut world, "net.status");
+		assert_eq!(world.asked.len(), 1, "the line waited for the frame");
 
-		assert_eq!(waiting, 0, "the queue is empty either way");
+		serve(&mut world, None);
+
+		assert!(world.asked.is_empty(), "the queue is empty either way");
+	}
+
+	#[test]
+	fn a_line_said_here_is_said_pointing_where_this_screen_points() {
+		// the aim is the one the line was run with, which for a typed line is
+		// this screen's own ray at the moment of typing - not wherever the
+		// camera stands when the frame gets round to it.
+		let mut world = typing();
+		let pointing = world.pointing();
+
+		crate::console::run(&mut world, "net.say hello there");
+		world.camera.position = Vec3::new(-9.0, -9.0, -9.0);
+
+		let taken = crate::console::take(&mut world, NAMES);
+
+		assert_eq!(
+			Request::of(&taken[0]),
+			Some(Request::Say(pointing, "hello there".to_owned())),
+			"the words joined back together, and the ray from the moment of typing"
+		);
+	}
+
+	#[test]
+	fn saying_nothing_is_refused_rather_than_sent() {
+		let mut world = typing();
+
+		crate::console::run(&mut world, "net.say");
+
+		let taken = crate::console::take(&mut world, NAMES);
+
+		assert_eq!(taken.len(), 1, "the line waited");
+		assert_eq!(Request::of(&taken[0]), None, "and asks for nothing");
 	}
 
 	#[test]

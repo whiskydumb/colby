@@ -13,6 +13,7 @@ use colby_audio::Device;
 use colby_core::{
 	abi::{Input, World},
 	time::Rate,
+	warn,
 };
 use colby_physics::Simulation;
 use colby_script::Vm;
@@ -219,20 +220,28 @@ pub(crate) fn run(
 		// that reads what `update` decided this step is the common case, and
 		// one that wants to decide first can be a console command the game
 		// calls.
+		// the answer to `script.status` is the interpreter's and a console
+		// command is handed nothing but a world, so the line waited for this
+		// step. Taken whether or not anything is running, so a question asked
+		// while Lua is down is a question that stops rather than one that
+		// waits.
+		let status = !crate::console::take(world, &[crate::console::SCRIPT_STATUS]).is_empty();
+
 		if let Some(scripts) = scripts {
 			// what was typed at a program since the last step, handed over
 			// before its tick so a command acts on the step that follows the
-			// line rather than the one after it.
-			scripts.gameplay(world, &crate::console::asked_of_scripts());
+			// line rather than the one after it. Taken off the world by who
+			// registered the name rather than by what it is; @ref
+			// `crate::console::of_scripts`.
+			let asked = crate::console::of_scripts(world);
 
-			// and the answer to `script.status`, written here because these
-			// numbers are the interpreter's and a console command is handed
-			// nothing but a world. The mark is taken whether or not anything
-			// is running, so a question asked while Lua is down is a question
-			// that stops rather than one that waits.
-			if crate::console::wants_script_status() {
+			scripts.gameplay(world, &asked);
+
+			if status {
 				scripts.report();
 			}
+		} else if status {
+			warn!("no interpreter is running, so there is nothing to report");
 		}
 
 		// and every command that was in front of this step is done with,
@@ -645,7 +654,8 @@ mod tests {
 		// game module: `Game` is a loaded library and there is none in a test.
 		// @ref `NET-7` on the audit list.
 		let (mut world, mut simulation) = falling();
-		let mut scripts = Vm::new(crate::console::publisher()).expect("the interpreter starts");
+		let mut scripts =
+			Vm::new(colby_core::abi::console::defer).expect("the interpreter starts");
 		let mut input = Input::default();
 
 		world.cvars.var(
@@ -867,5 +877,86 @@ mod tests {
 				"editing={editing}: and a second of sound is over after a second of steps"
 			);
 		}
+	}
+
+	/// A world with four lines waiting on it: the engine's, the interpreter's,
+	/// a module's, and the question about what the interpreter is running.
+	fn four_waiting() -> (Box<World>, Box<Simulation>) {
+		use colby_core::abi::{console, cvar::Owner};
+
+		let (mut world, simulation) = falling();
+
+		world
+			.cvars
+			.command("scene.save", console::defer, "");
+		world
+			.cvars
+			.command(crate::console::SCRIPT_STATUS, console::defer, "");
+		world.cvars.attribute(Owner::Script);
+		world
+			.cvars
+			.command("test.published", console::defer, "");
+		world.cvars.attribute(Owner::Module);
+		world
+			.cvars
+			.command("game.later", console::defer, "");
+		world.cvars.attribute(Owner::Engine);
+		console::run(&mut world, "scene.save one; test.published; game.later; script.status");
+		assert_eq!(world.asked.len(), 4, "four lines waited");
+
+		(world, simulation)
+	}
+
+	/// One step with an interpreter in it and nothing else.
+	fn scripted(world: &mut World, simulation: &mut Simulation, editing: bool) {
+		let mut scripts =
+			Vm::new(colby_core::abi::console::defer).expect("the interpreter starts");
+		let parts = Parts {
+			game: None,
+			interface: &mut Interface::new(),
+			scripts: Some(&mut scripts),
+			simulation,
+			audio: None,
+			wire: None,
+		};
+
+		run(world, parts, &mut Input::default(), Rate::DEFAULT, 0.0, editing);
+	}
+
+	/// The names still waiting, in order.
+	fn waiting(world: &World) -> Vec<&str> {
+		world
+			.asked
+			.iter()
+			.map(|asked| asked.name.as_str())
+			.collect()
+	}
+
+	#[test]
+	fn a_line_that_waited_is_taken_by_whoever_registered_its_name() {
+		// the rule, in one step: a program's line and the question about the
+		// interpreter go to the interpreter; the engine's waits for the frame
+		// loop, which is not this; a module's waits for the game, which is
+		// not here either.
+		let (mut world, mut simulation) = four_waiting();
+
+		scripted(&mut world, &mut simulation, false);
+
+		assert_eq!(waiting(&world), ["scene.save", "game.later"]);
+	}
+
+	#[test]
+	fn a_world_being_edited_leaves_every_line_where_it_waits() {
+		// a program's command is gameplay, and edit mode stops gameplay. The
+		// line is not lost: it is taken by the first step that plays.
+		let (mut world, mut simulation) = four_waiting();
+
+		scripted(&mut world, &mut simulation, true);
+
+		assert_eq!(world.asked.len(), 4, "nothing was taken");
+
+		scripted(&mut world, &mut simulation, false);
+
+		assert_eq!(waiting(&world), ["scene.save", "game.later"]);
 	}
 }

@@ -189,6 +189,10 @@ impl Args {
 	#[must_use]
 	pub fn int(&self, index: usize) -> Option<i64> { self.word(index)?.parse().ok() }
 
+	/// Every word, in order.
+	#[must_use]
+	pub fn words(&self) -> &[String] { &self.words }
+
 	/// Everything, joined back together with single spaces.
 	#[must_use]
 	pub fn rest(&self) -> String { self.words.join(" ") }

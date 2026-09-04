@@ -27,15 +27,14 @@
 //! command is handed a `&mut World` and nothing else, on purpose: a command is
 //! a function pointer that a *game module* may also register, so the signature
 //! cannot mention anything the host owns privately. A command therefore leaves
-//! a note here and the frame loop reads it, which is the same shape `sim.step`
-//! already has with `World::owed_steps` and differs only in where the note is
-//! kept: a scene path is the host's business rather than the world's, so it
-//! does not become a field on `World`.
+//! its line on `World::asked` and the frame loop reads it - the same shape
+//! `sim.step` already has with `World::owed_steps`, and the same field every
+//! other command that needs something the host owns leaves its line in. @ref
+//! [`Asked`] for who takes which line.
 
 use std::{
 	fs,
 	path::{Path, PathBuf},
-	sync::{Mutex, MutexGuard},
 };
 
 #[cfg(test)]
@@ -43,8 +42,8 @@ use colby_asset::AlignedBytes;
 use colby_asset::{level, scene as file};
 use colby_core::{
 	Result,
-	abi::{World, scene},
-	err, error, info, warn,
+	abi::{Asked, World, scene},
+	err, error, info,
 };
 use colby_physics::Simulation;
 
@@ -65,11 +64,28 @@ pub(crate) const SOURCES: &str = "scenes";
 /// with nothing told about it.
 pub(crate) const PROPS: &str = "props";
 
-/// What a console command has asked the host to do, waiting for a frame.
+/// `scene.save <name>` - writes the world out.
+pub(crate) const SAVE: &str = "scene.save";
+
+/// `scene.load <name>` - puts a saved world back.
+pub(crate) const LOAD: &str = "scene.load";
+
+/// `scene.write <name>` - writes the world out as a source somebody can edit.
 ///
-/// One at a time: typing two loads before the next frame means the second one
-/// is what was meant. A queue would only make the first one happen too.
-static ASKED: Mutex<Option<Request>> = Mutex::new(None);
+/// The other end of the editor's work, and the one that goes back into the
+/// repository rather than beside it.
+pub(crate) const WRITE: &str = "scene.write";
+
+/// `scene.prop <name>` - writes one registered scene out as a prop.
+///
+/// The half of saving a contraption that needs a filesystem. The other half is
+/// the game's: it cuts the piece out and registers it, because what is under
+/// somebody's crosshair is not something the host can see. @ref
+/// [`Request::Prop`].
+pub(crate) const PROP: &str = "scene.prop";
+
+/// The four names this module answers for, as they wait on the world.
+const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP];
 
 /// One thing to do with a scene.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,10 +109,23 @@ pub(crate) enum Request {
 	Prop(String),
 }
 
-/// Leaves a note for the frame loop.
-///
-/// @param request - what to do
-pub(crate) fn ask(request: Request) { *lock() = Some(request); }
+impl Request {
+	/// What one waiting line asks for, if it is one of this module's.
+	///
+	/// @param asked - a line the frame loop took off the world
+	/// @return the request, or `None` for a name that is not a scene's
+	fn of(asked: &Asked) -> Option<Self> {
+		let name = asked.words.join(" ");
+
+		match asked.name.as_str() {
+			| SAVE => Some(Self::Save(name)),
+			| LOAD => Some(Self::Load(name)),
+			| WRITE => Some(Self::Write(name)),
+			| PROP => Some(Self::Prop(name)),
+			| _ => None,
+		}
+	}
+}
 
 /// Does whatever a command asked for, if one did.
 ///
@@ -104,10 +133,18 @@ pub(crate) fn ask(request: Request) { *lock() = Some(request); }
 /// replaces the world, and doing that halfway through a step would leave the
 /// second half of it running against a world the first half never saw.
 ///
+/// **One at a time, and the last one.** Typing two loads before the next frame
+/// means the second one is what was meant, and running both would only make
+/// the first one happen too.
+///
 /// @param world - the world to write out or replace
 /// @param simulation - the solver, whose derived state a load drops
 pub(crate) fn serve(world: &mut World, simulation: &mut Simulation) {
-	let Some(request) = lock().take() else {
+	let Some(request) = crate::console::take(world, NAMES)
+		.pop()
+		.as_ref()
+		.and_then(Request::of)
+	else {
 		return;
 	};
 
@@ -366,18 +403,6 @@ fn plain(name: &str) -> Result<&str> {
 	Ok(trimmed)
 }
 
-/// The pending note, whichever thread is asking.
-///
-/// A poisoned lock is nothing to stop for: what it guards is one optional
-/// request, and the worst a torn one could be is a save that does not happen.
-fn lock() -> MutexGuard<'static, Option<Request>> {
-	ASKED.lock().unwrap_or_else(|poisoned| {
-		warn!("the scene request lock was poisoned; carrying on with what is in it");
-
-		poisoned.into_inner()
-	})
-}
-
 /// Reads what is on disk, without going through the world.
 ///
 /// The tests' way in, and the only thing here that is not the console's.
@@ -519,18 +544,84 @@ mod tests {
 		);
 	}
 
+	/// A world with the four scene commands registered the way the host does.
+	fn console() -> World {
+		let mut world = World::new();
+
+		for name in NAMES {
+			world
+				.cvars
+				.command(name, colby_core::abi::console::defer, "");
+		}
+
+		world
+	}
+
+	#[test]
+	fn a_scene_line_waits_on_the_world_and_reads_as_what_it_asked_for() {
+		let mut world = console();
+
+		colby_core::abi::console::run(&mut world, "scene.load quicksave");
+
+		let taken = crate::console::take(&mut world, NAMES);
+
+		assert_eq!(taken.len(), 1, "one line waited");
+		assert_eq!(
+			Request::of(&taken[0]),
+			Some(Request::Load("quicksave".to_owned())),
+			"and it is the load that was typed"
+		);
+		assert!(world.asked.is_empty(), "taken, not copied");
+		assert_eq!(
+			Request::of(&Asked {
+				name: "echo".to_owned(),
+				..taken[0].clone()
+			}),
+			None,
+			"a name that is not a scene's is not one of these"
+		);
+	}
+
 	#[test]
 	fn asking_twice_before_a_frame_leaves_the_second_one() {
-		ask(Request::Save("first".to_owned()));
-		ask(Request::Load("second".to_owned()));
+		let mut world = console();
 
-		let held = lock().take();
+		colby_core::abi::console::run(&mut world, "scene.save first; scene.load second");
+
+		let held = crate::console::take(&mut world, NAMES)
+			.pop()
+			.as_ref()
+			.and_then(Request::of);
 
 		assert_eq!(
 			held,
 			Some(Request::Load("second".to_owned())),
 			"the last thing typed is the one that was meant"
 		);
+	}
+
+	#[test]
+	fn a_line_that_is_not_a_scenes_is_left_where_it_waits() {
+		let mut world = console();
+		world
+			.cvars
+			.command("net.later", colby_core::abi::console::defer, "");
+
+		colby_core::abi::console::run(&mut world, "net.later; scene.save one");
+
+		let (mut world, mut simulation) = {
+			let (mut peopled, simulation) = peopled();
+			std::mem::swap(&mut peopled.asked, &mut world.asked);
+
+			(peopled, simulation)
+		};
+
+		serve(&mut world, &mut simulation);
+
+		assert_eq!(world.asked.len(), 1, "the other subsystem's line is still there");
+		assert_eq!(world.asked[0].name, "net.later");
+
+		drop(fs::remove_file(path("one").expect("a plain name")));
 	}
 
 	#[test]

@@ -78,12 +78,10 @@ use std::{
 
 use colby_core::{
 	Result,
-	abi::{ConsoleFn, EventKind, PanelId, ScriptId, Scripts, World, ui::Event},
+	abi::{Asked, ConsoleFn, EventKind, PanelId, ScriptId, Scripts, World, ui::Event},
 	err, info, trace, warn,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
-
-pub use crate::api::Asked;
 
 mod api;
 mod handle;
@@ -145,11 +143,12 @@ const CONVERSIONS: [&str; 3] = ["tonumber", "tostring", "type"];
 pub struct Vm {
 	lua: Lua,
 	tables: api::Tables,
-	/// The runner's stand-in for every command a program publishes.
+	/// The stand-in every command a program publishes is registered with.
 	///
 	/// Handed in rather than written here: a [`ConsoleFn`] is an unsafe extern
-	/// function and there is none of that in this crate, by design. @ref
-	/// [`Asked`].
+	/// function and there is none of that in this crate, by design. What the
+	/// runner hands over writes the line onto the world for the step to bring
+	/// back - @ref [`Asked`] - and a test hands over one that does nothing.
 	publish: ConsoleFn,
 	loaded: Vec<Loaded>,
 	/// Instructions the call now running has spent. Shared with the VM's hook,
@@ -274,8 +273,8 @@ impl Vm {
 	/// Brings up the interpreter with nothing loaded into it.
 	///
 	/// @param publish - the function every command a program publishes is
-	/// registered with. Its address has to be inside the host, which is never
-	/// unloaded; @ref [`Asked`] for why it is not written here
+	/// registered with. Its address has to be somewhere nothing unloads, which
+	/// is why the runner hands over the one `colby_core` keeps; @ref [`Asked`]
 	/// @return the interpreter, or why Lua could not be started
 	pub fn new(publish: ConsoleFn) -> Result<Self> {
 		let lua = Lua::new_with(libraries(), LuaOptions::default())

@@ -33,7 +33,7 @@ use std::{
 
 use colby_core::{
 	Result,
-	abi::{Input, World},
+	abi::{Input, World, console},
 	glam::Vec2,
 	info,
 	time::Clock,
@@ -196,7 +196,7 @@ fn run(end: End) -> Result {
 
 	let mut game = Game::open(&mut world)?;
 	let console = Console::open(&mut world);
-	let mut scripts = Vm::new(crate::console::publisher())?;
+	let mut scripts = Vm::new(console::defer)?;
 	let mut interface = Interface::new();
 	let mut input = Input::default();
 	let mut clock = Clock::new();
@@ -234,7 +234,7 @@ fn run(end: End) -> Result {
 		// something this line can fix on its own.
 		clock.set_rate(crate::app::paced(&world.cvars, !hosting));
 		crate::saves::serve(&mut world, &mut simulation);
-		crate::net::serve(Some(&mut net));
+		crate::net::serve(&mut world, Some(&mut net));
 		// everything the wire wants once a frame, in the one place it is
 		// written. @ref `crate::net::hear`, which a window calls too.
 		crate::net::hear(&mut net, &mut world, started.elapsed());

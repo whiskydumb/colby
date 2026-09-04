@@ -59,6 +59,7 @@ pub use self::{
 	},
 	camera::Camera,
 	character::{DECAY, Drift, MAX_CATCH_UP, Motion, Moved, replay},
+	console::Asked,
 	cvar::{Args, ConsoleFn, Cvars, Value},
 	debug::{Debug, Label, Line, Pen},
 	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
@@ -95,7 +96,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 51;
+pub const ABI_VERSION: u32 = 52;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -274,6 +275,20 @@ pub struct World {
 	/// Not written down by a save, for the reason an owner is not: what
 	/// somebody was asking for a moment ago is a moment rather than a world.
 	pub commands: Commands,
+
+	/// Console lines a command put off, waiting for whoever can answer them.
+	///
+	/// Host-owned plain data beside [`commands`](Self::commands), and the
+	/// other half of the console being the RPC layer: a command is handed a
+	/// world and nothing else, so one that needs the solver, the socket or the
+	/// interpreter writes its line here instead and the frame loop does the
+	/// work. Who takes which line is decided by who registered the name -
+	/// @ref [`console::Asked`] - and a name a game module registered with
+	/// [`console::defer`] is left here for its own `update` to read.
+	///
+	/// Not written down by a save, for the reason [`commands`](Self::commands)
+	/// is not: a line waiting for a frame is a moment rather than a world.
+	pub asked: Vec<Asked>,
 
 	/// Where the renderer looks from. Game-written.
 	pub camera: Camera,
@@ -549,6 +564,7 @@ impl World {
 			aim: Aim::NONE,
 			input: Input::default(),
 			commands: Commands::new(),
+			asked: Vec::new(),
 			camera: Camera::DEFAULT,
 			clear: Vec3::ZERO,
 			light: Vec3::new(-0.4, -1.0, -0.3),
