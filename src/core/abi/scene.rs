@@ -1311,8 +1311,16 @@ pub fn graft(world: &mut World, piece: &SceneData) -> Grafted {
 	// is going into are not being sized by this at all. @ref
 	// `SceneData::piece`, which says the vectors of a piece mean nothing.
 	let things = grafted_things(world, piece);
-	let solids = grafted_solids(world, piece, &things);
-	let links = grafted_links(world, piece, &solids);
+	// **what a record is tied to is not the same as what landed.** A body
+	// names the thing it drives and a joint names the two bodies it holds, and
+	// both do it by a place in this description - so a record whose slot was
+	// refused for being occupied still has to be *findable*, or a joint made
+	// between two bodies both machines already have could never cross. @ref
+	// `standing`.
+	let driving = standing_things(world, piece);
+	let solids = grafted_solids(world, piece, &driving);
+	let holding = standing_solids(world, piece);
+	let links = grafted_links(world, piece, &holding);
 
 	for (id, thing) in things.iter().zip(&piece.things) {
 		world.entities.set_name(*id, &thing.name);
@@ -1376,18 +1384,92 @@ fn grafted_solids(world: &mut World, piece: &SceneData, things: &[EntityId]) -> 
 		.collect()
 }
 
+/// The thing each entity record is to be tied to.
+///
+/// **Who is in the slot the record names, when it is the same occupant.** That
+/// is one answer for two cases and there is deliberately no branch between
+/// them: a record that just landed is the occupant of its slot, and a record
+/// that was refused for the slot being taken is one whose occupant was already
+/// there. A joint made between two bodies both machines already have could
+/// never cross without the second case, and a table lookup answers both.
+///
+/// A slot holding a *different* generation answers with nothing: a description
+/// of one thing must never be tied to whatever took its place.
+///
+/// This is what the counts in [`Grafted`] are deliberately *not* taken from.
+/// Nothing is written to a record that was refused - not its name, not its
+/// fields - and it is only ever looked up.
+///
+/// @param world - the world grafted into, after the things have landed
+/// @param piece - the description
+fn standing_things(world: &World, piece: &SceneData) -> Vec<EntityId> {
+	piece
+		.things
+		.iter()
+		.map(|thing| {
+			let here = world
+				.entities
+				.at(usize::try_from(thing.slot).unwrap_or(usize::MAX));
+
+			if here.generation() == thing.generation {
+				here
+			} else {
+				EntityId::NONE
+			}
+		})
+		.collect()
+}
+
+/// The body each body record is to be tied to.
+///
+/// The same lookup [`standing_things`] makes, one table over, and it is what a
+/// joint is tied through.
+///
+/// @param world - the world grafted into, after the bodies have landed
+/// @param piece - the description
+fn standing_solids(world: &World, piece: &SceneData) -> Vec<BodyId> {
+	piece
+		.solids
+		.iter()
+		.map(|solid| {
+			let here = world
+				.bodies
+				.at(usize::try_from(solid.slot).unwrap_or(usize::MAX));
+
+			if here.generation() == solid.generation {
+				here
+			} else {
+				BodyId::NONE
+			}
+		})
+		.collect()
+}
+
 /// Every joint of a piece, into the slots it names.
 ///
-/// After the bodies, because a joint names two of them by handle and the
-/// handles only exist once they have landed. A joint whose bodies did not is
-/// refused by the table itself.
+/// After the bodies, because a joint names two of them by their place in the
+/// description and what that place resolves to is a body in *this* world.
+///
+/// **A joint whose bodies did not resolve is refused here**, and the table
+/// would not have refused it: `Joints::graft` checks the slot and nothing
+/// about the record, so a joint holding [`BodyId::NONE`] lands as a joint
+/// holding nothing and stays in the table forever. A second end of nothing is
+/// legal and means the world, which is what a joint anchored to a wall is; a
+/// *first* end of nothing is not, and neither is a second end the description
+/// named and this world could not find.
 fn grafted_links(world: &mut World, piece: &SceneData, solids: &[BodyId]) -> Vec<JointId> {
 	let entries = link_joints(piece, solids);
 
 	entries
 		.iter()
 		.zip(&piece.links)
-		.map(|(&(slot, joint), link)| world.joints.graft(slot, link.generation, joint))
+		.map(|(&(slot, joint), link)| {
+			if !joint.first.is_some() || (link.second != NO_INDEX && !joint.second.is_some()) {
+				return JointId::NONE;
+			}
+
+			world.joints.graft(slot, link.generation, joint)
+		})
 		.collect()
 }
 
@@ -2114,6 +2196,243 @@ mod tests {
 			Some(Vec3::new(9.0, 9.0, 9.0)),
 			"with what it was carrying"
 		);
+	}
+
+	/// An entity in a slot a dead one left twice over, so its generation is
+	/// three.
+	///
+	/// **A fixture made of first occupants cannot tell a generation from a
+	/// one**, and this whole rule is about generations agreeing.
+	fn nth_entity(world: &mut World, times: u32) -> EntityId {
+		let mut id = world.entities.spawn();
+
+		for _ in 1..times {
+			world.entities.despawn(id);
+			id = world.entities.spawn();
+		}
+
+		assert_eq!(id.generation(), times, "the occupant it was asked for");
+		id
+	}
+
+	#[test]
+	fn a_body_that_lands_drives_the_thing_that_was_already_there() {
+		// the other half of the same rule the joint needs: a record that was
+		// refused for its slot being taken still has to be findable, because
+		// what a body drives is named by a place in the description.
+		let mut theirs = furnished();
+		let thing = nth_entity(&mut theirs, 3);
+
+		theirs.entities.set_renderable(
+			thing,
+			Renderable::of(
+				theirs.meshes.find("meshes/crystal"),
+				theirs.materials.find("brass"),
+				Vec3::X,
+			),
+		);
+
+		let mut body =
+			Body::new(BodyKind::Dynamic, Shape::cuboid(Vec3::ONE), Transform::IDENTITY);
+
+		body.entity = thing;
+
+		let made = theirs.bodies.spawn(body);
+
+		theirs.bodies.set_name(made, "crate");
+
+		// this end has the thing and not the body, which is what a client that
+		// built the same scenes and missed what happened during play looks
+		// like at one slot.
+		let mut world = furnished();
+
+		assert_eq!(nth_entity(&mut world, 3), thing, "the same slot and the same occupant");
+
+		let put = graft(&mut world, &capture(&theirs));
+
+		assert_eq!(put.things, 0, "the thing was already here");
+		assert_eq!(put.solids, 1, "and the body landed");
+		assert_eq!(
+			world.bodies.get(made).map(|body| body.entity),
+			Some(thing),
+			"driving the thing that was already here, rather than nothing"
+		);
+	}
+
+	/// A body driving a thing, with a name on it.
+	fn driving(world: &mut World, thing: EntityId, name: &str) -> BodyId {
+		let mut body =
+			Body::new(BodyKind::Dynamic, Shape::cuboid(Vec3::ONE), Transform::IDENTITY);
+
+		body.entity = thing;
+
+		let id = world.bodies.spawn(body);
+
+		world.bodies.set_name(id, name);
+		id
+	}
+
+	#[test]
+	fn nothing_is_tied_to_whoever_took_a_slot_over() {
+		// a description of one thing must never be tied to its successor, and
+		// the generations are the only thing that says which is which. So the
+		// fixture puts a *later* occupant in two of the slots the description
+		// names and the same one in a third, and every answer below is about
+		// telling those apart.
+		let mut theirs = furnished();
+		let mismatched = nth_entity(&mut theirs, 2);
+		let agreeing = nth_entity(&mut theirs, 2);
+		let held = driving(&mut theirs, mismatched, "held");
+		let anchor = driving(&mut theirs, agreeing, "anchor");
+		let alone = driving(&mut theirs, mismatched, "alone");
+		let weld = theirs.join(Joint::weld(held, anchor, (Vec3::ZERO, Vec3::X)));
+
+		assert!(weld.is_some() && alone.is_some());
+
+		let mut world = furnished();
+
+		// entity nought is a later occupant than the description names, entity
+		// one is the same one, and body nought is later as well.
+		assert_eq!(nth_entity(&mut world, 3).slot(), mismatched.slot());
+		assert_eq!(nth_entity(&mut world, 2), agreeing, "the same one, slot and all");
+
+		let over = second_occupant(&mut world, "somebody else", Vec3::ZERO);
+
+		assert_eq!(over.slot(), held.slot(), "standing where the described body is");
+
+		let put = graft(&mut world, &capture(&theirs));
+
+		assert_eq!(put.things, 0, "neither thing landed");
+		assert_eq!(put.solids, 2, "and the two bodies whose slots were free did");
+		assert_eq!(
+			world.bodies.get(anchor).map(|body| body.entity),
+			Some(agreeing),
+			"a body that landed drives the thing that was already there"
+		);
+		assert_eq!(
+			world.bodies.get(alone).map(|body| body.entity),
+			Some(EntityId::NONE),
+			"and one whose thing has been taken over drives nothing at all"
+		);
+		assert_eq!(world.joints.len(), 0, "nor is a joint made holding nothing");
+		assert_eq!(
+			world.bodies.name(over),
+			"somebody else",
+			"and the occupant that was here is untouched"
+		);
+	}
+
+	#[test]
+	fn a_joint_anchored_to_the_world_crosses() {
+		// a second end of nothing is legal and means the world - a door hinged
+		// on a wall is one - so the check that refuses a joint whose bodies
+		// could not be found has to let that one through.
+		let mut theirs = furnished();
+		let post = theirs.bodies.spawn(Body::default());
+		let hinge = theirs.join(Joint::weld(post, BodyId::NONE, (Vec3::ZERO, Vec3::Y)));
+
+		assert!(hinge.is_some(), "and it is a joint on the machine that made it");
+
+		let mut world = furnished();
+		let put = graft(&mut world, &capture(&theirs));
+
+		assert_eq!(put.solids, 1);
+		assert_eq!(put.links, 1, "the joint came with it");
+		assert_eq!(
+			world
+				.joints
+				.get(hinge)
+				.map(|joint| (joint.first, joint.second)),
+			Some((post, BodyId::NONE)),
+			"held by the body at one end and by the world at the other"
+		);
+	}
+
+	#[test]
+	fn a_graft_does_not_rename_what_it_refused() {
+		// nothing is written to a record that was refused - not its fields and
+		// not its name - however sure the far end is about what it is called.
+		let theirs = standing(4.0, "theirs");
+		let mut world = furnished();
+
+		restore(&mut world, &capture(&theirs)).expect("the same world");
+
+		let here = body_called(&world, "theirs");
+
+		world.bodies.set_name(here, "mine");
+		assert_eq!(world.bodies.name(here), "mine");
+
+		let put = graft(&mut world, &capture(&theirs));
+
+		assert_eq!(put.solids, 0, "it was already there");
+		assert_eq!(world.bodies.name(here), "mine", "and it is still called what it was");
+	}
+
+	#[test]
+	fn a_graft_ties_a_joint_to_bodies_that_are_already_there() {
+		// what a weld made during play looks like when it crosses: the two
+		// bodies it holds are on both machines already, so the only news is
+		// the joint - and a description of a joint has to carry its bodies,
+		// because a joint names them by their place in the description.
+		//
+		// The far end refuses both bodies for being occupied. The joint must
+		// land all the same, tied to the occupants that were already in those
+		// slots.
+		let mut theirs = standing(4.0, "crate");
+		let second = theirs.bodies.spawn(Body::new(
+			BodyKind::Dynamic,
+			Shape::cuboid(Vec3::ONE),
+			Transform::at(Vec3::X),
+		));
+
+		theirs.bodies.set_name(second, "plank");
+
+		let mut ours = capture(&theirs);
+		let mut world = furnished();
+
+		restore(&mut world, &ours).expect("both ends start with the same world");
+
+		let first = body_called(&world, "crate");
+		let over = body_called(&world, "plank");
+
+		assert!(first.is_some() && over.is_some(), "and both bodies are here");
+		assert_eq!(world.joints.len(), 0, "and nothing holds them together");
+
+		// now the weld, on the far machine only.
+		let weld = theirs.join(Joint::weld(
+			body_called(&theirs, "crate"),
+			second,
+			(Vec3::ZERO, Vec3::X),
+		));
+
+		theirs.joints.set_name(weld, "welded");
+		ours = capture(&theirs);
+
+		let holding: Vec<u32> = ours
+			.solids
+			.iter()
+			.enumerate()
+			.filter(|(_, solid)| solid.name == "crate" || solid.name == "plank")
+			.map(|(index, _)| u32::try_from(index).expect("a small index"))
+			.collect();
+		let piece = ours.piece(&holding);
+
+		assert_eq!(piece.links.len(), 1, "the cut brings the joint along");
+
+		let put = graft(&mut world, &piece);
+
+		assert_eq!(put.solids, 0, "neither body landed, because both were there");
+		assert_eq!(put.links, 1, "and the joint did");
+		assert_eq!(world.joints.len(), 1);
+
+		let made = world
+			.joints
+			.get(weld)
+			.expect("at the slot and generation the far end has it at");
+
+		assert_eq!(made.first, first, "tied to the occupants that were already here");
+		assert_eq!(made.second, over);
+		assert_eq!(world.joints.name(weld), "welded");
 	}
 
 	#[test]

@@ -1321,6 +1321,26 @@ impl Bodies {
 		}
 	}
 
+	/// Who is in one slot, if anybody.
+	///
+	/// **The way back from a slot number to a handle**, which nothing outside
+	/// this module can build for itself. What wants it is a description that
+	/// came from somewhere else: it names a body by the slot it is in, and a
+	/// reader that finds the slot occupied has no other way to say *which*
+	/// body that is. @ref `scene::graft`, where a joint has to be tied to a
+	/// body that was already there.
+	///
+	/// @param slot - an index below [`slots`](Self::slots)
+	/// @return the occupant, or [`BodyId::NONE`] for a slot nobody is in
+	#[must_use]
+	pub fn at(&self, slot: usize) -> BodyId {
+		let (Ok(index), Some(true)) = (u32::try_from(slot), self.alive.get(slot).copied()) else {
+			return BodyId::NONE;
+		};
+
+		BodyId { index, generation: self.generation(slot) }
+	}
+
 	/// The generation living in a slot, whether or not it is occupied.
 	///
 	/// The solver's, for noticing that the body it cached something for is not
@@ -1690,6 +1710,31 @@ mod tests {
 		assert_eq!(second.index, first.index, "the slot really is reused");
 		assert!(bodies.get(first).is_none(), "and the old handle no longer resolves");
 		assert!(bodies.get(second).is_some(), "while the new one does");
+	}
+
+	#[test]
+	fn who_is_in_a_slot_is_the_handle_that_slot_hands_back() {
+		// the way back from a slot number to a handle, which a description
+		// arriving from another machine needs and cannot build for itself.
+		let mut bodies = Bodies::new();
+		let first = bodies.spawn(Body::default());
+
+		assert_eq!(bodies.at(first.slot()), first, "the occupant, handle and all");
+
+		// and a *second* occupant, so that a generation is not the constant
+		// one. Everything in a fresh table is a first occupant, and a fixture
+		// made of those cannot tell a generation from a one.
+		assert!(bodies.despawn(first));
+
+		let second = bodies.spawn(Body::default());
+
+		assert_eq!(second.generation(), 2);
+		assert_eq!(bodies.at(second.slot()), second, "and it is the one there now");
+		assert_ne!(bodies.at(second.slot()), first, "not the one that was");
+
+		assert!(bodies.despawn(second));
+		assert_eq!(bodies.at(second.slot()), BodyId::NONE, "an empty slot holds nobody");
+		assert_eq!(bodies.at(9999), BodyId::NONE, "and so does one the table has not got");
 	}
 
 	#[test]

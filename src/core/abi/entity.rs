@@ -737,6 +737,24 @@ impl Entities {
 	#[must_use]
 	pub fn slots(&self) -> usize { self.alive.len() }
 
+	/// Who is in one slot, if anybody.
+	///
+	/// The way back from a slot number to a handle, for the reason
+	/// [`Bodies::at`](crate::abi::Bodies::at) has one: a description from
+	/// somewhere else names a thing by its slot, and a reader that finds that
+	/// slot occupied has no other way to say which thing is in it.
+	///
+	/// @param slot - an index below [`slots`](Self::slots)
+	/// @return the occupant, or [`EntityId::NONE`] for a slot nobody is in
+	#[must_use]
+	pub fn at(&self, slot: usize) -> EntityId {
+		let (Ok(index), Some(true)) = (u32::try_from(slot), self.alive.get(slot).copied()) else {
+			return EntityId::NONE;
+		};
+
+		EntityId { index, generation: self.generation(slot) }
+	}
+
 	/// Which occupant of a slot the table is on.
 	///
 	/// @param slot - the array index, not a handle
@@ -786,6 +804,28 @@ mod tests {
 	use std::f32::consts::{FRAC_PI_2, FRAC_PI_6, TAU};
 
 	use super::*;
+
+	#[test]
+	fn who_is_in_a_slot_is_the_handle_that_slot_hands_back() {
+		// the way back from a slot number to a handle, for the reason
+		// `Bodies::at` has one: a description from another machine names a
+		// thing by its slot and nothing out there can mint a handle.
+		let mut entities = Entities::new();
+		let first = entities.spawn();
+
+		assert_eq!(entities.at(first.slot()), first);
+		assert!(entities.despawn(first));
+
+		// a second occupant, so a generation is not the constant one.
+		let second = entities.spawn();
+
+		assert_eq!(second.generation(), 2);
+		assert_eq!(entities.at(second.slot()), second, "the one there now");
+		assert_ne!(entities.at(second.slot()), first, "not the one that was");
+		assert!(entities.despawn(second));
+		assert_eq!(entities.at(second.slot()), EntityId::NONE, "an empty slot holds nobody");
+		assert_eq!(entities.at(9999), EntityId::NONE, "nor has the table got that one");
+	}
 
 	#[test]
 	fn a_spawned_entity_is_alive_and_a_despawned_one_is_not() {
