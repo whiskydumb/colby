@@ -66,6 +66,8 @@
 //!   }
 //! ```
 
+use crate::glam::Vec3;
+
 /// How many peers one world keeps a block of gameplay state for.
 ///
 /// The host and eight clients. The runner's own ceiling is eight *clients* on
@@ -553,6 +555,106 @@ impl Command {
 	/// asked for", not "a command from step nought looking straight ahead".
 	#[must_use]
 	pub const fn is_some(self) -> bool { self.number != 0 }
+}
+
+/// Where somebody is pointing, as a ray in the world.
+///
+/// **The thing a look is not.** [`Command::yaw`] and [`Command::pitch`] say
+/// which way a person is facing, and for a game whose camera sits in the
+/// player's own head that is the same question as where they are pointing:
+/// the ray starts at the eye and goes where the eye goes, and the machine that
+/// simulates has the eye already. It stops being the same question the moment
+/// the camera is anywhere else. A camera over the shoulder aims down its own
+/// line rather than down the head's, and a crosshair that is a mouse pointer
+/// aims through a pixel that is not the middle of the screen. Neither of those
+/// follows from two angles and a body's position, and the machine that
+/// simulates has neither the camera nor the pointer: both are in the arena a
+/// snapshot never touches, because both are about a screen rather than about a
+/// world.
+///
+/// So what crosses is the answer rather than its inputs. A point and a
+/// direction mean the same thing on both machines however each of them arrived
+/// at the pair, which a pixel and a viewport do not. @ref
+/// [`World::pointing`](crate::abi::World::pointing) for the one this engine
+/// builds out of a camera and a pointer.
+///
+/// **Not a trace, and that is the authority model in one sentence.** What
+/// crosses is where somebody was pointing, never what they decided they had
+/// hit: the host traces the ray against its own world and its own answer is
+/// the one that counts. A client that sent a hit would be telling the host
+/// what had happened rather than asking for anything, which is the model this
+/// engine is not - the same argument [`Command`] makes about the direction it
+/// declines to resolve.
+///
+/// **Of the four systems read, not one puts a ray on a per-step command.**
+/// Three work it out from the pawn and the look angles, which they can because
+/// their camera is the pawn's eye; the fourth carries a whole traced hit, on a
+/// reliable call that exists only when somebody acts. This is the fourth's
+/// shape with the trace left where authority puts it, and it travels the way
+/// that one does - on the thing somebody said, rather than on every step
+/// whether or not anybody said anything.
+///
+/// Three floats and three floats rather than a vector type, because this is
+/// `Pod` and goes into a datagram as it stands, and the vector library here is
+/// built without the cast that would allow one of its types to be. @ref
+/// [`TraceInfo`](super::TraceInfo), which is `repr(C)` and deliberately not
+/// `Pod` for that same reason.
+#[repr(C)]
+#[derive(
+	Clone, Copy, Debug, Default, PartialEq, crate::bytemuck::Pod, crate::bytemuck::Zeroable,
+)]
+pub struct Aim {
+	/// Where the ray begins, in world space.
+	pub origin: [f32; 3],
+
+	/// Which way it goes, normalized when it was made.
+	pub direction: [f32; 3],
+}
+
+// twenty-four bytes with no padding, for [`Command`]'s reason: a wire-format
+// change should have to move this number on purpose rather than by rearranging
+// a struct.
+const _: () = assert!(size_of::<Aim>() == 24, "an aim is twenty-four bytes and no more");
+// and four, from the floats. A parcel puts one at the front of its bytes and a
+// datagram puts that wherever the piece before it ended, so nothing may cast a
+// slice to this either.
+const _: () = assert!(align_of::<Aim>() == 4, "an aim is aligned like the floats it is made of");
+
+impl Aim {
+	/// Nobody is pointing anywhere.
+	pub const NONE: Self = Self { origin: [0.0; 3], direction: [0.0; 3] };
+
+	/// A ray from a point, along a direction.
+	///
+	/// @param origin - where it begins
+	/// @param direction - which way it goes; normalized here, so it need not
+	/// be
+	#[must_use]
+	pub fn new(origin: Vec3, direction: Vec3) -> Self {
+		Self {
+			origin: origin.to_array(),
+			direction: direction.normalize_or_zero().to_array(),
+		}
+	}
+
+	/// Whether this points anywhere at all.
+	///
+	/// False for the zero value, and for [`PeerId::NONE`]'s reason: what
+	/// twenty-four zeroed bytes should say is "nobody was pointing", not "a ray
+	/// from the middle of the world going nowhere". A direction that would not
+	/// normalize - zero, or a number that is not one - leaves this false too,
+	/// which is what makes [`new`](Self::new) safe to hand anything a camera
+	/// produced.
+	#[must_use]
+	pub fn is_some(self) -> bool { self.forward().length_squared() > 0.0 }
+
+	/// Where the ray begins.
+	#[must_use]
+	pub fn start(self) -> Vec3 { Vec3::from_array(self.origin) }
+
+	/// Which way it goes.
+	#[must_use]
+	pub fn forward(self) -> Vec3 { Vec3::from_array(self.direction) }
 }
 
 /// What every peer recently asked for, one ring each.
@@ -1045,6 +1147,75 @@ impl Default for Commands {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn an_aim_that_points_nowhere_is_nothing() {
+		assert!(!Aim::NONE.is_some(), "the zero value points nowhere");
+		assert!(
+			!Aim::new(Vec3::new(1.0, 2.0, 3.0), Vec3::ZERO).is_some(),
+			"and so does one built from a direction that will not normalize, wherever it starts"
+		);
+		assert!(
+			!Aim::new(Vec3::ZERO, Vec3::splat(f32::NAN)).is_some(),
+			"and one built from numbers that are not numbers"
+		);
+		assert!(
+			Aim::new(Vec3::ZERO, Vec3::NEG_Z).is_some(),
+			"a ray from the middle of the world is still a ray"
+		);
+	}
+
+	#[test]
+	fn an_aim_normalizes_the_direction_it_is_given() {
+		let aim = Aim::new(Vec3::new(4.0, 5.0, 6.0), Vec3::new(0.0, 0.0, -12.0));
+
+		assert!(
+			aim.start()
+				.abs_diff_eq(Vec3::new(4.0, 5.0, 6.0), 1e-6),
+			"the origin crosses as it was given"
+		);
+		assert!(
+			aim.forward().abs_diff_eq(Vec3::NEG_Z, 1e-6),
+			"and the direction is a unit vector however long it arrived"
+		);
+	}
+
+	#[test]
+	fn an_aim_is_twenty_four_bytes_in_the_order_it_is_written() {
+		// six numbers that are six different numbers, so that a field read
+		// from the wrong offset cannot come back right by coincidence. That is
+		// not hypothetical: the first fixture written here pointed along
+		// `Vec3::X`, whose first component is the origin's first component
+		// too, and swapping the two fields of the struct moved nothing it
+		// looked at.
+		let aim = Aim::new(Vec3::new(1.0, 2.0, 3.0), Vec3::NEG_Z);
+		let bytes = bytemuck::bytes_of(&aim);
+		// asked of the bytes rather than of three floats read back out of
+		// them, which is both the question a format test means and the way
+		// past the lint that refuses comparing arrays of floats exactly.
+		let three = |a: f32, b: f32, c: f32| {
+			let mut out = [0_u8; 12];
+
+			out[0..4].copy_from_slice(&a.to_le_bytes());
+			out[4..8].copy_from_slice(&b.to_le_bytes());
+			out[8..12].copy_from_slice(&c.to_le_bytes());
+
+			out
+		};
+
+		assert_eq!(bytes.len(), 24, "six floats and nothing else");
+		assert_eq!(&bytes[0..12], &three(1.0, 2.0, 3.0), "the origin comes first");
+		assert_eq!(
+			&bytes[12..24],
+			&three(0.0, 0.0, -1.0),
+			"and the direction after it, all three components of it"
+		);
+		assert_eq!(
+			bytemuck::bytes_of(&Aim::NONE),
+			&[0_u8; 24],
+			"and nothing at all is twenty-four zeroes"
+		);
+	}
 
 	/// Some client, as the table handing slots out would mint one.
 	const fn client(index: u32, generation: u32) -> PeerId { PeerId::at(index, generation) }

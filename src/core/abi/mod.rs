@@ -19,7 +19,7 @@
 //! [`mods::linkage`](crate::mods::linkage), and [`ABI_VERSION`] catches a
 //! module built against a different definition.
 
-use crate::glam::{Mat4, Quat, Vec3};
+use crate::glam::{Mat4, Quat, Vec2, Vec3};
 
 pub mod anim;
 pub mod audio;
@@ -69,7 +69,7 @@ pub use self::{
 	mesh::{BONES_PER_VERTEX, Mesh, MeshData, MeshId, MeshVertex, Meshes, SkinVertex},
 	model::{Model, ModelData, ModelId, Models, Placement},
 	names::MAX_NAME,
-	net::{Command, Commands, PeerId, Role},
+	net::{Aim, Command, Commands, PeerId, Role},
 	physics::{
 		Bodies, Body, BodyId, BodyKind, Layers, MAX_BODIES, MAX_OVERLAPS, MAX_TOUCHES, Overlap,
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
@@ -95,7 +95,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 50;
+pub const ABI_VERSION: u32 = 51;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -217,6 +217,33 @@ pub struct World {
 	/// host and restored on a client would otherwise claim to be the
 	/// authority. Same reason [`editing`](Self::editing) is not written down.
 	pub peer: PeerId,
+
+	/// Where whoever asked for the thing being run was pointing.
+	///
+	/// [`Aim::NONE`] outside such a moment, which is nearly always: this is
+	/// written around one call and put back afterwards, exactly the way
+	/// [`peer`](Self::peer) is and by the same runner. A console line is the
+	/// one thing in this engine that crosses because somebody *did* something,
+	/// so it is the one thing that can carry where they were pointing when
+	/// they did it.
+	///
+	/// **What a game reads it for is the ray it would otherwise take from its
+	/// own camera.** A command that acts on whatever the crosshair is on gets
+	/// written once, against this, and then means the same thing whether it
+	/// was typed at this machine or arrived from a peer - which is the whole
+	/// of what lets a host run a client's tool as that client. What is not
+	/// here is what the ray hit, and that is deliberate: the host traces it
+	/// against its own world, because the host is the authority on what is
+	/// there.
+	///
+	/// A line typed at this machine's own console is given
+	/// [`pointing`](Self::pointing), so the two paths differ in where the ray
+	/// came from and in nothing else.
+	///
+	/// Not written down by a save, for [`peer`](Self::peer)'s reason and more
+	/// strongly than it: this is not even a fact about the process, only about
+	/// the call in progress.
+	pub aim: Aim,
 
 	/// The window's width divided by its height. Host-written; the renderer
 	/// uses it so that a shape does not stretch with the window.
@@ -517,6 +544,9 @@ impl World {
 			// its own authority, until somebody says otherwise. @ref the
 			// field, and note this is deliberately not the zero value.
 			peer: PeerId::HOST,
+			// nobody has asked for anything yet, and outside a line running
+			// nobody ever has. @ref the field.
+			aim: Aim::NONE,
 			input: Input::default(),
 			commands: Commands::new(),
 			camera: Camera::DEFAULT,
@@ -560,6 +590,37 @@ impl World {
 			// came before. The host overwrites this every frame.
 			interpolation: 1.0,
 		}
+	}
+
+	/// The ray this screen is pointing along.
+	///
+	/// Where the camera is, and the direction through the pointer - which is
+	/// the crosshair for anything that aims with a mouse, and the middle of the
+	/// screen for anything that does not, because **a pointer that has never
+	/// been over the window falls back to the middle of the viewport**. That
+	/// fallback is what makes this answer the same question in a run with no
+	/// window as in a window.
+	///
+	/// Here rather than in a game because every input to it is this world's
+	/// own: the camera, the viewport and the pointer. A game working the same
+	/// answer out for itself would be a second definition of where a screen
+	/// points, and the wire would then carry whichever of the two happened to
+	/// be asked. @ref [`Aim`], and [`aim`](Self::aim) for where the answer is
+	/// put while a line runs.
+	///
+	/// @return where this machine is pointing, for putting on a line that
+	/// crosses or for tracing here
+	#[must_use]
+	pub fn pointing(&self) -> Aim {
+		let viewport = self.ui.viewport();
+		let pointer = self.ui.pointer();
+		let pixel = if pointer.cmpge(Vec2::ZERO).all() && pointer.cmple(viewport).all() {
+			pointer
+		} else {
+			viewport * 0.5
+		};
+
+		Aim::new(self.camera.position, self.camera.pixel_direction(pixel, viewport))
 	}
 
 	/// Moves the present into the past, ready for another step.
@@ -1037,6 +1098,109 @@ fn over(bone: &Bone, matrices: &[Mat4]) -> Mat4 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A world whose camera stands away from the origin looking back at it, and
+	/// whose window is a wide one.
+	///
+	/// The camera is deliberately not at the origin and deliberately not
+	/// looking down an axis, so that a test reading the wrong end of the ray -
+	/// or the target instead of the position - cannot be answered by a vector
+	/// that happens to be zero.
+	fn watching() -> Box<World> {
+		let mut world = Box::new(World::new());
+
+		world.camera.position = Vec3::new(3.0, 5.0, 9.0);
+		world.camera.target = Vec3::new(1.0, 0.5, 0.0);
+		world
+			.ui
+			.set_viewport(Vec2::new(1280.0, 720.0), 1.0);
+
+		world
+	}
+
+	#[test]
+	fn a_screen_nobody_has_pointed_at_points_through_its_middle() {
+		let world = watching();
+		let aim = world.pointing();
+		let viewport = world.ui.viewport();
+
+		assert!(
+			world.ui.pointer().x < 0.0,
+			"a pointer that has never been over the window sits outside it"
+		);
+		assert!(aim.is_some(), "and the screen points somewhere all the same");
+		assert!(
+			aim.start()
+				.abs_diff_eq(world.camera.position, 1e-6),
+			"the ray starts where the camera is, not where it is looking"
+		);
+		assert!(
+			aim.forward().abs_diff_eq(
+				world
+					.camera
+					.pixel_direction(viewport * 0.5, viewport),
+				1e-6
+			),
+			"and goes through the middle of the viewport"
+		);
+	}
+
+	#[test]
+	fn a_pointer_over_the_window_is_what_the_screen_points_through() {
+		let mut world = watching();
+		let viewport = world.ui.viewport();
+		let corner = Vec2::new(64.0, 32.0);
+
+		world.ui.set_pointer(corner);
+
+		let aim = world.pointing();
+
+		assert!(
+			aim.forward()
+				.abs_diff_eq(world.camera.pixel_direction(corner, viewport), 1e-6),
+			"the ray goes through the pointer"
+		);
+		assert!(
+			!aim.forward().abs_diff_eq(
+				world
+					.camera
+					.pixel_direction(viewport * 0.5, viewport),
+				1e-3
+			),
+			"which is a different direction from the middle of the screen, or this proves \
+			 nothing"
+		);
+	}
+
+	#[test]
+	fn a_pointer_dragged_off_the_window_falls_back_to_the_middle() {
+		let mut world = watching();
+		let viewport = world.ui.viewport();
+
+		// past the right edge by one pixel, which is where a drag that left
+		// the window leaves it.
+		world
+			.ui
+			.set_pointer(Vec2::new(viewport.x + 1.0, 200.0));
+
+		assert!(
+			world.pointing().forward().abs_diff_eq(
+				world
+					.camera
+					.pixel_direction(viewport * 0.5, viewport),
+				1e-6
+			),
+			"a pointer outside the window is not where the screen points"
+		);
+	}
+
+	#[test]
+	fn a_world_is_pointing_nowhere_until_a_line_is_run() {
+		assert!(
+			!World::new().aim.is_some(),
+			"nobody has asked for anything, so nobody was pointing anywhere"
+		);
+	}
 
 	/// A world holding a two-limbed skeleton, a pose of it, and a ragdoll with
 	/// a body spawned for each part.
