@@ -62,7 +62,7 @@ use colby_asset::{
 use colby_core::{
 	Result,
 	abi::{
-		Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, JointId, PeerId, Role,
+		Aim, Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, JointId, PeerId, Role,
 		SceneData, Value, World, console, cvar::Owner, net::BACKUP, scene,
 	},
 	debug, err,
@@ -298,10 +298,16 @@ pub(crate) fn after(arguments: &[String], flag: &str) -> Option<SocketAddr> {
 static ASKED: Mutex<Vec<Request>> = Mutex::new(Vec::new());
 
 /// One thing a console line asked of the wire.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// @note: `PartialEq` and not `Eq`, because an [`Aim`] is floats.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Request {
-	/// Queue a console line for every peer.
-	Say(String),
+	/// Queue a console line for every peer, with the aim of whoever typed it.
+	///
+	/// The aim is taken when the line is typed rather than when it is sent,
+	/// which is a frame later and is the wrong moment: what a tool acts on is
+	/// where the person was pointing when they asked, not where the camera had
+	/// drifted to by the time the wire got round to it.
+	Say(Aim, String),
 
 	/// Report what the endpoint is carrying.
 	Status,
@@ -339,8 +345,8 @@ pub(crate) fn serve(net: Option<&mut Net>) {
 
 	for request in asked {
 		match request {
-			| Request::Say(text) =>
-				if let Err(error) = net.say(&text) {
+			| Request::Say(aim, text) =>
+				if let Err(error) = net.say(aim, &text) {
 					warn!(%text, %error, "the ring would not take it");
 				} else {
 					info!(%text, peers = net.peers(), "queued for every peer");
@@ -955,11 +961,17 @@ struct Taken {
 	baselines: u32,
 }
 
-/// A command that crossed, and who said it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A command that crossed, who said it, and where they were pointing.
+///
+/// @note: `PartialEq` and not `Eq`, because an [`Aim`] is floats. Nothing keys
+/// anything by one of these.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Said {
 	/// Which address it came from.
 	pub(crate) from: SocketAddr,
+
+	/// Where the sender was pointing when they said it, or [`Aim::NONE`].
+	pub(crate) aim: Aim,
 
 	/// The console line, exactly as it was queued.
 	pub(crate) text: String,
@@ -1516,8 +1528,15 @@ impl Net {
 
 	/// Queues a console line for every peer, resent until each of them has it.
 	///
+	/// @param aim - where whoever said it was pointing, or [`Aim::NONE`]
 	/// @param text - one console line
-	pub(crate) fn say(&mut self, text: &str) -> Result { self.post(Kind::Line, text.as_bytes()) }
+	pub(crate) fn say(&mut self, aim: Aim, text: &str) -> Result {
+		let mut bytes = Vec::new();
+
+		parcel::saying(aim, text, &mut bytes)?;
+
+		self.post(Kind::Line, &bytes)
+	}
 
 	/// Queues a parcel of any kind for every peer, all of it or none of it.
 	///
@@ -2908,9 +2927,9 @@ fn take(taking: Taking<'_>) -> bool {
 		// numbered by the stream carrying them, so a piece nobody can place
 		// leaves every piece behind it unplaceable too.
 		match pieces.take(&item) {
-			| Ok(Some(Parcel::Line(text))) => {
+			| Ok(Some(Parcel::Line { aim, text })) => {
 				info!(%from, %text, "a command crossed");
-				said.push(Said { from, text });
+				said.push(Said { from, aim, text });
 			},
 			| Ok(Some(Parcel::Scene(bytes))) => {
 				debug!(%from, bytes = bytes.len(), "a peer described part of a world");
@@ -3332,7 +3351,7 @@ mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
 	use colby_core::abi::{Joint, Shape, ShapeKind, Transform, net::MAX_PEERS as PLAYERS};
-	use colby_net::{MAX_ASKED, MAX_BASELINE, MAX_PARCEL, MAX_SNAPSHOT};
+	use colby_net::{AIM_BYTES, MAX_ASKED, MAX_BASELINE, MAX_PARCEL, MAX_SNAPSHOT};
 
 	use super::*;
 
@@ -3758,7 +3777,7 @@ mod tests {
 
 			if step == 1 {
 				client
-					.say("game.whoami")
+					.say(Aim::NONE, "game.whoami")
 					.expect("the ring took it");
 			}
 		}
@@ -4836,9 +4855,10 @@ mod tests {
 		let (mut host, mut client, _wire) = two();
 
 		round(&mut host, &mut client, 1);
-		host.say("host.hello").expect("the ring takes it");
+		host.say(Aim::NONE, "host.hello")
+			.expect("the ring takes it");
 		client
-			.say("client.hello")
+			.say(Aim::NONE, "client.hello")
 			.expect("the ring takes it");
 		round(&mut host, &mut client, 2);
 
@@ -4865,12 +4885,12 @@ mod tests {
 		client.set(Conditions { loss: 1.0, ..Conditions::PERFECT });
 
 		for index in 0..colby_net::MAX_ITEMS {
-			host.say(&format!("tick {index}"))
+			host.say(Aim::NONE, &format!("tick {index}"))
 				.expect("the ring takes sixty-four");
 			round(&mut host, &mut client, 2 + index);
 		}
 
-		host.say("one too many")
+		host.say(Aim::NONE, "one too many")
 			.expect_err("and refuses the next");
 	}
 
@@ -4881,9 +4901,12 @@ mod tests {
 		let (mut host, mut client, _wire) = two();
 
 		round(&mut host, &mut client, 1);
-		host.say(&"x".repeat(MAX_PARCEL + 1))
-			.expect_err("one byte past what a parcel may be");
-		host.say(&"x".repeat(MAX_PARCEL))
+		// and what a *line* holds is a ringful short of the aim in front of
+		// it, which is the one place those twenty-four bytes are visible from
+		// outside the format.
+		host.say(Aim::NONE, &"x".repeat(MAX_PARCEL - AIM_BYTES + 1))
+			.expect_err("one byte past what a line may be");
+		host.say(Aim::NONE, &"x".repeat(MAX_PARCEL - AIM_BYTES))
 			.expect("and exactly a ringful goes");
 	}
 
@@ -5984,7 +6007,7 @@ mod tests {
 
 		for step in 2..=400_u32 {
 			if step.is_multiple_of(50) {
-				host.say(&format!("host.tick {step}"))
+				host.say(Aim::NONE, &format!("host.tick {step}"))
 					.expect("the ring takes it");
 			}
 
@@ -6707,7 +6730,7 @@ mod tests {
 		joined(&mut window);
 		round(&mut host, &mut client, 1);
 		client
-			.say("game.whoami")
+			.say(Aim::NONE, "game.whoami")
 			.expect("the ring took it");
 		round(&mut host, &mut client, 2);
 
@@ -6751,7 +6774,7 @@ mod tests {
 
 		round(&mut host, &mut client, 1);
 		client
-			.say("game.whoami")
+			.say(Aim::NONE, "game.whoami")
 			.expect("the ring took it");
 		round(&mut host, &mut client, 2);
 
@@ -6811,9 +6834,14 @@ mod tests {
 
 		// the refused one first, so a gate that stopped after the first line
 		// would never reach the one that has to run.
-		client.say("quit").expect("the ring took it");
-		client.say("game.mark").expect("the ring took it");
-		host.say("game.mark").expect("the ring took it");
+		client
+			.say(Aim::NONE, "quit")
+			.expect("the ring took it");
+		client
+			.say(Aim::NONE, "game.mark")
+			.expect("the ring took it");
+		host.say(Aim::NONE, "game.mark")
+			.expect("the ring took it");
 		round(&mut host, &mut client, 2);
 
 		// what the host does with what a peer asked for.

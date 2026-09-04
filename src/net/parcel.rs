@@ -8,6 +8,11 @@
 //!    5  the piece, up to [`MAX_PIECE`] bytes of it
 //! ```
 //!
+//! **A console line carries the aim of whoever said it**, in the first
+//! twenty-four bytes of the parcel rather than of each piece. @ref [`saying`]
+//! for the layout and for why every line has one whether or not anybody was
+//! pointing.
+//!
 //! **A console line is a parcel of one piece**, which is the whole of what it
 //! used to be: the ring carried a line and nothing else, and everything that
 //! had to cross reliably had to be sayable as one. A world cannot be. What
@@ -39,7 +44,7 @@
 //! is the honest ceiling: a parcel longer than what can be waiting at once
 //! could never be put in the ring in the first place.
 
-use colby_core::{Result, err};
+use colby_core::{Result, abi::Aim, err};
 
 use crate::{
 	packet::{u16_at, u32_at},
@@ -87,7 +92,11 @@ const PIECES_AT: usize = 3;
 /// a thousand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-	/// A console line, the way every reliable item once was.
+	/// A console line, and where whoever said it was pointing.
+	///
+	/// The way every reliable item once was, with an [`Aim`] in front of it
+	/// since a host learned to run one as the peer that sent it. @ref
+	/// [`saying`].
 	Line,
 
 	/// A description of some part of a world, as a compiled scene has it.
@@ -154,10 +163,20 @@ impl Kind {
 /// The kinds are apart rather than a kind beside a bag of bytes, because what
 /// makes a line a line is a rule about its contents and this is where that rule
 /// is kept. A caller holding one of these has been told the text is text.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// @note: `PartialEq` and not `Eq`, because an [`Aim`] is floats and a float is
+/// not necessarily equal to itself. Nothing keys anything by a parcel, so what
+/// that costs is nothing.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Parcel {
-	/// A console line, checked to be one.
-	Line(String),
+	/// A console line, checked to be one, and the aim it was said with.
+	Line {
+		/// Where the sender was pointing, or [`Aim::NONE`] if nowhere.
+		aim: Aim,
+
+		/// The line itself.
+		text: String,
+	},
 
 	/// A description of some part of a world, for whoever knows how to read
 	/// one.
@@ -172,7 +191,7 @@ impl Parcel {
 	#[must_use]
 	pub const fn kind(&self) -> Kind {
 		match *self {
-			| Self::Line(_) => Kind::Line,
+			| Self::Line { .. } => Kind::Line,
 			| Self::Scene(_) => Kind::Scene,
 			| Self::Untied(_) => Kind::Untied,
 		}
@@ -220,7 +239,7 @@ pub fn post(ring: &mut Reliable, kind: Kind, bytes: &[u8]) -> Result {
 	// which are the same rules read from the wire.
 	match kind {
 		| Kind::Line => {
-			text(bytes)?;
+			line(bytes)?;
 		},
 		| Kind::Untied => {
 			untied(bytes)?;
@@ -390,7 +409,11 @@ impl Pieces {
 /// A parcel, out of the kind byte and the bytes that were under it.
 fn whole(kind: u8, bytes: &[u8]) -> Result<Parcel> {
 	match Kind::of(kind) {
-		| Some(Kind::Line) => Ok(Parcel::Line(text(bytes)?.to_owned())),
+		| Some(Kind::Line) => {
+			let (aim, text) = line(bytes)?;
+
+			Ok(Parcel::Line { aim, text: text.to_owned() })
+		},
 		| Some(Kind::Scene) => Ok(Parcel::Scene(bytes.to_vec())),
 		| Some(Kind::Untied) => Ok(Parcel::Untied(untied(bytes)?)),
 		| None => Err(err!(Network("a parcel of a kind number {kind} that means nothing"))),
@@ -491,7 +514,100 @@ fn untied(bytes: &[u8]) -> Result<Vec<Untied>> {
 		.collect()
 }
 
-/// The one rule a console line has, read in both directions.
+/// How many bytes an aim takes at the front of a console line.
+///
+/// Six little-endian floats, written the way every other number on this wire
+/// is rather than by casting the struct: the piece a parcel starts in begins
+/// wherever the piece before it ended, so nothing here is aligned to anything.
+///
+/// Published because it is what the longest line there is falls short of
+/// [`MAX_PARCEL`] by, and because a reader on the far end that was not built
+/// here needs the offset.
+pub const AIM_BYTES: usize = 24;
+
+// the two are one number, said in two places. `Aim` pins its own size for the
+// same reason and this is the wire's half of that agreement.
+const _: () =
+	assert!(AIM_BYTES == size_of::<Aim>(), "an aim on the wire is the aim in the world");
+
+/// Writes a console line and the aim it was said with as the bytes of a parcel.
+///
+/// ```text
+///    0  origin     3 * f32   where the sender was pointing from
+///   12  direction  3 * f32   and which way
+///   24  the line, as text
+/// ```
+///
+/// **The aim comes first because it is the fixed part.** A reader that has the
+/// head has the whole of the structure; what follows is a line however long it
+/// is, and nothing after it needs finding.
+///
+/// **Every line carries one, whether or not anybody was pointing.**
+/// [`Aim::NONE`] is twenty-four zero bytes and reads back as nobody pointing
+/// anywhere, so a line said by something with no screen - a script, a config
+/// file being run - costs the same twenty-four bytes and says the honest
+/// thing. A second kind for an aimed line would buy those bytes back on a
+/// message that exists only when somebody has actually done something, and it
+/// would cost two paths through everything downstream of here forever.
+///
+/// @param aim - where the sender was pointing, or [`Aim::NONE`]
+/// @param text - one console line
+/// @param out - where the bytes go, appended
+/// @return an error when the text is not one line
+pub fn saying(aim: Aim, text: &str, out: &mut Vec<u8>) -> Result {
+	// the rule about the text, checked before a byte is written rather than
+	// after twenty-four of them have been. @ref `parting`, which is the same
+	// shape for the same reason.
+	line_text(text.as_bytes())?;
+
+	for number in aim.origin.into_iter().chain(aim.direction) {
+		out.extend_from_slice(&number.to_bits().to_le_bytes());
+	}
+
+	out.extend_from_slice(text.as_bytes());
+
+	Ok(())
+}
+
+/// The aim and the line a parcel says, read from the wire.
+///
+/// The same layout [`saying`] writes, read where the bytes were chosen by
+/// somebody else.
+///
+/// **What is read is what was sent, float for float.** A direction that is not
+/// a unit vector is not refused and not put right here: it is that peer's
+/// claim about where they were pointing, the way [`Command::yaw`] is that
+/// peer's claim about which way they were facing, and this end has no more
+/// reason to believe one than the other. What makes it harmless is that
+/// nothing traces a direction without normalizing it, and that a direction of
+/// nothing - zero, or a number that is not one - reads back as
+/// [`Aim::is_some`] being false, which is nobody pointing anywhere.
+///
+/// @param bytes - the whole parcel
+fn line(bytes: &[u8]) -> Result<(Aim, &str)> {
+	let length = bytes.len();
+
+	if length < AIM_BYTES {
+		return Err(err!(Network("a console line of {length} bytes has no aim in front of it")));
+	}
+
+	// **and something after it**, because a parcel that says nothing is not
+	// one. `pieces` refuses a parcel of no bytes at all and this is the same
+	// rule once the fixed part has been taken off the front of it.
+	if length == AIM_BYTES {
+		return Err(err!(Network("a console line that is an aim and no line")));
+	}
+
+	let number = |at: usize| f32::from_bits(u32_at(bytes, at));
+	let aim = Aim {
+		origin: [number(0), number(4), number(8)],
+		direction: [number(12), number(16), number(20)],
+	};
+
+	Ok((aim, line_text(&bytes[AIM_BYTES..])?))
+}
+
+/// The one rule the *text* of a console line has, read in both directions.
 ///
 /// A line is text and it is one line. Nothing downstream of here treats it as
 /// a format string, so there is nothing else to strip - what a line break in
@@ -499,7 +615,7 @@ fn untied(bytes: &[u8]) -> Result<Vec<Untied>> {
 /// byte that is not text would do is make it unprintable.
 ///
 /// @param bytes - what the parcel holds
-fn text(bytes: &[u8]) -> Result<&str> {
+fn line_text(bytes: &[u8]) -> Result<&str> {
 	let line = std::str::from_utf8(bytes)
 		.map_err(|reason| err!(Network("a console line that is not text: {reason}")))?;
 
@@ -539,6 +655,38 @@ mod tests {
 		out
 	}
 
+	/// An aim whose six numbers are six different numbers.
+	///
+	/// Written as a literal rather than built through [`Aim::new`], because
+	/// what these tests are about is the wire carrying what it was handed -
+	/// a fixture that had been normalized on the way in could not tell a wire
+	/// that normalizes from one that does not.
+	fn pointing() -> Aim {
+		Aim {
+			origin: [1.5, -2.25, 3.75],
+			direction: [0.25, 0.5, -0.75],
+		}
+	}
+
+	/// The bytes of a console line parcel, aim and all.
+	fn spoken(aim: Aim, text: &str) -> Vec<u8> {
+		let mut out = Vec::new();
+
+		saying(aim, text, &mut out).expect("a line");
+
+		out
+	}
+
+	/// The same, with the rule left out, so that a line nobody may send can be
+	/// built anyway. Nobody is pointing anywhere in one of these.
+	fn unsayable(bytes: &[u8]) -> Vec<u8> {
+		let mut out = vec![0_u8; AIM_BYTES];
+
+		out.extend_from_slice(bytes);
+
+		out
+	}
+
 	/// One parcel through a ring and out the far side.
 	fn across(kind: Kind, bytes: &[u8]) -> Result<Option<Parcel>> {
 		let mut ring = Reliable::new();
@@ -569,13 +717,19 @@ mod tests {
 	fn a_console_line_is_a_parcel_of_one_piece() {
 		let mut ring = Reliable::new();
 
-		post(&mut ring, Kind::Line, b"game.spawn crate").expect("a line");
+		post(&mut ring, Kind::Line, &spoken(pointing(), "game.spawn crate")).expect("a line");
 		assert_eq!(ring.pending(), 1, "one item and no more");
 
 		let mut pieces = Pieces::new();
 		let got = pieces.take(&items(&ring)[0]).expect("a parcel");
 
-		assert_eq!(got, Some(Parcel::Line("game.spawn crate".to_owned())));
+		assert_eq!(
+			got,
+			Some(Parcel::Line {
+				aim: pointing(),
+				text: "game.spawn crate".to_owned()
+			})
+		);
 		assert!(!pieces.building(), "and nothing is being put together");
 	}
 
@@ -643,7 +797,8 @@ mod tests {
 		post(&mut ring, Kind::Scene, &bytes).expect("a ringful");
 		assert_eq!(ring.pending(), u32::from(MAX_PIECES));
 		assert_eq!(ring.room(), 0);
-		post(&mut ring, Kind::Line, b"game.spawn crate").expect_err("and nothing else fits");
+		post(&mut ring, Kind::Line, &spoken(Aim::NONE, "game.spawn crate"))
+			.expect_err("and nothing else fits");
 	}
 
 	#[test]
@@ -670,14 +825,18 @@ mod tests {
 	fn a_line_that_is_not_one_is_refused_on_the_way_out() {
 		let mut ring = Reliable::new();
 
-		post(&mut ring, Kind::Line, b"game.spawn box\ngame.freeze box")
+		post(&mut ring, Kind::Line, &unsayable(b"game.spawn box\ngame.freeze box"))
 			.expect_err("two lines pretending to be one");
-		post(&mut ring, Kind::Line, b"game.spawn\tbox").expect_err("nor one with a tab in it");
-		post(&mut ring, Kind::Line, b"game.spawn\x7Fbox")
+		post(&mut ring, Kind::Line, &unsayable(b"game.spawn\tbox"))
+			.expect_err("nor one with a tab in it");
+		post(&mut ring, Kind::Line, &unsayable(b"game.spawn\x7Fbox"))
 			.expect_err("nor one with a delete in it");
-		post(&mut ring, Kind::Line, &[0xFF, 0xFE]).expect_err("nor bytes that are not text");
+		post(&mut ring, Kind::Line, &unsayable(&[0xFF, 0xFE]))
+			.expect_err("nor bytes that are not text");
+		post(&mut ring, Kind::Line, &[0xFF, 0xFE]).expect_err("nor a parcel with no aim in it");
 		assert_eq!(ring.pending(), 0, "and none of them was queued");
-		post(&mut ring, Kind::Line, b"game.spawn box").expect("an ordinary one");
+		post(&mut ring, Kind::Line, &spoken(Aim::NONE, "game.spawn box"))
+			.expect("an ordinary one");
 
 		// and the same bytes are fine as a world, because the rule is the
 		// line's rather than the ring's.
@@ -689,16 +848,16 @@ mod tests {
 		let mut pieces = Pieces::new();
 
 		pieces
-			.take(&piece(Kind::Line.byte(), 0, 1, b"one\ntwo"))
+			.take(&piece(Kind::Line.byte(), 0, 1, &unsayable(b"one\ntwo")))
 			.expect_err("two lines");
 		pieces
-			.take(&piece(Kind::Line.byte(), 0, 1, &[0xFF]))
+			.take(&piece(Kind::Line.byte(), 0, 1, &unsayable(&[0xFF])))
 			.expect_err("not text at all");
 		assert_eq!(
 			pieces
-				.take(&piece(Kind::Line.byte(), 0, 1, b"quit"))
+				.take(&piece(Kind::Line.byte(), 0, 1, &spoken(pointing(), "quit")))
 				.expect("a line"),
-			Some(Parcel::Line("quit".to_owned()))
+			Some(Parcel::Line { aim: pointing(), text: "quit".to_owned() })
 		);
 	}
 
@@ -709,8 +868,10 @@ mod tests {
 		let mut ring = Reliable::new();
 		let mut long = "x".repeat(MAX_PIECE * 2);
 
-		post(&mut ring, Kind::Line, long.as_bytes()).expect("a very long line");
-		assert_eq!(ring.pending(), 2);
+		post(&mut ring, Kind::Line, &spoken(pointing(), &long)).expect("a very long line");
+		// three rather than two, because the aim is twenty-four bytes on the
+		// front of the parcel and two pieces were already exactly full.
+		assert_eq!(ring.pending(), 3);
 
 		let mut pieces = Pieces::new();
 		let mut got = None;
@@ -719,10 +880,10 @@ mod tests {
 			got = pieces.take(&item).expect("a piece");
 		}
 
-		assert_eq!(got, Some(Parcel::Line(long.clone())));
+		assert_eq!(got, Some(Parcel::Line { aim: pointing(), text: long.clone() }));
 
 		long.insert(MAX_PIECE, '\n');
-		post(&mut ring, Kind::Line, long.as_bytes())
+		post(&mut ring, Kind::Line, &unsayable(long.as_bytes()))
 			.expect_err("and a break anywhere in it is two lines");
 	}
 
@@ -840,9 +1001,12 @@ mod tests {
 		);
 		assert_eq!(
 			pieces
-				.take(&piece(Kind::Line.byte(), 0, 1, b"net.status"))
+				.take(&piece(Kind::Line.byte(), 0, 1, &spoken(Aim::NONE, "net.status")))
 				.expect("a line"),
-			Some(Parcel::Line("net.status".to_owned())),
+			Some(Parcel::Line {
+				aim: Aim::NONE,
+				text: "net.status".to_owned()
+			}),
 			"handed over where it stands"
 		);
 		assert!(pieces.building(), "and the world is still being put together");
@@ -930,6 +1094,97 @@ mod tests {
 		assert_eq!(HEAD, 5, "a byte and two shorts");
 		assert_eq!(MAX_PIECE, 1019, "which is what a piece is short of an item by");
 		assert_eq!(MAX_PARCEL, 65_216, "and a ringful of those is the longest parcel");
+	}
+
+	#[test]
+	fn a_line_is_laid_down_with_its_aim_at_the_offsets_the_module_publishes() {
+		// the offsets are the contract rather than a detail, for the reason
+		// the piece head's are: the end that reads them may not have been
+		// built here, and every other test in this file writes and reads
+		// through `saying` and `line` together, so two offsets swapping inside
+		// the pair would go unnoticed.
+		let mut ring = Reliable::new();
+
+		post(&mut ring, Kind::Line, &spoken(pointing(), "game.spawn crate")).expect("a line");
+
+		let sent = items(&ring);
+		let body = &sent[0][HEAD..];
+		let float = |at: usize| f32::from_bits(u32_at(body, at));
+
+		assert_eq!(AIM_BYTES, 24, "six floats and nothing else");
+		assert!(
+			[float(0), float(4), float(8)]
+				.iter()
+				.zip(pointing().origin)
+				.all(|(read, sent)| read.to_bits() == sent.to_bits()),
+			"the origin comes first, all three of it"
+		);
+		assert!(
+			[float(12), float(16), float(20)]
+				.iter()
+				.zip(pointing().direction)
+				.all(|(read, sent)| read.to_bits() == sent.to_bits()),
+			"then the direction"
+		);
+		assert_eq!(&body[AIM_BYTES..], b"game.spawn crate", "and then the line");
+	}
+
+	#[test]
+	fn a_direction_crosses_as_it_was_written_rather_than_put_right() {
+		// deliberate, and the reason is written on `line`: what a peer says
+		// about where it was pointing is that peer's claim, and this end has
+		// no more reason to correct it than it has to correct an angle on a
+		// command. Whatever traces it normalizes it.
+		let crooked = Aim {
+			origin: [0.0, 1.0, 0.0],
+			direction: [0.0, 0.0, -17.0],
+		};
+		let got = across(Kind::Line, &spoken(crooked, "game.grab")).expect("it crosses");
+
+		assert_eq!(
+			got,
+			Some(Parcel::Line {
+				aim: crooked,
+				text: "game.grab".to_owned()
+			})
+		);
+		assert!(crooked.is_some(), "and it is still somebody pointing somewhere");
+	}
+
+	#[test]
+	fn a_line_said_by_nobody_pointing_anywhere_says_so() {
+		let got = across(Kind::Line, &spoken(Aim::NONE, "net.status")).expect("it crosses");
+		let Some(Parcel::Line { aim, text }) = got else {
+			panic!("a line");
+		};
+
+		assert!(!aim.is_some(), "an aim of nothing arrives as an aim of nothing");
+		assert_eq!(text, "net.status", "and the line is untouched by it");
+	}
+
+	#[test]
+	fn a_line_with_no_room_for_an_aim_in_it_is_refused() {
+		let mut pieces = Pieces::new();
+
+		for length in 0..AIM_BYTES {
+			pieces
+				.take(&piece(Kind::Line.byte(), 0, 1, &vec![0_u8; length]))
+				.expect_err("shorter than an aim");
+		}
+
+		// and exactly an aim is an aim and no line, which is not a parcel
+		// either: a thing that says nothing has nothing to be run.
+		pieces
+			.take(&piece(Kind::Line.byte(), 0, 1, &[0_u8; AIM_BYTES]))
+			.expect_err("an aim and nothing after it");
+		post(&mut Reliable::new(), Kind::Line, &unsayable(b"")).expect_err("nor on the way out");
+		assert_eq!(
+			pieces
+				.take(&piece(Kind::Line.byte(), 0, 1, &spoken(Aim::NONE, "x")))
+				.expect("a line"),
+			Some(Parcel::Line { aim: Aim::NONE, text: "x".to_owned() }),
+			"and one byte past an aim is a line"
+		);
 	}
 
 	/// A handful of joints that have gone, with two different generations in
@@ -1045,7 +1300,7 @@ mod tests {
 
 	#[test]
 	fn the_kind_a_parcel_answers_to_is_the_one_it_arrived_as() {
-		assert_eq!(Parcel::Line(String::new()).kind(), Kind::Line);
+		assert_eq!(Parcel::Line { aim: Aim::NONE, text: String::new() }.kind(), Kind::Line);
 		assert_eq!(Parcel::Scene(Vec::new()).kind(), Kind::Scene);
 	}
 }

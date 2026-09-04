@@ -49,10 +49,16 @@ use std::{
 	time::Duration,
 };
 
-use colby_core::{Result, abi::Command, bytemuck, info, time::Rate, warn};
+use colby_core::{
+	Result,
+	abi::{Aim, Command},
+	bytemuck, info,
+	time::Rate,
+	warn,
+};
 use colby_net::{Conditions, MAX_ASKED, NOTHING, Slot, Solid, every};
 
-use crate::net::{Loopback, Net, Tally, Wire};
+use crate::net::{Loopback, Net, Said, Tally, Wire};
 
 /// The flag that asks for a two-endpoint run.
 const FLAG: &str = "--link";
@@ -219,6 +225,15 @@ pub(crate) struct Outcome {
 	/// How many commands the client asked for.
 	pub(crate) asked: u32,
 
+	/// How many lines arrived carrying an aim that is not the one they were
+	/// said with.
+	///
+	/// Nought, or the wire lost the aim without losing the line - which is
+	/// what a format change that drops it silently looks like, and what
+	/// nothing else in this run could notice: the digest would move, and a
+	/// digest that moved says only that something changed.
+	pub(crate) crooked: u32,
+
 	/// How many of them the host was still holding when the run ended.
 	///
 	/// A queue's depth at the end rather than a count of the run: nothing
@@ -272,6 +287,7 @@ pub(crate) fn run(steps: u32) -> Result {
 		asked = outcome.asked,
 		held = outcome.held_commands,
 		agreed = outcome.agreed,
+		crooked = outcome.crooked,
 		digest = format!("{:016x}", outcome.digest),
 		"everything that had to arrive, arrived"
 	);
@@ -281,6 +297,13 @@ pub(crate) fn run(steps: u32) -> Result {
 			taken = outcome.taken,
 			"the client did not end up with the host's world, which is the other thing this \
 			 cannot do"
+		);
+	}
+
+	if outcome.crooked != 0 {
+		warn!(
+			crooked = outcome.crooked,
+			"a line arrived pointing somewhere other than where it was said from"
 		);
 	}
 
@@ -319,6 +342,7 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 	let mut digest = 0xCBF2_9CE4_8422_2325_u64;
 	let mut said = 0_u32;
 	let mut heard = 0_u32;
+	let mut crooked = 0_u32;
 	let mut taken = 0_u32;
 	let mut held = NOTHING;
 	let mut world = Vec::new();
@@ -338,11 +362,11 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 		let talking = step <= steps;
 
 		if talking && step.is_multiple_of(HOST_EVERY) {
-			said += tell(&mut host, &format!("host.tick {step}"));
+			said += tell(&mut host, aimed(step), &format!("host.tick {step}"));
 		}
 
 		if talking && step.is_multiple_of(CLIENT_EVERY) {
-			said += tell(&mut client, &format!("client.tick {step}"));
+			said += tell(&mut client, aimed(step), &format!("client.tick {step}"));
 		}
 
 		// the world stops moving when the talking does, so the last two
@@ -378,9 +402,12 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 		client.receive(now);
 
 		for (side, net) in [(0_u8, &host), (1, &client)] {
-			for arrived in net.said() {
+			for said in net.said() {
+				let (folded, wrong) = arrival(digest, step, side, said);
+
 				heard += 1;
-				digest = fold(digest, step, side, &arrived.text);
+				digest = folded;
+				crooked += u32::from(wrong);
 			}
 		}
 
@@ -403,6 +430,7 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 
 	Outcome {
 		digest,
+		crooked,
 		said,
 		heard,
 		asked,
@@ -517,6 +545,49 @@ fn body(entity: u32, position: [f32; 3]) -> Solid {
 	}
 }
 
+/// One line that arrived, folded into the run's number, and whether it kept
+/// the aim it was said with.
+///
+/// Its own function because the fold and the check together sit four deep
+/// inside two loops otherwise, which is the shape the house rules refuse.
+///
+/// @param hash - the run's number so far
+/// @param step - which step it arrived on
+/// @param side - nought for the host, one for the client
+/// @param said - the line, its sender and its aim
+/// @return the number with this line in it, and whether the aim that arrived
+/// is not the one the line was sent with
+fn arrival(hash: u64, step: u32, side: u8, said: &Said) -> (u64, bool) {
+	let mut folded = fold(hash, step, side, &said.text);
+
+	// **the aim goes into the number too**, or the run cannot see it at all:
+	// the twenty-four bytes in front of a line are not in the text, and a wire
+	// that quietly dropped them would give the same digest as one that carried
+	// them.
+	for number in said
+		.aim
+		.origin
+		.into_iter()
+		.chain(said.aim.direction)
+	{
+		folded = fold(folded, number.to_bits(), side, "");
+	}
+
+	// and this is what the digest cannot say: a digest that moved says only
+	// that something changed, and this says that a line differs from itself.
+	(folded, when(&said.text).map(aimed) != Some(said.aim))
+}
+
+/// Which step a line made by [`tell`] was said on, out of the line itself.
+///
+/// The lines this run sends all end in the number of the step that made them,
+/// which is what lets an aim that arrived be checked against the aim it was
+/// sent with rather than only against itself.
+///
+/// @param text - a line exactly as it arrived
+/// @return the step, or nothing if this is not one of those lines
+fn when(text: &str) -> Option<u32> { text.rsplit(' ').next()?.parse().ok() }
+
 /// One snapshot's worth of world folded into the number that stands for a run.
 ///
 /// Every word of every occupied slot, and the slot's own number with it, so
@@ -549,11 +620,30 @@ fn connect(client: &mut Net, host: SocketAddr) {
 	client.introduce(host);
 }
 
+/// Where whoever said a line on this step was pointing.
+///
+/// Made up, because this mode has no world and no camera, and made up the way
+/// [`wanted`] makes up a look: six numbers that are six different non-linear
+/// functions of the step, so that a run whose aims all walked in a straight
+/// line could not tell an aim read from the wrong offset from one read from
+/// the right one, and a run that dropped the aim entirely would still change
+/// the digest.
+///
+/// @param step - which step of the run
+fn aimed(step: u32) -> Aim {
+	let turn = f32::from(u16::try_from(step % 89).unwrap_or(0));
+
+	Aim {
+		origin: [turn, turn * 0.5 - 3.0, turn.mul_add(-turn, 1.0)],
+		direction: [turn * 0.25, -turn, turn * turn - 7.0],
+	}
+}
+
 /// Queues a line on one endpoint, and says whether it took it.
-fn tell(net: &mut Net, text: &str) -> u32 {
+fn tell(net: &mut Net, aim: Aim, text: &str) -> u32 {
 	let peers = u32::try_from(net.peers()).unwrap_or(0);
 
-	if let Err(error) = net.say(text) {
+	if let Err(error) = net.say(aim, text) {
 		warn!(%text, %error, "the ring would not take a command");
 
 		return 0;
@@ -669,9 +759,19 @@ mod tests {
 		// every one of those invalidates a recorded run, and this is what says
 		// so out loud rather than leaving it to be noticed. It last moved when
 		// the world itself started crossing, again when two bodies that change
-		// and change back were put into it, and again when the client started
-		// asking for things.
-		assert_eq!(exchange(600, WIRE).digest, 0x0A39_E2D3_E5A3_F78D);
+		// and change back were put into it, again when the client started
+		// asking for things, and again when a console line grew the aim of
+		// whoever said it.
+		let outcome = exchange(600, WIRE);
+
+		assert_eq!(outcome.digest, 0x707D_21BD_12D3_A1B9);
+		// **and the half a digest cannot say.** A number that moved says only
+		// that something changed; this says that each of the sixteen lines
+		// arrived pointing where it was said from. The count is written down
+		// with it, because nought lines all correct and nought lines is the
+		// same nought.
+		assert_eq!(outcome.heard, 16, "sixteen lines arrived to be checked");
+		assert_eq!(outcome.crooked, 0, "and every one of them kept its aim");
 	}
 
 	/// The other direction, which nothing in this run covered until now.

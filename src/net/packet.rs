@@ -54,8 +54,9 @@ pub const MAGIC: u16 = u16::from_le_bytes(*b"CN");
 /// shape. A datagram carrying a different number is refused with the number in
 /// the message rather than read as if it agreed.
 ///
-/// Two since the head grew a session.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Two since the head grew a session, three since a console line grew the
+/// aim of whoever said it.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 const MAGIC_AT: usize = 0;
 const VERSION_AT: usize = 2;
@@ -463,7 +464,7 @@ mod tests {
 		assert_eq!(
 			head,
 			[
-				b'C', b'N', 2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+				b'C', b'N', 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
 				0x10
 			],
 			"the magic, the protocol, then the six fields little-endian in order"

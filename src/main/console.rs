@@ -680,9 +680,12 @@ unsafe extern "C-unwind" fn echo(_world: *mut World, args: *const Args) {
 /// # Safety
 ///
 /// As [`help`].
-unsafe extern "C-unwind" fn say(_world: *mut World, args: *const Args) {
+unsafe extern "C-unwind" fn say(world: *mut World, args: *const Args) {
 	// SAFETY: as help.
 	let args = unsafe { &*args };
+	// SAFETY: as help, and a second block because two dereferences in one is
+	// a lint.
+	let world = unsafe { &*world };
 	let text = args.rest();
 
 	if text.is_empty() {
@@ -691,7 +694,12 @@ unsafe extern "C-unwind" fn say(_world: *mut World, args: *const Args) {
 		return;
 	}
 
-	crate::net::ask(crate::net::Request::Say(text));
+	// **where this screen is pointing, now.** A line is the one thing on this
+	// wire that crosses because somebody did something, so it is the one thing
+	// that can say where they were pointing when they did it - and the moment
+	// to ask is this one, not the frame that gets round to sending it. @ref
+	// `World::pointing`, and `crate::net::obey` for the end that reads it.
+	crate::net::ask(crate::net::Request::Say(world.pointing(), text));
 }
 
 /// `net.status` - reports the wire and every peer on it.
