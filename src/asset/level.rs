@@ -107,10 +107,13 @@ pub fn import(text: &str) -> Result<SceneData> {
 
 /// Refuses a field this build does not know.
 ///
+/// Shared with the project file, which follows the same rule for the same
+/// reason. @ref `crate::project`.
+///
 /// @param value - the object to check, or nothing
 /// @param known - every field that belongs
 /// @param what - what to call the object in the message
-fn fields(value: &Value, known: &[&str], what: &str) -> Result<()> {
+pub(crate) fn fields(value: &Value, known: &[&str], what: &str) -> Result<()> {
 	for (name, _) in value.as_object() {
 		if !known.contains(&name.as_str()) {
 			return Err(err!(Asset("{what} has no field called {name}")));

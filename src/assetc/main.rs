@@ -7,27 +7,30 @@
 //! to what a file turns into.
 //!
 //! ```text
-//! colby-assetc [--assets DIR] [--out DIR] [--force] [--quiet]
+//! colby-assetc [--project DIR] [--assets DIR] [--out DIR] [--force] [--quiet]
 //! ```
 //!
-//! Paths default to `assets` and `target/assets` under the working directory,
-//! which is where `just` runs it from. A source that fails to compile is
-//! reported and the rest are compiled anyway; the exit status is non-zero if
-//! anything failed.
+//! The trees are a project's: `assets/` and `.colby/assets/` under the
+//! directory `--project` names, or under the working directory when it names
+//! none, which is where `just` runs it from. Either tree can be pointed
+//! somewhere else by hand, and with both pointed there is no project to read.
+//! A source that fails to compile is reported and the rest are compiled
+//! anyway; the exit status is non-zero if anything failed.
 
-use std::{
-	path::{Path, PathBuf},
-	process::ExitCode,
+use std::{path::PathBuf, process::ExitCode};
+
+use colby_asset::{
+	Project,
+	compile::{self, Produced, Report},
 };
-
-use colby_asset::compile::{self, Produced, Report};
 use colby_core::{Result, err, glam::Vec3};
 
 /// What the command line asked for.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Options {
-	assets: PathBuf,
-	out: PathBuf,
+	project: Option<PathBuf>,
+	assets: Option<PathBuf>,
+	out: Option<PathBuf>,
 	force: bool,
 	quiet: bool,
 }
@@ -40,8 +43,10 @@ usage:
     colby-assetc [options]
 
 options:
-    -a, --assets DIR   the source tree to read       [default: assets]
-    -o, --out DIR      the tree to write             [default: target/assets]
+    -p, --project DIR  the project whose trees these are   [default: the working directory]
+    -a, --assets DIR   the source tree to read             [default: the project's assets/]
+    -o, --out DIR      the tree to write                   [default: the project's \
+                     .colby/assets/]
     -f, --force        recompile even what is current
     -q, --quiet        print only failures
     -h, --help         print this
@@ -62,7 +67,16 @@ fn main() -> ExitCode {
 		},
 	};
 
-	match compile::compile_dir(&options.assets, &options.out, options.force) {
+	let (assets, out) = match options.trees() {
+		| Ok(trees) => trees,
+		| Err(error) => {
+			eprintln!("colby-assetc: {error}");
+
+			return ExitCode::FAILURE;
+		},
+	};
+
+	match compile::compile_dir(&assets, &out, options.force) {
 		| Ok(report) => {
 			let failed = report.failed.len();
 			print(&options, &report);
@@ -86,12 +100,7 @@ impl Options {
 	///
 	/// @return the options, or `None` when help was asked for
 	fn parse() -> Result<Option<Self>> {
-		let mut options = Self {
-			assets: PathBuf::from(compile::SOURCE_DIR),
-			out: compile::output_root(Path::new("")),
-			force: false,
-			quiet: false,
-		};
+		let mut options = Self::default();
 
 		let arguments: Vec<String> = std::env::args().skip(1).collect();
 		let mut index = 0;
@@ -102,12 +111,16 @@ impl Options {
 				| "-h" | "--help" => return Ok(None),
 				| "-f" | "--force" => options.force = true,
 				| "-q" | "--quiet" => options.quiet = true,
+				| "-p" | "--project" => {
+					options.project = Some(PathBuf::from(value(&arguments, index, argument)?));
+					index += 1;
+				},
 				| "-a" | "--assets" => {
-					options.assets = PathBuf::from(value(&arguments, index, argument)?);
+					options.assets = Some(PathBuf::from(value(&arguments, index, argument)?));
 					index += 1;
 				},
 				| "-o" | "--out" => {
-					options.out = PathBuf::from(value(&arguments, index, argument)?);
+					options.out = Some(PathBuf::from(value(&arguments, index, argument)?));
 					index += 1;
 				},
 				| other => return Err(err!("unknown argument {other:?}")),
@@ -115,6 +128,31 @@ impl Options {
 		}
 
 		Ok(Some(options))
+	}
+
+	/// The two trees to compile between.
+	///
+	/// With both named by hand no project is read at all. Otherwise the project
+	/// fills in what was not named: the one `--project` points at, or the one
+	/// in the working directory.
+	///
+	/// @return the source tree and the output tree
+	fn trees(&self) -> Result<(PathBuf, PathBuf)> {
+		if let (Some(assets), Some(out)) = (&self.assets, &self.out) {
+			return Ok((assets.clone(), out.clone()));
+		}
+
+		let here = PathBuf::from(".");
+		let project = Project::open(self.project.as_deref().unwrap_or(&here))?;
+
+		Ok((
+			self.assets
+				.clone()
+				.unwrap_or_else(|| project.assets()),
+			self.out
+				.clone()
+				.unwrap_or_else(|| project.output()),
+		))
 	}
 }
 

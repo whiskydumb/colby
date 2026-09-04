@@ -39,6 +39,7 @@ pub mod lua;
 pub mod model;
 pub mod obj;
 pub mod png;
+pub mod project;
 pub mod scene;
 pub mod script;
 pub mod sdf;
@@ -52,6 +53,7 @@ pub use self::{
 	bytes::AlignedBytes,
 	compile::{Report, compile_dir, compile_file, output_root, source_root},
 	format::{FORMAT_VERSION, MAGIC, MeshFile, MeshHeader, encode},
+	project::Project,
 	scene::{SceneFile, SceneHeader},
 	texture::{TextureFile, TextureHeader},
 };
