@@ -22,6 +22,8 @@ use std::{
 
 use colby_core::{Result, debug, error, info, mods::path, warn};
 
+use crate::Build;
+
 /// How often the filesystem is looked at. Frequent enough to feel immediate,
 /// rare enough that a few dozen `stat` calls per second are irrelevant.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -37,9 +39,18 @@ const WATCHED_EXTENSIONS: &[&str] = &["rs", "toml"];
 
 /// Crate directories a change to forces a restart.
 ///
-/// Everything the runner itself links. `assetc` is not here: it is a separate
+/// Everything the runner itself links, which is every crate in the workspace
+/// but two: the game, which is the one being swapped, and `assetc`, a separate
 /// executable nothing in this process depends on, so rebuilding it is free.
-const FIXED_CRATES: &[&str] = &["asset", "core", "engine", "main"];
+///
+/// @note: the list held four names for a long time - `asset`, `core`, `engine`
+/// and the runner - and an edit under the six others went unremarked: no
+/// warning, no rebuild, and a process quietly running the solver it started
+/// with. Every crate the runner links belongs here, or the warning lies.
+const FIXED_CRATES: &[&str] = &[
+	"asset", "audio", "core", "editor", "engine", "main", "net", "physics", "runtime", "script",
+	"ui",
+];
 
 /// A set of directories and the newest modification time seen across them.
 struct Layer {
@@ -81,6 +92,9 @@ pub(crate) struct Watch {
 	build: Option<Child>,
 	next_poll: Instant,
 	stale_host: bool,
+	/// What the build script knew: the cargo, the profile and the flags a
+	/// rebuild has to match, and the package it must leave alone.
+	facts: Build,
 }
 
 impl Watch {
@@ -88,16 +102,17 @@ impl Watch {
 	///
 	/// @param module - the crate name, e.g. `colby_game`
 	/// @param sources - the directory holding that crate's sources
+	/// @param facts - what the build script knew, so that the rebuild matches
+	/// the build that is running
 	/// @return a watcher primed with the current state, so nothing fires until
 	/// something is actually written
-	pub(crate) fn new(module: &str, sources: PathBuf) -> Result<Self> {
+	pub(crate) fn new(module: &str, sources: PathBuf, facts: &Build) -> Result<Self> {
 		let artifact = path::from_name(module)?;
 		let artifact_stamp = path::mtime(&artifact)?;
 
-		let workspace = crate::workspace();
 		let fixed = FIXED_CRATES
 			.iter()
-			.map(|crate_dir| workspace.join("src").join(crate_dir))
+			.map(|crate_dir| facts.workspace.join("src").join(crate_dir))
 			.collect();
 
 		info!(sources = ?sources, artifact = ?artifact, "watching the game crate");
@@ -110,6 +125,7 @@ impl Watch {
 			build: None,
 			next_poll: Instant::now() + POLL_INTERVAL,
 			stale_host: false,
+			facts: facts.clone(),
 		})
 	}
 
@@ -212,11 +228,11 @@ impl Watch {
 		// colby_core and quietly break every property the host relies on. It
 		// inherits stdio too: a compile error belongs in front of whoever just
 		// saved the file.
-		let spawned = Command::new(env!("COLBY_CARGO"))
-			.args(["build", "--workspace", "--exclude", env!("CARGO_PKG_NAME")])
-			.args(["--profile", env!("COLBY_PROFILE")])
-			.current_dir(crate::workspace())
-			.env("CARGO_ENCODED_RUSTFLAGS", env!("COLBY_ENCODED_RUSTFLAGS"))
+		let spawned = Command::new(&self.facts.cargo)
+			.args(["build", "--workspace", "--exclude", self.facts.package.as_str()])
+			.args(["--profile", self.facts.profile.as_str()])
+			.current_dir(&self.facts.workspace)
+			.env("CARGO_ENCODED_RUSTFLAGS", &self.facts.rustflags)
 			.spawn();
 
 		match spawned {

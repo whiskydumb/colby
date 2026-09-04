@@ -1,0 +1,37 @@
+[package]
+name = "colby_runtime"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+
+[features]
+default = ["hot_reload", "editor"]
+hot_reload = ["colby_core/hot_reload"]
+# the egui editor, drawn over the scene. A feature because a shipped build has
+# no use for it and no wish to link it.
+editor = ["dep:colby_editor"]
+# links the game straight into the library instead of loading it. This is what
+# a shipped build looks like, and it is also the check that the boundary really
+# is just a table of function pointers.
+static_game = ["dep:colby_game"]
+
+[dependencies]
+colby_asset.workspace = true
+colby_audio.workspace = true
+colby_core.workspace = true
+colby_editor = { workspace = true, optional = true }
+colby_engine.workspace = true
+colby_game = { workspace = true, optional = true }
+colby_net.workspace = true
+colby_physics.workspace = true
+colby_script.workspace = true
+colby_ui.workspace = true
+
+[lints]
+workspace = true

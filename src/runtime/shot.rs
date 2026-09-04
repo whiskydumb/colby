@@ -45,10 +45,11 @@ const STEPS: u32 = 90;
 ///
 /// Accepts `--shot` on its own, `--shot path` and `--shot=path`.
 ///
+/// @param arguments - the command line, without the program's own name
 /// @return where to write the picture, if one was asked for
 #[must_use]
-pub(crate) fn requested() -> Option<PathBuf> {
-	let mut arguments = std::env::args().skip(1);
+pub(crate) fn requested(arguments: &[String]) -> Option<PathBuf> {
+	let mut arguments = arguments.iter();
 
 	while let Some(argument) = arguments.next() {
 		if let Some(path) = argument.strip_prefix(&format!("{FLAG}=")) {
@@ -70,8 +71,9 @@ pub(crate) fn requested() -> Option<PathBuf> {
 /// Runs the game for a moment and writes what the camera sees.
 ///
 /// @param path - where to write the picture
+/// @param workspace - the checkout the runner was built from
 /// @return `Ok` once the file is on disk
-pub(crate) fn take(path: &Path) -> Result {
+pub(crate) fn take(path: &Path, workspace: &Path) -> Result {
 	let Some(mut capture) = Capture::new(SIZE.0, SIZE.1)? else {
 		return Err!(Graphics("no usable adapter, so there is nothing to render with"));
 	};
@@ -85,7 +87,7 @@ pub(crate) fn take(path: &Path) -> Result {
 	// the same order the window path uses: assets first, so the game's `init`
 	// can resolve a mesh by name. A screenshot that skipped this would quietly
 	// be a picture of a different scene than the one on screen.
-	Assets::new(&crate::workspace()).sync(&mut world);
+	Assets::new(workspace).sync(&mut world);
 
 	let mut game = Game::open(&mut world)?;
 	let mut input = Input::default();

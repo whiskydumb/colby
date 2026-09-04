@@ -216,22 +216,15 @@ pub(crate) enum Standing {
 /// `--host` accepts them, and `--connect address` in the shapes the windowless
 /// client accepts it.
 ///
-/// @return which end of a wire this window is, if either
-#[must_use]
-pub(crate) fn standing() -> Standing {
-	let arguments: Vec<String> = std::env::args().skip(1).collect();
-
-	standing_in(&arguments)
-}
-
-/// The same, over arguments already collected.
-///
 /// **Serving wins when both are named**, and it is a rule rather than an
 /// accident: a window cannot be both ends of a wire, and of the two claims the
 /// stronger one is being the authority. Refusing to start over it would be
 /// worse - a person who typed both meant one of them, and the engine can say
 /// which it took.
-fn standing_in(arguments: &[String]) -> Standing {
+/// @param arguments - the command line, without the program's own name
+/// @return which end of a wire this window is, if either
+#[must_use]
+pub(crate) fn standing(arguments: &[String]) -> Standing {
 	if let Some(port) = crate::host::port_after(arguments, LISTEN) {
 		return Standing::Serving(port);
 	}
@@ -6140,23 +6133,20 @@ mod tests {
 	#[test]
 	fn a_host_named_on_the_command_line_is_read_and_a_word_that_is_not_one_is_not() {
 		assert_eq!(
-			standing_in(&words(&["--connect", "127.0.0.1:27015"])),
+			standing(&words(&["--connect", "127.0.0.1:27015"])),
 			Standing::Talking(somewhere(27_015))
 		);
+		assert_eq!(standing(&words(&["--connect=127.0.0.1:1"])), Standing::Talking(somewhere(1)));
+		assert_eq!(standing(&words(&["--connect"])), Standing::Alone, "with nothing after it");
 		assert_eq!(
-			standing_in(&words(&["--connect=127.0.0.1:1"])),
-			Standing::Talking(somewhere(1))
-		);
-		assert_eq!(standing_in(&words(&["--connect"])), Standing::Alone, "with nothing after it");
-		assert_eq!(
-			standing_in(&words(&["--connect", "not an address"])),
+			standing(&words(&["--connect", "not an address"])),
 			Standing::Alone,
 			"and with something that is not one"
 		);
 		// an address after it rather than a port, so that the flag is what
 		// this turns on: a word no reader could parse would refuse either way.
 		assert_eq!(
-			standing_in(&words(&["--join", "127.0.0.1:27015"])),
+			standing(&words(&["--join", "127.0.0.1:27015"])),
 			Standing::Alone,
 			"and not somebody else's flag"
 		);
@@ -6165,25 +6155,25 @@ mod tests {
 	#[test]
 	fn a_window_asked_to_listen_serves_on_the_port_it_was_given() {
 		assert_eq!(
-			standing_in(&words(&["--listen"])),
+			standing(&words(&["--listen"])),
 			Standing::Serving(DEFAULT_PORT),
 			"on its own it is the usual port"
 		);
-		assert_eq!(standing_in(&words(&["--listen", "9999"])), Standing::Serving(9999));
-		assert_eq!(standing_in(&words(&["--listen=9999"])), Standing::Serving(9999));
+		assert_eq!(standing(&words(&["--listen", "9999"])), Standing::Serving(9999));
+		assert_eq!(standing(&words(&["--listen=9999"])), Standing::Serving(9999));
 	}
 
 	#[test]
 	fn a_window_told_nothing_about_a_wire_has_no_socket() {
 		// the ordinary case, and the one a change that opened a socket by
 		// accident would break in silence.
-		assert_eq!(standing_in(&[]), Standing::Alone);
-		assert_eq!(standing_in(&words(&["--shot", "colby.png"])), Standing::Alone);
+		assert_eq!(standing(&[]), Standing::Alone);
+		assert_eq!(standing(&words(&["--shot", "colby.png"])), Standing::Alone);
 		// and the windowless flags are not this window's business: a process
 		// given either of those never reaches the window path at all.
-		assert_eq!(standing_in(&words(&["--host"])), Standing::Alone, "a dedicated end");
+		assert_eq!(standing(&words(&["--host"])), Standing::Alone, "a dedicated end");
 		assert_eq!(
-			standing_in(&words(&["--join", "127.0.0.1:1"])),
+			standing(&words(&["--join", "127.0.0.1:1"])),
 			Standing::Alone,
 			"and a windowless client"
 		);
@@ -6195,11 +6185,11 @@ mod tests {
 		// stronger one is being the authority. Refusing to start over it would
 		// be worse than picking and saying which was picked.
 		assert_eq!(
-			standing_in(&words(&["--connect", "127.0.0.1:1", "--listen", "9999"])),
+			standing(&words(&["--connect", "127.0.0.1:1", "--listen", "9999"])),
 			Standing::Serving(9999)
 		);
 		assert_eq!(
-			standing_in(&words(&["--listen", "--connect", "127.0.0.1:1"])),
+			standing(&words(&["--listen", "--connect", "127.0.0.1:1"])),
 			Standing::Serving(DEFAULT_PORT),
 			"whichever order they were typed in"
 		);

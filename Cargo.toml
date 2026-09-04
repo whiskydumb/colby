@@ -37,6 +37,14 @@ path = "src/net"
 [workspace.dependencies.colby_physics]
 path = "src/physics"
 
+# @note: `default-features = false` here rather than in the one manifest that
+# depends on it, because cargo refuses to turn a workspace dependency's defaults
+# off at the point of inheritance. Which of the runtime's three features a
+# build has is the bin's decision, made in its own feature table.
+[workspace.dependencies.colby_runtime]
+path = "src/runtime"
+default-features = false
+
 [workspace.dependencies.colby_script]
 path = "src/script"
 

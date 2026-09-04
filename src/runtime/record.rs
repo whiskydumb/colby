@@ -16,7 +16,10 @@
 //! `just shot` and `just hear` describe the same second and a half of the same
 //! world - one as a picture and one as a sound.
 
-use std::{fs, path::PathBuf};
+use std::{
+	fs,
+	path::{Path, PathBuf},
+};
 
 use colby_asset::wav;
 use colby_audio::{Bank, CHANNELS, Mixer, Snapshot};
@@ -101,13 +104,10 @@ pub(crate) struct Request {
 /// Accepts `--record` on its own, `--record path`, `--record=path`, and either
 /// of the last two followed by a number of steps.
 ///
+/// @param arguments - the command line, without the program's own name
 /// @return what to record, if anything was asked for
 #[must_use]
-pub(crate) fn requested() -> Option<Request> {
-	let arguments: Vec<String> = std::env::args().skip(1).collect();
-
-	parse(&arguments)
-}
+pub(crate) fn requested(arguments: &[String]) -> Option<Request> { parse(arguments) }
 
 /// The same, over arguments already collected.
 ///
@@ -148,8 +148,9 @@ fn parse(arguments: &[String]) -> Option<Request> {
 /// Runs the game for a moment and writes what came out of the mixer.
 ///
 /// @param request - where to write and how long for
+/// @param workspace - the checkout the runner was built from
 /// @return `Ok` once the file is on disk
-pub(crate) fn take(request: &Request) -> Result {
+pub(crate) fn take(request: &Request, workspace: &Path) -> Result {
 	// boxed and installed before anything else touches the world, for the same
 	// reason the window and the screenshot box it: the world keeps this
 	// address.
@@ -160,7 +161,7 @@ pub(crate) fn take(request: &Request) -> Result {
 	// assets first, so the game's `init` resolves its meshes and its sounds by
 	// name. A recording that skipped this would be a recording of a game that
 	// found nothing to play.
-	Assets::new(&crate::workspace()).sync(&mut world);
+	Assets::new(workspace).sync(&mut world);
 
 	let mut game = Game::open(&mut world)?;
 	let mut input = Input::default();

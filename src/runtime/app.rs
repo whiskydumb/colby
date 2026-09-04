@@ -41,6 +41,7 @@ use colby_ui::Interface;
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
 use crate::{
+	Build,
 	assets::Assets,
 	console::Console,
 	game::Game,
@@ -197,12 +198,22 @@ pub(crate) struct App {
 	/// is the same rule the material and console tables follow: whoever said
 	/// something last wins, and nobody says anything by standing still.
 	gravity: f32,
+	/// What the build script knew, handed down to the watcher.
+	build: Build,
+	/// Which end of a wire this window is, if either.
+	///
+	/// Read off the command line by whoever made the process, and decided
+	/// before the game module ever reads `World::peer`. @ref `start`.
+	standing: Standing,
 	failure: Option<Error>,
 }
 
 impl App {
 	/// An application that has not opened its window yet.
-	pub(crate) fn new() -> Self {
+	///
+	/// @param build - what the build script of the executable knew
+	/// @param standing - which end of a wire this window is, if either
+	pub(crate) fn new(build: Build, standing: Standing) -> Self {
 		let simulation = Box::new(Simulation::new());
 		let mut world = Box::<World>::default();
 
@@ -226,7 +237,7 @@ impl App {
 			records: Vec::new(),
 			started: Instant::now(),
 			simulation,
-			assets: Assets::new(&crate::workspace()),
+			assets: Assets::new(&build.workspace),
 			mode: Mode::new(),
 			console: None,
 			#[cfg(feature = "editor")]
@@ -235,6 +246,8 @@ impl App {
 			watch: None,
 			mix: Mix::FULL,
 			gravity: -PULL,
+			build,
+			standing,
 			failure: None,
 		}
 	}
@@ -305,7 +318,7 @@ impl App {
 		// authority its world already thinks it is, and one that connects
 		// stops being it before the game module ever reads the field.
 		let seed = crate::net::seed(&self.world.cvars);
-		let opened = match crate::net::standing() {
+		let opened = match self.standing {
 			| Standing::Serving(port) => Some((Net::host(port, seed), true)),
 			| Standing::Talking(address) => Some((Net::connect(address, seed), false)),
 			| Standing::Alone => None,
@@ -330,7 +343,7 @@ impl App {
 
 		// the config is read last of the three, because a line in it may name a
 		// variable the game registered a moment ago.
-		self.console = Some(Console::open(&mut self.world));
+		self.console = Some(Console::open(&mut self.world, &self.build.workspace));
 
 		// after the config, because that is where a rate somebody asked for
 		// arrives, and before the first step, because that is the last moment
@@ -448,8 +461,8 @@ impl App {
 	/// Starts watching the game crate for changes.
 	#[cfg(feature = "hot_reload")]
 	fn start_watching(&mut self) -> Result {
-		let sources = crate::workspace().join("src").join("game");
-		self.watch = Some(Watch::new(crate::game::MODULE_NAME, sources)?);
+		let sources = self.build.workspace.join("src").join("game");
+		self.watch = Some(Watch::new(crate::game::MODULE_NAME, sources, &self.build)?);
 
 		Ok(())
 	}
@@ -555,12 +568,16 @@ impl App {
 			console.poll(&mut self.world);
 		}
 
+		// and every config file somebody asked for, resolved against the
+		// workspace this runtime was handed. @ref `crate::console::serve`.
+		crate::console::serve(&mut self.world, &self.build.workspace);
+
 		// and whatever a command asked to be done with a scene, immediately
 		// after it was typed and before any step runs: a load replaces every
 		// table in the world, and doing that halfway through one would leave
 		// the rest of the step running against a world its first half never
 		// saw. @ref `crate::saves`.
-		crate::saves::serve(&mut self.world, &mut self.simulation);
+		crate::saves::serve(&mut self.world, &mut self.simulation, &self.build.workspace);
 
 		// and whatever a command asked of the wire, beside it and for the same
 		// reason. Then everything the socket is holding, before any step: what
@@ -899,6 +916,17 @@ impl ApplicationHandler for App {
 mod tests {
 	use super::*;
 
+	/// What a build script would have said, for a process nothing built.
+	fn build() -> Build {
+		Build {
+			workspace: std::env::temp_dir(),
+			cargo: "cargo".to_owned(),
+			profile: "dev".to_owned(),
+			rustflags: String::new(),
+			package: "colby".to_owned(),
+		}
+	}
+
 	/// How many steps a clock has ready.
 	fn drain(clock: &mut Clock) -> u32 {
 		let mut ran = 0;
@@ -974,7 +1002,7 @@ mod tests {
 		// inside the loop: two steps in one frame would then be microseconds
 		// apart, and two a frame apart a whole frame apart, with one blend
 		// asked to cover both.
-		let mut app = App::new();
+		let mut app = App::new(build(), Standing::Alone);
 		let began = Duration::from_secs(7);
 		let step = Rate::DEFAULT.step();
 		let after = app.stepped(began, Rate::DEFAULT);
@@ -989,7 +1017,7 @@ mod tests {
 		// same wire place a world against a moment each, and a moment that
 		// advanced by a constant while the world advanced by something else
 		// would be a delay nobody could measure.
-		let mut app = App::new();
+		let mut app = App::new(build(), Standing::Alone);
 		let fast = Rate::from_hz(240);
 		let began = Duration::from_secs(1);
 
@@ -1004,7 +1032,7 @@ mod tests {
 	fn the_moment_a_step_is_given_is_the_one_it_was_handed() {
 		// and not one this process read for itself. A window with no socket
 		// gets no wire at all, which is the ordinary case.
-		let mut app = App::new();
+		let mut app = App::new(build(), Standing::Alone);
 		let asked = Duration::from_secs(3);
 
 		assert!(App::wired(app.net.as_mut(), asked).is_none(), "no socket, no wire");

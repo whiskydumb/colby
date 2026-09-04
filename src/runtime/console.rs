@@ -115,8 +115,9 @@ impl Console {
 	/// variable the *game* registers finds it there.
 	///
 	/// @param world - the world whose table everything is registered into
-	pub(crate) fn open(world: &mut World) -> Self {
-		let archive = crate::workspace().join(ARCHIVE);
+	/// @param workspace - where the config is kept
+	pub(crate) fn open(world: &mut World, workspace: &Path) -> Self {
+		let archive = workspace.join(ARCHIVE);
 
 		if archive.is_file() {
 			console::exec(world, &archive);
@@ -181,7 +182,7 @@ pub(crate) fn install(world: &mut World) {
 		.command("echo", echo, "print the rest of the line");
 	world
 		.cvars
-		.command("exec", exec, "run a config file, relative to the workspace");
+		.command(EXEC, console::defer, "run a config file, relative to the workspace");
 	world
 		.cvars
 		.command("reset", reset, "put a variable back to the value its code registered");
@@ -695,31 +696,39 @@ unsafe extern "C-unwind" fn echo(_world: *mut World, args: *const Args) {
 
 /// `exec <path>` - runs a config file.
 ///
-/// # Safety
+/// Waits for the frame rather than answering inside the line, because the
+/// path is resolved against the workspace and the workspace is the runtime's
+/// rather than the world's: `exec scripts/demo.cfg` has to mean the same thing
+/// wherever the executable was started from, and a command is handed nothing
+/// that says where that is. @ref [`serve`], which takes it up.
+pub(crate) const EXEC: &str = "exec";
+
+/// Runs every config file somebody asked for since the last frame.
 ///
-/// As [`help`].
-unsafe extern "C-unwind" fn exec(world: *mut World, args: *const Args) {
-	// SAFETY: as help.
-	let world = unsafe { &mut *world };
-	// SAFETY: as help.
-	let args = unsafe { &*args };
+/// The frame loop's, beside the scene and the wire requests and for the same
+/// reason. The one thing a line loses by waiting is its place in a
+/// multi-statement line: `exec a.cfg; sim.pause 1` pauses first and runs the
+/// file when the frame gets to it.
+///
+/// @param world - where the lines wait, and what the file is run against
+/// @param workspace - what a relative path is resolved against
+pub(crate) fn serve(world: &mut World, workspace: &Path) {
+	for asked in take(world, &[EXEC]) {
+		let Some(name) = asked.words.first() else {
+			warn!("exec takes the path of a config file");
 
-	let Some(name) = args.word(0) else {
-		warn!("exec takes the path of a config file");
+			continue;
+		};
 
-		return;
-	};
+		let path = Path::new(name);
+		let path = if path.is_absolute() {
+			path.to_owned()
+		} else {
+			workspace.join(path)
+		};
 
-	// resolved against the workspace, so that `exec scripts/demo.cfg` means the
-	// same thing wherever the executable was started from.
-	let path = Path::new(name);
-	let path = if path.is_absolute() {
-		path.to_owned()
-	} else {
-		crate::workspace().join(path)
-	};
-
-	console::exec(world, &path);
+		console::exec(world, &path);
+	}
 }
 
 /// `reset <name>` - puts a variable back to its registered value.

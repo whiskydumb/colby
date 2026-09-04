@@ -60,9 +60,10 @@ const OUTPUT_VAR: &str = "COLBY_ASSETS_OUT";
 /// now need the answer: this loop, which watches it, and the editor, which
 /// writes a scene source into it. A source written under a different root from
 /// the one being watched is a file nothing would ever compile.
-pub(crate) fn source_root() -> PathBuf {
-	std::env::var_os(SOURCE_VAR)
-		.map_or_else(|| compile::source_root(&crate::workspace()), PathBuf::from)
+///
+/// @param workspace - the checkout the runner was built from
+pub(crate) fn source_root(workspace: &Path) -> PathBuf {
+	std::env::var_os(SOURCE_VAR).map_or_else(|| compile::source_root(workspace), PathBuf::from)
 }
 
 /// One compiled asset the world is currently holding.
@@ -90,7 +91,7 @@ impl Assets {
 	///
 	/// @param workspace - the checkout the runner was built from
 	pub(crate) fn new(workspace: &Path) -> Self {
-		let source = source_root();
+		let source = source_root(workspace);
 		let output = std::env::var_os(OUTPUT_VAR)
 			.map_or_else(|| compile::output_root(workspace), PathBuf::from);
 

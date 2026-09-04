@@ -153,13 +153,10 @@ const CLIENT_AT: u16 = 40000;
 ///
 /// Accepts `--link` on its own, `--link steps` and `--link=steps`.
 ///
+/// @param arguments - the command line, without the program's own name
 /// @return how many steps to run, if a run was asked for
 #[must_use]
-pub(crate) fn requested() -> Option<u32> {
-	let arguments: Vec<String> = std::env::args().skip(1).collect();
-
-	parse(&arguments)
-}
+pub(crate) fn requested(arguments: &[String]) -> Option<u32> { parse(arguments) }
 
 /// The same, over arguments already collected.
 ///

@@ -27,6 +27,7 @@
 
 use std::{
 	net::SocketAddr,
+	path::Path,
 	thread,
 	time::{Duration, Instant},
 };
@@ -68,13 +69,10 @@ const VIEWPORT: Vec2 = Vec2::new(1280.0, 720.0);
 ///
 /// Accepts `--host` on its own, `--host port` and `--host=port`.
 ///
+/// @param arguments - the command line, without the program's own name
 /// @return which port to listen on, if a host was asked for
 #[must_use]
-pub(crate) fn requested() -> Option<u16> {
-	let arguments: Vec<String> = std::env::args().skip(1).collect();
-
-	port_after(&arguments, FLAG)
-}
+pub(crate) fn requested(arguments: &[String]) -> Option<u16> { port_after(arguments, FLAG) }
 
 /// Reads the command line for a client with no window.
 ///
@@ -82,13 +80,10 @@ pub(crate) fn requested() -> Option<u16> {
 /// the standard library reads as one - the same shapes `--connect` takes,
 /// because it is the same question asked by a mode that draws nothing.
 ///
+/// @param arguments - the command line, without the program's own name
 /// @return where the host is, if a windowless client was asked for
 #[must_use]
-pub(crate) fn joining() -> Option<SocketAddr> {
-	let arguments: Vec<String> = std::env::args().skip(1).collect();
-
-	address(&arguments)
-}
+pub(crate) fn joining(arguments: &[String]) -> Option<SocketAddr> { address(arguments) }
 
 /// The same, over arguments already collected.
 ///
@@ -142,12 +137,16 @@ enum End {
 /// Brings a world up, opens a socket, and serves until somebody says stop.
 ///
 /// @param port - what to listen on
-pub(crate) fn serve(port: u16) -> Result { run(End::Serving(port)) }
+/// @param workspace - the checkout the runner was built from
+pub(crate) fn serve(port: u16, workspace: &Path) -> Result { run(End::Serving(port), workspace) }
 
 /// The same, at the other end: a client with nothing on screen.
 ///
 /// @param address - where the host is
-pub(crate) fn join(address: SocketAddr) -> Result { run(End::Asking(address)) }
+/// @param workspace - the checkout the runner was built from
+pub(crate) fn join(address: SocketAddr, workspace: &Path) -> Result {
+	run(End::Asking(address), workspace)
+}
 
 /// The loop both ends share.
 ///
@@ -160,7 +159,8 @@ pub(crate) fn join(address: SocketAddr) -> Result { run(End::Asking(address)) }
 /// machines disagree about where somebody is standing.
 ///
 /// @param end - which end of the wire this process is
-fn run(end: End) -> Result {
+/// @param workspace - the checkout the runner was built from
+fn run(end: End, workspace: &Path) -> Result {
 	// boxed and installed before anything else touches the world, for the
 	// reason the window and the screenshot box it: the world keeps this
 	// address.
@@ -168,7 +168,7 @@ fn run(end: End) -> Result {
 	let mut world = Box::<World>::default();
 	world.install_physics(simulation.table());
 
-	let mut assets = Assets::new(&crate::workspace());
+	let mut assets = Assets::new(workspace);
 	assets.sync(&mut world);
 
 	world.ui.set_viewport(VIEWPORT, 1.0);
@@ -195,7 +195,7 @@ fn run(end: End) -> Result {
 	}
 
 	let mut game = Game::open(&mut world)?;
-	let console = Console::open(&mut world);
+	let console = Console::open(&mut world, workspace);
 	let mut scripts = Vm::new(console::defer)?;
 	let mut interface = Interface::new();
 	let mut input = Input::default();
@@ -221,6 +221,7 @@ fn run(end: End) -> Result {
 		clock.tick();
 		assets.poll(&mut world);
 		console.poll(&mut world);
+		crate::console::serve(&mut world, workspace);
 		// the tick rate, read where a window reads it. A serving end is the
 		// authority and runs what it was told; an asking one takes the rate
 		// every host runs, because nothing on the wire says what this host
@@ -233,7 +234,7 @@ fn run(end: End) -> Result {
 		// between it and any harness - and that is `NET-7` rather than
 		// something this line can fix on its own.
 		clock.set_rate(crate::app::paced(&world.cvars, !hosting));
-		crate::saves::serve(&mut world, &mut simulation);
+		crate::saves::serve(&mut world, &mut simulation, workspace);
 		crate::net::serve(&mut world, Some(&mut net));
 		// everything the wire wants once a frame, in the one place it is
 		// written. @ref `crate::net::hear`, which a window calls too.

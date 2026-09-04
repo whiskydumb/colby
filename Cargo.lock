@@ -277,16 +277,8 @@ dependencies = [
 name = "colby"
 version = "0.1.0"
 dependencies = [
- "colby_asset",
- "colby_audio",
  "colby_core",
- "colby_editor",
- "colby_engine",
- "colby_game",
- "colby_net",
- "colby_physics",
- "colby_script",
- "colby_ui",
+ "colby_runtime",
 ]
 
 [[package]]
@@ -374,6 +366,22 @@ name = "colby_physics"
 version = "0.1.0"
 dependencies = [
  "colby_core",
+]
+
+[[package]]
+name = "colby_runtime"
+version = "0.1.0"
+dependencies = [
+ "colby_asset",
+ "colby_audio",
+ "colby_core",
+ "colby_editor",
+ "colby_engine",
+ "colby_game",
+ "colby_net",
+ "colby_physics",
+ "colby_script",
+ "colby_ui",
 ]
 
 [[package]]

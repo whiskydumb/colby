@@ -139,7 +139,8 @@ impl Request {
 ///
 /// @param world - the world to write out or replace
 /// @param simulation - the solver, whose derived state a load drops
-pub(crate) fn serve(world: &mut World, simulation: &mut Simulation) {
+/// @param workspace - where the saves are, and what the asset tree hangs off
+pub(crate) fn serve(world: &mut World, simulation: &mut Simulation, workspace: &Path) {
 	let Some(request) = crate::console::take(world, NAMES)
 		.pop()
 		.as_ref()
@@ -149,10 +150,10 @@ pub(crate) fn serve(world: &mut World, simulation: &mut Simulation) {
 	};
 
 	let outcome = match &request {
-		| Request::Save(name) => save(world, name),
-		| Request::Load(name) => load(world, simulation, name),
-		| Request::Write(name) => write(world, name),
-		| Request::Prop(name) => prop(world, name),
+		| Request::Save(name) => save(world, workspace, name),
+		| Request::Load(name) => load(world, simulation, workspace, name),
+		| Request::Write(name) => write(world, workspace, name),
+		| Request::Prop(name) => prop(world, workspace, name),
 	};
 
 	if let Err(failure) = outcome {
@@ -163,14 +164,15 @@ pub(crate) fn serve(world: &mut World, simulation: &mut Simulation) {
 /// Writes the world out.
 ///
 /// @param world - what to write
+/// @param workspace - where the saves are
 /// @param name - what to call it, without an extension
 ///
 /// # Errors
 ///
 /// If the description will not fit in one file, or the directory or the file
 /// cannot be written.
-fn save(world: &World, name: &str) -> Result {
-	let path = path(name)?;
+fn save(world: &World, workspace: &Path, name: &str) -> Result {
+	let path = path(workspace, name)?;
 	let bytes = file::encode(&scene::capture(world))?;
 
 	if let Some(directory) = path.parent() {
@@ -193,14 +195,15 @@ fn save(world: &World, name: &str) -> Result {
 ///
 /// @param world - the world to replace
 /// @param simulation - the solver, told to forget what it derived
+/// @param workspace - where the saves are
 /// @param name - the save to read, without an extension
 ///
 /// # Errors
 ///
 /// If the file cannot be read, is not a scene this build reads, or was written
 /// by a build of the game whose state has a different shape.
-fn load(world: &mut World, simulation: &mut Simulation, name: &str) -> Result {
-	let path = path(name)?;
+fn load(world: &mut World, simulation: &mut Simulation, workspace: &Path, name: &str) -> Result {
+	let path = path(workspace, name)?;
 	let read = file::SceneFile::open(&path)?;
 	let put = scene::restore(world, &read.to_scene_data())?;
 
@@ -235,14 +238,15 @@ fn load(world: &mut World, simulation: &mut Simulation, name: &str) -> Result {
 /// repository, which is where the previous one still is.
 ///
 /// @param world - what to write
+/// @param workspace - what the asset tree hangs off
 /// @param name - what to call it, without an extension
 ///
 /// # Errors
 ///
 /// If the name is not a plain file name, if the world holds a number JSON
 /// cannot write, or if the directory or the file cannot be written.
-fn write(world: &World, name: &str) -> Result {
-	let path = source(name)?;
+fn write(world: &World, workspace: &Path, name: &str) -> Result {
+	let path = source(workspace, name)?;
 	let existed = path.exists();
 	let bytes = written(world, &path)?;
 
@@ -268,6 +272,7 @@ fn write(world: &World, name: &str) -> Result {
 /// new writes it.
 ///
 /// @param world - the registry to take the scene from
+/// @param workspace - what the asset tree hangs off
 /// @param name - what it is called, without its prefix or its extension
 ///
 /// # Errors
@@ -275,8 +280,8 @@ fn write(world: &World, name: &str) -> Result {
 /// If the name is not a plain file name, if nothing is registered under it, if
 /// the piece holds a number JSON cannot write, or if the file cannot be
 /// written.
-fn prop(world: &World, name: &str) -> Result {
-	let path = crate::assets::source_root()
+fn prop(world: &World, workspace: &Path, name: &str) -> Result {
+	let path = crate::assets::source_root(workspace)
 		.join(PROPS)
 		.join(plain(name)?)
 		.with_extension(level::EXTENSION);
@@ -346,13 +351,14 @@ fn written(world: &World, path: &Path) -> Result<usize> {
 /// `COLBY_ASSETS` names if it names one - so a source written here is a source
 /// the watcher is watching, on every machine and in every test.
 ///
+/// @param workspace - what the asset tree hangs off
 /// @param name - what a command was given
 ///
 /// # Errors
 ///
 /// As [`path`], and for the same reasons.
-fn source(name: &str) -> Result<PathBuf> {
-	Ok(crate::assets::source_root()
+fn source(workspace: &Path, name: &str) -> Result<PathBuf> {
+	Ok(crate::assets::source_root(workspace)
 		.join(SOURCES)
 		.join(plain(name)?)
 		.with_extension(level::EXTENSION))
@@ -360,13 +366,14 @@ fn source(name: &str) -> Result<PathBuf> {
 
 /// Where a save by that name is.
 ///
+/// @param workspace - where the saves are
 /// @param name - what a command was given
 ///
 /// # Errors
 ///
 /// As [`plain`].
-fn path(name: &str) -> Result<PathBuf> {
-	Ok(crate::workspace()
+fn path(workspace: &Path, name: &str) -> Result<PathBuf> {
+	Ok(workspace
 		.join(DIRECTORY)
 		.join(plain(name)?)
 		.with_extension(file::EXTENSION))
@@ -407,8 +414,8 @@ fn plain(name: &str) -> Result<&str> {
 ///
 /// The tests' way in, and the only thing here that is not the console's.
 #[cfg(test)]
-fn read(name: &str) -> Result<colby_core::abi::SceneData> {
-	let bytes = AlignedBytes::read(&path(name)?)?;
+fn read(workspace: &Path, name: &str) -> Result<colby_core::abi::SceneData> {
+	let bytes = AlignedBytes::read(&path(workspace, name)?)?;
 
 	Ok(file::SceneFile::from_bytes(bytes)?.to_scene_data())
 }
@@ -423,6 +430,15 @@ mod tests {
 	};
 
 	use super::*;
+
+	/// A workspace nothing else is using, so that a test writes nowhere
+	/// near the checkout.
+	fn workspace(name: &str) -> PathBuf {
+		let inside = env::temp_dir().join(format!("colby_test_{name}"));
+		drop(fs::remove_dir_all(&inside));
+
+		inside
+	}
 
 	/// A world with something in it, and a simulation wired to it.
 	fn peopled() -> (Box<World>, Box<Simulation>) {
@@ -442,19 +458,22 @@ mod tests {
 
 	#[test]
 	fn a_name_that_is_not_a_file_name_is_refused() {
+		let root = workspace("names");
+
 		for name in ["", "   ", "..", "../escape", "sub/one", "c:\\here", "version.2"] {
-			assert!(path(name).is_err(), "{name} is not a name a save can have");
-			assert!(source(name).is_err(), "nor one a source can, which is one rule");
+			assert!(path(&root, name).is_err(), "{name} is not a name a save can have");
+			assert!(source(&root, name).is_err(), "nor one a source can, which is one rule");
 		}
 
-		assert!(path("quicksave").is_ok(), "and a plain one is");
-		assert!(path(" quicksave ").is_ok(), "with the spaces around it taken off");
-		assert!(source(" quicksave ").is_ok(), "either side of the same rule");
+		assert!(path(&root, "quicksave").is_ok(), "and a plain one is");
+		assert!(path(&root, " quicksave ").is_ok(), "with the spaces around it taken off");
+		assert!(source(&root, " quicksave ").is_ok(), "either side of the same rule");
 	}
 
 	#[test]
 	fn a_source_lands_where_the_compiler_is_already_looking() {
-		let path = source("edited").expect("a plain name");
+		let root = workspace("looking");
+		let path = source(&root, "edited").expect("a plain name");
 
 		assert_eq!(
 			path.extension().and_then(std::ffi::OsStr::to_str),
@@ -467,7 +486,7 @@ mod tests {
 			"in the directory scenes are compiled from"
 		);
 		assert!(
-			path.starts_with(crate::assets::source_root()),
+			path.starts_with(crate::assets::source_root(&root)),
 			"under the tree the watcher is watching: {}",
 			path.display()
 		);
@@ -530,7 +549,8 @@ mod tests {
 
 	#[test]
 	fn a_name_lands_in_the_saves_directory_with_the_scene_extension() {
-		let path = path("quicksave").expect("a plain name");
+		let root = workspace("landing");
+		let path = path(&root, "quicksave").expect("a plain name");
 
 		assert_eq!(
 			path.extension().and_then(std::ffi::OsStr::to_str),
@@ -542,6 +562,7 @@ mod tests {
 			Some(std::ffi::OsStr::new(DIRECTORY)),
 			"and it is under the saves directory"
 		);
+		assert!(path.starts_with(&root), "of the workspace it was given, not the checkout");
 	}
 
 	/// A world with the four scene commands registered the way the host does.
@@ -615,26 +636,34 @@ mod tests {
 
 			(peopled, simulation)
 		};
+		let root = workspace("left");
 
-		serve(&mut world, &mut simulation);
+		serve(&mut world, &mut simulation, &root);
 
 		assert_eq!(world.asked.len(), 1, "the other subsystem's line is still there");
 		assert_eq!(world.asked[0].name, "net.later");
+		assert!(
+			path(&root, "one")
+				.expect("a plain name")
+				.is_file(),
+			"and the scene's own line was served"
+		);
 
-		drop(fs::remove_file(path("one").expect("a plain name")));
+		drop(fs::remove_dir_all(&root));
 	}
 
 	#[test]
 	fn a_world_written_out_reads_back_as_itself() {
 		let (world, _simulation) = peopled();
-		let name = "colby_test_round_trip";
+		let root = workspace("round_trip");
+		let name = "quicksave";
 
-		save(&world, name).expect("it is written");
-		let read = read(name).expect("and read back");
+		save(&world, &root, name).expect("it is written");
+		let read = read(&root, name).expect("and read back");
 
 		assert_eq!(read, scene::capture(&world), "the file is the world");
 
-		drop(fs::remove_file(path(name).expect("a plain name")));
+		drop(fs::remove_dir_all(&root));
 	}
 
 	#[test]
@@ -642,15 +671,11 @@ mod tests {
 		let (mut world, mut simulation) = peopled();
 		let before = scene::capture(&world);
 
-		let failure = load(&mut world, &mut simulation, "colby_test_no_such_save")
+		let root = workspace("no_such");
+		let failure = load(&mut world, &mut simulation, &root, "nothing_here")
 			.expect_err("there is no such file");
 
-		assert!(
-			failure
-				.to_string()
-				.contains("colby_test_no_such_save"),
-			"the message names it: {failure}"
-		);
+		assert!(failure.to_string().contains("nothing_here"), "the message names it: {failure}");
 		assert_eq!(scene::capture(&world), before, "and the world is untouched");
 	}
 }
