@@ -62,8 +62,8 @@ use colby_asset::{
 use colby_core::{
 	Result,
 	abi::{
-		Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, PeerId, Role, SceneData, Value,
-		World, console, cvar::Owner, net::BACKUP, scene,
+		Bodies, Body, BodyId, BodyKind, Command, Cvars, EntityId, JointId, PeerId, Role,
+		SceneData, Value, World, console, cvar::Owner, net::BACKUP, scene,
 	},
 	debug, err,
 	glam::Vec3,
@@ -71,7 +71,8 @@ use colby_core::{
 };
 use colby_net::{
 	Block, Channel, Conditions, Delivery, Header, Heard, Kind, Link, MAX_DATAGRAM, MAX_MESSAGE,
-	NOTHING, Parcel, Pieces, Reliable, Ring, Slot, Snapshot, Solid, every, parcel,
+	MAX_UNTIED, NOTHING, Parcel, Pieces, Reliable, Ring, Slot, Snapshot, Solid, Untied, every,
+	parcel,
 };
 
 /// A session number no other run of this program will pick.
@@ -741,6 +742,14 @@ struct Peer {
 	channel: Channel,
 	reliable: Reliable,
 
+	/// Which joint slots this peer has been told about, by generation.
+	///
+	/// The joint half of [`described`](Self::described), and it carries a
+	/// second duty: a slot marked here whose occupant is no longer the one
+	/// marked is a joint the far end holds and this end has undone, which is
+	/// the only removal on this wire that a snapshot cannot say.
+	tied: Vec<u32>,
+
 	/// Which body slots this peer has been told the whole of, by generation.
 	///
 	/// Indexed by slot, nil meaning never. A snapshot says where a body *is*
@@ -867,6 +876,7 @@ impl Peer {
 		self.channel.forget();
 		self.reliable.forget();
 		self.described.clear();
+		self.tied.clear();
 		// @note: nothing can observe this one, and it is kept for the reason
 		// the two above it are called at all. The ring writes every item it is
 		// still owed into every message, so a parcel's pieces are always read
@@ -995,6 +1005,13 @@ pub(crate) struct Net {
 	items: Vec<Vec<u8>>,
 	said: Vec<Said>,
 
+	/// The joints that have crossed as gone and not been undone here yet.
+	///
+	/// Beside [`described`](Self::described) and for its reason: a joint that
+	/// has been undone is a change to a world, and a world being edited must
+	/// not have one made to it. Bounded by the same ceiling.
+	untied: Vec<Untied>,
+
 	/// The descriptions that have crossed and not been put into a world yet.
 	///
 	/// A queue rather than a slice cleared on every drain, for the reason
@@ -1006,6 +1023,9 @@ pub(crate) struct Net {
 
 	/// Which bodies are alive, gathered once rather than once per peer.
 	living: Vec<BodyId>,
+
+	/// And which joints, with the bodies they hold.
+	tying: Vec<Tie>,
 
 	/// How many appearances have been described, ever.
 	appearances: u32,
@@ -1112,7 +1132,9 @@ impl Net {
 			items: Vec::new(),
 			said: Vec::new(),
 			described: Vec::new(),
+			untied: Vec::new(),
 			living: Vec::new(),
+			tying: Vec::new(),
 			appearances: 0,
 			crowded_out: 0,
 			asking: Vec::new(),
@@ -1235,6 +1257,9 @@ impl Net {
 
 	/// What crossed on the last [`receive`](Self::receive).
 	pub(crate) fn said(&self) -> &[Said] { &self.said }
+
+	/// Takes the joints that have crossed as gone and not been undone yet.
+	pub(crate) fn parted(&mut self) -> Vec<Untied> { std::mem::take(&mut self.untied) }
 
 	/// Takes the descriptions that have arrived and not been used.
 	///
@@ -1542,12 +1567,22 @@ impl Net {
 		self.living.clear();
 		self.living
 			.extend(world.bodies.iter().map(|(id, _)| id));
+		self.tying.clear();
+		self.tying
+			.extend(world.joints.iter().map(|(id, joint)| Tie {
+				id,
+				first: joint.first,
+				second: joint.second,
+			}));
 
-		if !self
-			.peers
-			.iter()
-			.any(|peer| owed(peer, &self.living).is_some())
-		{
+		let wanting = |peer: &Peer| {
+			owed(peer, &self.living).is_some()
+				|| tying(peer, &self.tying).is_some()
+				|| parted(peer, &self.tying).is_some()
+		};
+		let ties = Ties { living: &self.living, tying: &self.tying };
+
+		if !self.peers.iter().any(wanting) {
 			return;
 		}
 
@@ -1568,46 +1603,18 @@ impl Net {
 		}
 
 		for peer in &mut self.peers {
-			let Some(saying) = owed(peer, &self.living) else {
-				continue;
-			};
-			let cutting: Vec<u32> = saying
-				.iter()
-				.filter_map(|id| index_of.get(id.slot()).copied())
-				.filter(|index| *index != NO_SOLID)
-				.collect();
+			// **at most one parcel a peer a snapshot**, and in this order: a
+			// joint that has gone first because it is the smallest and a stale
+			// one is a thing welded to a player forever; then bodies, because
+			// a joint cannot be tied at the far end until the bodies it holds
+			// are there; then the joints.
+			let said = untie(peer, &self.tying)
+				|| described(peer, &whole, &index_of, &ties)
+				|| tied(peer, &whole, &index_of, &ties);
 
-			if cutting.is_empty() {
-				continue;
+			if said {
+				self.appearances = self.appearances.saturating_add(1);
 			}
-
-			let Ok(bytes) = encode(&whole.piece(&cutting)) else {
-				warn!(address = %peer.address, "a description of what appeared could not be written");
-
-				continue;
-			};
-
-			// **not queued is not said.** A ring with no room for the whole
-			// parcel takes none of it, and the mark below is what would
-			// otherwise say a body had been described when nothing of it went
-			// out. The next snapshot tries the same bodies again.
-			if let Err(error) = parcel::post(&mut peer.reliable, Kind::Scene, &bytes) {
-				debug!(address = %peer.address, %error, "an appearance waits for room in the ring");
-
-				continue;
-			}
-
-			for id in &saying {
-				mark(&mut peer.described, *id);
-			}
-
-			self.appearances = self.appearances.saturating_add(1);
-			debug!(
-				address = %peer.address,
-				bodies = saying.len(),
-				bytes = bytes.len(),
-				"what appeared, described"
-			);
 		}
 	}
 
@@ -1795,6 +1802,15 @@ impl Net {
 		// the ring that carried it has already counted it delivered and
 		// nothing will say it again. So the ceiling is generous and going past
 		// it is said out loud rather than counted quietly.
+		if self.untied.len() > WAITING {
+			let over = self.untied.len() - WAITING;
+
+			self.untied.drain(..over);
+			self.crowded_out = self
+				.crowded_out
+				.saturating_add(u32::try_from(over).unwrap_or(u32::MAX));
+		}
+
 		if self.described.len() > WAITING {
 			let over = self.described.len() - WAITING;
 
@@ -1999,6 +2015,7 @@ impl Net {
 					pieces: &mut peer.pieces,
 					said: &mut self.said,
 					described: &mut self.described,
+					untied: &mut self.untied,
 				};
 
 				if !take(taking) {
@@ -2152,6 +2169,7 @@ impl Net {
 			address,
 			channel: Channel::new(self.session),
 			reliable: Reliable::new(),
+			tied: Vec::new(),
 			described: Vec::new(),
 			pieces: Pieces::new(),
 			link,
@@ -2224,21 +2242,26 @@ pub(crate) fn hear(net: &mut Net, world: &mut World, now: Duration) {
 /// impulse cache all live outside the world and have never seen these bodies
 pub(crate) fn land(net: &mut Net, world: &mut World) -> bool {
 	let arrived = net.appeared();
+	let gone = net.parted();
 
-	if arrived.is_empty() {
+	if arrived.is_empty() && gone.is_empty() {
 		return false;
 	}
 
 	if net.hosting() {
 		warn!(
-			count = arrived.len(),
-			"a peer described part of a world at a host, which decides"
+			descriptions = arrived.len(),
+			joints = gone.len(),
+			"a peer said what a world is at a host, which decides"
 		);
 
 		return false;
 	}
 
-	let mut landed = 0;
+	// **the undoing before the making**, because a slot is reused: a joint
+	// that has gone and one that took its place cross in that order, and
+	// undoing afterwards would take away the one that just landed.
+	let mut landed = untie_here(world, &gone);
 
 	for description in arrived {
 		let piece = match read(&description.bytes) {
@@ -2265,6 +2288,39 @@ pub(crate) fn land(net: &mut Net, world: &mut World) -> bool {
 	}
 
 	landed > 0
+}
+
+/// Takes out the joints a far end says are no longer there.
+///
+/// **Both halves are checked.** A slot is reused, so a parting naming a slot
+/// this end has a *different* joint in is one that crossed while something took
+/// the slot over, and the thing in it now is the one to keep. There is nothing
+/// to do about that but leave it: the far end will have said the newer one is
+/// gone as well when it is.
+///
+/// @param world - the world to undo them in
+/// @param gone - what the far end says has been undone
+/// @return how many went
+fn untie_here(world: &mut World, gone: &[Untied]) -> usize {
+	let mut undone = 0;
+
+	for joint in gone {
+		let here = world.joints.iter().map(|(id, _)| id).find(|id| {
+			id.slot() == usize::from(joint.slot) && id.generation() == joint.generation
+		});
+
+		if let Some(id) = here
+			&& world.joints.despawn(id)
+		{
+			undone += 1;
+		}
+	}
+
+	if undone > 0 {
+		debug!(joints = undone, said = gone.len(), "joints that had gone, undone here");
+	}
+
+	undone
 }
 
 /// Takes out whatever is standing where a *newer* occupant is about to land.
@@ -2806,6 +2862,9 @@ struct Taking<'a> {
 
 	/// Where a description goes.
 	described: &'a mut Vec<Described>,
+
+	/// Where a joint that has gone goes.
+	untied: &'a mut Vec<Untied>,
 }
 
 /// Takes what a block turned into, or says why it was nothing.
@@ -2825,6 +2884,7 @@ fn take(taking: Taking<'_>) -> bool {
 		pieces,
 		said,
 		described,
+		untied,
 	} = taking;
 
 	if let Err(error) = read {
@@ -2856,6 +2916,10 @@ fn take(taking: Taking<'_>) -> bool {
 				debug!(%from, bytes = bytes.len(), "a peer described part of a world");
 				described.push(Described { from, bytes });
 			},
+			| Ok(Some(Parcel::Untied(gone))) => {
+				debug!(%from, joints = gone.len(), "a peer says joints are gone");
+				untied.extend(gone);
+			},
 			| Ok(None) => {},
 			| Err(error) => {
 				debug!(%from, %error, "a peer sent a piece of something that is not a parcel");
@@ -2866,6 +2930,254 @@ fn take(taking: Taking<'_>) -> bool {
 	}
 
 	true
+}
+
+/// One joint of the world, and the two bodies it holds.
+///
+/// Gathered once a pass rather than once a peer, which is what keeps the walk
+/// over the joint table from being nine walks.
+#[derive(Clone, Copy)]
+struct Tie {
+	/// Which joint.
+	id: JointId,
+
+	/// The body at one end.
+	first: BodyId,
+
+	/// The body at the other, or [`BodyId::NONE`] for the world.
+	second: BodyId,
+}
+
+/// What is alive, gathered once a pass rather than once a peer.
+struct Ties<'a> {
+	/// Every body there is, in slot order.
+	living: &'a [BodyId],
+
+	/// Every joint there is, with the bodies it holds.
+	tying: &'a [Tie],
+}
+
+/// Describes the bodies one peer has not been told the whole of, if any.
+///
+/// @return whether anything was queued
+fn described(peer: &mut Peer, whole: &SceneData, index_of: &[u32], ties: &Ties<'_>) -> bool {
+	let living = ties.living;
+	let Some(saying) = owed(peer, living) else {
+		return false;
+	};
+	let cutting: Vec<u32> = saying
+		.iter()
+		.filter_map(|id| index_of.get(id.slot()).copied())
+		.filter(|index| *index != NO_SOLID)
+		.collect();
+
+	if cutting.is_empty() {
+		return false;
+	}
+
+	let Ok(bytes) = encode(&whole.piece(&cutting)) else {
+		warn!(address = %peer.address, "a description of what appeared could not be written");
+
+		return false;
+	};
+
+	// **not queued is not said.** A ring with no room for the whole parcel
+	// takes none of it, and the mark below is what would otherwise say a body
+	// had been described when nothing of it went out. The next snapshot tries
+	// the same bodies again.
+	if let Err(error) = parcel::post(&mut peer.reliable, Kind::Scene, &bytes) {
+		debug!(address = %peer.address, %error, "an appearance waits for room in the ring");
+
+		return false;
+	}
+
+	for id in &saying {
+		note(&mut peer.described, id.slot(), id.generation());
+	}
+
+	// **and every joint the cut carried.** A piece of some bodies holds the
+	// joints between them, so a description of bodies is a description of
+	// those joints as well - and a mark that did not say so would send them
+	// again, one at a time, for nothing.
+	mark_carried(peer, ties.tying, &saying);
+	debug!(
+		address = %peer.address,
+		bodies = saying.len(),
+		joints = carrying(ties.tying, &saying),
+		bytes = bytes.len(),
+		"what appeared, described"
+	);
+	true
+}
+
+/// Describes one joint the peer has not been told about, if there is one.
+///
+/// **A joint is described by describing the bodies it holds**, because that is
+/// the only cut that carries it: `SceneData::piece` keeps a link whose ends are
+/// both in the piece and drops one whose partner is elsewhere. The bodies land
+/// on slots the far end already has and are refused there; the joint is what
+/// is new. @ref `scene::graft`, which is what ties it to the occupants that
+/// were already standing in those slots.
+///
+/// One at a time, because a cut of two bodies is about a kilobyte and a person
+/// welds rather more slowly than twenty times a second.
+///
+/// @return whether anything was queued
+fn tied(peer: &mut Peer, whole: &SceneData, index_of: &[u32], ties: &Ties<'_>) -> bool {
+	let Some(tie) = tying(peer, ties.tying) else {
+		return false;
+	};
+	let holding = [tie.first, tie.second];
+	let cutting: Vec<u32> = holding
+		.iter()
+		.filter(|id| id.is_some())
+		.filter_map(|id| index_of.get(id.slot()).copied())
+		.filter(|index| *index != NO_SOLID)
+		.collect();
+
+	if cutting.is_empty() {
+		return false;
+	}
+
+	let Ok(bytes) = encode(&whole.piece(&cutting)) else {
+		warn!(address = %peer.address, "a description of a joint could not be written");
+
+		return false;
+	};
+
+	if let Err(error) = parcel::post(&mut peer.reliable, Kind::Scene, &bytes) {
+		debug!(address = %peer.address, %error, "a joint waits for room in the ring");
+
+		return false;
+	}
+
+	mark_carried(peer, ties.tying, &holding);
+	debug!(address = %peer.address, joint = tie.id.slot(), bytes = bytes.len(), "a joint, described");
+	true
+}
+
+/// Tells one peer about the joints it was told of that are no longer there.
+///
+/// **The one removal this wire has to carry.** A body that has gone is said by
+/// the snapshot - a slot that emptied is written as such - and a joint is in no
+/// snapshot at all. A physgun makes and unmakes one every time somebody picks
+/// a prop up, so a wire that carried the making and not the unmaking would weld
+/// a player to everything it ever touched.
+///
+/// @return whether anything was queued
+fn untie(peer: &mut Peer, ties: &[Tie]) -> bool {
+	let Some(gone) = parted(peer, ties) else {
+		return false;
+	};
+	let mut bytes = Vec::new();
+
+	if let Err(error) = parcel::parting(&gone, &mut bytes) {
+		warn!(address = %peer.address, %error, "a parting could not be written");
+
+		return false;
+	}
+
+	if let Err(error) = parcel::post(&mut peer.reliable, Kind::Untied, &bytes) {
+		debug!(address = %peer.address, %error, "a parting waits for room in the ring");
+
+		return false;
+	}
+
+	for joint in &gone {
+		if let Some(entry) = peer.tied.get_mut(usize::from(joint.slot)) {
+			*entry = 0;
+		}
+	}
+
+	debug!(address = %peer.address, joints = gone.len(), "joints that are gone, said");
+	true
+}
+
+/// Whether a cut of these bodies carries this joint.
+///
+/// **The cut's own rule, read from here.** `SceneData::piece` keeps a link
+/// whose first end is in the piece and whose second is in it or is the world,
+/// and drops one whose partner is somewhere else. So what a description of
+/// some bodies says about joints is exactly this, and a mark that said
+/// anything else would send a joint again for nothing or never send it at all.
+fn carried(tie: &Tie, cut: &[BodyId]) -> bool {
+	cut.contains(&tie.first) && (!tie.second.is_some() || cut.contains(&tie.second))
+}
+
+/// How many joints a cut of these bodies carries.
+fn carrying(ties: &[Tie], cut: &[BodyId]) -> usize {
+	ties.iter()
+		.filter(|tie| carried(tie, cut))
+		.count()
+}
+
+/// Writes down every joint a cut of these bodies has just described.
+fn mark_carried(peer: &mut Peer, ties: &[Tie], cut: &[BodyId]) {
+	for tie in ties {
+		if carried(tie, cut) {
+			note(&mut peer.tied, tie.id.slot(), tie.id.generation());
+		}
+	}
+}
+
+/// Which joint one peer has not been told about, if any.
+///
+/// **Only once both the bodies it holds have been described.** A joint arriving
+/// at an end that has neither body would carry them along and land, which is
+/// right; the reason to wait is that the bodies are described four at a time
+/// and a joint one at a time, so sending the joint first would send its bodies
+/// twice.
+///
+/// @param peer - whose conversation
+/// @param ties - every joint there is
+fn tying(peer: &Peer, ties: &[Tie]) -> Option<Tie> {
+	ties.iter()
+		.find(|tie| {
+			// @note: nothing can observe the two calls below, because the pass
+			// that asks this only reaches a joint once nothing else is owed -
+			// a peer with a body still to hear about is told that instead. It
+			// is kept because it is the line that says what the order is for,
+			// and the day the order changes is the day it starts to matter.
+			let told = |id: BodyId| {
+				!id.is_some() || peer.described.get(id.slot()).copied() == Some(id.generation())
+			};
+
+			peer.tied.get(tie.id.slot()).copied() != Some(tie.id.generation())
+				&& told(tie.first)
+				&& told(tie.second)
+		})
+		.copied()
+}
+
+/// Which joints a peer was told about that are no longer there.
+///
+/// A slot this end marked and whose occupant is not the one that was marked:
+/// either it is empty now or somebody else is in it, and both mean the joint
+/// the far end holds is one to take away.
+///
+/// @param peer - whose conversation
+/// @param ties - every joint there is
+fn parted(peer: &Peer, ties: &[Tie]) -> Option<Vec<Untied>> {
+	let gone: Vec<Untied> = peer
+		.tied
+		.iter()
+		.enumerate()
+		.filter(|(_, generation)| **generation != 0)
+		.filter(|(slot, generation)| {
+			!ties
+				.iter()
+				.any(|tie| tie.id.slot() == *slot && tie.id.generation() == **generation)
+		})
+		.filter_map(|(slot, generation)| {
+			Some(Untied {
+				slot: u16::try_from(slot).ok()?,
+				generation: *generation,
+			})
+		})
+		.take(MAX_UNTIED)
+		.collect();
+
+	(!gone.is_empty()).then_some(gone)
 }
 
 /// Which bodies one peer has not been told the whole of.
@@ -2895,14 +3207,15 @@ fn owed(peer: &Peer, living: &[BodyId]) -> Option<Vec<BodyId>> {
 /// growth inside a loop inside a loop is one level deeper than the house rules
 /// allow.
 ///
-/// @param described - that peer's marks, by slot
-/// @param id - the body that has now been described
-fn mark(described: &mut Vec<u32>, id: BodyId) {
-	if described.len() <= id.slot() {
-		described.resize(id.slot() + 1, 0);
+/// @param marks - that peer's marks, by slot
+/// @param slot - which slot
+/// @param generation - which occupant of it has now been described
+fn note(marks: &mut Vec<u32>, slot: usize, generation: u32) {
+	if marks.len() <= slot {
+		marks.resize(slot + 1, 0);
 	}
 
-	described[id.slot()] = id.generation();
+	marks[slot] = generation;
 }
 
 /// How bad the wire is, as the console table has it.
@@ -3018,7 +3331,7 @@ pub(crate) fn install(cvars: &mut Cvars) {
 mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
-	use colby_core::abi::{Shape, ShapeKind, Transform, net::MAX_PEERS as PLAYERS};
+	use colby_core::abi::{Joint, Shape, ShapeKind, Transform, net::MAX_PEERS as PLAYERS};
 	use colby_net::{MAX_ASKED, MAX_BASELINE, MAX_PARCEL, MAX_SNAPSHOT};
 
 	use super::*;
@@ -3057,6 +3370,7 @@ mod tests {
 			address: somewhere(7),
 			channel: Channel::new(OURS),
 			reliable: Reliable::new(),
+			tied: Vec::new(),
 			described: Vec::new(),
 			pieces: Pieces::new(),
 			link: Link::new(1),
@@ -4853,6 +5167,428 @@ mod tests {
 			Some(BodyKind::Kinematic),
 			"and it is the wire holding the pen, not the solver"
 		);
+	}
+
+	#[test]
+	fn a_joint_between_two_bodies_that_are_already_there_crosses() {
+		// what the toolgun does: two props that both machines already have,
+		// welded together during play. Neither body is news, so the only thing
+		// that has to cross is the joint - and a description of a joint is a
+		// description of the two bodies it holds, which the far end refuses
+		// for being already there.
+		let (mut host, mut client, _wire) = two();
+		let (mut theirs, mut ours) = (built(), built());
+
+		ours.peer = PeerId::NONE;
+		round(&mut host, &mut client, 1);
+
+		for step in 2..6 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(shape_of(&ours), shape_of(&theirs), "the two worlds start alike");
+
+		let pair: Vec<BodyId> = theirs
+			.bodies
+			.iter()
+			.map(|(id, _)| id)
+			.take(2)
+			.collect();
+		let weld = theirs.join(Joint::weld(pair[0], pair[1], (Vec3::ZERO, Vec3::X)));
+
+		theirs.joints.set_name(weld, "welded");
+		assert_eq!(theirs.joints.len(), 1);
+
+		for step in 6..14 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(ours.joints.len(), 1, "and the weld is at the far end too");
+
+		let there = ours
+			.joints
+			.get(weld)
+			.expect("the same handle, on the other machine");
+
+		assert_eq!(there.first, pair[0], "holding the same two bodies");
+		assert_eq!(there.second, pair[1]);
+		assert_eq!(ours.joints.name(weld), "welded");
+	}
+
+	/// Two endpoints, two worlds alike, and a wire that has to be kept alive.
+	struct Pair {
+		host: Net,
+		client: Net,
+		theirs: Box<World>,
+		ours: Box<World>,
+		_wire: Rc<RefCell<Wire>>,
+	}
+
+	/// Two worlds alike, a wire between them, and everything already told.
+	fn welded() -> Pair {
+		let (mut host, mut client, wire) = two();
+		let (theirs, mut ours) = (built(), built());
+
+		ours.peer = PeerId::NONE;
+		round(&mut host, &mut client, 1);
+
+		for step in 2..6 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		Pair { host, client, theirs, ours, _wire: wire }
+	}
+
+	/// The two bodies a weld in these fixtures is made between.
+	fn pair(world: &World) -> (BodyId, BodyId) {
+		let found: Vec<BodyId> = world
+			.bodies
+			.iter()
+			.map(|(id, _)| id)
+			.take(2)
+			.collect();
+
+		(found[0], found[1])
+	}
+
+	#[test]
+	fn a_joint_that_was_undone_is_undone_at_the_far_end() {
+		// **the half that matters more than the making.** A physgun makes and
+		// unmakes a joint every time somebody picks a prop up, so a wire
+		// carrying the one and not the other would weld a player to everything
+		// it ever touched - and a snapshot cannot say it, because a joint is
+		// in no snapshot at all.
+		let Pair {
+			mut host,
+			mut client,
+			mut theirs,
+			mut ours,
+			..
+		} = welded();
+		let (one, two) = pair(&theirs);
+		let weld = theirs.join(Joint::weld(one, two, (Vec3::ZERO, Vec3::X)));
+		let mut put = false;
+
+		for step in 6..14 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(ours.joints.len(), 1, "it crossed");
+
+		// **undone and remade in one breath**, which is the case a slot number
+		// alone cannot tell apart and the case the order of the saying is
+		// about. The far end holds the first one; the second is in its slot.
+		theirs.joints.despawn(weld);
+
+		let again = theirs.join(Joint::weld(two, one, (Vec3::Y, Vec3::ZERO)));
+
+		assert_eq!(again.slot(), weld.slot(), "the slot really is reused");
+		assert_eq!(again.generation(), 2);
+
+		for step in 14..26 {
+			put |= exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert!(put, "the step it went on is one the solver is told about");
+		assert_eq!(ours.joints.len(), 1, "one joint, not two and not none");
+		assert!(ours.joints.get(again).is_some(), "at the slot and generation the host has it");
+		assert!(ours.joints.get(weld).is_none(), "and the old handle resolves to nothing");
+
+		// and nothing is said about it ever again. A mark put down when a
+		// joint went would otherwise be a slot reported gone forever.
+		let said = host.appearances();
+
+		for step in 26..40 {
+			host.appear(&theirs);
+			host.send(colby_core::time::STEP * step, None);
+			client.receive(colby_core::time::STEP * step);
+			assert!(client.parted().is_empty(), "nothing more has gone at step {step}");
+			assert!(client.appeared().is_empty());
+			host.receive(colby_core::time::STEP * step);
+			client.send(colby_core::time::STEP * step, None);
+		}
+
+		assert_eq!(host.appearances(), said, "and the count stands still");
+	}
+
+	#[test]
+	fn a_joint_this_end_has_a_later_one_of_is_left_alone() {
+		// a parting names both halves, so one that crossed while something
+		// took the slot over takes nothing away. Nothing on the wire can
+		// produce that - the ring is in order - which is why it is asked here
+		// rather than through two endpoints.
+		let mut world = built();
+		let (one, two) = pair(&world);
+		let first = world.join(Joint::weld(one, two, (Vec3::ZERO, Vec3::X)));
+
+		world.joints.despawn(first);
+
+		let second = world.join(Joint::weld(one, two, (Vec3::Y, Vec3::ZERO)));
+
+		assert_eq!(second.generation(), 2, "the second occupant of that slot");
+
+		let slot = u16::try_from(second.slot()).expect("a small slot");
+
+		assert_eq!(
+			untie_here(&mut world, &[Untied { slot, generation: 1 }]),
+			0,
+			"a parting for the one that was there takes nothing"
+		);
+		assert!(world.joints.get(second).is_some(), "and the one there now is still there");
+		assert_eq!(
+			untie_here(&mut world, &[Untied { slot, generation: 2 }]),
+			1,
+			"and a parting for the one that is takes it"
+		);
+		assert_eq!(world.joints.len(), 0);
+	}
+
+	#[test]
+	fn every_joint_a_cut_carries_is_marked_as_said() {
+		// a piece of two bodies holds *every* joint between them, so a second
+		// weld on the same pair crosses with the first - and saying otherwise
+		// would send the same bytes again for as long as both stood.
+		let Pair {
+			mut host,
+			mut client,
+			mut theirs,
+			mut ours,
+			..
+		} = welded();
+		let (one, two) = pair(&theirs);
+
+		theirs.join(Joint::weld(one, two, (Vec3::ZERO, Vec3::X)));
+		theirs.join(Joint::weld(one, two, (Vec3::Y, Vec3::Z)));
+		assert_eq!(theirs.joints.len(), 2, "two of them, on the one pair");
+
+		let said = host.appearances();
+
+		for step in 6..16 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(ours.joints.len(), 2, "both crossed");
+		assert_eq!(host.appearances(), said + 1, "and one telling was enough for the pair");
+	}
+
+	#[test]
+	fn a_joint_held_by_the_world_at_one_end_crosses() {
+		// a second end of nothing is legal and means the world, which is what
+		// a door hinged on a wall is. A rule that waited for both bodies to
+		// have been described would wait for that one forever.
+		let Pair {
+			mut host,
+			mut client,
+			mut theirs,
+			mut ours,
+			..
+		} = welded();
+		let (one, _) = pair(&theirs);
+		let hinge = theirs.join(Joint::weld(one, BodyId::NONE, (Vec3::ZERO, Vec3::Y)));
+
+		for step in 6..16 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(
+			ours.joints
+				.get(hinge)
+				.map(|joint| (joint.first, joint.second)),
+			Some((one, BodyId::NONE)),
+			"held by the body at one end and by the world at the other"
+		);
+	}
+
+	#[test]
+	fn a_joint_is_said_once_however_the_cut_carries_it() {
+		// two joints a body cut cannot treat alike: one across the whole table,
+		// whose ends land in different cuts and which therefore has to be told
+		// on its own; and one held by the world at its far end, which any cut
+		// holding its body carries. A mark that got either wrong would send it
+		// again forever or never send it at all.
+		let (mut host, mut client, _wire) = two();
+		let (mut theirs, mut ours) = (built(), built());
+
+		ours.peer = PeerId::NONE;
+		round(&mut host, &mut client, 1);
+
+		for index in 0..APPEARING * 2 {
+			prop(&mut theirs, &format!("prop {index}"), 1.0);
+		}
+
+		let ends: Vec<BodyId> = theirs.bodies.iter().map(|(id, _)| id).collect();
+		let across = theirs.join(Joint::weld(
+			ends[0],
+			*ends.last().expect("eleven of them"),
+			(Vec3::ZERO, Vec3::X),
+		));
+		let hung = theirs.join(Joint::weld(ends[1], BodyId::NONE, (Vec3::ZERO, Vec3::Y)));
+
+		for step in 2..24 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(shape_of(&ours), shape_of(&theirs), "every body arrived");
+		assert!(ours.joints.get(across).is_some(), "the one across the table did");
+		assert!(ours.joints.get(hung).is_some(), "and the one held by the world");
+		assert_eq!(ours.joints.len(), 2);
+
+		// **and what it cost, exactly.** Eleven bodies is three tellings of
+		// four, and the joint across the table is a fourth; the one held by
+		// the world rode along in the cut its body was in. A count that came
+		// out higher is a joint being described twice.
+		let said = host.appearances();
+
+		assert_eq!(said, 4, "three cuts of bodies and one joint on its own");
+
+		for step in 24..40 {
+			host.appear(&theirs);
+			host.send(colby_core::time::STEP * step, None);
+			client.receive(colby_core::time::STEP * step);
+			assert!(client.appeared().is_empty(), "and nothing more at step {step}");
+			host.receive(colby_core::time::STEP * step);
+			client.send(colby_core::time::STEP * step, None);
+		}
+
+		assert_eq!(host.appearances(), said, "with the count standing still");
+	}
+
+	#[test]
+	fn a_slot_that_was_never_marked_is_not_reported_gone() {
+		// a mark table is as long as the highest slot ever written down, so
+		// every slot below one is a nil - and a nil is "never told about"
+		// rather than "gone". Reading it the other way would report a parting
+		// for a joint that never crossed, every snapshot, forever.
+		let mut peer = fresh_peer();
+		let world = built();
+		let (one, two) = pair(&world);
+		let mut world = world;
+		let held = world.join(Joint::weld(one, two, (Vec3::ZERO, Vec3::X)));
+		let ties: Vec<Tie> = world
+			.joints
+			.iter()
+			.map(|(id, joint)| Tie {
+				id,
+				first: joint.first,
+				second: joint.second,
+			})
+			.collect();
+
+		note(&mut peer.tied, held.slot() + 2, 1);
+		peer.tied[held.slot() + 2] = 0;
+		note(&mut peer.tied, held.slot(), held.generation());
+		assert!(peer.tied.len() > held.slot() + 1, "with a nil above and below it");
+		assert_eq!(parted(&peer, &ties), None, "nothing has gone");
+
+		world.joints.despawn(held);
+
+		assert_eq!(
+			parted(&peer, &[]),
+			Some(vec![Untied {
+				slot: u16::try_from(held.slot()).expect("small"),
+				generation: held.generation(),
+			}]),
+			"and when it does, it is the one that was marked and no other"
+		);
+	}
+
+	#[test]
+	fn a_joint_the_ring_had_no_room_for_is_said_again() {
+		let Pair {
+			mut host,
+			mut client,
+			mut theirs,
+			mut ours,
+			..
+		} = welded();
+		let (one, two) = pair(&theirs);
+
+		theirs.join(Joint::weld(one, two, (Vec3::ZERO, Vec3::X)));
+		host.post(Kind::Scene, &vec![0xD1; MAX_PARCEL])
+			.expect("a ringful, and now there is no room");
+
+		let said = host.appearances();
+
+		host.appear(&theirs);
+		assert_eq!(host.appearances(), said, "there was nowhere to put it");
+
+		for step in 6..20 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		assert_eq!(ours.joints.len(), 1, "and once the ring drained it went");
+	}
+
+	#[test]
+	fn a_joint_is_described_once_and_not_again() {
+		let Pair {
+			mut host,
+			mut client,
+			mut theirs,
+			mut ours,
+			..
+		} = welded();
+		let (one, two) = pair(&theirs);
+
+		theirs.join(Joint::weld(one, two, (Vec3::ZERO, Vec3::X)));
+
+		for step in 6..14 {
+			exchange(&mut host, &mut client, &theirs, &mut ours, step);
+		}
+
+		let said = host.appearances();
+
+		assert_eq!(ours.joints.len(), 1);
+
+		for step in 14..30 {
+			host.appear(&theirs);
+			host.send(colby_core::time::STEP * step, None);
+			client.receive(colby_core::time::STEP * step);
+			assert!(client.appeared().is_empty(), "nothing more to say at step {step}");
+			assert!(client.parted().is_empty());
+			host.receive(colby_core::time::STEP * step);
+			client.send(colby_core::time::STEP * step, None);
+		}
+
+		assert_eq!(host.appearances(), said, "and the count stands still");
+	}
+
+	#[test]
+	fn a_joint_waits_for_the_bodies_it_holds() {
+		// a joint is one parcel and bodies are four, so describing the joint
+		// first would send its bodies over again in the cut that carries it.
+		let (mut host, mut client, _wire) = two();
+		let (mut theirs, mut ours) = (built(), empty_world());
+
+		ours.peer = PeerId::NONE;
+		round(&mut host, &mut client, 1);
+
+		let (one, two) = pair(&theirs);
+
+		theirs.join(Joint::weld(one, two, (Vec3::ZERO, Vec3::X)));
+
+		// **one telling, and it carries both.** A piece of some bodies holds
+		// the joints between them, so the joint crosses with them rather than
+		// after them - and what waiting buys is that it is never described a
+		// second time on its own.
+		exchange(&mut host, &mut client, &theirs, &mut ours, 2);
+		assert_eq!(host.appearances(), 1, "one telling");
+		assert_eq!(ours.bodies.iter().count(), 3, "the bodies");
+		assert_eq!(ours.joints.len(), 1, "and the joint between them, in the same cut");
+
+		for step in 3..16 {
+			host.appear(&theirs);
+			host.send(colby_core::time::STEP * step, None);
+			client.receive(colby_core::time::STEP * step);
+			assert!(client.appeared().is_empty(), "and nothing more at step {step}");
+			host.receive(colby_core::time::STEP * step);
+			client.send(colby_core::time::STEP * step, None);
+		}
+
+		assert_eq!(host.appearances(), 1, "one telling was the whole of it");
+
+		assert_eq!(shape_of(&ours), shape_of(&theirs), "and everything arrives in the end");
+		assert_eq!(ours.joints.len(), 1);
 	}
 
 	#[test]

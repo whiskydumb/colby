@@ -76,7 +76,7 @@ pub use self::{
 		ACK_BITS, HEADER_BYTES, Header, MAGIC, MAX_DATAGRAM, MAX_FRAGMENTS, MAX_MESSAGE,
 		MAX_PAYLOAD, PROTOCOL_VERSION, Reason, after, distance,
 	},
-	parcel::{Kind, MAX_PARCEL, MAX_PIECE, MAX_PIECES, Parcel, Pieces},
+	parcel::{Kind, MAX_PARCEL, MAX_PIECE, MAX_PIECES, MAX_UNTIED, Parcel, Pieces, Untied},
 	random::Random,
 	reliable::{MAX_ITEM, MAX_ITEMS, Reliable},
 	ring::{DEPTH, Ring},

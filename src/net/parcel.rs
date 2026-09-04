@@ -2,7 +2,7 @@
 //! one item gets across anyway.
 //!
 //! ```text
-//!    0  kind    u8    what the whole parcel is: a console line, or a world
+//!    0  kind    u8    a console line, part of a world, or joints that are gone
 //!    1  index   u16   which piece of it this is, counting from nil
 //!    3  pieces  u16   how many pieces it was cut into, one meaning whole
 //!    5  the piece, up to [`MAX_PIECE`] bytes of it
@@ -42,7 +42,7 @@
 use colby_core::{Result, err};
 
 use crate::{
-	packet::u16_at,
+	packet::{u16_at, u32_at},
 	reliable::{MAX_ITEM, MAX_ITEMS, Reliable},
 };
 
@@ -97,6 +97,31 @@ pub enum Kind {
 	/// in, and the only thing that can say what a body *is* is the whole
 	/// description of it.
 	Scene,
+
+	/// Joints that are no longer there.
+	///
+	/// **The one removal this wire has to carry.** A body that has gone is
+	/// already said by a snapshot - a slot that emptied is written as such -
+	/// and a joint is in no snapshot at all, so nothing else could ever say
+	/// one has been undone. A physgun makes and unmakes a joint every time
+	/// somebody picks a prop up, so a wire that carried the making and not the
+	/// unmaking would weld a player to everything it ever touched.
+	Untied,
+}
+
+/// One joint that is no longer there.
+///
+/// **Both halves, and not the slot alone.** A slot is reused, and a removal
+/// that named only the slot would take away whatever is in it now if the two
+/// ends were even a moment out of step.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Untied {
+	/// Which slot it was in.
+	pub slot: u16,
+
+	/// Which occupant of that slot it was.
+	pub generation: u32,
 }
 
 impl Kind {
@@ -106,6 +131,7 @@ impl Kind {
 		match self {
 			| Self::Line => 1,
 			| Self::Scene => 2,
+			| Self::Untied => 3,
 		}
 	}
 
@@ -117,6 +143,7 @@ impl Kind {
 		match byte {
 			| 1 => Some(Self::Line),
 			| 2 => Some(Self::Scene),
+			| 3 => Some(Self::Untied),
 			| _ => None,
 		}
 	}
@@ -135,6 +162,9 @@ pub enum Parcel {
 	/// A description of some part of a world, for whoever knows how to read
 	/// one.
 	Scene(Vec<u8>),
+
+	/// The joints that have gone, checked to be a list of them.
+	Untied(Vec<Untied>),
 }
 
 impl Parcel {
@@ -144,6 +174,7 @@ impl Parcel {
 		match *self {
 			| Self::Line(_) => Kind::Line,
 			| Self::Scene(_) => Kind::Scene,
+			| Self::Untied(_) => Kind::Untied,
 		}
 	}
 }
@@ -184,11 +215,17 @@ pub fn pieces(length: usize) -> Result<u16> {
 pub fn post(ring: &mut Reliable, kind: Kind, bytes: &[u8]) -> Result {
 	let count = pieces(bytes.len())?;
 
-	// the rule about what a line is, checked before anything is queued rather
-	// than after half of it has been. @ref `text`, which is the same rule read
-	// from the wire.
-	if kind == Kind::Line {
-		text(bytes)?;
+	// the rule about what a kind's bytes are, checked before anything is
+	// queued rather than after half of it has been. @ref `text` and `untied`,
+	// which are the same rules read from the wire.
+	match kind {
+		| Kind::Line => {
+			text(bytes)?;
+		},
+		| Kind::Untied => {
+			untied(bytes)?;
+		},
+		| Kind::Scene => {},
 	}
 
 	let room = ring.room();
@@ -355,8 +392,103 @@ fn whole(kind: u8, bytes: &[u8]) -> Result<Parcel> {
 	match Kind::of(kind) {
 		| Some(Kind::Line) => Ok(Parcel::Line(text(bytes)?.to_owned())),
 		| Some(Kind::Scene) => Ok(Parcel::Scene(bytes.to_vec())),
+		| Some(Kind::Untied) => Ok(Parcel::Untied(untied(bytes)?)),
 		| None => Err(err!(Network("a parcel of a kind number {kind} that means nothing"))),
 	}
+}
+
+/// How many joints one parcel may say have gone.
+///
+/// A hundred and ninety-four bytes at that count, which is one item, and more
+/// joints than anything has ever undone in a twentieth of a second. What is
+/// past it waits for the next one.
+pub const MAX_UNTIED: usize = 32;
+
+/// Bytes before the first joint in a parcel of them.
+const UNTIED_HEAD: usize = 2;
+
+/// Bytes per joint.
+const UNTIED_RECORD: usize = 6;
+
+/// Writes the joints that have gone as the bytes of a parcel.
+///
+/// ```text
+///    0  count  u16   how many follow
+///    2  per joint: u16 slot, u32 generation
+/// ```
+///
+/// @param gone - at most [`MAX_UNTIED`] of them
+/// @param out - where the bytes go, appended
+/// @return an error when there are none or far too many, because a parcel of
+/// nothing is not one and a count nobody could have meant is a mistake worth
+/// hearing about at the end that made it
+pub fn parting(gone: &[Untied], out: &mut Vec<u8>) -> Result {
+	let count = gone.len();
+
+	if count == 0 || count > MAX_UNTIED {
+		return Err(err!(Network(
+			"a parting of {count} joints, where one to {MAX_UNTIED} is what there may be"
+		)));
+	}
+
+	out.extend_from_slice(&u16::try_from(count).unwrap_or(0).to_le_bytes());
+
+	for joint in gone {
+		out.extend_from_slice(&joint.slot.to_le_bytes());
+		out.extend_from_slice(&joint.generation.to_le_bytes());
+	}
+
+	Ok(())
+}
+
+/// The joints a parcel says have gone.
+///
+/// The same rule [`parting`] writes, read from the wire, where the bytes were
+/// chosen by somebody else.
+///
+/// @param bytes - the whole parcel
+fn untied(bytes: &[u8]) -> Result<Vec<Untied>> {
+	let length = bytes.len();
+
+	if length < UNTIED_HEAD {
+		return Err(err!(Network("a parting of {length} bytes has no head in it")));
+	}
+
+	let count = usize::from(u16_at(bytes, 0));
+
+	if count == 0 || count > MAX_UNTIED {
+		return Err(err!(Network(
+			"a parting of {count} joints, where one to {MAX_UNTIED} is what there may be"
+		)));
+	}
+
+	// **exactly**, rather than at least: a parting with something after it is a
+	// parcel this end does not understand, and reading the front of one is
+	// worse than refusing the whole.
+	if length != UNTIED_HEAD + count * UNTIED_RECORD {
+		return Err(err!(Network(
+			"a parting of {count} joints is {length} bytes, which is not what that many are"
+		)));
+	}
+
+	(0..count)
+		.map(|index| {
+			let at = UNTIED_HEAD + index * UNTIED_RECORD;
+			let joint = Untied {
+				slot: u16_at(bytes, at),
+				generation: u32_at(bytes, at + 2),
+			};
+
+			// a slot nobody has ever been in. Nothing this end holds could
+			// match it, so a record saying so is a peer that is confused about
+			// its own table rather than one telling this end anything.
+			if joint.generation == 0 {
+				return Err(err!(Network("a joint said to be gone that was never in a slot")));
+			}
+
+			Ok(joint)
+		})
+		.collect()
 }
 
 /// The one rule a console line has, read in both directions.
@@ -798,6 +930,117 @@ mod tests {
 		assert_eq!(HEAD, 5, "a byte and two shorts");
 		assert_eq!(MAX_PIECE, 1019, "which is what a piece is short of an item by");
 		assert_eq!(MAX_PARCEL, 65_216, "and a ringful of those is the longest parcel");
+	}
+
+	/// A handful of joints that have gone, with two different generations in
+	/// them so a fixture of first occupants cannot answer for both fields.
+	fn parted() -> Vec<Untied> {
+		vec![Untied { slot: 0, generation: 1 }, Untied { slot: 7, generation: 4 }, Untied {
+			slot: 300,
+			generation: 2,
+		}]
+	}
+
+	#[test]
+	fn joints_that_have_gone_cross_and_come_back_as_they_went() {
+		let mut ring = Reliable::new();
+		let gone = parted();
+		let mut bytes = Vec::new();
+
+		parting(&gone, &mut bytes).expect("a parting");
+		post(&mut ring, Kind::Untied, &bytes).expect("and it goes in the ring");
+		assert_eq!(ring.pending(), 1, "which is one item");
+		assert_eq!(across(Kind::Untied, &bytes).expect("it crosses"), Some(Parcel::Untied(gone)));
+	}
+
+	#[test]
+	fn a_parting_is_laid_down_at_the_offsets_the_module_publishes() {
+		// the offsets are the contract, because the end that reads them may
+		// not have been built here. Every other test writes and reads through
+		// the same two functions and would not notice the two fields swapping.
+		let mut bytes = Vec::new();
+
+		parting(&[Untied { slot: 0x0201, generation: 0x0605_0403 }], &mut bytes)
+			.expect("one joint");
+		assert_eq!(bytes, [1, 0, 1, 2, 3, 4, 5, 6], "a count, then a slot and a generation");
+		assert_eq!(UNTIED_HEAD, 2);
+		assert_eq!(UNTIED_RECORD, 6);
+		assert_eq!(MAX_UNTIED, 32, "and a full parting is one hundred and ninety-four bytes");
+	}
+
+	#[test]
+	fn a_parting_of_nothing_or_of_far_too_many_is_refused_both_ways() {
+		let mut ring = Reliable::new();
+		let mut bytes = Vec::new();
+
+		parting(&[], &mut bytes).expect_err("a parting that says nothing is not one");
+		assert!(bytes.is_empty(), "and it wrote nothing before saying so");
+
+		let many = vec![Untied { slot: 1, generation: 1 }; MAX_UNTIED + 1];
+
+		parting(&many, &mut bytes).expect_err("one past the ceiling");
+		post(&mut ring, Kind::Untied, &[0, 0]).expect_err("nor is a count of nil sent");
+
+		let mut full = Vec::new();
+
+		parting(&many[..MAX_UNTIED], &mut full).expect("exactly the ceiling is fine");
+		post(&mut ring, Kind::Untied, &full).expect("and it goes");
+
+		let mut over = full.clone();
+
+		over[..2].copy_from_slice(
+			&u16::try_from(MAX_UNTIED + 1)
+				.expect("small")
+				.to_le_bytes(),
+		);
+		Pieces::new()
+			.take(&piece(Kind::Untied.byte(), 0, 1, &over))
+			.expect_err("a count past the ceiling on the way in as well");
+	}
+
+	#[test]
+	fn a_parting_that_is_not_the_length_it_says_is_refused() {
+		let mut pieces = Pieces::new();
+		let untied = Kind::Untied.byte();
+		let mut bytes = Vec::new();
+
+		parting(&parted(), &mut bytes).expect("three of them");
+
+		for length in 0..bytes.len() {
+			assert!(
+				pieces
+					.take(&piece(untied, 0, 1, &bytes[..length]))
+					.is_err(),
+				"a parting cut to {length} bytes was read anyway"
+			);
+		}
+
+		let mut longer = bytes.clone();
+
+		longer.push(0);
+		pieces
+			.take(&piece(untied, 0, 1, &longer))
+			.expect_err("and one with something after it, which this end cannot read");
+		assert!(
+			pieces
+				.take(&piece(untied, 0, 1, &bytes))
+				.expect("the whole of it")
+				.is_some()
+		);
+	}
+
+	#[test]
+	fn a_joint_that_was_never_in_a_slot_is_refused() {
+		// nothing this end holds could match a generation of nil, so a record
+		// saying so is a peer confused about its own table.
+		let mut ring = Reliable::new();
+		let mut bytes = Vec::new();
+
+		parting(&[Untied { slot: 4, generation: 0 }], &mut bytes).expect("it writes");
+		post(&mut ring, Kind::Untied, &bytes).expect_err("and is refused on the way out");
+		Pieces::new()
+			.take(&piece(Kind::Untied.byte(), 0, 1, &bytes))
+			.expect_err("and on the way in");
 	}
 
 	#[test]
