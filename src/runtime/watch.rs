@@ -20,7 +20,7 @@ use std::{
 	time::{Duration, Instant, SystemTime},
 };
 
-use colby_core::{Result, debug, error, info, mods::path, warn};
+use colby_core::{Result, debug, err, error, info, mods::path, warn};
 
 use crate::Build;
 
@@ -228,18 +228,54 @@ impl Watch {
 		// colby_core and quietly break every property the host relies on. It
 		// inherits stdio too: a compile error belongs in front of whoever just
 		// saved the file.
-		let spawned = Command::new(&self.facts.cargo)
-			.args(["build", "--workspace", "--exclude", self.facts.package.as_str()])
-			.args(["--profile", self.facts.profile.as_str()])
-			.current_dir(&self.facts.engine)
-			.env("CARGO_ENCODED_RUSTFLAGS", &self.facts.rustflags)
-			.spawn();
+		let spawned = cargo(&self.facts).spawn();
 
 		match spawned {
 			| Ok(child) => self.build = Some(child),
 			| Err(error) => error!(%error, "could not start cargo"),
 		}
 	}
+}
+
+/// The build every module comes from: the whole workspace, less the runner, in
+/// the profile and with the flags the running executable was built with.
+///
+/// @ref [`Watch::start_build`] for why it is the whole workspace and why the
+/// flags have to match.
+///
+/// @param facts - what the build script knew
+fn cargo(facts: &Build) -> Command {
+	let mut command = Command::new(&facts.cargo);
+
+	command
+		.args(["build", "--workspace", "--exclude", facts.package.as_str()])
+		.args(["--profile", facts.profile.as_str()])
+		.current_dir(&facts.engine)
+		.env("CARGO_ENCODED_RUSTFLAGS", &facts.rustflags);
+
+	command
+}
+
+/// Builds the game crate now, and waits for it.
+///
+/// For a module image that does not exist yet - a project opened for the first
+/// time on this engine. The same command the watcher runs on an edit, so the
+/// two cannot disagree about how a module is built; it inherits the terminal,
+/// so a compile error lands in front of whoever is opening the project.
+///
+/// @param facts - what the build script knew
+pub(crate) fn build(facts: &Build) -> Result {
+	info!("no module image yet; building the game crate");
+
+	let status = cargo(facts)
+		.status()
+		.map_err(|error| err!(Module("could not start cargo: {error}")))?;
+
+	if !status.success() {
+		return Err(err!(Module("building the game crate failed: {status}")));
+	}
+
+	Ok(())
 }
 
 /// The most recent modification time under a set of directories.

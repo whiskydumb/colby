@@ -14,6 +14,13 @@
 /saves/
 /.colby/
 
+# mounts of projects that live elsewhere, made by the runtime so that their
+# game crates are built in this workspace. @ref src/runtime/mount.rs. The one
+# project that lives here for good is the Blank fixture, which is also what
+# keeps the workspace's member glob matching something.
+/projects/*
+!/projects/blank/
+
 # secrets and local overrides
 .env
 .env.*

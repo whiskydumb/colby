@@ -40,6 +40,8 @@ mod input;
 mod launch;
 mod link;
 mod mode;
+#[cfg(feature = "hot_reload")]
+mod mount;
 mod net;
 mod record;
 mod runtime;
@@ -135,12 +137,12 @@ pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 		// neither does a recording, which additionally opens no device, because
 		// what it writes has to be the same file on a machine with speakers and
 		// one without.
-		| Run::Shot(path) => shot::take(&path, &project),
-		| Run::Record { path, steps } => record::take(&path, steps, &project),
+		| Run::Shot(path) => shot::take(&path, &project, &build),
+		| Run::Record { path, steps } => record::take(&path, steps, &project, &build),
 		// a socket instead of a window, which is a run rather than a build: the
 		// same executable, the same module, the same step. @ref `crate::host`.
-		| Run::Host(port) => host::run(Front::Host(port), &project),
-		| Run::Join(address) => host::run(Front::Join(address), &project),
+		| Run::Host(port) => host::run(Front::Host(port), &project, &build),
+		| Run::Join(address) => host::run(Front::Join(address), &project, &build),
 		| Run::Window(standing) => app::run(build, standing, &project),
 	};
 

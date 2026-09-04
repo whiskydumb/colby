@@ -194,13 +194,12 @@ impl App {
 		not(feature = "hot_reload"),
 		expect(
 			clippy::needless_pass_by_value,
-			unused_variables,
 			reason = "with hot-reload built in the facts are kept for the watcher; without it \
 			          there is nothing to rebuild, and the two have to agree on a signature"
 		)
 	)]
 	pub(crate) fn new(build: Build, standing: Standing, project: &Project) -> Result<Self> {
-		let runtime = Runtime::open(Front::Window(standing), project)?;
+		let runtime = Runtime::open(Front::Window(standing), project, &build)?;
 
 		// after the config, because that is where a rate somebody asked for
 		// arrives, and before the first step, because that is the last moment

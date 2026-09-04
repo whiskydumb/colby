@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["src/*"]
+# @note: `projects/*/game` is where a project's game crate is built from. A
+# module has to be built in this workspace to link the same `colby_core` the
+# runner loaded - a crate built on its own resolves features and versions
+# differently and gets other symbol names - so a project from elsewhere is
+# mounted under `projects/<id>` by the runtime, and one made by the launcher
+# lives there to begin with. Git ignores the directory; a mounted project costs
+# the lock file one entry while it is mounted. @ref src/runtime/mount.rs.
+members = ["src/*", "projects/*/game"]
 
 [workspace.package]
 version = "0.1.0"

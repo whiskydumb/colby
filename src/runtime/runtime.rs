@@ -39,6 +39,7 @@ use colby_script::Vm;
 use colby_ui::Interface;
 
 use crate::{
+	Build,
 	assets::Assets,
 	console::Console,
 	game::Game,
@@ -168,8 +169,10 @@ impl Runtime {
 	/// @param front - what kind of process this is
 	/// @param project - the project: where the assets, the saves, the config
 	/// and the game crate are, and what the world starts as
+	/// @param build - what the build script knew, which says where the engine
+	/// is: the game crate is mounted there and built there
 	/// @return the runtime, or the first thing that would not come up
-	pub fn open(front: Front, project: &Project) -> Result<Self> {
+	pub fn open(front: Front, project: &Project, build: &Build) -> Result<Self> {
 		// boxed and installed before anything else touches the world: the
 		// world keeps this address. Once, here, and never again - the pointers
 		// in the table address this executable rather than the game module, so
@@ -217,6 +220,11 @@ impl Runtime {
 				"no game crate; the world is its scenes and its programs"
 			);
 		}
+
+		// mounted in the engine's workspace and built if no image of it exists
+		// yet, before it is loaded. @ref `crate::mount` for why a module has
+		// to be built there and nowhere else.
+		prepare_module(project, build, module.as_deref())?;
 
 		let game = Game::open(&mut world, module.as_deref())?;
 
@@ -386,6 +394,38 @@ impl Runtime {
 	#[must_use]
 	pub fn project(&self) -> &Project { &self.project }
 }
+
+/// Makes sure the project's module can be loaded: mounted in the engine's
+/// workspace, and built when no image of it exists yet.
+///
+/// A project opened for the first time on this engine has no `<id>_game.dll`
+/// beside the executable, and loading has to wait for one; the build is the
+/// same one the watcher runs on an edit, and it inherits the terminal so that
+/// a compile error lands in front of whoever is opening the project. Dead
+/// mounts are swept first, because one of those fails every cargo command.
+///
+/// @param project - whose module
+/// @param build - where the engine is
+/// @param module - the module's name, or nothing for a project with no crate
+#[cfg(feature = "hot_reload")]
+fn prepare_module(project: &Project, build: &Build, module: Option<&str>) -> Result {
+	let Some(module) = module else {
+		return Ok(());
+	};
+
+	crate::mount::sweep(&build.engine);
+	crate::mount::mount(project, &build.engine)?;
+
+	if !colby_core::mods::path::from_name(module)?.is_file() {
+		crate::watch::build(build)?;
+	}
+
+	Ok(())
+}
+
+/// Nothing to prepare: the game is linked in, whatever a project says.
+#[cfg(not(feature = "hot_reload"))]
+fn prepare_module(_project: &Project, _build: &Build, _module: Option<&str>) -> Result { Ok(()) }
 
 /// Puts the world the project starts as in place, if its file names one.
 ///

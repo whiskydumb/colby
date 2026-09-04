@@ -1,0 +1,33 @@
+[package]
+name = "blank_game"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+# @note: `dylib`, not `cdylib`, for the reason the sandbox's crate gives: a
+# cdylib would carry its own std and its own colby_core, and the shared
+# allocator, the shared panic runtime and the shared statics are what hot-reload
+# stands on. `rlib` is kept so that a build with the game linked in can take it.
+crate-type = [
+	"rlib",
+	"dylib",
+]
+
+[features]
+default = ["hot_reload"]
+hot_reload = ["colby_core/hot_reload"]
+
+# @note: by path rather than `workspace = true`, because this crate is the shape
+# every project's game crate has: mounted under the engine's `projects/<id>/game`
+# and reaching the engine three directories up. A project made from this one
+# keeps the line as it is.
+[dependencies]
+colby_core = { path = "../../../src/core" }
+
+[lints]
+workspace = true

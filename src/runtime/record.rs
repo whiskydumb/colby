@@ -27,7 +27,7 @@ use colby_core::{
 	time::{Rate, STEP},
 };
 
-use crate::{Front, Project, Runtime};
+use crate::{Build, Front, Project, Runtime};
 
 /// Where the sound goes when the flag is given without a path.
 pub(crate) const DEFAULT_PATH: &str = "colby.wav";
@@ -85,8 +85,9 @@ pub(crate) const MAX_STEPS: u32 = 10_000;
 /// @param path - where to write the file
 /// @param steps - how many simulation steps to run
 /// @param project - the project to record
+/// @param build - what the build script knew
 /// @return `Ok` once the file is on disk
-pub(crate) fn take(path: &Path, steps: u32, project: &Project) -> Result {
+pub(crate) fn take(path: &Path, steps: u32, project: &Project, build: &Build) -> Result {
 	// no console and no device here either, for the screenshot's reasons and
 	// one more: what replaces the device is the two lines after every step
 	// below, which are what a device's callback would have done. The runtime
@@ -94,7 +95,7 @@ pub(crate) fn take(path: &Path, steps: u32, project: &Project) -> Result {
 	// a document laid out against another size does not put its buttons
 	// somewhere else and a script that reacts to one does not react
 	// differently. Nothing here draws it. @ref `Front::Fixed`.
-	let mut runtime = Runtime::open(Front::Fixed, project)?;
+	let mut runtime = Runtime::open(Front::Fixed, project, build)?;
 	let mut input = Input::default();
 
 	let mut bank = Bank::new();
