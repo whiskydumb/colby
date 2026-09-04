@@ -48,6 +48,3 @@ rustc-ice-*
 
 # nix
 /result*
-
-# a rigged model used to drive the skinning work; not colby's to redistribute
-/assets/models/rig_test.glb

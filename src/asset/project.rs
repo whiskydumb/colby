@@ -21,10 +21,10 @@
 //! {
 //!   "schema": 1,
 //!   "engine": "0.1.0",
-//!   "id": "colby",
-//!   "name": "colby",
-//!   "game": "src/game",
-//!   "startup_scene": "scenes/construct"
+//!   "id": "yard",
+//!   "name": "The Yard",
+//!   "game": "game",
+//!   "startup_scene": "scenes/yard"
 //! }
 //! ```
 

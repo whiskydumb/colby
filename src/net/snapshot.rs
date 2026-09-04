@@ -1804,7 +1804,7 @@ mod tests {
 		assert_eq!(WHOLE, record);
 		assert_eq!(MAX_BASELINE, (MAX_SNAPSHOT - HEAD) / record);
 		assert_eq!(LEAST_BASELINE, (LEAST_ROOM - HEAD) / record);
-		assert!(LEAST_BASELINE >= 51, "the sandbox has fifty one bodies and has to fit");
+		assert!(LEAST_BASELINE >= 51, "a sandbox of fifty one bodies had to fit");
 		assert!(
 			MAX_BASELINE < MAX_SLOTS,
 			"and a world of every slot does not, which is what interest management is for"

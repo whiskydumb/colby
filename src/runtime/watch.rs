@@ -100,7 +100,7 @@ pub(crate) struct Watch {
 impl Watch {
 	/// Starts watching the workspace a module is built from.
 	///
-	/// @param module - the crate name, e.g. `colby_game`
+	/// @param module - the crate name, e.g. `blank_game`
 	/// @param sources - the directory holding that crate's sources
 	/// @param facts - what the build script knew, so that the rebuild matches
 	/// the build that is running
@@ -211,7 +211,7 @@ impl Watch {
 
 		info!("game sources changed, rebuilding");
 
-		// @note: the whole workspace, not `--package colby_game`. Restricting
+		// @note: the whole workspace, not `--package <id>_game`. Restricting
 		// the build changes the unit graph - wgpu drops out, and with it the
 		// features it turns on in crates colby_core also uses - which makes
 		// cargo consider colby_core dirty and try to relink the dll this

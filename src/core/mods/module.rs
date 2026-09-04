@@ -29,7 +29,7 @@ pub struct Module {
 impl Module {
 	/// Loads the module a crate name resolves to.
 	///
-	/// @param name - the crate name, e.g. `colby_game`
+	/// @param name - the crate name, e.g. `blank_game`
 	/// @return the loaded module
 	pub fn from_name(name: &str) -> Result<Self> { Self::from_path(&path::from_name(name)?) }
 

@@ -67,7 +67,7 @@ pub fn scratch_dir() -> PathBuf {
 /// Copies a module image somewhere the build is free to overwrite the original.
 ///
 /// Windows keeps a loaded image mapped and refuses writes to the file behind
-/// it, so loading `target/hot/colby_game.dll` directly would make the next
+/// it, so loading `target/hot/blank_game.dll` directly would make the next
 /// `cargo build` fail with a locked-file error. Each generation gets its own
 /// directory so the copy keeps its original file name, which is also what lets
 /// a debugger find the `.pdb` staged next to it.

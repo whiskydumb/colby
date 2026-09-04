@@ -355,13 +355,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "colby_game"
-version = "0.1.0"
-dependencies = [
- "colby_core",
-]
-
-[[package]]
 name = "colby_net"
 version = "0.1.0"
 dependencies = [

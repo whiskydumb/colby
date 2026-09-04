@@ -7,8 +7,8 @@
 //! **Picking is a ray against what is drawn, not against what collides.** A
 //! person clicks on a thing they can see, and in this engine those are two
 //! different tables: a body may have no entity, an entity may have no body, and
-//! the demo has one of each. So the ray is tested against every entity's mesh
-//! bounds, in that entity's own space, and the nearest hit wins. What that
+//! a world may hold one of each. So the ray is tested against every entity's
+//! mesh bounds, in that entity's own space, and the nearest hit wins. What that
 //! costs is a body nobody draws - a bare collider, a sensor volume - being
 //! unclickable and reachable only from the tree, which is named in the gaps.
 //!

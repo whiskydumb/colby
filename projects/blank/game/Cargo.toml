@@ -9,8 +9,8 @@ version.workspace = true
 [lib]
 path = "mod.rs"
 bench = false
-# @note: `dylib`, not `cdylib`, for the reason the sandbox's crate gives: a
-# cdylib would carry its own std and its own colby_core, and the shared
+# @note: `dylib`, not `cdylib`, and not by accident: a cdylib would carry its
+# own std and its own colby_core, and the shared
 # allocator, the shared panic runtime and the shared statics are what hot-reload
 # stands on. `rlib` is kept so that a build with the game linked in can take it.
 crate-type = [

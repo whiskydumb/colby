@@ -1,6 +1,6 @@
 //! The parts of colby that a change to forces a full restart.
 //!
-//! Window and renderer live here. The split from `colby_game` is the one from
+//! Window and renderer live here. The split from a game module is the one from
 //! the architecture notes: touch the engine and the process has to come back
 //! up, touch the game and it does not.
 //!

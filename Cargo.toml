@@ -42,9 +42,6 @@ path = "src/editor"
 [workspace.dependencies.colby_engine]
 path = "src/engine"
 
-[workspace.dependencies.colby_game]
-path = "src/game"
-
 [workspace.dependencies.colby_net]
 path = "src/net"
 

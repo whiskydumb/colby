@@ -15,9 +15,8 @@
 //! the project's directory, and the workspace's `members` glob
 //! `projects/*/game` picks the crate up. On Windows that is a junction, which
 //! needs no privilege; elsewhere a symbolic link. A project that already lives
-//! under `projects/` - the place the launcher will create them - needs nothing,
-//! and neither does the engine's own project, whose crate is a member on its
-//! own.
+//! under the engine checkout - `projects/`, the place the launcher will create
+//! them - needs nothing: the glob picks its crate up as it is.
 //!
 //! **A mount that points at nothing breaks every cargo command in the engine
 //! checkout**, because the glob matches a directory whose manifest cannot be
@@ -46,7 +45,7 @@ use colby_core::{Result, err, info, warn};
 /// @param project - the project, which has a game crate
 /// @param engine - the engine checkout
 /// @return where the crate is reached from, or nothing when it already is a
-/// member: the engine's own project, or one that lives under `projects/`
+/// member, which a project under the engine checkout is
 ///
 /// # Errors
 ///
@@ -235,7 +234,11 @@ mod tests {
 		let engine = fresh("engine_own");
 		let own = project(&engine, "own", Some("src/game"));
 
-		assert_eq!(mount(&own, &engine).expect("nothing to do"), None, "the engine's own");
+		assert_eq!(
+			mount(&own, &engine).expect("nothing to do"),
+			None,
+			"at the checkout's root, wherever its crate is"
+		);
 
 		let under = engine.join("projects").join("under");
 		fs::create_dir_all(&under).expect("a project living where the launcher puts them");

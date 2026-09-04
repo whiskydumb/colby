@@ -55,10 +55,10 @@ pub(crate) const SOURCES: &str = "scenes";
 
 /// The directory props live in, under the same tree.
 ///
-/// Also not a choice: the spawn menu finds a prop by walking the scene registry
-/// for everything named `props/`, and the compiler names an asset by its own
-/// path. So a contraption written here is offered by the menu on the next run
-/// with nothing told about it.
+/// Also not a choice: a game that keeps a catalogue of props finds them by
+/// walking the scene registry for everything named `props/`, and the compiler
+/// names an asset by its own path. So a contraption written here is in that
+/// catalogue on the next run with nothing told about it.
 pub(crate) const PROPS: &str = "props";
 
 /// `scene.save <name>` - writes the world out.
@@ -264,8 +264,8 @@ fn write(world: &World, project: &Project, name: &str) -> Result {
 /// **A saved contraption is a prop and there is no second format for one.** The
 /// game cuts a connected piece out of the world, registers it under
 /// `props/<name>`, and asks for this; what lands on disk is an ordinary
-/// `.scene` in the directory the spawn menu already walks, so the next run
-/// offers it beside the ones written by hand. Nothing new reads it and nothing
+/// `.scene` in the directory a game's catalogue already walks, so the next run
+/// finds it beside the ones written by hand. Nothing new reads it and nothing
 /// new writes it.
 ///
 /// @param world - the registry to take the scene from

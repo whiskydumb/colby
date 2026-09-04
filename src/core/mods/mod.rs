@@ -13,7 +13,7 @@
 //! | `.init_array` / `.fini_array`       | `ctor` / `dtor` (`.CRT$XCU`, atexit)|
 //!
 //! The copy is not optional: Windows keeps a loaded image mapped and denies
-//! writes to the file, so the linker could not overwrite `colby_game.dll` while
+//! writes to the file, so the linker could not overwrite `blank_game.dll` while
 //! the running process had it open. Everything else follows from there.
 
 pub(crate) use libloading::os::windows::{Library, Symbol};

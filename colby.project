@@ -1,7 +1,0 @@
-{
-	"schema": 1,
-	"engine": "0.1.0",
-	"id": "colby",
-	"name": "colby",
-	"game": "src/game"
-}
