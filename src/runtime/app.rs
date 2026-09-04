@@ -34,7 +34,7 @@ use colby_engine::{
 
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
-use crate::{Build, Front, Runtime, input, mode::Mode, net::Standing};
+use crate::{Build, Front, Project, Runtime, input, mode::Mode, net::Standing};
 
 /// The window title.
 const TITLE: &str = "colby";
@@ -122,7 +122,8 @@ pub(crate) fn paced(cvars: &Cvars, client: bool) -> Rate {
 ///
 /// @param build - what the build script of the executable knew
 /// @param standing - which end of a wire this window is, if either
-pub(crate) fn run(build: Build, standing: Standing) -> Result {
+/// @param project - the project to run
+pub(crate) fn run(build: Build, standing: Standing, project: &Project) -> Result {
 	let event_loop =
 		EventLoop::new().map_err(|error| err!(Graphics("creating the event loop: {error}")))?;
 
@@ -131,7 +132,7 @@ pub(crate) fn run(build: Build, standing: Standing) -> Result {
 	// the window has anything to say.
 	event_loop.set_control_flow(ControlFlow::Poll);
 
-	let mut app = App::new(build, standing)?;
+	let mut app = App::new(build, standing, project)?;
 
 	event_loop
 		.run_app(&mut app)
@@ -188,16 +189,18 @@ impl App {
 	///
 	/// @param build - what the build script of the executable knew
 	/// @param standing - which end of a wire this window is, if either
+	/// @param project - the project to run
 	#[cfg_attr(
 		not(feature = "hot_reload"),
 		expect(
 			clippy::needless_pass_by_value,
+			unused_variables,
 			reason = "with hot-reload built in the facts are kept for the watcher; without it \
-			          they are read once here, and the two have to agree on a signature"
+			          there is nothing to rebuild, and the two have to agree on a signature"
 		)
 	)]
-	pub(crate) fn new(build: Build, standing: Standing) -> Result<Self> {
-		let runtime = Runtime::open(Front::Window(standing), &build.workspace)?;
+	pub(crate) fn new(build: Build, standing: Standing, project: &Project) -> Result<Self> {
+		let runtime = Runtime::open(Front::Window(standing), project)?;
 
 		// after the config, because that is where a rate somebody asked for
 		// arrives, and before the first step, because that is the last moment
@@ -362,8 +365,14 @@ impl App {
 	/// Starts watching the game crate for changes.
 	#[cfg(feature = "hot_reload")]
 	fn start_watching(&mut self) -> Result {
-		let sources = self.build.workspace.join("src").join("game");
-		self.watch = Some(Watch::new(crate::game::MODULE_NAME, sources, &self.build)?);
+		// a project with no game crate has nothing to watch: its world is its
+		// scenes and its programs, and those the asset loop already watches.
+		let Some(sources) = self.runtime.project().game() else {
+			return Ok(());
+		};
+		let module = self.runtime.project().module();
+
+		self.watch = Some(Watch::new(&module, sources, &self.build)?);
 
 		Ok(())
 	}

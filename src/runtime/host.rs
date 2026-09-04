@@ -26,11 +26,11 @@
 //! a noise, and one that did would be making it into somebody's empty room.
 //! Everything else about the step is what a window would have run.
 
-use std::{path::Path, thread, time::Duration};
+use std::{thread, time::Duration};
 
 use colby_core::{Result, abi::Input, info, time::Clock};
 
-use crate::{Front, Runtime};
+use crate::{Front, Project, Runtime};
 
 /// How long a pass that ran no step waits before looking again.
 ///
@@ -51,9 +51,9 @@ const IDLE: Duration = Duration::from_millis(1);
 ///
 /// @param front - which end of the wire this process is: [`Front::Host`] or
 /// [`Front::Join`], and nothing else opens no window
-/// @param workspace - the checkout the runner was built from
-pub(crate) fn run(front: Front, workspace: &Path) -> Result {
-	let mut runtime = Runtime::open(front, workspace)?;
+/// @param project - the project to serve, or to ask for
+pub(crate) fn run(front: Front, project: &Project) -> Result {
+	let mut runtime = Runtime::open(front, project)?;
 	let following = runtime.following();
 	let mut input = Input::default();
 	let mut clock = Clock::new();

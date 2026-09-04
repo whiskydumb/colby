@@ -1,6 +1,6 @@
 //! What the command line asked for, read once and in one place.
 //!
-//! Six runs, seven flags, one pass. Every flag's shape is written down here
+//! Six runs, eight flags, one pass. Every flag's shape is written down here
 //! and nowhere else: `--flag`, `--flag value` and `--flag=value`, with a value
 //! taken from the next word only when it is one - a port that parses, a count
 //! that parses, a path that does not start with a dash - so that `--host
@@ -57,9 +57,43 @@ const LISTEN: &str = "--listen";
 /// `--connect <address>`: a window that talks to a host.
 const CONNECT: &str = "--connect";
 
+/// `--project <dir>`: the project to run, whichever run it is.
+///
+/// Not a run of its own: a picture, a sound, a host and a window all run
+/// *some* project, and without this flag it is the one in the working
+/// directory. @ref `crate::run`, which looks there.
+const PROJECT: &str = "--project";
+
+/// What the command line asked for: a run, and the project to run it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launch {
+	/// Which kind of run.
+	pub run: Run,
+
+	/// The project directory `--project` named, if it did.
+	pub project: Option<PathBuf>,
+}
+
+impl Launch {
+	/// Reads the command line.
+	///
+	/// @param arguments - the command line, without the program's own name
+	/// @return what was asked for; a window on its own, in the project of the
+	/// working directory, when nothing was
+	#[must_use]
+	pub fn parse(arguments: &[String]) -> Self {
+		let flags = Flags::read(arguments);
+
+		Self {
+			project: flags.project.clone(),
+			run: flags.decide(),
+		}
+	}
+}
+
 /// What kind of run was asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Launch {
+pub enum Run {
 	/// Two endpoints against each other over a wire that lies, for this many
 	/// steps.
 	Link(u32),
@@ -86,15 +120,6 @@ pub enum Launch {
 	Window(Standing),
 }
 
-impl Launch {
-	/// Reads the command line.
-	///
-	/// @param arguments - the command line, without the program's own name
-	/// @return what was asked for; a window on its own when nothing was
-	#[must_use]
-	pub fn parse(arguments: &[String]) -> Self { Flags::read(arguments).decide() }
-}
-
 /// Every flag that was named, before one run is chosen among them.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Flags {
@@ -105,6 +130,7 @@ struct Flags {
 	join: Option<SocketAddr>,
 	listen: Option<u16>,
 	connect: Option<SocketAddr>,
+	project: Option<PathBuf>,
 }
 
 impl Flags {
@@ -132,6 +158,12 @@ impl Flags {
 				| JOIN => flags.join = words.address(inline, JOIN),
 				| LISTEN => flags.listen = Some(words.port(inline)),
 				| CONNECT => flags.connect = words.address(inline, CONNECT),
+				| PROJECT =>
+					flags.project = words.path(inline).or_else(|| {
+						warn!("{PROJECT} needs a directory after it");
+
+						None
+					}),
 				| other => warn!(word = other, "not a flag this engine knows; left alone"),
 			}
 		}
@@ -140,7 +172,7 @@ impl Flags {
 	}
 
 	/// The one run, out of everything that was named.
-	fn decide(self) -> Launch {
+	fn decide(self) -> Run {
 		let Self {
 			link,
 			shot,
@@ -149,6 +181,7 @@ impl Flags {
 			join,
 			listen,
 			connect,
+			..
 		} = self;
 		let named =
 			[link.is_some(), shot.is_some(), record.is_some(), host.is_some(), join.is_some()]
@@ -158,16 +191,16 @@ impl Flags {
 
 		// the precedence, as a table: the first run named in dispatch order.
 		let chosen = match (link, shot, record, host, join, listen, connect) {
-			| (Some(steps), ..) => Launch::Link(steps),
-			| (None, Some(path), ..) => Launch::Shot(path),
-			| (None, None, Some((path, steps)), ..) => Launch::Record { path, steps },
-			| (None, None, None, Some(port), ..) => Launch::Host(port),
-			| (None, None, None, None, Some(address), ..) => Launch::Join(address),
+			| (Some(steps), ..) => Run::Link(steps),
+			| (None, Some(path), ..) => Run::Shot(path),
+			| (None, None, Some((path, steps)), ..) => Run::Record { path, steps },
+			| (None, None, None, Some(port), ..) => Run::Host(port),
+			| (None, None, None, None, Some(address), ..) => Run::Join(address),
 			| (None, None, None, None, None, Some(port), _) =>
-				Launch::Window(Standing::Serving(port)),
+				Run::Window(Standing::Serving(port)),
 			| (None, None, None, None, None, None, Some(address)) =>
-				Launch::Window(Standing::Talking(address)),
-			| (None, None, None, None, None, None, None) => Launch::Window(Standing::Alone),
+				Run::Window(Standing::Talking(address)),
+			| (None, None, None, None, None, None, None) => Run::Window(Standing::Alone),
 		};
 
 		if named > 1 {
@@ -324,31 +357,31 @@ mod tests {
 		SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 	}
 
-	/// What the command line came to.
-	fn parse(line: &[&str]) -> Launch { Launch::parse(&words(line)) }
+	/// What the command line came to, as a run.
+	fn parse(line: &[&str]) -> Run { Launch::parse(&words(line)).run }
 
 	/// Every flag on it, before one run is chosen.
 	fn read(line: &[&str]) -> Flags { Flags::read(&words(line)) }
 
 	/// A recording of this path and this many steps.
-	fn recording(path: &str, steps: u32) -> Launch {
-		Launch::Record { path: PathBuf::from(path), steps }
+	fn recording(path: &str, steps: u32) -> Run {
+		Run::Record { path: PathBuf::from(path), steps }
 	}
 
 	#[test]
 	fn nothing_at_all_is_a_window_on_its_own() {
 		// the ordinary case, and the one a change that opened a socket by
 		// accident would break in silence.
-		assert_eq!(parse(&[]), Launch::Window(Standing::Alone));
+		assert_eq!(parse(&[]), Run::Window(Standing::Alone));
 	}
 
 	#[test]
 	fn a_two_endpoint_run_is_read_on_its_own_and_with_a_count() {
-		assert_eq!(parse(&["--link"]), Launch::Link(link::DEFAULT_STEPS));
-		assert_eq!(parse(&["--link", "120"]), Launch::Link(120));
-		assert_eq!(parse(&["--link=120"]), Launch::Link(120));
-		assert_eq!(parse(&["--link=0"]), Launch::Link(1), "a count of nil is clamped");
-		assert_eq!(parse(&["--link=99999999"]), Launch::Link(link::MAX_STEPS), "and a silly one");
+		assert_eq!(parse(&["--link"]), Run::Link(link::DEFAULT_STEPS));
+		assert_eq!(parse(&["--link", "120"]), Run::Link(120));
+		assert_eq!(parse(&["--link=120"]), Run::Link(120));
+		assert_eq!(parse(&["--link=0"]), Run::Link(1), "a count of nil is clamped");
+		assert_eq!(parse(&["--link=99999999"]), Run::Link(link::MAX_STEPS), "and a silly one");
 		assert_eq!(read(&["--shot"]).link, None, "and not somebody else's flag");
 	}
 
@@ -370,9 +403,9 @@ mod tests {
 
 	#[test]
 	fn a_picture_is_read_on_its_own_and_with_a_path() {
-		assert_eq!(parse(&["--shot"]), Launch::Shot(PathBuf::from(shot::DEFAULT_PATH)));
-		assert_eq!(parse(&["--shot", "out.png"]), Launch::Shot(PathBuf::from("out.png")));
-		assert_eq!(parse(&["--shot=out.png"]), Launch::Shot(PathBuf::from("out.png")));
+		assert_eq!(parse(&["--shot"]), Run::Shot(PathBuf::from(shot::DEFAULT_PATH)));
+		assert_eq!(parse(&["--shot", "out.png"]), Run::Shot(PathBuf::from("out.png")));
+		assert_eq!(parse(&["--shot=out.png"]), Run::Shot(PathBuf::from("out.png")));
 
 		let flags = read(&["--shot", "--record"]);
 
@@ -427,9 +460,9 @@ mod tests {
 
 	#[test]
 	fn a_host_is_read_on_its_own_and_with_a_port() {
-		assert_eq!(parse(&["--host"]), Launch::Host(DEFAULT_PORT));
-		assert_eq!(parse(&["--host", "9999"]), Launch::Host(9999));
-		assert_eq!(parse(&["--host=9999"]), Launch::Host(9999));
+		assert_eq!(parse(&["--host"]), Run::Host(DEFAULT_PORT));
+		assert_eq!(parse(&["--host", "9999"]), Run::Host(9999));
+		assert_eq!(parse(&["--host=9999"]), Run::Host(9999));
 		assert_eq!(read(&["--connect"]).host, None, "and not somebody else's");
 	}
 
@@ -441,15 +474,15 @@ mod tests {
 		assert!(flags.shot.is_some(), "so the flag after it is read");
 		assert_eq!(
 			parse(&["--host", "99999"]),
-			Launch::Host(DEFAULT_PORT),
+			Run::Host(DEFAULT_PORT),
 			"and a number that is not a port is not one"
 		);
 	}
 
 	#[test]
 	fn a_windowless_client_is_read_after_its_flag_and_needs_an_address() {
-		assert_eq!(parse(&["--join", "127.0.0.1:9999"]), Launch::Join(somewhere(9999)));
-		assert_eq!(parse(&["--join=127.0.0.1:1234"]), Launch::Join(somewhere(1234)));
+		assert_eq!(parse(&["--join", "127.0.0.1:9999"]), Run::Join(somewhere(9999)));
+		assert_eq!(parse(&["--join=127.0.0.1:1234"]), Run::Join(somewhere(1234)));
 		// **an address after the flag, not a port.** A payload nothing could
 		// read as an address would let this pass whether the flag is looked
 		// at or not, which is a test that cannot fail for the reason it is
@@ -461,17 +494,17 @@ mod tests {
 	fn a_flag_with_nothing_usable_after_it_asks_for_nothing() {
 		assert_eq!(
 			parse(&["--join"]),
-			Launch::Window(Standing::Alone),
+			Run::Window(Standing::Alone),
 			"a flag on its own is not an address"
 		);
 		assert_eq!(
 			parse(&["--join", "not-an-address"]),
-			Launch::Window(Standing::Alone),
+			Run::Window(Standing::Alone),
 			"and neither is a word"
 		);
 		assert_eq!(
 			parse(&["--join", "127.0.0.1"]),
-			Launch::Window(Standing::Alone),
+			Run::Window(Standing::Alone),
 			"a host with no port is not one either, because a wire needs both"
 		);
 	}
@@ -494,20 +527,16 @@ mod tests {
 	fn a_window_told_to_talk_is_read_and_a_word_that_is_not_an_address_is_not() {
 		assert_eq!(
 			parse(&["--connect", "127.0.0.1:27015"]),
-			Launch::Window(Standing::Talking(somewhere(27_015)))
+			Run::Window(Standing::Talking(somewhere(27_015)))
 		);
 		assert_eq!(
 			parse(&["--connect=127.0.0.1:1"]),
-			Launch::Window(Standing::Talking(somewhere(1)))
+			Run::Window(Standing::Talking(somewhere(1)))
 		);
-		assert_eq!(
-			parse(&["--connect"]),
-			Launch::Window(Standing::Alone),
-			"with nothing after it"
-		);
+		assert_eq!(parse(&["--connect"]), Run::Window(Standing::Alone), "with nothing after it");
 		assert_eq!(
 			parse(&["--connect", "not an address"]),
-			Launch::Window(Standing::Alone),
+			Run::Window(Standing::Alone),
 			"and with something that is not one"
 		);
 	}
@@ -516,11 +545,11 @@ mod tests {
 	fn a_window_asked_to_listen_serves_on_the_port_it_was_given() {
 		assert_eq!(
 			parse(&["--listen"]),
-			Launch::Window(Standing::Serving(DEFAULT_PORT)),
+			Run::Window(Standing::Serving(DEFAULT_PORT)),
 			"on its own it is the usual port"
 		);
-		assert_eq!(parse(&["--listen", "9999"]), Launch::Window(Standing::Serving(9999)));
-		assert_eq!(parse(&["--listen=9999"]), Launch::Window(Standing::Serving(9999)));
+		assert_eq!(parse(&["--listen", "9999"]), Run::Window(Standing::Serving(9999)));
+		assert_eq!(parse(&["--listen=9999"]), Run::Window(Standing::Serving(9999)));
 	}
 
 	#[test]
@@ -530,40 +559,59 @@ mod tests {
 		// be worse than picking and saying which was picked.
 		assert_eq!(
 			parse(&["--connect", "127.0.0.1:1", "--listen", "9999"]),
-			Launch::Window(Standing::Serving(9999))
+			Run::Window(Standing::Serving(9999))
 		);
 		assert_eq!(
 			parse(&["--listen", "--connect", "127.0.0.1:1"]),
-			Launch::Window(Standing::Serving(DEFAULT_PORT)),
+			Run::Window(Standing::Serving(DEFAULT_PORT)),
 			"whichever order they were typed in"
 		);
 		assert_eq!(
 			parse(&["--connect", "--listen", "9999"]),
-			Launch::Window(Standing::Serving(9999)),
+			Run::Window(Standing::Serving(9999)),
 			"and a flag is never taken as an address"
 		);
+	}
+
+	#[test]
+	fn a_project_is_named_beside_whichever_run_and_needs_a_directory() {
+		let launch = Launch::parse(&words(&["--project", "C:/somewhere/demo", "--shot"]));
+
+		assert_eq!(launch.project, Some(PathBuf::from("C:/somewhere/demo")));
+		assert_eq!(launch.run, Run::Shot(PathBuf::from(shot::DEFAULT_PATH)), "and the run");
+		assert_eq!(
+			Launch::parse(&words(&["--project=demo"])).project,
+			Some(PathBuf::from("demo")),
+			"either way round"
+		);
+		assert_eq!(
+			Launch::parse(&words(&["--project", "--host"])).project,
+			None,
+			"a flag is not a directory"
+		);
+		assert_eq!(Launch::parse(&[]).project, None, "and nothing named is nothing");
 	}
 
 	#[test]
 	fn the_first_run_in_dispatch_order_wins_when_several_are_named() {
 		assert_eq!(
 			parse(&["--record", "x.wav", "--shot", "y.png"]),
-			Launch::Shot(PathBuf::from("y.png")),
+			Run::Shot(PathBuf::from("y.png")),
 			"a picture before a sound"
 		);
 		assert_eq!(
 			parse(&["--join", "127.0.0.1:1", "--host"]),
-			Launch::Host(DEFAULT_PORT),
+			Run::Host(DEFAULT_PORT),
 			"a host before a client"
 		);
 		assert_eq!(
 			parse(&["--host", "--link"]),
-			Launch::Link(link::DEFAULT_STEPS),
+			Run::Link(link::DEFAULT_STEPS),
 			"and a two-endpoint run before everything"
 		);
 		assert_eq!(
 			parse(&["--listen", "--shot"]),
-			Launch::Shot(PathBuf::from(shot::DEFAULT_PATH)),
+			Run::Shot(PathBuf::from(shot::DEFAULT_PATH)),
 			"a window is what is left when nothing else was asked for"
 		);
 	}

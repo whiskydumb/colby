@@ -26,9 +26,9 @@ use std::{
 };
 
 use colby_asset::{
-	MeshFile, TextureFile, anim::ClipFile, compile, compile::Kind, document::DocumentFile,
-	font::FontFile, model::ModelFile, scene::SceneFile, script::ScriptFile,
-	skeleton::SkeletonFile, sound::SoundFile,
+	MeshFile, Project, TextureFile, anim::ClipFile, compile, compile::Kind,
+	document::DocumentFile, font::FontFile, model::ModelFile, scene::SceneFile,
+	script::ScriptFile, skeleton::SkeletonFile, sound::SoundFile,
 };
 use colby_core::{
 	abi::{
@@ -45,26 +45,6 @@ use colby_core::{
 /// dozen files is a few dozen `stat` calls, which is not worth pacing
 /// differently.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Overrides the source tree. Mostly for running the executable from
-/// elsewhere.
-const SOURCE_VAR: &str = "COLBY_ASSETS";
-
-/// Overrides the compiled tree. The one to set for a build that ships its
-/// assets beside the executable instead of under `target`.
-const OUTPUT_VAR: &str = "COLBY_ASSETS_OUT";
-
-/// The tree sources are read from.
-///
-/// A function rather than a value worked out in one place, because two things
-/// now need the answer: this loop, which watches it, and the editor, which
-/// writes a scene source into it. A source written under a different root from
-/// the one being watched is a file nothing would ever compile.
-///
-/// @param workspace - the checkout the runner was built from
-pub(crate) fn source_root(workspace: &Path) -> PathBuf {
-	std::env::var_os(SOURCE_VAR).map_or_else(|| compile::source_root(workspace), PathBuf::from)
-}
 
 /// One compiled asset the world is currently holding.
 struct Loaded {
@@ -83,17 +63,15 @@ pub(crate) struct Assets {
 }
 
 impl Assets {
-	/// Points the loop at a workspace's asset trees.
+	/// Points the loop at a project's asset trees.
 	///
-	/// Neither directory has to exist. A workspace with no `assets/` compiles
+	/// Neither directory has to exist. A project with no `assets/` compiles
 	/// nothing and loads nothing, which is what a project that has not made an
 	/// asset yet looks like.
 	///
-	/// @param workspace - the checkout the runner was built from
-	pub(crate) fn new(workspace: &Path) -> Self {
-		let source = source_root(workspace);
-		let output = std::env::var_os(OUTPUT_VAR)
-			.map_or_else(|| compile::output_root(workspace), PathBuf::from);
+	/// @param project - whose trees
+	pub(crate) fn of(project: &Project) -> Self {
+		let (source, output) = (project.assets(), project.output());
 
 		info!(source = ?source, output = ?output, "watching the asset tree");
 

@@ -48,13 +48,6 @@ pub const FILE: &str = "colby.project";
 /// The shape of the file this build writes and reads.
 pub const SCHEMA: u32 = 1;
 
-/// Where compiled assets go, relative to the project root.
-///
-/// Under `.colby/` rather than `target/`: a project is not a cargo workspace,
-/// and what the engine derives for itself belongs in a directory the engine
-/// owns and version control ignores.
-pub const OUTPUT_DIR: [&str; 2] = [".colby", "assets"];
-
 /// Where saved worlds go, relative to the project root.
 pub const SAVES_DIR: &str = "saves";
 
@@ -214,11 +207,7 @@ impl Project {
 
 	/// Where the sources compile to, and what the engine loads from.
 	#[must_use]
-	pub fn output(&self) -> PathBuf {
-		OUTPUT_DIR
-			.iter()
-			.fold(self.root.clone(), |path, part| path.join(part))
-	}
+	pub fn output(&self) -> PathBuf { compile::output_root(&self.root) }
 
 	/// Where saved worlds go.
 	#[must_use]

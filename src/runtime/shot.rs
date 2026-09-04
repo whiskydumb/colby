@@ -21,7 +21,7 @@ use colby_core::{
 };
 use colby_engine::{Capture, Image, Overlay};
 
-use crate::{Front, Runtime};
+use crate::{Front, Project, Runtime};
 
 /// Where the picture goes when the flag is given without a path.
 pub(crate) const DEFAULT_PATH: &str = "colby.png";
@@ -38,9 +38,9 @@ const STEPS: u32 = 90;
 /// Runs the game for a moment and writes what the camera sees.
 ///
 /// @param path - where to write the picture
-/// @param workspace - the checkout the runner was built from
+/// @param project - the project to picture
 /// @return `Ok` once the file is on disk
-pub(crate) fn take(path: &Path, workspace: &Path) -> Result {
+pub(crate) fn take(path: &Path, project: &Project) -> Result {
 	// the adapter first, before anything is brought up: a machine with nothing
 	// to render on has no business loading a module to find that out.
 	let Some(mut capture) = Capture::new(SIZE.0, SIZE.1)? else {
@@ -54,7 +54,7 @@ pub(crate) fn take(path: &Path, workspace: &Path) -> Result {
 	// picture's own size at a scale of one, for the same reason - a screenshot
 	// taken on a display with another scale would otherwise lay the interface
 	// out differently from one taken here. @ref `Front::Fixed`.
-	let mut runtime = Runtime::open(Front::Fixed, workspace)?;
+	let mut runtime = Runtime::open(Front::Fixed, project)?;
 	let mut input = Input::default();
 
 	runtime

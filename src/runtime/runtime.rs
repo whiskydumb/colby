@@ -18,16 +18,17 @@
 
 use std::{
 	net::SocketAddr,
-	path::{Path, PathBuf},
 	time::{Duration, Instant},
 };
 
+use colby_asset::Project;
 use colby_audio::Device;
 use colby_core::{
 	Result,
-	abi::{Input, World, console},
-	debug, error,
+	abi::{Input, World, console, scene},
+	debug, err, error,
 	glam::Vec2,
+	info,
 	time::Rate,
 };
 #[cfg(feature = "editor")]
@@ -149,8 +150,8 @@ pub struct Runtime {
 	/// number is about the wire rather than about the world.
 	started: Instant,
 
-	/// The checkout everything on disk resolves against.
-	workspace: PathBuf,
+	/// The project everything on disk resolves against.
+	project: Project,
 }
 
 impl Runtime {
@@ -165,21 +166,23 @@ impl Runtime {
 	/// module, because a line in it may name a variable the game registered.
 	///
 	/// @param front - what kind of process this is
-	/// @param workspace - the checkout everything on disk resolves against
+	/// @param project - the project: where the assets, the saves, the config
+	/// and the game crate are, and what the world starts as
 	/// @return the runtime, or the first thing that would not come up
-	pub fn open(front: Front, workspace: &Path) -> Result<Self> {
+	pub fn open(front: Front, project: &Project) -> Result<Self> {
 		// boxed and installed before anything else touches the world: the
 		// world keeps this address. Once, here, and never again - the pointers
 		// in the table address this executable rather than the game module, so
 		// no reload disturbs them, which is the whole difference between this
 		// and a console command and is why one has to be forgotten on unload
 		// and the other does not.
-		let simulation = Box::new(Simulation::new());
+		let mut simulation = Box::new(Simulation::new());
 		let mut world = Box::<World>::default();
 		world.install_physics(simulation.table());
 
-		let mut assets = Assets::new(workspace);
+		let mut assets = Assets::of(project);
 		assets.sync(&mut world);
+		start(&mut world, &mut simulation, project)?;
 
 		if let Some(viewport) = front.viewport() {
 			world.ui.set_viewport(viewport, 1.0);
@@ -204,13 +207,24 @@ impl Runtime {
 			Editor::install(&mut world);
 		}
 
-		let game = Game::open(&mut world)?;
+		// a project without a game crate has no module, and runs on its scenes
+		// and its programs. @ref `Game::open` for the build that links one in.
+		let module = project.game().is_some().then(|| project.module());
+
+		if module.is_none() {
+			info!(
+				project = project.id(),
+				"no game crate; the world is its scenes and its programs"
+			);
+		}
+
+		let game = Game::open(&mut world, module.as_deref())?;
 
 		// last of the three that register, because a line in it may name a
 		// variable the game registered a moment ago.
 		let console = front
 			.has_console()
-			.then(|| Console::open(&mut world, workspace));
+			.then(|| Console::open(&mut world, &project.settings()));
 
 		// a run that cannot start its interpreter is a run that stops, whatever
 		// the front: a picture, a sound and a digest are only comparable when
@@ -222,7 +236,7 @@ impl Runtime {
 			world,
 			simulation,
 			assets,
-			game: Some(game),
+			game,
 			scripts,
 			interface: Interface::new(),
 			console,
@@ -230,7 +244,7 @@ impl Runtime {
 			audio,
 			records: Vec::new(),
 			started: Instant::now(),
-			workspace: workspace.to_owned(),
+			project: project.clone(),
 		})
 	}
 
@@ -265,8 +279,8 @@ impl Runtime {
 		// subsystem that registered its name: a config file to run, a scene to
 		// write or put back, a word for the wire. @ref
 		// `colby_core::abi::console::Asked`.
-		crate::console::serve(&mut self.world, &self.workspace);
-		crate::saves::serve(&mut self.world, &mut self.simulation, &self.workspace);
+		crate::console::serve(&mut self.world, self.project.root());
+		crate::saves::serve(&mut self.world, &mut self.simulation, &self.project);
 		crate::net::serve(&mut self.world, self.net.as_mut());
 
 		// and everything the socket is holding, before any step: what a step
@@ -368,9 +382,50 @@ impl Runtime {
 			.is_some_and(|net| !net.hosting())
 	}
 
-	/// The checkout everything on disk resolves against.
+	/// The project everything on disk resolves against.
 	#[must_use]
-	pub fn workspace(&self) -> &Path { &self.workspace }
+	pub fn project(&self) -> &Project { &self.project }
+}
+
+/// Puts the world the project starts as in place, if its file names one.
+///
+/// After the assets and before the module, so that a game's `init` finds the
+/// map there rather than having to make it - which is also what lets a project
+/// with no game crate at all have a world. A named scene the registry does not
+/// hold is a stop rather than an empty world: the project said what it starts
+/// as, and a picture of nothing is not that.
+///
+/// @param world - the world, empty until now
+/// @param simulation - the solver, told to forget what it derived, which is the
+/// obligation every restore leaves and here nothing yet
+/// @param project - whose file may name a scene
+fn start(world: &mut World, simulation: &mut Simulation, project: &Project) -> Result {
+	let Some(name) = project.startup_scene() else {
+		return Ok(());
+	};
+
+	let id = world.scenes.find(name);
+
+	if !id.is_some() {
+		return Err(err!(Asset(
+			"the startup scene {name} is not among the compiled scenes; it compiles from \
+			 assets/{name}.scene"
+		)));
+	}
+
+	let data = world.scenes.data(id).clone();
+	let put = scene::restore(world, &data)?;
+	simulation.forget();
+
+	info!(
+		scene = name,
+		entities = put.things,
+		bodies = put.solids,
+		joints = put.links,
+		"the world starts as the project says"
+	);
+
+	Ok(())
 }
 
 /// Opens the output device, if the machine has one.
@@ -486,7 +541,11 @@ mod tests {
 				audio: None,
 				records: Vec::new(),
 				started: Instant::now(),
-				workspace: scratch,
+				project: Project::parse(
+					&scratch,
+					r#"{ "schema": 1, "engine": "0.1.0", "id": "empty", "name": "empty" }"#,
+				)
+				.expect("a project"),
 			}
 		}
 	}

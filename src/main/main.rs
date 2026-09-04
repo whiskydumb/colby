@@ -13,8 +13,16 @@ use colby_runtime::Build;
 
 fn main() -> ExitCode {
 	let arguments: Vec<String> = env::args().skip(1).collect();
+	let here = match env::current_dir() {
+		| Ok(here) => here,
+		| Err(error) => {
+			error!(%error, "the working directory cannot be read");
 
-	match colby_runtime::run(&arguments, build()) {
+			return ExitCode::FAILURE;
+		},
+	};
+
+	match colby_runtime::run(&arguments, build(), &here) {
 		| Ok(()) => ExitCode::SUCCESS,
 		| Err(error) => {
 			error!(%error, "colby stopped");
@@ -26,10 +34,10 @@ fn main() -> ExitCode {
 
 /// What the build script knew, as the runtime wants it.
 ///
-/// The workspace is baked in at build time and overridable at runtime, which is
-/// what makes it possible to run the executable from somewhere else and still
-/// point it at a checkout. The rest is what a rebuild of the game module has
-/// to match, and only a build script can know it. @ref `build.rs`.
+/// The engine checkout is baked in at build time - it is where a game module is
+/// rebuilt, and a project is whatever `--project` names or the working
+/// directory holds, so nothing here needs overriding. The rest is what that
+/// rebuild has to match, and only a build script can know it. @ref `build.rs`.
 fn build() -> Build {
 	// bound before they are copied, because `env!` expands to a literal and an
 	// empty literal turned into a `String` trips a lint in exactly the build
@@ -42,9 +50,7 @@ fn build() -> Build {
 	);
 
 	Build {
-		workspace: env::var("COLBY_WORKSPACE")
-			.map(PathBuf::from)
-			.unwrap_or_else(|_| PathBuf::from(env!("COLBY_WORKSPACE"))),
+		engine: PathBuf::from(env!("COLBY_ENGINE")),
 		cargo: cargo.to_owned(),
 		profile: profile.to_owned(),
 		rustflags: rustflags.to_owned(),

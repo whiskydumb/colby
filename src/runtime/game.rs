@@ -17,10 +17,6 @@ use colby_core::{
 	mods::Module,
 };
 
-/// The crate name the module is built from.
-#[cfg(feature = "hot_reload")]
-pub(crate) const MODULE_NAME: &str = "colby_game";
-
 /// Tidies up after a module's `init`.
 ///
 /// Two things, both of which can only be done once the new build has had its
@@ -44,6 +40,10 @@ fn settle(world: &mut World) {
 pub(crate) struct Game {
 	#[cfg(feature = "hot_reload")]
 	module: Option<Module>,
+	/// The crate the module is built from, which is also its file name:
+	/// `<id>_game` for a project called `id`. @ref `Project::module`.
+	#[cfg(feature = "hot_reload")]
+	name: String,
 	api: Option<GameApi>,
 }
 
@@ -51,12 +51,20 @@ impl Game {
 	/// Loads the game and runs its `init`.
 	///
 	/// @param world - the host-owned state handed to the module
-	/// @return the loaded game, or the reason it could not be loaded
-	pub(crate) fn open(world: &mut World) -> Result<Self> {
-		let mut game = Self::closed();
+	/// @param module - the crate the module is built from, `<id>_game`. A
+	/// project with no game crate names none, and then there is nothing to
+	/// load; a build with the game linked in has one game whatever a project
+	/// says, and ignores it
+	/// @return the loaded game, nothing when there is none to load, or the
+	/// reason it could not be loaded
+	pub(crate) fn open(world: &mut World, module: Option<&str>) -> Result<Option<Self>> {
+		let Some(mut game) = Self::closed(module) else {
+			return Ok(None);
+		};
+
 		game.swap_in(world)?;
 
-		Ok(game)
+		Ok(Some(game))
 	}
 
 	/// Runs the game's `update` for one simulation step.
@@ -90,14 +98,19 @@ impl Game {
 		self.swap_in(world)
 	}
 
-	/// An unloaded game.
-	fn closed() -> Self {
-		Self {
-			#[cfg(feature = "hot_reload")]
+	/// An unloaded game, or nothing when there is no module to load.
+	#[cfg(feature = "hot_reload")]
+	fn closed(module: Option<&str>) -> Option<Self> {
+		Some(Self {
 			module: None,
+			name: module?.to_owned(),
 			api: None,
-		}
+		})
 	}
+
+	/// An unloaded game: the one linked in, whatever a project says.
+	#[cfg(not(feature = "hot_reload"))]
+	fn closed(_module: Option<&str>) -> Option<Self> { Some(Self { api: None }) }
 
 	/// Calls one boundary entry point, containing anything it throws.
 	///
@@ -135,7 +148,7 @@ impl Game {
 impl Game {
 	/// Loads the module, checks its ABI and runs `init`.
 	fn swap_in(&mut self, world: &mut World) -> Result {
-		let module = Module::from_name(MODULE_NAME)?;
+		let module = Module::from_name(&self.name)?;
 		let api = Self::resolve(&module)?;
 
 		self.module = Some(module);
@@ -148,7 +161,7 @@ impl Game {
 		// at. @ref `Cvars::forget_module`.
 		world.cvars.attribute(Owner::Module);
 
-		info!(reloads = world.reloads, "game module swapped in");
+		info!(module = self.name, reloads = world.reloads, "game module swapped in");
 		self.call("init", api.init, world);
 		settle(world);
 

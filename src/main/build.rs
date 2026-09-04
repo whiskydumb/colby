@@ -2,8 +2,8 @@
 //!
 //! Two jobs. It hands the runner the few facts it cannot work out for itself -
 //! which profile it was built into, which `RUSTFLAGS` produced it, where the
-//! workspace is - so that the rebuild it launches on a source change matches
-//! the build it is running. And under `-Cprefer-dynamic` it copies the
+//! engine checkout is - so that the rebuild it launches on a source change
+//! matches the build it is running. And under `-Cprefer-dynamic` it copies the
 //! toolchain's `std-*.dll` next to the executable, because with a dynamically
 //! linked std the loader needs that file before `main` exists and cargo does
 //! not place it anywhere.
@@ -23,7 +23,7 @@ fn main() {
 	// including any that contain a space.
 	let rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
 	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-	let workspace = manifest
+	let engine = manifest
 		.parent()
 		.and_then(Path::parent)
 		.expect("the package sits two directories below the workspace root");
@@ -31,7 +31,7 @@ fn main() {
 	let profile = profile_dir();
 
 	println!("cargo::rustc-env=COLBY_ENCODED_RUSTFLAGS={rustflags}");
-	println!("cargo::rustc-env=COLBY_WORKSPACE={}", workspace.display());
+	println!("cargo::rustc-env=COLBY_ENGINE={}", engine.display());
 	println!(
 		"cargo::rustc-env=COLBY_PROFILE={}",
 		profile

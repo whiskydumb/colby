@@ -3,13 +3,16 @@
 **/*.rs.bk
 
 # what running the engine leaves behind. The console archive is a user file
-# rather than a derived one, which is why it stays in the workspace root and out
-# of target/: cargo clean should not take somebody's settings. Saved scenes are
-# the same kind of thing and are there for the same reason. colby.png is what
-# `just shot` writes when nobody names a path.
-/cvars.cfg
+# rather than a derived one, which is why it stays in the project root and out
+# of the derived directories: cargo clean should not take somebody's settings.
+# Saved scenes are the same kind of thing and are there for the same reason.
+# colby.png is what `just shot` writes when nobody names a path. `.colby/` is
+# what the engine derives for a project - the compiled assets - and
+# `just clean` takes it.
+/settings.cfg
 /colby.png
 /saves/
+/.colby/
 
 # secrets and local overrides
 .env

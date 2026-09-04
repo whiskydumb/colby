@@ -68,7 +68,7 @@ release:
 dist:
     cargo build --profile dist {{locked}}
 
-# compile assets/ into target/assets/
+# compile the project's assets/ into its .colby/assets/
 #
 # @note: the runner does this for itself, on a timer, so `just hot` and
 # `just shot` never need it. It is here for building a tree without starting the
@@ -118,6 +118,7 @@ setup:
     rustup toolchain install {{nightly}} --profile minimal --component rustfmt
     cargo install typos-cli --locked
 
-# remove build artifacts
+# remove build artifacts, the compiled assets among them
 clean:
     cargo clean
+    if (Test-Path .colby) { Remove-Item -Recurse -Force .colby }

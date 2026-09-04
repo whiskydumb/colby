@@ -10,9 +10,9 @@
 //! facts only a build script can know - @ref [`Build`] - and everything below
 //! takes them as values. That is what lets a second executable link the same
 //! runtime, and what keeps a test from depending on where the checkout happens
-//! to be. The two asset-tree overrides in [`assets`] are the one thing still
-//! read from the environment, and they go when a project replaces the
-//! checkout as the thing being run.
+//! to be. Everything on disk that is not the engine's own is a project's -
+//! @ref [`Project`] - named by `--project` or found in the working directory,
+//! and nothing in here reads the environment at all.
 //!
 //! **One state, one stand-up, one parser.** [`Runtime`] is the state a world
 //! needs to run and [`Runtime::open`] the one order it is brought up in, with
@@ -49,12 +49,13 @@ mod step;
 #[cfg(feature = "hot_reload")]
 mod watch;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+pub use colby_asset::Project;
 use colby_core::{Result, log};
 
 pub use crate::{
-	launch::Launch,
+	launch::{Launch, Run},
 	net::Standing,
 	runtime::{Front, Runtime, VIEWPORT},
 };
@@ -65,16 +66,17 @@ pub use crate::{
 /// only thing that knows them is the build script of whichever executable
 /// links this runtime: which profile it was built into, which `RUSTFLAGS`
 /// produced it, which cargo built it, which package it is, and where the
-/// workspace was. The runtime needs them for exactly one thing - rebuilding
-/// the game module so that it matches the build that is running - and takes
-/// them as a value so that nothing in here is baked in.
+/// engine checkout was. The runtime needs them for exactly one thing -
+/// rebuilding the game module so that it matches the build that is running -
+/// and takes them as a value so that nothing in here is baked in.
 #[derive(Clone, Debug)]
 pub struct Build {
-	/// The workspace directory the executable was built from.
+	/// The engine checkout the executable was built from.
 	///
-	/// Everything that reads a tree of files - the game module's watcher, the
-	/// asset compiler, the console archive, the saves - resolves against this.
-	pub workspace: PathBuf,
+	/// What a rebuild of a game module runs in, and what the watcher looks at
+	/// for edits beneath the game that need a restart. Nothing a project owns
+	/// resolves against this: assets, saves and config are the project's.
+	pub engine: PathBuf,
 
 	/// The cargo that built the executable, as a path or a name on `PATH`.
 	pub cargo: String,
@@ -100,37 +102,46 @@ pub struct Build {
 ///
 /// @param arguments - the command line, without the program's own name
 /// @param build - what the build script of the executable knew
-pub fn run(arguments: &[String], build: Build) -> Result {
+/// @param here - the working directory, which is where the project is looked
+/// for when `--project` names none
+pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 	log::init()?;
 
-	let launch = Launch::parse(arguments);
+	let Launch { run, project } = Launch::parse(arguments);
 
 	// a two-endpoint run before anything else, including the check that this
-	// process is laid out for hot-reload: it loads no module, opens no window
-	// and opens no socket. The wire between the two is a pair of inboxes, so
-	// the answer is the same on a machine with a network and one without, and
-	// in any build. @ref `crate::link`.
-	if let Launch::Link(steps) = launch {
+	// process is laid out for hot-reload and the project itself: it loads no
+	// module, opens no window, opens no socket and reads no file. The wire
+	// between the two is a pair of inboxes, so the answer is the same on a
+	// machine with a network and one without, and in any build. @ref
+	// `crate::link`.
+	if let Run::Link(steps) = run {
 		return link::run(steps);
 	}
 
+	// the project before anything that touches a file, because every file
+	// hangs off it: the one named, or the one in the working directory - the
+	// rule a project manager's `--path` follows, and the branch a launcher
+	// takes when neither is there.
+	let project = Project::open(project.as_deref().unwrap_or(here))?;
+
 	prepare()?;
 
-	let result = match launch {
+	let result = match run {
 		// answered above, before `prepare`; here so that the match is
 		// exhaustive rather than wildcarded.
-		| Launch::Link(_) => Ok(()),
+		| Run::Link(_) => Ok(()),
 		// a screenshot never opens a window, so it takes its own way out; and
 		// neither does a recording, which additionally opens no device, because
 		// what it writes has to be the same file on a machine with speakers and
 		// one without.
-		| Launch::Shot(path) => shot::take(&path, &build.workspace),
-		| Launch::Record { path, steps } => record::take(&path, steps, &build.workspace),
+		| Run::Shot(path) => shot::take(&path, &project),
+		| Run::Record { path, steps } => record::take(&path, steps, &project),
 		// a socket instead of a window, which is a run rather than a build: the
 		// same executable, the same module, the same step. @ref `crate::host`.
-		| Launch::Host(port) => host::run(Front::Host(port), &build.workspace),
-		| Launch::Join(address) => host::run(Front::Join(address), &build.workspace),
-		| Launch::Window(standing) => app::run(build, standing),
+		| Run::Host(port) => host::run(Front::Host(port), &project),
+		| Run::Join(address) => host::run(Front::Join(address), &project),
+		| Run::Window(standing) => app::run(build, standing, &project),
 	};
 
 	finish();

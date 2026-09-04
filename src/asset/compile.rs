@@ -51,11 +51,13 @@ use crate::{
 /// The directory under a workspace that holds editable sources.
 pub const SOURCE_DIR: &str = "assets";
 
-/// Where compiled assets go, relative to a workspace.
+/// Where compiled assets go, relative to a project.
 ///
-/// Under `target/` because they are derived: `cargo clean` should take them,
-/// and nothing should ever be tempted to edit one.
-pub const OUTPUT_DIR: [&str; 2] = ["target", "assets"];
+/// Under `.colby/` because they are derived and a project is not a cargo
+/// workspace: what the engine makes for itself lives in a directory the engine
+/// owns and version control ignores, and nothing should ever be tempted to
+/// edit one. `just clean` takes it along with `target/`.
+pub const OUTPUT_DIR: [&str; 2] = [".colby", "assets"];
 
 /// What a `.png` has to be called to be compiled as numbers rather than color.
 ///
@@ -419,11 +421,11 @@ impl Report {
 	pub fn is_quiet(&self) -> bool { self.compiled.is_empty() && self.removed.is_empty() }
 }
 
-/// Where a workspace keeps its editable assets.
+/// Where a project keeps its editable assets.
 #[must_use]
 pub fn source_root(workspace: &Path) -> PathBuf { workspace.join(SOURCE_DIR) }
 
-/// Where a workspace keeps its compiled assets.
+/// Where a project keeps its compiled assets.
 #[must_use]
 pub fn output_root(workspace: &Path) -> PathBuf {
 	OUTPUT_DIR
@@ -1310,8 +1312,8 @@ f 4 1 5 8
 		assert_eq!(source_root(workspace), workspace.join("assets"), "sources are edited");
 		assert_eq!(
 			output_root(workspace),
-			workspace.join("target").join("assets"),
-			"and outputs are derived, so they live under target"
+			workspace.join(".colby").join("assets"),
+			"and outputs are derived, so they live in the engine's own directory"
 		);
 	}
 

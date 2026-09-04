@@ -8,14 +8,14 @@
 //! [`console::run`] a config file does, which is what makes the feature usable
 //! today instead of after the next two subsystems.
 //!
-//! The way out is `cvars.cfg` in the workspace, written when the process stops
+//! The way out is the project's `settings.cfg`, written when the process stops
 //! and read when it starts. It is a config script, not a serialization format:
 //! the same parser reads it, it is meant to be edited by hand, and colby gains
 //! no dependency for it. Writing it as JSON would have cost one.
 //!
-//! @note: `--shot` has no console and does not read `cvars.cfg`. A screenshot
-//! is meant to be the same picture on every machine, and a file holding
-//! whatever someone last typed is the opposite of that.
+//! @note: `--shot` has no console and does not read `settings.cfg`. A
+//! screenshot is meant to be the same picture on every machine, and a file
+//! holding whatever someone last typed is the opposite of that.
 
 use std::{
 	fs,
@@ -34,9 +34,6 @@ use colby_core::{
 	},
 	error, info, warn,
 };
-
-/// The file archived variables are kept in.
-const ARCHIVE: &str = "cvars.cfg";
 
 /// The name `script.status` waits under.
 pub(crate) const SCRIPT_STATUS: &str = "script.status";
@@ -111,13 +108,14 @@ pub(crate) struct Console {
 impl Console {
 	/// Registers the host's commands, reads the config, and starts listening.
 	///
-	/// Called after the game module is loaded, so that a `cvars.cfg` naming a
-	/// variable the *game* registers finds it there.
+	/// Called after the game module is loaded, so that a `settings.cfg` naming
+	/// a variable the *game* registers finds it there.
 	///
 	/// @param world - the world whose table everything is registered into
-	/// @param workspace - where the config is kept
-	pub(crate) fn open(world: &mut World, workspace: &Path) -> Self {
-		let archive = workspace.join(ARCHIVE);
+	/// @param archive - the file the archived variables are kept in, which is
+	/// the project's
+	pub(crate) fn open(world: &mut World, archive: &Path) -> Self {
+		let archive = archive.to_owned();
 
 		if archive.is_file() {
 			console::exec(world, &archive);
@@ -182,7 +180,7 @@ pub(crate) fn install(world: &mut World) {
 		.command("echo", echo, "print the rest of the line");
 	world
 		.cvars
-		.command(EXEC, console::defer, "run a config file, relative to the workspace");
+		.command(EXEC, console::defer, "run a config file, relative to the project");
 	world
 		.cvars
 		.command("reset", reset, "put a variable back to the value its code registered");
@@ -697,7 +695,7 @@ unsafe extern "C-unwind" fn echo(_world: *mut World, args: *const Args) {
 /// `exec <path>` - runs a config file.
 ///
 /// Waits for the frame rather than answering inside the line, because the
-/// path is resolved against the workspace and the workspace is the runtime's
+/// path is resolved against the project and the project is the runtime's
 /// rather than the world's: `exec scripts/demo.cfg` has to mean the same thing
 /// wherever the executable was started from, and a command is handed nothing
 /// that says where that is. @ref [`serve`], which takes it up.
@@ -711,8 +709,8 @@ pub(crate) const EXEC: &str = "exec";
 /// file when the frame gets to it.
 ///
 /// @param world - where the lines wait, and what the file is run against
-/// @param workspace - what a relative path is resolved against
-pub(crate) fn serve(world: &mut World, workspace: &Path) {
+/// @param root - the project directory a relative path is resolved against
+pub(crate) fn serve(world: &mut World, root: &Path) {
 	for asked in take(world, &[EXEC]) {
 		let Some(name) = asked.words.first() else {
 			warn!("exec takes the path of a config file");
@@ -724,7 +722,7 @@ pub(crate) fn serve(world: &mut World, workspace: &Path) {
 		let path = if path.is_absolute() {
 			path.to_owned()
 		} else {
-			workspace.join(path)
+			root.join(path)
 		};
 
 		console::exec(world, &path);

@@ -112,7 +112,7 @@ impl Watch {
 
 		let fixed = FIXED_CRATES
 			.iter()
-			.map(|crate_dir| facts.workspace.join("src").join(crate_dir))
+			.map(|crate_dir| facts.engine.join("src").join(crate_dir))
 			.collect();
 
 		info!(sources = ?sources, artifact = ?artifact, "watching the game crate");
@@ -231,7 +231,7 @@ impl Watch {
 		let spawned = Command::new(&self.facts.cargo)
 			.args(["build", "--workspace", "--exclude", self.facts.package.as_str()])
 			.args(["--profile", self.facts.profile.as_str()])
-			.current_dir(&self.facts.workspace)
+			.current_dir(&self.facts.engine)
 			.env("CARGO_ENCODED_RUSTFLAGS", &self.facts.rustflags)
 			.spawn();
 
