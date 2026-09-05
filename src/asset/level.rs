@@ -10,6 +10,18 @@
 //! keep them agreeing is a test that runs one into the other - which needs
 //! both in front of it.
 //!
+//! **A plain field is read and written through the record's own table.** A
+//! body's mass, a joint's stiffness, an entity's position: each is a row of a
+//! [`Field`] table, and the key in the text is the field's name - `position`,
+//! `rotation`, `max_impulse`, `shape.radius` as a `radius` inside a `shape`.
+//! Nothing here lists what a body's fields are; a field added to the table is
+//! a key here the same day, read and written and refused when misspelled. What
+//! is still read and written by hand is what a table cannot spell: a
+//! *reference*, which the text names and the file numbers, and the three
+//! things whose spelling is older than the tables - a body's layers as a
+//! number and a list, a joint's two anchors as one list, and `position`
+//! standing for the rest of a body's own place.
+//!
 //! **A source names things and the file numbers them.** A body says
 //! `"entity": "crate"` and a joint says `"first": "crate"`, because a person
 //! writing a scene knows what things are called and does not know what order
@@ -23,13 +35,17 @@
 //! alternative is `"whereabouts": [1, 2, 3]` doing nothing at all while
 //! looking exactly like it works - a field somebody guessed at, or the one
 //! they meant with a letter out of place. A warning would say so once and
-//! scroll away.
+//! scroll away. The same goes for a value of the wrong kind: a mass that is a
+//! word is refused, not read as the default. The text has no version, so a
+//! file written with the keys the format had before the tables - `at`,
+//! `turn`, `max impulse` - is refused naming the key, with the new word beside
+//! it.
 //!
 //! ```text
 //! {
 //!   "stage":    { "camera": { "position": [0, 2, 5], "target": [0, 0, 0] } },
-//!   "entities": [ { "name": "crate", "at": [0, 4, 0], "mesh": "cube" },
-//!                 { "name": "lid", "parent": "crate", "at": [0, 0.6, 0], "mesh": "cube" } ],
+//!   "entities": [ { "name": "crate", "position": [0, 4, 0], "mesh": "cube" },
+//!                 { "name": "lid", "parent": "crate", "position": [0, 0.6, 0], "mesh": "cube" } ],
 //!   "bodies":   [ { "entity": "crate", "kind": "dynamic",
 //!                   "shape": { "kind": "box", "extents": [0.5, 0.5, 0.5] } } ],
 //!   "joints":   [ { "kind": "rope", "first": "crate", "length": 3.0,
@@ -39,10 +55,11 @@
 //! ```
 //!
 //! **An entity hangs off another by name.** `"parent": "crate"` on the lid
-//! above makes its `at`, `turn` and `scale` its place inside the crate rather
-//! than in the world, and it goes wherever the crate goes. A parent nothing
-//! answers to, an entity hanging off itself, and a loop are each an error
-//! naming the entity; the order the two are written in does not matter.
+//! above makes its `position`, `rotation` and `scale` its place inside the
+//! crate rather than in the world, and it goes wherever the crate goes. A
+//! parent nothing answers to, an entity hanging off itself, and a loop are
+//! each an error naming the entity; the order the two are written in does not
+//! matter.
 //!
 //! **A pose is a record of its own and an entity names it**, rather than an
 //! entity naming a skeleton directly. The two are not the same claim: a model
@@ -59,8 +76,10 @@
 use colby_core::{
 	Result,
 	abi::{
-		BodyKind, Camera, Joint, JointKind, Layers, ShapeKind, Transform,
-		scene::{Form, Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
+		Body, BodyId, BodyKind, Camera, EntityId, Field, Joint, JointKind, Layers, MeshId,
+		Renderable, Shape, Transform,
+		field::{self, Kind},
+		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
 	err,
 	glam::{Quat, Vec3},
@@ -74,6 +93,48 @@ use crate::{
 /// The extension a scene source is written with.
 pub const EXTENSION: &str = "scene";
 
+/// The body a source describes when it says nothing about one.
+///
+/// A static unit box - and a sphere's radius of half a unit beside it, which
+/// a live body's default does not carry. It used to be that a missing `shape`
+/// gave a radius of nothing and an empty one gave half a unit, and nothing
+/// could see the difference until the writer had to tell the two apart; the
+/// reader was made to agree with itself, and this is where it agrees.
+const BLANK_BODY: Body = {
+	let mut body = Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY);
+	body.shape.radius = 0.5;
+
+	body
+};
+
+/// The joint a source describes when it says nothing about one: a rope of
+/// length one, holding nothing, which is not quite [`Joint::default`] either.
+const BLANK_JOINT: Joint = {
+	let mut joint =
+		Joint::new(JointKind::Rope, BodyId::NONE, BodyId::NONE, (Vec3::ZERO, Vec3::ZERO));
+	joint.length = 1.0;
+
+	joint
+};
+
+/// The two layer fields, which the text spells by hand as `layer` and
+/// `collides`: a number and a list of numbers rather than two bit masks,
+/// because that is what a person means.
+const LAYER_FIELDS: &[&str] = &["layers.layer", "layers.mask"];
+
+/// The two anchors, which the text spells by hand as one `anchors` list.
+const ANCHOR_FIELDS: &[&str] = &["first_anchor", "second_anchor"];
+
+/// The keys the format had before a plain field's key became its field name,
+/// so that a file written with one is refused with the new word beside it.
+const RENAMED: &[(&str, &str)] = &[
+	("at", "position"),
+	("turn", "rotation"),
+	("max impulse", "max_impulse"),
+	("max torque", "max_torque"),
+	("fov", "fov_y"),
+];
+
 /// Reads a scene out of the text somebody wrote.
 ///
 /// @param text - the whole `.scene` file
@@ -81,8 +142,9 @@ pub const EXTENSION: &str = "scene";
 ///
 /// # Errors
 ///
-/// If the text is not JSON, holds a field this build does not know, names
-/// something nothing answers to, or names one thing twice.
+/// If the text is not JSON, holds a field this build does not know or a value
+/// of the wrong kind, names something nothing answers to, or names one thing
+/// twice.
 pub fn import(text: &str) -> Result<SceneData> {
 	let root = json::parse(text)?;
 	fields(&root, &["stage", "entities", "bodies", "joints", "poses"], "the scene")?;
@@ -112,10 +174,11 @@ pub fn import(text: &str) -> Result<SceneData> {
 	})
 }
 
-/// Refuses a field this build does not know.
+/// Refuses a field this build does not know, in a flat object.
 ///
 /// Shared with the project file, which follows the same rule for the same
-/// reason. @ref `crate::project`.
+/// reason. @ref `crate::project`. A record with a table behind it goes
+/// through [`check`] instead, which knows the table.
 ///
 /// @param value - the object to check, or nothing
 /// @param known - every field that belongs
@@ -123,7 +186,7 @@ pub fn import(text: &str) -> Result<SceneData> {
 pub(crate) fn fields(value: &Value, known: &[&str], what: &str) -> Result<()> {
 	for (name, _) in value.as_object() {
 		if !known.contains(&name.as_str()) {
-			return Err(err!(Asset("{what} has no field called {name}")));
+			return Err(unknown(what, name));
 		}
 	}
 
@@ -136,35 +199,17 @@ fn stage(value: Option<&Value>) -> Result<Stage> {
 		return Ok(Stage::DEFAULT);
 	};
 
-	fields(value, &["camera", "clear", "light", "ambient", "gravity"], "a stage")?;
+	check(value, &[names(Stage::FIELDS, &[])], &["camera"], "a stage")?;
 
-	Ok(Stage {
-		camera: camera(value.get("camera"))?,
-		clear: vector(value.get("clear"), Stage::DEFAULT.clear),
-		light: vector(value.get("light"), Stage::DEFAULT.light),
-		ambient: vector(value.get("ambient"), Stage::DEFAULT.ambient),
-		gravity: vector(value.get("gravity"), Stage::DEFAULT.gravity),
-		time: 0.0,
-		steps: 0,
-	})
-}
+	let mut stage = Stage::DEFAULT;
+	read(&mut stage, value, Stage::FIELDS, "a stage")?;
 
-/// Where the camera looks from.
-fn camera(value: Option<&Value>) -> Result<Camera> {
-	let Some(value) = value else {
-		return Ok(Camera::DEFAULT);
-	};
+	if let Some(lens) = value.get("camera") {
+		check(lens, &[names(Camera::FIELDS, &[])], &[], "a camera")?;
+		read(&mut stage.camera, lens, Camera::FIELDS, "a camera")?;
+	}
 
-	fields(value, &["position", "target", "up", "fov", "near", "far"], "a camera")?;
-
-	Ok(Camera {
-		position: vector(value.get("position"), Camera::DEFAULT.position),
-		target: vector(value.get("target"), Camera::DEFAULT.target),
-		up: vector(value.get("up"), Camera::DEFAULT.up),
-		fov_y: number(value.get("fov"), Camera::DEFAULT.fov_y),
-		near: number(value.get("near"), Camera::DEFAULT.near),
-		far: number(value.get("far"), Camera::DEFAULT.far),
-	})
+	Ok(stage)
 }
 
 /// Every pose the source declares.
@@ -194,13 +239,18 @@ fn poses(value: Option<&Value>) -> Result<Vec<Posed>> {
 }
 
 /// Every entity the source stands, with the pose that moves it looked up.
+///
+/// Its place comes through the transform's table and its tint through the
+/// renderable's; the mesh, the material and the pose are references, and are
+/// read by name.
 fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 	let mut things: Vec<Thing> = Vec::new();
 
 	for (index, entry) in listed(value).iter().enumerate() {
-		fields(
+		check(
 			entry,
-			&["name", "parent", "at", "turn", "scale", "mesh", "material", "color", "pose"],
+			&[names(Transform::FIELDS, &[]), names(Renderable::FIELDS, &[])],
+			&["name", "parent"],
 			"an entity",
 		)?;
 
@@ -222,14 +272,20 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			)?
 		};
 
+		let mut transform = Transform::IDENTITY;
+		read(&mut transform, entry, Transform::FIELDS, "an entity")?;
+
+		let mut look = Renderable::NOTHING;
+		read(&mut look, entry, Renderable::FIELDS, "an entity")?;
+
 		things.push(Thing {
 			name,
 			slot: count(index, "a scene's records")?,
 			generation: 1,
-			transform: transform(entry)?,
+			transform,
 			mesh: text(entry.get("mesh")),
 			material: text(entry.get("material")),
-			color: vector(entry.get("color"), Vec3::ONE),
+			color: look.color,
 			pose,
 			parent: NO_INDEX,
 		});
@@ -293,30 +349,18 @@ fn hang(things: &mut [Thing], value: Option<&Value>) -> Result {
 }
 
 /// Every body, with the entity it drives looked up by name.
+///
+/// The plain fields come through the body's table, over [`BLANK_BODY`]; the
+/// entity and the mesh of a mesh shape are references and are read by name,
+/// and the layers are read as the number and the list a person writes.
 fn bodies(value: Option<&Value>, things: &[Thing]) -> Result<Vec<Solid>> {
 	let mut solids: Vec<Solid> = Vec::new();
 
 	for (index, entry) in listed(value).iter().enumerate() {
-		fields(
+		check(
 			entry,
-			&[
-				"name",
-				"entity",
-				"kind",
-				"shape",
-				"at",
-				"turn",
-				"scale",
-				"velocity",
-				"angular",
-				"mass",
-				"restitution",
-				"friction",
-				"sensor",
-				"weightless",
-				"layer",
-				"collides",
-			],
+			&[names(Transform::FIELDS, &[]), names(Body::FIELDS, LAYER_FIELDS)],
+			&["name", "entity", "layer", "collides"],
 			"a body",
 		)?;
 
@@ -338,91 +382,92 @@ fn bodies(value: Option<&Value>, things: &[Thing]) -> Result<Vec<Solid>> {
 			)?
 		};
 
-		// a body with an entity and no place of its own stands where the
-		// entity does, which is what a person writing one means by leaving it
-		// out.
-		let placed = things
-			.get(usize::try_from(thing).unwrap_or(usize::MAX))
-			.map_or(Transform::IDENTITY, |it| it.transform);
+		let mut body = BLANK_BODY;
+		read(&mut body, entry, Body::FIELDS, "a body")?;
+		body.layers = layers(entry)?;
+		body.transform = standing(entry, things, thing)?;
 
-		solids.push(Solid {
-			name,
-			slot: count(index, "a scene's records")?,
-			generation: 1,
-			kind: body_kind(entry.get("kind"))?,
-			shape: shape(entry.get("shape"))?,
-			transform: if entry.get("at").is_some() {
-				transform(entry)?
-			} else {
-				placed
-			},
-			velocity: vector(entry.get("velocity"), Vec3::ZERO),
-			angular: vector(entry.get("angular"), Vec3::ZERO),
-			mass: number(entry.get("mass"), 1.0),
-			restitution: number(entry.get("restitution"), 0.2),
-			friction: number(entry.get("friction"), 0.5),
-			sensor: flag(entry.get("sensor")),
-			weightless: flag(entry.get("weightless")),
-			sleeping: false,
-			layers: layers(entry)?,
-			thing,
-		});
+		let mesh = text(
+			entry
+				.get("shape")
+				.and_then(|shape| shape.get("mesh")),
+		);
+		let mut solid = Solid::of(&body, mesh, thing);
+		solid.name = name;
+		solid.slot = count(index, "a scene's records")?;
+		solid.generation = 1;
+
+		solids.push(solid);
 	}
 
 	Ok(solids)
 }
 
+/// Where a body stands: where it says, or where its entity does.
+///
+/// A body with an entity and no `position` of its own stands where the entity
+/// does, which is what a person writing one means by leaving it out. It is
+/// the presence of `position` that decides, and a rotation or a scale written
+/// without one is refused rather than quietly read against nothing.
+///
+/// @param entry - the body's object
+/// @param things - the entities, read
+/// @param thing - which of them it drives, or [`NO_INDEX`]
+fn standing(entry: &Value, things: &[Thing], thing: u32) -> Result<Transform> {
+	if entry.get("position").is_some() {
+		let mut own = Transform::IDENTITY;
+		read(&mut own, entry, Transform::FIELDS, "a body")?;
+
+		return Ok(own);
+	}
+
+	if entry.get("rotation").is_some() || entry.get("scale").is_some() {
+		return Err(err!(Asset(
+			"a body turned or sized on its own has to say where it is: there is no position"
+		)));
+	}
+
+	Ok(things
+		.get(usize::try_from(thing).unwrap_or(usize::MAX))
+		.map_or(Transform::IDENTITY, |it| it.transform))
+}
+
 /// Every joint, with both of its bodies looked up by name.
+///
+/// The plain fields come through the joint's table, over [`BLANK_JOINT`]; the
+/// two bodies are references read by name, and the anchors are one list.
 fn joints(value: Option<&Value>, solids: &[Solid]) -> Result<Vec<Link>> {
 	let mut links: Vec<Link> = Vec::new();
 
 	for (index, entry) in listed(value).iter().enumerate() {
-		fields(
+		check(
 			entry,
-			&[
-				"name",
-				"kind",
-				"first",
-				"second",
-				"anchors",
-				"axis",
-				"length",
-				"stiffness",
-				"damping",
-				"max impulse",
-				"max torque",
-				"collide",
-			],
+			&[names(Joint::FIELDS, ANCHOR_FIELDS)],
+			&["name", "first", "second", "anchors"],
 			"a joint",
 		)?;
 
 		let name = text(entry.get("name"));
 		once(links.iter().any(|it| it.name == name), &name, "joint")?;
 
+		let mut joint = BLANK_JOINT;
+		read(&mut joint, entry, Joint::FIELDS, "a joint")?;
+
 		let anchors = entry.get("anchors").cloned().unwrap_or_default();
 		let anchors = anchors.as_array();
+		joint.first_anchor = triple(anchors.first(), Vec3::ZERO, "a joint", "anchors")?;
+		joint.second_anchor = triple(anchors.get(1), Vec3::ZERO, "a joint", "anchors")?;
 
-		links.push(Link {
-			name,
-			slot: count(index, "a scene's records")?,
-			generation: 1,
-			kind: joint_kind(entry.get("kind"))?,
-			first: held(entry.get("first"), solids)?,
-			second: held(entry.get("second"), solids)?,
-			first_anchor: vector(anchors.first(), Vec3::ZERO),
-			second_anchor: vector(anchors.get(1), Vec3::ZERO),
-			axis: vector(entry.get("axis"), Vec3::Y),
-			length: number(entry.get("length"), 1.0),
-			// a weld written by hand holds the angle the two bodies are
-			// written at, which is no relative rotation at all: they are
-			// exactly where the file put them.
-			rest: Quat::IDENTITY,
-			stiffness: number(entry.get("stiffness"), Joint::RIGID),
-			damping: number(entry.get("damping"), Joint::DAMPING),
-			max_impulse: number(entry.get("max impulse"), Joint::NO_CEILING),
-			max_torque: number(entry.get("max torque"), Joint::NO_CEILING),
-			collide: flag(entry.get("collide")),
-		});
+		let mut link = Link::of(
+			&joint,
+			held(entry.get("first"), solids)?,
+			held(entry.get("second"), solids)?,
+		);
+		link.name = name;
+		link.slot = count(index, "a scene's records")?;
+		link.generation = 1;
+
+		links.push(link);
 	}
 
 	Ok(links)
@@ -442,65 +487,6 @@ fn held(value: Option<&Value>, solids: &[Solid]) -> Result<u32> {
 			.ok_or_else(|| err!(Asset("a joint holds {name}, and no body is that")))?,
 		"a scene's records",
 	)
-}
-
-/// A transform out of `at`, `turn` and `scale`.
-fn transform(value: &Value) -> Result<Transform> {
-	let turn = value.get("turn").cloned().unwrap_or_default();
-	let turn = turn.as_array();
-	let rotation = if turn.is_empty() {
-		Quat::IDENTITY
-	} else {
-		Quat::from_xyzw(
-			number(turn.first(), 0.0),
-			number(turn.get(1), 0.0),
-			number(turn.get(2), 0.0),
-			number(turn.get(3), 1.0),
-		)
-	};
-
-	if !rotation.is_normalized() {
-		return Err(err!(Asset("a turn has to be a unit quaternion, xyzw")));
-	}
-
-	Ok(Transform {
-		position: vector(value.get("at"), Vec3::ZERO),
-		rotation,
-		scale: vector(value.get("scale"), Vec3::ONE),
-	})
-}
-
-/// What a body is shaped like.
-fn shape(value: Option<&Value>) -> Result<Form> {
-	// the same half unit an empty `shape` gives, and not nothing. A box does
-	// not use a radius, so the two were invisibly different for as long as
-	// nothing wrote a scene back out; a writer that has to tell them apart has
-	// to write `"shape": {}` for the second, which is a thing nobody should
-	// have to read. @ref `export`.
-	let Some(value) = value else {
-		return Ok(Form {
-			kind: ShapeKind::Box,
-			radius: 0.5,
-			extents: Vec3::splat(0.5),
-			mesh: String::new(),
-		});
-	};
-
-	fields(value, &["kind", "radius", "extents", "mesh"], "a shape")?;
-
-	let kind = match text(value.get("kind")).as_str() {
-		| "" | "box" => ShapeKind::Box,
-		| "sphere" => ShapeKind::Sphere,
-		| "mesh" => ShapeKind::Mesh,
-		| other => return Err(err!(Asset("{other} is not a shape a body can be"))),
-	};
-
-	Ok(Form {
-		kind,
-		radius: number(value.get("radius"), 0.5),
-		extents: vector(value.get("extents"), Vec3::splat(0.5)),
-		mesh: text(value.get("mesh")),
-	})
 }
 
 /// Which layers a body is on and which it interacts with.
@@ -531,25 +517,240 @@ fn layers(value: &Value) -> Result<Layers> {
 	Ok(Layers::new(Layers::bit(on), mask))
 }
 
-/// What the solver may do with a body.
-fn body_kind(value: Option<&Value>) -> Result<BodyKind> {
-	match text(value).as_str() {
-		| "" | "static" => Ok(BodyKind::Static),
-		| "kinematic" => Ok(BodyKind::Kinematic),
-		| "dynamic" => Ok(BodyKind::Dynamic),
-		| other => Err(err!(Asset("{other} is not a kind of body"))),
+// -------------------------------------------------------------------------
+// a record's plain fields, through its table
+// -------------------------------------------------------------------------
+
+/// The keys a table gives a record, dotted for a field inside another.
+///
+/// @param table - the record's table
+/// @param skipped - the plain fields the text spells by hand under other
+/// keys, which are therefore not keys
+fn names<T>(table: &[Field<T>], skipped: &[&str]) -> Vec<&'static str> {
+	table
+		.iter()
+		.map(|field| field.name)
+		.filter(|name| !skipped.contains(name))
+		.collect()
+}
+
+/// Refuses a field this build does not know, anywhere in a record.
+///
+/// A key is known when a table names it, when it is read by hand, or when it
+/// is the head of a dotted name - `shape` for `shape.radius` - in which case
+/// what stands under it is an object and its keys are checked against the
+/// tails.
+///
+/// @param value - the record's object
+/// @param tables - the keys each of the record's tables gives it
+/// @param hand - the keys read by hand beside the tables
+/// @param what - what to call the record in a message
+fn check(value: &Value, tables: &[Vec<&'static str>], hand: &[&str], what: &str) -> Result<()> {
+	for (key, held) in value.as_object() {
+		let key = key.as_str();
+
+		if hand.contains(&key) || tables.iter().any(|names| names.contains(&key)) {
+			continue;
+		}
+
+		let tails: Vec<&str> = tables
+			.iter()
+			.flat_map(|names| names.iter())
+			.filter_map(|name| name.strip_prefix(key)?.strip_prefix('.'))
+			.collect();
+
+		if tails.is_empty() {
+			return Err(unknown(what, key));
+		}
+
+		if !matches!(held, Value::Object(_)) {
+			return Err(err!(Asset(
+				"{what}'s {key} is a record of its own, with {}",
+				tails.join(", ")
+			)));
+		}
+
+		for (inner, _) in held.as_object() {
+			if !tails.contains(&inner.as_str()) {
+				return Err(err!(Asset("{what} has no field called {key}.{inner}")));
+			}
+		}
+	}
+
+	Ok(())
+}
+
+/// The error for a key nothing knows, with the new word beside an old one.
+fn unknown(what: &str, key: &str) -> colby_core::Error {
+	match RENAMED.iter().find(|(old, _)| *old == key) {
+		| Some((_, now)) => err!(Asset("{what} has no field called {key}; it is {now} now")),
+		| None => err!(Asset("{what} has no field called {key}")),
 	}
 }
 
-/// Which of the four joints one is.
-fn joint_kind(value: Option<&Value>) -> Result<JointKind> {
-	match text(value).as_str() {
-		| "" | "rope" => Ok(JointKind::Rope),
-		| "weld" => Ok(JointKind::Weld),
-		| "axis" => Ok(JointKind::Axis),
-		| "ball" => Ok(JointKind::Ball),
-		| other => Err(err!(Asset("{other} is not a kind of joint"))),
+/// Reads every plain field of a record's table out of its object.
+///
+/// A field the object does not mention keeps what the record holds, which is
+/// what leaving one out means. A reference has no spelling and is read by
+/// hand beside this. A field the text spells under other keys needs no skip
+/// here: [`check`] has already refused its own name as a key, so the object
+/// cannot hold one.
+///
+/// @param record - what to read into, holding the defaults
+/// @param entry - the record's object
+/// @param table - the record's table
+/// @param what - what to call the record in a message
+fn read<T>(record: &mut T, entry: &Value, table: &[Field<T>], what: &str) -> Result<()> {
+	for field in table {
+		if field.kind.is_reference() {
+			continue;
+		}
+
+		let Some(written) = at_path(entry, field.name) else {
+			continue;
+		};
+
+		let value = parsed(written, field.kind, &field.get(record), what, field.name)?;
+
+		if !field.set(record, value) {
+			return Err(err!(Asset("{what} would not take its {}", field.name)));
+		}
 	}
+
+	Ok(())
+}
+
+/// A value nested by a dotted name: `shape.radius` is `radius` inside `shape`.
+fn at_path<'a>(entry: &'a Value, path: &str) -> Option<&'a Value> {
+	path.split('.')
+		.try_fold(entry, |value, part| value.get(part))
+}
+
+/// One written value read as the kind a field holds.
+///
+/// @param written - what the text says
+/// @param kind - what the field holds
+/// @param current - what the record holds now, which a shorter list of
+/// numbers keeps in the axes it did not mention
+/// @param what - what to call the record in a message
+/// @param name - what to call the field
+fn parsed(
+	written: &Value,
+	kind: Kind,
+	current: &field::Value,
+	what: &str,
+	name: &str,
+) -> Result<field::Value> {
+	let wrong = || err!(Asset("{what}'s {name} should be {}", kind.name()));
+
+	Ok(match kind {
+		| Kind::Bool => field::Value::Bool(written.as_bool().ok_or_else(wrong)?),
+		| Kind::Int => field::Value::Int(whole(written).ok_or_else(wrong)?),
+		| Kind::Float => field::Value::Float(written.as_f32().ok_or_else(wrong)?),
+		| Kind::Text => field::Value::Text(written.as_str().ok_or_else(wrong)?.to_owned()),
+		| Kind::Vec3 => {
+			let field::Value::Vec3(held) = *current else {
+				return Err(wrong());
+			};
+
+			field::Value::Vec3(triple(Some(written), held, what, name)?)
+		},
+		| Kind::Color => {
+			let field::Value::Color(held) = *current else {
+				return Err(wrong());
+			};
+
+			field::Value::Color(triple(Some(written), held, what, name)?)
+		},
+		| Kind::Quat => field::Value::Quat(turn(written, what, name)?),
+		| Kind::Word(words) => {
+			let word = written.as_str().ok_or_else(wrong)?;
+			let index = kind.word(word).ok_or_else(|| {
+				err!(Asset(
+					"{what} has no {name} called {word}; it is one of {}",
+					words.join(", ")
+				))
+			})?;
+
+			field::Value::Word(index)
+		},
+		| Kind::Entity | Kind::Body | Kind::Joint | Kind::Pose | Kind::Mesh | Kind::Material =>
+			return Err(wrong()),
+	})
+}
+
+/// A whole number, of either sign, or nothing for a number that is not one.
+fn whole(value: &Value) -> Option<i64> {
+	let number = value.as_f64()?;
+
+	if number < 0.0 {
+		return Value::Number(-number)
+			.as_u64()
+			.and_then(|it| i64::try_from(it).ok())
+			.map(|it| -it);
+	}
+
+	value
+		.as_u64()
+		.and_then(|it| i64::try_from(it).ok())
+}
+
+/// Three numbers, or nothing at all.
+///
+/// A shorter list keeps the default in the axes it did not mention, which is
+/// what `"color": [1, 0]` most likely meant and is in any case better than
+/// silently reading the missing one as zero. A longer one, or anything that
+/// is not a list of numbers, is refused.
+///
+/// @param value - the list, or nothing
+/// @param default - what the axes not written hold
+/// @param what - what to call the record in a message
+/// @param name - what to call the field
+fn triple(value: Option<&Value>, default: Vec3, what: &str, name: &str) -> Result<Vec3> {
+	let Some(value) = value else {
+		return Ok(default);
+	};
+
+	let wrong = || err!(Asset("{what}'s {name} should be three numbers"));
+
+	let Value::Array(parts) = value else {
+		return Err(wrong());
+	};
+
+	if parts.len() > 3 {
+		return Err(wrong());
+	}
+
+	let mut out = default.to_array();
+	for (slot, part) in out.iter_mut().zip(parts) {
+		*slot = part.as_f32().ok_or_else(wrong)?;
+	}
+
+	Ok(Vec3::from_array(out))
+}
+
+/// A rotation, as the four numbers of a unit quaternion.
+fn turn(value: &Value, what: &str, name: &str) -> Result<Quat> {
+	let Value::Array(parts) = value else {
+		return Err(err!(Asset("{what}'s {name} should be a rotation, four numbers xyzw")));
+	};
+
+	if parts.len() != 4 || parts.iter().any(|part| part.as_f32().is_none()) {
+		return Err(err!(Asset("{what}'s {name} should be a rotation, four numbers xyzw")));
+	}
+
+	let rotation = Quat::from_xyzw(
+		number(parts.first(), 0.0),
+		number(parts.get(1), 0.0),
+		number(parts.get(2), 0.0),
+		number(parts.get(3), 1.0),
+	);
+
+	if !rotation.is_normalized() {
+		return Err(err!(Asset("{what}'s {name} has to be a unit quaternion, xyzw")));
+	}
+
+	Ok(rotation)
 }
 
 /// Refuses a name something else already has.
@@ -579,31 +780,9 @@ fn text(value: Option<&Value>) -> String {
 		.to_owned()
 }
 
-/// A number field, or a default.
+/// A number, or a default.
 fn number(value: Option<&Value>, default: f32) -> f32 {
 	value.and_then(Value::as_f32).unwrap_or(default)
-}
-
-/// A flag field, or false.
-fn flag(value: Option<&Value>) -> bool { matches!(value, Some(Value::Bool(true))) }
-
-/// A three-number field, or a default.
-///
-/// A shorter list keeps the default in the axes it did not mention, which is
-/// what `"color": [1, 0]` most likely meant and is in any case better than
-/// silently reading the missing one as zero.
-fn vector(value: Option<&Value>, default: Vec3) -> Vec3 {
-	let Some(value) = value else {
-		return default;
-	};
-
-	let parts = value.as_array();
-
-	Vec3::new(
-		number(parts.first(), default.x),
-		number(parts.get(1), default.y),
-		number(parts.get(2), default.z),
-	)
 }
 
 // -------------------------------------------------------------------------
@@ -642,8 +821,6 @@ fn vector(value: Option<&Value>, default: Vec3) -> Vec3 {
 /// If the description holds a number JSON has no spelling for - an infinity or
 /// a nan, which is what a world that has blown up is full of.
 pub fn export(scene: &SceneData) -> Result<String> {
-	spellable(scene)?;
-
 	let thing_names = named(
 		&scene.things,
 		|thing| thing.name.as_str(),
@@ -672,24 +849,24 @@ pub fn export(scene: &SceneData) -> Result<String> {
 		"pose",
 	);
 
-	let things: Vec<String> = scene
+	let things = scene
 		.things
 		.iter()
 		.zip(&thing_names)
 		.map(|(thing, name)| thing_of(thing, name, &thing_names, &pose_names))
-		.collect();
-	let solids: Vec<String> = scene
+		.collect::<Result<Vec<String>>>()?;
+	let solids = scene
 		.solids
 		.iter()
 		.zip(&solid_names)
 		.map(|(solid, name)| solid_of(scene, solid, name, &thing_names))
-		.collect();
-	let links: Vec<String> = scene
+		.collect::<Result<Vec<String>>>()?;
+	let links = scene
 		.links
 		.iter()
 		.zip(&link_names)
 		.map(|(link, name)| link_of(link, name, &solid_names))
-		.collect();
+		.collect::<Result<Vec<String>>>()?;
 	let poses: Vec<String> = scene
 		.posed
 		.iter()
@@ -701,7 +878,7 @@ pub fn export(scene: &SceneData) -> Result<String> {
 	// written by whatever knows there is a next one. A trailing one is the
 	// single thing JSON refuses that is easy to write by accident.
 	let parts: Vec<String> = [
-		stage_of(&scene.stage),
+		stage_of(&scene.stage)?,
 		block("entities", &things),
 		block("bodies", &solids),
 		block("joints", &links),
@@ -762,48 +939,72 @@ fn named<T>(
 
 /// The world's own settings, or nothing if they are the ones a world starts
 /// with.
-fn stage_of(stage: &Stage) -> Option<String> {
-	let camera = &stage.camera;
-	let start = &Camera::DEFAULT;
-	let mut inner: Vec<(&str, String)> = Vec::new();
+fn stage_of(stage: &Stage) -> Result<Option<String>> {
+	let mut rows = Rows::default();
 
-	let mut lens: Vec<(&str, String)> = Vec::new();
-	put_vector(&mut lens, "position", camera.position, start.position);
-	put_vector(&mut lens, "target", camera.target, start.target);
-	put_vector(&mut lens, "up", camera.up, start.up);
-	put_number(&mut lens, "fov", camera.fov_y, start.fov_y);
-	put_number(&mut lens, "near", camera.near, start.near);
-	put_number(&mut lens, "far", camera.far, start.far);
+	put_all(
+		&mut rows,
+		&stage.camera,
+		&Camera::DEFAULT,
+		Camera::FIELDS,
+		&Writing {
+			prefix: "camera.",
+			what: "the stage",
+			skipped: &[],
+		},
+		|_| None,
+	)?;
+	put_all(
+		&mut rows,
+		stage,
+		&Stage::DEFAULT,
+		Stage::FIELDS,
+		&Writing {
+			prefix: "",
+			what: "the stage",
+			skipped: &[],
+		},
+		|_| None,
+	)?;
 
-	if !lens.is_empty() {
-		inner.push(("camera", object(&lens)));
+	if rows.is_empty() {
+		return Ok(None);
 	}
 
-	put_vector(&mut inner, "clear", stage.clear, Stage::DEFAULT.clear);
-	put_vector(&mut inner, "light", stage.light, Stage::DEFAULT.light);
-	put_vector(&mut inner, "ambient", stage.ambient, Stage::DEFAULT.ambient);
-	put_vector(&mut inner, "gravity", stage.gravity, Stage::DEFAULT.gravity);
-
-	if inner.is_empty() {
-		return None;
-	}
-
-	Some(format!("\t\"stage\": {}", object(&inner)))
+	Ok(Some(format!("\t\"stage\": {}", rows.text())))
 }
 
 /// One entity, with what it hangs off named rather than numbered.
-fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> String {
-	let mut fields: Vec<(&str, String)> = Vec::new();
+fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> Result<String> {
+	let mut rows = Rows::default();
 
-	put_text(&mut fields, "name", name);
-	put_text(&mut fields, "parent", &at_index(things, thing.parent));
-	put_place(&mut fields, &thing.transform, &Transform::IDENTITY);
-	put_text(&mut fields, "mesh", &thing.mesh);
-	put_text(&mut fields, "material", &thing.material);
-	put_vector(&mut fields, "color", thing.color, Vec3::ONE);
-	put_text(&mut fields, "pose", &at_index(poses, thing.pose));
+	rows.put_text("name", name);
+	rows.put_text("parent", &at_index(things, thing.parent));
+	put_place(&mut rows, &thing.transform, &Transform::IDENTITY, "an entity")?;
 
-	object(&fields)
+	let look = Renderable {
+		color: thing.color,
+		..Renderable::NOTHING
+	};
+	put_all(
+		&mut rows,
+		&look,
+		&Renderable::NOTHING,
+		Renderable::FIELDS,
+		&Writing {
+			prefix: "",
+			what: "an entity",
+			skipped: &[],
+		},
+		|field| match field {
+			| "mesh" => named_row("mesh", &thing.mesh),
+			| "material" => named_row("material", &thing.material),
+			| "pose" => named_row("pose", &at_index(poses, thing.pose)),
+			| _ => None,
+		},
+	)?;
+
+	Ok(rows.text())
 }
 
 /// One pose: which skeleton it wears, and nothing about where its bones are.
@@ -812,141 +1013,117 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> S
 /// source is a level rather than a moment, and thirty-five transforms a
 /// character would bury everything a person came to the file to change.
 fn pose_of(posed: &Posed, name: &str) -> String {
-	let mut fields: Vec<(&str, String)> = Vec::new();
+	let mut rows = Rows::default();
 
-	put_text(&mut fields, "name", name);
-	put_text(&mut fields, "skeleton", &posed.skeleton);
+	rows.put_text("name", name);
+	rows.put_text("skeleton", &posed.skeleton);
 
-	object(&fields)
+	rows.text()
 }
 
 /// One body, with the entity it drives named rather than numbered.
-fn solid_of(scene: &SceneData, solid: &Solid, name: &str, things: &[String]) -> String {
-	let mut fields: Vec<(&str, String)> = Vec::new();
+fn solid_of(scene: &SceneData, solid: &Solid, name: &str, things: &[String]) -> Result<String> {
+	let mut rows = Rows::default();
 
-	put_text(&mut fields, "name", name);
-
-	let driven = at_index(things, solid.thing);
-	put_text(&mut fields, "entity", &driven);
-
-	if solid.kind != BodyKind::Static {
-		fields.push(("kind", as_text(kind_word(solid.kind))));
-	}
-
-	if let Some(form) = form_of(&solid.shape) {
-		fields.push(("shape", form));
-	}
+	rows.put_text("name", name);
+	rows.put_text("entity", &at_index(things, solid.thing));
 
 	// a body with an entity and no place of its own stands where the entity
 	// does, which is what leaving it out means on the way in. So the three are
-	// written only when they differ from that - and then `at` is written even
-	// if it is nothing, because it is its presence that decides.
+	// written only when they differ from that - and then `position` is
+	// written even if it is nothing, because it is its presence that decides.
 	let standing = scene
 		.things
 		.get(usize::try_from(solid.thing).unwrap_or(usize::MAX))
 		.map_or(Transform::IDENTITY, |thing| thing.transform);
-	put_place(&mut fields, &solid.transform, &standing);
+	put_place(&mut rows, &solid.transform, &standing, "a body")?;
 
-	put_vector(&mut fields, "velocity", solid.velocity, Vec3::ZERO);
-	put_vector(&mut fields, "angular", solid.angular, Vec3::ZERO);
-	put_number(&mut fields, "mass", solid.mass, 1.0);
-	put_number(&mut fields, "restitution", solid.restitution, 0.2);
-	put_number(&mut fields, "friction", solid.friction, 0.5);
+	let body = solid.body(MeshId::NONE, EntityId::NONE);
+	put_all(
+		&mut rows,
+		&body,
+		&BLANK_BODY,
+		Body::FIELDS,
+		&Writing {
+			prefix: "",
+			what: "a body",
+			skipped: LAYER_FIELDS,
+		},
+		|field| match field {
+			| "shape.mesh" => named_row("shape.mesh", &solid.shape.mesh),
+			| "layers.layer" => layer_row(solid.layers),
+			| "layers.mask" => collides_row(solid.layers),
+			| _ => None,
+		},
+	)?;
 
-	if solid.sensor {
-		fields.push(("sensor", "true".to_owned()));
-	}
-
-	if solid.weightless {
-		fields.push(("weightless", "true".to_owned()));
-	}
-
-	put_layers(&mut fields, solid.layers);
-
-	object(&fields)
+	Ok(rows.text())
 }
 
 /// One joint, with both bodies named rather than numbered.
-fn link_of(link: &Link, name: &str, solids: &[String]) -> String {
-	let mut fields: Vec<(&str, String)> = Vec::new();
-
-	put_text(&mut fields, "name", name);
-
-	if link.kind != JointKind::Rope {
-		fields.push(("kind", as_text(joint_word(link.kind))));
+fn link_of(link: &Link, name: &str, solids: &[String]) -> Result<String> {
+	if !link.first_anchor.is_finite() || !link.second_anchor.is_finite() {
+		return Err(err!(Asset("a joint holds a number JSON cannot write")));
 	}
 
-	put_text(&mut fields, "first", &at_index(solids, link.first));
-	put_text(&mut fields, "second", &at_index(solids, link.second));
+	let mut rows = Rows::default();
 
-	if link.first_anchor != Vec3::ZERO || link.second_anchor != Vec3::ZERO {
-		fields.push((
-			"anchors",
-			format!("[{}, {}]", as_vector(link.first_anchor), as_vector(link.second_anchor)),
-		));
-	}
+	rows.put_text("name", name);
 
-	put_vector(&mut fields, "axis", link.axis, Vec3::Y);
-	put_number(&mut fields, "length", link.length, 1.0);
-	put_number(&mut fields, "stiffness", link.stiffness, Joint::RIGID);
-	put_number(&mut fields, "damping", link.damping, Joint::DAMPING);
-	put_number(&mut fields, "max impulse", link.max_impulse, Joint::NO_CEILING);
-	put_number(&mut fields, "max torque", link.max_torque, Joint::NO_CEILING);
+	let joint = link.joint(BodyId::NONE, BodyId::NONE);
+	put_all(
+		&mut rows,
+		&joint,
+		&BLANK_JOINT,
+		Joint::FIELDS,
+		&Writing {
+			prefix: "",
+			what: "a joint",
+			skipped: ANCHOR_FIELDS,
+		},
+		|field| match field {
+			| "first" => named_row("first", &at_index(solids, link.first)),
+			| "second" => named_row("second", &at_index(solids, link.second)),
+			| "first_anchor" =>
+				(link.first_anchor != Vec3::ZERO || link.second_anchor != Vec3::ZERO).then(|| {
+					(
+						"anchors",
+						format!(
+							"[{}, {}]",
+							as_vector(link.first_anchor),
+							as_vector(link.second_anchor)
+						),
+					)
+				}),
+			| _ => None,
+		},
+	)?;
 
-	if link.collide {
-		fields.push(("collide", "true".to_owned()));
-	}
-
-	object(&fields)
+	Ok(rows.text())
 }
 
-/// What a body is shaped like, or nothing if it is the shape a body has
-/// without a `shape` field at all.
-///
-/// The two used to differ - a missing `shape` gave a radius of nothing and an
-/// empty one half a unit - and a writer had to tell them apart by writing
-/// `"shape": {}`, which is a thing nobody should have to read in a file meant
-/// to be read. The reader was made to agree with itself instead. That
-/// asymmetry had been there since the format existed and nothing could see it
-/// until something had to write one back out.
-fn form_of(form: &Form) -> Option<String> {
-	let absent = form.kind == ShapeKind::Box
-		&& form.extents == Vec3::splat(0.5)
-		&& form.mesh.is_empty()
-		&& (form.radius - 0.5).abs() < f32::EPSILON;
-
-	if absent {
-		return None;
-	}
-
-	let mut fields: Vec<(&str, String)> = Vec::new();
-
-	if form.kind != ShapeKind::Box {
-		fields.push(("kind", as_text(shape_word(form.kind))));
-	}
-
-	put_number(&mut fields, "radius", form.radius, 0.5);
-	put_vector(&mut fields, "extents", form.extents, Vec3::splat(0.5));
-	put_text(&mut fields, "mesh", &form.mesh);
-
-	Some(object(&fields))
-}
-
-/// Which layers a body is on, back as the numbers a person writes.
+/// Which layer a body is on, back as the number a person writes, or nothing
+/// for the layer a body is on anyway.
 ///
 /// @note: the source says one layer per body, so a body somehow on several is
 /// written on its lowest and the rest are lost. Nothing in the engine makes
 /// one - `Layers::single` and the default both set exactly one bit - and the
 /// alternative is a format where `"layer"` is sometimes a list.
-fn put_layers(fields: &mut Vec<(&'static str, String)>, layers: Layers) {
-	let on = layers.layer.trailing_zeros().min(u32::BITS - 1);
-
-	if layers.layer != Layers::DEFAULT.layer {
-		fields.push(("layer", on.to_string()));
+fn layer_row(layers: Layers) -> Option<(&'static str, String)> {
+	if layers.layer == Layers::DEFAULT.layer {
+		return None;
 	}
 
+	let on = layers.layer.trailing_zeros().min(u32::BITS - 1);
+
+	Some(("layer", on.to_string()))
+}
+
+/// Which layers a body interacts with, as the list a person writes, or
+/// nothing for a body that meets everything.
+fn collides_row(layers: Layers) -> Option<(&'static str, String)> {
 	if layers.mask == u32::MAX {
-		return;
+		return None;
 	}
 
 	let with: Vec<String> = (0..u32::BITS)
@@ -954,73 +1131,204 @@ fn put_layers(fields: &mut Vec<(&'static str, String)>, layers: Layers) {
 		.map(|index| index.to_string())
 		.collect();
 
-	fields.push(("collides", format!("[{}]", with.join(", "))));
+	Some(("collides", format!("[{}]", with.join(", "))))
+}
+
+/// A row naming something, or nothing when there is nothing to name.
+fn named_row(name: &'static str, value: &str) -> Option<(&'static str, String)> {
+	if value.is_empty() {
+		return None;
+	}
+
+	Some((name, as_text(value)))
 }
 
 /// Where something is, if it is anywhere other than where it would be anyway.
 ///
-/// The three go together: [`import`] reads `turn` and `scale` only in the
-/// presence of `at`, so writing one of them without it would quietly lose the
-/// other two.
+/// The three go together: `position` is written even when it is nothing,
+/// because [`import`] reads a body's rotation and scale only in its presence,
+/// so writing one of them without it would quietly lose the other two.
 fn put_place(
-	fields: &mut Vec<(&'static str, String)>,
+	rows: &mut Rows,
 	transform: &Transform,
 	otherwise: &Transform,
-) {
+	what: &str,
+) -> Result<()> {
 	if transform == otherwise {
-		return;
+		return Ok(());
 	}
 
-	fields.push(("at", as_vector(transform.position)));
-
-	if transform.rotation != Quat::IDENTITY {
-		fields.push(("turn", as_turn(transform.rotation)));
+	if !transform.position.is_finite() {
+		return Err(err!(Asset("{what} holds a number JSON cannot write")));
 	}
 
-	if transform.scale != Vec3::ONE {
-		fields.push(("scale", as_vector(transform.scale)));
-	}
+	rows.put("position", as_vector(transform.position));
+	put_all(
+		rows,
+		transform,
+		&Transform::IDENTITY,
+		Transform::FIELDS,
+		&Writing { prefix: "", what, skipped: &["position"] },
+		|_| None,
+	)
 }
 
-/// A text field, unless it is empty.
-fn put_text(fields: &mut Vec<(&'static str, String)>, name: &'static str, value: &str) {
-	if value.is_empty() {
-		return;
-	}
+/// How one table is written: under what prefix, called what, and which of
+/// its plain fields are spelled by hand under other keys instead.
+struct Writing<'a> {
+	/// What goes in front of every key, `camera.` for a record inside another.
+	prefix: &'a str,
 
-	fields.push((name, as_text(value)));
+	/// What to call the record in a message.
+	what: &'a str,
+
+	/// The plain fields the text spells by hand, which the table never
+	/// writes; the same list the reader skips, so the two agree.
+	skipped: &'a [&'a str],
 }
 
-/// A number, unless it is the one it would be anyway.
-#[expect(
-	clippy::float_cmp,
-	reason = "the question is whether the reader would produce this exact number from nothing 	          at all, which is an exact comparison and not an approximate one: a tolerance 	          here would throw away a small deliberate value"
-)]
-fn put_number(
-	fields: &mut Vec<(&'static str, String)>,
-	name: &'static str,
-	value: f32,
-	otherwise: f32,
-) {
-	if value == otherwise {
-		return;
+/// Writes every plain field of a record's table that differs from what the
+/// reader would produce from nothing.
+///
+/// A reference has no spelling, and neither does a field spelled by hand
+/// under other keys; for those the caller is asked, at the field's place in
+/// the table, so that a row it writes lands where the field would have.
+///
+/// @param rows - where the rows go
+/// @param record - what to write
+/// @param otherwise - what the reader produces from nothing, which is left out
+/// @param table - the record's table
+/// @param writing - the prefix, the name and the hand-written fields
+/// @param hand - a row for a field the table cannot spell, or nothing
+fn put_all<T, F>(
+	rows: &mut Rows,
+	record: &T,
+	otherwise: &T,
+	table: &[Field<T>],
+	writing: &Writing<'_>,
+	hand: F,
+) -> Result<()>
+where
+	F: Fn(&'static str) -> Option<(&'static str, String)>,
+{
+	for field in table {
+		if let Some((name, spelled)) = hand(field.name) {
+			rows.put(&format!("{}{name}", writing.prefix), spelled);
+
+			continue;
+		}
+
+		if field.kind.is_reference() || writing.skipped.contains(&field.name) {
+			continue;
+		}
+
+		let value = field.get(record);
+		if value == field.get(otherwise) {
+			continue;
+		}
+
+		if !value.is_finite() {
+			return Err(err!(Asset("{} holds a number JSON cannot write", writing.what)));
+		}
+
+		if let Some(spelled) = spelling(field.kind, &value) {
+			rows.put(&format!("{}{}", writing.prefix, field.name), spelled);
+		}
 	}
 
-	fields.push((name, as_number(value)));
+	Ok(())
 }
 
-/// Three numbers, unless they are the ones they would be anyway.
-fn put_vector(
-	fields: &mut Vec<(&'static str, String)>,
-	name: &'static str,
-	value: Vec3,
-	otherwise: Vec3,
-) {
-	if value == otherwise {
-		return;
+/// One value, spelled the way the reader reads it back, or nothing for a
+/// reference, which has no spelling.
+fn spelling(kind: Kind, value: &field::Value) -> Option<String> {
+	Some(match value {
+		| field::Value::Bool(held) => held.to_string(),
+		| field::Value::Int(held) => held.to_string(),
+		| field::Value::Float(held) => as_number(*held),
+		| field::Value::Text(held) => as_text(held),
+		| field::Value::Vec3(held) | field::Value::Color(held) => as_vector(*held),
+		| field::Value::Quat(held) => as_turn(*held),
+		| field::Value::Word(index) => {
+			let word = usize::try_from(*index)
+				.ok()
+				.and_then(|index| kind.words().get(index))?;
+
+			as_text(word)
+		},
+		| field::Value::Entity(_)
+		| field::Value::Body(_)
+		| field::Value::Joint(_)
+		| field::Value::Pose(_)
+		| field::Value::Mesh(_)
+		| field::Value::Material(_) => return None,
+	})
+}
+
+/// The rows of one record on their way out, in the order they were put.
+///
+/// A dotted name is a field inside another: at writing time every row whose
+/// name shares a head is gathered into one object, at the place the first of
+/// them was put, so that `shape.kind` and `shape.radius` come out as one
+/// `shape`.
+#[derive(Default)]
+struct Rows {
+	rows: Vec<(String, String)>,
+}
+
+impl Rows {
+	/// Puts one row, already spelled.
+	fn put(&mut self, name: &str, spelled: String) { self.rows.push((name.to_owned(), spelled)); }
+
+	/// Puts a text row, unless the text is empty.
+	fn put_text(&mut self, name: &str, value: &str) {
+		if value.is_empty() {
+			return;
+		}
+
+		self.put(name, as_text(value));
 	}
 
-	fields.push((name, as_vector(value)));
+	/// Whether nothing was put.
+	fn is_empty(&self) -> bool { self.rows.is_empty() }
+
+	/// The record as one line of JSON.
+	fn text(&self) -> String {
+		let mut written: Vec<String> = Vec::new();
+		let mut gathered: Vec<&str> = Vec::new();
+
+		for (name, spelled) in &self.rows {
+			let Some((head, _)) = name.split_once('.') else {
+				written.push(format!("\"{name}\": {spelled}"));
+
+				continue;
+			};
+
+			if gathered.contains(&head) {
+				continue;
+			}
+
+			gathered.push(head);
+
+			let inner: Vec<String> = self
+				.rows
+				.iter()
+				.filter_map(|(other, spelled)| {
+					let (found, tail) = other.split_once('.')?;
+
+					(found == head).then(|| format!("\"{tail}\": {spelled}"))
+				})
+				.collect();
+
+			written.push(format!("\"{head}\": {{ {} }}", inner.join(", ")));
+		}
+
+		if written.is_empty() {
+			return "{}".to_owned();
+		}
+
+		format!("{{ {} }}", written.join(", "))
+	}
 }
 
 /// One name out of a list, by the index a record wrote down.
@@ -1060,20 +1368,6 @@ fn block(name: &str, records: &[String]) -> Option<String> {
 	out.push_str("\t]");
 
 	Some(out)
-}
-
-/// A one-line object out of fields that are already written.
-fn object(fields: &[(&str, String)]) -> String {
-	let inner: Vec<String> = fields
-		.iter()
-		.map(|(name, value)| format!("\"{name}\": {value}"))
-		.collect();
-
-	if inner.is_empty() {
-		return "{}".to_owned();
-	}
-
-	format!("{{ {} }}", inner.join(", "))
 }
 
 /// One number, in the shortest spelling that reads back as itself.
@@ -1139,128 +1433,34 @@ fn escaped(out: &mut String, letter: char) {
 	out.push(DIGITS[code & 0xF]);
 }
 
-/// The word a kind of body is written as.
-const fn kind_word(kind: BodyKind) -> &'static str {
-	match kind {
-		| BodyKind::Static => "static",
-		| BodyKind::Kinematic => "kinematic",
-		| BodyKind::Dynamic => "dynamic",
-	}
-}
-
-/// The word a kind of joint is written as.
-const fn joint_word(kind: JointKind) -> &'static str {
-	match kind {
-		| JointKind::Rope => "rope",
-		| JointKind::Weld => "weld",
-		| JointKind::Axis => "axis",
-		| JointKind::Ball => "ball",
-	}
-}
-
-/// The word a kind of shape is written as.
-const fn shape_word(kind: ShapeKind) -> &'static str {
-	match kind {
-		| ShapeKind::Box => "box",
-		| ShapeKind::Sphere => "sphere",
-		| ShapeKind::Mesh => "mesh",
-	}
-}
-
-/// Refuses a description holding a number JSON has no spelling for.
-///
-/// An infinity or a nan is what a world that has blown up is full of, and
-/// writing one produces a file that will not read back. Better to say so than
-/// to write `inf` and have the compiler refuse it later with no idea where it
-/// came from.
-fn spellable(scene: &SceneData) -> Result<()> {
-	let stage = &scene.stage;
-	let camera = &stage.camera;
-
-	let settled = camera.position.is_finite()
-		&& camera.target.is_finite()
-		&& camera.up.is_finite()
-		&& [camera.fov_y, camera.near, camera.far]
-			.iter()
-			.all(|it| it.is_finite())
-		&& stage.clear.is_finite()
-		&& stage.light.is_finite()
-		&& stage.ambient.is_finite()
-		&& stage.gravity.is_finite();
-
-	if !settled {
-		return Err(err!(Asset("the stage holds a number JSON cannot write")));
-	}
-
-	for thing in &scene.things {
-		if !finite(&thing.transform) || !thing.color.is_finite() {
-			return Err(err!(Asset("an entity holds a number JSON cannot write")));
-		}
-	}
-
-	for solid in &scene.solids {
-		let good = finite(&solid.transform)
-			&& solid.velocity.is_finite()
-			&& solid.angular.is_finite()
-			&& solid.shape.extents.is_finite()
-			&& [solid.mass, solid.restitution, solid.friction, solid.shape.radius]
-				.iter()
-				.all(|it| it.is_finite());
-
-		if !good {
-			return Err(err!(Asset("a body holds a number JSON cannot write")));
-		}
-	}
-
-	for link in &scene.links {
-		let good = link.first_anchor.is_finite()
-			&& link.second_anchor.is_finite()
-			&& link.axis.is_finite()
-			&& [link.length, link.stiffness, link.damping, link.max_impulse, link.max_torque]
-				.iter()
-				.all(|it| it.is_finite());
-
-		if !good {
-			return Err(err!(Asset("a joint holds a number JSON cannot write")));
-		}
-	}
-
-	Ok(())
-}
-
-/// Whether every number in a transform is one that can be written.
-fn finite(transform: &Transform) -> bool {
-	transform.position.is_finite()
-		&& transform.rotation.is_finite()
-		&& transform.scale.is_finite()
-}
-
 #[cfg(test)]
 mod tests {
+	use colby_core::abi::{ShapeKind, scene::Form};
+
 	use super::*;
 
 	/// A source with one of everything in it.
 	const SOURCE: &str = r#"{
 		"stage": {
-			"camera": { "position": [0, 6, 12], "target": [0, 1, 0], "fov": 1.2 },
+			"camera": { "position": [0, 6, 12], "target": [0, 1, 0], "fov_y": 1.2 },
 			"gravity": [0, -20, 0]
 		},
 		"entities": [
-			{ "name": "crate", "at": [1, 4, -2], "scale": [2, 2, 2],
+			{ "name": "crate", "position": [1, 4, -2], "scale": [2, 2, 2],
 			  "mesh": "cube", "material": "plastic", "color": [0.8, 0.2, 0.1] },
-			{ "name": "hook", "at": [0, 8, 0] }
+			{ "name": "hook", "position": [0, 8, 0] }
 		],
 		"bodies": [
 			{ "name": "crate", "entity": "crate", "kind": "dynamic",
 			  "shape": { "kind": "box", "extents": [1, 1, 1] },
 			  "mass": 4.0, "friction": 0.7, "layer": 2, "collides": [0, 2] },
-			{ "name": "ground", "kind": "static", "at": [0, -0.5, 0],
+			{ "name": "ground", "kind": "static", "position": [0, -0.5, 0],
 			  "shape": { "kind": "mesh", "mesh": "meshes/floor" } }
 		],
 		"joints": [
 			{ "name": "rope", "kind": "rope", "first": "crate",
 			  "anchors": [[0, 1, 0], [0, 8, 0]], "length": 3.5,
-			  "stiffness": 8.0, "damping": 0.6, "max impulse": 45.0, "max torque": 12.5 }
+			  "stiffness": 8.0, "damping": 0.6, "max_impulse": 45.0, "max_torque": 12.5 }
 		]
 	}"#;
 
@@ -1367,8 +1567,8 @@ mod tests {
 	/// A source where one entity hangs off another that is written below it.
 	const HUNG: &str = r#"{
 		"entities": [
-			{ "name": "wheel", "parent": "car", "at": [1, 0, 0] },
-			{ "name": "car", "at": [2, 0, 0], "scale": [2, 2, 2] }
+			{ "name": "wheel", "parent": "car", "position": [1, 0, 0] },
+			{ "name": "car", "position": [2, 0, 0], "scale": [2, 2, 2] }
 		]
 	}"#;
 
@@ -1511,13 +1711,22 @@ mod tests {
 
 	#[test]
 	fn what_a_source_leaves_out_is_what_it_meant() {
-		let scene = import(r#"{ "entities": [ {} ], "bodies": [ {} ] }"#).expect("a scene");
+		let scene = import(r#"{ "entities": [ {} ], "bodies": [ {} ], "joints": [ {} ] }"#)
+			.expect("a scene");
 
 		assert_eq!(scene.things[0].transform, Transform::IDENTITY, "an entity is at the origin");
 		assert_eq!(scene.things[0].color, Vec3::ONE, "and untinted");
 		assert_eq!(scene.solids[0].kind, BodyKind::Static, "a body is static");
 		assert_eq!(scene.solids[0].shape.kind, ShapeKind::Box, "and a unit box");
 		assert_eq!(scene.solids[0].shape.extents, Vec3::splat(0.5), "half a unit each way");
+		assert!(
+			(scene.solids[0].shape.radius - 0.5).abs() < f32::EPSILON,
+			"and half a unit across, for the sphere it would be if it were one"
+		);
+		assert_eq!(scene.links[0].kind, JointKind::Rope, "a joint is a rope");
+		assert!((scene.links[0].length - 1.0).abs() < f32::EPSILON, "one unit long");
+		assert_eq!(scene.links[0].axis, Vec3::Y, "turning about up if it were a hinge");
+		assert!((scene.links[0].damping - 1.0).abs() < f32::EPSILON, "critically damped");
 	}
 
 	#[test]
@@ -1605,14 +1814,14 @@ mod tests {
 
 	#[test]
 	fn a_turn_that_is_not_a_unit_quaternion_is_an_error() {
-		let refused = import(r#"{ "entities": [ { "turn": [1, 1, 1, 1] } ] }"#)
+		let refused = import(r#"{ "entities": [ { "rotation": [1, 1, 1, 1] } ] }"#)
 			.expect_err("that is not a rotation")
 			.to_string();
 
 		assert!(refused.contains("unit"), "and it says what one is: {refused}");
 
 		let half = std::f32::consts::FRAC_1_SQRT_2;
-		let text = format!(r#"{{ "entities": [ {{ "turn": [0, {half}, 0, {half}] }} ] }}"#);
+		let text = format!(r#"{{ "entities": [ {{ "rotation": [0, {half}, 0, {half}] }} ] }}"#);
 		let scene = import(&text).expect("a quarter turn is a rotation");
 
 		assert!(scene.things[0].transform.rotation.is_normalized(), "and it survives");
@@ -1773,7 +1982,7 @@ mod tests {
 			.expect("the crate's body is in there");
 
 		assert!(
-			!body.contains("\"at\""),
+			!body.contains("\"position\""),
 			"and it stands where the crate does without a place of its own: {body}"
 		);
 	}
@@ -1898,12 +2107,24 @@ mod tests {
 		// one field away from the default is a shape again, and only that
 		// field is written.
 		scene.solids[0].shape.radius = 2.0;
-		let (_, back) = round(&export(&scene).expect("it can be written"));
+		scene.solids[0].shape.kind = ShapeKind::Sphere;
+		let written = export(&scene).expect("it can be written");
+		let (_, back) = round(&written);
 
 		assert!(
 			(back.solids[0].shape.radius - 2.0).abs() < 1.0e-6,
 			"the radius came back: {}",
 			back.solids[0].shape.radius
+		);
+		let crate_line = written
+			.lines()
+			.find(|line| line.contains("\"entity\": \"crate\""))
+			.expect("the crate's body is in there");
+
+		assert_eq!(
+			crate_line.matches("\"shape\"").count(),
+			1,
+			"two fields inside a shape are one shape, written once: {crate_line}"
 		);
 	}
 
@@ -1921,6 +2142,16 @@ mod tests {
 		let written = export(&first).expect("it can be written");
 		assert!(written.contains("\"layer\": 2"), "written as an index: {written}");
 		assert!(written.contains("\"collides\": [0, 2]"), "and a list of them");
+		assert_eq!(
+			written.matches("\"layer\"").count(),
+			1,
+			"and only for the body that is not on layer zero: {written}"
+		);
+		assert_eq!(
+			written.matches("\"collides\"").count(),
+			1,
+			"and only for the body that does not meet everything: {written}"
+		);
 	}
 
 	#[test]
@@ -1929,8 +2160,8 @@ mod tests {
 		// three tests count the bodies of.
 		let source = r#"{
 			"bodies": [
-				{ "name": "balloon", "kind": "dynamic", "at": [2, 3, 0], "weightless": true },
-				{ "name": "brick", "kind": "dynamic", "at": [0, 3, 0] }
+				{ "name": "balloon", "kind": "dynamic", "position": [2, 3, 0], "weightless": true },
+				{ "name": "brick", "kind": "dynamic", "position": [0, 3, 0] }
 			]
 		}"#;
 
@@ -2012,11 +2243,10 @@ mod tests {
 
 	#[test]
 	fn what_a_source_cannot_say_is_not_pretended() {
-		// a capture carries four things the text has no words for. What comes
-		// back is what a source would have produced, which is the honest
-		// answer rather than a silent half.
+		// a capture carries things the text has no words for. What comes back
+		// is what a source would have produced, which is the honest answer
+		// rather than a silent half.
 		let mut scene = import(SOURCE).expect("it is a scene");
-		scene.solids[0].sleeping = true;
 		scene.stage.time = 12.5;
 		scene.stage.steps = 750;
 		scene.things[0].slot = 40;
@@ -2024,10 +2254,234 @@ mod tests {
 
 		let (_, again) = round(&export(&scene).expect("it can be written"));
 
-		assert!(!again.solids[0].sleeping, "a source cannot say a body is asleep");
-		assert!((again.stage.time).abs() < 1.0e-6, "nor what time it is");
+		assert!((again.stage.time).abs() < 1.0e-6, "a source cannot say what time it is");
 		assert_eq!(again.stage.steps, 0, "nor how many steps have run");
 		assert_eq!(again.things[0].slot, 0, "and a record's slot is its place in the file");
 		assert_eq!(again.things[0].generation, 1, "on its first occupant");
+	}
+
+	#[test]
+	fn a_sleeping_body_and_a_joints_rest_are_written_now_that_the_table_spells_them() {
+		// two things the text could not say before the tables: a body the
+		// solver had stopped, and the angle a weld was made at. A settled pile
+		// written out used to come back awake and a welded pair square.
+		let mut scene = import(SOURCE).expect("it is a scene");
+		scene.solids[0].sleeping = true;
+		scene.links[0].rest = Quat::from_rotation_y(0.5);
+
+		let written = export(&scene).expect("it can be written");
+		let (_, again) = round(&written);
+
+		assert!(written.contains("\"sleeping\": true"), "written, once: {written}");
+		assert!(written.contains("\"rest\""), "and the rest rotation: {written}");
+		assert!(again.solids[0].sleeping, "the body comes back asleep");
+		assert!(
+			again.links[0]
+				.rest
+				.abs_diff_eq(Quat::from_rotation_y(0.5), 1.0e-6),
+			"and the weld at its angle"
+		);
+	}
+
+	#[test]
+	fn a_file_written_before_the_tables_is_refused_naming_the_key_and_the_new_word() {
+		// the text has no version, so an old key is an unknown key; what it
+		// gets that a misspelling does not is the word to replace it with.
+		let refused = |text: &str| {
+			import(text)
+				.expect_err("an old key does not read")
+				.to_string()
+		};
+
+		let old = refused(r#"{ "entities": [ { "at": [1, 2, 3] } ] }"#);
+		assert!(old.contains("at") && old.contains("position"), "got {old}");
+
+		let old = refused(r#"{ "bodies": [ { "turn": [0, 0, 0, 1] } ] }"#);
+		assert!(old.contains("turn") && old.contains("rotation"), "got {old}");
+
+		let old = refused(r#"{ "joints": [ { "max impulse": 4 } ] }"#);
+		assert!(old.contains("max impulse") && old.contains("max_impulse"), "got {old}");
+
+		let old = refused(r#"{ "stage": { "camera": { "fov": 1.2 } } }"#);
+		assert!(old.contains("fov") && old.contains("fov_y"), "got {old}");
+
+		let plain = refused(r#"{ "entities": [ { "whereabouts": [1, 2, 3] } ] }"#);
+		assert!(!plain.contains(" now"), "and a plain unknown gets no such hint: {plain}");
+	}
+
+	#[test]
+	fn a_value_of_the_wrong_kind_is_refused_naming_the_field() {
+		// the rule the unknown-field rule already stands on: a mass that is a
+		// word doing nothing while looking like it works is the same bug.
+		let refused = |text: &str| {
+			import(text)
+				.expect_err("a value of the wrong kind does not read")
+				.to_string()
+		};
+
+		let heavy = refused(r#"{ "bodies": [ { "mass": "heavy" } ] }"#);
+		assert!(heavy.contains("mass") && heavy.contains("number"), "got {heavy}");
+
+		let yes = refused(r#"{ "bodies": [ { "sensor": "yes" } ] }"#);
+		assert!(yes.contains("sensor"), "got {yes}");
+
+		let flat = refused(r#"{ "entities": [ { "position": 3 } ] }"#);
+		assert!(flat.contains("position") && flat.contains("three numbers"), "got {flat}");
+
+		let long = refused(r#"{ "entities": [ { "scale": [1, 2, 3, 4] } ] }"#);
+		assert!(long.contains("scale"), "four numbers are not three: {long}");
+
+		let word = refused(r#"{ "entities": [ { "color": ["red", 0, 0] } ] }"#);
+		assert!(word.contains("color"), "and a word is not a number: {word}");
+
+		let bare = refused(r#"{ "bodies": [ { "shape": 3 } ] }"#);
+		assert!(bare.contains("shape"), "a shape is a record of its own: {bare}");
+
+		let floaty = refused(r#"{ "bodies": [ { "kind": 2 } ] }"#);
+		assert!(floaty.contains("kind"), "and a kind is a word, not a number: {floaty}");
+	}
+
+	#[test]
+	fn a_body_turned_or_sized_without_a_position_is_refused_rather_than_read_against_nothing() {
+		let refused = import(r#"{ "bodies": [ { "scale": [2, 2, 2] } ] }"#)
+			.expect_err("a scale with no position")
+			.to_string();
+
+		assert!(refused.contains("position"), "it says what is missing: {refused}");
+		assert!(
+			import(r#"{ "bodies": [ { "position": [0, 0, 0], "scale": [2, 2, 2] } ] }"#).is_ok(),
+			"and with one it reads"
+		);
+	}
+
+	#[test]
+	fn a_whole_number_is_read_as_one_and_a_fraction_is_not() {
+		let parse = |written: Value| {
+			parsed(&written, Kind::Int, &field::Value::Int(0), "a test", "count")
+		};
+
+		assert_eq!(parse(Value::Number(6.0)).ok(), Some(field::Value::Int(6)));
+		assert_eq!(
+			parse(Value::Number(-3.0)).ok(),
+			Some(field::Value::Int(-3)),
+			"of either sign"
+		);
+		assert!(parse(Value::Number(2.5)).is_err(), "a fraction is not a whole number");
+		assert!(parse(Value::String("six".to_owned())).is_err(), "nor is a word");
+	}
+
+	/// A value of every plain kind that is not what a fresh record holds.
+	fn sample(kind: Kind) -> Option<field::Value> {
+		Some(match kind {
+			| Kind::Bool => field::Value::Bool(true),
+			| Kind::Int => field::Value::Int(6),
+			| Kind::Float => field::Value::Float(2.5),
+			| Kind::Text => field::Value::Text("hello".to_owned()),
+			| Kind::Vec3 => field::Value::Vec3(Vec3::new(1.0, 2.0, 3.0)),
+			| Kind::Quat => field::Value::Quat(Quat::from_rotation_y(0.5)),
+			| Kind::Color => field::Value::Color(Vec3::new(0.2, 0.4, 0.6)),
+			| Kind::Word(words) => field::Value::Word(u32::try_from(words.len()).ok()? - 1),
+			| Kind::Entity
+			| Kind::Body
+			| Kind::Joint
+			| Kind::Pose
+			| Kind::Mesh
+			| Kind::Material => return None,
+		})
+	}
+
+	/// Sets every plain field the text spells to something other than its
+	/// default.
+	fn fill<T>(record: &mut T, table: &[Field<T>], skipped: &[&str]) {
+		for field in table {
+			if skipped.contains(&field.name) {
+				continue;
+			}
+
+			if let Some(value) = sample(field.kind) {
+				assert!(field.set(record, value), "{} takes its own kind", field.name);
+			}
+		}
+	}
+
+	#[test]
+	fn every_plain_field_of_every_table_survives_the_text() {
+		// the test the tables make possible: nothing here names a field, so a
+		// field added to a table tomorrow is read and written by this today,
+		// or this fails. Every plain field of every record is set to something
+		// other than its default, written, and read back.
+		let mut body = BLANK_BODY;
+		fill(&mut body, Body::FIELDS, LAYER_FIELDS);
+		fill(&mut body.transform, Transform::FIELDS, &[]);
+		body.layers = Layers::new(Layers::bit(3), Layers::bit(3) | Layers::bit(5));
+
+		let mut joint = BLANK_JOINT;
+		fill(&mut joint, Joint::FIELDS, ANCHOR_FIELDS);
+		joint.first_anchor = Vec3::X;
+		joint.second_anchor = Vec3::Y;
+
+		let mut transform = Transform::IDENTITY;
+		fill(&mut transform, Transform::FIELDS, &[]);
+		let mut look = Renderable::NOTHING;
+		fill(&mut look, Renderable::FIELDS, &[]);
+
+		let mut stage = Stage::DEFAULT;
+		fill(&mut stage, Stage::FIELDS, &[]);
+		fill(&mut stage.camera, Camera::FIELDS, &[]);
+
+		let scene = SceneData {
+			stage,
+			things: vec![Thing {
+				name: "crate".to_owned(),
+				generation: 1,
+				transform,
+				mesh: "cube".to_owned(),
+				material: "plastic".to_owned(),
+				color: look.color,
+				..Thing::default()
+			}],
+			solids: vec![Solid {
+				name: "crate".to_owned(),
+				generation: 1,
+				..Solid::of(&body, "meshes/rock".to_owned(), 0)
+			}],
+			links: vec![Link {
+				name: "tie".to_owned(),
+				generation: 1,
+				..Link::of(&joint, 0, NO_INDEX)
+			}],
+			thing_generations: vec![1],
+			solid_generations: vec![1],
+			link_generations: vec![1],
+			..SceneData::default()
+		};
+
+		let written = export(&scene).expect("it can be written");
+		let again = import(&written).unwrap_or_else(|failure| {
+			panic!("what was written did not read back: {failure}\n{written}")
+		});
+
+		assert_eq!(again.stage, scene.stage, "the stage and its camera: {written}");
+		assert_eq!(again.things, scene.things, "the entity: {written}");
+		assert_eq!(again.solids, scene.solids, "the body: {written}");
+		assert_eq!(again.links, scene.links, "and the joint: {written}");
+
+		// and every one of those keys is the field's own name
+		for field in Body::FIELDS {
+			if field.kind.is_reference() || LAYER_FIELDS.contains(&field.name) {
+				continue;
+			}
+
+			let key = field
+				.name
+				.rsplit('.')
+				.next()
+				.unwrap_or(field.name);
+			assert!(
+				written.contains(&format!("\"{key}\"")),
+				"{} is in the text: {written}",
+				field.name
+			);
+		}
 	}
 }

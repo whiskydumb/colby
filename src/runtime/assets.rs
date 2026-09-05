@@ -1615,7 +1615,7 @@ mod tests {
 			&source,
 			"scenes/room.scene",
 			r#"{
-				"entities": [ { "name": "crate", "at": [0, 4, 0], "mesh": "cube" } ],
+				"entities": [ { "name": "crate", "position": [0, 4, 0], "mesh": "cube" } ],
 				"bodies": [ { "entity": "crate", "kind": "dynamic" } ]
 			}"#,
 		);

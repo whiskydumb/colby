@@ -1250,7 +1250,7 @@ f 4 1 5 8
 
 	/// A scene source with an entity, a body under it and a rope holding it.
 	const SCENE: &str = r#"{
-		"entities": [ { "name": "crate", "at": [0, 4, 0], "mesh": "cube" } ],
+		"entities": [ { "name": "crate", "position": [0, 4, 0], "mesh": "cube" } ],
 		"bodies": [ { "name": "crate", "entity": "crate", "kind": "dynamic" } ],
 		"joints": [ { "first": "crate", "anchors": [[0, 0, 0], [0, 8, 0]], "length": 3 } ]
 	}"#;

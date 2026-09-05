@@ -69,7 +69,8 @@ use crate::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
-		MaterialId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind, Transform, World,
+		MaterialId, MeshId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind, Transform,
+		World,
 		field::{Field, field},
 		net::MAX_PEERS,
 		state::STATE_BYTES,
@@ -334,6 +335,72 @@ impl Solid {
 	/// What a restore keys the table's rebuilt generation array on.
 	#[must_use]
 	pub const fn key(&self) -> (u32, u32) { (self.slot, self.generation) }
+
+	/// A body written down, with its mesh named and its entity placed as given.
+	///
+	/// The name, the slot and the generation are left for the caller: a
+	/// capture knows them and a source invents them. This and
+	/// [`body`](Self::body) are the two places a plain field of a body is
+	/// copied between the live record and the written one, so a field added
+	/// to [`Body`] is added here and nowhere else in this module.
+	///
+	/// @param body - the body as it stands
+	/// @param mesh - what its mesh shape's mesh is called, or empty
+	/// @param thing - which entity record it drives, or [`NO_INDEX`]
+	#[must_use]
+	pub fn of(body: &Body, mesh: String, thing: u32) -> Self {
+		Self {
+			name: String::new(),
+			slot: 0,
+			generation: 0,
+			kind: body.kind,
+			shape: Form {
+				kind: body.shape.kind,
+				radius: body.shape.radius,
+				extents: body.shape.extents,
+				mesh,
+			},
+			transform: body.transform,
+			velocity: body.velocity,
+			angular: body.angular,
+			mass: body.mass,
+			restitution: body.restitution,
+			friction: body.friction,
+			sensor: body.sensor,
+			weightless: body.weightless,
+			sleeping: body.sleeping,
+			layers: body.layers,
+			thing,
+		}
+	}
+
+	/// The body this describes, with its mesh and its entity looked up as
+	/// given. The other half of [`of`](Self::of).
+	///
+	/// @param mesh - what the named mesh resolved to, or none
+	/// @param entity - what the entity record resolved to, or none
+	#[must_use]
+	pub fn body(&self, mesh: MeshId, entity: EntityId) -> Body {
+		let shape = Shape {
+			kind: self.shape.kind,
+			radius: self.shape.radius,
+			extents: self.shape.extents,
+			mesh,
+		};
+		let mut body = Body::new(self.kind, shape, self.transform);
+		body.velocity = self.velocity;
+		body.angular = self.angular;
+		body.mass = self.mass;
+		body.restitution = self.restitution;
+		body.friction = self.friction;
+		body.sensor = self.sensor;
+		body.weightless = self.weightless;
+		body.sleeping = self.sleeping;
+		body.layers = self.layers;
+		body.entity = entity;
+
+		body
+	}
 }
 
 /// One joint, naming the two bodies it holds by their place in the file.
@@ -424,6 +491,61 @@ impl Link {
 	/// What a restore keys the table's rebuilt generation array on.
 	#[must_use]
 	pub const fn key(&self) -> (u32, u32) { (self.slot, self.generation) }
+
+	/// A joint written down, with the two bodies it holds placed as given.
+	///
+	/// The name, the slot and the generation are left for the caller, as with
+	/// [`Solid::of`], and for the same reason this and [`joint`](Self::joint)
+	/// are the two places a plain field of a joint is copied.
+	///
+	/// @param joint - the joint as it stands
+	/// @param first - which body record it holds, or [`NO_INDEX`]
+	/// @param second - the other, or [`NO_INDEX`] for a point in the world
+	#[must_use]
+	pub fn of(joint: &Joint, first: u32, second: u32) -> Self {
+		Self {
+			name: String::new(),
+			slot: 0,
+			generation: 0,
+			kind: joint.kind,
+			first,
+			second,
+			first_anchor: joint.first_anchor,
+			second_anchor: joint.second_anchor,
+			axis: joint.axis,
+			length: joint.length,
+			rest: joint.rest,
+			stiffness: joint.stiffness,
+			damping: joint.damping,
+			max_impulse: joint.max_impulse,
+			max_torque: joint.max_torque,
+			collide: joint.collide,
+		}
+	}
+
+	/// The joint this describes, holding the two bodies as given. The other
+	/// half of [`of`](Self::of).
+	///
+	/// @param first - what the first body record resolved to, or none
+	/// @param second - what the second resolved to, or none
+	#[must_use]
+	pub const fn joint(&self, first: BodyId, second: BodyId) -> Joint {
+		Joint {
+			kind: self.kind,
+			first,
+			second,
+			first_anchor: self.first_anchor,
+			second_anchor: self.second_anchor,
+			axis: self.axis,
+			length: self.length,
+			rest: self.rest,
+			stiffness: self.stiffness,
+			damping: self.damping,
+			max_impulse: self.max_impulse,
+			max_torque: self.max_torque,
+			collide: self.collide,
+		}
+	}
 }
 
 /// The game's own bytes, and the layout number they were written under.
@@ -979,10 +1101,7 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
 			transform: *transform,
-			mesh: world
-				.meshes
-				.get(renderable.mesh)
-				.map_or_else(String::new, |entry| entry.name().to_owned()),
+			mesh: mesh_name(world, renderable.mesh),
 			material: world
 				.materials
 				.entry(renderable.material)
@@ -1021,23 +1140,15 @@ fn solids(world: &World, thing_of: &[u32]) -> Vec<Solid> {
 			name: world.bodies.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
-			kind: body.kind,
-			shape: form(world, &body.shape),
-			transform: body.transform,
-			velocity: body.velocity,
-			angular: body.angular,
-			mass: body.mass,
-			restitution: body.restitution,
-			friction: body.friction,
-			sensor: body.sensor,
-			weightless: body.weightless,
-			sleeping: body.sleeping,
-			layers: body.layers,
-			thing: thing_of
-				.get(body.entity.slot())
-				.copied()
-				.filter(|_| body.entity.is_some())
-				.unwrap_or(NO_INDEX),
+			..Solid::of(
+				body,
+				mesh_name(world, body.shape.mesh),
+				thing_of
+					.get(body.entity.slot())
+					.copied()
+					.filter(|_| body.entity.is_some())
+					.unwrap_or(NO_INDEX),
+			)
 		})
 		.collect()
 }
@@ -1059,34 +1170,17 @@ fn links(world: &World, solid_of: &[u32]) -> Vec<Link> {
 			name: world.joints.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
-			kind: joint.kind,
-			first: named(joint.first),
-			second: named(joint.second),
-			first_anchor: joint.first_anchor,
-			second_anchor: joint.second_anchor,
-			axis: joint.axis,
-			length: joint.length,
-			rest: joint.rest,
-			stiffness: joint.stiffness,
-			damping: joint.damping,
-			max_impulse: joint.max_impulse,
-			max_torque: joint.max_torque,
-			collide: joint.collide,
+			..Link::of(joint, named(joint.first), named(joint.second))
 		})
 		.collect()
 }
 
-/// A shape with its mesh named.
-fn form(world: &World, shape: &Shape) -> Form {
-	Form {
-		kind: shape.kind,
-		radius: shape.radius,
-		extents: shape.extents,
-		mesh: world
-			.meshes
-			.get(shape.mesh)
-			.map_or_else(String::new, |entry| entry.name().to_owned()),
-	}
+/// The name a mesh is registered under, or nothing for no mesh.
+fn mesh_name(world: &World, mesh: MeshId) -> String {
+	world
+		.meshes
+		.get(mesh)
+		.map_or_else(String::new, |entry| entry.name().to_owned())
 }
 
 crate::registry_handle! {
@@ -1701,17 +1795,10 @@ fn solid_bodies(world: &World, scene: &SceneData, things: &[EntityId]) -> Vec<(u
 		.solids
 		.iter()
 		.map(|solid| {
-			let mut body = Body::new(solid.kind, shape(world, &solid.shape), solid.transform);
-			body.velocity = solid.velocity;
-			body.angular = solid.angular;
-			body.mass = solid.mass;
-			body.restitution = solid.restitution;
-			body.friction = solid.friction;
-			body.sensor = solid.sensor;
-			body.weightless = solid.weightless;
-			body.sleeping = solid.sleeping;
-			body.layers = solid.layers;
-			body.entity = at(things, solid.thing).unwrap_or(EntityId::NONE);
+			let body = solid.body(
+				world.meshes.find(&solid.shape.mesh),
+				at(things, solid.thing).unwrap_or(EntityId::NONE),
+			);
 
 			(usize::try_from(solid.slot).unwrap_or(usize::MAX), body)
 		})
@@ -1724,21 +1811,10 @@ fn link_joints(scene: &SceneData, solids: &[BodyId]) -> Vec<(usize, Joint)> {
 		.links
 		.iter()
 		.map(|link| {
-			let joint = Joint {
-				kind: link.kind,
-				first: at(solids, link.first).unwrap_or(BodyId::NONE),
-				second: at(solids, link.second).unwrap_or(BodyId::NONE),
-				first_anchor: link.first_anchor,
-				second_anchor: link.second_anchor,
-				axis: link.axis,
-				length: link.length,
-				rest: link.rest,
-				stiffness: link.stiffness,
-				damping: link.damping,
-				max_impulse: link.max_impulse,
-				max_torque: link.max_torque,
-				collide: link.collide,
-			};
+			let joint = link.joint(
+				at(solids, link.first).unwrap_or(BodyId::NONE),
+				at(solids, link.second).unwrap_or(BodyId::NONE),
+			);
 
 			(usize::try_from(link.slot).unwrap_or(usize::MAX), joint)
 		})
@@ -1825,16 +1901,6 @@ fn material(world: &World, name: &str) -> MaterialId {
 	}
 
 	found
-}
-
-/// A shape with its named mesh looked up.
-fn shape(world: &World, form: &Form) -> Shape {
-	Shape {
-		kind: form.kind,
-		radius: form.radius,
-		extents: form.extents,
-		mesh: world.meshes.find(&form.mesh),
-	}
 }
 
 /// Writes the world's own settings and declares the whole thing a cut.
@@ -2086,19 +2152,15 @@ fn spawn_solid(
 	things: &[(String, EntityId)],
 	at: Vec3,
 ) -> BodyId {
-	let mut transform = solid.transform;
-	transform.position += at;
-
-	let mut body = Body::new(solid.kind, shape(world, &solid.shape), transform);
-	body.velocity = solid.velocity;
-	body.angular = solid.angular;
-	body.mass = solid.mass;
-	body.restitution = solid.restitution;
-	body.friction = solid.friction;
-	body.sensor = solid.sensor;
-	body.weightless = solid.weightless;
-	body.layers = solid.layers;
-	body.entity = handle(things, solid.thing).unwrap_or(EntityId::NONE);
+	let mut body = solid.body(
+		world.meshes.find(&solid.shape.mesh),
+		handle(things, solid.thing).unwrap_or(EntityId::NONE),
+	);
+	body.transform.position += at;
+	// an instantiated body arrives awake, whatever the description said: it has
+	// just been put somewhere, and the solver's own first look at it is what
+	// decides whether it may rest there. A restored one keeps what was written.
+	body.sleeping = false;
 
 	let id = world.bodies.spawn(body);
 	world.bodies.set_name(id, &solid.name);
@@ -2131,25 +2193,14 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 		link.second_anchor
 	};
 
-	let id = world.joints.spawn(Joint {
-		kind: link.kind,
-		first: first.unwrap_or(BodyId::NONE),
-		second: second.unwrap_or(BodyId::NONE),
-		first_anchor: link.first_anchor,
-		second_anchor: anchored,
-		axis: link.axis,
-		length: link.length,
-		// the description's own, not one worked out here: a weld holds the
-		// angle it was *made* at, and the two bodies have just been created at
-		// whatever angle they were written down at, so the answer is already in
-		// the file. @ref `World::join`, which is the other case.
-		rest: link.rest,
-		stiffness: link.stiffness,
-		damping: link.damping,
-		max_impulse: link.max_impulse,
-		max_torque: link.max_torque,
-		collide: link.collide,
-	});
+	// the rest rotation stays the description's own, not one worked out here:
+	// a weld holds the angle it was *made* at, and the two bodies have just
+	// been created at whatever angle they were written down at, so the answer
+	// is already in the file. @ref `World::join`, which is the other case.
+	let mut joint = link.joint(first.unwrap_or(BodyId::NONE), second.unwrap_or(BodyId::NONE));
+	joint.second_anchor = anchored;
+
+	let id = world.joints.spawn(joint);
 	world.joints.set_name(id, &link.name);
 
 	id
@@ -2965,7 +3016,7 @@ mod tests {
 		let id = world.entities.spawn();
 		world
 			.entities
-			.set_renderable(id, Renderable::new(crate::abi::MeshId::CUBE, Vec3::ONE));
+			.set_renderable(id, Renderable::new(MeshId::CUBE, Vec3::ONE));
 
 		let scene = capture(&world);
 
@@ -3550,7 +3601,7 @@ mod tests {
 			.next()
 			.expect("it still exists");
 
-		assert_eq!(renderable.mesh, crate::abi::MeshId::NONE, "the missing mesh draws nothing");
+		assert_eq!(renderable.mesh, MeshId::NONE, "the missing mesh draws nothing");
 		assert_eq!(
 			renderable.material,
 			MaterialId::DEFAULT,
@@ -4695,6 +4746,72 @@ mod tests {
 
 		assert!(!put.joint(0).is_some(), "the joint was refused");
 		assert!(world.joints.is_empty(), "and nothing was created");
+	}
+
+	#[test]
+	fn a_body_and_a_joint_written_down_read_back_field_for_field() {
+		// the two conversions are the two places a plain field is copied
+		// between a live record and a written one, and nothing here names a
+		// field: every row of each table is set to something other than its
+		// default, written down, and read back through the other half.
+		let sample = |kind: crate::abi::field::Kind| -> Option<crate::abi::field::Value> {
+			use crate::abi::field::{Kind, Value};
+
+			Some(match kind {
+				| Kind::Bool => Value::Bool(true),
+				| Kind::Int => Value::Int(6),
+				| Kind::Float => Value::Float(2.5),
+				| Kind::Text => Value::Text("hello".to_owned()),
+				| Kind::Vec3 => Value::Vec3(Vec3::new(1.0, 2.0, 3.0)),
+				| Kind::Quat => Value::Quat(Quat::from_rotation_y(0.5)),
+				| Kind::Color => Value::Color(Vec3::new(0.2, 0.4, 0.6)),
+				| Kind::Word(words) => Value::Word(u32::try_from(words.len()).ok()? - 1),
+				| Kind::Entity
+				| Kind::Body
+				| Kind::Joint
+				| Kind::Pose
+				| Kind::Mesh
+				| Kind::Material => return None,
+			})
+		};
+
+		let mut body = Body::default();
+		for field in Body::FIELDS {
+			if let Some(value) = sample(field.kind) {
+				assert!(field.set(&mut body, value), "{} takes its own kind", field.name);
+			}
+		}
+		body.shape.mesh = MeshId::new(3);
+		body.entity = EntityId::at(4, 2);
+		body.transform = Transform::at(Vec3::new(7.0, 8.0, 9.0));
+
+		let solid = Solid::of(&body, "meshes/rock".to_owned(), 5);
+
+		assert_eq!(solid.shape.mesh, "meshes/rock", "the mesh is named");
+		assert_eq!(solid.thing, 5, "and the entity is placed");
+		assert_eq!(
+			solid.body(MeshId::new(3), EntityId::at(4, 2)),
+			body,
+			"and every plain field came back as it went"
+		);
+
+		let mut joint = Joint::default();
+		for field in Joint::FIELDS {
+			if let Some(value) = sample(field.kind) {
+				assert!(field.set(&mut joint, value), "{} takes its own kind", field.name);
+			}
+		}
+		joint.first = BodyId::at(1, 1);
+		joint.second = BodyId::at(2, 1);
+
+		let link = Link::of(&joint, 0, 1);
+
+		assert_eq!((link.first, link.second), (0, 1), "the two bodies are placed");
+		assert_eq!(
+			link.joint(BodyId::at(1, 1), BodyId::at(2, 1)),
+			joint,
+			"and every plain field came back as it went, the rest rotation too"
+		);
 	}
 
 	#[test]
