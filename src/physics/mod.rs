@@ -546,12 +546,13 @@ impl Simulation {
 		}
 	}
 
-	/// Copies the entity's transform into every body gameplay owns.
+	/// Copies the entity's place in the world into every body gameplay owns.
 	///
 	/// Static and kinematic bodies follow the thing they are bolted to; that is
 	/// what "kinematic" means, and it is what makes a collider on an entity the
-	/// game animates track it without being told. @ref
-	/// [`Body::transform`](colby_core::abi::Body::transform).
+	/// game animates track it without being told. The place in the world,
+	/// whatever the entity hangs off, so a collider on a wheel follows the
+	/// car. @ref [`Body::transform`](colby_core::abi::Body::transform).
 	///
 	/// @param world - the host state
 	fn pull(world: &mut World) {
@@ -566,13 +567,19 @@ impl Simulation {
 				continue;
 			}
 
-			if let Some(&transform) = entities.transform(body.entity) {
+			if let Some(transform) = entities.placed(body.entity) {
 				body.transform = transform;
 			}
 		}
 	}
 
 	/// Copies every solver-owned body's transform back into its entity.
+	///
+	/// As a place in the world, whatever the entity hangs off: the body's
+	/// transform is the world's, and an entity under a parent takes it as its
+	/// place inside that parent. So a dynamic body's entity goes where the
+	/// solver put it whatever its parent did in the meantime, which is the
+	/// rule that a transform has one writer a step.
 	///
 	/// @param world - the host state
 	fn push(world: &mut World) {
@@ -584,9 +591,7 @@ impl Simulation {
 				continue;
 			}
 
-			if let Some(slot) = entities.transform_mut(body.entity) {
-				*slot = body.transform;
-			}
+			entities.set_placed(body.entity, body.transform);
 		}
 	}
 }
@@ -3520,6 +3525,86 @@ mod tests {
 				.position
 				.abs_diff_eq(Vec3::new(0.0, 7.0, 0.0), 1.0e-5),
 			"the solver owns a dynamic body's transform"
+		);
+	}
+
+	#[test]
+	fn a_kinematic_body_on_a_child_follows_the_parent_around() {
+		let (mut world, mut simulation) = wired();
+		let car = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(0.0, 0.0, -3.0)));
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::X));
+		assert!(world.entities.set_parent(wheel, car));
+		let body = world.attach_body(wheel, BodyKind::Kinematic, Shape::UNIT);
+
+		assert!(
+			world
+				.bodies
+				.get(body)
+				.expect("alive")
+				.transform
+				.position
+				.abs_diff_eq(Vec3::new(1.0, 0.0, -3.0), 1.0e-5),
+			"the body is made where the wheel is in the world"
+		);
+
+		if let Some(at) = world.entities.transform_mut(car) {
+			at.position = Vec3::new(0.0, 0.0, 5.0);
+		}
+		simulation.step(&mut world);
+
+		let followed = world
+			.bodies
+			.get(body)
+			.expect("alive")
+			.transform
+			.position;
+
+		assert!(
+			followed.abs_diff_eq(Vec3::new(1.0, 0.0, 5.0), 1.0e-5),
+			"the body went with the car: {followed}"
+		);
+	}
+
+	#[test]
+	fn a_dynamic_body_on_a_child_writes_the_world_and_the_local_follows() {
+		let (mut world, mut simulation) = wired();
+		let car = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(10.0, 0.0, 0.0)));
+		let wheel = world
+			.entities
+			.spawn_at(Transform::at(Vec3::Y * 4.0));
+		assert!(world.entities.set_parent(wheel, car));
+		let body = world.attach_body(wheel, BodyKind::Dynamic, Shape::UNIT);
+		world.gravity = Vec3::ZERO;
+
+		if let Some(body) = world.bodies.get_mut(body) {
+			body.transform.position = Vec3::new(0.0, 7.0, 0.0);
+		}
+		simulation.step(&mut world);
+
+		let placed = world
+			.entities
+			.placed(wheel)
+			.expect("alive")
+			.position;
+
+		assert!(
+			placed.abs_diff_eq(Vec3::new(0.0, 7.0, 0.0), 1.0e-4),
+			"the solver owns where it is in the world: {placed}"
+		);
+
+		let own = world
+			.entities
+			.transform(wheel)
+			.expect("alive")
+			.position;
+
+		assert!(
+			own.abs_diff_eq(Vec3::new(-10.0, 7.0, 0.0), 1.0e-4),
+			"and its own transform is that place inside the car: {own}"
 		);
 	}
 

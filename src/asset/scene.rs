@@ -68,7 +68,9 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// Bump it whenever the header or any block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it
 /// agreed.
-pub const FORMAT_VERSION: u32 = 5;
+///
+/// Six since an entity record says what it hangs off.
+pub const FORMAT_VERSION: u32 = 6;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -319,6 +321,12 @@ pub struct Stood {
 	/// Which pose moves it, as an index into the pose block, or
 	/// [`NO_INDEX`](colby_core::abi::scene::NO_INDEX).
 	pub pose: u32,
+
+	/// Which entity it hangs off, as an index into this block, or
+	/// [`NO_INDEX`](colby_core::abi::scene::NO_INDEX) for one standing on its
+	/// own. Its position, rotation and scale are then its place inside that
+	/// entity.
+	pub parent: u32,
 }
 
 /// One posed skeleton, as the file holds it.
@@ -772,6 +780,7 @@ impl SceneFile {
 			material: self.name(stood.material).to_owned(),
 			color: Vec3::from_array(stood.color),
 			pose: stood.pose,
+			parent: stood.parent,
 		}
 	}
 
@@ -914,6 +923,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 			scale: thing.transform.scale.to_array(),
 			color: thing.color.to_array(),
 			pose: thing.pose,
+			parent: thing.parent,
 		})
 		.collect();
 	let bulk: Vec<Bulk> = data
@@ -1623,6 +1633,7 @@ mod tests {
 				material: "brass".to_owned(),
 				color: Vec3::new(0.8, 0.7, 0.6),
 				pose: 0,
+				parent: scene::NO_INDEX,
 			},
 			Thing {
 				name: String::new(),
@@ -1637,6 +1648,9 @@ mod tests {
 				material: String::new(),
 				color: Vec3::ONE,
 				pose: scene::NO_INDEX,
+				// hanging off the first, so the field carries something a
+				// round trip could lose
+				parent: 0,
 			},
 		]
 	}

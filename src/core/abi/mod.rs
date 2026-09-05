@@ -96,7 +96,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 52;
+pub const ABI_VERSION: u32 = 53;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -331,6 +331,11 @@ pub struct World {
 	pub owed_steps: u32,
 
 	/// Every entity in the world. Host-owned storage, reached by handle.
+	///
+	/// An entity may hang off another - @ref [`Entities::parent`] - and its
+	/// transform is then its place inside that parent; [`Entities::placed`]
+	/// is where it is in the world, and
+	/// [`render_transform`](Self::render_transform) where it is drawn.
 	pub entities: Entities,
 
 	/// Every joint holding two bodies together, reached by handle.
@@ -697,13 +702,14 @@ impl World {
 			.lerp(self.camera, self.interpolation)
 	}
 
-	/// Where an entity should be drawn this frame.
+	/// Where an entity should be drawn this frame, with everything it hangs
+	/// off applied.
 	///
 	/// @param id - the entity to place
 	/// @return the blended transform, or `None` if the handle is stale
 	#[must_use]
 	pub fn render_transform(&self, id: EntityId) -> Option<Transform> {
-		self.entities.interpolated(id, self.interpolation)
+		self.entities.blended(id, self.interpolation)
 	}
 
 	/// The matrices a pose hands the vertex stage this frame, appended.
@@ -1014,7 +1020,9 @@ impl World {
 	/// @return the body's handle, or [`BodyId::NONE`] if the table is full or
 	/// the entity handle was stale
 	pub fn attach_body(&mut self, entity: EntityId, kind: BodyKind, shape: Shape) -> BodyId {
-		let Some(&transform) = self.entities.transform(entity) else {
+		// where the entity is in the world, whatever it hangs off: a body is a
+		// world-space thing.
+		let Some(transform) = self.entities.placed(entity) else {
 			return BodyId::NONE;
 		};
 
@@ -1073,8 +1081,10 @@ impl World {
 		body.transform = transform;
 		let entity = body.entity;
 
-		if let Some(slot) = self.entities.transform_mut(entity) {
-			*slot = transform;
+		// as a place in the world, whatever the entity hangs off: a body's
+		// transform is the world's, and the entity takes it as its place
+		// inside its parent.
+		if self.entities.set_placed(entity, transform) {
 			self.entities.snap(entity);
 		}
 
@@ -1114,6 +1124,30 @@ fn over(bone: &Bone, matrices: &[Mat4]) -> Mat4 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_child_is_drawn_where_its_parent_is_drawn() {
+		let mut world = World::new();
+		let parent = world.entities.spawn_at(Transform::IDENTITY);
+		let child = world.entities.spawn_at(Transform::at(Vec3::X));
+		assert!(world.entities.set_parent(child, parent));
+		world.advance();
+
+		if let Some(at) = world.entities.transform_mut(parent) {
+			at.position = Vec3::new(0.0, 4.0, 0.0);
+		}
+
+		world.set_interpolation(0.25);
+
+		let drawn = world.render_transform(child).expect("alive");
+
+		assert!(
+			drawn
+				.position
+				.abs_diff_eq(Vec3::new(1.0, 1.0, 0.0), 1.0e-5),
+			"got {drawn:?}"
+		);
+	}
 
 	/// A world whose camera stands away from the origin looking back at it, and
 	/// whose window is a wide one.

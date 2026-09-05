@@ -132,8 +132,8 @@ impl Default for Stage {
 	fn default() -> Self { Self::DEFAULT }
 }
 
-/// One entity: where it is and what it looks like.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// One entity: where it is, what it looks like, and what it hangs off.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Thing {
 	/// What this is called, or empty.
 	///
@@ -151,7 +151,7 @@ pub struct Thing {
 	/// Which occupant of that slot it was.
 	pub generation: u32,
 
-	/// Where it is.
+	/// Where it is: in the world, or inside its parent when it hangs off one.
 	pub transform: Transform,
 
 	/// The asset name of its mesh, or empty for nothing to draw.
@@ -165,6 +165,33 @@ pub struct Thing {
 
 	/// Which entry of [`SceneData::posed`] moves it, or [`NO_INDEX`].
 	pub pose: u32,
+
+	/// Which entry of [`SceneData::things`] it hangs off, or [`NO_INDEX`] for
+	/// an entity standing on its own.
+	///
+	/// An index into the same list, the way a body names its entity and a
+	/// joint names its bodies: a position in this description's own table,
+	/// which a restore reads for its slot and an instantiate reads as a place
+	/// in the file. `transform` is then the place inside that parent rather
+	/// than in the world.
+	pub parent: u32,
+}
+
+impl Default for Thing {
+	/// Standing on its own, moved by nothing, at the origin, drawing nothing.
+	fn default() -> Self {
+		Self {
+			name: String::new(),
+			slot: 0,
+			generation: 0,
+			transform: Transform::IDENTITY,
+			mesh: String::new(),
+			material: String::new(),
+			color: Vec3::ZERO,
+			pose: NO_INDEX,
+			parent: NO_INDEX,
+		}
+	}
 }
 
 impl Thing {
@@ -575,9 +602,10 @@ impl SceneData {
 	/// drive the wrong body.
 	///
 	/// Everything else is identical, the internal indices included: `first`
-	/// and `second` on a joint, `thing` on a body and `pose` on an entity are
-	/// positions in this description's own tables and are renumbered either
-	/// way. It is only what a table will be *asked for* that differs.
+	/// and `second` on a joint, `thing` on a body and `pose` and `parent` on
+	/// an entity are positions in this description's own tables and are
+	/// renumbered either way. It is only what a table will be *asked for* that
+	/// differs.
 	///
 	/// @param solids - which of [`solids`](Self::solids) to keep
 	/// @return a description of them alone, at the numbers they are at here
@@ -628,6 +656,22 @@ impl SceneData {
 				drag_along(&self.things, solid.thing, &mut thing_of, &mut things, renumber);
 
 			kept.push(copy);
+		}
+
+		// and what any of them hangs off, transitively: a child cut out
+		// without its parent would stand somewhere relative to nothing. The
+		// list grows while it is walked, and a parent that came along brings
+		// its own parent when the walk reaches it.
+		let mut index = 0;
+		while index < things.len() {
+			let parent = things[index].parent;
+
+			if parent != NO_INDEX {
+				things[index].parent =
+					drag_along(&self.things, parent, &mut thing_of, &mut things, renumber);
+			}
+
+			index += 1;
 		}
 
 		let mut links = Vec::new();
@@ -897,6 +941,16 @@ fn stage(world: &World) -> Stage {
 
 /// Every living entity, with its handles resolved back to names.
 fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
+	// where each slot's entity lands in the list, so that a parent is named
+	// by its place here rather than by a slot a reader would have to search
+	// for. Sized by the table, so a slot is an index into it directly.
+	let mut index_of = vec![NO_INDEX; world.entities.slots()];
+	for (index, (id, ..)) in world.entities.iter().enumerate() {
+		if let Some(entry) = index_of.get_mut(id.slot()) {
+			*entry = count(index);
+		}
+	}
+
 	world
 		.entities
 		.iter()
@@ -906,6 +960,7 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 				.copied()
 				.filter(|_| world.poses.alive(renderable.pose))
 				.unwrap_or(NO_INDEX),
+			parent: parent_index(world, id, &index_of),
 			name: world.entities.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
@@ -1184,6 +1239,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	let generations = slots(&scene.thing_generations, scene.things.iter().map(Thing::key));
 	let entries = placed(world, scene, &poses);
 	let things = world.entities.restore(&generations, &entries);
+	hang(world, &things, &things, &scene.things);
 
 	let generations = slots(&scene.solid_generations, scene.solids.iter().map(Solid::key));
 	let entries = solid_bodies(world, scene, &things);
@@ -1318,6 +1374,10 @@ pub fn graft(world: &mut World, piece: &SceneData) -> Grafted {
 	// between two bodies both machines already have could never cross. @ref
 	// `standing`.
 	let driving = standing_things(world, piece);
+	// what landed hangs off whoever stands in the slot its record names, for
+	// the reason a body is tied that way: the parent may be a record that
+	// landed just now, or one the far end already had.
+	hang(world, &things, &driving, &piece.things);
 	let solids = grafted_solids(world, piece, &driving);
 	let holding = standing_solids(world, piece);
 	let links = grafted_links(world, piece, &holding);
@@ -1683,6 +1743,54 @@ fn at<T: Copy>(handles: &[T], index: u32) -> Option<T> {
 	handles.get(usize::try_from(index).ok()?).copied()
 }
 
+/// Which place in a captured list an entity's parent is at, or [`NO_INDEX`].
+///
+/// @param world - the world being written down
+/// @param id - the entity
+/// @param index_of - each slot's place in the list, [`NO_INDEX`] for a slot
+/// nobody is in
+fn parent_index(world: &World, id: EntityId, index_of: &[u32]) -> u32 {
+	let parent = world.entities.parent(id);
+
+	if !parent.is_some() {
+		return NO_INDEX;
+	}
+
+	index_of
+		.get(parent.slot())
+		.copied()
+		.unwrap_or(NO_INDEX)
+}
+
+/// Hangs every entity that landed off what its record names.
+///
+/// After the whole list has landed, because a child may be written above its
+/// parent and a handle only exists once the slot holds something. A record
+/// naming a place nothing stands at, or one closing a loop, is left standing
+/// on its own, and a record that did not land is refused the same way: the
+/// table refuses the link, and there is deliberately no second check here
+/// that would restate it.
+///
+/// @param world - the world the records went into
+/// @param landed - what each record became, [`EntityId::NONE`] for one that
+/// did not land, which the table refuses to hang anything off
+/// @param standing - who is at each record's place, which for a graft may be
+/// somebody who was already there
+/// @param things - the records
+fn hang(world: &mut World, landed: &[EntityId], standing: &[EntityId], things: &[Thing]) {
+	for (id, thing) in landed.iter().zip(things) {
+		if thing.parent == NO_INDEX {
+			continue;
+		}
+
+		let parent = at(standing, thing.parent).unwrap_or(EntityId::NONE);
+
+		if parent.is_some() {
+			world.entities.set_parent(*id, parent);
+		}
+	}
+}
+
 /// A material by name, falling back to the default rather than to nothing.
 ///
 /// The two branches produce the same handle and differ only in whether
@@ -1890,6 +1998,11 @@ pub fn instantiate(world: &mut World, scene: &SceneData, at: Vec3) -> Remap {
 		.map(|thing| (thing.name.clone(), spawn_thing(world, thing, &poses, at)))
 		.collect();
 
+	// once every entity exists, because a child may be written above the
+	// thing it hangs off.
+	let ids: Vec<EntityId> = things.iter().map(|(_, id)| *id).collect();
+	hang(world, &ids, &ids, &scene.things);
+
 	let solids: Vec<(String, BodyId)> = scene
 		.solids
 		.iter()
@@ -1919,7 +2032,12 @@ fn spawn_pose(world: &mut World, posed: &Posed) -> PoseId {
 /// Creates one entity.
 fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> EntityId {
 	let mut transform = thing.transform;
-	transform.position += at;
+
+	// only a thing standing on its own is moved by the offset: a child is
+	// placed inside its parent, and the parent's move carries it.
+	if thing.parent == NO_INDEX {
+		transform.position += at;
+	}
 
 	let id = world.entities.spawn_at(transform);
 	if !id.is_some() {
@@ -4605,6 +4723,172 @@ mod tests {
 		assert_eq!(running.state.get::<Held>(5).0.count, 1, "the game's own bytes are its own");
 		assert_eq!(running.camera.position, Vec3::splat(-3.0), "pasting moves nobody's camera");
 		assert_eq!(running.gravity, Vec3::ZERO, "and changes nothing about the world");
+	}
+
+	/// A car and a wheel hanging off it, the car turned and twice the size so
+	/// that a wheel put back in the wrong terms lands somewhere else.
+	fn hung() -> (World, EntityId, EntityId) {
+		let mut world = World::new();
+		let car = world.entities.spawn_at(Transform {
+			position: Vec3::new(2.0, 0.0, 0.0),
+			rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+			scale: Vec3::splat(2.0),
+		});
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::X));
+		world.entities.set_name(car, "car");
+		world.entities.set_name(wheel, "wheel");
+		assert!(world.entities.set_parent(wheel, car));
+
+		(world, car, wheel)
+	}
+
+	/// Which records of a description are the body in a slot.
+	fn records_of(scene: &SceneData, body: BodyId) -> Vec<u32> {
+		let slot = u32::try_from(body.slot()).expect("small");
+
+		scene
+			.solids
+			.iter()
+			.enumerate()
+			.filter(|(_, it)| it.slot == slot)
+			.map(|(at, _)| u32::try_from(at).expect("small"))
+			.collect()
+	}
+
+	#[test]
+	fn capture_writes_a_parent_as_a_place_in_the_list() {
+		let (world, ..) = hung();
+		let scene = capture(&world);
+
+		assert_eq!(scene.things.len(), 2);
+		assert_eq!(scene.things[0].parent, NO_INDEX, "the car hangs off nothing");
+		assert_eq!(scene.things[1].parent, 0, "the wheel hangs off the car, by its place");
+		assert_eq!(scene.things[1].transform, Transform::at(Vec3::X), "written as its own place");
+	}
+
+	#[test]
+	fn a_restored_child_still_hangs_off_its_parent() {
+		let (world, car, wheel) = hung();
+		let scene = capture(&world);
+		let placed = world.entities.placed(wheel).expect("alive");
+
+		let mut again = World::new();
+		restore(&mut again, &scene).expect("nothing to disagree about");
+
+		assert_eq!(again.entities.parent(wheel), car, "the same handles, the same link");
+		assert_eq!(again.entities.placed(wheel), Some(placed), "and it stands where it stood");
+	}
+
+	#[test]
+	fn an_instantiated_child_hangs_off_the_copy_and_is_offset_once() {
+		let (world, _, wheel) = hung();
+		let scene = capture(&world);
+		let placed = world.entities.placed(wheel).expect("alive");
+
+		let mut again = World::new();
+		let put = instantiate(&mut again, &scene, Vec3::new(0.0, 0.0, 10.0));
+		let car = put.entity_named("car");
+		let copy = put.entity_named("wheel");
+
+		assert_eq!(again.entities.parent(copy), car);
+
+		let landed = again.entities.placed(copy).expect("alive");
+
+		assert!(
+			landed
+				.position
+				.abs_diff_eq(placed.position + Vec3::new(0.0, 0.0, 10.0), 1.0e-4),
+			"the offset reaches the wheel through the car and not twice, got {landed:?}"
+		);
+	}
+
+	#[test]
+	fn a_cut_drags_a_parent_along_and_renumbers_the_link() {
+		let (mut world, _, wheel) = hung();
+		// a body on the wheel and none on the car, so that a cut around the
+		// wheel has to go looking for the car
+		let body = world.attach_body(wheel, BodyKind::Dynamic, Shape::cuboid(Vec3::splat(0.5)));
+		let scene = capture(&world);
+
+		let piece = scene.subset(&records_of(&scene, body));
+
+		assert_eq!(piece.things.len(), 2, "the wheel and the car it hangs off");
+
+		let wheel_at = piece
+			.things
+			.iter()
+			.position(|it| it.name == "wheel")
+			.expect("the wheel");
+		let car_at = piece
+			.things
+			.iter()
+			.position(|it| it.name == "car")
+			.expect("the car came along");
+
+		assert_eq!(
+			piece.things[wheel_at].parent,
+			u32::try_from(car_at).expect("small"),
+			"renumbered to where the car is now"
+		);
+		assert_eq!(piece.things[car_at].parent, NO_INDEX);
+	}
+
+	#[test]
+	fn a_grafted_child_hangs_off_whoever_stands_in_its_parents_slot() {
+		let (mut world, car, wheel) = hung();
+		let body = world.attach_body(wheel, BodyKind::Dynamic, Shape::cuboid(Vec3::splat(0.5)));
+		let scene = capture(&world);
+		let piece = scene.piece(&records_of(&scene, body));
+
+		assert_eq!(piece.things.len(), 2, "the piece carries the car too");
+
+		// the far end already has the car standing in the same slot and no
+		// wheel: what arrives has to hang off the car that is there
+		let mut far = World::new();
+		restore(&mut far, &scene).expect("agrees");
+		assert!(far.entities.despawn(wheel));
+		assert!(far.bodies.despawn(body));
+
+		let put = graft(&mut far, &piece);
+
+		assert_eq!(put.things, 1, "the wheel landed and the car was already there");
+		assert_eq!(far.entities.parent(wheel), car, "hanging off the car in its slot");
+	}
+
+	#[test]
+	fn a_description_with_a_loop_of_parents_is_read_with_the_loop_broken() {
+		let scene = SceneData {
+			things: vec![
+				Thing {
+					name: "a".to_owned(),
+					slot: 0,
+					generation: 1,
+					parent: 1,
+					..Thing::default()
+				},
+				Thing {
+					name: "b".to_owned(),
+					slot: 1,
+					generation: 1,
+					parent: 0,
+					..Thing::default()
+				},
+			],
+			thing_generations: vec![1, 1],
+			..SceneData::default()
+		};
+		let mut world = World::new();
+		restore(&mut world, &scene).expect("agrees");
+		let a = world.entities.at(0);
+		let b = world.entities.at(1);
+
+		assert!(a.is_some() && b.is_some(), "both landed");
+		assert_eq!(world.entities.parent(a), b, "the first link is made");
+		assert_eq!(
+			world.entities.parent(b),
+			EntityId::NONE,
+			"and the one that would close the loop is refused"
+		);
 	}
 
 	#[test]

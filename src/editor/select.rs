@@ -157,16 +157,19 @@ fn again(world: &World, was: Pick, name: &str) -> Pick {
 	}
 }
 
-/// Where something is, if it is the sort of thing that is anywhere.
+/// Where something is in the world, if it is the sort of thing that is
+/// anywhere.
 ///
 /// A joint is not: it is a relationship between two bodies, and its anchors are
-/// in their spaces rather than in the world's.
+/// in their spaces rather than in the world's. An entity hanging off another
+/// is placed through it, because this is what a gizmo works in; @ref
+/// [`local`] for what an inspector shows.
 ///
 /// @param world - what to look in
 /// @param at - what to look for
 pub(crate) fn transform(world: &World, at: Pick) -> Option<Transform> {
 	match at {
-		| Pick::Entity(id) => world.entities.transform(id).copied(),
+		| Pick::Entity(id) => world.entities.placed(id),
 		| Pick::Body(id) => world.bodies.get(id).map(|body| body.transform),
 		| Pick::Nothing | Pick::Joint(_) => None,
 	}
@@ -191,11 +194,11 @@ pub(crate) fn place(world: &mut World, at: Pick, transform: Transform) -> bool {
 				return world.teleport_body(body, transform);
 			}
 
-			let Some(held) = world.entities.transform_mut(id) else {
+			// as a place in the world, whatever it hangs off
+			if !world.entities.set_placed(id, transform) {
 				return false;
-			};
+			}
 
-			*held = transform;
 			// dragged, not traveled. Only play mode blends at all - a world
 			// being edited is drawn as it stands - so this is about the
 			// inspector being used while the game runs. @ref `crate::mode`
@@ -206,6 +209,42 @@ pub(crate) fn place(world: &mut World, at: Pick, transform: Transform) -> bool {
 		},
 		| Pick::Body(id) => world.teleport_body(id, transform),
 		| Pick::Nothing | Pick::Joint(_) => false,
+	}
+}
+
+/// Where something is in its own terms: inside its parent for an entity that
+/// hangs off one, and the same as [`transform`] for everything else.
+///
+/// What an inspector shows and edits, the way every editor checked shows a
+/// child's numbers relative to its parent while its gizmo works in the world.
+///
+/// @param world - what to look in
+/// @param at - what to look for
+pub(crate) fn local(world: &World, at: Pick) -> Option<Transform> {
+	match at {
+		| Pick::Entity(id) if world.entities.parent(id).is_some() =>
+			world.entities.transform(id).copied(),
+		| _ => transform(world, at),
+	}
+}
+
+/// Puts something where it is asked to go, in its own terms. @ref [`local`].
+///
+/// @param world - the world to write
+/// @param at - what to move
+/// @param transform - where it now is, inside its parent for an entity that
+/// hangs off one
+/// @return `true` if anything was moved
+pub(crate) fn place_local(world: &mut World, at: Pick, transform: Transform) -> bool {
+	match at {
+		| Pick::Entity(id) if world.entities.parent(id).is_some() => {
+			let Some(parent) = world.entities.placed(world.entities.parent(id)) else {
+				return false;
+			};
+
+			place(world, at, parent.then(transform))
+		},
+		| _ => place(world, at, transform),
 	}
 }
 
@@ -421,6 +460,74 @@ mod tests {
 			Some(put.position)
 		);
 		assert!(driver(&world, lone).is_none(), "and there was nothing under it");
+	}
+
+	#[test]
+	fn a_child_is_picked_up_in_the_world_and_put_down_as_a_local() {
+		let (mut world, ..) = peopled();
+		let car = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(5.0, 0.0, 0.0)));
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::X));
+		assert!(world.entities.set_parent(wheel, car));
+
+		assert_eq!(
+			transform(&world, Pick::Entity(wheel)).map(|it| it.position),
+			Some(Vec3::new(6.0, 0.0, 0.0)),
+			"the gizmo sees where it is in the world"
+		);
+		assert_eq!(
+			local(&world, Pick::Entity(wheel)).map(|it| it.position),
+			Some(Vec3::X),
+			"and the inspector sees its place inside the car"
+		);
+
+		assert!(place(&mut world, Pick::Entity(wheel), Transform::at(Vec3::new(9.0, 0.0, 0.0))));
+		assert_eq!(
+			world
+				.entities
+				.transform(wheel)
+				.map(|it| it.position),
+			Some(Vec3::new(4.0, 0.0, 0.0)),
+			"a world drop lands as a local"
+		);
+
+		assert!(place_local(&mut world, Pick::Entity(wheel), Transform::at(Vec3::NEG_X)));
+		assert_eq!(
+			transform(&world, Pick::Entity(wheel)).map(|it| it.position),
+			Some(Vec3::new(4.0, 0.0, 0.0)),
+			"and a local edit is a world place through the car"
+		);
+	}
+
+	#[test]
+	fn a_body_under_a_child_is_teleported_and_the_child_lands_as_a_local() {
+		let (mut world, ..) = peopled();
+		let car = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(5.0, 0.0, 0.0)));
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::X));
+		assert!(world.entities.set_parent(wheel, car));
+		let body = world.attach_body(wheel, BodyKind::Dynamic, Shape::UNIT);
+
+		assert!(place(&mut world, Pick::Body(body), Transform::at(Vec3::new(9.0, 0.0, 0.0))));
+
+		assert_eq!(
+			world
+				.bodies
+				.get(body)
+				.map(|it| it.transform.position),
+			Some(Vec3::new(9.0, 0.0, 0.0)),
+			"the body is where it was put, in the world"
+		);
+		assert_eq!(
+			world
+				.entities
+				.transform(wheel)
+				.map(|it| it.position),
+			Some(Vec3::new(4.0, 0.0, 0.0)),
+			"and the wheel took it as its place inside the car"
+		);
 	}
 
 	#[test]

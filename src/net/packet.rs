@@ -55,8 +55,9 @@ pub const MAGIC: u16 = u16::from_le_bytes(*b"CN");
 /// the message rather than read as if it agreed.
 ///
 /// Two since the head grew a session, three since a console line grew the
-/// aim of whoever said it.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// aim of whoever said it, four since an entity record grew what it hangs off
+/// and the piece of a world that crosses carries the record.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 const MAGIC_AT: usize = 0;
 const VERSION_AT: usize = 2;
@@ -464,7 +465,7 @@ mod tests {
 		assert_eq!(
 			head,
 			[
-				b'C', b'N', 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+				b'C', b'N', 4, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
 				0x10
 			],
 			"the magic, the protocol, then the six fields little-endian in order"

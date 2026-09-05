@@ -17,6 +17,13 @@
 //! [`interpolated`](Entities::interpolated), and invisible to the game, which
 //! goes on writing one transform per step and knowing nothing about the rate
 //! the picture is drawn at.
+//!
+//! An entity may hang off another - @ref [`Entities::parent`] - and its
+//! transform is then its own place inside that parent rather than in the
+//! world. The world's answer is [`Entities::placed`], worked out by walking up
+//! the chain when it is asked for rather than kept in a second array, and the
+//! renderer's is [`blended`](Entities::blended), which does the same between
+//! two steps.
 
 use super::{material::MaterialId, mesh::MeshId, names::Names, pose::PoseId};
 use crate::{
@@ -107,7 +114,8 @@ impl Default for EntityId {
 /// which host and module share.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
-	/// Position in world space.
+	/// Position: in the world for an entity standing on its own, inside the
+	/// parent for one that hangs off another. @ref [`Entities::placed`].
 	pub position: Vec3,
 
 	/// Rotation.
@@ -154,6 +162,49 @@ impl Transform {
 
 	/// Sets every axis of the scale at once.
 	pub fn set_scale(&mut self, scale: f32) { self.scale = Vec3::splat(scale); }
+
+	/// This transform with another applied inside it: where a child stands
+	/// when this is its parent.
+	///
+	/// Position, rotation and scale composed each on their own, which is exact
+	/// whenever this transform's scale is the same along every axis and the
+	/// nearest thing that is not a shear otherwise: a turned child under a
+	/// parent stretched along one axis would need a shear, and a translation,
+	/// a rotation and a scale cannot hold one. That is the bargain every
+	/// engine with a transform of this shape makes, and the one
+	/// [`from_matrix`](Self::from_matrix) already makes here.
+	///
+	/// @param child - a transform relative to this one
+	#[must_use]
+	pub fn then(&self, child: Self) -> Self {
+		Self {
+			position: self.position + self.rotation * (self.scale * child.position),
+			rotation: self.rotation * child.rotation,
+			scale: self.scale * child.scale,
+		}
+	}
+
+	/// The transform that, applied inside `parent`, lands at `world`.
+	///
+	/// The inverse of [`then`](Self::then): `parent.then(Transform::local_of(
+	/// world, parent))` is `world` to within rounding, wherever `parent` scales
+	/// by something other than nothing. An axis a parent scales by nothing is
+	/// one nothing under it can be placed along, and along it the child's own
+	/// numbers are kept rather than divided by it.
+	///
+	/// @param world - where the child is to be, in the world
+	/// @param parent - what it hangs off, in the world
+	#[must_use]
+	pub fn local_of(world: Self, parent: Self) -> Self {
+		let undo = parent.rotation.inverse();
+		let scale = Vec3::select(parent.scale.cmpeq(Vec3::ZERO), Vec3::ONE, parent.scale);
+
+		Self {
+			position: (undo * (world.position - parent.position)) / scale,
+			rotation: undo * world.rotation,
+			scale: world.scale / scale,
+		}
+	}
 
 	/// This transform part of the way towards another one.
 	///
@@ -280,6 +331,12 @@ pub struct Entities {
 	/// `transforms`, and the same length; the renderer draws between the two.
 	previous: Vec<Transform>,
 	renderables: Vec<Renderable>,
+	/// What each slot hangs off, or [`EntityId::NONE`] for a thing standing
+	/// on its own. The same slots again. A handle rather than a slot number,
+	/// so that a parent which died and whose slot something else took is a
+	/// stale handle resolving to nobody, rather than a new parent nobody
+	/// asked for. @ref [`Entities::parent`].
+	parents: Vec<EntityId>,
 	/// What each slot is called, or the empty string. The same slots again,
 	/// and the one array here that is not read by anything the engine does -
 	/// it exists for whoever has to point at a particular entity in words.
@@ -305,6 +362,7 @@ impl Entities {
 			transforms: Vec::new(),
 			previous: Vec::new(),
 			renderables: Vec::new(),
+			parents: Vec::new(),
 			names: Names::new(),
 			generations: Vec::new(),
 			alive: Vec::new(),
@@ -344,6 +402,8 @@ impl Entities {
 		self.previous[slot] = transform;
 		self.pending.push(slot);
 		self.renderables[slot] = Renderable::NOTHING;
+		// and it hangs off nothing, whatever the previous occupant did.
+		self.parents[slot] = EntityId::NONE;
 		// whatever the previous occupant of this slot was called is not what
 		// this is called. This is the only place a name is cleared, and it is
 		// here rather than at the despawn because a slot reaches the free list
@@ -370,6 +430,7 @@ impl Entities {
 		self.transforms[slot] = Transform::IDENTITY;
 		self.previous[slot] = Transform::IDENTITY;
 		self.renderables[slot] = Renderable::NOTHING;
+		self.parents[slot] = EntityId::NONE;
 		self.free.push(id.index);
 		self.live -= 1;
 
@@ -387,6 +448,7 @@ impl Entities {
 			self.transforms[slot] = Transform::IDENTITY;
 			self.previous[slot] = Transform::IDENTITY;
 			self.renderables[slot] = Renderable::NOTHING;
+			self.parents[slot] = EntityId::NONE;
 			if let Ok(index) = u32::try_from(slot) {
 				self.free.push(index);
 			}
@@ -471,6 +533,131 @@ impl Entities {
 		};
 
 		self.names.set(slot, name);
+
+		true
+	}
+
+	/// What an entity hangs off, or [`EntityId::NONE`] for one standing on its
+	/// own.
+	///
+	/// A parent that has been despawned is no parent: the handle kept here
+	/// stops resolving the moment its slot is freed, so a child is not moved by
+	/// whatever takes the slot afterwards and reads as a root from then on,
+	/// without anything having to walk the table when its parent goes.
+	#[must_use]
+	pub fn parent(&self, id: EntityId) -> EntityId {
+		let Some(slot) = self.slot(id) else {
+			return EntityId::NONE;
+		};
+
+		let parent = self.parents[slot];
+
+		if self.slot(parent).is_some() {
+			parent
+		} else {
+			EntityId::NONE
+		}
+	}
+
+	/// Hangs an entity off another, or takes it down.
+	///
+	/// The entity's own transform is left exactly as it is and starts meaning
+	/// something else: its place inside the parent rather than in the world.
+	/// A caller that wants the thing to stay where it stands writes
+	/// [`set_placed`](Self::set_placed) afterwards with the place it had.
+	///
+	/// @param id - the entity
+	/// @param parent - what to hang it off, or [`EntityId::NONE`] to stand it
+	/// on its own
+	/// @return `true` if it was done; `false` for a stale handle, a parent
+	/// that is not alive, an entity hanging off itself, or a loop - an entity
+	/// cannot hang off something that hangs off it
+	pub fn set_parent(&mut self, id: EntityId, parent: EntityId) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		if !parent.is_some() {
+			self.parents[slot] = EntityId::NONE;
+
+			return true;
+		}
+
+		if self.slot(parent).is_none() || parent == id {
+			return false;
+		}
+
+		// walking up from the parent: a walk that reaches this entity means
+		// hanging off that parent would close a loop, and a loop is a chain
+		// nothing can resolve. Bounded by the table, which no chain exceeds.
+		let mut above = parent;
+		for _ in 0..MAX_ENTITIES {
+			above = self.parent(above);
+
+			if !above.is_some() {
+				break;
+			}
+
+			if above == id {
+				return false;
+			}
+		}
+
+		self.parents[slot] = parent;
+
+		true
+	}
+
+	/// Where an entity is in the world, with everything it hangs off applied.
+	///
+	/// The same as [`transform`](Self::transform) for an entity standing on
+	/// its own, and every parent's transform applied in turn for one that is
+	/// not. Worked out when asked rather than kept: a second copy of every
+	/// transform is stale for whoever reads it between the write and the pass
+	/// that would refresh it, and a chain here is a few multiplies.
+	///
+	/// @param id - the entity
+	/// @return where it is, or `None` if the handle is stale
+	#[must_use]
+	pub fn placed(&self, id: EntityId) -> Option<Transform> {
+		let slot = self.slot(id)?;
+		let mut placed = self.transforms[slot];
+		let mut above = self.parent(id);
+
+		// bounded like the check in `set_parent`, and for the same reason: a
+		// loop cannot be made, and a walk that could not end anyway must.
+		for _ in 0..MAX_ENTITIES {
+			let Some(slot) = self.slot(above) else {
+				break;
+			};
+
+			placed = self.transforms[slot].then(placed);
+			above = self.parent(above);
+		}
+
+		Some(placed)
+	}
+
+	/// Puts an entity somewhere in the world, whatever it hangs off.
+	///
+	/// Writes the entity's own transform such that [`placed`](Self::placed)
+	/// answers with `world`: the transform itself for an entity standing on
+	/// its own, and the place inside the parent for one that is not.
+	///
+	/// @param id - the entity
+	/// @param world - where it is to be, in the world
+	/// @return `true` if the handle resolved
+	pub fn set_placed(&mut self, id: EntityId, world: Transform) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		let local = match self.placed(self.parent(id)) {
+			| Some(parent) => Transform::local_of(world, parent),
+			| None => world,
+		};
+
+		self.transforms[slot] = local;
 
 		true
 	}
@@ -561,6 +748,34 @@ impl Entities {
 		Some(previous.lerp(current, t.clamp(0.0, 1.0)))
 	}
 
+	/// Where an entity should be drawn part of the way through a step, with
+	/// everything it hangs off applied.
+	///
+	/// [`interpolated`](Self::interpolated) at every level of the chain and
+	/// the levels composed, so a child of something turning is drawn turning
+	/// with it between two steps rather than snapping to wherever the step
+	/// left its parent.
+	///
+	/// @param id - the entity to place
+	/// @param t - how far past the previous step this frame sits, `0.0 ..= 1.0`
+	/// @return the blended transform, or `None` if the handle is stale
+	#[must_use]
+	pub fn blended(&self, id: EntityId, t: f32) -> Option<Transform> {
+		let mut placed = self.interpolated(id, t)?;
+		let mut above = self.parent(id);
+
+		for _ in 0..MAX_ENTITIES {
+			let Some(parent) = self.interpolated(above, t) else {
+				break;
+			};
+
+			placed = parent.then(placed);
+			above = self.parent(above);
+		}
+
+		Some(placed)
+	}
+
 	/// Every living entity, with everything it has.
 	///
 	/// Yields in slot order, which is stable until something is despawned.
@@ -619,6 +834,8 @@ impl Entities {
 		self.renderables.clear();
 		self.renderables
 			.resize(slots, Renderable::NOTHING);
+		self.parents.clear();
+		self.parents.resize(slots, EntityId::NONE);
 		self.names.reset(slots);
 		self.generations.clear();
 		self.generations
@@ -674,6 +891,7 @@ impl Entities {
 			self.transforms.push(Transform::IDENTITY);
 			self.previous.push(Transform::IDENTITY);
 			self.renderables.push(Renderable::NOTHING);
+			self.parents.push(EntityId::NONE);
 			self.names.push();
 			self.generations.push(0);
 			self.alive.push(false);
@@ -720,6 +938,9 @@ impl Entities {
 		self.transforms[slot] = transform;
 		self.previous[slot] = transform;
 		self.renderables[slot] = renderable;
+		// off nothing until whoever put it back says otherwise, which a
+		// restore does once every record has landed. @ref `scene::restore`.
+		self.parents[slot] = EntityId::NONE;
 		self.generations[slot] = self.generations[slot].max(1);
 		self.live += 1;
 
@@ -787,6 +1008,7 @@ impl Entities {
 		self.transforms.push(Transform::IDENTITY);
 		self.previous.push(Transform::IDENTITY);
 		self.renderables.push(Renderable::NOTHING);
+		self.parents.push(EntityId::NONE);
 		self.names.push();
 		self.generations.push(0);
 		self.alive.push(false);
@@ -1173,6 +1395,201 @@ mod tests {
 		assert_eq!(entities.alive.len(), length, "and the rest of the table agrees");
 		assert_eq!(entities.generations.len(), length, "and the rest of the table agrees");
 		assert_eq!(entities.names.slots(), length, "and the rest of the table agrees");
+		assert_eq!(entities.parents.len(), length, "and the rest of the table agrees");
+	}
+
+	/// A parent that is turned, scaled and moved, so that every part of a
+	/// composition has something to get wrong.
+	fn awkward() -> Transform {
+		Transform {
+			position: Vec3::new(3.0, -1.0, 2.0),
+			rotation: Quat::from_rotation_y(FRAC_PI_2),
+			scale: Vec3::splat(2.0),
+		}
+	}
+
+	#[test]
+	fn a_child_stands_where_its_parent_puts_it() {
+		let parent = awkward();
+		let placed = parent.then(Transform::at(Vec3::X));
+
+		// a step of one along the parent's x, which its quarter turn about y
+		// points down negative z, at twice the size, from where it stands
+		assert!(
+			placed
+				.position
+				.abs_diff_eq(Vec3::new(3.0, -1.0, 0.0), 1.0e-5),
+			"got {}",
+			placed.position
+		);
+		assert!(placed.scale.abs_diff_eq(Vec3::splat(2.0), 1.0e-6), "the scale multiplies");
+		assert!(turns(placed.rotation, parent.rotation, 1.0e-6), "and the turn is the parent's");
+	}
+
+	#[test]
+	fn local_of_undoes_then_under_an_awkward_parent() {
+		let parent = awkward();
+		let world = Transform {
+			position: Vec3::new(-4.0, 5.0, 1.5),
+			rotation: Quat::from_rotation_x(FRAC_PI_6),
+			scale: Vec3::new(1.0, 3.0, 0.5),
+		};
+		let local = Transform::local_of(world, parent);
+		let back = parent.then(local);
+
+		assert!(back.position.abs_diff_eq(world.position, 1.0e-4), "got {}", back.position);
+		assert!(turns(back.rotation, world.rotation, 1.0e-5), "the turn comes back");
+		assert!(back.scale.abs_diff_eq(world.scale, 1.0e-5), "got {}", back.scale);
+		assert!(
+			!local.position.abs_diff_eq(world.position, 1.0e-3),
+			"and the local really is another number, or this proves nothing"
+		);
+	}
+
+	#[test]
+	fn a_child_is_placed_through_its_parent_and_a_root_where_it_says() {
+		let mut entities = Entities::new();
+		let parent = entities.spawn_at(awkward());
+		let child = entities.spawn_at(Transform::at(Vec3::X));
+
+		assert!(entities.set_parent(child, parent), "it hangs");
+		assert_eq!(entities.parent(child), parent);
+		assert_eq!(entities.parent(parent), EntityId::NONE, "and the parent is a root");
+
+		let placed = entities.placed(child).expect("alive");
+
+		assert!(
+			placed
+				.position
+				.abs_diff_eq(Vec3::new(3.0, -1.0, 0.0), 1.0e-5),
+			"got {placed:?}"
+		);
+		assert_eq!(
+			entities.transform(child).copied(),
+			Some(Transform::at(Vec3::X)),
+			"while its own transform is untouched and now means inside the parent"
+		);
+		assert_eq!(entities.placed(parent), Some(awkward()), "a root is placed where it says");
+	}
+
+	#[test]
+	fn set_placed_writes_the_local_that_lands_there() {
+		let mut entities = Entities::new();
+		let parent = entities.spawn_at(awkward());
+		let child = entities.spawn();
+		assert!(entities.set_parent(child, parent));
+
+		let wanted = Transform::at(Vec3::splat(7.0));
+
+		assert!(entities.set_placed(child, wanted));
+
+		let placed = entities.placed(child).expect("alive");
+
+		assert!(
+			placed
+				.position
+				.abs_diff_eq(wanted.position, 1.0e-4),
+			"got {placed:?}"
+		);
+		assert!(
+			!entities
+				.transform(child)
+				.expect("alive")
+				.position
+				.abs_diff_eq(wanted.position, 1.0e-3),
+			"by way of a local that is not the world position"
+		);
+
+		let lone = entities.spawn();
+
+		assert!(entities.set_placed(lone, wanted));
+		assert_eq!(entities.transform(lone).copied(), Some(wanted), "a root takes it as it is");
+	}
+
+	#[test]
+	fn a_parent_that_is_itself_a_descendant_or_dead_is_refused() {
+		let mut entities = Entities::new();
+		let a = entities.spawn();
+		let b = entities.spawn();
+		let c = entities.spawn();
+
+		assert!(entities.set_parent(b, a));
+		assert!(entities.set_parent(c, b));
+
+		assert!(!entities.set_parent(a, a), "itself");
+		assert!(!entities.set_parent(a, c), "a loop three long");
+		assert!(!entities.set_parent(a, b), "a loop two long");
+		assert_eq!(entities.parent(a), EntityId::NONE, "and nothing was written");
+
+		let gone = entities.spawn();
+		assert!(entities.despawn(gone));
+
+		assert!(!entities.set_parent(a, gone), "a dead parent");
+		assert!(!entities.set_parent(gone, a), "or a dead child");
+		assert!(entities.set_parent(c, EntityId::NONE), "taking down is always allowed");
+		assert_eq!(entities.parent(c), EntityId::NONE);
+	}
+
+	#[test]
+	fn a_parent_that_died_is_no_parent_and_its_slot_reused_is_not_one_either() {
+		let mut entities = Entities::new();
+		let parent = entities.spawn_at(Transform::at(Vec3::Y));
+		let child = entities.spawn_at(Transform::at(Vec3::X));
+		assert!(entities.set_parent(child, parent));
+		assert!(entities.despawn(parent));
+
+		assert_eq!(entities.parent(child), EntityId::NONE, "gone");
+		assert_eq!(
+			entities.placed(child),
+			Some(Transform::at(Vec3::X)),
+			"and the child stands on its own"
+		);
+
+		// the slot comes back with another occupant, which is not the parent
+		let stranger = entities.spawn_at(Transform::at(Vec3::Z * 9.0));
+
+		assert_eq!(
+			stranger.slot(),
+			parent.slot(),
+			"the fixture reuses the slot, or it proves nothing"
+		);
+		assert_eq!(
+			entities.parent(child),
+			EntityId::NONE,
+			"a stranger in the slot is nobody's parent"
+		);
+		assert_eq!(
+			entities.parent(stranger),
+			EntityId::NONE,
+			"and a reused slot hangs off nothing"
+		);
+	}
+
+	#[test]
+	fn a_child_is_drawn_between_where_its_parent_was_and_is() {
+		let mut entities = Entities::new();
+		let parent = entities.spawn_at(Transform::IDENTITY);
+		let child = entities.spawn_at(Transform::at(Vec3::X));
+		assert!(entities.set_parent(child, parent));
+		entities.advance();
+
+		if let Some(at) = entities.transform_mut(parent) {
+			at.position = Vec3::new(0.0, 10.0, 0.0);
+		}
+
+		let halfway = entities.blended(child, 0.5).expect("alive");
+
+		assert!(
+			halfway
+				.position
+				.abs_diff_eq(Vec3::new(1.0, 5.0, 0.0), 1.0e-5),
+			"got {halfway:?}"
+		);
+		assert_eq!(
+			entities.interpolated(child, 0.5),
+			Some(Transform::at(Vec3::X)),
+			"while its own transform did not move"
+		);
 	}
 
 	#[test]

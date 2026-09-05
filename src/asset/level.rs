@@ -28,7 +28,8 @@
 //! ```text
 //! {
 //!   "stage":    { "camera": { "position": [0, 2, 5], "target": [0, 0, 0] } },
-//!   "entities": [ { "name": "crate", "at": [0, 4, 0], "mesh": "cube" } ],
+//!   "entities": [ { "name": "crate", "at": [0, 4, 0], "mesh": "cube" },
+//!                 { "name": "lid", "parent": "crate", "at": [0, 0.6, 0], "mesh": "cube" } ],
 //!   "bodies":   [ { "entity": "crate", "kind": "dynamic",
 //!                   "shape": { "kind": "box", "extents": [0.5, 0.5, 0.5] } } ],
 //!   "joints":   [ { "kind": "rope", "first": "crate", "length": 3.0,
@@ -36,6 +37,12 @@
 //!   "poses":    [ { "name": "hero", "skeleton": "models/hero/rig" } ]
 //! }
 //! ```
+//!
+//! **An entity hangs off another by name.** `"parent": "crate"` on the lid
+//! above makes its `at`, `turn` and `scale` its place inside the crate rather
+//! than in the world, and it goes wherever the crate goes. A parent nothing
+//! answers to, an entity hanging off itself, and a loop are each an error
+//! naming the entity; the order the two are written in does not matter.
 //!
 //! **A pose is a record of its own and an entity names it**, rather than an
 //! entity naming a skeleton directly. The two are not the same claim: a model
@@ -193,7 +200,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 	for (index, entry) in listed(value).iter().enumerate() {
 		fields(
 			entry,
-			&["name", "at", "turn", "scale", "mesh", "material", "color", "pose"],
+			&["name", "parent", "at", "turn", "scale", "mesh", "material", "color", "pose"],
 			"an entity",
 		)?;
 
@@ -224,10 +231,65 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			material: text(entry.get("material")),
 			color: vector(entry.get("color"), Vec3::ONE),
 			pose,
+			parent: NO_INDEX,
 		});
 	}
 
+	hang(&mut things, value)?;
+
 	Ok(things)
+}
+
+/// Resolves what every entity hangs off, once every name is known.
+///
+/// A second pass on purpose: a child may be written above the thing it hangs
+/// off, and a person is not going to sort a file by depth to please a reader.
+/// A loop is caught here too, because one record at a time cannot see one.
+///
+/// @param things - the entities, read
+/// @param value - the list they were read from
+fn hang(things: &mut [Thing], value: Option<&Value>) -> Result {
+	for (index, entry) in listed(value).iter().enumerate() {
+		let named = text(entry.get("parent"));
+
+		if named.is_empty() {
+			continue;
+		}
+
+		let parent = things
+			.iter()
+			.position(|it| it.name == named)
+			.ok_or_else(|| err!(Asset("an entity hangs off {named}, and no entity is that")))?;
+
+		if parent == index {
+			return Err(err!(Asset("{named} hangs off itself")));
+		}
+
+		things[index].parent = count(parent, "a scene's records")?;
+	}
+
+	// a chain of parents longer than the list has come back to something,
+	// which is a loop, and a loop is a chain nothing can resolve. Counting is
+	// the whole check: comparing against the record the climb started from
+	// would catch only a loop that runs through that record, and the count
+	// catches one that does not.
+	for thing in &*things {
+		let mut above = thing.parent;
+		let mut climbed = 0;
+
+		while above != NO_INDEX {
+			if climbed > things.len() {
+				return Err(err!(Asset("{} hangs off a chain that never ends", thing.name)));
+			}
+
+			above = things
+				.get(usize::try_from(above).unwrap_or(usize::MAX))
+				.map_or(NO_INDEX, |it| it.parent);
+			climbed += 1;
+		}
+	}
+
+	Ok(())
 }
 
 /// Every body, with the entity it drives looked up by name.
@@ -585,7 +647,10 @@ pub fn export(scene: &SceneData) -> Result<String> {
 	let thing_names = named(
 		&scene.things,
 		|thing| thing.name.as_str(),
-		|index| scene.solids.iter().any(|it| it.thing == index),
+		|index| {
+			scene.solids.iter().any(|it| it.thing == index)
+				|| scene.things.iter().any(|it| it.parent == index)
+		},
 		"entity",
 	);
 	let solid_names = named(
@@ -611,7 +676,7 @@ pub fn export(scene: &SceneData) -> Result<String> {
 		.things
 		.iter()
 		.zip(&thing_names)
-		.map(|(thing, name)| thing_of(thing, name, &pose_names))
+		.map(|(thing, name)| thing_of(thing, name, &thing_names, &pose_names))
 		.collect();
 	let solids: Vec<String> = scene
 		.solids
@@ -726,11 +791,12 @@ fn stage_of(stage: &Stage) -> Option<String> {
 	Some(format!("\t\"stage\": {}", object(&inner)))
 }
 
-/// One entity.
-fn thing_of(thing: &Thing, name: &str, poses: &[String]) -> String {
+/// One entity, with what it hangs off named rather than numbered.
+fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> String {
 	let mut fields: Vec<(&str, String)> = Vec::new();
 
 	put_text(&mut fields, "name", name);
+	put_text(&mut fields, "parent", &at_index(things, thing.parent));
 	put_place(&mut fields, &thing.transform, &Transform::IDENTITY);
 	put_text(&mut fields, "mesh", &thing.mesh);
 	put_text(&mut fields, "material", &thing.material);
@@ -1296,6 +1362,80 @@ mod tests {
 			.to_string();
 
 		assert!(refused.contains("bones"), "it names the field: {refused}");
+	}
+
+	/// A source where one entity hangs off another that is written below it.
+	const HUNG: &str = r#"{
+		"entities": [
+			{ "name": "wheel", "parent": "car", "at": [1, 0, 0] },
+			{ "name": "car", "at": [2, 0, 0], "scale": [2, 2, 2] }
+		]
+	}"#;
+
+	#[test]
+	fn an_entity_hangs_off_the_one_it_names_whichever_is_written_first() {
+		let scene = import(HUNG).expect("it is a scene");
+
+		assert_eq!(scene.things[0].parent, 1, "the wheel hangs off the car, by its place");
+		assert_eq!(scene.things[1].parent, NO_INDEX, "the car hangs off nothing");
+		assert_eq!(scene.things[0].transform.position, Vec3::X, "and its place is its own");
+	}
+
+	#[test]
+	fn a_parent_survives_being_written_back_out_and_read_again() {
+		let scene = import(HUNG).expect("it is a scene");
+		let text = export(&scene).expect("it writes");
+
+		assert!(text.contains("\"parent\": \"car\""), "written by name: {text}");
+		assert_eq!(import(&text).expect("it reads back"), scene);
+	}
+
+	#[test]
+	fn a_parent_is_named_even_when_nothing_else_needed_a_name() {
+		let scene = SceneData {
+			things: vec![Thing { generation: 1, ..Thing::default() }, Thing {
+				generation: 1,
+				parent: 0,
+				..Thing::default()
+			}],
+			thing_generations: vec![1, 1],
+			..SceneData::default()
+		};
+		let text = export(&scene).expect("it writes");
+
+		assert!(text.contains("\"parent\": \"entity 0\""), "the parent was given a name: {text}");
+		assert_eq!(import(&text).expect("it reads back").things[1].parent, 0);
+	}
+
+	#[test]
+	fn a_parent_nothing_answers_to_and_a_loop_are_errors_naming_the_entity() {
+		let nobody = r#"{ "entities": [ { "name": "wheel", "parent": "cart" } ] }"#;
+		let error = import(nobody).expect_err("no cart").to_string();
+
+		assert!(error.contains("cart"), "it says which: {error}");
+
+		let itself = r#"{ "entities": [ { "name": "wheel", "parent": "wheel" } ] }"#;
+		let error = import(itself).expect_err("itself").to_string();
+
+		assert!(error.contains("wheel") && error.contains("itself"), "got {error}");
+
+		let ring = r#"{ "entities": [
+			{ "name": "a", "parent": "b" }, { "name": "b", "parent": "c" }, { "name": "c", "parent": "a" }
+		] }"#;
+		let error = import(ring).expect_err("a loop").to_string();
+
+		assert!(error.contains("a hangs off a chain that never ends"), "got {error}");
+
+		// and a loop that does not run through the record the climb started
+		// from is a loop all the same
+		let beside = r#"{ "entities": [
+			{ "name": "a", "parent": "b" }, { "name": "b", "parent": "c" }, { "name": "c", "parent": "b" }
+		] }"#;
+		let error = import(beside)
+			.expect_err("a loop beside it")
+			.to_string();
+
+		assert!(error.contains("hangs off a chain that never ends"), "got {error}");
 	}
 
 	#[test]

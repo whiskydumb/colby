@@ -252,6 +252,7 @@ fn detail(ui: &mut egui::Ui, world: &mut World, pick: Pick) {
 		},
 		| Pick::Entity(id) => {
 			naming(ui, world, pick);
+			hanging(ui, world, id);
 			placing(ui, world, pick);
 			tint(ui, world, id);
 		},
@@ -387,9 +388,31 @@ fn naming(ui: &mut egui::Ui, world: &mut World, pick: Pick) {
 	});
 }
 
+/// What an entity hangs off, which is read rather than written here.
+///
+/// Hanging one entity off another is the hierarchy panel's job, and that
+/// panel is not built yet; until it is, the fact is shown so that the numbers
+/// under it read right.
+fn hanging(ui: &mut egui::Ui, world: &World, id: EntityId) {
+	let parent = world.entities.parent(id);
+
+	if !parent.is_some() {
+		return;
+	}
+
+	ui.horizontal(|ui| {
+		ui.label("inside");
+		ui.monospace(entity_label(world, parent));
+	});
+}
+
 /// Position, rotation and scale, for the things that have them.
+///
+/// In the thing's own terms - inside its parent, for an entity that hangs off
+/// one - because that is what a person expects to type; the gizmo in the
+/// viewport works in the world. @ref `select::local`.
 fn placing(ui: &mut egui::Ui, world: &mut World, pick: Pick) {
-	let Some(transform) = select::transform(world, pick) else {
+	let Some(transform) = select::local(world, pick) else {
 		return;
 	};
 
@@ -412,7 +435,7 @@ fn placing(ui: &mut egui::Ui, world: &mut World, pick: Pick) {
 		});
 
 	if edited != transform {
-		select::place(world, pick, edited);
+		select::place_local(world, pick, edited);
 	}
 }
 

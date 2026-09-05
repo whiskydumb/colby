@@ -216,8 +216,14 @@ pub(crate) fn under(world: &World, from: Vec3, along: Vec3) -> Pick {
 	let mut nearest = f32::INFINITY;
 	let mut found = Pick::Nothing;
 
-	for (id, transform, renderable) in world.entities.iter() {
+	for (id, _, renderable) in world.entities.iter() {
 		let Some(mesh) = world.meshes.get(renderable.mesh) else {
+			continue;
+		};
+
+		// where it is in the world, whatever it hangs off: the ray is a
+		// world-space thing, and the bounds are tested in the entity's own.
+		let Some(placed) = world.entities.placed(id) else {
 			continue;
 		};
 
@@ -234,7 +240,7 @@ pub(crate) fn under(world: &World, from: Vec3, along: Vec3) -> Pick {
 			continue;
 		}
 
-		let (start, direction) = local(transform, from, along);
+		let (start, direction) = local(&placed, from, along);
 		let Some(distance) = slab(start, direction, min, max) else {
 			continue;
 		};
@@ -344,6 +350,30 @@ mod tests {
 		let cube = stood(&mut world, Transform::IDENTITY);
 
 		assert_eq!(under(&world, Vec3::Z * 10.0, Vec3::NEG_Z), cube, "straight at it");
+	}
+
+	#[test]
+	fn something_hanging_off_another_is_found_where_it_stands_in_the_world() {
+		let mut world = cubed();
+		let car = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(5.0, 0.0, 0.0)));
+		let wheel = stood(&mut world, Transform::at(Vec3::X));
+		let Pick::Entity(id) = wheel else {
+			panic!("stood makes an entity");
+		};
+		assert!(world.entities.set_parent(id, car));
+
+		assert_eq!(
+			under(&world, Vec3::new(6.0, 0.0, 10.0), Vec3::NEG_Z),
+			wheel,
+			"at its place in the world, through the car"
+		);
+		assert_eq!(
+			under(&world, Vec3::new(1.0, 0.0, 10.0), Vec3::NEG_Z),
+			Pick::Nothing,
+			"and not where its own transform alone would put it"
+		);
 	}
 
 	#[test]
