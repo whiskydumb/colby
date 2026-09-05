@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install the library the build links and a software vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev pkg-config mesa-vulkan-drivers
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,typos
+
+      - name: install the pinned nightly rustfmt
+        run: rustup toolchain install "$(just --evaluate nightly)" --profile minimal --component rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: the gate
+        run: just ci
+
+      - name: the three oracles, each twice, byte for byte
+        run: |
+          just shot one.png && just shot two.png && cmp one.png two.png
+          just hear one.wav && just hear two.wav && cmp one.wav two.wav
+          just link | grep -o 'taken=.*digest=.*' > one.txt
+          just link | grep -o 'taken=.*digest=.*' > two.txt
+          cmp one.txt two.txt
+          sha256sum one.png one.wav
+          cat one.txt
