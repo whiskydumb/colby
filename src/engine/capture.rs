@@ -1340,25 +1340,40 @@ f 1 4 5
 		assert_eq!(dominant(middle), 2, "the cube is blue now, not red: {middle:?}");
 	}
 
-	/// A two-by-two image: red, green over blue, white, with its whole chain.
+	/// An eight-by-eight image in four quarters: red, green over blue, white,
+	/// with its whole chain.
 	///
 	/// Built by hand rather than decoded, because the decoder is
 	/// `colby_asset`'s to test. What this one is for is the other end: whether
 	/// those texels come out of the screen where the coordinates say they
-	/// should.
+	/// should. Eight across rather than two so that a sample a quarter of the
+	/// way in sits two texels from any change of color: a software
+	/// rasterizer's anisotropic filter was measured to blend in a fifth of a
+	/// texel from beside the one sampled, which at two across is a fifth of
+	/// the neighboring color and at eight across is more of the same one.
 	fn quadrants() -> TextureData {
-		let base = vec![
-			0xFF, 0x00, 0x00, 0xFF, // red
-			0x00, 0xFF, 0x00, 0xFF, // green
-			0x00, 0x00, 0xFF, 0xFF, // blue
-			0xFF, 0xFF, 0xFF, 0xFF, // white
+		const SIDE: u32 = 8;
+		const HALF: u32 = SIDE / 2;
+		let colors: [[u8; 4]; 4] = [
+			[0xFF, 0x00, 0x00, 0xFF], // red
+			[0x00, 0xFF, 0x00, 0xFF], // green
+			[0x00, 0x00, 0xFF, 0xFF], // blue
+			[0xFF, 0xFF, 0xFF, 0xFF], // white
 		];
 
+		let mut base = Vec::new();
+		for y in 0..SIDE {
+			for x in 0..SIDE {
+				let quarter = usize::from(x >= HALF) + 2 * usize::from(y >= HALF);
+				base.extend_from_slice(&colors[quarter]);
+			}
+		}
+
 		TextureData {
-			width: 2,
-			height: 2,
+			width: SIDE,
+			height: SIDE,
 			texel: Texel::Rgba8Srgb,
-			levels: colby_asset::texture::build_chain(2, 2, base, Texel::Rgba8Srgb)
+			levels: colby_asset::texture::build_chain(SIDE, SIDE, base, Texel::Rgba8Srgb)
 				.expect("the chain builds"),
 		}
 	}
@@ -1392,9 +1407,10 @@ f 1 4 5
 			.insert("test/quadrants", Material::textured(texture));
 
 		// sized so that a quarter of the frame is a quarter of the quad, which
-		// puts each sample below on the middle of a texel. Off-center would
-		// blend with the neighbor the sampler wraps around to, and the test
-		// would be measuring the filter rather than the coordinates.
+		// puts each sample below in the middle of a quarter of the image: two
+		// texels from the nearest other color and from the edge the sampler
+		// wraps around to. Nearer, and the test would be measuring the filter
+		// rather than the coordinates - @ref `quadrants`.
 		let across = (world.camera.fov_y / 2.0).tan() * HEIGHT * 2.0;
 		let floor = world.entities.spawn_at(Transform {
 			position: Vec3::ZERO,
@@ -1753,18 +1769,25 @@ f 1 4 5
 		u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2])
 	}
 
-	/// A two-texel normal map: the left texel leans towards `-x`, the right one
-	/// towards `+x`, both by about forty-five degrees.
+	/// An eight-texel normal map: the left four lean towards `-x`, the right
+	/// four towards `+x`, all by about forty-five degrees.
 	///
 	/// One level and no chain, so that what reaches the sampler is what is
-	/// written here rather than an average of it.
+	/// written here rather than an average of it; four texels a side rather
+	/// than one for the reason `quadrants` gives.
 	fn leaning_normals() -> TextureData {
 		// tangent space, and the quad's tangent runs along +x. 37 and 217 are
 		// -0.707 and +0.707 folded into a byte; 128 is zero.
-		let base = vec![37, 128, 217, 255, 217, 128, 217, 255];
+		let left = [37, 128, 217, 255];
+		let right = [217, 128, 217, 255];
+		let base = [left; 4]
+			.concat()
+			.into_iter()
+			.chain([right; 4].concat())
+			.collect();
 
 		TextureData {
-			width: 2,
+			width: 8,
 			height: 1,
 			texel: Texel::Rgba8Unorm,
 			levels: vec![base],
@@ -1775,7 +1798,8 @@ f 1 4 5
 	fn a_normal_map_turns_the_light_a_surface_catches() {
 		// square, for the reason the texture test is: the quad then fills the
 		// frame in both directions, and a sample a quarter of the way across
-		// lands on the middle of a texel rather than in the blend between two.
+		// lands in the middle of a half, two texels from the seam and from the
+		// wrap rather than in the blend between two.
 		let Some((_gpu, mut capture)) = capture_of(SQUARE, SQUARE) else {
 			return;
 		};

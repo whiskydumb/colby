@@ -8,6 +8,8 @@
 //! unload canary reads a counter nobody increments. Both failures look like
 //! something else entirely, so the host asks the loader up front.
 
+use std::ffi::OsStr;
+
 use libloading::library_filename;
 
 use super::Library;
@@ -15,16 +17,16 @@ use crate::{Err, Result};
 
 /// Answers whether this crate is loaded as a shared library.
 ///
-/// @return `true` when a module named `colby_core.dll` is mapped into the
-/// process, which is only the case when the executable imports it rather than
-/// linking it in
+/// @return `true` when an image named `colby_core.dll` - `libcolby_core.so`
+/// on unix - is mapped into the process, which is only the case when the
+/// executable imports it rather than linking it in
 #[must_use]
 pub fn core_is_shared() -> bool {
 	let name = library_filename(env!("CARGO_PKG_NAME"));
 
-	match Library::open_already_loaded(name) {
+	match already_loaded(&name) {
 		| Ok(library) => {
-			// GetModuleHandleExW with no flags takes a reference; give it back.
+			// the handle took a reference on the image; give it back.
 			drop(library.close());
 
 			true
@@ -47,3 +49,41 @@ pub fn require_shared_core() -> Result {
 		 passes -Cprefer-dynamic, or turn the `hot_reload` feature off"
 	))
 }
+
+/// A handle to an image the process already has, without mapping anything.
+///
+/// `GetModuleHandleExW` with no flags, which takes a reference the caller
+/// gives back.
+#[cfg(windows)]
+fn already_loaded(name: &OsStr) -> Result<Library, libloading::Error> {
+	Library::open_already_loaded(name)
+}
+
+/// A handle to an image the process already has, without mapping anything.
+///
+/// `dlopen` with `RTLD_NOLOAD` maps nothing and runs no initializer: it
+/// answers only for a name the loader already holds, and takes a reference
+/// the caller gives back. The name matches what the executable imports
+/// because cargo writes a path package's shared library without the metadata
+/// hash in its name, on every platform, so the import is `libcolby_core.so`
+/// exactly.
+#[cfg(target_os = "linux")]
+fn already_loaded(name: &OsStr) -> Result<Library, libloading::Error> {
+	use std::ffi::c_int;
+
+	use libloading::os::unix::RTLD_NOW;
+
+	/// glibc's and musl's value. Not in `libloading`, which exposes the four
+	/// POSIX flags and no more.
+	const RTLD_NOLOAD: c_int = 0x4;
+
+	// SAFETY: with RTLD_NOLOAD the call maps no image and runs no code from
+	// one; it is a lookup among the images already in the process.
+	unsafe { Library::open(Some(name), RTLD_NOW | RTLD_NOLOAD) }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+compile_error!(
+	"linkage::already_loaded has no answer for this unix: the value of RTLD_NOLOAD differs \
+	 between loaders, and the check that colby_core is shared cannot be skipped"
+);

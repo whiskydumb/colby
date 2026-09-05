@@ -8,10 +8,11 @@
 //!
 //! There is a third signal that stops rather than starts anything. A change to
 //! any crate *below* the game - core, engine, the runner itself - cannot be
-//! swapped into a running process: the executable and `colby_core.dll` are
-//! mapped and Windows will not let the linker replace them. Some hosts name a
-//! threshold layer for this; here the layer below the game is simply all of
-//! it.
+//! swapped into a running process: the executable and `colby_core` are
+//! mapped, and either Windows will not let the linker replace them or unix
+//! will and the process keeps running the old ones, which a freshly built
+//! module no longer matches. Some hosts name a threshold layer for this; here
+//! the layer below the game is simply all of it.
 
 use std::{
 	fs,
@@ -191,8 +192,9 @@ impl Watch {
 	/// Notices edits below the game layer and says so, once.
 	///
 	/// Building after one of these is pointless: cargo would have to relink
-	/// `colby.exe` or `colby_core.dll`, both of which this process has mapped,
-	/// and Windows answers that with `Access is denied`. Saying so plainly
+	/// the executable or `colby_core`, both of which this process has mapped,
+	/// and Windows answers that with `Access is denied` where unix would hand
+	/// the next module a core this process is not running. Saying so plainly
 	/// beats letting a linker error scroll past.
 	fn note_fixed_changes(&mut self) {
 		if !self.fixed.changed() || self.stale_host {

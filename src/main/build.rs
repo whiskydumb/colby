@@ -3,14 +3,17 @@
 //! Two jobs. It hands the runner the few facts it cannot work out for itself -
 //! which profile it was built into, which `RUSTFLAGS` produced it, where the
 //! engine checkout is - so that the rebuild it launches on a source change
-//! matches the build it is running. And under `-Cprefer-dynamic` it copies the
-//! toolchain's `std-*.dll` next to the executable, because with a dynamically
-//! linked std the loader needs that file before `main` exists and cargo does
-//! not place it anywhere.
+//! matches the build it is running. And under `-Cprefer-dynamic` it puts the
+//! toolchain's shared `std` where the executable will find it, because with a
+//! dynamically linked std the loader needs that file before `main` exists and
+//! cargo does not place it anywhere: a copy beside the executable, which is
+//! where Windows looks, and on Linux an rpath saying to look there, because
+//! its loader does not on its own.
 
 use std::{
 	env, fs,
 	path::{Path, PathBuf},
+	process::Command,
 };
 
 fn main() {
@@ -18,7 +21,7 @@ fn main() {
 	println!("cargo::rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
 
 	// @note: `RUSTFLAGS` is not visible to a build script; cargo forwards the
-	// ``-separated `CARGO_ENCODED_RUSTFLAGS` instead. Keeping it encoded is
+	// ``-separated `CARGO_ENCODED_RUSTFLAGS` instead. Keeping it encoded is
 	// what lets the runner hand the exact same flags to the build it spawns,
 	// including any that contain a space.
 	let rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
@@ -46,6 +49,7 @@ fn main() {
 
 	if rustflags.contains("prefer-dynamic") {
 		place_std_dylib(&profile);
+		point_loader_beside_executable();
 	}
 }
 
@@ -66,17 +70,18 @@ fn profile_dir() -> PathBuf {
 
 /// Copies the toolchain's dynamic std beside the executable.
 ///
-/// With `-Cprefer-dynamic` every artifact imports `std-<hash>.dll`, and Windows
-/// resolves that at load time from the executable's own directory. Running
-/// through `cargo run` happens to work because cargo puts the toolchain's
-/// library directory on `PATH` for the child; running `target/hot/colby.exe`
-/// directly does not, and that is how the runner is meant to be started.
+/// With `-Cprefer-dynamic` every artifact imports `std-<hash>.dll` -
+/// `libstd-<hash>.so` on Linux - and the loader has to find it before `main`
+/// runs. Running through `cargo run` happens to work because cargo puts the
+/// toolchain's library directory on the search path for the child; running
+/// `target/hot/colby` directly does not, and that is how the runner is meant
+/// to be started.
 ///
 /// @param profile - the directory the executable is being written into
 fn place_std_dylib(profile: &Path) {
 	let Some(source) = find_std_dylib() else {
 		println!(
-			"cargo::warning=could not find std-*.dll in the toolchain; a hot build will not \
+			"cargo::warning=could not find the toolchain's shared std; a hot build will not \
 			 start"
 		);
 		return;
@@ -96,18 +101,41 @@ fn place_std_dylib(profile: &Path) {
 	}
 }
 
-/// Locates `std-<hash>.dll` inside the active toolchain.
+/// Tells the Linux loader to look beside the executable.
+///
+/// Windows searches the executable's own directory for an import as a matter
+/// of course, and that is where cargo puts `colby_core.dll` and where
+/// [`place_std_dylib`] puts std. A Linux loader searches only what the
+/// executable's rpath, `LD_LIBRARY_PATH` and the system say, so the rpath has
+/// to say `$ORIGIN`, which is that same directory. `libcolby_core.so` is there
+/// because cargo hard-links a workspace member's shared library up from
+/// `deps/`, and under the name the import says, because a path package's
+/// shared library carries no metadata hash in its name. The linker gets the
+/// string as it is; `$ORIGIN` is expanded by the loader, not by a shell.
+fn point_loader_beside_executable() {
+	if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+		println!("cargo::rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
+	}
+}
+
+/// Locates the shared std inside the active toolchain.
+///
+/// `rustc --print target-libdir` names the directory that holds it on every
+/// platform, `lib/rustlib/<target>/lib` under the sysroot; only the spelling
+/// of the file differs, @ref [`dylib_affixes`].
 fn find_std_dylib() -> Option<PathBuf> {
 	let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
-	let output = std::process::Command::new(rustc)
-		.arg("--print")
-		.arg("sysroot")
+	let target = env::var("TARGET").ok()?;
+	let output = Command::new(rustc)
+		.args(["--print", "target-libdir", "--target", &target])
 		.output()
 		.ok()?;
 
-	let sysroot = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+	let libdir = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+	let (prefix, suffix) = dylib_affixes();
+	let head = format!("{prefix}std-");
 
-	fs::read_dir(sysroot.join("bin"))
+	fs::read_dir(libdir)
 		.ok()?
 		.filter_map(Result::ok)
 		.map(|entry| entry.path())
@@ -117,6 +145,18 @@ fn find_std_dylib() -> Option<PathBuf> {
 				.unwrap_or_default()
 				.to_string_lossy();
 
-			name.starts_with("std-") && name.ends_with(".dll")
+			name.starts_with(&head) && name.ends_with(suffix)
 		})
+}
+
+/// How the target names a shared library.
+///
+/// Read from the target rather than from this build script's own platform,
+/// which is the host's.
+fn dylib_affixes() -> (&'static str, &'static str) {
+	match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+		| Ok("windows") => ("", ".dll"),
+		| Ok("macos" | "ios") => ("lib", ".dylib"),
+		| _ => ("lib", ".so"),
+	}
 }

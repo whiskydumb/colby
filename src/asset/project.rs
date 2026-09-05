@@ -426,7 +426,14 @@ mod tests {
 
 	#[test]
 	fn a_game_directory_stays_inside_the_project() {
-		for outside in ["../elsewhere", "C:/absolute/game", "/rooted"] {
+		// a drive letter is a prefix on windows and an ordinary name anywhere
+		// else, where `C:` is a directory like any other; the rule reads the
+		// platform's own components, so the test has to as well.
+		let drive = cfg!(windows).then_some("C:/absolute/game");
+		for outside in ["../elsewhere", "/rooted"]
+			.into_iter()
+			.chain(drive)
+		{
 			let text = refused(&format!(
 				r#"{{ "schema": 1, "engine": "0.1.0", "id": "ok", "name": "x", "game": "{outside}" }}"#
 			));

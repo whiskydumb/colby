@@ -152,7 +152,8 @@ pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 	result
 }
 
-/// Verifies the process is laid out for hot-reload, and clears `%TEMP%`.
+/// Verifies the process is laid out for hot-reload, and clears the module
+/// scratch.
 #[cfg(feature = "hot_reload")]
 fn prepare() -> Result {
 	colby_core::mods::linkage::require_shared_core()?;

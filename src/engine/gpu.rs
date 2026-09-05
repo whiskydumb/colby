@@ -90,32 +90,47 @@ impl By {
 #[must_use]
 pub fn backends(asked: Option<&str>) -> Backends {
 	let forced = env::var(BACKEND_VAR).ok();
-	let (chosen, by) = choose(asked, forced.as_deref());
+	let (chosen, by) = choose(asked, forced.as_deref(), Instance::enabled_backend_features());
 	debug!(backends = ?chosen, by = by.as_str(), "graphics APIs to consider");
 
 	chosen
 }
 
-/// The precedence, with the environment handed in so that a test can say what
-/// it holds.
-fn choose(asked: Option<&str>, forced: Option<&str>) -> (Backends, By) {
+/// The precedence, with the environment and the build's own set handed in so
+/// that a test can say what each holds.
+///
+/// A level is skipped when nothing in it is an API this build has - `dx12` in
+/// a `settings.cfg` carried over from Windows would otherwise stop a Linux
+/// window with "no adapter" - and a list is narrowed to what is here, because
+/// a person who lists alternatives means whichever of them there is.
+///
+/// @param asked - what [`BACKEND`] holds, if there is a console to hold it
+/// @param forced - what [`BACKEND_VAR`] holds, if it is set
+/// @param have - the APIs this build compiled in for this platform
+fn choose(asked: Option<&str>, forced: Option<&str>, have: Backends) -> (Backends, By) {
 	if let Some(text) = forced.filter(|text| !text.trim().is_empty()) {
-		match parse(text) {
+		match parse(text).and_then(|set| here(set, have)) {
 			| Some(set) => return (set, By::Environment),
 			| None =>
-				warn!(text, "{BACKEND_VAR} names no graphics API this build knows; ignoring it"),
+				warn!(text, "{BACKEND_VAR} names no graphics API this build has; ignoring it"),
 		}
 	}
 
 	if let Some(text) = asked {
-		match parse(text) {
+		match parse(text).and_then(|set| here(set, have)) {
 			| Some(set) => return (set, By::Variable),
-			| None =>
-				warn!(text, "{BACKEND} names no graphics API this build knows; using {AUTO}"),
+			| None => warn!(text, "{BACKEND} names no graphics API this build has; using {AUTO}"),
 		}
 	}
 
-	(DEFAULT, By::Default)
+	(DEFAULT & have, By::Default)
+}
+
+/// The part of a set this build has, or nothing when none of it is.
+fn here(set: Backends, have: Backends) -> Option<Backends> {
+	let kept = set & have;
+
+	(!kept.is_empty()).then_some(kept)
 }
 
 /// Reads a value of [`BACKEND`]: [`AUTO`], or a comma list of wgpu's words.
@@ -254,11 +269,45 @@ mod tests {
 		assert!(DEFAULT.contains(Backends::VULKAN | Backends::DX12), "and these are not");
 	}
 
+	/// A build that has every API there is, so that the words alone decide.
+	const EVERY: Backends = Backends::all();
+
 	#[test]
 	fn auto_and_nothing_at_all_are_both_the_default() {
-		assert_eq!(choose(Some(AUTO), None), (DEFAULT, By::Variable));
-		assert_eq!(choose(Some(" Auto "), None), (DEFAULT, By::Variable));
-		assert_eq!(choose(None, None), (DEFAULT, By::Default));
+		assert_eq!(choose(Some(AUTO), None, EVERY), (DEFAULT, By::Variable));
+		assert_eq!(choose(Some(" Auto "), None, EVERY), (DEFAULT, By::Variable));
+		assert_eq!(choose(None, None, EVERY), (DEFAULT, By::Default));
+	}
+
+	#[test]
+	fn an_api_this_build_lacks_is_skipped_and_a_list_is_narrowed_to_what_is_here() {
+		let vulkan = Backends::VULKAN;
+
+		assert_eq!(
+			choose(Some("dx12"), None, vulkan),
+			(vulkan, By::Default),
+			"a variable naming only what is not here falls to the default"
+		);
+		assert_eq!(
+			choose(Some("dx12,vulkan"), None, vulkan),
+			(vulkan, By::Variable),
+			"a list keeps what is here"
+		);
+		assert_eq!(
+			choose(Some("vulkan"), Some("dx12"), vulkan),
+			(vulkan, By::Variable),
+			"an override naming only what is not here falls to the variable"
+		);
+		assert_eq!(
+			choose(Some(AUTO), None, vulkan),
+			(vulkan, By::Variable),
+			"and auto is the default narrowed to what is here"
+		);
+		assert_eq!(
+			choose(None, None, vulkan),
+			(vulkan, By::Default),
+			"which the default itself is too"
+		);
 	}
 
 	#[test]
@@ -278,7 +327,7 @@ mod tests {
 		assert_eq!(parse("webgpu"), None, "a browser is not an API this draws with");
 		assert_eq!(parse("noop"), None, "and nothing is not one either");
 		assert_eq!(
-			choose(Some("dx11"), None),
+			choose(Some("dx11"), None, EVERY),
 			(DEFAULT, By::Default),
 			"a bad variable draws with the default"
 		);
@@ -286,15 +335,18 @@ mod tests {
 
 	#[test]
 	fn the_environment_wins_and_a_bad_one_is_skipped_rather_than_taken() {
-		assert_eq!(choose(Some("dx12"), Some("vulkan")), (Backends::VULKAN, By::Environment));
-		assert_eq!(choose(None, Some("dx12")), (Backends::DX12, By::Environment));
 		assert_eq!(
-			choose(Some("dx12"), Some("dx11")),
+			choose(Some("dx12"), Some("vulkan"), EVERY),
+			(Backends::VULKAN, By::Environment)
+		);
+		assert_eq!(choose(None, Some("dx12"), EVERY), (Backends::DX12, By::Environment));
+		assert_eq!(
+			choose(Some("dx12"), Some("dx11"), EVERY),
 			(Backends::DX12, By::Variable),
 			"a bad override falls through to the variable"
 		);
 		assert_eq!(
-			choose(Some("dx12"), Some("  ")),
+			choose(Some("dx12"), Some("  "), EVERY),
 			(Backends::DX12, By::Variable),
 			"an empty override is no override"
 		);

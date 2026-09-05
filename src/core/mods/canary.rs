@@ -6,9 +6,11 @@
 //!
 //! The host decrements the counter just before unloading. The module's static
 //! destructor increments it as the library tears down. If the count is not back
-//! to zero afterwards, the destructor never ran, which on Windows means
-//! `FreeLibrary` did not actually unmap the image - some reference is still
-//! outstanding.
+//! to zero afterwards, the destructor never ran, which means the loader did
+//! not actually unmap the image: `FreeLibrary` or `dlclose` returned with
+//! some reference still outstanding. On unix one such reference is a
+//! `thread_local!` with a destructor inside the module, which glibc answers
+//! by keeping the image mapped until the thread that touched it exits.
 //!
 //! @note: this only works because the counter is a static in colby_core and
 //! both sides link colby_core *dynamically*. Build without `-Cprefer-dynamic`

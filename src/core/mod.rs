@@ -7,7 +7,7 @@
 //! statics declared here exist exactly once in the process.
 
 // @note: crate-wide opt-in to the workspace `unsafe-code = "deny"`. The unsafe
-// in this crate is confined to `mods` (LoadLibrary/GetProcAddress and the
+// in this crate is confined to `mods` (the platform's loader calls and the
 // module ctor/dtor hooks) and to the bytemuck derives in `abi`.
 #![allow(unsafe_code)]
 

@@ -217,15 +217,32 @@ version = "0.3"
 default-features = false
 features = ["std", "fmt", "ansi", "env-filter", "smallvec"]
 
+# @note: which of these a build really has is decided by wgpu's own build
+# script from the target: `dx12` is Windows-only there, so on Linux the word
+# is inert and `vulkan` is the whole of it. @ref `colby_engine::gpu`.
 [workspace.dependencies.wgpu]
 version = "30.0"
 default-features = false
 features = ["std", "parking_lot", "wgpu-core", "dx12", "vulkan", "wgsl"]
 
+# @note: winit's own default set, spelled out. `x11` and `wayland` are the
+# two ways a Linux desktop has a window, and both are opened at run time: X11,
+# xkbcommon and, with `wayland-dlopen`, libwayland are `dlopen`ed, so a build
+# needs none of their headers. `wayland-csd-adwaita` draws a title bar on a
+# compositor that draws none, which is what a window under GNOME needs to be
+# moved or closed at all. On Windows every one of these compiles to nothing.
+# Measured: thirty-one lock entries, seven of them the title bar. @ref the
+# pre-commit audit list.
 [workspace.dependencies.winit]
 version = "0.30"
 default-features = false
-features = ["rwh_06"]
+features = [
+	"rwh_06",
+	"x11",
+	"wayland",
+	"wayland-dlopen",
+	"wayland-csd-adwaita",
+]
 
 #
 # Profiles

@@ -164,7 +164,17 @@ fn link(at: &Path, target: &Path) -> Result {
 }
 
 /// Takes a mount away without touching what it pointed at.
+///
+/// A junction is a directory to the filesystem and goes with `rmdir`.
+#[cfg(windows)]
 fn unlink(at: &Path) -> io::Result<()> { fs::remove_dir(at) }
+
+/// Takes a mount away without touching what it pointed at.
+///
+/// A symbolic link is a file to the filesystem whatever it points at, and
+/// `rmdir` on one is `ENOTDIR`.
+#[cfg(not(windows))]
+fn unlink(at: &Path) -> io::Result<()> { fs::remove_file(at) }
 
 #[cfg(test)]
 mod tests {

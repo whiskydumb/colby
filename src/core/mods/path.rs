@@ -1,7 +1,7 @@
 //! Locating a module on disk, and staging a copy the loader may keep.
 
 use std::{
-	env::{current_exe, temp_dir},
+	env::{consts::DLL_PREFIX, current_exe, temp_dir},
 	fs,
 	path::{Path, PathBuf},
 	process,
@@ -26,7 +26,8 @@ const SETTLE_TRIES: u32 = 32;
 /// of a profile.
 ///
 /// @param name - the crate name, without prefix or extension
-/// @return the absolute path to `<exe dir>/<name>.dll`
+/// @return the absolute path to `<exe dir>/<name>.dll`, or `lib<name>.so` on
+/// unix
 pub fn from_name(name: &str) -> Result<PathBuf> {
 	let exe = current_exe()?;
 	let dir = exe
@@ -41,10 +42,17 @@ pub fn from_name(name: &str) -> Result<PathBuf> {
 /// @param path - a path to a module image
 /// @return the crate name
 pub fn to_name(path: &Path) -> Result<String> {
-	path.file_stem()
+	let stem = path
+		.file_stem()
 		.and_then(|stem| stem.to_str())
-		.map(ToOwned::to_owned)
-		.ok_or_else(|| err!("module path {path:?} has no usable file stem"))
+		.ok_or_else(|| err!("module path {path:?} has no usable file stem"))?;
+
+	// the prefix `library_filename` put on: `lib` on unix and nothing on
+	// windows, where stripping an empty prefix is stripping nothing.
+	Ok(stem
+		.strip_prefix(DLL_PREFIX)
+		.unwrap_or(stem)
+		.to_owned())
 }
 
 /// Reads a file's modification time.
@@ -56,7 +64,9 @@ pub fn mtime(path: &Path) -> Result<SystemTime> { Ok(fs::metadata(path)?.modifie
 /// The directory staged module images live in, private to this process.
 ///
 /// Keyed by process id so two engines running at once cannot fight over the
-/// same file names.
+/// same file names. Under `%TEMP%` on Windows and `/tmp` on unix; a `/tmp`
+/// mounted `noexec` would refuse to map an image from it, and nothing here
+/// notices that before the loader does.
 #[must_use]
 pub fn scratch_dir() -> PathBuf {
 	temp_dir()
@@ -68,9 +78,13 @@ pub fn scratch_dir() -> PathBuf {
 ///
 /// Windows keeps a loaded image mapped and refuses writes to the file behind
 /// it, so loading `target/hot/blank_game.dll` directly would make the next
-/// `cargo build` fail with a locked-file error. Each generation gets its own
-/// directory so the copy keeps its original file name, which is also what lets
-/// a debugger find the `.pdb` staged next to it.
+/// `cargo build` fail with a locked-file error. A unix loader lets the build
+/// write, and instead hands back the mapping it already has for a path it
+/// already loaded, so a module that failed to leave would come back as its
+/// old self under the same name; a fresh path per load is the answer to
+/// both. Each generation gets its own directory so the copy keeps its
+/// original file name, which is also what lets a debugger find the `.pdb`
+/// staged next to it.
 ///
 /// @param source - the file the build wrote
 /// @param generation - a counter that increases with every reload
@@ -88,8 +102,8 @@ pub fn stage(source: &Path, generation: u64) -> Result<PathBuf> {
 	let image = dir.join(name);
 	fs::copy(source, &image)?;
 
-	// best effort: a debugger looks for the pdb beside the image when the path
-	// baked into the module no longer resolves.
+	// best effort, and windows only in effect: a debugger looks for the pdb
+	// beside the image when the path baked into the module no longer resolves.
 	let symbols = source.with_extension("pdb");
 	if symbols.is_file()
 		&& let Some(name) = symbols.file_name()
@@ -105,7 +119,8 @@ pub fn stage(source: &Path, generation: u64) -> Result<PathBuf> {
 /// Deletes a staged generation once its library has been unloaded.
 ///
 /// Failure is not an error: the image may still be mapped for a moment after
-/// `FreeLibrary` returns, and a leftover file in `%TEMP%` costs nothing.
+/// the unload returns, and a leftover file in the scratch directory costs
+/// nothing.
 ///
 /// @param image - a path previously returned by [`stage`]
 pub fn unstage(image: &Path) {
@@ -172,15 +187,14 @@ mod tests {
 		let path = from_name("colby_game").expect("the executable has a directory");
 
 		assert_eq!(
-			path.extension()
-				.and_then(|extension| extension.to_str()),
-			Some("dll"),
-			"windows modules are dlls, with no lib prefix"
+			path.file_name(),
+			Some(library_filename("colby_game").as_os_str()),
+			"the platform's own spelling: colby_game.dll, or libcolby_game.so"
 		);
 		assert_eq!(
 			to_name(&path).expect("the path has a stem"),
 			"colby_game",
-			"the name survives the trip to a path and back"
+			"the name survives the trip to a path and back, prefix and all"
 		);
 	}
 

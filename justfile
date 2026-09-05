@@ -1,6 +1,10 @@
 set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
-nightly := "nightly"
+# the formatter is pinned to one nightly on purpose: rustfmt with unstable
+# options re-wraps comments differently from one build to the next, so the
+# gate is only reproducible across machines on the same one. Bump it on
+# purpose, with the churn as a commit of its own.
+nightly := "nightly-2026-08-02"
 locked := ""
 
 # hot-reload build settings. -Cprefer-dynamic is what makes the host and the
@@ -17,6 +21,10 @@ locked := ""
 hot_profile := "hot"
 hot_flags := "-Cprefer-dynamic"
 hot_dir := "target" / hot_profile
+
+# the executable as this platform spells it
+exe := "colby" + if os_family() == "windows" { ".exe" } else { "" }
+hot_exe := hot_dir / exe
 
 # the project every recipe that runs the engine opens: the Blank fixture, the
 # one project that always lives in this tree. The engine checkout is not a
@@ -84,16 +92,19 @@ assets *args:
     cargo run --quiet --package colby_assetc {{locked}} -- --project "{{project}}" {{args}}
 
 # build every crate for hot-reload, with a shared std and a shared colby_core
-hot-build:
-    $env:CARGO_ENCODED_RUSTFLAGS = "{{hot_flags}}"; cargo build --profile {{hot_profile}} {{locked}}
+#
+# @note: the flags travel as an exported parameter rather than as a shell
+# assignment, because the one line has to hold under PowerShell and sh alike.
+hot-build $CARGO_ENCODED_RUSTFLAGS=hot_flags:
+    cargo build --profile {{hot_profile}} {{locked}}
 
 # run the engine with hot-reload enabled
 hot: hot-build
-    ./{{hot_dir}}/colby.exe --project "{{project}}"
+    ./{{hot_exe}} --project "{{project}}"
 
 # render one frame of the game to a png, without opening a window
 shot path="colby.png": hot-build
-    ./{{hot_dir}}/colby.exe --project "{{project}}" --shot "{{path}}"
+    ./{{hot_exe}} --project "{{project}}" --shot "{{path}}"
 
 # record what a run sounds like, into a wav
 #
@@ -102,7 +113,7 @@ shot path="colby.png": hot-build
 # no output device: the same build writes the same file on every machine, which
 # is what makes a hash of it worth comparing. Pass a step count for longer.
 hear path="colby.wav" steps="90": hot-build
-    ./{{hot_dir}}/colby.exe --project "{{project}}" --record "{{path}}" {{steps}}
+    ./{{hot_exe}} --project "{{project}}" --record "{{path}}" {{steps}}
 
 # run two endpoints against each other over a wire that lies
 #
@@ -125,6 +136,13 @@ setup:
     cargo install typos-cli --locked
 
 # remove build artifacts, the project's compiled assets among them
+[windows]
 clean:
     cargo clean
     if (Test-Path "{{project}}/.colby") { Remove-Item -Recurse -Force "{{project}}/.colby" }
+
+# remove build artifacts, the project's compiled assets among them
+[unix]
+clean:
+    cargo clean
+    rm -rf "{{project}}/.colby"

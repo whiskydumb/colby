@@ -66,9 +66,10 @@ impl Module {
 			.as_ref()
 			.ok_or_else(|| crate::err!(Module("{:?} is already unloaded", self.source)))?;
 
-		// SAFETY: this is GetProcAddress. The caller states the prototype and
-		// nothing checks it; a mismatch is undefined behavior at the call, not
-		// here. Callers go through the ABI version check for that reason.
+		// SAFETY: this is GetProcAddress, or dlsym. The caller states the
+		// prototype and nothing checks it; a mismatch is undefined behavior at
+		// the call, not here. Callers go through the ABI version check for that
+		// reason.
 		let bound = unsafe { handle.get::<Prototype>(symbol) };
 
 		bound.map_err(|error| {
@@ -117,7 +118,7 @@ impl Module {
 			&& let Err(error) = handle.close()
 		{
 			let source = &self.source;
-			error!(?source, %error, "FreeLibrary failed");
+			error!(?source, %error, "closing the module image failed");
 		}
 	}
 }
