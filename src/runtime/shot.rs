@@ -19,7 +19,7 @@ use colby_core::{
 	info,
 	time::{Rate, STEP},
 };
-use colby_engine::{Capture, Image, Overlay};
+use colby_engine::{Capture, Gpu, Image, Overlay, gpu};
 
 use crate::{Build, Front, Project, Runtime};
 
@@ -43,10 +43,13 @@ const STEPS: u32 = 90;
 /// @return `Ok` once the file is on disk
 pub(crate) fn take(path: &Path, project: &Project, build: &Build) -> Result {
 	// the adapter first, before anything is brought up: a machine with nothing
-	// to render on has no business loading a module to find that out.
-	let Some(mut capture) = Capture::new(SIZE.0, SIZE.1)? else {
+	// to render on has no business loading a module to find that out. No
+	// window, so nothing for the adapter to be compatible with; and no console,
+	// so no variable to read - the default, unless the environment says.
+	let Some(gpu) = Gpu::open(gpu::backends(None), None)? else {
 		return Err!(Graphics("no usable adapter, so there is nothing to render with"));
 	};
+	let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1)?;
 
 	// no console, so no config file and none of the host's variables, and no
 	// device: a screenshot must be the same on a machine with speakers and one
@@ -60,7 +63,7 @@ pub(crate) fn take(path: &Path, project: &Project, build: &Build) -> Result {
 
 	runtime
 		.interface
-		.attach(capture.device(), Capture::format())?;
+		.attach(capture.device(), capture.format())?;
 
 	for number in 1..=STEPS {
 		// the simulated time this step ends at, computed rather than

@@ -13,6 +13,7 @@
 //! the contract rather than beside the thing it happens to pace.
 
 pub mod capture;
+pub mod gpu;
 pub mod image;
 mod lines;
 pub mod overlay;
@@ -27,6 +28,6 @@ pub use ::winit;
 pub use colby_core::abi::mesh::{MeshData, MeshVertex};
 
 pub use self::{
-	capture::Capture, image::Image, overlay::Overlay, renderer::Renderer, scene::Scene,
+	capture::Capture, gpu::Gpu, image::Image, overlay::Overlay, renderer::Renderer, scene::Scene,
 	shader::Shader,
 };

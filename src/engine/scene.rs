@@ -51,6 +51,7 @@ use wgpu::{
 };
 
 use crate::{
+	gpu::Gpu,
 	lines::Lines,
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, Maps},
@@ -325,6 +326,8 @@ impl Pipelines {
 /// A device, a table of pipelines, the resources uploaded so far, and a
 /// frame's buffers.
 pub struct Scene {
+	/// A share of the process's one device, and of its queue. @ref [`Gpu`],
+	/// which is where both are made and the only place they are.
 	device: Device,
 	queue: Queue,
 	pipelines: Pipelines,
@@ -372,18 +375,15 @@ pub struct Scene {
 impl Scene {
 	/// Builds the pipelines, the depth buffer and the bind group layouts.
 	///
-	/// @param device - the device to build against
-	/// @param queue - the queue every upload goes through
+	/// @param gpu - the device to build against and the queue every upload
+	/// goes through; a share of each is kept
 	/// @param format - the color format the fragment stage writes
 	/// @param width - the target's width in pixels
 	/// @param height - the target's height in pixels
-	pub fn new(
-		device: Device,
-		queue: Queue,
-		format: TextureFormat,
-		width: u32,
-		height: u32,
-	) -> Result<Self> {
+	pub fn new(gpu: &Gpu, format: TextureFormat, width: u32, height: u32) -> Result<Self> {
+		let device = gpu.device().clone();
+		let queue = gpu.queue().clone();
+
 		let globals = device.create_buffer(&BufferDescriptor {
 			label: Some("globals"),
 			size: size_bytes::<Globals>(1)?,

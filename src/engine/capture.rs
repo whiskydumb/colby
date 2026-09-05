@@ -6,20 +6,20 @@
 //! test can make assertions about - or that can be written out as a PNG and
 //! looked at.
 
-use colby_core::{Result, abi::World, debug, err, glam::Vec3};
+use colby_core::{Err, Result, abi::World, err, glam::Vec3};
 use wgpu::{
-	Backends, BufferDescriptor, BufferUsages, DeviceDescriptor, ExperimentalFeatures, Extent3d,
-	Features, Instance, InstanceDescriptor, Limits, MapMode, MemoryHints, PollType,
-	PowerPreference, RequestAdapterOptions, TexelCopyBufferInfo, TexelCopyBufferLayout,
-	TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+	BufferDescriptor, BufferUsages, Extent3d, MapMode, PollType, TexelCopyBufferInfo,
+	TexelCopyBufferLayout, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+	TextureViewDescriptor,
 };
 
-use crate::{image::Image, overlay::Overlay, scene::Scene};
+use crate::{gpu::Gpu, image::Image, overlay::Overlay, scene::Scene};
 
-/// The color format captures render into.
+/// The color format a capture renders into when nobody says otherwise.
 ///
 /// The same family the window uses, so that the numbers a test reads back are
-/// the numbers that would reach the screen.
+/// the numbers that would reach the screen. A capture drawn beside a window
+/// takes the window's own format instead, @ref [`Capture::in_format`].
 const CAPTURE_FORMAT: TextureFormat = TextureFormat::Rgba8UnormSrgb;
 
 /// Copying a texture to a buffer wants each row aligned to this.
@@ -30,6 +30,8 @@ pub struct Capture {
 	scene: Scene,
 	width: u32,
 	height: u32,
+	/// What the target is, and therefore how the bytes read back are laid out.
+	format: TextureFormat,
 	color: wgpu::Texture,
 	readback: wgpu::Buffer,
 	/// Bytes per row in the readback buffer, padded up to [`ROW_ALIGNMENT`].
@@ -37,13 +39,69 @@ pub struct Capture {
 }
 
 impl Capture {
-	/// Builds an offscreen renderer, if this machine has a GPU to build it on.
+	/// Builds an offscreen renderer on the shared device.
 	///
+	/// A scene of its own on the same device: what it uploads it uploads for
+	/// itself, on demand, and what it draws can be read by anything else on
+	/// that device without a trip through the CPU.
+	///
+	/// @param gpu - the device to draw with
 	/// @param width - the image width in pixels
 	/// @param height - the image height in pixels
-	/// @return the capture, or `None` when no adapter could be found
-	pub fn new(width: u32, height: u32) -> Result<Option<Self>> {
-		pollster::block_on(Self::create(width, height))
+	pub fn new(gpu: &Gpu, width: u32, height: u32) -> Result<Self> {
+		Self::in_format(gpu, CAPTURE_FORMAT, width, height)
+	}
+
+	/// The same, into a format somebody else chose.
+	///
+	/// For a picture taken beside a window: an overlay's pipeline is built for
+	/// the window's format, and it cannot draw into a target of another. Only
+	/// the eight-bit formats are taken, because the readback has to know what
+	/// a texel is; a blue-first one is turned round into the red-first order
+	/// an [`Image`] holds on the way out.
+	///
+	/// @param gpu - the device to draw with
+	/// @param format - the color format the target has
+	/// @param width - the image width in pixels
+	/// @param height - the image height in pixels
+	pub fn in_format(gpu: &Gpu, format: TextureFormat, width: u32, height: u32) -> Result<Self> {
+		if !readable(format) {
+			return Err!(Graphics("a capture reads back eight-bit RGBA or BGRA, not {format:?}"));
+		}
+
+		let (width, height) = (width.max(1), height.max(1));
+		let device = gpu.device();
+
+		let color = device.create_texture(&TextureDescriptor {
+			label: Some("capture"),
+			size: Extent3d { width, height, depth_or_array_layers: 1 },
+			mip_level_count: 1,
+			sample_count: 1,
+			dimension: TextureDimension::D2,
+			format,
+			usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+			view_formats: &[],
+		});
+
+		let padded_stride = width.saturating_mul(4).div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+		let readback = device.create_buffer(&BufferDescriptor {
+			label: Some("readback"),
+			size: u64::from(padded_stride) * u64::from(height),
+			usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+			mapped_at_creation: false,
+		});
+
+		let scene = Scene::new(gpu, format, width, height)?;
+
+		Ok(Self {
+			scene,
+			width,
+			height,
+			format,
+			color,
+			readback,
+			padded_stride,
+		})
 	}
 
 	/// Renders a world and reads the result back.
@@ -99,7 +157,7 @@ impl Capture {
 
 	/// The color format an overlay has to build a pipeline for.
 	#[must_use]
-	pub const fn format() -> TextureFormat { CAPTURE_FORMAT }
+	pub const fn format(&self) -> TextureFormat { self.format }
 
 	/// What this capture draws with.
 	///
@@ -171,6 +229,13 @@ impl Capture {
 			pixels.extend_from_slice(row);
 		}
 
+		// into the order an image holds, if the target was the other way round.
+		if swapped(self.format) {
+			for texel in pixels.chunks_exact_mut(4) {
+				texel.swap(0, 2);
+			}
+		}
+
 		drop(view);
 		self.readback.unmap();
 
@@ -180,70 +245,22 @@ impl Capture {
 			pixels,
 		})
 	}
+}
 
-	/// The async half of [`new`](Self::new).
-	async fn create(width: u32, height: u32) -> Result<Option<Self>> {
-		let (width, height) = (width.max(1), height.max(1));
-		let instance = Instance::new(InstanceDescriptor {
-			backends: Backends::DX12 | Backends::VULKAN,
-			..InstanceDescriptor::new_without_display_handle()
-		});
+/// Whether a capture can read a format back: four bytes a texel, one a channel.
+const fn readable(format: TextureFormat) -> bool {
+	matches!(
+		format,
+		TextureFormat::Rgba8Unorm
+			| TextureFormat::Rgba8UnormSrgb
+			| TextureFormat::Bgra8Unorm
+			| TextureFormat::Bgra8UnormSrgb
+	)
+}
 
-		let Ok(adapter) = instance
-			.request_adapter(&RequestAdapterOptions {
-				power_preference: PowerPreference::HighPerformance,
-				..Default::default()
-			})
-			.await
-		else {
-			return Ok(None);
-		};
-
-		let info = adapter.get_info();
-		debug!(adapter = %info.name, backend = ?info.backend, "capture adapter selected");
-
-		let (device, queue) = adapter
-			.request_device(&DeviceDescriptor {
-				label: Some("colby capture"),
-				required_features: Features::empty(),
-				required_limits: Limits::default(),
-				experimental_features: ExperimentalFeatures::disabled(),
-				memory_hints: MemoryHints::Performance,
-				trace: wgpu::Trace::Off,
-			})
-			.await
-			.map_err(|error| err!(Graphics("requesting a capture device: {error}")))?;
-
-		let color = device.create_texture(&TextureDescriptor {
-			label: Some("capture"),
-			size: Extent3d { width, height, depth_or_array_layers: 1 },
-			mip_level_count: 1,
-			sample_count: 1,
-			dimension: TextureDimension::D2,
-			format: CAPTURE_FORMAT,
-			usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-			view_formats: &[],
-		});
-
-		let padded_stride = width.saturating_mul(4).div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
-		let readback = device.create_buffer(&BufferDescriptor {
-			label: Some("readback"),
-			size: u64::from(padded_stride) * u64::from(height),
-			usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-			mapped_at_creation: false,
-		});
-
-		let scene = Scene::new(device, queue, CAPTURE_FORMAT, width, height)?;
-
-		Ok(Some(Self {
-			scene,
-			width,
-			height,
-			color,
-			readback,
-			padded_stride,
-		}))
-	}
+/// Whether a format's texels are blue first, and have to be turned round.
+const fn swapped(format: TextureFormat) -> bool {
+	matches!(format, TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb)
 }
 
 /// How far apart two colors are, as the largest difference on any channel.
@@ -328,17 +345,127 @@ mod tests {
 		world
 	}
 
-	/// A capture, or `None` with a note when this machine has no GPU.
-	fn capture() -> Option<Capture> {
-		match Capture::new(SIZE.0, SIZE.1) {
+	/// A device and a capture on it, or `None` when this machine has no GPU.
+	///
+	/// The device comes back beside the capture so that it outlives it; a
+	/// test that wants two captures on one device opens the device itself.
+	fn capture_of(width: u32, height: u32) -> Option<(Gpu, Capture)> {
+		let gpu = match Gpu::open(crate::gpu::backends(None), None) {
+			| Ok(Some(gpu)) => gpu,
+			| Ok(None) => return None,
+			| Err(error) => panic!("opening the device failed: {error}"),
+		};
+		let capture = match Capture::new(&gpu, width, height) {
 			| Ok(capture) => capture,
 			| Err(error) => panic!("building the capture failed: {error}"),
+		};
+
+		Some((gpu, capture))
+	}
+
+	/// A capture the usual size, or `None` when this machine has no GPU.
+	fn capture() -> Option<(Gpu, Capture)> { capture_of(SIZE.0, SIZE.1) }
+
+	#[test]
+	fn two_captures_on_one_device_each_draw_their_own_picture() {
+		// the whole point of the shared device: a second target on the same
+		// device is a second scene and not a second GPU, and neither picture
+		// leaks into the other. Different sizes and different clears, so a
+		// mix-up of targets, sizes or worlds each shows on its own.
+		let gpu = match Gpu::open(crate::gpu::backends(None), None) {
+			| Ok(Some(gpu)) => gpu,
+			| Ok(None) => return,
+			| Err(error) => panic!("opening the device failed: {error}"),
+		};
+		let mut wide = Capture::new(&gpu, 64, 32).expect("the first capture builds");
+		let mut tall = Capture::new(&gpu, 32, 64).expect("the second capture builds");
+
+		let mut red = World::new();
+		red.clear = rgb(1.0, 0.0, 0.0);
+		let mut blue = World::new();
+		blue.clear = rgb(0.0, 0.0, 1.0);
+
+		let first = wide
+			.shoot(&mut red)
+			.expect("the wide frame renders");
+		let second = tall
+			.shoot(&mut blue)
+			.expect("the tall frame renders");
+		let again = wide
+			.shoot(&mut red)
+			.expect("the wide frame renders again");
+
+		assert_eq!((first.width, first.height), (64, 32), "the wide one is wide");
+		assert_eq!((second.width, second.height), (32, 64), "the tall one is tall");
+		assert_eq!(dominant(first.pixel(10, 10)), 0, "the wide one is red");
+		assert_eq!(dominant(second.pixel(10, 10)), 2, "the tall one is blue");
+		assert_eq!(first.pixels, again.pixels, "drawing the other did not touch it");
+	}
+
+	#[test]
+	fn a_capture_in_the_windows_format_reads_back_the_same_picture() {
+		// the window's surface is blue-first on this machine and a capture's
+		// is red-first; a screenshot taken beside the window is drawn into the
+		// window's format so that the interface's pipeline fits, and the bytes
+		// have to come out in the order an image holds. A red cube on a blue
+		// clear: a readback that forgot to turn the texels round swaps the two.
+		let gpu = match Gpu::open(crate::gpu::backends(None), None) {
+			| Ok(Some(gpu)) => gpu,
+			| Ok(None) => return,
+			| Err(error) => panic!("opening the device failed: {error}"),
+		};
+		let mut usual = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the usual capture builds");
+		let mut windows = Capture::in_format(&gpu, TextureFormat::Bgra8UnormSrgb, SIZE.0, SIZE.1)
+			.expect("the window's format builds");
+
+		let mut world = looking_world();
+		let cube = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(2.0),
+		});
+		world
+			.entities
+			.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.1, 0.1)));
+
+		let first = usual
+			.shoot(&mut world)
+			.expect("the usual frame renders");
+		let second = windows
+			.shoot(&mut world)
+			.expect("the other frame renders");
+
+		assert_eq!(windows.format(), TextureFormat::Bgra8UnormSrgb, "the format is kept");
+		assert_eq!(
+			dominant(second.pixel(SIZE.0 / 2, SIZE.1 / 2)),
+			0,
+			"the cube is red either way"
+		);
+		assert_eq!(dominant(second.pixel(1, 1)), 2, "and the clear is blue either way");
+		assert_eq!(first.pixels, second.pixels, "the same picture, byte for byte");
+	}
+
+	#[test]
+	fn a_format_the_readback_cannot_read_is_refused() {
+		let gpu = match Gpu::open(crate::gpu::backends(None), None) {
+			| Ok(Some(gpu)) => gpu,
+			| Ok(None) => return,
+			| Err(error) => panic!("opening the device failed: {error}"),
+		};
+
+		for format in
+			[TextureFormat::R8Unorm, TextureFormat::Rgba16Float, TextureFormat::Rgb10a2Unorm]
+		{
+			assert!(
+				Capture::in_format(&gpu, format, 4, 4).is_err(),
+				"{format:?} is not four bytes of one channel each"
+			);
 		}
 	}
 
 	#[test]
 	fn an_empty_world_is_nothing_but_the_clear_color() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			eprintln!("no GPU adapter; skipping the pixel tests");
 			return;
 		};
@@ -361,7 +488,7 @@ mod tests {
 
 	#[test]
 	fn a_cube_is_drawn_lit_side_towards_the_camera() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -397,7 +524,7 @@ mod tests {
 
 	#[test]
 	fn the_nearer_cube_wins_the_depth_test() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -432,7 +559,7 @@ mod tests {
 
 	#[test]
 	fn the_picture_is_neither_mirrored_nor_upside_down() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -599,7 +726,7 @@ mod tests {
 
 	#[test]
 	fn a_pose_two_entities_share_is_gathered_once_and_not_twice() {
-		let Some(capture) = capture() else {
+		let Some((_gpu, capture)) = capture() else {
 			return;
 		};
 
@@ -627,7 +754,7 @@ mod tests {
 
 	#[test]
 	fn a_pose_that_is_gone_is_no_run_at_all() {
-		let Some(capture) = capture() else {
+		let Some((_gpu, capture)) = capture() else {
 			return;
 		};
 
@@ -648,7 +775,7 @@ mod tests {
 
 	#[test]
 	fn a_bone_that_turns_bends_the_geometry_hanging_off_it() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -687,7 +814,7 @@ mod tests {
 
 	#[test]
 	fn a_vertex_two_bones_share_lands_where_neither_alone_would_put_it() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -742,7 +869,7 @@ mod tests {
 
 	#[test]
 	fn a_vertex_naming_a_bone_past_its_own_run_reads_the_last_one_instead() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -795,7 +922,7 @@ mod tests {
 
 	#[test]
 	fn one_bent_character_does_not_bend_the_one_beside_it() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -855,7 +982,7 @@ mod tests {
 
 	#[test]
 	fn a_resting_pose_draws_the_shape_the_mesh_was_modeled_in() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -882,7 +1009,7 @@ mod tests {
 
 	#[test]
 	fn an_entity_halfway_between_two_steps_is_drawn_halfway() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -918,7 +1045,7 @@ mod tests {
 
 	#[test]
 	fn an_entity_that_teleported_is_drawn_where_it_landed() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -956,7 +1083,7 @@ mod tests {
 
 	#[test]
 	fn a_capture_is_written_where_a_person_can_look_at_it() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1037,7 +1164,7 @@ f 1 4 5
 
 	#[test]
 	fn a_mesh_compiled_from_a_file_reaches_the_screen() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1088,7 +1215,7 @@ f 1 4 5
 
 	#[test]
 	fn replacing_a_mesh_in_the_registry_changes_what_is_drawn() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1141,7 +1268,7 @@ f 1 4 5
 
 	#[test]
 	fn a_shader_that_does_not_compile_leaves_the_picture_alone() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1178,7 +1305,7 @@ f 1 4 5
 
 	#[test]
 	fn a_shader_that_does_compile_replaces_the_picture() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1241,10 +1368,7 @@ f 1 4 5
 		// square, so that a quarter of the frame is the same distance in world
 		// units across as it is down and the arithmetic below has one number
 		// in it rather than two.
-		let Some(mut capture) = (match Capture::new(SQUARE, SQUARE) {
-			| Ok(capture) => capture,
-			| Err(error) => panic!("building the capture failed: {error}"),
-		}) else {
+		let Some((_gpu, mut capture)) = capture_of(SQUARE, SQUARE) else {
 			return;
 		};
 
@@ -1354,10 +1478,7 @@ f 1 4 5
 	/// @param blend - how the material reads the picture's alpha
 	/// @return the frame, or `None` on a machine with no GPU
 	fn shot_of(blend: Blend) -> Option<Image> {
-		let mut capture = (match Capture::new(SQUARE, SQUARE) {
-			| Ok(capture) => capture,
-			| Err(error) => panic!("building the capture failed: {error}"),
-		})?;
+		let (_gpu, mut capture) = capture_of(SQUARE, SQUARE)?;
 
 		let mut world = looking_world();
 		world.ambient = Vec3::splat(1.0);
@@ -1436,7 +1557,7 @@ f 1 4 5
 
 	#[test]
 	fn a_metal_and_a_dielectric_of_the_same_color_do_not_look_the_same() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1486,7 +1607,7 @@ f 1 4 5
 
 	#[test]
 	fn a_floor_seen_from_above_is_not_culled_away() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1550,7 +1671,7 @@ f 1 4 5
 
 	#[test]
 	fn a_debug_segment_reaches_the_screen() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1568,7 +1689,7 @@ f 1 4 5
 
 	#[test]
 	fn a_debug_segment_behind_something_is_hidden_by_it() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1601,7 +1722,7 @@ f 1 4 5
 
 	#[test]
 	fn a_debug_segment_asked_for_on_top_ignores_what_is_in_front_of_it() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1655,10 +1776,7 @@ f 1 4 5
 		// square, for the reason the texture test is: the quad then fills the
 		// frame in both directions, and a sample a quarter of the way across
 		// lands on the middle of a texel rather than in the blend between two.
-		let Some(mut capture) = (match Capture::new(SQUARE, SQUARE) {
-			| Ok(capture) => capture,
-			| Err(error) => panic!("building the capture failed: {error}"),
-		}) else {
+		let Some((_gpu, mut capture)) = capture_of(SQUARE, SQUARE) else {
 			return;
 		};
 
@@ -1719,10 +1837,7 @@ f 1 4 5
 	/// @return the four colors an eighth, three eighths, five eighths and seven
 	/// eighths of the way across, or `None` when this machine has no GPU
 	fn tiled_twice(clamp: bool) -> Option<Vec<usize>> {
-		let mut capture = match Capture::new(SQUARE, SQUARE) {
-			| Ok(capture) => capture?,
-			| Err(error) => panic!("building the capture failed: {error}"),
-		};
+		let (_gpu, mut capture) = capture_of(SQUARE, SQUARE)?;
 
 		let mut world = looking_world();
 		world.ambient = Vec3::splat(1.0);
@@ -1841,7 +1956,7 @@ f 1 4 5
 
 	#[test]
 	fn a_prop_above_a_floor_casts_a_shadow_onto_it() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -1923,7 +2038,7 @@ f 1 4 5
 	/// @param blend - how the caster's material reads the picture's alpha
 	/// @return the frame and the world it was shot from, or `None` with no GPU
 	fn cast_by(blend: Blend) -> Option<(Image, World)> {
-		let mut capture = capture()?;
+		let (_gpu, mut capture) = capture()?;
 		let mut world = shadowed_world();
 		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
 		world.camera.target = Vec3::ZERO;
@@ -2097,7 +2212,7 @@ f 1 4 5
 
 	#[test]
 	fn a_blended_surface_lets_what_is_behind_it_through() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -2153,7 +2268,7 @@ f 1 4 5
 
 	#[test]
 	fn the_nearer_of_two_panes_is_the_one_on_top() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -2189,7 +2304,7 @@ f 1 4 5
 
 	#[test]
 	fn a_pane_is_sorted_by_where_its_geometry_is_and_not_by_its_origin() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -2240,7 +2355,7 @@ f 1 4 5
 
 	#[test]
 	fn two_panes_at_one_distance_do_not_hold_each_other_out() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -2300,7 +2415,7 @@ f 1 4 5
 
 	#[test]
 	fn a_blended_surface_reads_its_picture_and_its_opacity_both() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -2381,7 +2496,7 @@ f 1 4 5
 
 	#[test]
 	fn a_debug_segment_behind_glass_is_seen_through_it() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -2434,7 +2549,7 @@ f 1 4 5
 
 	#[test]
 	fn a_prop_far_down_the_view_is_shadowed_by_a_further_cascade() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 
@@ -2515,7 +2630,7 @@ f 1 4 5
 
 	#[test]
 	fn a_stretched_entity_is_lit_by_the_normals_it_really_has() {
-		let Some(mut capture) = capture() else {
+		let Some((_gpu, mut capture)) = capture() else {
 			return;
 		};
 

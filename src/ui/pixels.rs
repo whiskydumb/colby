@@ -18,12 +18,20 @@ mod tests {
 		abi::{FontData, Glyph, World},
 		glam::{Vec2, Vec3},
 	};
-	use colby_engine::{Capture, Image, Overlay, capture::distance};
+	use colby_engine::{Capture, Gpu, Image, Overlay, capture::distance, gpu};
 
 	use crate::Interface;
 
 	/// How big every test picture is.
 	const SIZE: (u32, u32) = (256, 256);
+
+	/// A device and a capture on it, or `None` when this machine has no GPU.
+	fn capture() -> Option<(Gpu, Capture)> {
+		let gpu = Gpu::open(gpu::backends(None), None).expect("the adapter query works")?;
+		let capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+
+		Some((gpu, capture))
+	}
 
 	/// A font of solid square glyphs, so that "is there ink here" has an answer
 	/// that does not depend on a typeface.
@@ -92,7 +100,7 @@ mod tests {
 		focused: &str,
 		caret: u32,
 	) -> Option<Image> {
-		let mut capture = Capture::new(SIZE.0, SIZE.1).expect("the adapter query works")?;
+		let (_gpu, mut capture) = capture()?;
 
 		let mut world = Box::new(World::new());
 		world.clear = Vec3::ZERO;
@@ -113,7 +121,7 @@ mod tests {
 
 		let mut interface = Interface::new();
 		interface
-			.attach(capture.device(), Capture::format())
+			.attach(capture.device(), capture.format())
 			.expect("the interface pipeline builds");
 		interface.run(&world);
 		interface.prepare(capture.device(), capture.queue(), &world);
@@ -134,7 +142,7 @@ mod tests {
 	///
 	/// @return the pixels, or `None` when this machine has no GPU
 	fn shoot_label() -> Option<Image> {
-		let mut capture = Capture::new(SIZE.0, SIZE.1).expect("the adapter query works")?;
+		let (_gpu, mut capture) = capture()?;
 
 		let mut world = Box::new(World::new());
 		world.clear = Vec3::ZERO;
@@ -155,7 +163,7 @@ mod tests {
 
 		let mut interface = Interface::new();
 		interface
-			.attach(capture.device(), Capture::format())
+			.attach(capture.device(), capture.format())
 			.expect("the interface pipeline builds");
 		interface.run(&world);
 		interface.prepare(capture.device(), capture.queue(), &world);

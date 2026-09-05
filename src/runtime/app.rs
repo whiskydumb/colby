@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use colby_core::{
-	Error, Result,
+	Err, Error, Result,
 	abi::{Input, Mix, World, cvar::Cvars},
 	err, error,
 	glam::{Vec2, Vec3},
@@ -21,7 +21,7 @@ use colby_core::{
 #[cfg(feature = "editor")]
 use colby_editor::Editor;
 use colby_engine::{
-	Overlay, Renderer,
+	Gpu, Overlay, Renderer, gpu,
 	winit::{
 		application::ApplicationHandler,
 		dpi::LogicalSize,
@@ -34,7 +34,7 @@ use colby_engine::{
 
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
-use crate::{Build, Front, Project, Runtime, input, mode::Mode, net::Standing};
+use crate::{Build, Front, Project, Runtime, input, mode::Mode, net::Standing, screenshot};
 
 /// The window title.
 const TITLE: &str = "colby";
@@ -151,6 +151,10 @@ pub(crate) struct App {
 	/// of the whole arrangement.
 	frames: u64,
 	input: Input,
+	/// The process's one device, made with the window and kept as long as
+	/// anything draws: the renderer and every picture taken while the window
+	/// is open are built on it. @ref `colby_engine::gpu`.
+	gpu: Option<Gpu>,
 	renderer: Option<Renderer>,
 	/// Whether the world is being played or edited, and the world play started
 	/// from. @ref `crate::mode`.
@@ -218,6 +222,7 @@ impl App {
 			clock: Clock::new(),
 			frames: 0,
 			input: Input::default(),
+			gpu: None,
 			renderer: None,
 			mode: Mode::new(),
 			#[cfg(feature = "editor")]
@@ -241,11 +246,22 @@ impl App {
 			.with_title(TITLE)
 			.with_inner_size(SIZE);
 
-		let window = event_loop
-			.create_window(attributes)
-			.map_err(|error| err!(Graphics("creating the window: {error}")))?;
+		let window = Arc::new(
+			event_loop
+				.create_window(attributes)
+				.map_err(|error| err!(Graphics("creating the window: {error}")))?,
+		);
 
-		let renderer = Renderer::new(Arc::new(window))?;
+		// the device before the renderer and against this window, so that the
+		// adapter chosen is one that can present to it; the surface itself is
+		// the renderer's. Which APIs it may use is the config's to say, and it
+		// is read here and never again. @ref `colby_engine::gpu`.
+		let asked = self.runtime.world.cvars.text(gpu::BACKEND);
+		let Some(gpu) = Gpu::open(gpu::backends(asked), Some(&window))? else {
+			return Err!(Graphics("no usable adapter, so there is nothing to draw with"));
+		};
+
+		let renderer = Renderer::new(&gpu, window)?;
 		let (width, height) = renderer.size();
 
 		self.runtime.world.aspect = renderer.aspect();
@@ -263,6 +279,7 @@ impl App {
 			error!(%error, "the interface has no pipeline; nothing it draws will be on screen");
 		}
 
+		self.gpu = Some(gpu);
 		self.renderer = Some(renderer);
 		self.start_editor();
 		self.start_watching()?;
@@ -503,6 +520,7 @@ impl App {
 		}
 
 		self.run_editor();
+		self.screenshots();
 
 		#[cfg(feature = "editor")]
 		let shown = Editor::shown(&self.runtime.world);
@@ -522,6 +540,51 @@ impl App {
 		};
 
 		renderer.render(&self.runtime.world, &mut overlays)
+	}
+
+	/// Writes every picture the console asked for since the last frame.
+	///
+	/// After the interface has been prepared and before the window is drawn,
+	/// so that what goes into the file is this frame: the same world and the
+	/// same interface, drawn by a second scene on the same device while the
+	/// window's own goes on drawing into the window. The editor is not in it,
+	/// as it is not in `--shot`: a screenshot is of the game. @ref
+	/// [`crate::screenshot`].
+	fn screenshots(&mut self) {
+		let asked = crate::console::take(&mut self.runtime.world, &[screenshot::COMMAND]);
+		if asked.is_empty() {
+			return;
+		}
+
+		let (Some(gpu), Some(renderer)) = (self.gpu.as_ref(), self.renderer.as_ref()) else {
+			return;
+		};
+		let root = self.runtime.project().root().to_owned();
+
+		for line in asked {
+			let name = line.words.first().map(String::as_str);
+			let outcome = screenshot::place(&root, name).and_then(|path| {
+				screenshot::take(
+					gpu,
+					renderer.format(),
+					renderer.size(),
+					&mut self.runtime.world,
+					&mut self.runtime.interface,
+					&path,
+				)
+			});
+
+			if let Err(error) = outcome {
+				error!(%error, "no screenshot");
+			}
+		}
+
+		// a second scene's pipelines, its uploads and a readback took as long
+		// as they took, and none of it is time the simulation owes: billed as
+		// arrears it would be a burst of catch-up steps and a warning about
+		// falling behind, once per picture. The same arrangement a module
+		// swap has. @ref `reload_if_stale`.
+		self.clock.reset();
 	}
 
 	/// Puts the console's pacing variables onto the clock.

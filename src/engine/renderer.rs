@@ -7,20 +7,20 @@
 //!
 //! Everything that is not about the window lives in [`Scene`], which is what
 //! makes an offscreen render possible, and with it a test that reads the pixels
-//! back. @ref [`capture`](crate::capture).
+//! back. @ref [`capture`](crate::capture). The device is not the window's
+//! either: it is the process's, made once and shared by every surface and
+//! every picture. @ref [`gpu`](crate::gpu).
 
 use std::sync::Arc;
 
 use colby_core::{Err, Result, abi::World, debug, err};
 use wgpu::{
-	Backends, CurrentSurfaceTexture, Device, DeviceDescriptor, ExperimentalFeatures, Features,
-	Instance, InstanceDescriptor, Limits, MemoryHints, PowerPreference, PresentMode,
-	RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
-	TextureViewDescriptor, Trace,
+	CurrentSurfaceTexture, Device, PresentMode, Surface, SurfaceConfiguration, TextureFormat,
+	TextureUsages, TextureViewDescriptor,
 };
 use winit::window::Window;
 
-use crate::{overlay::Overlay, scene::Scene};
+use crate::{gpu::Gpu, overlay::Overlay, scene::Scene};
 
 /// A window, its surface, and the scene drawn into it.
 ///
@@ -35,12 +35,15 @@ pub struct Renderer {
 }
 
 impl Renderer {
-	/// Brings up an adapter, a device, the pipeline and the built-in meshes.
+	/// Makes a surface for the window on the shared device, and a scene to
+	/// draw into it.
 	///
+	/// @param gpu - the device to draw with; the surface is made on its
+	/// instance and configured against its adapter
 	/// @param window - the window to present into
 	/// @return a renderer ready for [`render`](Self::render)
-	pub fn new(window: Arc<Window>) -> Result<Self> {
-		let mut renderer = pollster::block_on(Self::create(window))?;
+	pub fn new(gpu: &Gpu, window: Arc<Window>) -> Result<Self> {
+		let mut renderer = Self::create(gpu, window)?;
 
 		// before the first frame rather than after it. Windows hands out a
 		// window at a default size and applies the requested one a moment
@@ -241,60 +244,31 @@ impl Renderer {
 			.resize(self.config.width, self.config.height);
 	}
 
-	/// The async half of [`new`](Self::new).
-	async fn create(window: Arc<Window>) -> Result<Self> {
-		let instance = Instance::new(InstanceDescriptor {
-			backends: Backends::DX12 | Backends::VULKAN,
-			..InstanceDescriptor::new_without_display_handle()
-		});
-
-		let surface = instance
+	/// The surface, its configuration and the scene, before the first resync.
+	fn create(gpu: &Gpu, window: Arc<Window>) -> Result<Self> {
+		let surface = gpu
+			.instance()
 			.create_surface(Arc::clone(&window))
 			.map_err(|error| err!(Graphics("creating the surface: {error}")))?;
 
-		let adapter = instance
-			.request_adapter(&RequestAdapterOptions {
-				power_preference: PowerPreference::HighPerformance,
-				compatible_surface: Some(&surface),
-				..Default::default()
-			})
-			.await
-			.map_err(|error| err!(Graphics("no usable adapter: {error}")))?;
-
-		let info = adapter.get_info();
-		debug!(adapter = %info.name, backend = ?info.backend, "adapter selected");
-
-		let (device, queue) = adapter
-			.request_device(&DeviceDescriptor {
-				label: Some("colby"),
-				required_features: Features::empty(),
-				required_limits: Limits::default(),
-				experimental_features: ExperimentalFeatures::disabled(),
-				memory_hints: MemoryHints::Performance,
-				trace: Trace::Off,
-			})
-			.await
-			.map_err(|error| err!(Graphics("requesting a device: {error}")))?;
-
-		// read again rather than reused: `size` was taken before the adapter and
-		// the device were asked for, which on Windows is long enough for the
-		// window to have settled on a different one - a scaled display gives
-		// the size it was asked for first and the size it really is after. A
-		// surface configured for the wrong one is out of date from its first
-		// frame.
+		// read here rather than before the device was asked for, which on
+		// Windows is long enough for the window to have settled on a different
+		// size - a scaled display gives the size it was asked for first and
+		// the size it really is after. A surface configured for the wrong one
+		// is out of date from its first frame.
 		let size = window.inner_size();
 
 		// @note: taken from wgpu rather than filled in field by field, so that a
 		// new field in `SurfaceConfiguration` is a default here instead of a
 		// compile error in a crate that has no opinion about it.
 		let mut config = surface
-			.get_default_config(&adapter, size.width.max(1), size.height.max(1))
+			.get_default_config(gpu.adapter(), size.width.max(1), size.height.max(1))
 			.ok_or_else(|| err!(Graphics("the adapter cannot present to this surface")))?;
 
 		config.usage = TextureUsages::RENDER_ATTACHMENT;
 		config.present_mode = PresentMode::AutoVsync;
 
-		let capabilities = surface.get_capabilities(&adapter);
+		let capabilities = surface.get_capabilities(gpu.adapter());
 		if let Some(srgb) = capabilities
 			.formats
 			.iter()
@@ -304,9 +278,9 @@ impl Renderer {
 			config.format = srgb;
 		}
 
-		surface.configure(&device, &config);
+		surface.configure(gpu.device(), &config);
 
-		let scene = Scene::new(device, queue, config.format, config.width, config.height)?;
+		let scene = Scene::new(gpu, config.format, config.width, config.height)?;
 
 		Ok(Self { surface, config, scene, window })
 	}

@@ -210,6 +210,18 @@ impl Runtime {
 			Editor::install(&mut world);
 		}
 
+		if front.is_window() {
+			// the window's own: a picture of what it shows needs its device,
+			// so the frame loop takes the line. Before the module, so that it
+			// is the engine's. @ref `crate::screenshot`.
+			world.cvars.command(
+				crate::screenshot::COMMAND,
+				console::defer,
+				"write what the window shows to a png under screenshots/: a name, or the next \
+				 number",
+			);
+		}
+
 		// a project without a game crate has no module, and runs on its scenes
 		// and its programs. @ref `Game::open` for the build that links one in.
 		let module = project.game().is_some().then(|| project.module());

@@ -5,13 +5,15 @@
 # what running the engine leaves behind, under whichever project it was run
 # on. The console archive is a user file rather than a derived one, which is
 # why it stays in the project's root and out of the derived directory: cargo
-# clean should not take somebody's settings. Saved scenes are the same kind of
-# thing and are there for the same reason. `.colby/` is what the engine derives
+# clean should not take somebody's settings. Saved scenes and screenshots are
+# the same kind of thing and are there for the same reason. `.colby/` is what
+# the engine derives
 # for a project - the compiled assets - and `just clean` takes it. colby.png
 # and colby.wav are what `just shot` and `just hear` write when nobody names a
 # path, and they land wherever the command was run from.
 settings.cfg
 saves/
+screenshots/
 .colby/
 /colby.png
 /colby.wav

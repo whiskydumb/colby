@@ -251,6 +251,32 @@ pub(crate) fn install(world: &mut World) {
 		Value::Bool(false),
 		"mark every joint and the two anchors it holds",
 	);
+	world.cvars.var(
+		colby_ui::world_text::TEXT_SIZE,
+		Value::Float(colby_ui::world_text::DEFAULT_TEXT_SIZE),
+		"how big a label anchored in the world is drawn, in layout pixels",
+	);
+	world.cvars.command(
+		"debug.clear",
+		clear_debug,
+		"throw away every debug line that has a lifetime",
+	);
+
+	install_render(world);
+	install_scenes(world);
+	install_audio(world);
+	install_net(world);
+	install_scripts(world);
+}
+
+/// The renderer's variables: the shadows, and which graphics APIs to draw with.
+///
+/// Registered whether or not there is a window, like everything else here: a
+/// host writes them into its config untouched, and a config is one file for a
+/// project rather than one per kind of process.
+///
+/// @param world - the table to register into
+fn install_render(world: &mut World) {
 	// shadows, and these are on by default because they are a feature rather
 	// than a tool: what the variable is for is turning them off on a machine
 	// that cannot afford them. The cascade tint is the exception and is a tool.
@@ -269,21 +295,17 @@ pub(crate) fn install(world: &mut World) {
 		Value::Bool(false),
 		"color every pixel by the shadow cascade it read",
 	);
-	world.cvars.var(
-		colby_ui::world_text::TEXT_SIZE,
-		Value::Float(colby_ui::world_text::DEFAULT_TEXT_SIZE),
-		"how big a label anchored in the world is drawn, in layout pixels",
+	// which graphics APIs the window may draw with. Saved, because it is a
+	// property of the machine rather than of a session; and read once, when
+	// the device is made, so a value typed at a running window takes effect
+	// at the next start - which is what every engine does with this setting.
+	// The environment's `WGPU_BACKEND` overrides it for one run.
+	world.cvars.saved(
+		colby_engine::gpu::BACKEND,
+		Value::Text(colby_engine::gpu::AUTO.to_owned()),
+		"which graphics APIs to consider at the next start: auto, or vulkan, dx12, metal, gl in \
+		 a comma list",
 	);
-	world.cvars.command(
-		"debug.clear",
-		clear_debug,
-		"throw away every debug line that has a lifetime",
-	);
-
-	install_scenes(world);
-	install_audio(world);
-	install_net(world);
-	install_scripts(world);
 }
 
 /// The three commands over the programs the host is running.
@@ -1122,6 +1144,8 @@ mod tests {
 			// and the tick rate, which is the same kind of thing: a property
 			// of the project rather than a knob somebody turned for a minute.
 			crate::app::RATE,
+			// and the graphics API, which is a property of the machine.
+			colby_engine::gpu::BACKEND,
 		] {
 			assert!(archived.contains(&name), "{name} should survive a restart");
 		}

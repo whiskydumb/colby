@@ -46,6 +46,7 @@ mod net;
 mod record;
 mod runtime;
 mod saves;
+mod screenshot;
 mod shot;
 mod step;
 #[cfg(feature = "hot_reload")]
