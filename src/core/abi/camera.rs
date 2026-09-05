@@ -5,6 +5,7 @@
 //! carrying its own rotation is the better shape for a first-person controller
 //! and can be added when one exists - the renderer only ever asks for a matrix.
 
+use super::field::{Field, field};
 use crate::glam::{
 	Mat4, Vec2, Vec3,
 	camera::rh::{proj::directx::perspective, view::look_at_mat4},
@@ -48,6 +49,16 @@ impl Camera {
 		near: 0.1,
 		far: 200.0,
 	};
+	/// Its fields, for an inspector, a reader and a writer. @ref
+	/// [`field`](super::field).
+	pub const FIELDS: &[Field<Self>] = &[
+		field!(Vec3, "position", position, "where the camera is, in the world"),
+		field!(Vec3, "target", target, "what it is pointed at"),
+		field!(Vec3, "up", up, "which way is up; not along the line of sight"),
+		field!(Float, "fov_y", fov_y, "the vertical field of view, in radians"),
+		field!(Float, "near", near, "nothing closer than this is drawn"),
+		field!(Float, "far", far, "nothing further than this is drawn"),
+	];
 
 	/// The view matrix: world space into camera space.
 	#[must_use]

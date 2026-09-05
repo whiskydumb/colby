@@ -1,29 +1,41 @@
 //! The world as a tree, and one thing in it at a time in detail.
 //!
-//! **There is no hierarchy in colby, so this is not one.** An entity has no
-//! parent - the model importer flattened node trees on purpose, and nothing
-//! composes transforms. What the tree groups by instead is what the tables
-//! already say: a body names the entity it drives, and a joint names two
-//! bodies. So an entity's bodies hang under it, the bodies driving nothing
-//! stand on their own, and the joints are a group of their own at the bottom.
-//! That is a real relationship rather than an invented one, and when parenting
-//! arrives it will be a second kind of nesting rather than a replacement for
-//! this.
+//! **What the tree groups by is what the tables say.** An entity hangs off
+//! another by [`parent`](colby_core::abi::Entities::parent) since 1d, and the
+//! tree does not draw that yet: what it draws is the older relationship, a
+//! body naming the entity it drives, so an entity's bodies hang under it, the
+//! bodies driving nothing stand on their own, and the joints are a group of
+//! their own at the bottom. The hierarchy panel that draws the parents is the
+//! editor application's, and it will be a second kind of nesting rather than a
+//! replacement for this.
 //!
 //! **What a thing is called comes from the world, not from here.** A panel that
 //! kept its own names would lose them the moment a scene was loaded. Something
 //! nobody has named is shown by what it is made of, in angle brackets -
-//! `<cube>` for an entity drawing that mesh, `<dynamic ball 4>` for a body - so
-//! that a name and a description can never be mistaken for each other.
+//! `<cube>` for an entity drawing that mesh, `<dynamic sphere 4>` for a body -
+//! so that a name and a description can never be mistaken for each other.
+//!
+//! **The inspector is one function over a table.** Every record with a
+//! [`Field`] table is shown by [`inspect`]: a row per plain field, a widget
+//! the field's kind decides, and a write only when a number actually moved.
+//! Nothing here knows what a body's fields are; a field added to the table is
+//! a row here the same day, which is the whole reason the table exists. What
+//! is still drawn by hand is a relationship - what a joint holds, what an
+//! entity hangs off - because a handle is worth showing by name and a table
+//! knows nothing about names.
 //!
 //! Everything that can be tested lives in [`select`](crate::select); what is
-//! here is the drawing, and it is checked by looking at it.
+//! here is the drawing, and it is checked by looking at it - except that an
+//! inspector nobody touches writes nothing, which a headless frame can check.
 
 use colby_core::{
-	abi::{Body, BodyId, BodyKind, EntityId, JointId, JointKind, ShapeKind, World, console},
+	abi::{
+		Body, BodyId, EntityId, Field, Joint, JointId, Renderable, Transform, World, console,
+		field::{Kind, Value},
+	},
 	glam::{EulerRot, Quat, Vec3},
 };
-use egui::{Context, DragValue, Grid, ScrollArea, Window};
+use egui::{ComboBox, Context, DragValue, Grid, ScrollArea, Window};
 
 use crate::{
 	gizmo::Tool,
@@ -33,14 +45,14 @@ use crate::{
 /// How tall the tree is allowed to get before it scrolls.
 const TREE_HEIGHT: f32 = 240.0;
 
-/// How far a drag of one pixel moves a position.
+/// How far a drag of one pixel moves three numbers.
 const MOVE_SPEED: f32 = 0.02;
 
 /// How far a drag of one pixel turns something, in degrees.
 const TURN_SPEED: f32 = 0.5;
 
-/// How far a drag of one pixel scales something.
-const SCALE_SPEED: f32 = 0.01;
+/// How far a drag of one pixel moves a number on its own.
+const STEP_SPEED: f32 = 0.01;
 
 /// The scene window's own state.
 #[derive(Debug, Default)]
@@ -254,7 +266,7 @@ fn detail(ui: &mut egui::Ui, world: &mut World, pick: Pick) {
 			naming(ui, world, pick);
 			hanging(ui, world, id);
 			placing(ui, world, pick);
-			tint(ui, world, id);
+			look(ui, world, id);
 		},
 		| Pick::Body(id) => {
 			naming(ui, world, pick);
@@ -334,27 +346,19 @@ fn joint_label(world: &World, id: JointId) -> String {
 
 	world.joints.get(id).map_or_else(
 		|| format!("<joint {}>", id.slot()),
-		|joint| format!("<{} {}>", joint_word(joint.kind), id.slot()),
+		|joint| format!("<{} {}>", joint.kind.word(), id.slot()),
 	)
 }
 
 /// What a body is, in the fewest words that say it.
 ///
-/// The editor's own vocabulary rather than the scene format's: these are read
-/// in a list, and the format's words are written to a file. When something
-/// needs both to be the same word, that is the moment to put them somewhere
-/// they can be shared.
+/// The words the format writes a body with, so that a row in this tree and a
+/// line in a scene file agree; the tree used to have a vocabulary of its own,
+/// and the moment the two had to be the same word was the moment the words
+/// went on the kinds themselves.
 fn body_words(body: &Body) -> String {
-	let kind = match body.kind {
-		| BodyKind::Static => "static",
-		| BodyKind::Kinematic => "kinematic",
-		| BodyKind::Dynamic => "dynamic",
-	};
-	let shape = match body.shape.kind {
-		| ShapeKind::Box => "box",
-		| ShapeKind::Sphere => "ball",
-		| ShapeKind::Mesh => "mesh",
-	};
+	let kind = body.kind.word();
+	let shape = body.shape.kind.word();
 
 	if body.sensor {
 		// the first thing anybody wants to know about one, because a sensor is
@@ -362,16 +366,6 @@ fn body_words(body: &Body) -> String {
 		format!("{kind} {shape} sensor")
 	} else {
 		format!("{kind} {shape}")
-	}
-}
-
-/// What a joint does, in one word.
-const fn joint_word(kind: JointKind) -> &'static str {
-	match kind {
-		| JointKind::Rope => "rope",
-		| JointKind::Weld => "weld",
-		| JointKind::Axis => "hinge",
-		| JointKind::Ball => "ball",
 	}
 }
 
@@ -418,63 +412,45 @@ fn placing(ui: &mut egui::Ui, world: &mut World, pick: Pick) {
 
 	let mut edited = transform;
 
-	Grid::new("transform")
-		.num_columns(2)
-		.show(ui, |ui| {
-			ui.label("position");
-			vector(ui, &mut edited.position, MOVE_SPEED);
-			ui.end_row();
-
-			ui.label("rotation");
-			turn(ui, &mut edited.rotation);
-			ui.end_row();
-
-			ui.label("scale");
-			vector(ui, &mut edited.scale, SCALE_SPEED);
-			ui.end_row();
-		});
-
-	if edited != transform {
+	if inspect(ui, "transform", &mut edited, Transform::FIELDS) {
 		select::place_local(world, pick, edited);
 	}
 }
 
-/// What the solver is doing with a body, which is read rather than written.
-fn solid(ui: &mut egui::Ui, world: &World, id: BodyId) {
-	let Some(body) = world.bodies.get(id) else {
+/// What an entity looks like: the plain half of its renderable, which is the
+/// tint. The mesh, the material and the pose are handles, and the tree names
+/// the mesh in the row above.
+fn look(ui: &mut egui::Ui, world: &mut World, id: EntityId) {
+	let Some(renderable) = world.entities.renderable_mut(id) else {
 		return;
 	};
 
-	Grid::new("body").num_columns(2).show(ui, |ui| {
-		ui.label("mass");
-		ui.monospace(format!("{:.2}", body.mass));
-		ui.end_row();
-
-		ui.label("speed");
-		ui.monospace(format!("{:.2}", body.velocity.length()));
-		ui.end_row();
-
-		ui.label("asleep");
-		ui.monospace(if body.sleeping { "yes" } else { "no" });
-		ui.end_row();
-	});
+	inspect(ui, "renderable", renderable, Renderable::FIELDS);
 }
 
-/// What a joint holds, which is read rather than written.
+/// Everything the solver reads about a body, to edit.
 ///
-/// Its anchors are in each body's own space, so there is nothing to type here
-/// that would mean anything without something drawn in the world to type it
-/// against.
-fn tie(ui: &mut egui::Ui, world: &World, id: JointId) {
-	let Some(joint) = world.joints.get(id) else {
+/// Its place is the row above, through the transform's own table, and the
+/// entity it drives is the branch it hangs under in the tree.
+fn solid(ui: &mut egui::Ui, world: &mut World, id: BodyId) {
+	let Some(body) = world.bodies.get_mut(id) else {
 		return;
 	};
 
-	Grid::new("joint").num_columns(2).show(ui, |ui| {
-		ui.label("kind");
-		ui.monospace(joint_word(joint.kind));
-		ui.end_row();
+	inspect(ui, "body", body, Body::FIELDS);
+}
 
+/// What a joint holds, by name, and then everything else about it.
+///
+/// Its two bodies are handles, which the table describes and cannot name, so
+/// the two rows that name them are drawn here; the anchors are in each body's
+/// own space, and are numbers all the same.
+fn tie(ui: &mut egui::Ui, world: &mut World, id: JointId) {
+	let Some(joint) = world.joints.get(id).copied() else {
+		return;
+	};
+
+	Grid::new("held").num_columns(2).show(ui, |ui| {
 		ui.label("first");
 		ui.monospace(body_label(world, joint.first));
 		ui.end_row();
@@ -486,32 +462,92 @@ fn tie(ui: &mut egui::Ui, world: &World, id: JointId) {
 			"a point in the world".to_owned()
 		});
 		ui.end_row();
+	});
 
-		if joint.kind == JointKind::Rope {
-			ui.label("length");
-			ui.monospace(format!("{:.2}", joint.length));
+	if let Some(held) = world.joints.get_mut(id) {
+		inspect(ui, "joint", held, Joint::FIELDS);
+	}
+}
+
+/// One inspector over any record with a table: a row per plain field, and a
+/// widget the field's kind decides.
+///
+/// A reference is left out. The table says a body drives an entity, and a row
+/// that could only show a slot number would say less than the tree already
+/// does by nesting one under the other; where a relationship is worth a row,
+/// the caller draws it by name, @ref [`tie`].
+///
+/// **A write is guarded by the numbers having actually changed**, field by
+/// field, and that matters more than it looks for a rotation: two different
+/// triples of angles can name one rotation, so converting out and straight
+/// back in every frame would walk a rotation somewhere it was never dragged.
+///
+/// @param ui - where to draw
+/// @param salt - what tells this grid from another in the same window
+/// @param record - what to show and edit
+/// @param fields - its table
+/// @return whether any field was written
+fn inspect<T>(ui: &mut egui::Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> bool {
+	let mut edited = false;
+
+	Grid::new(salt).num_columns(2).show(ui, |ui| {
+		for field in fields {
+			if field.kind.is_reference() {
+				continue;
+			}
+
+			ui.label(field.name).on_hover_text(field.help);
+
+			let held = field.get(record);
+			let mut value = held.clone();
+			widget(ui, field, &mut value);
+
+			if value != held && field.set(record, value) {
+				edited = true;
+			}
+
 			ui.end_row();
 		}
 	});
+
+	edited
 }
 
-/// The selected entity's own color.
-fn tint(ui: &mut egui::Ui, world: &mut World, id: EntityId) {
-	let Some(renderable) = world.entities.renderable(id).copied() else {
-		return;
-	};
-
-	let mut color = renderable.color.to_array();
-
-	ui.horizontal(|ui| {
-		ui.label("tint");
-
-		if ui.color_edit_button_rgb(&mut color).changed()
-			&& let Some(held) = world.entities.renderable_mut(id)
-		{
-			held.color = Vec3::from_array(color);
-		}
-	});
+/// The widget one value is edited with, by its kind.
+///
+/// @param ui - where to draw
+/// @param field - whose value it is, for the words a word may be and for an
+/// id no other widget in the window has
+/// @param value - what to draw and edit in place
+fn widget<T>(ui: &mut egui::Ui, field: &Field<T>, value: &mut Value) {
+	match value {
+		| Value::Bool(held) => {
+			ui.checkbox(held, "");
+		},
+		| Value::Int(held) => {
+			ui.add(DragValue::new(held));
+		},
+		| Value::Float(held) => {
+			ui.add(DragValue::new(held).speed(STEP_SPEED));
+		},
+		| Value::Text(held) => {
+			ui.text_edit_singleline(held);
+		},
+		| Value::Vec3(held) => vector(ui, held, MOVE_SPEED),
+		| Value::Quat(held) => turn(ui, held),
+		| Value::Color(held) => color(ui, held),
+		| Value::Word(held) => words(ui, field.name, field.kind, held),
+		// never reached: a reference is skipped before a widget is asked for,
+		// @ref `inspect`. A slot number is what there would be to show.
+		| Value::Entity(_)
+		| Value::Body(_)
+		| Value::Joint(_)
+		| Value::Pose(_)
+		| Value::Mesh(_)
+		| Value::Material(_) => {
+			ui.monospace("a reference");
+		},
+	}
 }
 
 /// Three numbers on one row.
@@ -556,5 +592,116 @@ fn turn(ui: &mut egui::Ui, rotation: &mut Quat) {
 			edited.x.to_radians(),
 			edited.z.to_radians(),
 		);
+	}
+}
+
+/// A color, as a swatch that opens a picker.
+///
+/// Guarded by the widget's own word rather than by comparing numbers: the
+/// picker keeps its color as hue, saturation and value and writes the three
+/// channels back from that every frame, which is a round trip through a
+/// different number of bits, and comparing would see a change where nobody
+/// made one.
+fn color(ui: &mut egui::Ui, value: &mut Vec3) {
+	let mut rgb = value.to_array();
+
+	if ui.color_edit_button_rgb(&mut rgb).changed() {
+		*value = Vec3::from_array(rgb);
+	}
+}
+
+/// One of a few words, as a drop-down over the field's own list.
+fn words(ui: &mut egui::Ui, salt: &str, kind: Kind, held: &mut u32) {
+	let list = kind.words();
+	let shown = usize::try_from(*held)
+		.ok()
+		.and_then(|index| list.get(index))
+		.copied()
+		.unwrap_or("?");
+
+	ComboBox::from_id_salt(salt)
+		.selected_text(shown)
+		.show_ui(ui, |ui| {
+			for (index, word) in list.iter().enumerate() {
+				if let Ok(index) = u32::try_from(index) {
+					ui.selectable_value(held, index, *word);
+				}
+			}
+		});
+}
+
+#[cfg(test)]
+mod tests {
+	use colby_core::abi::{MeshId, Shape};
+	use egui::RawInput;
+
+	use super::*;
+
+	/// Runs one frame of an inspector over a record with nobody touching it,
+	/// and hands back what the frame reported.
+	fn untouched<T: Clone + PartialEq + core::fmt::Debug>(
+		record: &T,
+		fields: &[Field<T>],
+	) -> bool {
+		let context = Context::default();
+		let mut edited = record.clone();
+		let mut written = false;
+
+		// nothing paints this frame, and epaint asserts that a texture delta is
+		// applied rather than dropped - the right rule for a painter and the
+		// wrong one for a test - so the delta is cleared on purpose, the way
+		// the editor does on its way out.
+		let mut output = context.run_ui(RawInput::default(), |ui| {
+			written = inspect(ui, "test", &mut edited, fields);
+		});
+		output.textures_delta.clear();
+
+		assert_eq!(edited, *record, "nothing was touched, so nothing may have moved");
+
+		written
+	}
+
+	#[test]
+	fn an_inspector_nobody_touches_writes_nothing() {
+		// the trap the rotation row guards against: a rotation shown as three
+		// angles and read straight back is not always the same rotation, and
+		// an inspector that wrote it back every frame would walk it. A
+		// rotation that is none of the easy ones, so the round trip is real.
+		let turned = Transform {
+			position: Vec3::new(1.5, -2.0, 0.25),
+			rotation: Quat::from_euler(EulerRot::YXZ, 1.2, -0.4, 2.9),
+			scale: Vec3::new(1.0, 2.0, 0.5),
+		};
+
+		assert!(!untouched(&turned, Transform::FIELDS), "a transform stays put");
+
+		let body = Body::dynamic(Shape::ball(0.7), turned, 2.5)
+			.moving(Vec3::X, Vec3::Y)
+			.surfaced(0.3, 0.9);
+
+		assert!(!untouched(&body, Body::FIELDS), "and so does a body");
+
+		let mut joint = Joint::weld(BodyId::at(1, 1), BodyId::at(2, 1), (Vec3::X, Vec3::Z))
+			.sprung(4.0, 0.7)
+			.capped(12.0, 3.0);
+		joint.rest = turned.rotation;
+
+		assert!(!untouched(&joint, Joint::FIELDS), "and a joint, rest rotation and all");
+		assert!(
+			!untouched(
+				&Renderable::new(MeshId::CUBE, Vec3::new(0.2, 0.7, 0.9)),
+				Renderable::FIELDS
+			),
+			"and a tint through the picker"
+		);
+	}
+
+	#[test]
+	fn a_body_is_described_in_the_words_a_file_writes_it_with() {
+		let body = Body::dynamic(Shape::ball(0.5), Transform::IDENTITY, 1.0);
+
+		assert_eq!(body_words(&body), "dynamic sphere");
+		assert_eq!(body_words(&body.sensing()), "dynamic sphere sensor");
+		assert_eq!(body_words(&Body::default()), "static box");
 	}
 }

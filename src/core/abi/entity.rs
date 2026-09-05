@@ -25,7 +25,13 @@
 //! renderer's is [`blended`](Entities::blended), which does the same between
 //! two steps.
 
-use super::{material::MaterialId, mesh::MeshId, names::Names, pose::PoseId};
+use super::{
+	field::{Field, field},
+	material::MaterialId,
+	mesh::MeshId,
+	names::Names,
+	pose::PoseId,
+};
 use crate::{
 	bytemuck::{Pod, Zeroable},
 	glam::{Mat4, Quat, Vec3},
@@ -126,6 +132,18 @@ pub struct Transform {
 }
 
 impl Transform {
+	/// Its fields, for an inspector, a reader and a writer. @ref
+	/// [`field`](super::field).
+	pub const FIELDS: &[Field<Self>] = &[
+		field!(
+			Vec3,
+			"position",
+			position,
+			"where it is: in the world on its own, inside its parent when it hangs off one"
+		),
+		field!(Quat, "rotation", rotation, "which way it is turned"),
+		field!(Vec3, "scale", scale, "how big it is along each axis"),
+	];
 	/// At the origin, unrotated, unscaled.
 	pub const IDENTITY: Self = Self {
 		position: Vec3::ZERO,
@@ -274,6 +292,14 @@ pub struct Renderable {
 }
 
 impl Renderable {
+	/// Its fields, for an inspector, a reader and a writer. @ref
+	/// [`field`](super::field).
+	pub const FIELDS: &[Field<Self>] = &[
+		field!(Mesh, "mesh", mesh, "the shape to draw"),
+		field!(Material, "material", material, "what it is made of"),
+		field!(Color, "color", color, "its own tint, multiplied into the material"),
+		field!(Pose, "pose", pose, "the bones that move it, or none"),
+	];
 	/// Draws nothing.
 	pub const NOTHING: Self = Self {
 		mesh: MeshId::NONE,

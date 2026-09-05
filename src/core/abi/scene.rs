@@ -70,7 +70,9 @@ use crate::{
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
 		MaterialId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind, Transform, World,
-		net::MAX_PEERS, state::STATE_BYTES,
+		field::{Field, field},
+		net::MAX_PEERS,
+		state::STATE_BYTES,
 	},
 	err,
 	glam::{Quat, Vec3},
@@ -126,6 +128,18 @@ impl Stage {
 		time: 0.0,
 		steps: 0,
 	};
+	/// Its plain fields, for an inspector, a reader and a writer. @ref
+	/// [`field`](super::field).
+	///
+	/// The camera is a record of its own with its own table,
+	/// [`Camera::FIELDS`], and the two counters are the host's rather than
+	/// anything a person sets: a source has no words for what time it is.
+	pub const FIELDS: &[Field<Self>] = &[
+		field!(Color, "clear", clear, "the clear color"),
+		field!(Vec3, "light", light, "the direction the light travels"),
+		field!(Color, "ambient", ambient, "how lit a surface facing away from the light is"),
+		field!(Vec3, "gravity", gravity, "what every dynamic body accelerates by"),
+	];
 }
 
 impl Default for Stage {

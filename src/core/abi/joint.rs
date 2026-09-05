@@ -17,7 +17,11 @@
 //! by whoever owns the body. Converting is one matrix each, and the solver does
 //! it.
 
-use super::{names::Names, physics::BodyId};
+use super::{
+	field::{Field, field, word},
+	names::Names,
+	physics::BodyId,
+};
 use crate::{
 	bytemuck::{Pod, Zeroable},
 	glam::{Quat, Vec3},
@@ -67,6 +71,45 @@ pub enum JointKind {
 	/// because the answer is a limit on the angle rather than a different
 	/// joint. Those limits are not here yet.
 	Ball,
+}
+
+impl JointKind {
+	/// The word each kind is written as, in declaration order.
+	///
+	/// A file's vocabulary and an inspector's drop-down, @ref
+	/// [`field::Kind::Word`](super::field::Kind::Word).
+	pub const WORDS: &[&str] = &["rope", "weld", "axis", "ball"];
+
+	/// The kind at a place in [`WORDS`](Self::WORDS), if there is one.
+	///
+	/// @param index - the place
+	#[must_use]
+	pub const fn at(index: u32) -> Option<Self> {
+		match index {
+			| 0 => Some(Self::Rope),
+			| 1 => Some(Self::Weld),
+			| 2 => Some(Self::Axis),
+			| 3 => Some(Self::Ball),
+			| _ => None,
+		}
+	}
+
+	/// Where this kind is in [`WORDS`](Self::WORDS).
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "the discriminant is the place in the list, by declaration order"
+	)]
+	pub const fn index(self) -> u32 { self as u32 }
+
+	/// The word this kind is written as.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "u32 to usize is lossless on every target this builds for, and try_from is not \
+		          available in a const fn"
+	)]
+	pub const fn word(self) -> &'static str { Self::WORDS[self.index() as usize] }
 }
 
 /// A handle to a joint.
@@ -223,6 +266,55 @@ pub struct Joint {
 impl Joint {
 	/// How quickly a spring settles unless it says otherwise.
 	pub const DAMPING: f32 = 1.0;
+	/// Its fields, for an inspector, a reader and a writer. @ref
+	/// [`field`](super::field).
+	pub const FIELDS: &[Field<Self>] = &[
+		word!(
+			"kind",
+			kind,
+			JointKind::WORDS,
+			JointKind::at,
+			JointKind::index,
+			"which of the four it is"
+		),
+		field!(Body, "first", first, "one of the two bodies it holds"),
+		field!(Body, "second", second, "the other, or none for a point in the world"),
+		field!(
+			Vec3,
+			"first_anchor",
+			first_anchor,
+			"where it attaches on the first, in its space"
+		),
+		field!(
+			Vec3,
+			"second_anchor",
+			second_anchor,
+			"where it attaches on the second, in its space, or in the world if there is none"
+		),
+		field!(Vec3, "axis", axis, "what a hinge turns about, in the first body's space"),
+		field!(Float, "length", length, "how far apart a rope lets them get"),
+		field!(Quat, "rest", rest, "how the two were turned relative to each other when made"),
+		field!(
+			Float,
+			"stiffness",
+			stiffness,
+			"how stiff its spring is, in hertz; zero is rigid"
+		),
+		field!(
+			Float,
+			"damping",
+			damping,
+			"how quickly that spring stops ringing; one is critical"
+		),
+		field!(
+			Float,
+			"max_impulse",
+			max_impulse,
+			"the most it may pull with; zero is no ceiling"
+		),
+		field!(Float, "max_torque", max_torque, "the most it may turn with; zero is no ceiling"),
+		field!(Bool, "collide", collide, "whether the two bodies it holds still collide"),
+	];
 	/// How much a joint may spend unless it says otherwise, which is all of it.
 	pub const NO_CEILING: f32 = 0.0;
 	/// How stiff a joint is unless it says otherwise, which is perfectly.

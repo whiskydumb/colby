@@ -42,6 +42,7 @@ use core::ffi::c_void;
 
 use super::{
 	entity::EntityId,
+	field::{Field, Kind, Value, field, word},
 	mesh::MeshId,
 	names::Names,
 	net::{PeerId, Role},
@@ -177,6 +178,44 @@ pub enum ShapeKind {
 	Mesh,
 }
 
+impl ShapeKind {
+	/// The word each kind is written as, in declaration order.
+	///
+	/// A file's vocabulary and an inspector's drop-down, @ref
+	/// [`field::Kind::Word`](super::field::Kind::Word).
+	pub const WORDS: &[&str] = &["box", "sphere", "mesh"];
+
+	/// The kind at a place in [`WORDS`](Self::WORDS), if there is one.
+	///
+	/// @param index - the place
+	#[must_use]
+	pub const fn at(index: u32) -> Option<Self> {
+		match index {
+			| 0 => Some(Self::Box),
+			| 1 => Some(Self::Sphere),
+			| 2 => Some(Self::Mesh),
+			| _ => None,
+		}
+	}
+
+	/// Where this kind is in [`WORDS`](Self::WORDS).
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "the discriminant is the place in the list, by declaration order"
+	)]
+	pub const fn index(self) -> u32 { self as u32 }
+
+	/// The word this kind is written as.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "u32 to usize is lossless on every target this builds for, and try_from is not \
+		          available in a const fn"
+	)]
+	pub const fn word(self) -> &'static str { Self::WORDS[self.index() as usize] }
+}
+
 /// What a body is shaped like.
 ///
 /// One struct covering all three kinds, with the fields the kind does not use
@@ -296,6 +335,44 @@ pub enum BodyKind {
 
 	/// Moved by the solver.
 	Dynamic,
+}
+
+impl BodyKind {
+	/// The word each kind is written as, in declaration order.
+	///
+	/// A file's vocabulary and an inspector's drop-down, @ref
+	/// [`field::Kind::Word`](super::field::Kind::Word).
+	pub const WORDS: &[&str] = &["static", "kinematic", "dynamic"];
+
+	/// The kind at a place in [`WORDS`](Self::WORDS), if there is one.
+	///
+	/// @param index - the place
+	#[must_use]
+	pub const fn at(index: u32) -> Option<Self> {
+		match index {
+			| 0 => Some(Self::Static),
+			| 1 => Some(Self::Kinematic),
+			| 2 => Some(Self::Dynamic),
+			| _ => None,
+		}
+	}
+
+	/// Where this kind is in [`WORDS`](Self::WORDS).
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "the discriminant is the place in the list, by declaration order"
+	)]
+	pub const fn index(self) -> u32 { self as u32 }
+
+	/// The word this kind is written as.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "u32 to usize is lossless on every target this builds for, and try_from is not \
+		          available in a const fn"
+	)]
+	pub const fn word(self) -> &'static str { Self::WORDS[self.index() as usize] }
 }
 
 /// A handle to a body.
@@ -552,6 +629,69 @@ pub struct Body {
 }
 
 impl Body {
+	/// Its fields, for an inspector, a reader and a writer. @ref
+	/// [`field`](super::field).
+	///
+	/// The transform is not here: a body's place is edited and written the way
+	/// an entity's is, through [`Transform::FIELDS`]. Neither are the two force
+	/// accumulators nor the owner, because each is a moment rather than a
+	/// thing: the solver clears the first two every step, and the third names
+	/// a peer that a world read back need not have. A field an inspector could
+	/// set and a file could carry would be a lie about both.
+	pub const FIELDS: &[Field<Self>] = &[
+		word!(
+			"kind",
+			kind,
+			BodyKind::WORDS,
+			BodyKind::at,
+			BodyKind::index,
+			"what the solver may do with it"
+		),
+		word!(
+			"shape.kind",
+			shape.kind,
+			ShapeKind::WORDS,
+			ShapeKind::at,
+			ShapeKind::index,
+			"what it is shaped like"
+		),
+		field!(Float, "shape.radius", shape.radius, "the radius of a sphere"),
+		field!(Vec3, "shape.extents", shape.extents, "the half-extents of a box"),
+		field!(Mesh, "shape.mesh", shape.mesh, "the geometry of a mesh shape"),
+		field!(Vec3, "velocity", velocity, "how fast it is moving, in units a second"),
+		field!(Vec3, "angular", angular, "how fast it is turning, in radians a second"),
+		field!(Float, "mass", mass, "how heavy it is; read only for a dynamic body"),
+		field!(
+			Float,
+			"restitution",
+			restitution,
+			"how much of an impact comes back, zero to one"
+		),
+		field!(Float, "friction", friction, "how hard it is to slide along"),
+		field!(Bool, "sensor", sensor, "whether it notices what it overlaps instead of pushing"),
+		field!(Bool, "weightless", weightless, "whether gravity leaves it alone"),
+		field!(
+			Bool,
+			"sleeping",
+			sleeping,
+			"whether the solver has stopped it; clear to wake it"
+		),
+		Field {
+			name: "layers.layer",
+			help: "the layers it is on, one bit each",
+			kind: Kind::Int,
+			get: |body| Value::Int(i64::from(body.layers.layer)),
+			set: |body, value| put_bits(&mut body.layers.layer, &value),
+		},
+		Field {
+			name: "layers.mask",
+			help: "the layers it interacts with, one bit each",
+			kind: Kind::Int,
+			get: |body| Value::Int(i64::from(body.layers.mask)),
+			set: |body, value| put_bits(&mut body.layers.mask, &value),
+		},
+		field!(Entity, "entity", entity, "the entity it drives, or none"),
+	];
 	/// How much a body grips unless it says otherwise.
 	pub const FRICTION: f32 = 0.5;
 	/// How heavy a body is unless it says otherwise.
@@ -728,6 +868,26 @@ impl Body {
 
 impl Default for Body {
 	fn default() -> Self { Self::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY) }
+}
+
+/// Writes a whole number into a bit mask, if it is one a mask can hold.
+///
+/// @param mask - where to write
+/// @param value - what to write; anything but a whole number from zero to
+/// thirty-two ones is refused
+fn put_bits(mask: &mut u32, value: &Value) -> bool {
+	let Value::Int(held) = *value else {
+		return false;
+	};
+
+	match u32::try_from(held) {
+		| Ok(bits) => {
+			*mask = bits;
+
+			true
+		},
+		| Err(_) => false,
+	}
 }
 
 /// The half-extents of the axis-aligned box holding a rotated box.

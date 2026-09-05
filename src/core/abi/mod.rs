@@ -29,6 +29,7 @@ pub mod console;
 pub mod cvar;
 pub mod debug;
 pub mod entity;
+pub mod field;
 pub mod font;
 pub mod input;
 pub mod joint;
@@ -63,6 +64,7 @@ pub use self::{
 	cvar::{Args, ConsoleFn, Cvars, Value},
 	debug::{Debug, Label, Line, Pen},
 	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
+	field::Field,
 	font::{Font, FontData, FontId, Fonts, Glyph},
 	input::{Button, Input, Key},
 	joint::{Joint, JointId, JointKind, Joints, MAX_JOINTS},
