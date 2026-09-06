@@ -6,6 +6,8 @@
 use colby_core::{abi::World, time::Clock};
 use egui::{Grid, ScrollArea, Ui};
 
+use crate::KEEP;
+
 /// Draws the statistics into a panel.
 ///
 /// @param ui - the panel
@@ -33,10 +35,13 @@ fn body(ui: &mut Ui, world: &World, clock: &Clock, frames: u64) {
 	// which mode, said first and said plainly: everything else here is a
 	// number that means something different depending on it, starting with
 	// the two that stop moving.
-	ui.label(if world.editing {
-		"editing. F5 plays, and stopping puts this world back"
-	} else {
-		"playing. F5 stops, and comes back to the world it started from"
+	// what a stop does is a variable away from being the opposite, so the
+	// line says which of the two it is rather than promising one of them
+	let keeping = world.cvars.bool(KEEP).unwrap_or(false);
+	ui.label(match (world.editing, keeping) {
+		| (true, _) => "editing. F5 plays",
+		| (false, false) => "playing. F5 stops, and comes back to the world it started from",
+		| (false, true) => "playing. F5 stops and keeps this world, because sim.keep is on",
 	});
 	ui.separator();
 

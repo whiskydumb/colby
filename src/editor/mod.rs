@@ -93,6 +93,14 @@ pub const SHOW: &str = "editor.show";
 /// and the console reach the mode by one path.
 const EDIT: &str = "sim.edit";
 
+/// The variable that decides whether a stop keeps what the game did.
+///
+/// The runner's as well: the editor never writes it and only says which of
+/// the two things a stop is about to do, because a promise about that is the
+/// one thing a panel can get wrong without anybody noticing until the work is
+/// gone.
+const KEEP: &str = "sim.keep";
+
 /// How wide the hierarchy starts out, in points.
 const HIERARCHY_WIDTH: f32 = 240.0;
 
@@ -333,6 +341,21 @@ impl Editor {
 			.set(SHOW, if shown { "false" } else { "true" });
 	}
 
+	/// Starts play if the world is being edited, and stops it if it is not.
+	///
+	/// **The one path.** The key in the window and the button on the bar both
+	/// come here, so the world before play is written down once and by the
+	/// same hand - and so that it is written down whether the editor is on
+	/// screen or hidden, which a key can be pressed either way.
+	///
+	/// @param world - the world, whose variable is written and whose state is
+	/// what an undo of the play goes back to
+	pub fn play(&mut self, world: &mut World) {
+		let editing = world.editing;
+
+		self.panels.set_mode(world, !editing);
+	}
+
 	/// Offers one window event to the editor.
 	///
 	/// @param window - the window the event came from
@@ -489,14 +512,24 @@ impl Panels {
 
 	/// Acts on play having started or stopped since the last frame.
 	///
-	/// The records are dropped when play starts: what they describe is a
-	/// world the game is about to rewrite, and the world that comes back when
-	/// play stops is the one play started from - which the records were made
-	/// before, not after. @ref [`history`].
+	/// The record that spans the play was opened by @ref `set_mode`, before
+	/// the mode moved; this is the other end of it. A stop that put the world
+	/// back closes it with the world it opened with and writes nothing down,
+	/// and a stop under `sim.keep` closes it as one step. Play that began
+	/// somewhere else - a typed line, a config file - held nothing, and there
+	/// is nothing here to close. @ref [`history`].
 	fn follow(&mut self, world: &World) {
-		if self.was_editing && !world.editing {
-			self.history.clear();
-			info!("playing; what was done while editing can no longer be undone");
+		if self.was_editing && !world.editing && !self.history.holding() {
+			// play was started by something that is not the editor - a typed
+			// `sim.edit 0`, a config file, a game that asked for it - so
+			// nobody wrote the world down and there is nothing to close. The
+			// records made before it stand, and what an undo of one does is
+			// what it always does: put a whole world back.
+			debug!("playing; nobody wrote this play down, so there is no step back over it");
+		}
+
+		if !self.was_editing && world.editing && self.history.release(world) {
+			info!("editing; the play is one step to go back over, because sim.keep is on");
 		}
 
 		self.was_editing = world.editing;
@@ -578,11 +611,7 @@ impl Panels {
 				}
 			},
 			| Change::Tool(tool) => self.viewport.set_tool(tool),
-			| Change::Edit(editing) => {
-				world
-					.cvars
-					.set(EDIT, if editing { "true" } else { "false" });
-			},
+			| Change::Edit(editing) => self.set_mode(world, editing),
 			| Change::Write(name) =>
 				colby_core::abi::console::run(world, &format!("scene.write {name}")),
 			| Change::Undo => self.restore = self.history.undo(world),
@@ -593,6 +622,28 @@ impl Panels {
 
 	/// Puts an asset into the world where it was dropped, as one record, and
 	/// selects what it became.
+	/// Asks for a mode, and writes the play down when one is starting.
+	///
+	/// The variable is written rather than the state, so a typed `sim.edit 1`
+	/// and this are the same thing one frame later; what this adds is the
+	/// record. A play is one step to go back over, opened here and closed
+	/// when the world comes back to being edited, @ref `follow`. A stop that
+	/// puts the world back closes it with the world it opened with and
+	/// nothing is written down; a stop under `sim.keep` closes it with what
+	/// the game left, and one ctrl+z undoes the whole play.
+	///
+	/// @param world - the world to write the variable into
+	/// @param editing - the mode being asked for
+	fn set_mode(&mut self, world: &mut World, editing: bool) {
+		if !editing {
+			self.history.hold("play", world);
+		}
+
+		world
+			.cvars
+			.set(EDIT, if editing { "true" } else { "false" });
+	}
+
 	fn drop(&mut self, world: &mut World, name: &str, kind: Kind, at: Vec3) {
 		self.history.begin("drop", world);
 		let landed = select::drop(world, name, kind, at);
@@ -823,6 +874,29 @@ mod tests {
 
 		assert!(prompt.max.y <= 720.0, "the prompt is under the window's floor: {prompt:?}");
 		assert!(view.max.y <= prompt.min.y, "and the picture stops above it: {view:?}");
+	}
+
+	/// A world with one thing hung off another and a ball above the floor,
+	/// with that hang already a record.
+	fn hung() -> (World, Panels, EntityId) {
+		let mut world = World::new();
+		world.editing = true;
+		let car = world.entities.spawn_at(Transform::at(Vec3::X));
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::Z));
+		let ball = world.entities.spawn_at(Transform::at(Vec3::Y));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Hang { child: wheel, parent: car });
+		frame(&mut panels, &mut world);
+		frame(&mut panels, &mut world);
+
+		(world, panels, ball)
+	}
+
+	/// Moves a thing, the way a game does every step it runs.
+	fn shift(world: &mut World, id: EntityId, to: Vec3) {
+		if let Some(transform) = world.entities.transform_mut(id) {
+			transform.position = to;
+		}
 	}
 
 	#[test]
@@ -1060,20 +1134,80 @@ mod tests {
 	}
 
 	#[test]
-	fn play_starting_drops_what_was_done_while_editing() {
-		let mut world = World::new();
-		world.editing = true;
-		let car = world.entities.spawn_at(Transform::at(Vec3::X));
-		let wheel = world.entities.spawn_at(Transform::at(Vec3::Z));
-		let mut panels = Panels::default();
-		panels.apply(&mut world, Change::Hang { child: wheel, parent: car });
-		frame(&mut panels, &mut world);
-		frame(&mut panels, &mut world);
+	fn a_play_that_puts_the_world_back_leaves_what_was_done_before_it() {
+		let (mut world, mut panels, ball) = hung();
 		assert_eq!(panels.history.undoable(), Some("hang"));
 
+		// play, through the same call the key and the button make
+		panels.set_mode(&mut world, false);
 		world.editing = false;
+		for _ in 0..3 {
+			frame(&mut panels, &mut world);
+		}
+		// the game moves something, every step it runs
+		shift(&mut world, ball, Vec3::new(0.0, 9.0, 0.0));
+		frame(&mut panels, &mut world);
+		assert_eq!(panels.history.undoable(), Some("hang"), "and nothing is written down");
+
+		// stopping puts the world back, which the runner does; the editor
+		// sees the mode change on the frame after. The clock is not put
+		// back with it, because it never stopped: a step runs in either
+		// mode and only the simulation is skipped.
+		shift(&mut world, ball, Vec3::Y);
+		world.time += 4.0;
+		world.steps += 240;
+		world.editing = true;
 		frame(&mut panels, &mut world);
 
-		assert_eq!(panels.history.undoable(), None, "the game owns the world now");
+		assert_eq!(
+			panels.history.undoable(),
+			Some("hang"),
+			"a play that changed nothing is not a step, and the record before it stands"
+		);
+	}
+
+	#[test]
+	fn a_play_whose_world_is_kept_is_one_step_to_go_back_over() {
+		let (mut world, mut panels, ball) = hung();
+
+		panels.set_mode(&mut world, false);
+		world.editing = false;
+		frame(&mut panels, &mut world);
+		// the game drops it, and the stop keeps where it landed
+		shift(&mut world, ball, Vec3::new(0.0, -4.0, 0.0));
+		frame(&mut panels, &mut world);
+		world.editing = true;
+		frame(&mut panels, &mut world);
+
+		assert_eq!(panels.history.undoable(), Some("play"), "the whole play is one step");
+
+		panels.apply(&mut world, Change::Undo);
+		let back = panels
+			.restore
+			.take()
+			.expect("a world to put back");
+		let ball = back
+			.things
+			.iter()
+			.find(|thing| thing.transform.position.y > 0.0)
+			.expect("the world before the play, with the ball where it was");
+
+		assert!((ball.transform.position.y - 1.0).abs() < 1.0e-5, "at {ball:?}");
+		assert_eq!(panels.history.undoable(), Some("hang"), "and the edit before it is next");
+	}
+
+	#[test]
+	fn a_play_nobody_wrote_down_leaves_the_records_alone() {
+		let (mut world, mut panels, ball) = hung();
+
+		// a typed `sim.edit 0` rather than the key or the button: nothing
+		// held a record open, so there is nothing to close
+		world.editing = false;
+		frame(&mut panels, &mut world);
+		shift(&mut world, ball, Vec3::new(0.0, -4.0, 0.0));
+		world.editing = true;
+		frame(&mut panels, &mut world);
+
+		assert_eq!(panels.history.undoable(), Some("hang"));
 	}
 }

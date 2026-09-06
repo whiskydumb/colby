@@ -239,6 +239,14 @@ pub(crate) fn install(world: &mut World) {
 		Value::Bool(false),
 		"edit the world instead of playing it; stopping puts back what play started from",
 	);
+	// saved, unlike the mode beside it: which mode a session opens in is that
+	// session's business, and whether a stop keeps what the game did is a way
+	// of working that somebody settles on once.
+	world.cvars.saved(
+		crate::mode::KEEP,
+		Value::Bool(false),
+		"keep what the game did when play stops, instead of putting the world back",
+	);
 
 	world.cvars.var(
 		crate::app::GRAVITY,

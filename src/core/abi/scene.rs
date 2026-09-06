@@ -645,6 +645,34 @@ impl SceneData {
 		self.things.is_empty() && self.solids.is_empty() && self.links.is_empty()
 	}
 
+	/// Whether these are the same world, the clock aside.
+	///
+	/// [`Stage::time`] and [`Stage::steps`] advance in every step, and a step
+	/// runs while a world is being edited as well as while it is played - the
+	/// mode stops the *simulation* and nothing else. So two descriptions of a
+	/// world nobody touched, taken a frame apart, differ in those two numbers
+	/// and in nothing else, and anything asking "did this come to anything"
+	/// has to ask it this way or answer yes every time.
+	///
+	/// The clock is still part of a description and is still put back by a
+	/// restore, which is what keeps a restored world's animations where they
+	/// were. This is about what counts as a change, not about what is kept.
+	///
+	/// One clone of the other world, which is the same order of work as the
+	/// capture whoever is asking has just taken, and it is written this way so
+	/// that a field added to a world is compared without anybody remembering
+	/// to add it here.
+	///
+	/// @param other - the world to compare against
+	#[must_use]
+	pub fn same_world(&self, other: &Self) -> bool {
+		let mut theirs = other.clone();
+		theirs.stage.time = self.stage.time;
+		theirs.stage.steps = self.stage.steps;
+
+		*self == theirs
+	}
+
 	/// Which bodies are held to this one, directly or through others.
 	///
 	/// The joints are a graph and this is its connected component: a body, what
@@ -2300,6 +2328,31 @@ mod tests {
 		let id = world.bodies.spawn(body);
 		world.bodies.set_name(id, name);
 		world
+	}
+
+	#[test]
+	fn two_descriptions_of_a_world_nobody_touched_are_the_same_world() {
+		let mut world = World::new();
+		let thing = world.entities.spawn_at(Transform::at(Vec3::Y));
+		world.entities.set_name(thing, "crate");
+		let first = capture(&world);
+
+		// a few steps go by in which nothing is written: the clock runs
+		// while a world is edited as well as while it is played
+		world.time += 2.5;
+		world.steps += 150;
+		let second = capture(&world);
+
+		assert_ne!(first, second, "the two are not equal, because the clock moved");
+		assert!(first.same_world(&second), "but they are the same world");
+		assert!(second.same_world(&first), "either way round");
+
+		// and something that did move is not
+		if let Some(transform) = world.entities.transform_mut(thing) {
+			transform.position = Vec3::X;
+		}
+
+		assert!(!first.same_world(&capture(&world)), "a thing that moved is a change");
 	}
 
 	#[test]

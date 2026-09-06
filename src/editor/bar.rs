@@ -10,7 +10,7 @@
 use colby_core::abi::World;
 use egui::{Align, Button, Layout, RichText, TextEdit, Ui};
 
-use crate::{Change, gizmo::Tool};
+use crate::{Change, KEEP, gizmo::Tool};
 
 /// The strip's own state.
 #[derive(Debug, Default)]
@@ -90,7 +90,13 @@ fn mode(ui: &mut Ui, world: &World, changes: &mut Vec<Change>) {
 			changes.push(Change::Edit(true));
 		}
 
-		ui.label("playing; stopping puts the world back");
+		// which of the two a stop is about to do, read fresh: it is a
+		// variable and it can be turned while the game is running
+		ui.label(if world.cvars.bool(KEEP).unwrap_or(false) {
+			"playing; stopping keeps this world"
+		} else {
+			"playing; stopping puts the world back"
+		});
 	}
 }
 

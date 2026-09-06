@@ -21,6 +21,14 @@
 //! the solver is told to forget everything it derived, because a step run
 //! against a stale contact cache is a step mixing two worlds.
 //!
+//! **Unless `sim.keep` says otherwise.** With it on, stopping keeps the world
+//! the game left and throws away the description of the one before it: what
+//! the simulation did is what you wanted. Nothing is replaced in that case,
+//! so the solver keeps the caches it built rather than forgetting them, and
+//! a build with an editor in it has written the same moment down as one step
+//! to go back over. Off by default, because the useful thing about play in an
+//! editor is that it costs nothing.
+//!
 //! **The first stop is the exception, and it is deliberate.** The process
 //! starts playing, so the first time somebody presses F5 there is no captured
 //! world to go back to. What happens then is nothing: the world being played
@@ -47,6 +55,9 @@ use colby_physics::Simulation;
 /// The variable that decides whether the game is running.
 pub(crate) const EDIT: &str = "sim.edit";
 
+/// The variable that decides whether stopping keeps what the game did.
+pub(crate) const KEEP: &str = "sim.keep";
+
 /// What the variable says right now.
 ///
 /// A world whose console never registered it - a test, a screenshot - is being
@@ -54,6 +65,16 @@ pub(crate) const EDIT: &str = "sim.edit";
 ///
 /// @param world - where the variable lives
 pub(crate) fn wanted(world: &World) -> bool { world.cvars.bool(EDIT).unwrap_or(false) }
+
+/// Whether a stop keeps the world the game left.
+///
+/// Off by default, because the useful thing about play in an editor is that
+/// it costs nothing: a world you played is the world you had. Turning it on
+/// is for the other case - dropping a pile of crates, letting them settle,
+/// and wanting where they settled.
+///
+/// @param world - where the variable lives
+pub(crate) fn kept(world: &World) -> bool { world.cvars.bool(KEEP).unwrap_or(false) }
 
 /// Asks for the other mode.
 ///
@@ -172,6 +193,25 @@ impl Mode {
 
 			return;
 		};
+
+		if kept(world) {
+			// the world the game left is the world, and the description of
+			// the one before it goes. Nothing is replaced, so the solver's
+			// caches are of the world it is still looking at and there is
+			// nothing to forget; a build with an editor in it has written
+			// the same moment down as a step to go back over, @ref the
+			// editor's history, and one without an editor has not, which is
+			// what asking for this means there.
+			drop(before);
+
+			info!(
+				entities = world.entities.len(),
+				bodies = world.bodies.len(),
+				"editing; what the game did is kept, because sim.keep is on"
+			);
+
+			return;
+		}
 
 		match scene::restore(world, &before) {
 			| Ok(put) => {
@@ -305,6 +345,75 @@ mod tests {
 			"stopping put back the world play started from, not the one play left"
 		);
 		assert_eq!(world.entities.name(entity), "crate", "names and all");
+	}
+
+	#[test]
+	fn a_stop_with_sim_keep_on_keeps_the_world_the_game_left() {
+		let mut world = falling();
+		world
+			.cvars
+			.saved(KEEP, colby_core::abi::cvar::Value::Bool(true), "");
+		let mut simulation = Simulation::new();
+		let mut mode = Mode::new();
+		mode.follow(&mut world, &mut simulation, true);
+		let entity = world
+			.entities
+			.iter()
+			.next()
+			.map(|(id, ..)| id)
+			.unwrap_or_default();
+		if let Some(transform) = world.entities.transform_mut(entity) {
+			transform.position = Vec3::new(3.0, 4.0, 5.0);
+		}
+
+		// play, the game moves it, and the stop keeps where it got to
+		mode.follow(&mut world, &mut simulation, false);
+		if let Some(transform) = world.entities.transform_mut(entity) {
+			transform.position = Vec3::ZERO;
+		}
+		mode.follow(&mut world, &mut simulation, true);
+
+		assert_eq!(
+			world
+				.entities
+				.transform(entity)
+				.map(|it| it.position),
+			Some(Vec3::ZERO),
+			"the world the game left is the world"
+		);
+		assert!(mode.before.is_none(), "and the one it started from is gone rather than held");
+	}
+
+	#[test]
+	fn a_world_whose_console_never_registered_sim_keep_is_put_back() {
+		let mut world = falling();
+		let mut simulation = Simulation::new();
+		let mut mode = Mode::new();
+		mode.follow(&mut world, &mut simulation, true);
+		let entity = world
+			.entities
+			.iter()
+			.next()
+			.map(|(id, ..)| id)
+			.unwrap_or_default();
+		if let Some(transform) = world.entities.transform_mut(entity) {
+			transform.position = Vec3::X;
+		}
+
+		mode.follow(&mut world, &mut simulation, false);
+		if let Some(transform) = world.entities.transform_mut(entity) {
+			transform.position = Vec3::ZERO;
+		}
+		mode.follow(&mut world, &mut simulation, true);
+
+		assert_eq!(
+			world
+				.entities
+				.transform(entity)
+				.map(|it| it.position),
+			Some(Vec3::X),
+			"a screenshot or a test keeps the behavior it always had"
+		);
 	}
 
 	#[test]

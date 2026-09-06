@@ -1181,8 +1181,17 @@ impl App {
 			// under the same feature as F1, and for the same reason: play and
 			// stop is a tool's gesture. A build with no editor in it still has
 			// the variable, and nothing in it presses this.
+			//
+			// Through the editor rather than straight at the variable, so the
+			// key and the button on the bar are one path and the world before
+			// play is written down once; before the editor exists - the
+			// launcher, a world still coming up - there is nothing to write
+			// it down and the variable is all there is.
 			#[cfg(feature = "editor")]
-			| NamedKey::F5 => crate::mode::toggle(&mut self.runtime.world),
+			| NamedKey::F5 => match self.editor.as_mut() {
+				| Some(editor) => editor.play(&mut self.runtime.world),
+				| None => crate::mode::toggle(&mut self.runtime.world),
+			},
 			| _ => {},
 		}
 	}

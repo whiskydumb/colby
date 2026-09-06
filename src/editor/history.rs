@@ -27,17 +27,27 @@
 //! [`Frame`](crate::Frame) - and the frame loop does what a stopped play
 //! does, restore and forget, in the one place that already does it.
 //!
-//! **While the world is played, nothing is recorded**: the game writes the
-//! world every step, and a record of a world it has since rewritten is a
-//! record of nothing. The records that exist are dropped when play starts,
-//! because the world that comes back when play stops is the one play started
-//! from and the records were made against the one before that - which may be
-//! the same world, and may not, and a stack that is sometimes wrong is worse
-//! than an empty one.
+//! **While the world is played, nothing is recorded** by a panel: the game
+//! writes the world every step, and a record of a world it has since
+//! rewritten is a record of nothing. [`History::begin`] refuses while a world
+//! is played, which is the whole of that rule.
+//!
+//! **The play itself is one record**, and the one thing here that is not a
+//! gesture. [`History::hold`] opens it as play starts and
+//! [`History::release`] closes it as play stops, whatever the thousands of
+//! frames in between do; a stop that puts the world back closes it with the
+//! world it opened with, so nothing is written down, and a stop that keeps
+//! what the game did leaves exactly one step to go back over. The records
+//! made before the play are kept either way: the first case leaves the world
+//! they were made against, and the second leaves a record of the difference
+//! standing in front of them.
 
-use colby_core::abi::{
-	World,
-	scene::{self, SceneData},
+use colby_core::{
+	abi::{
+		World,
+		scene::{self, SceneData},
+	},
+	trace,
 };
 
 /// How many records are kept before the oldest is dropped.
@@ -83,6 +93,10 @@ pub(crate) struct History {
 	/// open across the frames of a drag.
 	written: bool,
 
+	/// Whether the open record is a play rather than a gesture, and is
+	/// therefore kept open until whoever started it says otherwise.
+	holding: bool,
+
 	/// How many records are kept.
 	limit: usize,
 }
@@ -101,6 +115,7 @@ impl History {
 			done: 0,
 			open: None,
 			written: false,
+			holding: false,
 			limit,
 		}
 	}
@@ -131,6 +146,58 @@ impl History {
 		}
 	}
 
+	/// Opens a record that outlasts the frame, and the frames after it.
+	///
+	/// A gesture is over when nobody writes to it, @ref
+	/// [`settle`](Self::settle), which is the right rule for a drag and the
+	/// wrong one for a play: a game running is thousands of frames in which
+	/// the editor writes nothing. This opens a record and holds it open until
+	/// [`release`](Self::release), whatever happens in between.
+	///
+	/// The world is not asked whether it is being edited. What this is for is
+	/// the moment before it stops being edited, and a caller who has reached
+	/// for it means it.
+	///
+	/// @param label - what the stretch is, for the button that undoes it
+	/// @param world - the world as it stands, which is what an undo goes
+	/// back to
+	pub(crate) fn hold(&mut self, label: &str, world: &World) {
+		// a held record already open is not replaced: two starts without a
+		// stop between them would otherwise throw away the older world, which
+		// is the one worth going back to
+		if self.holding {
+			return;
+		}
+
+		self.close(world);
+		self.holding = true;
+		self.open = Some(Open {
+			label: label.to_owned(),
+			before: Box::new(scene::capture(world)),
+		});
+	}
+
+	/// Ends a held record.
+	///
+	/// @param world - the world as it stands, which is what the record ends
+	/// with
+	/// @return whether it came to anything: a play that left the world as it
+	/// found it - which is what a stop that puts the world back does - is not
+	/// a step to go back over
+	pub(crate) fn release(&mut self, world: &World) -> bool {
+		if !self.holding {
+			return false;
+		}
+
+		self.holding = false;
+		self.written = false;
+
+		self.close(world)
+	}
+
+	/// Whether a stretch is being held open.
+	pub(crate) const fn holding(&self) -> bool { self.holding }
+
 	/// Ends the frame: a gesture nobody wrote to this frame is over.
 	///
 	/// Called once a frame by the editor, after every panel has drawn, which
@@ -142,7 +209,9 @@ impl History {
 	pub(crate) fn settle(&mut self, world: &World) -> bool {
 		let written = std::mem::take(&mut self.written);
 
-		if written {
+		// a play is not a gesture and does not end because a frame went by
+		// without a panel writing to the world
+		if written || self.holding {
 			return false;
 		}
 
@@ -159,9 +228,27 @@ impl History {
 		};
 
 		let after = scene::capture(world);
-		if after == *open.before {
+
+		// the clock aside, @ref `SceneData::same_world`: `time` and `steps`
+		// advance in every step and a step runs while a world is edited as
+		// well as while it is played, so a plain comparison calls every
+		// gesture a change and every play a step to go back over - which is
+		// exactly what it did until a window was driven and said so.
+		if open.before.same_world(&after) {
 			return false;
 		}
+
+		// which part moved, for the next time that question comes up
+		trace!(
+			label = open.label,
+			stage = after.stage == open.before.stage,
+			things = after.things == open.before.things,
+			solids = after.solids == open.before.solids,
+			links = after.links == open.before.links,
+			posed = after.posed == open.before.posed,
+			arena = after.arena == open.before.arena,
+			"a record is being written down"
+		);
 
 		// whatever had been undone is gone: a new thing was done instead of
 		// it, and there is no second timeline to keep.
@@ -228,14 +315,6 @@ impl History {
 			.map(|record| record.label.as_str())
 	}
 
-	/// Drops everything: the records and the gesture in progress.
-	pub(crate) fn clear(&mut self) {
-		self.records.clear();
-		self.done = 0;
-		self.open = None;
-		self.written = false;
-	}
-
 	/// How many records there are, undone ones included.
 	#[cfg(test)]
 	pub(crate) fn len(&self) -> usize { self.records.len() }
@@ -275,6 +354,128 @@ mod tests {
 		if let Some(transform) = world.entities.transform_mut(id) {
 			transform.position = to;
 		}
+	}
+
+	#[test]
+	fn a_held_record_outlasts_every_frame_that_writes_nothing_to_it() {
+		let (mut world, id) = edited();
+		let mut history = History::default();
+
+		history.hold("play", &world);
+		// a thousand frames of a game running, in which no panel writes
+		for _ in 0..5 {
+			assert!(!history.settle(&world), "a settle does not end a play");
+			assert!(history.holding());
+		}
+
+		// the game moved it, and the stop kept where it got to
+		if let Some(transform) = world.entities.transform_mut(id) {
+			transform.position = Vec3::X * 7.0;
+		}
+
+		assert!(history.release(&world), "the play is a step to go back over");
+		assert!(!history.holding());
+		assert_eq!(history.undoable(), Some("play"));
+		assert_eq!(
+			history
+				.undo(&world)
+				.expect("the world before it")
+				.things[0]
+				.transform
+				.position,
+			Vec3::Y,
+			"back to where the play started"
+		);
+	}
+
+	#[test]
+	fn a_play_that_ends_where_it_began_is_not_a_step() {
+		let (mut world, _) = edited();
+		let mut history = History::default();
+
+		history.hold("play", &world);
+		// the clock runs while a world is edited as well as while it is
+		// played, so a play that changed nothing still ends at a later
+		// second than it began. A window said so before this test did.
+		world.time += 4.5;
+		world.steps += 270;
+
+		assert!(!history.release(&world), "a stop that put the world back changed nothing");
+		assert_eq!(history.len(), 0);
+		assert!(!history.release(&world), "and releasing again is nothing at all");
+	}
+
+	#[test]
+	fn a_gesture_that_left_the_world_as_it_found_it_is_not_a_step_either() {
+		let (mut world, id) = edited();
+		let mut history = History::default();
+
+		// a drag that went nowhere: the writer wrote, and wrote the same
+		// value, over frames in which the clock kept going
+		for _ in 0..3 {
+			shove(&mut history, &mut world, id, Vec3::Y);
+			world.time += 0.016;
+			world.steps += 1;
+		}
+		history.settle(&world);
+		history.settle(&world);
+
+		assert_eq!(history.len(), 0, "nothing moved, so there is nothing to go back over");
+	}
+
+	#[test]
+	fn a_play_does_not_throw_away_what_was_done_before_it() {
+		let (mut world, id) = edited();
+		let mut history = History::default();
+		shove(&mut history, &mut world, id, Vec3::X);
+		history.settle(&world);
+		history.settle(&world);
+		assert_eq!(history.len(), 1);
+
+		history.hold("play", &world);
+		if let Some(transform) = world.entities.transform_mut(id) {
+			transform.position = Vec3::Z;
+		}
+		assert!(history.release(&world));
+
+		assert_eq!(history.len(), 2, "the play stands in front of the move");
+		assert_eq!(history.undoable(), Some("play"));
+	}
+
+	#[test]
+	fn a_second_hold_without_a_release_keeps_the_older_world() {
+		let (mut world, id) = edited();
+		let mut history = History::default();
+
+		history.hold("play", &world);
+		if let Some(transform) = world.entities.transform_mut(id) {
+			transform.position = Vec3::X;
+		}
+		history.hold("play", &world);
+		if let Some(transform) = world.entities.transform_mut(id) {
+			transform.position = Vec3::Z;
+		}
+		assert!(history.release(&world));
+
+		assert_eq!(
+			history.undo(&world).expect("a world").things[0]
+				.transform
+				.position,
+			Vec3::Y,
+			"the world the first hold saw, not the second"
+		);
+	}
+
+	#[test]
+	fn a_gesture_open_when_a_play_starts_is_closed_first() {
+		let (mut world, id) = edited();
+		let mut history = History::default();
+		shove(&mut history, &mut world, id, Vec3::X);
+
+		history.hold("play", &world);
+
+		assert_eq!(history.len(), 1, "the move became a record of its own");
+		assert_eq!(history.undoable(), Some("move"));
 	}
 
 	#[test]
@@ -403,23 +604,6 @@ mod tests {
 			.expect("the gesture so far is a record");
 		assert_eq!(back.things[0].transform.position, Vec3::Y, "back to before it");
 		assert_eq!(history.len(), 1);
-	}
-
-	#[test]
-	fn clearing_drops_the_records_and_the_gesture() {
-		let (mut world, id) = edited();
-		let mut history = History::default();
-
-		shove(&mut history, &mut world, id, Vec3::X);
-		history.settle(&world);
-		history.settle(&world);
-		shove(&mut history, &mut world, id, Vec3::Z);
-		history.clear();
-		history.settle(&world);
-		history.settle(&world);
-
-		assert_eq!(history.len(), 0);
-		assert!(history.undo(&world).is_none());
 	}
 
 	#[test]
