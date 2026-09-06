@@ -1912,6 +1912,72 @@ f 1 4 5
 	}
 
 	#[test]
+	fn nothing_glows_until_something_asks_it_to() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		// a small bright thing on a dark ground, which is the shape bloom is
+		// for and the shape it is easiest to be wrong about.
+		let mut world = looking_world();
+		world.post = Post::DEFAULT;
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+		world.post.tonemap = ToneMap::None;
+		world.ambient = Vec3::splat(6.0);
+		world.light = Vec3::Z;
+
+		let lump = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(0.7),
+		});
+		world
+			.entities
+			.set_renderable(lump, Renderable::new(MeshId::CUBE, rgb(1.0, 1.0, 1.0)));
+
+		// a point well clear of the lump, where only a glow could reach
+		let beside = (SIZE.0 / 2 + 40, SIZE.1 / 2);
+		let dark = capture.shoot(&mut world).expect("it renders");
+
+		world.post.bloom = 1.0;
+		let glowing = capture.shoot(&mut world).expect("it renders");
+
+		let before = u32::from(dark.pixel(beside.0, beside.1)[1]);
+		let after = u32::from(glowing.pixel(beside.0, beside.1)[1]);
+
+		assert!(before < 40, "beside the lump is dark to begin with: {before}");
+		assert!(after > before + 10, "and a glow reaches it: {after} against {before}");
+	}
+
+	#[test]
+	fn a_threshold_decides_what_is_bright_enough_to_glow() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		// a wall at about half, so that the reading has room to move up before
+		// it clips and the test is measuring the threshold rather than a clamp
+		let mut world = glowing(0.5);
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+		world.post.tonemap = ToneMap::None;
+
+		let plain = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.bloom = 1.0;
+		world.post.bloom_threshold = 0.1;
+		let low = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.bloom_threshold = 40.0;
+		let high = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		assert!(plain > 0 && plain < 255, "the wall alone is neither black nor white: {plain}");
+		assert!(low > plain, "a wall past the threshold glows: {low} against {plain}");
+		assert_eq!(high, plain, "and a threshold nothing reaches adds nothing at all");
+	}
+
+	#[test]
 	fn a_world_with_no_sky_shows_the_clear_color_behind_it() {
 		let Some((_gpu, mut capture)) = capture() else {
 			return;

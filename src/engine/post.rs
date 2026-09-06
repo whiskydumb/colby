@@ -27,15 +27,15 @@ use colby_core::{
 };
 use wgpu::{
 	AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
-	BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, BlendState,
-	Buffer, BufferBindingType, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites,
-	CommandEncoder, Device, ErrorFilter, Extent3d, FilterMode, FragmentState, LoadOp,
-	MultisampleState, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor,
-	PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-	RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
-	ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TextureDescriptor,
-	TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
-	TextureViewDescriptor, TextureViewDimension, VertexState,
+	BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType,
+	BlendComponent, BlendFactor, BlendOperation, BlendState, Buffer, BufferBindingType,
+	BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites, CommandEncoder, Device,
+	ErrorFilter, Extent3d, FilterMode, FragmentState, LoadOp, MultisampleState, Operations,
+	PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, Queue,
+	RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
+	Sampler, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
+	ShaderStages, StoreOp, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+	TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
 /// The format the world is drawn into.
@@ -52,6 +52,16 @@ pub(crate) const HDR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 /// precision at the ends of a range no scene reaches, and filterable without
 /// asking the device for a feature.
 const METER_FORMAT: TextureFormat = TextureFormat::R16Float;
+
+/// How many rungs the bloom chain may have.
+///
+/// Six halvings from half a picture reaches a couple of hundredths of its
+/// width, which is as wide as a glow ever needs to spread. More rungs cost
+/// more passes and buy a halo nobody asked for.
+const GLOW_RUNGS: usize = 6;
+
+/// How small a bloom rung may get before another one is not worth a pass.
+const GLOW_SMALLEST: u32 = 8;
 
 /// How wide the first rung of the ladder is.
 ///
@@ -72,6 +82,9 @@ struct Tuning {
 	/// `[the key the meter aims for, the smallest exposure, the largest, how
 	/// far the eye moves this frame]`.
 	meter: [f32; 4],
+
+	/// `[how much is added back, the threshold, the knee under it, unused]`.
+	bloom: [f32; 4],
 }
 
 /// One rung of the ladder: a target, and the way to read it.
@@ -90,6 +103,15 @@ pub(crate) struct Chain {
 
 	/// The ladder, widest first, ending at one texel.
 	rungs: Vec<Rung>,
+
+	/// The bloom chain, widest first at half the target and halving down.
+	///
+	/// Empty when the target is too small to halve at all, which is a
+	/// thumbnail rather than a window and wants no glow anyway.
+	glow: Vec<Rung>,
+
+	/// The way the composite reads the widest rung of it.
+	glow_read: BindGroup,
 
 	/// Where the eye is, and where it is about to be.
 	///
@@ -113,6 +135,9 @@ pub(crate) struct Chain {
 	luminance: RenderPipeline,
 	halve: RenderPipeline,
 	adapt: RenderPipeline,
+	threshold: RenderPipeline,
+	down: RenderPipeline,
+	up: RenderPipeline,
 	composite: RenderPipeline,
 	size: (u32, u32),
 }
@@ -169,35 +194,8 @@ impl Chain {
 			source: ShaderSource::Wgsl(source.into()),
 		});
 
-		// each pipeline declares exactly the groups its entry point reads, and
-		// the holes are why the list is of options: a pipeline layout is what a
-		// pipeline *requires*, so declaring a group it ignores would mean the
-		// pass could not draw until something irrelevant had been bound.
-		let luminance = screen_pipeline(
-			device,
-			&module,
-			"post luminance",
-			"fragment_luminance",
-			METER_FORMAT,
-			&[None, Some(&texture_layout)],
-		);
-		let halve =
-			screen_pipeline(device, &module, "post halve", "fragment_halve", METER_FORMAT, &[
-				None,
-				Some(&texture_layout),
-			]);
-		let adapt =
-			screen_pipeline(device, &module, "post adapt", "fragment_adapt", METER_FORMAT, &[
-				Some(&numbers_layout),
-				Some(&texture_layout),
-				Some(&eye_layout),
-			]);
-		let composite =
-			screen_pipeline(device, &module, "post composite", "fragment_composite", format, &[
-				Some(&numbers_layout),
-				Some(&texture_layout),
-				Some(&eye_layout),
-			]);
+		let built =
+			pipelines(device, &module, format, [&numbers_layout, &texture_layout, &eye_layout]);
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
 			return Err(err!(Graphics("the post-processing pipelines: {complaint}")));
@@ -209,11 +207,15 @@ impl Chain {
 		];
 		let rungs = ladder(device, &sampler, &texture_layout);
 		let (target, target_read) = colors(device, &sampler, &texture_layout, width, height);
+		let glow = chain(device, &sampler, &texture_layout, width, height);
+		let glow_read = widest(device, &sampler, &texture_layout, &glow, &target);
 
 		Ok(Self {
 			target,
 			target_read,
 			rungs,
+			glow,
+			glow_read,
 			eyes,
 			eye: 0,
 			adapted: false,
@@ -221,10 +223,13 @@ impl Chain {
 			numbers,
 			sampler,
 			texture_layout,
-			luminance,
-			halve,
-			adapt,
-			composite,
+			luminance: built.0,
+			halve: built.1,
+			adapt: built.2,
+			threshold: built.3,
+			down: built.4,
+			up: built.5,
+			composite: built.6,
 			size: (width, height),
 		})
 	}
@@ -246,6 +251,9 @@ impl Chain {
 
 		self.target = target;
 		self.target_read = read;
+		self.glow = chain(device, &self.sampler, &self.texture_layout, width, height);
+		self.glow_read =
+			widest(device, &self.sampler, &self.texture_layout, &self.glow, &self.target);
 		self.size = (width, height);
 	}
 
@@ -275,6 +283,10 @@ impl Chain {
 			self.measure(encoder);
 		}
 
+		if post.is_blooming() {
+			self.gather(encoder);
+		}
+
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
 			label: Some("post composite"),
 			color_attachments: &[Some(RenderPassColorAttachment {
@@ -299,7 +311,42 @@ impl Chain {
 		pass.set_bind_group(0, &self.numbers, &[]);
 		pass.set_bind_group(1, &self.target_read, &[]);
 		pass.set_bind_group(2, &self.eyes[self.eye].read, &[]);
+		pass.set_bind_group(3, &self.glow_read, &[]);
 		pass.draw(0..3, 0..1);
+	}
+
+	/// The bloom chain: what is bright, spread wide.
+	///
+	/// Down the chain thresholding once and halving after, then back up
+	/// adding each rung into the one under it. The widest rung is what the
+	/// composite reads, and it holds every rung above it by the time this
+	/// returns.
+	fn gather(&self, encoder: &mut CommandEncoder) {
+		for (step, rung) in self.glow.iter().enumerate() {
+			let (pipeline, source) = if step == 0 {
+				(&self.threshold, &self.target_read)
+			} else {
+				(&self.down, &self.glow[step - 1].read)
+			};
+
+			screen_pass(encoder, "post glow down", &rung.view, |pass| {
+				pass.set_pipeline(pipeline);
+				pass.set_bind_group(0, &self.numbers, &[]);
+				pass.set_bind_group(1, source, &[]);
+			});
+		}
+
+		// and back, narrowest first, each into the wider one under it. The
+		// pass loads rather than clears, because what is already in a rung is
+		// its own half of the answer.
+		for step in (1..self.glow.len()).rev() {
+			let source = &self.glow[step].read;
+
+			over_pass(encoder, "post glow up", &self.glow[step - 1].view, |pass| {
+				pass.set_pipeline(&self.up);
+				pass.set_bind_group(1, source, &[]);
+			});
+		}
 	}
 
 	/// The ladder and the eye, for a frame that measures.
@@ -334,6 +381,70 @@ impl Chain {
 		self.eye = after;
 		self.adapted = true;
 	}
+}
+
+/// The seven pipelines, all against one shader module.
+///
+/// A tuple rather than a struct because the caller unpacks it into fields
+/// straight away and a struct of seven pipelines would be named twice for
+/// nothing. In the order the frame runs them.
+fn pipelines(
+	device: &Device,
+	module: &wgpu::ShaderModule,
+	format: TextureFormat,
+	[numbers, texture, eye]: [&BindGroupLayout; 3],
+) -> (
+	RenderPipeline,
+	RenderPipeline,
+	RenderPipeline,
+	RenderPipeline,
+	RenderPipeline,
+	RenderPipeline,
+	RenderPipeline,
+) {
+	// each pipeline declares exactly the groups its entry point reads, and
+	// the holes are why the list is of options: a pipeline layout is what a
+	// pipeline *requires*, so declaring a group it ignores would mean the
+	// pass could not draw until something irrelevant had been bound.
+	let luminance =
+		screen_pipeline(device, module, "post luminance", "fragment_luminance", METER_FORMAT, &[
+			None,
+			Some(texture),
+		]);
+	let halve = screen_pipeline(device, module, "post halve", "fragment_halve", METER_FORMAT, &[
+		None,
+		Some(texture),
+	]);
+	let adapt = screen_pipeline(device, module, "post adapt", "fragment_adapt", METER_FORMAT, &[
+		Some(numbers),
+		Some(texture),
+		Some(eye),
+	]);
+	let threshold =
+		screen_pipeline(device, module, "post threshold", "fragment_threshold", HDR_FORMAT, &[
+			Some(numbers),
+			Some(texture),
+		]);
+	let down = screen_pipeline(device, module, "post down", "fragment_down", HDR_FORMAT, &[
+		None,
+		Some(texture),
+	]);
+	// the one pass here that blends rather than replaces: a rung is written
+	// on the way up over what it already held on the way down, so the
+	// widest one ends up carrying everything above it.
+	let up = adding_pipeline(device, module, "post up", "fragment_up", HDR_FORMAT, &[
+		None,
+		Some(texture),
+	]);
+	let composite =
+		screen_pipeline(device, module, "post composite", "fragment_composite", format, &[
+			Some(numbers),
+			Some(texture),
+			Some(eye),
+			Some(texture),
+		]);
+
+	(luminance, halve, adapt, threshold, down, up, composite)
 }
 
 /// The three ways a pass here is handed something: the numbers, a texture
@@ -414,6 +525,15 @@ fn tuning_of(post: Post, moving: f32) -> Tuning {
 			post.exposure_max,
 			moving,
 		],
+		bloom: [
+			post.bloom.max(0.0),
+			post.bloom_threshold.max(0.0),
+			// half the threshold, which is the band the soft edge spans. A
+			// number of its own would be a thirteenth field on a record that
+			// already has twelve, for a knob nobody has asked to turn.
+			post.bloom_threshold.max(0.0) * 0.5,
+			0.0,
+		],
 	}
 }
 
@@ -451,6 +571,69 @@ fn colors(
 	let read = sampled(device, sampler, layout, &view, "hdr");
 
 	(view, read)
+}
+
+/// The bloom chain: half the target, halving until it is too small to be worth
+/// another pass.
+///
+/// Six at most and none at all below sixteen pixels. The widest rung is half
+/// the target rather than the whole of it, which halves the bandwidth of every
+/// pass and costs nothing anybody can see: a glow is by definition the part of
+/// a picture with no detail in it.
+fn chain(
+	device: &Device,
+	sampler: &Sampler,
+	layout: &BindGroupLayout,
+	width: u32,
+	height: u32,
+) -> Vec<Rung> {
+	let mut rungs = Vec::new();
+	let (mut wide, mut tall) = (width / 2, height / 2);
+
+	while rungs.len() < GLOW_RUNGS && wide.min(tall) >= GLOW_SMALLEST {
+		let texture = device.create_texture(&TextureDescriptor {
+			label: Some("post glow"),
+			size: Extent3d {
+				width: wide,
+				height: tall,
+				depth_or_array_layers: 1,
+			},
+			mip_level_count: 1,
+			sample_count: 1,
+			dimension: TextureDimension::D2,
+			format: HDR_FORMAT,
+			usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+			view_formats: &[],
+		});
+		let view = texture.create_view(&TextureViewDescriptor::default());
+		let read = sampled(device, sampler, layout, &view, "post glow");
+
+		rungs.push(Rung { view, read });
+		wide /= 2;
+		tall /= 2;
+	}
+
+	rungs
+}
+
+/// The way the composite reads the chain, or the target when there is none.
+///
+/// A pipeline requires every group its layout names, so the composite has to
+/// be handed *something* at group three even in a frame with no bloom in it.
+/// The target itself is the honest something: it is the right size and the
+/// right format, and nothing samples it, because the shader skips the tap when
+/// the intensity is nought.
+fn widest(
+	device: &Device,
+	sampler: &Sampler,
+	layout: &BindGroupLayout,
+	glow: &[Rung],
+	target: &TextureView,
+) -> BindGroup {
+	glow.first().map_or_else(
+		|| sampled(device, sampler, layout, target, "post glow stand-in"),
+		|rung| sampled(device, sampler, layout, &rung.view, "post glow"),
+	)
 }
 
 /// Every rung, widest first, ending at one texel.
@@ -567,6 +750,63 @@ where
 	pass.draw(0..3, 0..1);
 }
 
+/// One pass over a target that keeps what is already in it.
+///
+/// The upsample's, and the only one here that loads: a rung on the way up is
+/// written over its own half of the answer rather than instead of it.
+fn over_pass<F>(encoder: &mut CommandEncoder, label: &str, view: &TextureView, setup: F)
+where
+	F: FnOnce(&mut wgpu::RenderPass<'_>),
+{
+	let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+		label: Some(label),
+		color_attachments: &[Some(RenderPassColorAttachment {
+			view,
+			depth_slice: None,
+			resolve_target: None,
+			ops: Operations {
+				load: LoadOp::Load,
+				store: StoreOp::Store,
+			},
+		})],
+		depth_stencil_attachment: None,
+		timestamp_writes: None,
+		occlusion_query_set: None,
+		multiview_mask: None,
+	});
+
+	setup(&mut pass);
+	pass.draw(0..3, 0..1);
+}
+
+/// The same as [`screen_pipeline`], with the fragment added to the target
+/// rather than replacing it.
+fn adding_pipeline(
+	device: &Device,
+	module: &wgpu::ShaderModule,
+	label: &str,
+	entry: &str,
+	format: TextureFormat,
+	groups: &[Option<&BindGroupLayout>],
+) -> RenderPipeline {
+	built(
+		device,
+		module,
+		label,
+		entry,
+		format,
+		groups,
+		Some(BlendState {
+			color: BlendComponent {
+				src_factor: BlendFactor::One,
+				dst_factor: BlendFactor::One,
+				operation: BlendOperation::Add,
+			},
+			alpha: BlendComponent::REPLACE,
+		}),
+	)
+}
+
 /// One pipeline over the full-screen triangle, with no vertex buffers and no
 /// depth.
 fn screen_pipeline(
@@ -576,6 +816,19 @@ fn screen_pipeline(
 	entry: &str,
 	format: TextureFormat,
 	groups: &[Option<&BindGroupLayout>],
+) -> RenderPipeline {
+	built(device, module, label, entry, format, groups, Some(BlendState::REPLACE))
+}
+
+/// Everything both of them do, with the blend as the one difference.
+fn built(
+	device: &Device,
+	module: &wgpu::ShaderModule,
+	label: &str,
+	entry: &str,
+	format: TextureFormat,
+	groups: &[Option<&BindGroupLayout>],
+	blend: Option<BlendState>,
 ) -> RenderPipeline {
 	let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
 		label: Some(label),
@@ -601,7 +854,7 @@ fn screen_pipeline(
 			compilation_options: PipelineCompilationOptions::default(),
 			targets: &[Some(ColorTargetState {
 				format,
-				blend: Some(BlendState::REPLACE),
+				blend,
 				write_mask: ColorWrites::ALL,
 			})],
 		}),

@@ -18,9 +18,12 @@
 // x is the key the meter aims for, which is middle grey moved by the bias in
 // stops; y and z are the smallest and largest exposure a measurement may ask
 // for; w is how far towards a new measurement this frame moves the eye.
+// x is how much of the bright pass is added back; y is how bright a pixel has
+// to be to be in it; z is the width of the knee under that; w is unused.
 struct Tuning {
     curve: vec4<f32>,
     meter: vec4<f32>,
+    bloom: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> tuning: Tuning;
@@ -31,6 +34,11 @@ struct Tuning {
 // The eye as it was at the end of the last frame, one texel of log luminance.
 // Bound by the two passes that have an opinion about it and by nothing else.
 @group(2) @binding(0) var eye: texture_2d<f32>;
+
+// The widest rung of the bloom chain, which is everything the chain gathered.
+// Bound by the composite alone, and only when there is any bloom to add.
+@group(3) @binding(0) var bloom: texture_2d<f32>;
+@group(3) @binding(1) var bloom_sampler: sampler;
 
 struct ScreenOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -124,6 +132,90 @@ fn fragment_adapt(input: ScreenOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(mix(before, measured, tuning.meter.w), 0.0, 0.0, 1.0);
 }
 
+// What is bright enough to bloom, with a soft edge under the threshold.
+//
+// A hard cut is what makes bloom flicker: a pixel wandering either side of the
+// line appears and disappears whole, and a highlight moving across a wall
+// crawls. The knee is a quadratic that eases the contribution in over a band
+// below the threshold, which is what Godot and Unity both do and costs four
+// lines.
+@fragment
+fn fragment_threshold(input: ScreenOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(source, source_sampler, input.uv).rgb;
+    let bright = max(color.r, max(color.g, color.b));
+    let threshold = tuning.bloom.y;
+    let knee = max(tuning.bloom.z, 0.0001);
+
+    let soft = clamp(bright - threshold + knee, 0.0, 2.0 * knee);
+    let eased = soft * soft / (4.0 * knee);
+    let taken = max(eased, bright - threshold) / max(bright, 0.0001);
+
+    return vec4<f32>(color * taken, 1.0);
+}
+
+// The same picture at half the width and half the height, in thirteen taps.
+//
+// A plain four-tap box at half size aliases badly on a highlight one pixel
+// wide, and a single bright pixel that appears and vanishes between frames is
+// exactly what a bloom chain must not do. The thirteen are four overlapping
+// two-by-two groups and a fifth in the middle carrying half the weight, which
+// is the filter Jimenez wrote for Call of Duty and everybody ships.
+@fragment
+fn fragment_down(input: ScreenOutput) -> @location(0) vec4<f32> {
+    let t = 1.0 / vec2<f32>(textureDimensions(source, 0));
+    let uv = input.uv;
+
+    let a = textureSample(source, source_sampler, uv + vec2<f32>(-2.0, -2.0) * t).rgb;
+    let b = textureSample(source, source_sampler, uv + vec2<f32>(0.0, -2.0) * t).rgb;
+    let c = textureSample(source, source_sampler, uv + vec2<f32>(2.0, -2.0) * t).rgb;
+    let d = textureSample(source, source_sampler, uv + vec2<f32>(-2.0, 0.0) * t).rgb;
+    let e = textureSample(source, source_sampler, uv).rgb;
+    let f = textureSample(source, source_sampler, uv + vec2<f32>(2.0, 0.0) * t).rgb;
+    let g = textureSample(source, source_sampler, uv + vec2<f32>(-2.0, 2.0) * t).rgb;
+    let h = textureSample(source, source_sampler, uv + vec2<f32>(0.0, 2.0) * t).rgb;
+    let i = textureSample(source, source_sampler, uv + vec2<f32>(2.0, 2.0) * t).rgb;
+
+    let j = textureSample(source, source_sampler, uv + vec2<f32>(-1.0, -1.0) * t).rgb;
+    let k = textureSample(source, source_sampler, uv + vec2<f32>(1.0, -1.0) * t).rgb;
+    let l = textureSample(source, source_sampler, uv + vec2<f32>(-1.0, 1.0) * t).rgb;
+    let m = textureSample(source, source_sampler, uv + vec2<f32>(1.0, 1.0) * t).rgb;
+
+    var total = (j + k + l + m) * 0.5;
+    total += (a + b + d + e) * 0.125;
+    total += (b + c + e + f) * 0.125;
+    total += (d + e + g + h) * 0.125;
+    total += (e + f + h + i) * 0.125;
+
+    return vec4<f32>(total * 0.25, 1.0);
+}
+
+// One rung of the chain spread back over the wider one under it.
+//
+// A three-by-three tent, and the pass it runs in blends by adding, so a rung
+// ends up holding its own light plus everything gathered above it. Widening
+// happens here rather than at the downsample because this is the pass that
+// runs once per rung on the way back down - which is what turns eight halvings
+// into one wide glow instead of eight rings.
+@fragment
+fn fragment_up(input: ScreenOutput) -> @location(0) vec4<f32> {
+    let t = 1.0 / vec2<f32>(textureDimensions(source, 0));
+    let uv = input.uv;
+
+    var total = textureSample(source, source_sampler, uv).rgb * 4.0;
+
+    total += textureSample(source, source_sampler, uv + vec2<f32>(0.0, -1.0) * t).rgb * 2.0;
+    total += textureSample(source, source_sampler, uv + vec2<f32>(-1.0, 0.0) * t).rgb * 2.0;
+    total += textureSample(source, source_sampler, uv + vec2<f32>(1.0, 0.0) * t).rgb * 2.0;
+    total += textureSample(source, source_sampler, uv + vec2<f32>(0.0, 1.0) * t).rgb * 2.0;
+
+    total += textureSample(source, source_sampler, uv + vec2<f32>(-1.0, -1.0) * t).rgb;
+    total += textureSample(source, source_sampler, uv + vec2<f32>(1.0, -1.0) * t).rgb;
+    total += textureSample(source, source_sampler, uv + vec2<f32>(-1.0, 1.0) * t).rgb;
+    total += textureSample(source, source_sampler, uv + vec2<f32>(1.0, 1.0) * t).rgb;
+
+    return vec4<f32>(total / 16.0, 1.0);
+}
+
 // `c / (1 + c)`, scaled so that the white point reaches one.
 //
 // The cheapest curve that is a curve. Nothing desaturates and no hue shifts,
@@ -160,7 +252,16 @@ fn aces(color: vec3<f32>) -> vec3<f32> {
 // that produced it.
 @fragment
 fn fragment_composite(input: ScreenOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(source, source_sampler, input.uv).rgb;
+    var color = textureSample(source, source_sampler, input.uv).rgb;
+
+    // added before the exposure and the curve, not after: what glows is part
+    // of the picture, so it is metered with the rest of it and rolls off the
+    // same shoulder. Adding it afterwards would put light on the screen that
+    // no exposure could stop down.
+    if (tuning.bloom.x > 0.0) {
+        color += textureSample(bloom, bloom_sampler, input.uv).rgb * tuning.bloom.x;
+    }
+
     var exposure = tuning.curve.z;
 
     if (tuning.curve.w > 0.5) {
