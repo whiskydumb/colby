@@ -46,6 +46,7 @@ pub mod registry;
 pub mod scene;
 pub mod script;
 pub mod skeleton;
+pub mod sky;
 pub mod state;
 pub mod texture;
 pub mod ui;
@@ -90,6 +91,7 @@ pub use self::{
 	skeleton::{
 		Bone, MAX_BONES, NO_PARENT, Skeleton, SkeletonData, SkeletonId, Skeletons, rests,
 	},
+	sky::{Sky, SkyKind},
 	state::{GameState, Players},
 	texture::{Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},
@@ -100,7 +102,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 54;
+pub const ABI_VERSION: u32 = 55;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -298,7 +300,22 @@ pub struct World {
 	pub camera: Camera,
 
 	/// The window clear color, linear RGB. Game-written.
+	///
+	/// What the target is wiped to before anything is drawn. A world with a
+	/// [`sky`](Self::sky) covers every pixel of it afterwards, so this then
+	/// shows nowhere at all - it is still the honest thing to clear to,
+	/// because a frame whose sky pipeline is not there yet has to look like
+	/// something.
 	pub clear: Vec3,
+
+	/// What is drawn behind everything, or nothing at all. Game-written.
+	///
+	/// Beside [`clear`](Self::clear), [`light`](Self::light) and
+	/// [`ambient`](Self::ambient) and for the same reason: it is a property of
+	/// the world rather than of anything standing in it. @ref
+	/// [`sky`](crate::abi::sky), which says why turning it on changes what is
+	/// behind the world and nothing about what lights it.
+	pub sky: Sky,
 
 	/// The direction the light travels, in world space. Game-written.
 	///
@@ -576,6 +593,7 @@ impl World {
 			asked: Vec::new(),
 			camera: Camera::DEFAULT,
 			clear: Vec3::ZERO,
+			sky: Sky::NONE,
 			light: Vec3::new(-0.4, -1.0, -0.3),
 			ambient: Vec3::splat(0.25),
 			gravity: Vec3::new(0.0, -9.81, 0.0),

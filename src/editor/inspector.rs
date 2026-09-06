@@ -20,8 +20,9 @@
 
 use colby_core::{
 	abi::{
-		Body, BodyId, EntityId, Field, Joint, JointId, Light, Renderable, Transform, World,
+		Body, BodyId, EntityId, Field, Joint, JointId, Light, Renderable, Sky, Transform, World,
 		field::{Kind, Value},
+		scene::{self, Stage},
 	},
 	glam::{EulerRot, Quat, Vec3},
 };
@@ -75,7 +76,9 @@ pub(crate) fn show(
 fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History, rename: bool) {
 	match pick {
 		| Pick::Nothing => {
-			ui.label("nothing selected");
+			ui.label("nothing selected, so this is the world itself");
+			ui.separator();
+			settings(ui, world, history);
 		},
 		| Pick::Entity(id) => {
 			naming(ui, world, pick, history, rename);
@@ -179,6 +182,28 @@ fn look(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 	if inspect(ui, "renderable", &mut renderable, Renderable::FIELDS) {
 		history.begin("tint", world);
 		world.entities.set_renderable(id, renderable);
+	}
+}
+
+/// The world's own settings, shown when nothing in it is.
+///
+/// **Where an environment lives when there is no node to hang it on.** Godot
+/// puts one on a `WorldEnvironment` and Unreal on a volume; colby has neither,
+/// and the honest place for "the clear color, the sun, the ambient, the
+/// gravity and the sky" is the panel that is otherwise empty. It is also the
+/// first thing "nothing selected" has ever said that is worth reading.
+///
+/// The camera and the clock are in the record and are deliberately not
+/// written back. @ref `colby_core::abi::scene::set_settings`.
+fn settings(ui: &mut Ui, world: &mut World, history: &mut History) {
+	let mut stage = scene::settings(world);
+	let mut moved = inspect(ui, "world", &mut stage, Stage::FIELDS);
+
+	moved |= inspect(ui, "sky", &mut stage.sky, Sky::FIELDS);
+
+	if moved {
+		history.begin("world", world);
+		scene::set_settings(world, stage);
 	}
 }
 
@@ -476,5 +501,77 @@ mod tests {
 			),
 			"and a tint through the picker"
 		);
+		assert!(
+			!untouched(&Light::spot(Vec3::new(1.0, 0.9, 0.7), 3.0, 8.0, 0.2, 0.5), Light::FIELDS),
+			"and a lamp, its word and its two angles included"
+		);
+		assert!(
+			!untouched(
+				&Sky::gradient(
+					Vec3::new(0.1, 0.2, 0.5),
+					Vec3::new(0.6, 0.7, 0.8),
+					Vec3::new(0.1, 0.1, 0.1)
+				),
+				Sky::FIELDS
+			),
+			"and a sky"
+		);
+	}
+
+	#[test]
+	fn the_world_itself_is_what_the_panel_shows_when_nothing_in_it_is() {
+		let context = Context::default();
+		let mut world = World::new();
+		world.sky = Sky::day();
+		world.clear = Vec3::new(0.3, 0.4, 0.5);
+		let mut history = History::default();
+		let was = scene::settings(&world);
+
+		let mut output = context.run_ui(RawInput::default(), |ui| {
+			detail(ui, &mut world, Pick::Nothing, &mut history, false);
+		});
+		output.textures_delta.clear();
+
+		assert_eq!(
+			scene::settings(&world),
+			was,
+			"a frame nobody touched writes nothing back to the world"
+		);
+		assert_eq!(history.undoable(), None, "and nothing is written down either");
+	}
+
+	#[test]
+	fn the_settings_a_panel_writes_back_are_the_ones_its_table_names() {
+		// the pairing `set_settings` is documented with: everything in
+		// `Stage::FIELDS` has to survive the trip, and the camera and the
+		// clock have to be left exactly where they were.
+		let mut world = World::new();
+		world.camera.position = Vec3::new(9.0, 9.0, 9.0);
+		world.time = 42.0;
+		world.steps = 700;
+
+		let mut stage = scene::settings(&world);
+		stage.clear = Vec3::new(0.1, 0.2, 0.3);
+		stage.sky = Sky::day();
+		stage.light = Vec3::new(1.0, -2.0, 3.0);
+		stage.ambient = Vec3::splat(0.4);
+		stage.gravity = Vec3::new(0.0, -3.0, 0.0);
+		stage.camera.position = Vec3::ZERO;
+		stage.time = 0.0;
+
+		scene::set_settings(&mut world, stage);
+
+		assert_eq!(world.clear, stage.clear, "the clear color went in");
+		assert_eq!(world.sky, stage.sky, "and the sky");
+		assert_eq!(world.light, stage.light, "and the sun");
+		assert_eq!(world.ambient, stage.ambient, "and the ambient");
+		assert_eq!(world.gravity, stage.gravity, "and the gravity");
+		assert_eq!(
+			world.camera.position,
+			Vec3::new(9.0, 9.0, 9.0),
+			"and the camera was left where whoever is flying it put it"
+		);
+		assert!((world.time - 42.0).abs() < 1.0e-6, "and the clock was not moved");
+		assert_eq!(world.steps, 700, "in either half");
 	}
 }

@@ -48,7 +48,8 @@ use std::path::Path;
 use colby_core::{
 	Result,
 	abi::{
-		BodyKind, Camera, JointKind, Layers, Light, LightKind, ShapeKind, Transform,
+		BodyKind, Camera, JointKind, Layers, Light, LightKind, ShapeKind, Sky, SkyKind,
+		Transform,
 		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
@@ -70,7 +71,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// agreed.
 ///
 /// Six since an entity record says what it hangs off.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -294,9 +295,32 @@ pub struct Setting {
 	/// Simulated seconds so far.
 	pub time: f32,
 
-	/// Spare, and the reason this record has no padding in it.
+	/// Which sky is drawn, as [`SkyKind`](colby_core::abi::SkyKind) in
+	/// declaration order.
+	pub sky_kind: u32,
+
+	/// The color straight up, linear RGB.
+	pub sky_zenith: [f32; 3],
+
+	/// The color at eye level.
+	pub sky_horizon: [f32; 3],
+
+	/// The color straight down.
+	pub sky_ground: [f32; 3],
+
+	/// Spare, and the reason this record has no padding in it: the eight-byte
+	/// `steps` at the top makes the record eight-aligned, so its length has to
+	/// be a multiple of eight and the fields before this add up to four short.
 	pub reserved: u32,
 }
+
+// a record with padding in it is not `Pod`, so this would already have failed
+// to compile - but it would have failed pointing at the derive rather than at
+// the reason, and the reason is worth having written down where the fields are.
+const _: () = assert!(
+	size_of::<Setting>().is_multiple_of(align_of::<Setting>()),
+	"a settings record has to be a whole number of its own alignment"
+);
 
 /// One entity standing somewhere, looking like something.
 #[repr(C)]
@@ -975,6 +999,10 @@ const EMPTY_SETTING: Setting = Setting {
 	ambient: [0.0; 3],
 	gravity: [0.0; 3],
 	time: 0.0,
+	sky_kind: 0,
+	sky_zenith: [0.0; 3],
+	sky_horizon: [0.0; 3],
+	sky_ground: [0.0; 3],
 	reserved: 0,
 };
 
@@ -1356,6 +1384,10 @@ fn setting_of(stage: Stage) -> Setting {
 		ambient: stage.ambient.to_array(),
 		gravity: stage.gravity.to_array(),
 		time: stage.time,
+		sky_kind: stage.sky.kind.index(),
+		sky_zenith: stage.sky.zenith.to_array(),
+		sky_horizon: stage.sky.horizon.to_array(),
+		sky_ground: stage.sky.ground.to_array(),
 		reserved: 0,
 	}
 }
@@ -1372,6 +1404,14 @@ fn stage_of(setting: Setting) -> Stage {
 			far: setting.far,
 		},
 		clear: Vec3::from_array(setting.clear),
+		// a kind this build does not know reads as no sky, for the reason a
+		// light of an unknown kind reads as no light. @ref `light_of`.
+		sky: Sky {
+			kind: SkyKind::at(setting.sky_kind).unwrap_or(SkyKind::None),
+			zenith: Vec3::from_array(setting.sky_zenith),
+			horizon: Vec3::from_array(setting.sky_horizon),
+			ground: Vec3::from_array(setting.sky_ground),
+		},
 		light: Vec3::from_array(setting.light),
 		ambient: Vec3::from_array(setting.ambient),
 		gravity: Vec3::from_array(setting.gravity),
@@ -1876,6 +1916,13 @@ mod tests {
 					far: 300.0,
 				},
 				clear: Vec3::new(0.1, 0.2, 0.3),
+				// drawn, and three colors none of which is a default, so the
+				// round trip carries something it could lose
+				sky: Sky::gradient(
+					Vec3::new(0.05, 0.15, 0.45),
+					Vec3::new(0.60, 0.70, 0.85),
+					Vec3::new(0.08, 0.07, 0.06),
+				),
 				light: Vec3::new(-0.4, -1.0, -0.3),
 				ambient: Vec3::splat(0.25),
 				gravity: Vec3::new(0.0, -9.81, 0.0),
@@ -2119,6 +2166,31 @@ mod tests {
 		SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
 			.expect("a changed word is not a broken file")
 			.to_scene_data()
+	}
+
+	#[test]
+	fn a_sky_of_a_kind_this_build_does_not_know_reads_as_no_sky() {
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let at = usize::try_from(header.setting_offset).expect("it is an offset")
+			+ offset_of!(Setting, sky_kind);
+
+		bytes[at..at + 4].copy_from_slice(&9_u32.to_le_bytes());
+
+		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a changed word is not a broken file")
+			.to_scene_data();
+
+		assert_eq!(
+			read.stage.sky.kind,
+			SkyKind::None,
+			"a word off the end of the list is nothing rather than a refusal"
+		);
+		assert_eq!(
+			read.stage.sky.zenith, data.stage.sky.zenith,
+			"and the colors beside it are still read"
+		);
 	}
 
 	#[test]

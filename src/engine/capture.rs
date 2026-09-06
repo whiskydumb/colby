@@ -302,8 +302,8 @@ pub const fn rgb(red: f32, green: f32, blue: f32) -> Vec3 { Vec3::new(red, green
 mod tests {
 	use colby_core::{
 		abi::{
-			Material, MeshData, MeshId, Pose, PoseId, Renderable, SkinVertex, Texel, TextureData,
-			Transform,
+			Material, MeshData, MeshId, Pose, PoseId, Renderable, SkinVertex, Sky, SkyKind,
+			Texel, TextureData, Transform,
 			cvar::Value,
 			material::{Blend, MaterialId},
 			mesh,
@@ -1683,6 +1683,101 @@ f 1 4 5
 		}
 
 		world
+	}
+
+	/// A world with a sky of three flat, unmistakable colors.
+	///
+	/// Not a plausible sky: red up, green across, blue down, so that which
+	/// band a pixel came out of is one comparison rather than an argument
+	/// about a gradient.
+	fn skied_world() -> World {
+		let mut world = looking_world();
+		world.clear = rgb(0.0, 0.0, 0.0);
+		world.sky = Sky::gradient(rgb(1.0, 0.0, 0.0), rgb(0.0, 1.0, 0.0), rgb(0.0, 0.0, 1.0));
+
+		world
+	}
+
+	#[test]
+	fn a_world_with_no_sky_shows_the_clear_color_behind_it() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		let mut world = skied_world();
+		world.sky.kind = SkyKind::None;
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert_eq!(
+			image.pixel(SIZE.0 / 2, SIZE.1 / 2),
+			[0, 0, 0, 255],
+			"the word is what decides it, and the three colors are still on the record"
+		);
+	}
+
+	#[test]
+	fn a_sky_turned_on_is_the_three_colors_in_the_three_directions() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		let mut world = skied_world();
+		// looking at the origin from +z, so the middle row is the horizon, the
+		// top of the picture is up and the bottom is down
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert_eq!(
+			dominant(image.pixel(SIZE.0 / 2, 2)),
+			0,
+			"the top of the picture is the zenith"
+		);
+		assert_eq!(dominant(image.pixel(SIZE.0 / 2, SIZE.1 / 2)), 1, "the middle is the horizon");
+		assert_eq!(
+			dominant(image.pixel(SIZE.0 / 2, SIZE.1 - 3)),
+			2,
+			"and the bottom is the ground"
+		);
+	}
+
+	#[test]
+	fn a_sky_is_behind_the_world_rather_than_over_it() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		// the whole point of the depth test on the sky's pipeline: a cube in
+		// front of the camera has to survive it. Without the test, or with the
+		// sky drawn after the blended pass, this is a screen of sky.
+		let mut world = skied_world();
+		world.ambient = Vec3::splat(1.0);
+		let cube = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(2.0),
+		});
+		world
+			.entities
+			.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.9, 0.9)));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let middle = image.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert!(
+			middle[0] > 150 && middle[1] > 150 && middle[2] > 150,
+			"the cube is in front of the sky and is white: {middle:?}"
+		);
+		assert_eq!(
+			dominant(image.pixel(SIZE.0 / 2, 2)),
+			0,
+			"and the sky is still there where the cube is not"
+		);
 	}
 
 	#[test]

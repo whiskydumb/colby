@@ -29,6 +29,9 @@
 
 struct Globals {
     view_projection: mat4x4<f32>,
+    // Clip space back into the world, for the sky, which is the one thing
+    // drawn here that starts from a pixel and asks which way it is looking.
+    inverse_view_projection: mat4x4<f32>,
     // xyz is the direction the light travels; w is unused.
     light: vec4<f32>,
     // rgb is how lit a surface facing away from the light still is.
@@ -46,6 +49,12 @@ struct Globals {
     // x is one texel in map coordinates, y is unused, z is whether shadows are
     // on at all, w is whether to color every pixel by the cascade it read.
     shadow: vec4<f32>,
+    // rgb is the color straight up; w is whether a sky is drawn at all.
+    sky_zenith: vec4<f32>,
+    // rgb is the color at eye level; w is unused.
+    sky_horizon: vec4<f32>,
+    // rgb is the color straight down; w is unused.
+    sky_ground: vec4<f32>,
     // x is how many of the lamps below are real; the rest is unused.
     counts: vec4<u32>,
     // The local lights, nearest first. Everything from `counts.x` up is
@@ -606,4 +615,70 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
     }
 
     return color;
+}
+
+// The sky: a full-screen triangle at the far plane, shaded by which way each
+// pixel is looking.
+//
+// **A triangle rather than a quad, and no vertex buffer at all.** Three
+// vertices covering the screen have no seam down the middle for the rasterizer
+// to sample twice, and the positions are arithmetic on the vertex index, so the
+// draw is `draw(0..3)` with nothing bound.
+//
+// z is one, which is the far plane under wgpu's zero-to-one depth range. The
+// pipeline tests depth with `less-equal` and writes none, so the sky survives
+// exactly where the cleared depth is still one - every pixel no wall covered -
+// and is thrown away everywhere else before it is shaded.
+struct SkyOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    // Where this corner is in clip space, carried through so the fragment
+    // stage can unproject it. The builtin position is in pixels by then.
+    @location(0) ndc: vec2<f32>,
+};
+
+@vertex
+fn vertex_sky(@builtin(vertex_index) index: u32) -> SkyOutput {
+    // (-1,-1), (3,-1), (-1,3): a triangle whose middle is the screen.
+    let x = f32(i32(index) / 2) * 4.0 - 1.0;
+    let y = f32(i32(index) & 1) * 4.0 - 1.0;
+
+    var output: SkyOutput;
+    output.clip_position = vec4<f32>(x, y, 1.0, 1.0);
+    output.ndc = vec2<f32>(x, y);
+
+    return output;
+}
+
+@fragment
+fn fragment_sky(input: SkyOutput) -> @location(0) vec4<f32> {
+    // the ray through this pixel: the near plane and the far plane unprojected,
+    // and the direction between them. Doing it per pixel rather than
+    // interpolating three corner rays is what keeps it right under a wide field
+    // of view, where the corners and the middle disagree.
+    let near = globals.inverse_view_projection * vec4<f32>(input.ndc, 0.0, 1.0);
+    let far = globals.inverse_view_projection * vec4<f32>(input.ndc, 1.0, 1.0);
+    let way = normalize(far.xyz / far.w - near.xyz / near.w);
+
+    return vec4<f32>(sky_color(way), 1.0);
+}
+
+// The gradient in one direction.
+//
+// Two halves meeting at the horizon, each eased so that the band at eye level
+// is a band rather than a line: a linear ramp from the zenith straight to the
+// ground puts all of its change at the poles and none where anybody is looking.
+// The square is what Godot's `sky_curve` and `ground_curve` are for, fixed here
+// at the value that reads as a sky rather than left as a number to tune.
+fn sky_color(way: vec3<f32>) -> vec3<f32> {
+    let up = clamp(way.y, -1.0, 1.0);
+
+    if (up >= 0.0) {
+        let t = 1.0 - (1.0 - up) * (1.0 - up);
+
+        return mix(globals.sky_horizon.rgb, globals.sky_zenith.rgb, t);
+    }
+
+    let t = 1.0 - (1.0 + up) * (1.0 + up);
+
+    return mix(globals.sky_horizon.rgb, globals.sky_ground.rgb, t);
 }

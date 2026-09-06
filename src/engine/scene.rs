@@ -226,6 +226,8 @@ impl Lamp {
 #[bytemuck(crate = "::colby_core::bytemuck")]
 struct Globals {
 	view_projection: [[f32; 4]; 4],
+	/// Clip space back into the world, for the sky.
+	inverse_view_projection: [[f32; 4]; 4],
 	light: [f32; 4],
 	ambient: [f32; 4],
 	/// xyz is where the camera is; w is unused. Needed by anything that depends
@@ -243,6 +245,15 @@ struct Globals {
 	cascade_texels: [f32; CASCADES],
 	/// `[one texel in map coordinates, unused, shadows on, tint by cascade]`.
 	shadow: [f32; 4],
+
+	/// `[r, g, b, whether a sky is drawn]` straight up.
+	sky_zenith: [f32; 4],
+
+	/// `[r, g, b, unused]` at eye level.
+	sky_horizon: [f32; 4],
+
+	/// `[r, g, b, unused]` straight down.
+	sky_ground: [f32; 4],
 
 	/// `[how many lamps are real, unused, unused, unused]`.
 	counts: [u32; 4],
@@ -442,6 +453,14 @@ struct Batch {
 /// time a mode is added.
 struct Pipelines {
 	entries: [RenderPipeline; Blend::COUNT * 2],
+	/// The one that draws what is behind the world.
+	///
+	/// Not in the table, because it is not a point on the table's two axes: it
+	/// reads no vertex buffer, no material and no bone, and the whole of what
+	/// it has in common with the six is the source file and the globals. In
+	/// the same struct all the same, so that a shader edit rebuilds all seven
+	/// together or none of them.
+	sky: RenderPipeline,
 }
 
 impl Pipelines {
@@ -470,6 +489,7 @@ impl Pipelines {
 				compile_pipeline(device, format, layouts, source, Blend::Alpha, false)?,
 				compile_pipeline(device, format, layouts, source, Blend::Alpha, true)?,
 			],
+			sky: compile_sky(device, format, layouts, source)?,
 		})
 	}
 
@@ -536,6 +556,12 @@ pub struct Scene {
 	/// Every lit entity with how far its reach is from the eye, kept so it
 	/// allocates once. @ref [`Scene::lamps`].
 	lit: Vec<(f32, Lamp)>,
+	/// Whether this frame draws a sky behind the world.
+	///
+	/// Read off the world once in [`Scene::upload`] rather than again in the
+	/// pass, for the reason the shadow flag is: what the frame does and what
+	/// its uniform says have to be the same answer.
+	sky: bool,
 }
 
 impl Scene {
@@ -638,6 +664,7 @@ impl Scene {
 			blended: Vec::new(),
 			order: Vec::with_capacity(MAX_ENTITIES),
 			lit: Vec::with_capacity(MAX_LAMPS),
+			sky: false,
 		})
 	}
 
@@ -756,6 +783,17 @@ impl Scene {
 		pass.set_vertex_buffer(1, self.instances.slice(..));
 
 		self.draw(&mut pass, &self.batches);
+
+		// after everything opaque and before everything else. Every pixel a
+		// wall covered is thrown away by the depth test before it is shaded,
+		// which is why this is here rather than in front of the batches; and
+		// it is before the lines and the blended pass because both of those
+		// composite with what is already in the target, and what is behind
+		// them has to be there first.
+		if self.sky {
+			pass.set_pipeline(&self.pipelines.sky);
+			pass.draw(0..3, 0..1);
+		}
 
 		// then, into the same pass and therefore against the same depth buffer:
 		// whether a debug line is hidden by a wall is the most useful thing it
@@ -991,14 +1029,15 @@ impl Scene {
 		}
 
 		let (lamps, count) = self.lamps(world, camera.position);
+		let projection = camera.view_projection(world.aspect);
+		self.sky = world.sky.is_drawn();
 
 		self.queue.write_buffer(
 			&self.globals,
 			0,
 			bytemuck::bytes_of(&Globals {
-				view_projection: camera
-					.view_projection(world.aspect)
-					.to_cols_array_2d(),
+				view_projection: projection.to_cols_array_2d(),
+				inverse_view_projection: projection.inverse().to_cols_array_2d(),
 				light: world.light.extend(0.0).to_array(),
 				ambient: world.ambient.extend(0.0).to_array(),
 				eye: camera.position.extend(1.0).to_array(),
@@ -1019,6 +1058,13 @@ impl Scene {
 						0.0
 					},
 				],
+				sky_zenith: world
+					.sky
+					.zenith
+					.extend(if self.sky { 1.0 } else { 0.0 })
+					.to_array(),
+				sky_horizon: world.sky.horizon.extend(0.0).to_array(),
+				sky_ground: world.sky.ground.extend(0.0).to_array(),
 				counts: [count, 0, 0, 0],
 				lamps,
 			}),
@@ -1779,6 +1825,105 @@ fn compile_pipeline(
 	}
 }
 
+/// Builds the sky's pipeline, and reports whether wgpu liked it.
+///
+/// The same arguments and the same error scope as [`compile_pipeline`]; what
+/// differs is the whole of what a sky is. @ref [`build_sky`].
+fn compile_sky(
+	device: &Device,
+	format: TextureFormat,
+	layouts: &[&BindGroupLayout],
+	source: &str,
+) -> Result<RenderPipeline> {
+	let scope = device.push_error_scope(ErrorFilter::Validation);
+	let pipeline = build_sky(device, format, layouts, source);
+
+	match pollster::block_on(scope.pop()) {
+		| Some(complaint) => Err(err!(Graphics("{complaint}"))),
+		| None => Ok(pipeline),
+	}
+}
+
+/// The pipeline that draws what is behind the world.
+///
+/// Three things about it are the whole design and each is deliberate.
+///
+/// **No vertex buffers.** The triangle is arithmetic on the vertex index, so
+/// the draw is three vertices and nothing bound. @ref `vertex_sky`.
+///
+/// **The depth test on and the depth write off, comparing less-or-equal.** The
+/// sky is emitted at the far plane, which is what the depth buffer was cleared
+/// to, so it passes exactly where nothing was drawn and is discarded - before
+/// the fragment stage - everywhere a wall already wrote a nearer depth. Writing
+/// depth would achieve nothing and would stop the blended pass behind it.
+///
+/// **The globals and nothing else in its layout.** A pipeline layout is what a
+/// pipeline *requires*, not what it may ignore, so declaring the scene's four
+/// groups would mean the sky could not be drawn until a material had been
+/// bound - and group one is bound per batch, so an empty world would refuse the
+/// draw. That is a wgpu validation error rather than a black screen, and the
+/// rendered test found it.
+fn build_sky(
+	device: &Device,
+	format: TextureFormat,
+	layouts: &[&BindGroupLayout],
+	source: &str,
+) -> RenderPipeline {
+	let shader = device.create_shader_module(ShaderModuleDescriptor {
+		label: Some("sky"),
+		source: ShaderSource::Wgsl(source.into()),
+	});
+
+	let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+		label: Some("sky"),
+		bind_group_layouts: &[layouts.first().copied()],
+		immediate_size: 0,
+	});
+
+	device.create_render_pipeline(&RenderPipelineDescriptor {
+		label: Some("sky"),
+		layout: Some(&layout),
+		vertex: VertexState {
+			module: &shader,
+			entry_point: Some("vertex_sky"),
+			compilation_options: PipelineCompilationOptions::default(),
+			buffers: &[],
+		},
+		primitive: PrimitiveState {
+			topology: PrimitiveTopology::TriangleList,
+			strip_index_format: None,
+			front_face: FrontFace::Ccw,
+			// nothing: the triangle's winding depends on which corners the
+			// index arithmetic lands on, and a sky culled by accident is a
+			// black screen with no error anywhere.
+			cull_mode: None,
+			unclipped_depth: false,
+			polygon_mode: PolygonMode::Fill,
+			conservative: false,
+		},
+		depth_stencil: Some(DepthStencilState {
+			format: DEPTH_FORMAT,
+			depth_write_enabled: Some(false),
+			depth_compare: Some(CompareFunction::LessEqual),
+			stencil: StencilState::default(),
+			bias: DepthBiasState::default(),
+		}),
+		multisample: MultisampleState::default(),
+		fragment: Some(FragmentState {
+			module: &shader,
+			entry_point: Some("fragment_sky"),
+			compilation_options: PipelineCompilationOptions::default(),
+			targets: &[Some(ColorTargetState {
+				format,
+				blend: Some(BlendState::REPLACE),
+				write_mask: ColorWrites::ALL,
+			})],
+		}),
+		multiview_mask: None,
+		cache: None,
+	})
+}
+
 /// What one of the table's pipelines is called in a graphics debugger.
 ///
 /// Written out rather than formatted, because a label is borrowed for the
@@ -2043,8 +2188,8 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 		// vectors rather than a struct of named floats.
 		assert!(size_of::<Lamp>().is_multiple_of(16), "and a uniform array's stride is not it");
 		assert!(
-			size_of::<Globals>() == 448 + size_of::<Lamp>() * MAX_LAMPS,
-			"the camera, the light, the cascades, the counts and the lamps"
+			size_of::<Globals>() == 560 + size_of::<Lamp>() * MAX_LAMPS,
+			"the two camera matrices, the light, the cascades, the sky, the counts and the lamps"
 		);
 		assert!(size_of::<Globals>().is_multiple_of(16), "and a uniform struct has to be");
 		// lines.wgsl declares only the first field of this struct and reads

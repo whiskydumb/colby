@@ -77,7 +77,7 @@ use colby_core::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Field, Joint, JointKind, Layers, Light, MeshId,
-		Renderable, Shape, Transform,
+		Renderable, Shape, Sky, Transform,
 		field::{self, Kind},
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
@@ -199,7 +199,7 @@ fn stage(value: Option<&Value>) -> Result<Stage> {
 		return Ok(Stage::DEFAULT);
 	};
 
-	check(value, &[names(Stage::FIELDS, &[])], &["camera"], "a stage")?;
+	check(value, &[names(Stage::FIELDS, &[])], &["camera", "sky"], "a stage")?;
 
 	let mut stage = Stage::DEFAULT;
 	read(&mut stage, value, Stage::FIELDS, "a stage")?;
@@ -207,6 +207,15 @@ fn stage(value: Option<&Value>) -> Result<Stage> {
 	if let Some(lens) = value.get("camera") {
 		check(lens, &[names(Camera::FIELDS, &[])], &[], "a camera")?;
 		read(&mut stage.camera, lens, Camera::FIELDS, "a camera")?;
+	}
+
+	// nested beside the camera, and for the reason a light on an entity is:
+	// a sky has a `ground` and a `horizon`, and a flat namespace shared with
+	// `clear`, `light` and `ambient` reads as four colors nobody can tell
+	// apart. It is also a record of its own in the world.
+	if let Some(above) = value.get("sky") {
+		check(above, &[names(Sky::FIELDS, &[])], &[], "a sky")?;
+		read(&mut stage.sky, above, Sky::FIELDS, "a sky")?;
 	}
 
 	Ok(stage)
@@ -977,6 +986,18 @@ fn stage_of(stage: &Stage) -> Result<Option<String>> {
 		},
 		|_| None,
 	)?;
+	put_all(
+		&mut rows,
+		&stage.sky,
+		&Sky::NONE,
+		Sky::FIELDS,
+		&Writing {
+			prefix: "sky.",
+			what: "the sky",
+			skipped: &[],
+		},
+		|_| None,
+	)?;
 
 	if rows.is_empty() {
 		return Ok(None);
@@ -1427,7 +1448,7 @@ fn as_text(value: &str) -> String { json::quoted(value) }
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{LightKind, ShapeKind, scene::Form};
+	use colby_core::abi::{LightKind, ShapeKind, SkyKind, scene::Form};
 
 	use super::*;
 
@@ -2397,6 +2418,53 @@ mod tests {
 	}
 
 	#[test]
+	fn a_sky_is_read_out_of_its_own_object_and_written_back_into_one() {
+		let scene = import(
+			r#"{ "stage": {
+				"clear": [0.5, 0.5, 0.5],
+				"sky": { "kind": "gradient", "zenith": [0, 0, 1],
+					"horizon": [0, 1, 0], "ground": [1, 0, 0] }
+			} }"#,
+		)
+		.expect("it is a scene");
+
+		assert_eq!(scene.stage.sky.kind, SkyKind::Gradient, "the word is the kind");
+		assert_eq!(scene.stage.sky.zenith, Vec3::Z, "up");
+		assert_eq!(scene.stage.sky.horizon, Vec3::Y, "across");
+		assert_eq!(scene.stage.sky.ground, Vec3::X, "and down");
+		assert_eq!(
+			scene.stage.clear,
+			Vec3::splat(0.5),
+			"and the clear color is not one of them, which a flat namespace could not promise"
+		);
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains("\"sky\": {"), "the sky is written under its own key");
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_world_with_no_sky_writes_no_sky_key() {
+		let scene = import(r#"{ "stage": { "clear": [0.5, 0.5, 0.5] } }"#).expect("a scene");
+		let text = export(&scene).expect("it writes back");
+
+		assert_eq!(scene.stage.sky, Sky::NONE, "nothing was asked for");
+		assert!(!text.contains("\"sky\""), "so nothing is written: {text}");
+	}
+
+	#[test]
+	fn a_sky_field_nobody_declared_is_refused_by_name() {
+		let refused = import(r#"{ "stage": { "sky": { "clouds": 3 } } }"#)
+			.expect_err("a sky has no clouds");
+
+		assert!(
+			format!("{refused}").contains("clouds"),
+			"and the message says which word it was: {refused}"
+		);
+	}
+
+	#[test]
 	fn a_light_is_read_out_of_its_own_object_and_written_back_into_one() {
 		let scene = import(
 			r#"{ "entities": [
@@ -2473,6 +2541,7 @@ mod tests {
 		let mut stage = Stage::DEFAULT;
 		fill(&mut stage, Stage::FIELDS, &[]);
 		fill(&mut stage.camera, Camera::FIELDS, &[]);
+		fill(&mut stage.sky, Sky::FIELDS, &[]);
 
 		let scene = SceneData {
 			stage,

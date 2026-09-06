@@ -69,7 +69,7 @@ use crate::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
-		Light, MaterialId, MeshId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind,
+		Light, MaterialId, MeshId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind, Sky,
 		Transform, World,
 		field::{Field, field},
 		net::MAX_PEERS,
@@ -99,6 +99,9 @@ pub struct Stage {
 	/// The clear color, linear RGB.
 	pub clear: Vec3,
 
+	/// What is drawn behind everything, or nothing at all.
+	pub sky: Sky,
+
 	/// The direction the light travels.
 	pub light: Vec3,
 
@@ -123,6 +126,7 @@ impl Stage {
 	pub const DEFAULT: Self = Self {
 		camera: Camera::DEFAULT,
 		clear: Vec3::ZERO,
+		sky: Sky::NONE,
 		light: Vec3::new(-0.4, -1.0, -0.3),
 		ambient: Vec3::splat(0.25),
 		gravity: Vec3::new(0.0, -9.81, 0.0),
@@ -132,9 +136,10 @@ impl Stage {
 	/// Its plain fields, for an inspector, a reader and a writer. @ref
 	/// [`field`](super::field).
 	///
-	/// The camera is a record of its own with its own table,
-	/// [`Camera::FIELDS`], and the two counters are the host's rather than
-	/// anything a person sets: a source has no words for what time it is.
+	/// The camera and the sky are records of their own with their own tables,
+	/// [`Camera::FIELDS`] and [`Sky::FIELDS`], and the two counters are the
+	/// host's rather than anything a person sets: a source has no words for
+	/// what time it is.
 	pub const FIELDS: &[Field<Self>] = &[
 		field!(Color, "clear", clear, "the clear color"),
 		field!(Vec3, "light", light, "the direction the light travels"),
@@ -1062,7 +1067,7 @@ pub fn capture(world: &World) -> SceneData {
 	}
 
 	SceneData {
-		stage: stage(world),
+		stage: settings(world),
 		links: links(world, &solid_of),
 		posed,
 		pose_generations: (0..world.poses.slots())
@@ -1101,17 +1106,47 @@ pub fn capture(world: &World) -> SceneData {
 	}
 }
 
-/// The world's own settings.
-fn stage(world: &World) -> Stage {
+/// The world's own settings, as a record.
+///
+/// The capture's, and an editor's: a panel that shows what is not an entity
+/// has to get the same fields from the same place a file does, or the two
+/// disagree the first time one of them grows.
+///
+/// @param world - the world to read
+#[must_use]
+pub fn settings(world: &World) -> Stage {
 	Stage {
 		camera: world.camera,
 		clear: world.clear,
+		sky: world.sky,
 		light: world.light,
 		ambient: world.ambient,
 		gravity: world.gravity,
 		time: world.time,
 		steps: world.steps,
 	}
+}
+
+/// Writes back the settings somebody edits, and only those.
+///
+/// **Not the camera and not the clock**, which is the whole difference from
+/// what a restore does: those two are in the record because a world written
+/// down has to carry them, and neither is a thing a person sets in a panel. A
+/// camera written back here would fight whoever is flying it, and a clock
+/// written back would move time.
+///
+/// The fields it does write are exactly the ones [`Stage::FIELDS`] names, and
+/// that is the pairing to keep: a field added to the table and forgotten here
+/// is a field an inspector shows and cannot change.
+///
+/// @param world - the world to write
+/// @param stage - the settings to put on it
+pub fn set_settings(world: &mut World, stage: Stage) {
+	world.clear = stage.clear;
+	world.sky = stage.sky;
+	world.light = stage.light;
+	world.ambient = stage.ambient;
+	world.gravity = stage.gravity;
 }
 
 /// Every living entity, with its handles resolved back to names.
@@ -1963,6 +1998,7 @@ fn material(world: &World, name: &str) -> MaterialId {
 fn stage_world(world: &mut World, stage: Stage) {
 	world.camera = stage.camera;
 	world.clear = stage.clear;
+	world.sky = stage.sky;
 	world.light = stage.light;
 	world.ambient = stage.ambient;
 	world.gravity = stage.gravity;
