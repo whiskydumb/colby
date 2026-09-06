@@ -1,25 +1,30 @@
 //! The window, and the loop that drives everything else.
 //!
-//! `App` is the window's half of the process: the runtime, the clock that
-//! paces it off the vertical blank, the renderer, the editor and the file
-//! watcher. Everything a world needs to run is in the runtime and is the same
-//! for a window as for a socket or a picture - @ref [`Runtime`] - and nothing
-//! here lives inside the hot-reloaded module, which is why swapping the module
-//! is allowed to be a two-line operation in the middle of a frame.
+//! Two halves, one after the other. First the window comes up over a world
+//! that is still coming up - @ref [`Loader`], which runs the stand-up one
+//! stage a frame behind a screen that says which stage, because compiling an
+//! asset tree and building a game crate are seconds and a window that shows
+//! nothing for seconds looks like a window that died. Then [`App`] takes the
+//! window over: the runtime, the clock that paces it off the vertical blank,
+//! the renderer, the editor and the file watcher. Everything a world needs to
+//! run is in the runtime and is the same for a window as for a socket or a
+//! picture - @ref [`Runtime`] - and nothing here lives inside the hot-reloaded
+//! module, which is why swapping the module is allowed to be a two-line
+//! operation in the middle of a frame.
 
 use std::sync::Arc;
 
 use colby_core::{
 	Err, Error, Result,
 	abi::{Input, Mix, World, cvar::Cvars},
-	err, error,
+	debug, err, error,
 	glam::{Vec2, Vec3},
 	info,
 	time::{Clock, Pace, Rate},
 	warn,
 };
 #[cfg(feature = "editor")]
-use colby_editor::Editor;
+use colby_editor::{Editor, Loading, State, Step};
 use colby_engine::{
 	Gpu, Overlay, Renderer, gpu,
 	winit::{
@@ -32,9 +37,17 @@ use colby_engine::{
 	},
 };
 
+#[cfg(feature = "editor")]
+use crate::runtime::Stage;
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
-use crate::{Build, Front, Project, Runtime, input, mode::Mode, net::Standing, screenshot};
+use crate::{
+	Build, Front, Project, Runtime, input,
+	mode::Mode,
+	net::Standing,
+	runtime::{Opening, Progress},
+	screenshot,
+};
 
 /// The window title.
 const TITLE: &str = "colby";
@@ -132,13 +145,380 @@ pub(crate) fn run(build: Build, standing: Standing, project: &Project) -> Result
 	// the window has anything to say.
 	event_loop.set_control_flow(ControlFlow::Poll);
 
-	let mut app = App::new(build, standing, project)?;
+	let mut boot = Boot::new(build, standing, project);
 
 	event_loop
-		.run_app(&mut app)
+		.run_app(&mut boot)
 		.map_err(|error| err!(Graphics("running the event loop: {error}")))?;
 
-	app.into_result()
+	boot.into_result()
+}
+
+/// Which half the window is in.
+enum Phase {
+	/// The world coming up behind its screen.
+	Loading(Box<Loader>),
+
+	/// The world running.
+	Running(Box<App>),
+
+	/// Neither: the moment between the two, and after either has stopped.
+	Over,
+}
+
+/// The window's whole life: the loader, then the app, one handler over both.
+struct Boot {
+	phase: Phase,
+	failure: Option<Error>,
+}
+
+impl Boot {
+	/// A window waiting to be made, and a world waiting to come up behind it.
+	fn new(build: Build, standing: Standing, project: &Project) -> Self {
+		Self {
+			phase: Phase::Loading(Box::new(Loader::new(build, standing, project))),
+			failure: None,
+		}
+	}
+
+	/// The reason the loop stopped, if it was not asked to.
+	fn into_result(self) -> Result { self.failure.map_or(Ok(()), Err) }
+
+	/// Records a failure and asks the loop to stop.
+	fn fail(&mut self, event_loop: &ActiveEventLoop, error: Error) {
+		error!(%error, "stopping");
+		self.failure = Some(error);
+		event_loop.exit();
+	}
+
+	/// Takes the window over from the loader, once the world is up.
+	fn take_over(&mut self, event_loop: &ActiveEventLoop, runtime: Runtime) {
+		let Phase::Loading(loader) = std::mem::replace(&mut self.phase, Phase::Over) else {
+			return;
+		};
+
+		match App::new(*loader, runtime) {
+			| Ok(app) => self.phase = Phase::Running(Box::new(app)),
+			| Err(error) => self.fail(event_loop, error),
+		}
+	}
+}
+
+impl ApplicationHandler for Boot {
+	fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+		let Phase::Loading(loader) = &mut self.phase else {
+			return;
+		};
+
+		if loader.renderer.is_some() {
+			return;
+		}
+
+		if let Err(error) = loader.start(event_loop) {
+			self.fail(event_loop, error);
+		}
+	}
+
+	fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+		match &mut self.phase {
+			| Phase::Loading(loader) => match loader.window_event(event_loop, &event) {
+				| Ok(Some(runtime)) => self.take_over(event_loop, runtime),
+				| Ok(None) => {},
+				| Err(error) => self.fail(event_loop, error),
+			},
+			| Phase::Running(app) => app.window_event(event_loop, id, &event),
+			| Phase::Over => {},
+		}
+	}
+
+	fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+		match &mut self.phase {
+			| Phase::Loading(loader) => loader.request_redraw(),
+			| Phase::Running(app) => app.about_to_wait(event_loop),
+			| Phase::Over => {},
+		}
+	}
+
+	fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+		match &mut self.phase {
+			| Phase::Loading(loader) =>
+				if let Some(error) = loader.close() {
+					self.failure = Some(error);
+				},
+			| Phase::Running(app) => app.exiting(event_loop),
+			| Phase::Over => {},
+		}
+	}
+}
+
+/// The window's first half: the window, the device, and the world coming up
+/// behind a screen that says how far it has come.
+///
+/// One stage a frame, so that the screen is drawn between them; the build
+/// stage is another process and is looked at rather than waited for, so the
+/// window goes on answering while cargo works. A stage that fails stops the
+/// stand-up and leaves the screen up with the failure on it, because a person
+/// who opened the project from a list has nowhere else to read it.
+struct Loader {
+	build: Build,
+	standing: Standing,
+	project: Project,
+	gpu: Option<Gpu>,
+	renderer: Option<Renderer>,
+	#[cfg(feature = "editor")]
+	screen: Option<Loading>,
+	opening: Option<Opening>,
+	failure: Option<Error>,
+}
+
+impl Loader {
+	/// A world waiting for its window.
+	fn new(build: Build, standing: Standing, project: &Project) -> Self {
+		Self {
+			build,
+			standing,
+			project: project.clone(),
+			gpu: None,
+			renderer: None,
+			#[cfg(feature = "editor")]
+			screen: None,
+			opening: None,
+			failure: None,
+		}
+	}
+
+	/// Opens the window and the device, and starts the world coming up.
+	///
+	/// The device before the world, which is the other way round from how a
+	/// picture does it, because the screen the world comes up behind needs
+	/// something to be drawn on. Which APIs the device may use is the
+	/// archive's to say and there is no table yet to run the archive against,
+	/// so the one variable is read from the file by name.
+	fn start(&mut self, event_loop: &ActiveEventLoop) -> Result {
+		let attributes = Window::default_attributes()
+			.with_title(TITLE)
+			.with_inner_size(SIZE);
+
+		let window = Arc::new(
+			event_loop
+				.create_window(attributes)
+				.map_err(|error| err!(Graphics("creating the window: {error}")))?,
+		);
+
+		// against this window, so that the adapter chosen is one that can
+		// present to it; the surface itself is the renderer's. @ref
+		// `colby_engine::gpu`.
+		let asked = crate::console::archived(&self.project.settings(), gpu::BACKEND);
+		let Some(gpu) = Gpu::open(gpu::backends(asked.as_deref()), Some(&window))? else {
+			return Err!(Graphics("no usable adapter, so there is nothing to draw with"));
+		};
+
+		let renderer = Renderer::new(&gpu, window)?;
+
+		self.start_screen(&renderer);
+
+		let mut opening =
+			Opening::start(Front::Window(self.standing), &self.project, &self.build)?;
+		opening.world_mut().aspect = renderer.aspect();
+
+		self.gpu = Some(gpu);
+		self.renderer = Some(renderer);
+		self.opening = Some(opening);
+
+		info!(
+			project = self.project.id(),
+			"the window is open; the world is coming up behind it"
+		);
+
+		Ok(())
+	}
+
+	/// Reacts to one window event.
+	///
+	/// @return the runtime, the frame every stage has run
+	fn window_event(
+		&mut self,
+		event_loop: &ActiveEventLoop,
+		event: &WindowEvent,
+	) -> Result<Option<Runtime>> {
+		self.offer(event);
+
+		match event {
+			| WindowEvent::CloseRequested => {
+				event_loop.exit();
+
+				Ok(None)
+			},
+			| WindowEvent::Resized(size) => {
+				if let Some(renderer) = self.renderer.as_mut() {
+					renderer.resize(size.width, size.height);
+				}
+
+				Ok(None)
+			},
+			| WindowEvent::RedrawRequested => self.frame(),
+			| _ => Ok(None),
+		}
+	}
+
+	/// Brings up the screen against the window and the device.
+	#[cfg(feature = "editor")]
+	fn start_screen(&mut self, renderer: &Renderer) {
+		self.screen = Some(Loading::new(
+			renderer.window(),
+			renderer.device(),
+			renderer.format(),
+			self.project.name(),
+		));
+	}
+
+	/// Nothing to bring up; this build has no screen.
+	#[cfg(not(feature = "editor"))]
+	#[expect(
+		clippy::unused_self,
+		clippy::needless_pass_by_ref_mut,
+		reason = "the editor build of this function needs both, and the two have to agree on a \
+		          signature"
+	)]
+	fn start_screen(&mut self, _renderer: &Renderer) {}
+
+	/// Offers an event to the screen, so that it follows the window.
+	#[cfg(feature = "editor")]
+	fn offer(&mut self, event: &WindowEvent) {
+		if let (Some(screen), Some(renderer)) = (self.screen.as_mut(), self.renderer.as_ref()) {
+			let window = Arc::clone(renderer.window());
+
+			screen.on_event(&window, event);
+		}
+	}
+
+	/// Nothing to offer it to; this build has no screen.
+	#[cfg(not(feature = "editor"))]
+	#[expect(
+		clippy::unused_self,
+		clippy::needless_pass_by_ref_mut,
+		reason = "the editor build of this function needs both, and the two have to agree on a \
+		          signature"
+	)]
+	fn offer(&mut self, _event: &WindowEvent) {}
+
+	/// Asks for another frame.
+	fn request_redraw(&self) {
+		if let Some(renderer) = self.renderer.as_ref() {
+			renderer.window().request_redraw();
+		}
+	}
+
+	/// Draws the screen as things stand, then runs one stage.
+	///
+	/// The picture first, so that what is on screen while a stage runs is the
+	/// line saying which stage; a stage that takes a second would otherwise
+	/// be a second of the previous frame.
+	///
+	/// @return the runtime, once every stage has run
+	fn frame(&mut self) -> Result<Option<Runtime>> {
+		self.draw()?;
+
+		if self.failure.is_some() {
+			return Ok(None);
+		}
+
+		let Some(opening) = self.opening.as_mut() else {
+			return Ok(None);
+		};
+
+		match opening.advance() {
+			| Ok(Progress::Done) => {
+				let Some(opening) = self.opening.take() else {
+					return Ok(None);
+				};
+
+				Ok(Some(opening.finish()?))
+			},
+			| Ok(Progress::Moved(stage)) => {
+				debug!(stage = stage.title(), "up");
+
+				Ok(None)
+			},
+			| Ok(Progress::Waiting(_)) => Ok(None),
+			| Err(error) => {
+				// the screen stays, with the failure on it, until the window is
+				// closed: somebody who opened this from a list has nowhere else
+				// to read why it did not open.
+				error!(%error, "the world did not come up; close the window");
+				self.failure = Some(error);
+
+				Ok(None)
+			},
+		}
+	}
+
+	/// Draws the world as it stands and the screen over it.
+	fn draw(&mut self) -> Result {
+		let (Some(renderer), Some(opening)) = (self.renderer.as_mut(), self.opening.as_ref())
+		else {
+			return Ok(());
+		};
+
+		let mut overlays: Vec<&mut dyn Overlay> = Vec::new();
+
+		#[cfg(feature = "editor")]
+		if let Some(screen) = self.screen.as_mut() {
+			let window = Arc::clone(renderer.window());
+			let steps = steps(opening.next());
+			let failure = self.failure.as_ref().map(ToString::to_string);
+
+			screen.run(&window, &steps, failure.as_deref());
+			overlays.push(screen);
+		}
+
+		renderer.render(opening.world(), &mut overlays)
+	}
+
+	/// Takes the window down, the screen before the renderer whose surface
+	/// borrows the window.
+	///
+	/// @return the failure that stopped the stand-up, if one did
+	fn close(&mut self) -> Option<Error> {
+		self.drop_screen();
+		self.opening = None;
+		self.renderer = None;
+
+		self.failure.take()
+	}
+
+	/// Takes the screen down.
+	#[cfg(feature = "editor")]
+	fn drop_screen(&mut self) { self.screen = None; }
+
+	/// Nothing to take down; this build has no screen.
+	#[cfg(not(feature = "editor"))]
+	#[expect(
+		clippy::unused_self,
+		clippy::needless_pass_by_ref_mut,
+		reason = "as start_screen"
+	)]
+	fn drop_screen(&mut self) {}
+}
+
+/// Every stage as the screen shows it, given the one about to run.
+#[cfg(feature = "editor")]
+fn steps(next: Option<Stage>) -> Vec<Step<'static>> {
+	let current = next.and_then(|stage| Stage::ALL.iter().position(|it| *it == stage));
+
+	Stage::ALL
+		.iter()
+		.enumerate()
+		.map(|(index, stage)| Step {
+			title: stage.title(),
+			state: match current {
+				| Some(at) if index < at => State::Done,
+				| Some(at) if index == at => State::Current,
+				| Some(_) => State::Pending,
+				| None => State::Done,
+			},
+		})
+		.collect()
 }
 
 /// The window's half of the process.
@@ -183,27 +563,26 @@ pub(crate) struct App {
 }
 
 impl App {
-	/// A world brought up, waiting for its window.
+	/// Takes the window over from the loader, with the world up.
 	///
-	/// The runtime is opened here, before the event loop exists: a module is
-	/// loaded and its `init` run against a world with no screen yet, which is
-	/// what a socket and a picture do too. The window, the renderer and
-	/// everything that needs a device come in [`start`](Self::start), a moment
-	/// later.
+	/// Everything that needs both a device and a runtime happens here: the
+	/// interface's pipeline, the editor, the watcher. The clock is reset last,
+	/// because everything before it took as long as it took and none of that
+	/// is time the simulation owes.
 	///
-	/// @param build - what the build script of the executable knew
-	/// @param standing - which end of a wire this window is, if either
-	/// @param project - the project to run
+	/// @param loader - the window and the device, done loading
+	/// @param runtime - the world, up
 	#[cfg_attr(
 		not(feature = "hot_reload"),
 		expect(
-			clippy::needless_pass_by_value,
-			reason = "with hot-reload built in the facts are kept for the watcher; without it \
-			          there is nothing to rebuild, and the two have to agree on a signature"
+			unused_variables,
+			reason = "with hot-reload built in the loader's facts are kept for the watcher; \
+			          without it there is nothing to rebuild, and the two have to agree on a \
+			          signature"
 		)
 	)]
-	pub(crate) fn new(build: Build, standing: Standing, project: &Project) -> Result<Self> {
-		let runtime = Runtime::open(Front::Window(standing), project, &build)?;
+	fn new(loader: Loader, runtime: Runtime) -> Result<Self> {
+		let Loader { build, gpu, renderer, .. } = loader;
 
 		// after the config, because that is where a rate somebody asked for
 		// arrives, and before the first step, because that is the last moment
@@ -217,13 +596,13 @@ impl App {
 			);
 		}
 
-		Ok(Self {
+		let mut app = Self {
 			runtime,
 			clock: Clock::new(),
 			frames: 0,
 			input: Input::default(),
-			gpu: None,
-			renderer: None,
+			gpu,
+			renderer,
 			mode: Mode::new(),
 			#[cfg(feature = "editor")]
 			editor: None,
@@ -234,34 +613,18 @@ impl App {
 			#[cfg(feature = "hot_reload")]
 			build,
 			failure: None,
-		})
-	}
-
-	/// The reason the loop stopped, if it was not asked to.
-	pub(crate) fn into_result(self) -> Result { self.failure.map_or(Ok(()), Err) }
-
-	/// Opens the window and brings up everything that needs a device.
-	fn start(&mut self, event_loop: &ActiveEventLoop) -> Result {
-		let attributes = Window::default_attributes()
-			.with_title(TITLE)
-			.with_inner_size(SIZE);
-
-		let window = Arc::new(
-			event_loop
-				.create_window(attributes)
-				.map_err(|error| err!(Graphics("creating the window: {error}")))?,
-		);
-
-		// the device before the renderer and against this window, so that the
-		// adapter chosen is one that can present to it; the surface itself is
-		// the renderer's. Which APIs it may use is the config's to say, and it
-		// is read here and never again. @ref `colby_engine::gpu`.
-		let asked = self.runtime.world.cvars.text(gpu::BACKEND);
-		let Some(gpu) = Gpu::open(gpu::backends(asked), Some(&window))? else {
-			return Err!(Graphics("no usable adapter, so there is nothing to draw with"));
 		};
 
-		let renderer = Renderer::new(&gpu, window)?;
+		app.start()?;
+
+		Ok(app)
+	}
+
+	/// Brings up everything that needs the device and the world at once.
+	fn start(&mut self) -> Result {
+		let Some(renderer) = self.renderer.as_ref() else {
+			return Err!(Graphics("the loader handed over no renderer"));
+		};
 		let (width, height) = renderer.size();
 
 		self.runtime.world.aspect = renderer.aspect();
@@ -279,16 +642,13 @@ impl App {
 			error!(%error, "the interface has no pipeline; nothing it draws will be on screen");
 		}
 
-		self.gpu = Some(gpu);
-		self.renderer = Some(renderer);
 		self.start_editor();
 		self.start_watching()?;
 
-		// everything above and everything in `new` took as long as it took: a
-		// module, the asset tree, a window, an adapter and a shader. The clock
-		// has been running since `new`, and without this the first frame would
-		// arrive owing the simulation a second of catch-up it never actually
-		// missed.
+		// everything above and everything the loader did took as long as it
+		// took: a module, the asset tree, a window, an adapter and a shader.
+		// Without this the first frame would arrive owing the simulation
+		// seconds of catch-up it never actually missed.
 		self.clock.reset();
 
 		info!("colby is running; escape or the window close button stops it");
@@ -398,7 +758,8 @@ impl App {
 	#[expect(
 		clippy::unused_self,
 		clippy::needless_pass_by_ref_mut,
-		reason = "the hot-reload variant of this function needs both, and the two have to 		          agree on a signature"
+		reason = "the hot-reload variant of this function needs both, and the two have to agree \
+		          on a signature"
 	)]
 	fn start_watching(&mut self) -> Result { Ok(()) }
 
@@ -461,7 +822,8 @@ impl App {
 			#[expect(
 				clippy::as_conversions,
 				clippy::cast_possible_truncation,
-				reason = "a display scale is between one and four, and the only f32 it is ever 				          multiplied by is a pixel count"
+				reason = "a display scale is between one and four, and the only f32 it is ever \
+				          multiplied by is a pixel count"
 			)]
 			let scale = renderer.window().scale_factor() as f32;
 
@@ -704,25 +1066,14 @@ impl App {
 		self.failure = Some(error);
 		event_loop.exit();
 	}
-}
 
-impl ApplicationHandler for App {
-	fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-		if self.renderer.is_some() {
-			return;
-		}
-
-		if let Err(error) = self.start(event_loop) {
-			self.fail(event_loop, error);
-		}
-	}
-
-	fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+	/// Reacts to one window event.
+	fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: &WindowEvent) {
 		// the editor first: what it takes, the game must not also act on.
-		let taken = self.editor_took(&event);
+		let taken = self.editor_took(event);
 
 		if !taken {
-			input::apply(&mut self.input, &event);
+			input::apply(&mut self.input, event);
 		}
 
 		match event {
@@ -735,7 +1086,7 @@ impl ApplicationHandler for App {
 						..
 					},
 				..
-			} if !taken => self.pressed(event_loop, key),
+			} if !taken => self.pressed(event_loop, *key),
 			| WindowEvent::Resized(size) =>
 				if let Some(renderer) = self.renderer.as_mut() {
 					renderer.resize(size.width, size.height);
@@ -755,12 +1106,14 @@ impl ApplicationHandler for App {
 		}
 	}
 
-	fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+	/// Asks for another frame.
+	fn about_to_wait(&self, _event_loop: &ActiveEventLoop) {
 		if let Some(renderer) = self.renderer.as_ref() {
 			renderer.window().request_redraw();
 		}
 	}
 
+	/// Takes everything down, in order.
 	fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
 		// the config and then the game, and the module dropped with it: it may
 		// still be running code from the image, so it goes before the renderer,
@@ -847,6 +1200,32 @@ mod tests {
 			paced(&world.cvars, true).hz(),
 			Rate::DEFAULT.hz(),
 			"and one that does not, does not"
+		);
+	}
+
+	#[cfg(feature = "editor")]
+	#[test]
+	fn the_screen_is_told_which_stage_is_running_and_which_are_done() {
+		let marks = steps(Some(Stage::Build));
+
+		assert_eq!(marks.len(), Stage::ALL.len(), "every stage has a line");
+		assert_eq!(marks[0].state, State::Done, "the assets are done");
+		assert_eq!(marks[3].state, State::Done, "and the wire");
+		assert_eq!(marks[4].state, State::Current, "the build is running");
+		assert_eq!(marks[4].title, "building the game crate");
+		assert_eq!(marks[5].state, State::Pending, "the module is still to come");
+		assert!(
+			steps(None)
+				.iter()
+				.all(|step| step.state == State::Done),
+			"nothing left to run is everything done"
+		);
+		assert!(
+			steps(Some(Stage::Assets))
+				.iter()
+				.skip(1)
+				.all(|step| step.state == State::Pending),
+			"and the first stage running is nothing done"
 		);
 	}
 }

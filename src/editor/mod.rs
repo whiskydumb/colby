@@ -17,6 +17,12 @@
 //! [`select`], deliberately: a module with no egui in it is a module with
 //! tests.
 //!
+//! **The launcher and the loading screen live here too**, @ref [`launcher`]
+//! and [`loading`]: the screen every project is opened from and the screen a
+//! project comes up behind are tools in the same sense a panel is, drawn with
+//! the same egui through the same [`Shell`](shell::Shell), and they are what
+//! a build with no editor in it has no use for either.
+//!
 //! @note: the game's own interface will not be this. egui is for tools; a game
 //! draws its interface with HTML/CSS over taffy, which is a separate subsystem
 //! that happens to arrive through the same [`Overlay`] seam.
@@ -25,20 +31,25 @@ use colby_core::{
 	abi::{World, cvar::Value},
 	time::Clock,
 };
-use egui_wgpu::{Renderer as Painter, RendererOptions, ScreenDescriptor};
-use wgpu::{
-	CommandEncoderDescriptor, Device, LoadOp, Operations, Queue, RenderPassColorAttachment,
-	RenderPassDescriptor, StoreOp, TextureFormat, TextureView,
-};
+use colby_engine::Overlay;
+use wgpu::{Device, Queue, TextureFormat, TextureView};
 use winit::{event::WindowEvent, window::Window};
 
 mod aim;
 mod console;
 mod gizmo;
+pub mod launcher;
+pub mod loading;
 mod select;
+mod shell;
 mod stats;
 mod tree;
 mod viewport;
+
+pub use self::{
+	launcher::{Action, Launcher},
+	loading::{Loading, State, Step},
+};
 
 /// The variable that decides whether the editor is on screen.
 ///
@@ -48,14 +59,7 @@ pub const SHOW: &str = "editor.show";
 
 /// egui, and everything colby keeps on its behalf.
 pub struct Editor {
-	context: egui::Context,
-	state: egui_winit::State,
-	painter: Painter,
-	/// This frame's triangles, tessellated by [`Editor::run`] and painted by
-	/// [`Overlay::draw`] once the renderer has a frame to put them in.
-	jobs: Vec<egui::ClippedPrimitive>,
-	textures: egui::TexturesDelta,
-	points: f32,
+	shell: shell::Shell,
 	console: console::Console,
 	/// What is selected, held here rather than in a panel: the viewport picks
 	/// into it and the tree draws it, and two copies could disagree.
@@ -72,29 +76,8 @@ impl Editor {
 	/// @param format - the color format the surface was configured with
 	#[must_use]
 	pub fn new(window: &Window, device: &Device, format: TextureFormat) -> Self {
-		let context = egui::Context::default();
-		let state = egui_winit::State::new(
-			context.clone(),
-			context.viewport_id(),
-			window,
-			None,
-			None,
-			None,
-		);
-
-		// the defaults are what an overlay wants: no multisampling and no depth
-		// buffer, because this draws over a frame that is already finished and
-		// nothing in it is behind anything else. Dithering stays on; the
-		// surface is sRGB, which is what it assumes.
-		let painter = Painter::new(device, format, RendererOptions::default());
-
 		Self {
-			context,
-			state,
-			painter,
-			jobs: Vec::new(),
-			textures: egui::TexturesDelta::default(),
-			points: 1.0,
+			shell: shell::Shell::new(window, device, format),
 			console: console::Console::default(),
 			selection: select::Selection::default(),
 			tree: tree::Tree::default(),
@@ -138,7 +121,7 @@ impl Editor {
 	/// @return whether the editor took it, in which case the game must not also
 	/// act on it: a key typed into the console is not a key held to walk with
 	pub fn on_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
-		self.state.on_window_event(window, event).consumed
+		self.shell.on_event(window, event)
 	}
 
 	/// Builds this frame's interface.
@@ -152,20 +135,22 @@ impl Editor {
 	/// @param clock - the pacing, for the statistics
 	/// @param frames - how many frames have been drawn
 	pub fn run(&mut self, window: &Window, world: &mut World, clock: &Clock, frames: u64) {
-		let input = self.state.take_egui_input(window);
-		let console = &mut self.console;
-		let selection = &mut self.selection;
-		let tree = &mut self.tree;
-		let viewport = &mut self.viewport;
+		let Self {
+			shell,
+			console,
+			selection,
+			tree,
+			viewport,
+		} = self;
 
-		// cloned before the run rather than reached through the `Ui` egui hands
-		// the closure: a `Context` is a handle, cloning it is a refcount, and
-		// every window here wants the context rather than a root layout.
-		let context = self.context.clone();
+		shell.run(window, |ui| {
+			// every window here wants the context rather than the root layout:
+			// a `Context` is a handle, and cloning it is a refcount.
+			let context = ui.ctx().clone();
+			let context = &context;
 
-		let output = self.context.run_ui(input, |_ui| {
-			stats::show(&context, world, clock, frames);
-			console.show(&context, world);
+			stats::show(context, world, clock, frames);
+			console.show(context, world);
 
 			// the world may have been replaced since the last frame by a scene
 			// load or by play being stopped. Once, here, before anything reads
@@ -174,41 +159,16 @@ impl Editor {
 
 			// the viewport before the tree, so that a click out in the world
 			// is already in hand when the tree draws the row it selected.
-			if let Some(pick) = viewport.run(&context, world, selection) {
+			if let Some(pick) = viewport.run(context, world, selection) {
 				selection.set(world, pick);
 			}
 
-			tree.show(&context, world, selection, viewport.tool());
+			tree.show(context, world, selection, viewport.tool());
 		});
-
-		self.state
-			.handle_platform_output(window, output.platform_output);
-
-		self.points = output.pixels_per_point;
-		self.jobs = self
-			.context
-			.tessellate(output.shapes, output.pixels_per_point);
-
-		// appended rather than assigned. A frame is not always drawn - the
-		// surface can be lost, or the editor can be hidden between building it
-		// and painting it - and a `TexturesDelta` that is dropped with anything
-		// still in it is a panic, by epaint's own design. Merging means an
-		// unpainted frame's font atlas is still applied by the next one that
-		// does get painted.
-		self.textures.append(output.textures_delta);
 	}
 }
 
-impl Drop for Editor {
-	fn drop(&mut self) {
-		// epaint asserts that a delta is applied rather than dropped, which is
-		// the right rule while a frame is being built and the wrong one for a
-		// process on its way out. Nothing is going to paint this.
-		self.textures.clear();
-	}
-}
-
-impl colby_engine::Overlay for Editor {
+impl Overlay for Editor {
 	fn draw(
 		&mut self,
 		device: &Device,
@@ -217,62 +177,7 @@ impl colby_engine::Overlay for Editor {
 		width: u32,
 		height: u32,
 	) {
-		let screen = ScreenDescriptor {
-			size_in_pixels: [width, height],
-			pixels_per_point: self.points,
-		};
-
-		// taken, so that what is applied here cannot also be applied again, and
-		// so that the cleared remainder is what gets dropped.
-		let mut textures = std::mem::take(&mut self.textures);
-
-		for (id, deltas) in &textures.set {
-			for delta in deltas {
-				self.painter
-					.update_texture(device, queue, *id, delta);
-			}
-		}
-
-		let mut encoder =
-			device.create_command_encoder(&CommandEncoderDescriptor { label: Some("editor") });
-
-		self.painter
-			.update_buffers(device, queue, &mut encoder, &self.jobs, &screen);
-
-		// `Load`, not `Clear`: the scene is already in this frame, and the
-		// point of an overlay is to be over something.
-		let mut pass = encoder
-			.begin_render_pass(&RenderPassDescriptor {
-				label: Some("editor"),
-				color_attachments: &[Some(RenderPassColorAttachment {
-					view: target,
-					depth_slice: None,
-					resolve_target: None,
-					ops: Operations {
-						load: LoadOp::Load,
-						store: StoreOp::Store,
-					},
-				})],
-				depth_stencil_attachment: None,
-				timestamp_writes: None,
-				occlusion_query_set: None,
-				multiview_mask: None,
-			})
-			.forget_lifetime();
-
-		self.painter
-			.render(&mut pass, &self.jobs, &screen);
-		drop(pass);
-
-		queue.submit([encoder.finish()]);
-
-		// after the pass, not before it: a texture freed while the commands that
-		// sample it are still queued is a texture the driver is entitled to
-		// complain about.
-		for id in &textures.free {
-			self.painter.free_texture(id);
-		}
-
-		textures.clear();
+		self.shell
+			.draw(device, queue, target, width, height);
 	}
 }

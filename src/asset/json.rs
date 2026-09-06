@@ -616,12 +616,76 @@ fn whole(number: f64) -> u64 { number as u64 }
 )]
 fn narrow(number: f64) -> f32 { number as f32 }
 
+/// A string as JSON spells it: quoted, with the four things JSON will not take
+/// in one spelled out.
+///
+/// The one piece of *writing* in a module about reading, because every writer
+/// of this format in the workspace - a scene source, a project list - needs
+/// exactly this and nothing else from a JSON writer, and two of them would
+/// disagree about a control character one day.
+///
+/// @param text - the string
+/// @return the string between quotes, escaped
+#[must_use]
+pub fn quoted(text: &str) -> String {
+	let mut out = String::with_capacity(text.len() + 2);
+	out.push('"');
+
+	for letter in text.chars() {
+		match letter {
+			| '"' => out.push_str("\\\""),
+			| '\\' => out.push_str("\\\\"),
+			| '\n' => out.push_str("\\n"),
+			| '\t' => out.push_str("\\t"),
+			| '\r' => out.push_str("\\r"),
+			// anything below a space has no spelling of its own and has to go
+			// as a code point. Above it, JSON takes the character as it is.
+			| _ if u32::from(letter) < 0x20 => escaped(&mut out, letter),
+			| _ => out.push(letter),
+		}
+	}
+
+	out.push('"');
+
+	out
+}
+
+/// One character below a space, as the four hex digits JSON spells it with.
+fn escaped(out: &mut String, letter: char) {
+	const DIGITS: [char; 16] =
+		['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
+
+	// everything this is reached for is below 0x20, so the first two digits are
+	// always zero and the last two are one byte's worth.
+	let code = usize::try_from(u32::from(letter)).unwrap_or(0);
+
+	out.push_str("\\u00");
+	out.push(DIGITS[(code >> 4) & 0xF]);
+	out.push(DIGITS[code & 0xF]);
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	/// The value a document holds, or the message saying why it does not.
 	fn read(text: &str) -> Value { parse(text).expect("the document should read") }
+
+	#[test]
+	fn a_quoted_string_reads_back_as_itself() {
+		// the writer and the reader in one place, run into each other: the
+		// only property a spelling has to have.
+		for text in
+			["", "plain", "say \"hi\"", "back\\slash", "tab\there", "line\nbreak", "\u{1}"]
+		{
+			let written = quoted(text);
+			let value = read(&written);
+
+			assert_eq!(value.as_str(), Some(text), "{written}");
+		}
+
+		assert_eq!(quoted("\u{1}"), "\"\\u0001\"", "a control character is a code point");
+	}
 
 	/// Why a document was refused, without the wrapper around it.
 	fn refusal(text: &str) -> String {

@@ -15,8 +15,10 @@
 //! the project's directory, and the workspace's `members` glob
 //! `projects/*/game` picks the crate up. On Windows that is a junction, which
 //! needs no privilege; elsewhere a symbolic link. A project that already lives
-//! under the engine checkout - `projects/`, the place the launcher will create
-//! them - needs nothing: the glob picks its crate up as it is.
+//! under the engine checkout's `projects/` needs nothing: the glob picks its
+//! crate up as it is. The launcher makes projects elsewhere - under the
+//! person's documents, where the field puts them - so a project it made is
+//! mounted like any other the first time it is opened, and stays mounted.
 //!
 //! **A mount that points at nothing breaks every cargo command in the engine
 //! checkout**, because the glob matches a directory whose manifest cannot be

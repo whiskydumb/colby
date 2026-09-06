@@ -1396,42 +1396,7 @@ fn as_turn(value: Quat) -> String {
 }
 
 /// A string, with the four things JSON will not take in one spelled out.
-fn as_text(value: &str) -> String {
-	let mut out = String::with_capacity(value.len() + 2);
-	out.push('"');
-
-	for letter in value.chars() {
-		match letter {
-			| '"' => out.push_str("\\\""),
-			| '\\' => out.push_str("\\\\"),
-			| '\n' => out.push_str("\\n"),
-			| '\t' => out.push_str("\\t"),
-			| '\r' => out.push_str("\\r"),
-			// anything below a space has no spelling of its own and has to go
-			// as a code point. Above it, JSON takes the character as it is.
-			| _ if u32::from(letter) < 0x20 => escaped(&mut out, letter),
-			| _ => out.push(letter),
-		}
-	}
-
-	out.push('"');
-
-	out
-}
-
-/// One character below a space, as the four hex digits JSON spells it with.
-fn escaped(out: &mut String, letter: char) {
-	const DIGITS: [char; 16] =
-		['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
-
-	// everything this is reached for is below 0x20, so the first two digits are
-	// always zero and the last two are one byte's worth.
-	let code = usize::try_from(u32::from(letter)).unwrap_or(0);
-
-	out.push_str("\\u00");
-	out.push(DIGITS[(code >> 4) & 0xF]);
-	out.push(DIGITS[code & 0xF]);
-}
+fn as_text(value: &str) -> String { json::quoted(value) }
 
 #[cfg(test)]
 mod tests {

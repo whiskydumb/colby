@@ -1,0 +1,7 @@
+{
+	"schema": 1,
+	"engine": "$engine",
+	"id": "$id",
+	"name": "$name",
+	"game": "game"
+}

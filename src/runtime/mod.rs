@@ -38,6 +38,8 @@ mod game;
 mod host;
 mod input;
 mod launch;
+#[cfg(feature = "editor")]
+mod launcher;
 mod link;
 mod mode;
 #[cfg(feature = "hot_reload")]
@@ -60,7 +62,7 @@ use colby_core::{Result, log};
 pub use crate::{
 	launch::{Launch, Run},
 	net::Standing,
-	runtime::{Front, Runtime, VIEWPORT},
+	runtime::{Front, Opening, Progress, Runtime, Stage, VIEWPORT},
 };
 
 /// The few facts a running process cannot work out for itself.
@@ -124,9 +126,17 @@ pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 
 	// the project before anything that touches a file, because every file
 	// hangs off it: the one named, or the one in the working directory - the
-	// rule a project manager's `--path` follows, and the branch a launcher
-	// takes when neither is there.
-	let project = Project::open(project.as_deref().unwrap_or(here))?;
+	// rule a project manager's `--path` follows. When neither is there and a
+	// window on its own was asked for, the launcher is what opens, and it is
+	// where the project comes from: it starts this executable again with one
+	// named. A picture, a sound or a wire with no project is still a stop,
+	// because nothing on a screen can answer for what they are for.
+	let project = match project.as_deref() {
+		| Some(dir) => Project::open(dir)?,
+		#[cfg(feature = "editor")]
+		| None if wants_launcher(&run, here) => return launcher::run(&build),
+		| None => Project::open(here)?,
+	};
 
 	prepare()?;
 
@@ -150,6 +160,19 @@ pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 	finish();
 
 	result
+}
+
+/// Whether a run with no project named is the launcher's.
+///
+/// Only a window on its own, and only when the working directory holds no
+/// project file at all: a file that is there and cannot be read is somebody's
+/// mistake to see, not a reason to show a list instead.
+///
+/// @param run - what was asked for
+/// @param here - the working directory
+#[cfg(feature = "editor")]
+fn wants_launcher(run: &Run, here: &Path) -> bool {
+	*run == Run::Window(Standing::Alone) && !here.join(colby_asset::project::FILE).is_file()
 }
 
 /// Verifies the process is laid out for hot-reload, and clears the module

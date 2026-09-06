@@ -18,13 +18,14 @@
 
 use std::{
 	net::SocketAddr,
+	thread,
 	time::{Duration, Instant},
 };
 
 use colby_asset::Project;
 use colby_audio::Device;
 use colby_core::{
-	Result,
+	Err, Result,
 	abi::{Input, World, console, scene},
 	debug, err, error,
 	glam::Vec2,
@@ -158,13 +159,10 @@ pub struct Runtime {
 impl Runtime {
 	/// Brings a world up, the one way there is.
 	///
-	/// The order is the window's, which was the most demanding of the four:
-	/// the assets before the module, so `init` finds its meshes by name; the
-	/// host's variables before the module, so they are the engine's and
-	/// survive a reload; the socket before the module, so a client has said
-	/// what it is before `init` reads `World::peer`; the editor's variables
-	/// before the module for the reason the host's are; the config after the
-	/// module, because a line in it may name a variable the game registered.
+	/// An [`Opening`] run to the end with nothing between its stages: what a
+	/// picture, a sound and a windowless end do, and what a window does one
+	/// stage a frame behind a screen that says which. @ref [`Stage`] for the
+	/// order and the reasons.
 	///
 	/// @param front - what kind of process this is
 	/// @param project - the project: where the assets, the saves, the config
@@ -173,99 +171,15 @@ impl Runtime {
 	/// is: the game crate is mounted there and built there
 	/// @return the runtime, or the first thing that would not come up
 	pub fn open(front: Front, project: &Project, build: &Build) -> Result<Self> {
-		// boxed and installed before anything else touches the world: the
-		// world keeps this address. Once, here, and never again - the pointers
-		// in the table address this executable rather than the game module, so
-		// no reload disturbs them, which is the whole difference between this
-		// and a console command and is why one has to be forgotten on unload
-		// and the other does not.
-		let mut simulation = Box::new(Simulation::new());
-		let mut world = Box::<World>::default();
-		world.install_physics(simulation.table());
+		let mut opening = Opening::start(front, project, build)?;
 
-		let mut assets = Assets::of(project);
-		assets.sync(&mut world);
-		start(&mut world, &mut simulation, project)?;
-
-		if let Some(viewport) = front.viewport() {
-			world.ui.set_viewport(viewport, 1.0);
-			world.aspect = viewport.x / viewport.y;
+		loop {
+			match opening.advance()? {
+				| Progress::Moved(stage) => debug!(stage = stage.title(), "up"),
+				| Progress::Waiting(_) => thread::sleep(BUILD_POLL),
+				| Progress::Done => return opening.finish(),
+			}
 		}
-
-		// after the assets rather than before them, so the first copy into the
-		// mixer's bank finds a registry that is already full.
-		let audio = if front.is_window() { listen(&world) } else { None };
-
-		if front.has_console() {
-			crate::console::install(&mut world);
-		}
-
-		let net = connect(front, &mut world)?;
-
-		#[cfg(feature = "editor")]
-		if front.is_window() {
-			// registered here rather than in `Editor::new`, so that they exist
-			// whether or not a window was ever made - and before the module,
-			// so that they are the engine's.
-			Editor::install(&mut world);
-		}
-
-		if front.is_window() {
-			// the window's own: a picture of what it shows needs its device,
-			// so the frame loop takes the line. Before the module, so that it
-			// is the engine's. @ref `crate::screenshot`.
-			world.cvars.command(
-				crate::screenshot::COMMAND,
-				console::defer,
-				"write what the window shows to a png under screenshots/: a name, or the next \
-				 number",
-			);
-		}
-
-		// a project without a game crate has no module, and runs on its scenes
-		// and its programs. @ref `Game::open` for the build that links one in.
-		let module = project.game().is_some().then(|| project.module());
-
-		if module.is_none() {
-			info!(
-				project = project.id(),
-				"no game crate; the world is its scenes and its programs"
-			);
-		}
-
-		// mounted in the engine's workspace and built if no image of it exists
-		// yet, before it is loaded. @ref `crate::mount` for why a module has
-		// to be built there and nowhere else.
-		prepare_module(project, build, module.as_deref())?;
-
-		let game = Game::open(&mut world, module.as_deref())?;
-
-		// last of the three that register, because a line in it may name a
-		// variable the game registered a moment ago.
-		let console = front
-			.has_console()
-			.then(|| Console::open(&mut world, &project.settings()));
-
-		// a run that cannot start its interpreter is a run that stops, whatever
-		// the front: a picture, a sound and a digest are only comparable when
-		// the same programs ran, and a window without its documents' logic is
-		// a different window rather than a lesser one.
-		let scripts = Vm::new(console::defer)?;
-
-		Ok(Self {
-			world,
-			simulation,
-			assets,
-			game,
-			scripts,
-			interface: Interface::new(),
-			console,
-			net,
-			audio,
-			records: Vec::new(),
-			started: Instant::now(),
-			project: project.clone(),
-		})
 	}
 
 	/// Everything that happens once a frame and outside a step.
@@ -407,37 +321,397 @@ impl Runtime {
 	pub fn project(&self) -> &Project { &self.project }
 }
 
-/// Makes sure the project's module can be loaded: mounted in the engine's
-/// workspace, and built when no image of it exists yet.
+/// How long a windowless front waits between two looks at a build that is
+/// still running.
+const BUILD_POLL: Duration = Duration::from_millis(50);
+
+/// The stages a world comes up in, in the order they run.
 ///
-/// A project opened for the first time on this engine has no `<id>_game.dll`
-/// beside the executable, and loading has to wait for one; the build is the
-/// same one the watcher runs on an edit, and it inherits the terminal so that
-/// a compile error lands in front of whoever is opening the project. Dead
-/// mounts are swept first, because one of those fails every cargo command.
-///
-/// @param project - whose module
-/// @param build - where the engine is
-/// @param module - the module's name, or nothing for a project with no crate
-#[cfg(feature = "hot_reload")]
-fn prepare_module(project: &Project, build: &Build, module: Option<&str>) -> Result {
-	let Some(module) = module else {
-		return Ok(());
-	};
+/// The order is the window's, which was the most demanding of the four
+/// fronts: the assets before the module, so `init` finds its meshes by name;
+/// the host's variables before the module, so they are the engine's and
+/// survive a reload; the socket before the module, so a client has said what
+/// it is before `init` reads `World::peer`; the editor's variables before the
+/// module for the reason the host's are; the config after the module, because
+/// a line in it may name a variable the game registered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+	/// The asset tree, compiled and loaded.
+	Assets,
 
-	crate::mount::sweep(&build.engine);
-	crate::mount::mount(project, &build.engine)?;
+	/// The scene the project starts as, put in place.
+	Scene,
 
-	if !colby_core::mods::path::from_name(module)?.is_file() {
-		crate::watch::build(build)?;
-	}
+	/// The host's variables, the output device, the editor's variables.
+	Console,
 
-	Ok(())
+	/// The socket, for a front that is on a wire.
+	Wire,
+
+	/// The game crate, mounted in the engine's workspace and built by cargo.
+	Build,
+
+	/// The module, loaded and initialized.
+	Module,
+
+	/// The settings archive, run against the table.
+	Settings,
+
+	/// The interpreter.
+	Scripts,
 }
 
-/// Nothing to prepare: the game is linked in, whatever a project says.
-#[cfg(not(feature = "hot_reload"))]
-fn prepare_module(_project: &Project, _build: &Build, _module: Option<&str>) -> Result { Ok(()) }
+impl Stage {
+	/// Every stage, in the order they run.
+	pub const ALL: [Self; 8] = [
+		Self::Assets,
+		Self::Scene,
+		Self::Console,
+		Self::Wire,
+		Self::Build,
+		Self::Module,
+		Self::Settings,
+		Self::Scripts,
+	];
+
+	/// What a screen says while the stage runs.
+	#[must_use]
+	pub const fn title(self) -> &'static str {
+		match self {
+			| Self::Assets => "compiling the assets",
+			| Self::Scene => "the startup scene",
+			| Self::Console => "the console and the output device",
+			| Self::Wire => "the wire",
+			| Self::Build => "building the game crate",
+			| Self::Module => "loading the game module",
+			| Self::Settings => "reading settings.cfg",
+			| Self::Scripts => "starting the interpreter",
+		}
+	}
+
+	/// The stage after this one, if there is one.
+	const fn after(self) -> Option<Self> {
+		match self {
+			| Self::Assets => Some(Self::Scene),
+			| Self::Scene => Some(Self::Console),
+			| Self::Console => Some(Self::Wire),
+			| Self::Wire => Some(Self::Build),
+			| Self::Build => Some(Self::Module),
+			| Self::Module => Some(Self::Settings),
+			| Self::Settings => Some(Self::Scripts),
+			| Self::Scripts => None,
+		}
+	}
+}
+
+/// What one call to [`Opening::advance`] came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+	/// This stage finished.
+	Moved(Stage),
+
+	/// This stage is still busy - a build cargo has not finished - and the
+	/// next call will look again.
+	Waiting(Stage),
+
+	/// Every stage has run; @ref [`Opening::finish`].
+	Done,
+}
+
+/// A world on its way up, one stage at a time.
+///
+/// A value rather than a function because a window wants to draw between the
+/// stages: compiling an asset tree and building a game crate take seconds,
+/// and a window that shows nothing for those seconds looks like a window that
+/// died. So the stand-up is something a frame loop can hold and push one
+/// stage a frame, drawing what the screen should say in between - and the
+/// build, which is another process, is looked at rather than waited for, so
+/// the window stays a window while cargo works. The fronts with no screen run
+/// it to the end in one call, @ref [`Runtime::open`], which is what keeps this
+/// the one order a world is brought up in.
+pub struct Opening {
+	front: Front,
+	project: Project,
+	#[cfg(feature = "hot_reload")]
+	build: Build,
+
+	/// The stage the next call runs, or nothing once every stage has.
+	next: Option<Stage>,
+
+	world: Box<World>,
+	simulation: Box<Simulation>,
+	assets: Assets,
+	audio: Option<Device>,
+	net: Option<Net>,
+	game: Option<Game>,
+	console: Option<Console>,
+	scripts: Option<Vm>,
+
+	/// The module's name, or nothing for a project with no crate.
+	module: Option<String>,
+
+	/// The cargo building the module, while it runs.
+	#[cfg(feature = "hot_reload")]
+	building: Option<std::process::Child>,
+}
+
+impl Opening {
+	/// The world and its solver, and nothing that takes time.
+	///
+	/// @param front - what kind of process this is
+	/// @param project - the project everything on disk resolves against
+	/// @param build - what the build script knew, for the build stage
+	#[cfg_attr(
+		not(feature = "hot_reload"),
+		expect(
+			unused_variables,
+			reason = "with the game linked in there is no crate to build, and the two builds \
+			          have to agree on a signature"
+		)
+	)]
+	pub fn start(front: Front, project: &Project, build: &Build) -> Result<Self> {
+		// boxed and installed before anything else touches the world: the
+		// world keeps this address. Once, here, and never again - the pointers
+		// in the table address this executable rather than the game module, so
+		// no reload disturbs them, which is the whole difference between this
+		// and a console command and is why one has to be forgotten on unload
+		// and the other does not.
+		let simulation = Box::new(Simulation::new());
+		let mut world = Box::<World>::default();
+		world.install_physics(simulation.table());
+
+		if let Some(viewport) = front.viewport() {
+			world.ui.set_viewport(viewport, 1.0);
+			world.aspect = viewport.x / viewport.y;
+		}
+
+		// a project without a game crate has no module, and runs on its scenes
+		// and its programs. @ref `Game::open` for the build that links one in.
+		let module = project.game().is_some().then(|| project.module());
+
+		if module.is_none() {
+			info!(
+				project = project.id(),
+				"no game crate; the world is its scenes and its programs"
+			);
+		}
+
+		Ok(Self {
+			front,
+			project: project.clone(),
+			#[cfg(feature = "hot_reload")]
+			build: build.clone(),
+			next: Some(Stage::Assets),
+			world,
+			simulation,
+			assets: Assets::of(project),
+			audio: None,
+			net: None,
+			game: None,
+			console: None,
+			scripts: None,
+			module,
+			#[cfg(feature = "hot_reload")]
+			building: None,
+		})
+	}
+
+	/// The stage the next call to [`advance`](Self::advance) runs, or nothing
+	/// once every stage has run.
+	#[must_use]
+	pub const fn next(&self) -> Option<Stage> { self.next }
+
+	/// The world as it stands, for a screen that draws it while it comes up.
+	#[must_use]
+	pub fn world(&self) -> &World { &self.world }
+
+	/// The world as it stands, for a renderer that has to tell it how wide
+	/// the window is.
+	pub fn world_mut(&mut self) -> &mut World { &mut self.world }
+
+	/// Runs the next stage, or looks again at one that is still busy.
+	///
+	/// @return what came of it: a stage finished, a stage still busy, or
+	/// nothing left to run
+	pub fn advance(&mut self) -> Result<Progress> {
+		let Some(stage) = self.next else {
+			return Ok(Progress::Done);
+		};
+
+		match stage {
+			| Stage::Assets => self.assets.sync(&mut self.world),
+			| Stage::Scene => start(&mut self.world, &mut self.simulation, &self.project)?,
+			| Stage::Console => self.console_stage(),
+			| Stage::Wire => self.net = connect(self.front, &mut self.world)?,
+			| Stage::Build =>
+				if !self.build_stage()? {
+					return Ok(Progress::Waiting(stage));
+				},
+			| Stage::Module => self.game = Game::open(&mut self.world, self.module.as_deref())?,
+			| Stage::Settings => self.settings_stage(),
+			| Stage::Scripts => self.scripts = Some(Vm::new(console::defer)?),
+		}
+
+		self.next = stage.after();
+
+		Ok(Progress::Moved(stage))
+	}
+
+	/// The runtime, once every stage has run.
+	///
+	/// # Errors
+	///
+	/// If a stage is still to run: the value is not a runtime yet.
+	pub fn finish(self) -> Result<Runtime> {
+		let Self {
+			project,
+			next,
+			world,
+			simulation,
+			assets,
+			audio,
+			net,
+			game,
+			console,
+			scripts,
+			..
+		} = self;
+
+		if let Some(stage) = next {
+			return Err!(Err("the world is not up yet; {} is still to run", stage.title()));
+		}
+
+		let Some(scripts) = scripts else {
+			return Err!(Err("the world is not up yet; the interpreter is still to start"));
+		};
+
+		Ok(Runtime {
+			world,
+			simulation,
+			assets,
+			game,
+			scripts,
+			interface: Interface::new(),
+			console,
+			net,
+			audio,
+			records: Vec::new(),
+			started: Instant::now(),
+			project,
+		})
+	}
+
+	/// The output device, the host's variables and the editor's, and the
+	/// window's own command.
+	fn console_stage(&mut self) {
+		// after the assets rather than before them, so the first copy into the
+		// mixer's bank finds a registry that is already full.
+		if self.front.is_window() {
+			self.audio = listen(&self.world);
+		}
+
+		if self.front.has_console() {
+			crate::console::install(&mut self.world);
+		}
+
+		#[cfg(feature = "editor")]
+		if self.front.is_window() {
+			// registered here rather than in `Editor::new`, so that they exist
+			// whether or not a window was ever made - and before the module,
+			// so that they are the engine's.
+			Editor::install(&mut self.world);
+		}
+
+		if self.front.is_window() {
+			// the window's own: a picture of what it shows needs its device,
+			// so the frame loop takes the line. Before the module, so that it
+			// is the engine's. @ref `crate::screenshot`.
+			self.world.cvars.command(
+				crate::screenshot::COMMAND,
+				console::defer,
+				"write what the window shows to a png under screenshots/: a name, or the next \
+				 number",
+			);
+		}
+	}
+
+	/// The settings archive, run against the table.
+	///
+	/// Last of the three that register, because a line in it may name a
+	/// variable the game registered a moment ago.
+	fn settings_stage(&mut self) {
+		if self.front.has_console() {
+			self.console = Some(Console::open(&mut self.world, &self.project.settings()));
+		}
+	}
+
+	/// Mounts the project in the engine's workspace and builds its crate.
+	///
+	/// **Built at every open, not only when no image exists.** cargo is the
+	/// one thing that knows whether the image on disk matches the engine this
+	/// process runs and the sources as they stand now; a build that has
+	/// nothing to do is a third of a second, and one that has something to do
+	/// is the difference between a module that loads and a module built
+	/// against yesterday's core that fails to. The build is another process,
+	/// looked at rather than waited for, so a window can go on drawing.
+	///
+	/// @return whether the stage is finished: the build done, or nothing to
+	/// build
+	#[cfg(feature = "hot_reload")]
+	fn build_stage(&mut self) -> Result<bool> {
+		let Some(module) = self.module.as_deref() else {
+			return Ok(true);
+		};
+
+		let Some(child) = self.building.as_mut() else {
+			// dead mounts are swept first, because one of those fails every
+			// cargo command. @ref `crate::mount` for why a module has to be
+			// built in the engine's workspace and nowhere else.
+			crate::mount::sweep(&self.build.engine);
+			crate::mount::mount(&self.project, &self.build.engine)?;
+			self.building = Some(crate::watch::start(&self.build)?);
+
+			return Ok(false);
+		};
+
+		let Some(built) = crate::watch::finished(child)? else {
+			return Ok(false);
+		};
+
+		self.building = None;
+
+		if built {
+			return Ok(true);
+		}
+
+		// a build that failed with an image on disk is a warning and the
+		// image, because the image may well be the one that was running a
+		// moment ago; with no image there is nothing to load and this is a
+		// stop, with cargo's own words already on the terminal.
+		if colby_core::mods::path::from_name(module)?.is_file() {
+			colby_core::warn!(
+				module,
+				"building the game crate failed; loading the image that is there, which may be \
+				 stale"
+			);
+
+			return Ok(true);
+		}
+
+		Err!(Module("building the game crate failed, and there is no image of it to load"))
+	}
+
+	/// Nothing to build: the game is linked in, whatever a project says.
+	#[cfg(not(feature = "hot_reload"))]
+	#[expect(
+		clippy::unnecessary_wraps,
+		clippy::unused_self,
+		clippy::needless_pass_by_ref_mut,
+		reason = "the hot-reload build of this stage can fail and works on what it holds, and \
+		          the two have to agree on a signature"
+	)]
+	fn build_stage(&mut self) -> Result<bool> { Ok(true) }
+}
 
 /// Puts the world the project starts as in place, if its file names one.
 ///
@@ -570,6 +844,62 @@ mod tests {
 
 	use super::*;
 	use crate::net::{Loopback, Wire};
+
+	#[test]
+	fn the_stages_run_in_the_order_the_stand_up_always_had() {
+		// the assets before the module, the host's variables before the
+		// module, the socket before the module, the config after it: what the
+		// old one function did in one order, kept as a list a screen can show.
+		let mut walked = vec![Stage::ALL[0]];
+
+		while let Some(next) = walked.last().and_then(|stage| stage.after()) {
+			walked.push(next);
+		}
+
+		assert_eq!(walked, Stage::ALL, "the chain and the list agree");
+		assert_eq!(Stage::ALL.map(Stage::title), [
+			"compiling the assets",
+			"the startup scene",
+			"the console and the output device",
+			"the wire",
+			"building the game crate",
+			"loading the game module",
+			"reading settings.cfg",
+			"starting the interpreter",
+		]);
+	}
+
+	#[test]
+	fn an_opening_is_not_a_runtime_until_every_stage_has_run() {
+		let scratch = std::env::temp_dir().join("colby_opening_early");
+		let project = Project::parse(
+			&scratch,
+			r#"{ "schema": 1, "engine": "0.1.0", "id": "early", "name": "early" }"#,
+		)
+		.expect("a project");
+		let build = Build {
+			engine: scratch,
+			cargo: "cargo".to_owned(),
+			profile: "dev".to_owned(),
+			rustflags: String::new(),
+			package: "colby".to_owned(),
+		};
+
+		let opening = Opening::start(Front::Fixed, &project, &build).expect("started");
+
+		assert_eq!(opening.next(), Some(Stage::Assets), "nothing has run");
+		assert!(
+			(opening.world().aspect - VIEWPORT.x / VIEWPORT.y).abs() < f32::EPSILON,
+			"laid out like a picture"
+		);
+
+		let Err(error) = opening.finish() else {
+			panic!("an opening with every stage still to run is not a runtime");
+		};
+		let text = error.to_string();
+
+		assert!(text.contains("compiling the assets"), "it says which stage: {text}");
+	}
 
 	impl Runtime {
 		/// A runtime with a world in it and nothing loaded, for the questions

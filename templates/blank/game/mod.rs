@@ -49,7 +49,7 @@ unsafe extern "C-unwind" fn init(world: *mut World) {
 	// this runs.
 	let world = unsafe { &*world };
 
-	info!(reloads = world.reloads, entities = world.entities.len(), "blank game init");
+	info!(reloads = world.reloads, entities = world.entities.len(), "$id game init");
 }
 
 /// Runs once a simulation step, and has nothing to do.
@@ -68,5 +68,5 @@ unsafe extern "C-unwind" fn shutdown(world: *mut World) {
 	// SAFETY: as init.
 	let world = unsafe { &*world };
 
-	info!(steps = world.steps, "blank game shutdown");
+	info!(steps = world.steps, "$id game shutdown");
 }

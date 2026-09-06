@@ -258,26 +258,40 @@ fn cargo(facts: &Build) -> Command {
 	command
 }
 
-/// Builds the game crate now, and waits for it.
+/// Starts a build of the game crate, and hands it back to be looked at.
 ///
-/// For a module image that does not exist yet - a project opened for the first
-/// time on this engine. The same command the watcher runs on an edit, so the
-/// two cannot disagree about how a module is built; it inherits the terminal,
-/// so a compile error lands in front of whoever is opening the project.
+/// The same command the watcher runs on an edit, so the two cannot disagree
+/// about how a module is built; it inherits the terminal, so a compile error
+/// lands in front of whoever is opening the project. Looked at through
+/// [`finished`] rather than waited for, so that a window can go on drawing
+/// while cargo works.
 ///
 /// @param facts - what the build script knew
-pub(crate) fn build(facts: &Build) -> Result {
-	info!("no module image yet; building the game crate");
+pub(crate) fn start(facts: &Build) -> Result<Child> {
+	info!("building the game crate");
 
-	let status = cargo(facts)
-		.status()
-		.map_err(|error| err!(Module("could not start cargo: {error}")))?;
+	cargo(facts)
+		.spawn()
+		.map_err(|error| err!(Module("could not start cargo: {error}")))
+}
 
-	if !status.success() {
-		return Err(err!(Module("building the game crate failed: {status}")));
+/// Whether a build [`start`] began has finished, and how.
+///
+/// @param child - the build
+/// @return nothing while it is still running; whether it succeeded once it
+/// is not
+pub(crate) fn finished(child: &mut Child) -> Result<Option<bool>> {
+	match child.try_wait() {
+		| Ok(None) => Ok(None),
+		| Ok(Some(status)) => {
+			if status.success() {
+				debug!("game crate built");
+			}
+
+			Ok(Some(status.success()))
+		},
+		| Err(error) => Err(err!(Module("waiting on the build process failed: {error}"))),
 	}
-
-	Ok(())
 }
 
 /// The most recent modification time under a set of directories.

@@ -62,10 +62,10 @@ pub const MOUNTS_DIR: &str = "projects";
 pub const GAME_DIR: &str = "game";
 
 /// The fewest characters an id may have.
-const ID_SHORTEST: usize = 2;
+pub const ID_SHORTEST: usize = 2;
 
 /// The most characters an id may have.
-const ID_LONGEST: usize = 32;
+pub const ID_LONGEST: usize = 32;
 
 /// The engine version this build reports, and writes into a new project.
 pub const ENGINE: &str = env!("CARGO_PKG_VERSION");

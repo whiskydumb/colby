@@ -165,6 +165,28 @@ impl Console {
 	}
 }
 
+/// What the archive last said a variable was, without running it.
+///
+/// For the one variable that is needed before there is a table to run the
+/// archive against: the graphics API a window is made with is decided before
+/// the world comes up, because the screen that shows the world coming up
+/// needs a device to be drawn on. The same parser the archive is run with,
+/// so a value quoted in the file reads here as it reads there; the last line
+/// naming the variable wins, as it does when the file is run.
+///
+/// @param archive - the file, which need not exist
+/// @param name - the variable
+/// @return its value's first word, if a line in the file sets it
+pub(crate) fn archived(archive: &Path, name: &str) -> Option<String> {
+	let text = fs::read_to_string(archive).ok()?;
+
+	console::statements(&text)
+		.into_iter()
+		.rev()
+		.find(|words| words.first().is_some_and(|word| word == name))
+		.and_then(|words| words.get(1).cloned())
+}
+
 /// Registers everything the host answers for.
 ///
 /// Called before the game module loads, so that these are the engine's and stay
@@ -963,6 +985,52 @@ mod tests {
 	};
 
 	use super::*;
+
+	#[test]
+	fn the_one_variable_a_window_needs_before_the_table_is_read_from_the_archive_by_name() {
+		let dir = std::env::temp_dir().join("colby_console_archived");
+		drop(fs::remove_dir_all(&dir));
+		fs::create_dir_all(&dir).expect("a directory to work in");
+		let archive = dir.join("settings.cfg");
+
+		assert_eq!(archived(&archive, "r.backend"), None, "no file is no answer");
+
+		fs::write(
+			&archive,
+			"// written by colby
+sim.rate 60
+r.backend \"dx12, vulkan\"; snd.volume 1
+r.backend auto
+",
+		)
+		.expect("the archive");
+
+		assert_eq!(
+			archived(&archive, "r.backend").as_deref(),
+			Some("auto"),
+			"the last line naming it wins, as it does when the file is run"
+		);
+		assert_eq!(archived(&archive, "sim.rate").as_deref(), Some("60"));
+		assert_eq!(
+			archived(&archive, "snd.volume").as_deref(),
+			Some("1"),
+			"after a semicolon too"
+		);
+		assert_eq!(archived(&archive, "r.shadows"), None, "a name not in the file is no answer");
+
+		fs::write(
+			&archive,
+			"r.backend \"dx12, vulkan\"
+",
+		)
+		.expect("a quoted value");
+
+		assert_eq!(
+			archived(&archive, "r.backend").as_deref(),
+			Some("dx12, vulkan"),
+			"quotes come off, the way the parser takes them off for the table"
+		);
+	}
 
 	/// A console command that writes down where the world said its caller was
 	/// pointing, and then throws if it was told to.

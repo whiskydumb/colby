@@ -61,8 +61,9 @@ const CONNECT: &str = "--connect";
 ///
 /// Not a run of its own: a picture, a sound, a host and a window all run
 /// *some* project, and without this flag it is the one in the working
-/// directory. @ref `crate::run`, which looks there.
-const PROJECT: &str = "--project";
+/// directory. @ref `crate::run`, which looks there, and `crate::launcher`,
+/// which hands it to the process it starts.
+pub(crate) const PROJECT: &str = "--project";
 
 /// What the command line asked for: a run, and the project to run it in.
 #[derive(Clone, Debug, PartialEq, Eq)]

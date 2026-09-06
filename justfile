@@ -102,6 +102,14 @@ hot-build $CARGO_ENCODED_RUSTFLAGS=hot_flags:
 hot: hot-build
     ./{{hot_exe}} --project "{{project}}"
 
+# open the launcher: every project on this person's list, and a new one
+#
+# @note: no project named and none in this directory, which is the whole of
+# how the launcher is asked for. The project it opens runs in a process of its
+# own, the same executable with --project.
+launcher: hot-build
+    ./{{hot_exe}}
+
 # render one frame of the game to a png, without opening a window
 shot path="colby.png": hot-build
     ./{{hot_exe}} --project "{{project}}" --shot "{{path}}"

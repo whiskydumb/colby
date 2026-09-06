@@ -369,6 +369,7 @@ dependencies = [
 name = "colby_editor"
 version = "0.1.0"
 dependencies = [
+ "colby_asset",
  "colby_core",
  "colby_engine",
  "egui",
