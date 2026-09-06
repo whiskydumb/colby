@@ -19,7 +19,10 @@
 //! the step is the only thing that otherwise copies one into the other, so an
 //! entity dragged on its own would snap back the moment play started.
 
-use colby_core::abi::{Body, BodyId, EntityId, JointId, Transform, World};
+use colby_core::{
+	abi::{Body, BodyId, EntityId, JointId, Transform, World},
+	glam::Vec3,
+};
 
 /// One thing in the world, whichever of the three tables it lives in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,67 +63,123 @@ impl Pick {
 	}
 }
 
-/// What the tree is pointing at, and what it was called when it was picked.
+/// What the panels are pointing at: one thing or several, each with the
+/// name it answered to when it was picked.
+///
+/// **The last one picked is the primary**: the gizmo hangs off it, the
+/// inspector shows it, and a drag moves everything else by what it did to
+/// the primary. Godot and Unity both put the handles on the last thing
+/// clicked, and it is the one the person is looking at.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Selection {
-	/// The handle, which is what everything is done through.
-	at: Pick,
-
-	/// The name it answered to when it was picked, or empty.
+	/// Everything selected, in the order it was picked, the primary last.
 	///
-	/// Only ever read by [`refresh`](Self::refresh), and only when the handle
-	/// has stopped resolving.
-	name: String,
+	/// The name is only ever read by [`refresh`](Self::refresh), and only
+	/// when the handle has stopped resolving.
+	held: Vec<(Pick, String)>,
 }
 
 impl Selection {
-	/// What is selected.
-	pub(crate) const fn at(&self) -> Pick { self.at }
+	/// The primary: the last thing picked, or nothing.
+	pub(crate) fn at(&self) -> Pick {
+		self.held
+			.last()
+			.map_or(Pick::Nothing, |(pick, _)| *pick)
+	}
 
-	/// Whether a particular thing is the selected one.
-	pub(crate) fn is(&self, pick: Pick) -> bool { self.at == pick }
+	/// Whether a particular thing is among the selected.
+	pub(crate) fn is(&self, pick: Pick) -> bool {
+		pick != Pick::Nothing && self.held.iter().any(|(held, _)| *held == pick)
+	}
 
-	/// Selects something, remembering what it is called.
+	/// How many things are selected.
+	pub(crate) fn len(&self) -> usize { self.held.len() }
+
+	/// Everything selected, the primary last.
+	pub(crate) fn picks(&self) -> Vec<Pick> { self.held.iter().map(|(pick, _)| *pick).collect() }
+
+	/// Everything selected but the primary.
+	pub(crate) fn others(&self) -> Vec<Pick> {
+		let count = self.held.len().saturating_sub(1);
+
+		self.held
+			.iter()
+			.take(count)
+			.map(|(pick, _)| *pick)
+			.collect()
+	}
+
+	/// Selects one thing and nothing else, remembering what it is called.
+	///
+	/// [`Pick::Nothing`] selects nothing at all, which is what a click on
+	/// empty space means.
 	///
 	/// @param world - where the name is read from
 	/// @param pick - what to select
 	pub(crate) fn set(&mut self, world: &World, pick: Pick) {
-		self.at = pick;
-		pick.name(world).clone_into(&mut self.name);
+		self.held.clear();
+
+		if pick != Pick::Nothing {
+			self.held
+				.push((pick, pick.name(world).to_owned()));
+		}
+	}
+
+	/// Adds a thing to the selection, or takes it out if it was in.
+	///
+	/// A thing added becomes the primary; a thing taken out leaves whatever
+	/// was picked before it as the primary. Nothing at all is neither added
+	/// nor taken out.
+	///
+	/// @param world - where the name is read from
+	/// @param pick - what to add or take out
+	pub(crate) fn toggle(&mut self, world: &World, pick: Pick) {
+		if pick == Pick::Nothing {
+			return;
+		}
+
+		if let Some(index) = self
+			.held
+			.iter()
+			.position(|(held, _)| *held == pick)
+		{
+			self.held.remove(index);
+		} else {
+			self.held
+				.push((pick, pick.name(world).to_owned()));
+		}
 	}
 
 	/// Selects nothing.
-	pub(crate) fn clear(&mut self) {
-		self.at = Pick::Nothing;
-		self.name.clear();
-	}
+	pub(crate) fn clear(&mut self) { self.held.clear(); }
 
 	/// Finds the selection again if the world was replaced under it.
 	///
 	/// Called once a frame, before anything is drawn. A handle that still
 	/// resolves is left exactly alone - that is the ordinary case and it costs
 	/// one lookup. A handle that does not is looked for by name in the table
-	/// it came from, and a name nothing answers to clears the selection rather
+	/// it came from, and a name nothing answers to drops that entry rather
 	/// than leaving it pointing at a thing that is gone.
 	///
 	/// @param world - the world as it now is
 	pub(crate) fn refresh(&mut self, world: &World) {
-		if self.at.alive(world) {
-			// the name may have been edited since, here or by anything else
-			// holding the world. What is remembered is what it is called now.
-			self.at.name(world).clone_into(&mut self.name);
-
-			return;
+		for (pick, name) in &mut self.held {
+			if pick.alive(world) {
+				// the name may have been edited since, here or by anything
+				// else holding the world. What is remembered is what it is
+				// called now.
+				pick.name(world).clone_into(name);
+			} else {
+				*pick = again(world, *pick, name);
+			}
 		}
 
-		match again(world, self.at, &self.name) {
-			// nothing answers to it any more, so neither the handle nor the
-			// name is worth holding: a name with no handle beside it could
-			// only ever match something that has not been created yet, which
-			// is not the same thing and would be a surprise.
-			| Pick::Nothing => self.clear(),
-			| found => self.at = found,
-		}
+		// nothing answers to it any more, so neither the handle nor the name
+		// is worth holding: a name with no handle beside it could only ever
+		// match something that has not been created yet, which is not the
+		// same thing and would be a surprise.
+		self.held
+			.retain(|(pick, _)| *pick != Pick::Nothing);
 	}
 }
 
@@ -394,12 +453,398 @@ pub(crate) fn body_words(body: &Body) -> String {
 	}
 }
 
+/// Every entity hanging off one, directly or through others, in slot order.
+///
+/// A scan of the table rather than a list kept on the parent: the table has
+/// no children walk, and the panels ask this a few times a frame at most.
+///
+/// @param world - what to look in
+/// @param id - the ancestor
+pub(crate) fn descendants(world: &World, id: EntityId) -> Vec<EntityId> {
+	if !world.entities.alive(id) {
+		return Vec::new();
+	}
+
+	world
+		.entities
+		.iter()
+		.map(|(candidate, ..)| candidate)
+		.filter(|&candidate| candidate != id && hangs_off(world, candidate, id))
+		.collect()
+}
+
+/// Whether an entity hangs off another, at any distance.
+fn hangs_off(world: &World, child: EntityId, ancestor: EntityId) -> bool {
+	let mut above = world.entities.parent(child);
+
+	// bounded like the walk in `Entities::set_parent`, and for the same
+	// reason: a loop cannot be made, and a walk that could not end must.
+	for _ in 0..colby_core::abi::MAX_ENTITIES {
+		if !above.is_some() {
+			return false;
+		}
+
+		if above == ancestor {
+			return true;
+		}
+
+		above = world.entities.parent(above);
+	}
+
+	false
+}
+
+/// What a deletion took with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Deleted {
+	/// Entities, the selected ones and everything hanging off them.
+	pub(crate) entities: usize,
+
+	/// Bodies, the selected ones and every one driving an entity that went.
+	pub(crate) bodies: usize,
+
+	/// Joints, the selected ones and every one holding a body that went.
+	pub(crate) joints: usize,
+}
+
+/// Every entity picked, with everything hanging off each: once, alive, in
+/// slot order.
+///
+/// What a deletion takes and what a duplicate copies, because Godot and
+/// Unity both act on a branch rather than a node. Slot order so that a
+/// parent comes before its child whenever the table's order says so.
+fn branches(world: &World, picks: &[Pick]) -> Vec<EntityId> {
+	let mut found: Vec<EntityId> = Vec::new();
+
+	for &pick in picks {
+		let Pick::Entity(id) = pick else {
+			continue;
+		};
+
+		for each in std::iter::once(id).chain(descendants(world, id)) {
+			if world.entities.alive(each) && !found.contains(&each) {
+				found.push(each);
+			}
+		}
+	}
+
+	found.sort_by_key(|id| id.slot());
+
+	found
+}
+
+/// The bodies picked on their own, alive, once.
+fn picked_bodies(world: &World, picks: &[Pick]) -> Vec<BodyId> {
+	let mut found: Vec<BodyId> = Vec::new();
+
+	for &pick in picks {
+		if let Pick::Body(id) = pick
+			&& world.bodies.alive(id)
+			&& !found.contains(&id)
+		{
+			found.push(id);
+		}
+	}
+
+	found
+}
+
+/// The joints picked on their own, alive, once.
+fn picked_joints(world: &World, picks: &[Pick]) -> Vec<JointId> {
+	let mut found: Vec<JointId> = Vec::new();
+
+	for &pick in picks {
+		if let Pick::Joint(id) = pick
+			&& world.joints.alive(id)
+			&& !found.contains(&id)
+		{
+			found.push(id);
+		}
+	}
+
+	found
+}
+
+/// Removes what is picked, and everything that could not stand without it.
+///
+/// An entity goes with everything hanging off it - Godot and Unity both
+/// delete a branch, not a node - and with the bodies driving any of them,
+/// because a body left behind would be a collider nobody can see. A body
+/// goes with the joints holding it, because a joint holding a body that is
+/// gone holds nothing. A joint goes alone.
+///
+/// @param world - the world to write
+/// @param picks - what was selected
+/// @return how many of each went
+pub(crate) fn delete(world: &mut World, picks: &[Pick]) -> Deleted {
+	let entities = branches(world, picks);
+	let mut bodies = picked_bodies(world, picks);
+	let mut joints = picked_joints(world, picks);
+
+	// the bodies driving an entity that goes, then the joints holding a body
+	// that goes: each list grows from the one before it.
+	for (body, held) in world.bodies.iter() {
+		if entities.contains(&held.entity) && !bodies.contains(&body) {
+			bodies.push(body);
+		}
+	}
+
+	for (joint, held) in world.joints.iter() {
+		if (bodies.contains(&held.first) || bodies.contains(&held.second))
+			&& !joints.contains(&joint)
+		{
+			joints.push(joint);
+		}
+	}
+
+	for joint in &joints {
+		world.joints.despawn(*joint);
+	}
+
+	for body in &bodies {
+		world.bodies.despawn(*body);
+	}
+
+	for entity in &entities {
+		world.entities.despawn(*entity);
+	}
+
+	Deleted {
+		entities: entities.len(),
+		bodies: bodies.len(),
+		joints: joints.len(),
+	}
+}
+
+/// What a handle became when its thing was copied, if it was.
+fn became<T: PartialEq + Copy>(copies: &[(T, T)], was: T) -> Option<T> {
+	copies
+		.iter()
+		.find(|(from, _)| *from == was)
+		.map(|(_, to)| *to)
+}
+
+/// Makes a copy of what is picked, beside the original and in its place.
+///
+/// An entity is copied with everything hanging off it, its name, its look
+/// and its place; a copy hangs off the copy of its parent when the parent
+/// was copied and off the same parent otherwise, which is where Godot and
+/// Unity put a duplicate. The bodies driving copied entities are copied
+/// driving the copies; a body picked on its own is copied driving nothing;
+/// a joint is copied when the body it holds first was copied, holding the
+/// copies, and skipped otherwise. Names are kept as they are - the world
+/// does not mind two things with one name, and the scene writer numbers
+/// them on the way out.
+///
+/// @param world - the world to write
+/// @param picks - what was selected
+/// @return the copies, in the order the originals were picked, the copy of
+/// the primary last: what the selection becomes
+pub(crate) fn duplicate(world: &mut World, picks: &[Pick]) -> Vec<Pick> {
+	let copies = copy_entities(world, &branches(world, picks));
+	let body_copies = copy_bodies(world, picks, &copies);
+	let joint_copies = copy_joints(world, &body_copies);
+
+	picks
+		.iter()
+		.filter_map(|pick| match *pick {
+			| Pick::Entity(id) => became(&copies, id).map(Pick::Entity),
+			| Pick::Body(id) => became(&body_copies, id).map(Pick::Body),
+			| Pick::Joint(id) => became(&joint_copies, id).map(Pick::Joint),
+			| Pick::Nothing => None,
+		})
+		.collect()
+}
+
+/// Copies entities, then hangs the copies the way the originals hang.
+///
+/// @param sources - what to copy, a parent before its child where the
+/// table's order says so; hung in a second pass so that it does not matter
+/// where it does not
+/// @return each original with its copy
+fn copy_entities(world: &mut World, sources: &[EntityId]) -> Vec<(EntityId, EntityId)> {
+	let mut copies: Vec<(EntityId, EntityId)> = Vec::new();
+
+	for &source in sources {
+		let Some(transform) = world.entities.transform(source).copied() else {
+			continue;
+		};
+
+		let copy = world.entities.spawn_at(transform);
+		if !copy.is_some() {
+			continue;
+		}
+
+		if let Some(renderable) = world.entities.renderable(source).copied() {
+			world.entities.set_renderable(copy, renderable);
+		}
+
+		let name = world.entities.name(source).to_owned();
+		world.entities.set_name(copy, &name);
+		copies.push((source, copy));
+	}
+
+	// off the copy of the parent, or off the same parent when it was not
+	// copied
+	for &(source, copy) in &copies {
+		let parent = world.entities.parent(source);
+		let hung = became(&copies, parent).unwrap_or(parent);
+
+		world.entities.set_parent(copy, hung);
+	}
+
+	copies
+}
+
+/// Copies every body driving a copied entity, driving the copy, and every
+/// body picked on its own, driving nothing.
+///
+/// @return each original with its copy
+fn copy_bodies(
+	world: &mut World,
+	picks: &[Pick],
+	copies: &[(EntityId, EntityId)],
+) -> Vec<(BodyId, BodyId)> {
+	let mut sources: Vec<BodyId> = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| became(copies, body.entity).is_some())
+		.map(|(id, _)| id)
+		.collect();
+
+	for picked in picked_bodies(world, picks) {
+		if !sources.contains(&picked) {
+			sources.push(picked);
+		}
+	}
+
+	sources.sort_by_key(|id| id.slot());
+
+	let mut body_copies: Vec<(BodyId, BodyId)> = Vec::new();
+
+	for source in sources {
+		let Some(mut body) = world.bodies.get(source).copied() else {
+			continue;
+		};
+
+		body.entity = became(copies, body.entity).unwrap_or(EntityId::NONE);
+		let copy = world.bodies.spawn(body);
+		if !copy.is_some() {
+			continue;
+		}
+
+		let name = world.bodies.name(source).to_owned();
+		world.bodies.set_name(copy, &name);
+		body_copies.push((source, copy));
+	}
+
+	body_copies
+}
+
+/// Copies every joint holding a copied body first: holding the copy, and at
+/// the far end the copy when there is one, the same body when there is not,
+/// and the world when it was the world.
+///
+/// @return each original with its copy
+fn copy_joints(world: &mut World, body_copies: &[(BodyId, BodyId)]) -> Vec<(JointId, JointId)> {
+	let mut sources: Vec<JointId> = world
+		.joints
+		.iter()
+		.filter(|(_, joint)| became(body_copies, joint.first).is_some())
+		.map(|(id, _)| id)
+		.collect();
+	sources.sort_by_key(|id| id.slot());
+
+	let mut joint_copies: Vec<(JointId, JointId)> = Vec::new();
+
+	for source in sources {
+		let Some(mut joint) = world.joints.get(source).copied() else {
+			continue;
+		};
+
+		let Some(first) = became(body_copies, joint.first) else {
+			continue;
+		};
+
+		joint.first = first;
+		if joint.second.is_some() {
+			joint.second = became(body_copies, joint.second).unwrap_or(joint.second);
+		}
+
+		let copy = world.joints.spawn(joint);
+		if !copy.is_some() {
+			continue;
+		}
+
+		let name = world.joints.name(source).to_owned();
+		world.joints.set_name(copy, &name);
+		joint_copies.push((source, copy));
+	}
+
+	joint_copies
+}
+
+/// Puts the primary where a drag took it, and everything else selected
+/// along with it.
+///
+/// What the primary did is worked out as a change in the world - a shift, a
+/// turn about the primary, a stretch away from it - and the same change is
+/// applied to where each of the others was when the drag began, so that a
+/// drag of any length lands them where one frame of it would. Turning and
+/// stretching happen about the primary rather than about each thing's own
+/// middle, which is what Godot does with several nodes under one gizmo.
+///
+/// @param world - the world to write
+/// @param primary - what the gizmo is attached to
+/// @param from - where the primary was when the drag began
+/// @param put - where the drag has taken it
+/// @param others - everything else selected, each with where it was when
+/// the drag began, in the world
+pub(crate) fn drag_all(
+	world: &mut World,
+	primary: Pick,
+	from: Transform,
+	put: Transform,
+	others: &[(Pick, Transform)],
+) {
+	place(world, primary, put);
+
+	let shift = put.position - from.position;
+	let turn = (put.rotation * from.rotation.inverse()).normalize();
+	let stretch = Vec3::new(
+		ratio(put.scale.x, from.scale.x),
+		ratio(put.scale.y, from.scale.y),
+		ratio(put.scale.z, from.scale.z),
+	);
+
+	for &(other, was) in others {
+		// the other's offset from the primary, in the primary's own axes,
+		// stretched as the primary was, turned as it was, and shifted
+		let offset = from.rotation.inverse() * (was.position - from.position);
+		let moved = from.rotation * (offset * stretch);
+
+		let landed = Transform {
+			position: from.position + turn * moved + shift,
+			rotation: (turn * was.rotation).normalize(),
+			scale: was.scale * stretch,
+		};
+
+		place(world, other, landed);
+	}
+}
+
+/// How much longer one length is than another; one when either is nothing.
+fn ratio(now: f32, before: f32) -> f32 {
+	if before.abs() < f32::EPSILON || !now.is_finite() {
+		1.0
+	} else {
+		now / before
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use colby_core::{
-		abi::{BodyKind, Joint, Shape},
-		glam::Vec3,
-	};
+	use colby_core::abi::{BodyKind, Joint, Shape};
 
 	use super::*;
 
@@ -752,5 +1197,264 @@ mod tests {
 		selection.refresh(&world);
 
 		assert_eq!(selection.at(), Pick::Entity(again), "it followed the rename");
+	}
+
+	#[test]
+	fn several_things_are_selected_and_the_last_picked_is_the_primary() {
+		let (world, entity, body, joint) = peopled();
+		let mut selection = Selection::default();
+
+		selection.set(&world, Pick::Entity(entity));
+		selection.toggle(&world, Pick::Body(body));
+		selection.toggle(&world, Pick::Joint(joint));
+
+		assert_eq!(selection.len(), 3);
+		assert_eq!(selection.at(), Pick::Joint(joint), "the last picked");
+		assert_eq!(selection.others(), vec![Pick::Entity(entity), Pick::Body(body)]);
+		assert!(selection.is(Pick::Body(body)), "and the others are selected too");
+
+		selection.toggle(&world, Pick::Joint(joint));
+		assert_eq!(
+			selection.at(),
+			Pick::Body(body),
+			"taking the primary out leaves the one before"
+		);
+
+		selection.toggle(&world, Pick::Nothing);
+		assert_eq!(selection.len(), 2, "nothing is neither added nor taken out");
+
+		selection.set(&world, Pick::Nothing);
+		assert_eq!(selection.len(), 0, "a click on empty space clears the lot");
+		assert!(!selection.is(Pick::Nothing), "and nothing is never selected");
+	}
+
+	#[test]
+	fn a_selection_of_several_keeps_the_ones_that_still_resolve() {
+		let (mut world, entity, body, _) = peopled();
+		let mut selection = Selection::default();
+		selection.set(&world, Pick::Entity(entity));
+		selection.toggle(&world, Pick::Body(body));
+
+		world.bodies.despawn(body);
+		selection.refresh(&world);
+
+		assert_eq!(
+			selection.picks(),
+			vec![Pick::Entity(entity)],
+			"the body is gone, the entity stays"
+		);
+	}
+
+	#[test]
+	fn descendants_are_every_entity_down_the_chain_and_not_the_ancestor_itself() {
+		let mut world = World::new();
+		let car = world.entities.spawn_at(Transform::IDENTITY);
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::X));
+		let hub = world.entities.spawn_at(Transform::at(Vec3::Y));
+		let other = world.entities.spawn_at(Transform::at(Vec3::Z));
+		assert!(world.entities.set_parent(wheel, car));
+		assert!(world.entities.set_parent(hub, wheel));
+
+		assert_eq!(descendants(&world, car), vec![wheel, hub]);
+		assert_eq!(descendants(&world, wheel), vec![hub]);
+		assert!(descendants(&world, other).is_empty());
+		assert!(descendants(&world, EntityId::NONE).is_empty(), "nothing hangs off nothing");
+	}
+
+	#[test]
+	fn deleting_an_entity_takes_its_branch_its_bodies_and_their_joints() {
+		let (mut world, entity, body, joint) = peopled();
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::X));
+		assert!(world.entities.set_parent(wheel, entity));
+		let wheel_body = world.attach_body(wheel, BodyKind::Dynamic, Shape::UNIT);
+		let bystander = world.entities.spawn_at(Transform::at(Vec3::Z));
+		let floor = world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::ball(1.0),
+			Transform::IDENTITY,
+		));
+
+		let went = delete(&mut world, &[Pick::Entity(entity)]);
+
+		assert_eq!(went, Deleted { entities: 2, bodies: 2, joints: 1 });
+		assert!(!world.entities.alive(entity) && !world.entities.alive(wheel));
+		assert!(!world.bodies.alive(body) && !world.bodies.alive(wheel_body));
+		assert!(!world.joints.alive(joint), "the rope held a body that went");
+		assert!(world.entities.alive(bystander) && world.bodies.alive(floor), "the rest stands");
+	}
+
+	#[test]
+	fn deleting_a_body_takes_its_joints_and_leaves_its_entity() {
+		let (mut world, entity, body, joint) = peopled();
+
+		let went = delete(&mut world, &[Pick::Body(body)]);
+
+		assert_eq!(went, Deleted { entities: 0, bodies: 1, joints: 1 });
+		assert!(
+			world.entities.alive(entity),
+			"the thing drawn stays; the collider under it went"
+		);
+		assert!(!world.joints.alive(joint));
+
+		assert_eq!(
+			delete(&mut world, &[Pick::Body(body), Pick::Nothing]),
+			Deleted::default(),
+			"a stale handle and nothing at all delete nothing"
+		);
+	}
+
+	#[test]
+	fn a_duplicate_is_a_second_branch_with_its_bodies_and_joints_beside_the_first() {
+		let (mut world, car, car_body, rope) = peopled();
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::X));
+		world.entities.set_name(wheel, "wheel");
+		assert!(world.entities.set_parent(wheel, car));
+		let wheel_body = world.attach_body(wheel, BodyKind::Dynamic, Shape::UNIT);
+		let axle = world
+			.joints
+			.spawn(Joint::weld(car_body, wheel_body, (Vec3::X, Vec3::ZERO)));
+		let before = (world.entities.len(), world.bodies.len(), world.joints.len());
+
+		let copies = duplicate(&mut world, &[Pick::Entity(car)]);
+
+		assert_eq!(copies.len(), 1, "one thing was picked, so one copy is selected");
+		let Some(Pick::Entity(car_copy)) = copies.first().copied() else {
+			panic!("the copy of the car");
+		};
+		assert_ne!(car_copy, car);
+		assert_eq!(world.entities.name(car_copy), "crate", "the name is kept");
+		assert_eq!(
+			(world.entities.len(), world.bodies.len(), world.joints.len()),
+			(before.0 + 2, before.1 + 2, before.2 + 2),
+			"the car and the wheel, their two bodies, the rope and the axle"
+		);
+		assert!(world.entities.alive(car) && world.bodies.alive(car_body), "the originals stand");
+
+		let wheel_copy = descendants(&world, car_copy);
+		assert_eq!(wheel_copy.len(), 1, "the wheel came along");
+		assert_eq!(world.entities.name(wheel_copy[0]), "wheel");
+		assert_eq!(
+			world
+				.entities
+				.placed(wheel_copy[0])
+				.map(|it| it.position),
+			world.entities.placed(wheel).map(|it| it.position),
+			"in the same place as the original"
+		);
+
+		let driving: Vec<BodyId> = world
+			.bodies
+			.iter()
+			.filter(|(_, body)| body.entity == car_copy || body.entity == wheel_copy[0])
+			.map(|(id, _)| id)
+			.collect();
+		assert_eq!(driving.len(), 2, "each copy has its body");
+
+		let holding: Vec<&Joint> = world
+			.joints
+			.iter()
+			.filter(|(id, _)| *id != rope && *id != axle)
+			.map(|(_, joint)| joint)
+			.collect();
+		assert_eq!(holding.len(), 2, "the rope to the world and the axle between the copies");
+		assert!(
+			holding
+				.iter()
+				.all(|joint| driving.contains(&joint.first)),
+			"each copied joint holds a copied body first"
+		);
+		assert!(
+			holding
+				.iter()
+				.any(|joint| !joint.second.is_some())
+				&& holding
+					.iter()
+					.any(|joint| driving.contains(&joint.second)),
+			"one still to the world, one to the other copy"
+		);
+	}
+
+	#[test]
+	fn a_body_picked_on_its_own_is_copied_driving_nothing() {
+		let (mut world, entity, body, _) = peopled();
+
+		let copies = duplicate(&mut world, &[Pick::Body(body)]);
+
+		let Some(Pick::Body(copy)) = copies.first().copied() else {
+			panic!("the copy of the body");
+		};
+		assert_eq!(
+			world.bodies.get(copy).map(|it| it.entity),
+			Some(EntityId::NONE),
+			"two bodies driving one entity would be a fight"
+		);
+		assert_eq!(
+			world.bodies.get(body).map(|it| it.entity),
+			Some(entity),
+			"the original keeps its entity"
+		);
+	}
+
+	/// Two things a unit apart along x, the first the primary.
+	fn pair() -> (World, Pick, Pick, Transform, Transform) {
+		let mut world = World::new();
+		let first = world.entities.spawn_at(Transform::IDENTITY);
+		let second = world.entities.spawn_at(Transform::at(Vec3::X));
+
+		(
+			world,
+			Pick::Entity(first),
+			Pick::Entity(second),
+			Transform::IDENTITY,
+			Transform::at(Vec3::X),
+		)
+	}
+
+	#[test]
+	fn a_shift_of_the_primary_shifts_the_others_by_the_same_amount() {
+		let (mut world, first, second, from, other) = pair();
+
+		drag_all(&mut world, first, from, Transform::at(Vec3::Y * 3.0), &[(second, other)]);
+
+		assert_eq!(
+			transform(&world, second).map(|it| it.position),
+			Some(Vec3::new(1.0, 3.0, 0.0))
+		);
+	}
+
+	#[test]
+	fn a_turn_of_the_primary_turns_the_others_around_it() {
+		let (mut world, first, second, from, other) = pair();
+		let quarter = colby_core::glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+
+		drag_all(&mut world, first, from, Transform { rotation: quarter, ..from }, &[(
+			second, other,
+		)]);
+
+		let landed = transform(&world, second).expect("still there");
+		assert!(
+			landed
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 0.0, -1.0), 1.0e-5),
+			"a unit along x, a quarter turn about y, lands a unit along -z: {landed:?}"
+		);
+		assert!(landed.rotation.abs_diff_eq(quarter, 1.0e-5), "and it turned with the primary");
+	}
+
+	#[test]
+	fn a_stretch_of_the_primary_stretches_the_others_away_from_it() {
+		let (mut world, first, second, from, other) = pair();
+
+		drag_all(
+			&mut world,
+			first,
+			from,
+			Transform { scale: Vec3::new(2.0, 1.0, 1.0), ..from },
+			&[(second, other)],
+		);
+
+		let landed = transform(&world, second).expect("still there");
+		assert_eq!(landed.position, Vec3::new(2.0, 0.0, 0.0), "twice as far along x");
+		assert_eq!(landed.scale, Vec3::new(2.0, 1.0, 1.0), "and twice as wide");
 	}
 }

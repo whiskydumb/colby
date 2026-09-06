@@ -29,7 +29,7 @@ use egui::{ComboBox, DragValue, Grid, ScrollArea, Ui};
 
 use crate::{
 	history::History,
-	select::{self, Pick},
+	select::{self, Pick, Selection},
 };
 
 /// How far a drag of one pixel moves three numbers.
@@ -45,28 +45,46 @@ const STEP_SPEED: f32 = 0.01;
 ///
 /// @param ui - the panel
 /// @param world - the tables to show, and to edit
-/// @param pick - what is selected
+/// @param selection - what is selected; the primary is shown
 /// @param history - where a write is written down, so that it can be undone
-pub(crate) fn show(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History) {
+/// @param rename - whether the name field is to take the keyboard this
+/// frame, because somebody pressed the key for it
+pub(crate) fn show(
+	ui: &mut Ui,
+	world: &mut World,
+	selection: &Selection,
+	history: &mut History,
+	rename: bool,
+) {
 	ScrollArea::vertical()
 		.auto_shrink([false, false])
-		.show(ui, |ui| detail(ui, world, pick, history));
+		.show(ui, |ui| {
+			if selection.len() > 1 {
+				ui.label(format!(
+					"{} selected: the last picked is shown, and a drag moves all of them",
+					selection.len()
+				));
+				ui.separator();
+			}
+
+			detail(ui, world, selection.at(), history, rename);
+		});
 }
 
 /// The selected thing, in detail.
-fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History) {
+fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History, rename: bool) {
 	match pick {
 		| Pick::Nothing => {
 			ui.label("nothing selected");
 		},
 		| Pick::Entity(id) => {
-			naming(ui, world, pick, history);
+			naming(ui, world, pick, history, rename);
 			hanging(ui, world, id);
 			placing(ui, world, pick, history);
 			look(ui, world, id, history);
 		},
 		| Pick::Body(id) => {
-			naming(ui, world, pick, history);
+			naming(ui, world, pick, history, rename);
 			ui.label(world.bodies.get(id).map_or_else(
 				|| "gone".to_owned(),
 				|body| format!("a {}", select::body_words(body)),
@@ -75,7 +93,7 @@ fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History) {
 			solid(ui, world, id, history);
 		},
 		| Pick::Joint(id) => {
-			naming(ui, world, pick, history);
+			naming(ui, world, pick, history, rename);
 			tie(ui, world, id, history);
 		},
 	}
@@ -92,13 +110,21 @@ fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History) {
 }
 
 /// The name field.
-fn naming(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History) {
+///
+/// @param rename - whether it takes the keyboard this frame: F2's whole job
+fn naming(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History, rename: bool) {
 	let mut name = pick.name(world).to_owned();
 
 	ui.horizontal(|ui| {
 		ui.label("name");
 
-		if ui.text_edit_singleline(&mut name).changed() {
+		let response = ui.text_edit_singleline(&mut name);
+
+		if rename {
+			response.request_focus();
+		}
+
+		if response.changed() {
 			history.begin("rename", world);
 			select::rename(world, pick, &name);
 		}

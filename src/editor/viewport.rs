@@ -73,7 +73,7 @@ pub(crate) struct Viewport {
 }
 
 /// A drag of one handle, from the moment it was grabbed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Grab {
 	/// Which handle.
 	axis: Axis,
@@ -99,6 +99,11 @@ struct Grab {
 
 	/// How far the drag has gone in total.
 	total: f32,
+
+	/// Everything else that was selected when the handle was grabbed, each
+	/// with where it was in the world at that moment: what a drag of any
+	/// length lands them from. @ref [`select::drag_all`].
+	others: Vec<(Pick, Transform)>,
 }
 
 impl Viewport {
@@ -143,7 +148,7 @@ impl Viewport {
 		self.pick_tool(context);
 		self.fly(world, busy, held);
 
-		let dragging = self.gizmo(context, world, selection.at(), busy, held, view, history);
+		let dragging = self.gizmo(context, world, selection, busy, held, view, history);
 
 		let found = if busy || dragging || !held.clicked {
 			None
@@ -220,12 +225,13 @@ impl Viewport {
 		&mut self,
 		context: &Context,
 		world: &mut World,
-		pick: Pick,
+		selection: &Selection,
 		busy: bool,
 		held: Gestures,
 		view: Rect,
 		history: &mut History,
 	) -> bool {
+		let pick = selection.at();
 		let Some(at) = select::transform(world, pick) else {
 			self.grab = None;
 
@@ -259,7 +265,15 @@ impl Viewport {
 		if held.pressed
 			&& !busy && let (Some(axis), Some(point)) = (over, held.at)
 		{
-			self.hold(&camera, at, axis, point, viewport);
+			// everything else selected, with where it stands now: the drag
+			// lands them from here, however long it lasts
+			let others = selection
+				.others()
+				.into_iter()
+				.filter_map(|other| select::transform(world, other).map(|was| (other, was)))
+				.collect();
+
+			self.hold(&camera, at, axis, point, viewport, others);
 		}
 
 		if held.down
@@ -268,13 +282,29 @@ impl Viewport {
 			self.pull(world, pick, &camera, point, viewport, history);
 		}
 
-		handles.paint(context, self.grab.map_or(over, |grab| Some(grab.axis)), view);
+		handles.paint(
+			context,
+			self.grab
+				.as_ref()
+				.map_or(over, |grab| Some(grab.axis)),
+			view,
+		);
 
 		self.grab.is_some() || (over.is_some() && !busy)
 	}
 
 	/// Takes hold of a handle.
-	fn hold(&mut self, camera: &Camera, at: Transform, axis: Axis, point: Vec2, viewport: Vec2) {
+	///
+	/// @param others - everything else selected, each with where it stands
+	fn hold(
+		&mut self,
+		camera: &Camera,
+		at: Transform,
+		axis: Axis,
+		point: Vec2,
+		viewport: Vec2,
+		others: Vec<(Pick, Transform)>,
+	) {
 		let Some(start) = read(camera, at, axis, self.tool, point, viewport) else {
 			return;
 		};
@@ -287,6 +317,7 @@ impl Viewport {
 			start,
 			last: start,
 			total: 0.0,
+			others,
 		});
 	}
 
@@ -304,7 +335,7 @@ impl Viewport {
 		viewport: Vec2,
 		history: &mut History,
 	) {
-		let Some(mut grab) = self.grab else {
+		let Some(grab) = self.grab.as_mut() else {
 			return;
 		};
 
@@ -324,7 +355,6 @@ impl Viewport {
 			| Tool::Turn => grab.total + wrapped(now - grab.last),
 		};
 		grab.last = now;
-		self.grab = Some(grab);
 
 		let put = match grab.tool {
 			| Tool::Move => gizmo::moved(grab.from, grab.axis, grab.total),
@@ -332,9 +362,10 @@ impl Viewport {
 			| Tool::Size =>
 				gizmo::sized(grab.from, grab.axis, 1.0 + grab.total / grab.arm.max(1.0e-4)),
 		};
+		let (tool, from, others) = (grab.tool, grab.from, grab.others.clone());
 
-		history.begin(grab.tool.word(), world);
-		select::place(world, pick, put);
+		history.begin(tool.word(), world);
+		select::drag_all(world, pick, from, put, &others);
 	}
 }
 

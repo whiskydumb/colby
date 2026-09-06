@@ -115,8 +115,20 @@ pub struct Frame {
 /// intent and the world is written in one place, [`Panels::apply`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Change {
-	/// Select something, or nothing.
+	/// Select something and nothing else, or nothing.
 	Select(Pick),
+
+	/// Add something to the selection, or take it out.
+	Toggle(Pick),
+
+	/// Remove everything selected.
+	Delete,
+
+	/// Make a copy of everything selected, and select the copies.
+	Duplicate,
+
+	/// Put the keyboard in the primary's name field.
+	Rename,
 
 	/// Hang an entity off another, or stand it on its own.
 	Hang {
@@ -184,6 +196,9 @@ pub(crate) struct Panels {
 	viewport: viewport::Viewport,
 	history: History,
 	tab: Tab,
+	/// Whether the name field takes the keyboard this frame: F2 was pressed
+	/// last frame, and the inspector is what answers it.
+	rename: bool,
 	/// Whether the world was being edited last frame, so that play starting
 	/// is an edge: the records are dropped on it, @ref [`history`].
 	was_editing: bool,
@@ -210,6 +225,7 @@ impl Default for Panels {
 			viewport: viewport::Viewport::default(),
 			history: History::default(),
 			tab: Tab::default(),
+			rename: false,
 			was_editing: false,
 			restore: None,
 			// nowhere, until the first frame has laid the panels out: a
@@ -333,12 +349,17 @@ impl Panels {
 
 		// the viewport before the panels, against last frame's rectangle, so
 		// that a click out in the world is already in hand when the hierarchy
-		// draws the row it selected.
+		// draws the row it selected. A ctrl-click adds to what is selected
+		// rather than replacing it, out here as in the hierarchy.
 		if let Some(pick) =
 			self.viewport
 				.run(&context, world, &self.selection, self.view, &mut self.history)
 		{
-			self.selection.set(world, pick);
+			if context.input(|input| input.modifiers.command) {
+				self.selection.toggle(world, pick);
+			} else {
+				self.selection.set(world, pick);
+			}
 		}
 
 		let mut changes = Vec::new();
@@ -361,8 +382,10 @@ impl Panels {
 		Panel::right("inspector")
 			.default_size(INSPECTOR_WIDTH)
 			.show(ui, |ui| {
-				inspector::show(ui, world, self.selection.at(), &mut self.history);
+				inspector::show(ui, world, &self.selection, &mut self.history, self.rename);
 			});
+		// answered, whether or not the field took it
+		self.rename = false;
 		Panel::bottom("bottom")
 			.resizable(true)
 			.default_size(BOTTOM_HEIGHT)
@@ -387,6 +410,41 @@ impl Panels {
 		self.view = ui.available_rect_before_wrap();
 
 		self.view
+	}
+
+	/// Removes everything selected, and everything that could not stand
+	/// without it, as one record.
+	fn delete(&mut self, world: &mut World) {
+		let picks = self.selection.picks();
+		if picks.is_empty() {
+			return;
+		}
+
+		self.history.begin("delete", world);
+		let went = select::delete(world, &picks);
+		self.selection.clear();
+
+		info!(entities = went.entities, bodies = went.bodies, joints = went.joints, "deleted");
+	}
+
+	/// Copies everything selected, as one record, and selects the copies.
+	fn duplicate(&mut self, world: &mut World) {
+		let picks = self.selection.picks();
+		if picks.is_empty() {
+			return;
+		}
+
+		self.history.begin("duplicate", world);
+		let copies = select::duplicate(world, &picks);
+		self.selection.clear();
+
+		// in the order the originals were picked, so that the copy of the
+		// primary is the primary
+		for copy in &copies {
+			self.selection.toggle(world, *copy);
+		}
+
+		info!(copies = copies.len(), "duplicated");
 	}
 
 	/// Acts on play having started or stopped since the last frame.
@@ -426,6 +484,10 @@ impl Panels {
 	pub(crate) fn apply(&mut self, world: &mut World, change: Change) {
 		match change {
 			| Change::Select(pick) => self.selection.set(world, pick),
+			| Change::Toggle(pick) => self.selection.toggle(world, pick),
+			| Change::Delete => self.delete(world),
+			| Change::Duplicate => self.duplicate(world),
+			| Change::Rename => self.rename = true,
 			| Change::Hang { child, parent } => {
 				self.history.begin("hang", world);
 
@@ -451,12 +513,13 @@ impl Panels {
 	}
 }
 
-/// The two keys that take a step back and forward, if they were pressed
-/// where nothing else wanted them.
+/// The keys, if they were pressed where nothing else wanted them: a step
+/// back and forward, delete, duplicate, rename.
 ///
-/// Skipped while a text field is taking typing, so that a ctrl+z in it stays
-/// the field's - and only then: a row or a button that was clicked holds
-/// egui's focus too, and a key pressed after a click is exactly the case.
+/// Skipped while a text field is taking typing, so that a ctrl+z or a
+/// delete in it stays the field's - and only then: a row or a button that
+/// was clicked holds egui's focus too, and a key pressed after a click is
+/// exactly the case.
 fn stepped(context: &Context) -> Vec<Change> {
 	if context.text_edit_focused() {
 		return Vec::new();
@@ -473,6 +536,18 @@ fn stepped(context: &Context) -> Vec<Change> {
 			|| input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
 		{
 			changes.push(Change::Redo);
+		}
+
+		if input.consume_key(Modifiers::NONE, Key::Delete) {
+			changes.push(Change::Delete);
+		}
+
+		if input.consume_key(Modifiers::COMMAND, Key::D) {
+			changes.push(Change::Duplicate);
+		}
+
+		if input.consume_key(Modifiers::NONE, Key::F2) {
+			changes.push(Change::Rename);
 		}
 
 		changes
@@ -544,19 +619,30 @@ mod tests {
 
 	use super::*;
 
-	/// One headless frame of the whole editor over a world.
-	fn frame(panels: &mut Panels, world: &mut World) -> Rect {
+	/// One headless frame of the whole editor over a world, with these
+	/// events in it.
+	///
+	/// Built once, whatever egui asks: a context may run the closure a
+	/// second time in the same call when something asked for another pass,
+	/// and a frame built twice would answer a key twice - the same guard
+	/// `Shell::run` keeps.
+	fn frame_with(panels: &mut Panels, world: &mut World, events: Vec<egui::Event>) -> Rect {
 		let context = Context::default();
 		let clock = Clock::new();
 		let mut view = Rect::NOTHING;
+		let mut built = false;
 
 		let mut output = context.run_ui(
 			RawInput {
 				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0))),
+				events,
 				..Default::default()
 			},
 			|ui| {
-				view = panels.frame(ui, world, &clock, 1);
+				if !built {
+					built = true;
+					view = panels.frame(ui, world, &clock, 1);
+				}
 			},
 		);
 		// nothing paints this frame, and epaint asserts that a texture delta
@@ -565,6 +651,22 @@ mod tests {
 		output.textures_delta.clear();
 
 		view
+	}
+
+	/// One headless frame with nothing pressed.
+	fn frame(panels: &mut Panels, world: &mut World) -> Rect {
+		frame_with(panels, world, Vec::new())
+	}
+
+	/// One headless frame with one key pressed in it.
+	fn keyed(panels: &mut Panels, world: &mut World, key: Key, modifiers: Modifiers) {
+		frame_with(panels, world, vec![egui::Event::Key {
+			key,
+			physical_key: None,
+			pressed: true,
+			repeat: false,
+			modifiers,
+		}]);
 	}
 
 	#[test]
@@ -682,25 +784,7 @@ mod tests {
 		frame(&mut panels, &mut world);
 		assert_eq!(panels.history.undoable(), Some("hang"));
 
-		let context = Context::default();
-		let clock = Clock::new();
-		let mut output = context.run_ui(
-			RawInput {
-				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0))),
-				events: vec![egui::Event::Key {
-					key: Key::Z,
-					physical_key: None,
-					pressed: true,
-					repeat: false,
-					modifiers: Modifiers::COMMAND,
-				}],
-				..Default::default()
-			},
-			|ui| {
-				panels.frame(ui, &mut world, &clock, 1);
-			},
-		);
-		output.textures_delta.clear();
+		keyed(&mut panels, &mut world, Key::Z, Modifiers::COMMAND);
 
 		let described = panels
 			.restore
@@ -718,6 +802,65 @@ mod tests {
 				.all(|thing| thing.parent == colby_core::abi::scene::NO_INDEX),
 			"and neither hanging off the other"
 		);
+	}
+
+	#[test]
+	fn the_delete_key_removes_what_is_selected_as_one_record() {
+		let mut world = World::new();
+		world.editing = true;
+		let car = world.entities.spawn_at(Transform::at(Vec3::X));
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::Z));
+		assert!(world.entities.set_parent(wheel, car));
+		let bystander = world.entities.spawn_at(Transform::IDENTITY);
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(car)));
+
+		keyed(&mut panels, &mut world, Key::Delete, Modifiers::NONE);
+		frame(&mut panels, &mut world);
+
+		assert!(!world.entities.alive(car) && !world.entities.alive(wheel), "the branch went");
+		assert!(world.entities.alive(bystander), "and nothing else");
+		assert_eq!(panels.selection.at(), Pick::Nothing, "nothing is selected now");
+		assert_eq!(panels.history.undoable(), Some("delete"), "and it is one step back");
+	}
+
+	#[test]
+	fn ctrl_d_copies_what_is_selected_and_selects_the_copies() {
+		let mut world = World::new();
+		world.editing = true;
+		let car = world.entities.spawn_at(Transform::at(Vec3::X));
+		world.entities.set_name(car, "car");
+		let ball = world.entities.spawn_at(Transform::at(Vec3::Z));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(ball)));
+		panels.apply(&mut world, Change::Toggle(Pick::Entity(car)));
+
+		keyed(&mut panels, &mut world, Key::D, Modifiers::COMMAND);
+		frame(&mut panels, &mut world);
+
+		assert_eq!(world.entities.len(), 4, "two copies beside the two");
+		assert_eq!(panels.selection.len(), 2, "the copies are selected");
+		let Pick::Entity(primary) = panels.selection.at() else {
+			panic!("the copy of the car is the primary");
+		};
+		assert_ne!(primary, car);
+		assert_eq!(world.entities.name(primary), "car", "the copy of what was picked last");
+		assert_eq!(panels.history.undoable(), Some("duplicate"));
+	}
+
+	#[test]
+	fn f2_puts_the_keyboard_in_the_name_field_for_one_frame() {
+		let mut world = World::new();
+		world.editing = true;
+		let car = world.entities.spawn_at(Transform::at(Vec3::X));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(car)));
+
+		keyed(&mut panels, &mut world, Key::F2, Modifiers::NONE);
+		assert!(panels.rename, "asked for");
+
+		frame(&mut panels, &mut world);
+		assert!(!panels.rename, "and answered by the next frame");
 	}
 
 	#[test]

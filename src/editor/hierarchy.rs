@@ -19,14 +19,18 @@
 //! for a body - so that a name and a description can never be mistaken for
 //! each other. @ref [`select::entity_label`].
 //!
+//! **A click selects, a ctrl-click adds or takes out**, and a right click
+//! selects and opens the two things done to a selection: duplicate and
+//! delete, which the keys do as well.
+//!
 //! Nothing here changes the world: a press is handed back as a [`Change`] and
 //! applied by the caller, so the panel can be drawn in a test without a
 //! window and the world is written in one place.
 
 use colby_core::abi::{BodyId, EntityId, JointId, World};
 use egui::{
-	Align2, Button, DragAndDrop, Id, LayerId, Order, ScrollArea, Sense, Stroke, StrokeKind,
-	TextStyle, Ui, vec2,
+	Align2, Button, DragAndDrop, Id, LayerId, Order, Response, ScrollArea, Sense, Stroke,
+	StrokeKind, TextStyle, Ui, vec2,
 };
 
 use crate::{
@@ -262,9 +266,7 @@ fn entity_row(
 	// lands, so a row that went away mid-drag hangs nothing.
 	response.dnd_set_drag_payload(id);
 
-	if response.clicked() {
-		changes.push(Change::Select(pick));
-	}
+	acted(ui, &response, selection, changes, pick);
 
 	if response.dragged() {
 		ghost(ui, &label);
@@ -314,11 +316,47 @@ fn ghost(ui: &Ui, label: &str) {
 
 /// One selectable line that nothing is dropped on.
 fn row(ui: &mut Ui, selection: &Selection, changes: &mut Vec<Change>, pick: Pick, label: &str) {
-	if ui
-		.selectable_label(selection.is(pick), label)
-		.clicked()
-	{
+	let response = ui.selectable_label(selection.is(pick), label);
+
+	acted(ui, &response, selection, changes, pick);
+}
+
+/// What a press on any row comes to: a click selects, a ctrl-click adds or
+/// takes out, a right click selects what was not selected and opens the
+/// menu over the selection.
+fn acted(
+	ui: &Ui,
+	response: &Response,
+	selection: &Selection,
+	changes: &mut Vec<Change>,
+	pick: Pick,
+) {
+	if response.clicked() {
+		changes.push(if ui.input(|input| input.modifiers.command) {
+			Change::Toggle(pick)
+		} else {
+			Change::Select(pick)
+		});
+	}
+
+	if response.secondary_clicked() && !selection.is(pick) {
 		changes.push(Change::Select(pick));
+	}
+
+	response.context_menu(|ui| menu(ui, changes));
+}
+
+/// The two things done to a selection, for the people who do not know the
+/// keys yet.
+fn menu(ui: &mut Ui, changes: &mut Vec<Change>) {
+	if ui.button("duplicate  ctrl+d").clicked() {
+		changes.push(Change::Duplicate);
+		ui.close();
+	}
+
+	if ui.button("delete  del").clicked() {
+		changes.push(Change::Delete);
+		ui.close();
 	}
 }
 
