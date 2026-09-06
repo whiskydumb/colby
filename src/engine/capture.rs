@@ -133,7 +133,7 @@ impl Capture {
 			.color
 			.create_view(&TextureViewDescriptor::default());
 
-		self.scene.render(&view, world);
+		self.scene.render(&view, world, None);
 
 		for overlay in overlays {
 			overlay.draw(self.scene.device(), self.scene.queue(), &view, self.width, self.height);

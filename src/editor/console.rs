@@ -11,7 +11,7 @@ use colby_core::{
 	log::{self, Line},
 	tracing::Level,
 };
-use egui::{Align, Color32, Context, Key, Layout, RichText, ScrollArea, TextEdit, Window};
+use egui::{Align, Color32, Key, Layout, RichText, ScrollArea, TextEdit};
 
 /// How many lines the input remembers.
 const RECALLED: usize = 64;
@@ -36,17 +36,13 @@ pub(crate) struct Console {
 }
 
 impl Console {
-	/// Draws the console window.
+	/// Draws the console into a panel.
 	///
-	/// @param context - egui, mid-frame
+	/// @param ui - the panel
 	/// @param world - what commands act on
-	pub(crate) fn show(&mut self, context: &Context, world: &mut World) {
+	pub(crate) fn show(&mut self, ui: &mut egui::Ui, world: &mut World) {
 		self.refresh();
-
-		Window::new("console")
-			.default_pos([12.0, 300.0])
-			.default_size([660.0, 300.0])
-			.show(context, |ui| self.body(ui, world));
+		self.body(ui, world);
 	}
 
 	/// The scrollback and the prompt.

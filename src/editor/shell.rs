@@ -61,6 +61,10 @@ impl Shell {
 		}
 	}
 
+	/// How many physical pixels one of egui's points is, as of the last frame
+	/// built.
+	pub(crate) const fn points(&self) -> f32 { self.points }
+
 	/// Offers one window event to egui.
 	///
 	/// @param window - the window the event came from

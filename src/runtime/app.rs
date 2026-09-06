@@ -26,7 +26,7 @@ use colby_core::{
 #[cfg(feature = "editor")]
 use colby_editor::{Editor, Loading, State, Step};
 use colby_engine::{
-	Gpu, Overlay, Renderer, gpu,
+	Gpu, Overlay, Renderer, Viewport, gpu,
 	winit::{
 		application::ApplicationHandler,
 		dpi::LogicalSize,
@@ -472,7 +472,7 @@ impl Loader {
 			overlays.push(screen);
 		}
 
-		renderer.render(opening.world(), &mut overlays)
+		renderer.render(opening.world(), &mut overlays, None)
 	}
 
 	/// Takes the window down, the screen before the renderer whose surface
@@ -541,6 +541,15 @@ pub(crate) struct App {
 	mode: Mode,
 	#[cfg(feature = "editor")]
 	editor: Option<Editor>,
+	/// The part of the window the world is drawn into, in physical pixels,
+	/// while the editor's panels take the rest; `None` is the whole window.
+	///
+	/// What the editor decided last frame, and what everything that has to
+	/// agree with the picture is told this frame: the projection's shape, the
+	/// game's interface and its pointer, and the cursor the game reads. One
+	/// frame behind the panels, which is invisible, because a panel's edge
+	/// moves at most a few pixels between two frames.
+	view: Option<Viewport>,
 	#[cfg(feature = "hot_reload")]
 	watch: Option<Watch>,
 	/// The volumes the console last asked for. @ref
@@ -606,6 +615,7 @@ impl App {
 			mode: Mode::new(),
 			#[cfg(feature = "editor")]
 			editor: None,
+			view: None,
 			#[cfg(feature = "hot_reload")]
 			watch: None,
 			mix: Mix::FULL,
@@ -682,6 +692,9 @@ impl App {
 	#[cfg(feature = "editor")]
 	fn run_editor(&mut self) {
 		if !Editor::shown(&self.runtime.world) {
+			// the whole window is the world's again, from this frame on.
+			self.view = None;
+
 			return;
 		}
 
@@ -696,7 +709,40 @@ impl App {
 		};
 
 		if let Some(editor) = self.editor.as_mut() {
-			editor.run(&window, &mut self.runtime.world, &self.clock, self.frames);
+			let frame = editor.run(&window, &mut self.runtime.world, &self.clock, self.frames);
+
+			self.view = Some(frame.view);
+
+			if let Some(described) = frame.restore {
+				self.put_back(&described);
+			}
+		}
+	}
+
+	/// Puts a world the editor handed back in place of the one there is.
+	///
+	/// A step back or forward: the same restore a stopped play does, and the
+	/// same obligation after it - the solver is told to forget what it
+	/// derived, because its caches describe a world that is gone. Between the
+	/// steps and the draw, which is outside any step.
+	#[cfg(feature = "editor")]
+	fn put_back(&mut self, described: &colby_core::abi::scene::SceneData) {
+		match colby_core::abi::scene::restore(&mut self.runtime.world, described) {
+			| Ok(put) => {
+				self.runtime.simulation.forget();
+				info!(
+					entities = put.things,
+					bodies = put.solids,
+					joints = put.links,
+					"the world is as it was a step ago"
+				);
+			},
+			| Err(failure) => {
+				// the one way this fails is the game's state changing shape
+				// between the record and now: a hot-reload that bumped the
+				// layout number. Half a world is worse than none.
+				error!(%failure, "the world cannot be put back a step, so this one stays");
+			},
 		}
 	}
 
@@ -812,33 +858,10 @@ impl App {
 
 		self.hear();
 
-		if let Some(renderer) = self.renderer.as_ref() {
-			// before the steps rather than after them: gameplay asking how
-			// wide the window is should not be told last frame's answer, four
-			// times in a row.
-			self.runtime.world.aspect = renderer.aspect();
-
-			let (width, height) = renderer.size();
-			#[expect(
-				clippy::as_conversions,
-				clippy::cast_possible_truncation,
-				reason = "a display scale is between one and four, and the only f32 it is ever \
-				          multiplied by is a pixel count"
-			)]
-			let scale = renderer.window().scale_factor() as f32;
-
-			self.runtime.world.ui.set_viewport(
-				Vec2::new(
-					f32::from(u16::try_from(width).unwrap_or(u16::MAX)),
-					f32::from(u16::try_from(height).unwrap_or(u16::MAX)),
-				),
-				scale,
-			);
-			self.runtime
-				.world
-				.ui
-				.set_pointer(Vec2::from(self.input.cursor));
-		}
+		// before the steps rather than after them: gameplay asking how wide
+		// the window is should not be told last frame's answer, four times in
+		// a row.
+		self.place(self.view);
 
 		// the moment the next step is at, on the clock the wire is on. Read
 		// once a frame and advanced a step at a time by the runtime, rather
@@ -901,7 +924,90 @@ impl App {
 			return Ok(());
 		};
 
-		renderer.render(&self.runtime.world, &mut overlays)
+		renderer.render(&self.runtime.world, &mut overlays, self.view)
+	}
+
+	/// Where the world's picture begins on the window, in physical pixels.
+	///
+	/// What the cursor the game reads is measured from, so that a game inside
+	/// the editor is told where the pointer is on its picture rather than on
+	/// the window around it.
+	fn origin(&self) -> [f64; 2] {
+		self.view
+			.map_or([0.0; 2], |view| [f64::from(view.x), f64::from(view.y)])
+	}
+
+	/// Tells everything that has to agree with the picture where it is.
+	///
+	/// The projection's shape, the game's interface and its pointer, and the
+	/// cursor the game reads: all of them against the part of the window the
+	/// world is drawn into - the whole of it, or what the editor's panels
+	/// leave - so that a game inside the editor sees a window the size of its
+	/// picture. @ref `view`.
+	///
+	/// @param view - the part of the window, or `None` for the whole of it
+	fn place(&mut self, view: Option<Viewport>) {
+		let Some(renderer) = self.renderer.as_ref() else {
+			return;
+		};
+
+		let (width, height) = renderer.size();
+		let whole = Viewport::whole(width, height);
+		let placed = view.unwrap_or(whole);
+		let size = Vec2::new(
+			f32::from(u16::try_from(placed.width).unwrap_or(u16::MAX)),
+			f32::from(u16::try_from(placed.height).unwrap_or(u16::MAX)),
+		);
+		let corner = Vec2::new(
+			f32::from(u16::try_from(placed.x).unwrap_or(u16::MAX)),
+			f32::from(u16::try_from(placed.y).unwrap_or(u16::MAX)),
+		);
+
+		self.runtime.world.aspect = placed.aspect();
+		self.input
+			.set_viewport(f64::from(size.x), f64::from(size.y));
+
+		#[expect(
+			clippy::as_conversions,
+			clippy::cast_possible_truncation,
+			reason = "a display scale is between one and four, and the only f32 it is ever \
+			          multiplied by is a pixel count"
+		)]
+		let scale = renderer.window().scale_factor() as f32;
+
+		self.runtime.world.ui.set_viewport(size, scale);
+		// the cursor is already measured from the picture's corner, @ref
+		// `origin`, so the pointer is too.
+		self.runtime
+			.world
+			.ui
+			.set_pointer(Vec2::from(self.input.cursor));
+		self.runtime.interface.set_frame(view.map(|_| {
+			(
+				corner,
+				Vec2::new(
+					f32::from(u16::try_from(whole.width).unwrap_or(u16::MAX)),
+					f32::from(u16::try_from(whole.height).unwrap_or(u16::MAX)),
+				),
+			)
+		}));
+	}
+
+	/// Lays the game's interface out against where the picture is, and puts
+	/// it on the GPU.
+	///
+	/// @param view - the part of the window, or `None` for the whole of it
+	fn lay_out(&mut self, view: Option<Viewport>) {
+		self.place(view);
+		self.runtime.interface.run(&self.runtime.world);
+
+		if let Some(renderer) = self.renderer.as_ref() {
+			self.runtime.interface.prepare(
+				renderer.device(),
+				renderer.queue(),
+				&self.runtime.world,
+			);
+		}
 	}
 
 	/// Writes every picture the console asked for since the last frame.
@@ -916,6 +1022,16 @@ impl App {
 		let asked = crate::console::take(&mut self.runtime.world, &[screenshot::COMMAND]);
 		if asked.is_empty() {
 			return;
+		}
+
+		// a picture is of the game at the window's size, as if the editor were
+		// hidden: with the panels up, the interface was laid out against the
+		// picture between them and drawn at its corner, and a capture of the
+		// whole window wants it laid out against the whole window. Laid out
+		// again for the pictures alone, and put back for the frame.
+		let framed = self.view.is_some();
+		if framed {
+			self.lay_out(None);
 		}
 
 		let (Some(gpu), Some(renderer)) = (self.gpu.as_ref(), self.renderer.as_ref()) else {
@@ -939,6 +1055,11 @@ impl App {
 			if let Err(error) = outcome {
 				error!(%error, "no screenshot");
 			}
+		}
+
+		// and back against the picture, for the frame about to be drawn.
+		if framed {
+			self.lay_out(self.view);
 		}
 
 		// a second scene's pipelines, its uploads and a readback took as long
@@ -1071,9 +1192,10 @@ impl App {
 	fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: &WindowEvent) {
 		// the editor first: what it takes, the game must not also act on.
 		let taken = self.editor_took(event);
+		let origin = self.origin();
 
 		if !taken {
-			input::apply(&mut self.input, event);
+			input::apply(&mut self.input, event, origin);
 		}
 
 		match event {

@@ -114,7 +114,11 @@ const KEYS: &[(KeyCode, Key)] = &[
 ///
 /// @param input - the state carried between frames
 /// @param event - the event to fold in
-pub(crate) fn apply(input: &mut Input, event: &WindowEvent) {
+/// @param origin - where the world's picture begins on the window, in
+/// physical pixels, which the cursor is measured from: nought for a window
+/// that is all picture, and the picture's corner for one with the editor's
+/// panels around it
+pub(crate) fn apply(input: &mut Input, event: &WindowEvent, origin: [f64; 2]) {
 	match *event {
 		| WindowEvent::KeyboardInput {
 			event: KeyEvent { physical_key, state, ref text, .. },
@@ -160,7 +164,8 @@ pub(crate) fn apply(input: &mut Input, event: &WindowEvent) {
 				trace!(?button, down, cursor = ?input.cursor_clip, "button");
 				input.set_button(button, down);
 			},
-		| WindowEvent::CursorMoved { position, .. } => input.set_cursor(position.x, position.y),
+		| WindowEvent::CursorMoved { position, .. } =>
+			input.set_cursor(position.x - origin[0], position.y - origin[1]),
 		| WindowEvent::MouseWheel { delta, .. } => {
 			let lines = lines_of(delta);
 			trace!(lines, "wheel");

@@ -44,13 +44,20 @@ const SHADER: &str = "ui.wgsl";
 /// How many vertices a fresh buffer has room for.
 const INITIAL_VERTICES: u64 = 4096;
 
-/// The screen uniform: the layout area and its padding to sixteen bytes.
+/// The screen uniform: the target the interface is drawn into and where on
+/// it the layout area begins, both in layout pixels.
+///
+/// Two numbers rather than one because the layout area is not always the
+/// whole target: a window with tools around its picture lays the game's
+/// interface out against the picture and draws it there, and the shader has
+/// to know both where that is and how big the whole target is to put a layout
+/// pixel into clip space.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
 struct Screen {
-	viewport: [f32; 2],
-	padding: [f32; 2],
+	whole: [f32; 2],
+	origin: [f32; 2],
 }
 
 /// One texture the interface has put on the GPU, and what it was made from.
@@ -233,12 +240,19 @@ impl Painter {
 
 	/// Writes the list into the vertex and index buffers, growing them if it
 	/// does not fit.
-	pub fn write(&mut self, device: &Device, queue: &Queue, list: &DrawList, viewport: [f32; 2]) {
-		queue.write_buffer(
-			&self.screen,
-			0,
-			bytemuck::bytes_of(&Screen { viewport, padding: [0.0; 2] }),
-		);
+	///
+	/// @param list - this frame's triangles
+	/// @param whole - the size of what is drawn into, in layout pixels
+	/// @param origin - where the layout area begins on it, in layout pixels
+	pub fn write(
+		&mut self,
+		device: &Device,
+		queue: &Queue,
+		list: &DrawList,
+		whole: [f32; 2],
+		origin: [f32; 2],
+	) {
+		queue.write_buffer(&self.screen, 0, bytemuck::bytes_of(&Screen { whole, origin }));
 
 		let wanted = u64::try_from(list.vertices.len()).unwrap_or(0);
 		if wanted > self.vertex_capacity {

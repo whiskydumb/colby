@@ -62,6 +62,77 @@ use crate::{
 /// is supported everywhere, which is worth more right now than the memory.
 pub const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
 
+/// The part of a target a scene is drawn into, in physical pixels from the
+/// top left.
+///
+/// A window with tools around its picture draws the world into the middle
+/// and leaves the edges to whatever the tools paint there; a window with no
+/// tools, a picture and a test draw into the whole target. What is drawn is
+/// the same either way - the projection is built for the rectangle's own
+/// shape, so nothing stretches - and the target is cleared edge to edge
+/// first, because a load operation is not something a scissor cuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Viewport {
+	/// The left edge.
+	pub x: u32,
+
+	/// The top edge.
+	pub y: u32,
+
+	/// How wide.
+	pub width: u32,
+
+	/// How tall.
+	pub height: u32,
+}
+
+impl Viewport {
+	/// The whole of a target.
+	///
+	/// @param width - the target's width in pixels
+	/// @param height - its height
+	#[must_use]
+	pub const fn whole(width: u32, height: u32) -> Self { Self { x: 0, y: 0, width, height } }
+
+	/// This rectangle cut down to what lies inside a target.
+	///
+	/// A rectangle that reaches past the target is a validation error rather
+	/// than a picture, and a window that was resized a frame ago hands out
+	/// exactly that for one frame.
+	///
+	/// @param width - the target's width in pixels
+	/// @param height - its height
+	/// @return the part inside, or `None` if none of it is
+	#[must_use]
+	pub fn within(self, width: u32, height: u32) -> Option<Self> {
+		let x = self.x.min(width);
+		let y = self.y.min(height);
+		let right = self.x.saturating_add(self.width).min(width);
+		let bottom = self.y.saturating_add(self.height).min(height);
+
+		if right <= x || bottom <= y {
+			return None;
+		}
+
+		Some(Self {
+			x,
+			y,
+			width: right - x,
+			height: bottom - y,
+		})
+	}
+
+	/// Width over height, which is what the projection is built for.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_precision_loss,
+		reason = "u32 to f32 loses precision above 2^24, which is four thousand times wider \
+		          than any target"
+	)]
+	pub fn aspect(self) -> f32 { self.width.max(1) as f32 / self.height.max(1) as f32 }
+}
+
 /// What the shader needs to know that is neither per-vertex nor per-instance.
 ///
 /// @note: the `crate` attribute points the derive at colby_core's re-export.
@@ -340,6 +411,9 @@ pub struct Scene {
 	/// One per [`Wrap`], in its discriminant order.
 	samplers: [Sampler; 2],
 	shader: Shader,
+	/// The target's size, which the depth buffer was built for and which a
+	/// viewport is cut down to.
+	size: (u32, u32),
 	depth: TextureView,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
@@ -453,6 +527,7 @@ impl Scene {
 			material_layout,
 			samplers,
 			shader,
+			size: (width, height),
 			depth,
 			shadows,
 			cascades: Cascades::NONE,
@@ -475,6 +550,7 @@ impl Scene {
 
 	/// Rebuilds the depth buffer for a new target size.
 	pub fn resize(&mut self, width: u32, height: u32) {
+		self.size = (width, height);
 		self.depth = depth_view(&self.device, width, height);
 	}
 
@@ -507,7 +583,9 @@ impl Scene {
 	///
 	/// @param target - what to draw into
 	/// @param world - the state to draw
-	pub fn render(&mut self, target: &TextureView, world: &World) {
+	/// @param view - the part of the target to draw into, or the whole of it;
+	/// the projection is the caller's to match, through `world.aspect`
+	pub fn render(&mut self, target: &TextureView, world: &World, view: Option<Viewport>) {
 		self.reload_shader();
 		self.upload(world);
 
@@ -550,6 +628,34 @@ impl Scene {
 			occlusion_query_set: None,
 			multiview_mask: None,
 		});
+
+		// after the clear, which the pass has already done edge to edge, and
+		// before anything is drawn. A rectangle with nothing inside the
+		// target is a frame of clear color and nothing else, which is what a
+		// window squeezed down to its tools has to show.
+		if let Some(asked) = view {
+			let Some(view) = asked.within(self.size.0, self.size.1) else {
+				drop(pass);
+				self.queue.submit([encoder.finish()]);
+
+				return;
+			};
+
+			#[expect(
+				clippy::as_conversions,
+				clippy::cast_precision_loss,
+				reason = "pixel counts, nowhere near where f32 stops holding integers"
+			)]
+			pass.set_viewport(
+				view.x as f32,
+				view.y as f32,
+				view.width as f32,
+				view.height as f32,
+				0.0,
+				1.0,
+			);
+			pass.set_scissor_rect(view.x, view.y, view.width, view.height);
+		}
 
 		pass.set_bind_group(0, &self.bindings, &[]);
 		pass.set_bind_group(2, self.shadows.bindings(), &[]);

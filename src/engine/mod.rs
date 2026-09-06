@@ -28,6 +28,11 @@ pub use ::winit;
 pub use colby_core::abi::mesh::{MeshData, MeshVertex};
 
 pub use self::{
-	capture::Capture, gpu::Gpu, image::Image, overlay::Overlay, renderer::Renderer, scene::Scene,
+	capture::Capture,
+	gpu::Gpu,
+	image::Image,
+	overlay::Overlay,
+	renderer::Renderer,
+	scene::{Scene, Viewport},
 	shader::Shader,
 };

@@ -19,7 +19,7 @@
 //! the step is the only thing that otherwise copies one into the other, so an
 //! entity dragged on its own would snap back the moment play started.
 
-use colby_core::abi::{BodyId, EntityId, JointId, Transform, World};
+use colby_core::abi::{Body, BodyId, EntityId, JointId, Transform, World};
 
 /// One thing in the world, whichever of the three tables it lives in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -281,10 +281,123 @@ pub(crate) fn driver(world: &World, id: EntityId) -> Option<BodyId> {
 		.map(|(body, _)| body)
 }
 
+/// The entity a body drives, if it is still there.
+pub(crate) fn drives(world: &World, body: BodyId) -> Option<EntityId> {
+	let entity = world.bodies.get(body)?.entity;
+
+	world.entities.alive(entity).then_some(entity)
+}
+
+/// Hangs an entity off another, or stands it on its own, without moving it.
+///
+/// The thing stays exactly where it is in the world and only what it is
+/// measured from changes - which is what every editor checked does when a
+/// row is dropped onto another, and what a person dragging a wheel under a
+/// car means. The entity's own transform is rewritten as its place inside
+/// the new parent, @ref `Entities::set_placed`; a body under it is where it
+/// was and stays there, because a body's place is in the world already.
+///
+/// @param world - the world to write
+/// @param child - what to hang, or to take down
+/// @param parent - what to hang it off, or [`EntityId::NONE`] to stand it on
+/// its own
+/// @return `true` if it was done; `false` for a stale handle, a parent that
+/// is not alive, an entity hanging off itself, or a loop
+pub(crate) fn hang(world: &mut World, child: EntityId, parent: EntityId) -> bool {
+	let Some(placed) = world.entities.placed(child) else {
+		return false;
+	};
+
+	if !world.entities.set_parent(child, parent) {
+		return false;
+	}
+
+	if !world.entities.set_placed(child, placed) {
+		return false;
+	}
+
+	// dragged, not traveled: the same rule `place` follows, and for the same
+	// reason.
+	world.entities.snap(child);
+
+	true
+}
+
+/// What to call an entity in a panel: its name, or what it is made of in
+/// angle brackets, so that a name and a description can never be mistaken
+/// for each other.
+///
+/// From the world rather than from a panel, because a panel that kept its
+/// own names would lose them the moment a scene was loaded.
+pub(crate) fn entity_label(world: &World, id: EntityId) -> String {
+	let name = world.entities.name(id);
+	if !name.is_empty() {
+		return name.to_owned();
+	}
+
+	let mesh = world
+		.entities
+		.renderable(id)
+		.map(|renderable| renderable.mesh)
+		.and_then(|mesh| world.meshes.get(mesh))
+		.map_or("", |entry| entry.name());
+
+	if mesh.is_empty() {
+		format!("<entity {}>", id.slot())
+	} else {
+		format!("<{mesh}>")
+	}
+}
+
+/// What to call a body in a panel. @ref [`entity_label`].
+pub(crate) fn body_label(world: &World, id: BodyId) -> String {
+	let name = world.bodies.name(id);
+	if !name.is_empty() {
+		return name.to_owned();
+	}
+
+	world.bodies.get(id).map_or_else(
+		|| format!("<body {}>", id.slot()),
+		|body| format!("<{} {}>", body_words(body), id.slot()),
+	)
+}
+
+/// What to call a joint in a panel. @ref [`entity_label`].
+pub(crate) fn joint_label(world: &World, id: JointId) -> String {
+	let name = world.joints.name(id);
+	if !name.is_empty() {
+		return name.to_owned();
+	}
+
+	world.joints.get(id).map_or_else(
+		|| format!("<joint {}>", id.slot()),
+		|joint| format!("<{} {}>", joint.kind.word(), id.slot()),
+	)
+}
+
+/// What a body is, in the fewest words that say it.
+///
+/// The words the format writes a body with, so that a row in a panel and a
+/// line in a scene file agree; the tree used to have a vocabulary of its own,
+/// and the moment the two had to be the same word was the moment the words
+/// went on the kinds themselves.
+pub(crate) fn body_words(body: &Body) -> String {
+	let kind = body.kind.word();
+	let shape = body.shape.kind.word();
+
+	if body.sensor {
+		// the first thing anybody wants to know about one, because a sensor is
+		// the body that is there and does not push.
+		format!("{kind} {shape} sensor")
+	} else {
+		format!("{kind} {shape}")
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{Body, BodyKind, Joint, Shape},
+		abi::{BodyKind, Joint, Shape},
 		glam::Vec3,
 	};
 

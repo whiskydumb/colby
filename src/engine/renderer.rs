@@ -20,7 +20,11 @@ use wgpu::{
 };
 use winit::window::Window;
 
-use crate::{gpu::Gpu, overlay::Overlay, scene::Scene};
+use crate::{
+	gpu::Gpu,
+	overlay::Overlay,
+	scene::{Scene, Viewport},
+};
 
 /// A window, its surface, and the scene drawn into it.
 ///
@@ -82,8 +86,15 @@ impl Renderer {
 	/// [`Overlay`]. The game's interface first and the editor over it: a tool
 	/// that could be hidden behind the thing it is inspecting would be a tool
 	/// nobody could use.
+	/// @param view - the part of the window the world is drawn into, or the
+	/// whole of it; an overlay is handed the whole window either way
 	/// @return `Ok` once the frame has been submitted and presented
-	pub fn render(&mut self, world: &World, overlays: &mut [&mut dyn Overlay]) -> Result {
+	pub fn render(
+		&mut self,
+		world: &World,
+		overlays: &mut [&mut dyn Overlay],
+		view: Option<Viewport>,
+	) -> Result {
 		// whether the swapchain stopped matching the window while this frame
 		// was being handed out. @ref the note where it is acted on, below.
 		let mut stale = false;
@@ -116,11 +127,11 @@ impl Renderer {
 			},
 		};
 
-		let view = frame
+		let target = frame
 			.texture
 			.create_view(&TextureViewDescriptor::default());
 
-		self.scene.render(&view, world);
+		self.scene.render(&target, world, view);
 
 		// after the scene and before the surface goes back: an overlay draws
 		// into the frame the scene was just recorded into, and submits its own
@@ -129,7 +140,7 @@ impl Renderer {
 			overlay.draw(
 				self.scene.device(),
 				self.scene.queue(),
-				&view,
+				&target,
 				self.config.width,
 				self.config.height,
 			);

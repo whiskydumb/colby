@@ -599,10 +599,15 @@ mod tests {
 		wizard.location = list::spelled(&elsewhere);
 		wizard.remember = true;
 		wizard.git_init = false;
+		// the id the form settled on, rather than `my_project`: the default
+		// name steps past folders taken in the *first* location, which is the
+		// person's real projects folder, and a project made there for real
+		// once turned this test red.
+		let id = wizard.id.clone();
 
 		let made = pages.apply(Change::Create);
 
-		assert_eq!(made, Some(Action::Open(elsewhere.join("my_project"))));
+		assert_eq!(made, Some(Action::Open(elsewhere.join(&id))));
 		assert_eq!(pages.list().projects_dir, elsewhere);
 	}
 

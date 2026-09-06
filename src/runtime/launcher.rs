@@ -147,7 +147,7 @@ impl Hub {
 
 		let overlay: &mut dyn Overlay = launcher;
 
-		renderer.render(&self.world, &mut [overlay])
+		renderer.render(&self.world, &mut [overlay], None)
 	}
 
 	/// Records a failure and asks the loop to stop.

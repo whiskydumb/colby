@@ -147,6 +147,12 @@ pub struct Interface {
 	list: DrawList,
 	painter: Option<Painter>,
 	viewport: [f32; 2],
+	/// Where the layout area sits on the target, if it is not the whole of
+	/// it: its corner and the target's size, both in physical pixels. @ref
+	/// [`set_frame`](Self::set_frame).
+	frame: Option<(Vec2, Vec2)>,
+	/// How many physical pixels one layout pixel was when the layout ran.
+	scale: f32,
 }
 
 impl Interface {
@@ -470,7 +476,21 @@ impl Interface {
 		world_text::build(world, &mut self.list);
 
 		self.viewport = world.ui.viewport().to_array();
+		self.scale = world.ui.scale();
 	}
+
+	/// Says where on the target the layout area is drawn.
+	///
+	/// Nothing, for a window that is all picture, a screenshot or a test: the
+	/// interface then covers the target. A window with tools around its
+	/// picture lays the interface out against the picture - that is
+	/// `Ui::set_viewport`'s business - and says here where the picture is, so
+	/// that a box laid out at the top left of it is drawn at the top left of
+	/// it rather than under a tool.
+	///
+	/// @param frame - the layout area's corner and the target's size, both in
+	/// physical pixels, or `None` for the whole target
+	pub fn set_frame(&mut self, frame: Option<(Vec2, Vec2)>) { self.frame = frame; }
 
 	/// Puts everything this frame needs on the GPU.
 	///
@@ -485,9 +505,18 @@ impl Interface {
 			return;
 		};
 
+		// in layout pixels, the units the vertices are in: a frame given in
+		// physical pixels is divided by the same scale the layout used.
+		let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
+		let (target, origin) = self
+			.frame
+			.map_or((self.viewport, [0.0; 2]), |(corner, size)| {
+				((size / scale).to_array(), (corner / scale).to_array())
+			});
+
 		painter.reload_shader(device);
 		painter.upload(device, queue, world, &self.list);
-		painter.write(device, queue, &self.list, self.viewport);
+		painter.write(device, queue, &self.list, target, origin);
 	}
 
 	/// Everything laid out this frame, parents before children.

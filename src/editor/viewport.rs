@@ -1,13 +1,22 @@
-//! The part of the screen that is not a window.
+//! The part of the screen that is not a panel: the world's picture, in the
+//! middle of the four.
 //!
 //! Three gestures, a gizmo and a click, and none of them is a widget: what the
 //! pointer does out here is what it does when no panel wanted it. That is the
 //! whole of the guard - `Context::egui_wants_pointer_input`, whose own
 //! documentation says it is false exactly when "you may be interested in what
 //! it is doing" - and everything below is skipped while it is true. It also
-//! stays false for a drag that *began* outside a window and has since crossed
+//! stays false for a drag that *began* outside a panel and has since crossed
 //! one, which is the behavior a camera drag needs and the reason this is the
-//! right question to ask rather than "is the pointer over a window".
+//! right question to ask rather than "is the pointer over a panel". What
+//! makes the middle count as outside egui is that nothing is laid out there:
+//! egui takes the root layout's leftover rectangle as the part of the screen
+//! it does not own, so the picture is left as exactly that.
+//!
+//! Everything measured here is measured from the picture's own corner and
+//! against its own size, not the window's: the ray a click becomes, where a
+//! handle is on screen, how wide the projection is. The window's corner is
+//! added back only when a handle is painted.
 //!
 //! - **right drag** turns the camera around what it is looking at;
 //! - **middle drag** slides what it is looking at across the view;
@@ -37,6 +46,7 @@ use egui::{Color32, Context, Key, LayerId, PointerButton, Pos2, Rect, Stroke, ve
 use crate::{
 	aim::{self, View},
 	gizmo::{self, Axis, Tool},
+	history::History,
 	select::{self, Pick, Selection},
 };
 
@@ -95,12 +105,18 @@ impl Viewport {
 	/// Which of the three things the gizmo is doing.
 	pub(crate) const fn tool(&self) -> Tool { self.tool }
 
+	/// Switches the gizmo to one of its three things, from a panel rather
+	/// than a key.
+	pub(crate) const fn set_tool(&mut self, tool: Tool) { self.tool = tool; }
+
 	/// Drives the camera and the gizmo, and answers what was clicked.
 	///
 	/// @param context - egui, mid-frame
 	/// @param world - read for what is in it, written for the camera and for
 	/// whatever the gizmo is dragging
 	/// @param selection - what the gizmo is attached to
+	/// @param view - where the world's picture is on the screen, in points
+	/// @param history - where a drag is written down, so that it can be undone
 	/// @return what a click landed on, or nothing at all if there was no click
 	/// to answer for. A click on empty space answers [`Pick::Nothing`], which
 	/// is a different thing from not having clicked and is what deselects
@@ -109,6 +125,8 @@ impl Viewport {
 		context: &Context,
 		world: &mut World,
 		selection: &Selection,
+		view: Rect,
+		history: &mut History,
 	) -> Option<Pick> {
 		if !world.editing {
 			// the game's camera again. Whatever orbit this was holding
@@ -120,17 +138,17 @@ impl Viewport {
 		}
 
 		let busy = context.egui_wants_pointer_input();
-		let held = Gestures::read(context);
+		let held = Gestures::read(context, view);
 
 		self.pick_tool(context);
 		self.fly(world, busy, held);
 
-		let dragging = self.gizmo(context, world, selection.at(), busy, held);
+		let dragging = self.gizmo(context, world, selection.at(), busy, held, view, history);
 
 		let found = if busy || dragging || !held.clicked {
 			None
 		} else {
-			held.at.map(|at| picked(context, world, at))
+			held.at.map(|at| picked(world, at, size(view)))
 		};
 
 		if held.clicked {
@@ -145,10 +163,11 @@ impl Viewport {
 
 	/// Switches between move, turn and stretch.
 	///
-	/// The three keys every editor with a gizmo uses. Skipped while anything
-	/// is taking typing, so that a `w` in the console stays a `w`.
+	/// The three keys every editor with a gizmo uses. Skipped while a text
+	/// field is taking typing, so that a `w` in the console stays a `w` - and
+	/// only then, because a row that was clicked holds egui's focus as well.
 	fn pick_tool(&mut self, context: &Context) {
-		if context.egui_wants_keyboard_input() {
+		if context.text_edit_focused() {
 			return;
 		}
 
@@ -192,6 +211,11 @@ impl Viewport {
 	///
 	/// @return whether the pointer is on the gizmo's business rather than the
 	/// world's
+	#[expect(
+		clippy::too_many_arguments,
+		reason = "one frame of what the pointer did, against what it did it to; a struct for \
+		          the seven would be this signature with a name"
+	)]
 	fn gizmo(
 		&mut self,
 		context: &Context,
@@ -199,6 +223,8 @@ impl Viewport {
 		pick: Pick,
 		busy: bool,
 		held: Gestures,
+		view: Rect,
+		history: &mut History,
 	) -> bool {
 		let Some(at) = select::transform(world, pick) else {
 			self.grab = None;
@@ -207,7 +233,7 @@ impl Viewport {
 		};
 
 		let camera = world.render_camera();
-		let viewport = size_of(context);
+		let viewport = size(view);
 		let handles = Handles::of(&camera, at, self.tool, viewport);
 		let over = held.at.and_then(|point| handles.under(point));
 
@@ -239,10 +265,10 @@ impl Viewport {
 		if held.down
 			&& let Some(point) = held.at
 		{
-			self.pull(world, pick, &camera, point, viewport);
+			self.pull(world, pick, &camera, point, viewport, history);
 		}
 
-		handles.paint(context, self.grab.map_or(over, |grab| Some(grab.axis)));
+		handles.paint(context, self.grab.map_or(over, |grab| Some(grab.axis)), view);
 
 		self.grab.is_some() || (over.is_some() && !busy)
 	}
@@ -265,6 +291,10 @@ impl Viewport {
 	}
 
 	/// Applies the drag in progress.
+	///
+	/// Written down first, every frame of it: the record opens on the first
+	/// frame and stays open while the drag writes, so the whole drag is one
+	/// step back. @ref [`History::begin`].
 	fn pull(
 		&mut self,
 		world: &mut World,
@@ -272,6 +302,7 @@ impl Viewport {
 		camera: &Camera,
 		point: Vec2,
 		viewport: Vec2,
+		history: &mut History,
 	) {
 		let Some(mut grab) = self.grab else {
 			return;
@@ -302,6 +333,7 @@ impl Viewport {
 				gizmo::sized(grab.from, grab.axis, 1.0 + grab.total / grab.arm.max(1.0e-4)),
 		};
 
+		history.begin(grab.tool.word(), world);
 		select::place(world, pick, put);
 	}
 }
@@ -355,9 +387,18 @@ impl Handles {
 		}
 	}
 
-	/// Draws them, behind every window and over the world.
-	fn paint(&self, context: &Context, lit: Option<Axis>) {
-		let painter = context.layer_painter(LayerId::background());
+	/// Draws them, behind every panel and over the world.
+	///
+	/// The handles were projected against the picture, so the picture's
+	/// corner is added back here, and the painter is cut to the picture so
+	/// that an arm reaching under a panel stops at its edge.
+	///
+	/// @param view - where the picture is on the screen, in points
+	fn paint(&self, context: &Context, lit: Option<Axis>, view: Rect) {
+		let painter = context
+			.layer_painter(LayerId::background())
+			.with_clip_rect(view);
+		let corner = Vec2::new(view.min.x, view.min.y);
 
 		for (axis, arm) in Axis::ALL.into_iter().zip(&self.arms) {
 			let Some((start, end)) = *arm else {
@@ -365,16 +406,17 @@ impl Handles {
 			};
 
 			let stroke = ink(axis, lit == Some(axis));
-			painter.line_segment([spot(start), spot(end)], stroke);
+			painter.line_segment([spot(start + corner), spot(end + corner)], stroke);
 
 			// a blob for a move and a block for a stretch, so the two tools
 			// are told apart by the shape rather than by remembering which key
 			// was last pressed.
 			if self.tool == Tool::Size {
-				let corner = Rect::from_center_size(spot(end), vec2(TIP * 2.0, TIP * 2.0));
-				painter.rect_filled(corner, 1.0, stroke.color);
+				let block =
+					Rect::from_center_size(spot(end + corner), vec2(TIP * 2.0, TIP * 2.0));
+				painter.rect_filled(block, 1.0, stroke.color);
 			} else {
-				painter.circle_filled(spot(end), TIP, stroke.color);
+				painter.circle_filled(spot(end + corner), TIP, stroke.color);
 			}
 		}
 
@@ -383,7 +425,10 @@ impl Handles {
 				continue;
 			}
 
-			let points = ring.iter().copied().map(spot).collect();
+			let points = ring
+				.iter()
+				.map(|point| spot(*point + corner))
+				.collect();
 			painter.line(points, ink(axis, lit == Some(axis)));
 		}
 	}
@@ -419,13 +464,16 @@ struct Gestures {
 	/// Whether it was a click rather than the start of a drag.
 	clicked: bool,
 
-	/// Where the pointer is, in points from the top left.
+	/// Where the pointer is, in points from the picture's top left corner.
 	at: Option<Vec2>,
 }
 
 impl Gestures {
 	/// Reads the lot.
-	fn read(context: &Context) -> Self {
+	///
+	/// @param view - where the picture is on the screen, which the pointer is
+	/// measured from
+	fn read(context: &Context, view: Rect) -> Self {
 		context.input(|input| Self {
 			drag: Vec2::new(input.pointer.delta().x, input.pointer.delta().y),
 			wheel: input.smooth_scroll_delta.y,
@@ -442,7 +490,7 @@ impl Gestures {
 			at: input
 				.pointer
 				.interact_pos()
-				.map(|pos| Vec2::new(pos.x, pos.y)),
+				.map(|pos| Vec2::new(pos.x - view.min.x, pos.y - view.min.y)),
 		})
 	}
 }
@@ -491,12 +539,9 @@ fn ink(axis: Axis, lit: bool) -> Stroke {
 /// A point on the screen, in the type egui draws with.
 fn spot(at: Vec2) -> Pos2 { Pos2::new(at.x, at.y) }
 
-/// How big the picture is, in points.
-fn size_of(context: &Context) -> Vec2 {
-	let rect = context.viewport_rect();
-
-	Vec2::new(rect.width(), rect.height())
-}
+/// How big the picture is, in points; never less than a point each way, so
+/// that a window squeezed down to its panels divides by nothing.
+fn size(view: Rect) -> Vec2 { Vec2::new(view.width().max(1.0), view.height().max(1.0)) }
 
 /// What is under the pointer.
 ///
@@ -505,9 +550,12 @@ fn size_of(context: &Context) -> Vec2 {
 /// The camera is the one the frame was *drawn* through rather than the one the
 /// last step wrote, because what a person clicked on is what they were looking
 /// at.
-fn picked(context: &Context, world: &World, at: Vec2) -> Pick {
+///
+/// @param at - where the pointer is, from the picture's corner
+/// @param viewport - how big the picture is, in the same units
+fn picked(world: &World, at: Vec2, viewport: Vec2) -> Pick {
 	let camera = world.render_camera();
-	let (from, along) = aim::ray(&camera, at, size_of(context));
+	let (from, along) = aim::ray(&camera, at, viewport);
 
 	if along.abs_diff_eq(Vec3::ZERO, f32::EPSILON) {
 		return Pick::Nothing;

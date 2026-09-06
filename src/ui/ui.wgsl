@@ -21,10 +21,14 @@
 // the cut is measured against.
 
 struct Screen {
-	// the layout area, in layout pixels. Positions are in the same units, so a
-	// stylesheet written in pixels is the same size on a scaled display.
-	viewport: vec2<f32>,
-	_padding: vec2<f32>,
+	// the whole target, in layout pixels. Positions are in the same units, so
+	// a stylesheet written in pixels is the same size on a scaled display.
+	// (`target` is a word WGSL keeps for itself.)
+	whole: vec2<f32>,
+	// where the layout area begins on the target, in layout pixels: nought
+	// for a window that is all picture, and the picture's corner for one with
+	// tools around it.
+	origin: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> screen: Screen;
@@ -71,7 +75,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 	// pixels with the origin at the top left, into clip space with the origin
 	// in the middle and y pointing up.
-	let normalized = in.position / max(screen.viewport, vec2<f32>(1.0, 1.0));
+	let normalized = (screen.origin + in.position) / max(screen.whole, vec2<f32>(1.0, 1.0));
 	out.clip = vec4<f32>(normalized.x * 2.0 - 1.0, 1.0 - normalized.y * 2.0, 0.0, 1.0);
 
 	out.local = in.local;
