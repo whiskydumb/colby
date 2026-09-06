@@ -1343,12 +1343,20 @@ f 1 4 5
 		// the real shader with one line changed: every fragment comes out blue,
 		// whatever the entity asked for. Decisive, and it proves the swap
 		// reached the GPU rather than merely being accepted.
-		let source = include_str!("shader.wgsl")
-			.replace("return color;", "return vec3<f32>(0.0, 0.0, 1.0);");
+		//
+		// The guard is on the *anchor*, not on the result. It used to be on
+		// the result, which is a guard that passes when the line has moved and
+		// nothing was replaced at all - and that is exactly what happened the
+		// day the last line of `shade` grew a fog.
+		let shader = include_str!("shader.wgsl");
+		let anchor = "return fogged(color, input.world_position);";
+
 		assert!(
-			source.contains("0.0, 0.0, 1.0"),
-			"the line this test edits is still in the shader"
+			anchor.len() > 1 && shader.contains(anchor),
+			"the line this test edits has moved"
 		);
+
+		let source = shader.replace(anchor, "return vec3<f32>(0.0, 0.0, 1.0);");
 
 		capture
 			.scene_mut()
@@ -1909,6 +1917,74 @@ f 1 4 5
 		let darker = middle(&capture.shoot(&mut world).expect("it renders"));
 
 		assert!(darker < level, "two stops down is darker: {darker} against {level}");
+	}
+
+	#[test]
+	fn distance_fades_a_surface_towards_the_fog() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		// one wall filling the frame and a fog that is unmistakably red. What
+		// changes between the three readings is how far the wall is and how
+		// thick the air is, and nothing else - which is what makes the two
+		// comparisons about the falloff rather than about the geometry.
+		let mut world = glowing(0.8);
+		world.post.tonemap = ToneMap::None;
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+		world.post.fog = rgb(1.0, 0.0, 0.0);
+
+		let clear = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.fog_density = 0.02;
+		let thin = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.fog_density = 0.6;
+		let thick = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		// green, because the fog has none: the more fog there is the less
+		// green comes back.
+		assert!(clear > 200, "the wall alone is bright: {clear}");
+		assert!(thin > clear - 10, "five units of thin air changes almost nothing: {thin}");
+		assert!(thick < 25, "and thick air takes almost all of it: {thick}");
+
+		// the same air, further away
+		world.post.fog_density = 0.1;
+		let near = middle(&capture.shoot(&mut world).expect("it renders"));
+		world.camera.position = Vec3::new(0.0, 0.0, 18.0);
+		let far = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		assert!(
+			far + 40 < near,
+			"the same air over three times the distance takes far more: {far} against {near}"
+		);
+	}
+
+	#[test]
+	fn no_density_is_no_fog_at_all_and_not_a_faint_one() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		// the branchless arithmetic in one assertion: `exp(0)` is exactly one,
+		// so a density of nought has to leave the picture untouched rather
+		// than nearly so - even with a fog color as loud as this.
+		let mut world = glowing(0.4);
+		world.post.tonemap = ToneMap::None;
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+
+		let plain = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.fog = rgb(1.0, 0.0, 1.0);
+		world.post.fog_density = 0.0;
+
+		assert_eq!(
+			middle(&capture.shoot(&mut world).expect("it renders")),
+			plain,
+			"a fog nobody asked for is not a fog anybody gets"
+		);
 	}
 
 	#[test]

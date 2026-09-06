@@ -49,6 +49,10 @@ struct Globals {
     // x is one texel in map coordinates, y is unused, z is whether shadows are
     // on at all, w is whether to color every pixel by the cascade it read.
     shadow: vec4<f32>,
+    // rgb is the color a distant surface fades towards; w is how quickly it
+    // does, per unit of distance. A w of nought is no fog, and the arithmetic
+    // below says so without a branch.
+    fog: vec4<f32>,
     // rgb is the color straight up; w is whether a sky is drawn at all.
     sky_zenith: vec4<f32>,
     // rgb is the color at eye level; w is unused.
@@ -614,7 +618,33 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
         return color * cascade_color(slice);
     }
 
-    return color;
+    return fogged(color, input.world_position);
+}
+
+// A surface faded towards the fog by how far away it is.
+//
+// **Here rather than in a pass of its own**, which is what every engine that
+// has both does: a post pass would have to read the depth buffer as a texture,
+// which means either a second depth target or a copy, and it would fog a pane
+// of glass by the depth of whatever is behind it rather than by its own.
+// Godot calls `fog_process(vertex)` from inside its forward fragment stage for
+// the same two reasons.
+//
+// `exp(-(d * density)^2)` rather than `exp(-d * density)`: the square leaves
+// what is near alone and closes over the far distance, where a plain
+// exponential greys the whole picture evenly and reads as a dirty lens. A
+// density of nought makes this `exp(0)`, which is one, which is the surface
+// untouched - so there is no branch here and no cost worth one.
+//
+// The sky is not fogged. Its depth is the far plane rather than a surface's,
+// so any density at all would turn the whole background one flat color; Godot
+// exposes that as `fog_sky_affect` and it is a knob for another day. A scene
+// that wants a horizon that closes sets its sky's own horizon color to the
+// fog's, which is what everybody did before there was a knob.
+fn fogged(color: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
+    let away = length(world_position - globals.eye.xyz) * globals.fog.w;
+
+    return mix(globals.fog.rgb, color, exp(-away * away));
 }
 
 // The sky: a full-screen triangle at the far plane, shaded by which way each

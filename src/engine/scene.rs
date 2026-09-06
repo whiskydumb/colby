@@ -247,6 +247,9 @@ struct Globals {
 	/// `[one texel in map coordinates, unused, shadows on, tint by cascade]`.
 	shadow: [f32; 4],
 
+	/// `[r, g, b, how quickly a surface fades with distance]`.
+	fog: [f32; 4],
+
 	/// `[r, g, b, whether a sky is drawn]` straight up.
 	sky_zenith: [f32; 4],
 
@@ -1085,6 +1088,11 @@ impl Scene {
 						0.0
 					},
 				],
+				fog: world
+					.post
+					.fog
+					.extend(world.post.fog_density.max(0.0))
+					.to_array(),
 				sky_zenith: world
 					.sky
 					.zenith
@@ -2215,8 +2223,8 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 		// vectors rather than a struct of named floats.
 		assert!(size_of::<Lamp>().is_multiple_of(16), "and a uniform array's stride is not it");
 		assert!(
-			size_of::<Globals>() == 560 + size_of::<Lamp>() * MAX_LAMPS,
-			"the two camera matrices, the light, the cascades, the sky, the counts and the lamps"
+			size_of::<Globals>() == 576 + size_of::<Lamp>() * MAX_LAMPS,
+			"the two camera matrices, the light, the cascades, the fog, the sky, the counts and 			 the lamps"
 		);
 		assert!(size_of::<Globals>().is_multiple_of(16), "and a uniform struct has to be");
 		// lines.wgsl declares only the first field of this struct and reads
