@@ -677,7 +677,18 @@ impl App {
 			return;
 		};
 
-		self.editor = Some(Editor::new(renderer.window(), renderer.device(), renderer.format()));
+		let mut editor = Editor::new(renderer.window(), renderer.device(), renderer.format());
+		// what the last run was left with for this project: the panel widths
+		// and the scenes that were open. The tab the window is on is the
+		// scene the project starts with, which is already the world.
+		editor.remember(
+			&self.runtime.project,
+			self.runtime
+				.project
+				.startup_scene()
+				.unwrap_or_default(),
+		);
+		self.editor = Some(editor);
 	}
 
 	/// Does nothing; this build has no editor.
@@ -1255,6 +1266,11 @@ impl App {
 		// the config and then the game, and the module dropped with it: it may
 		// still be running code from the image, so it goes before the renderer,
 		// whose surface borrows the window it is holding the last share of.
+		#[cfg(feature = "editor")]
+		if let Some(editor) = self.editor.as_ref() {
+			editor.forget_not(&self.runtime.project);
+		}
+
 		self.runtime.close();
 		self.renderer = None;
 

@@ -27,6 +27,7 @@ use egui::{
 };
 
 use crate::{
+	Change,
 	catalog::{self, Entry, State},
 	thumbs::Thumbs,
 };
@@ -72,7 +73,13 @@ impl Browser {
 	/// @param ui - the panel
 	/// @param project - whose tree, if the window has one
 	/// @param gpu - the device to draw a mesh's picture with, if there is one
-	pub(crate) fn show(&mut self, ui: &mut Ui, project: Option<&Project>, gpu: Option<&Gpu>) {
+	pub(crate) fn show(
+		&mut self,
+		ui: &mut Ui,
+		project: Option<&Project>,
+		gpu: Option<&Gpu>,
+		changes: &mut Vec<Change>,
+	) {
 		let Some(project) = project else {
 			ui.label("no project");
 
@@ -88,7 +95,10 @@ impl Browser {
 					.desired_width(160.0)
 					.hint_text("search"),
 			);
-			ui.label(RichText::new("drag a scene, a mesh or a model into the picture").weak());
+			ui.label(
+				RichText::new("drag one into the picture, or open a scene by double-clicking")
+					.weak(),
+			);
 		});
 		ui.separator();
 
@@ -97,7 +107,7 @@ impl Browser {
 
 		ScrollArea::vertical()
 			.auto_shrink([false, false])
-			.show(ui, |ui| self.rows(ui, gpu, &mut made));
+			.show(ui, |ui| self.rows(ui, gpu, &mut made, changes));
 	}
 
 	/// Walks the tree again when it is time to, and starts over when the
@@ -120,7 +130,13 @@ impl Browser {
 	}
 
 	/// Every row that matches the search.
-	fn rows(&mut self, ui: &mut Ui, gpu: Option<&Gpu>, made: &mut bool) {
+	fn rows(
+		&mut self,
+		ui: &mut Ui,
+		gpu: Option<&Gpu>,
+		made: &mut bool,
+		changes: &mut Vec<Change>,
+	) {
 		let filter = self.search.trim().to_lowercase();
 
 		for entry in &self.entries {
@@ -133,14 +149,14 @@ impl Browser {
 				.as_mut()
 				.and_then(|thumbs| thumbs.get(ui.ctx(), gpu, entry, made));
 
-			row(ui, entry, thumb);
+			row(ui, entry, thumb, changes);
 		}
 	}
 }
 
 /// One asset: its picture or the room for one, a row that can be dragged,
 /// and a word about its state when there is something to say.
-fn row(ui: &mut Ui, entry: &Entry, thumb: Option<egui::TextureId>) {
+fn row(ui: &mut Ui, entry: &Entry, thumb: Option<egui::TextureId>, changes: &mut Vec<Change>) {
 	ui.horizontal(|ui| {
 		match thumb {
 			| Some(id) => {
@@ -162,6 +178,13 @@ fn row(ui: &mut Ui, entry: &Entry, thumb: Option<egui::TextureId>) {
 
 		if response.dragged() {
 			ghost(ui, &entry.name);
+		}
+
+		// a scene is the one kind of asset there is somewhere to go to, so it
+		// is the one kind a double-click opens. The other kinds are dragged
+		// into the picture and nothing else.
+		if entry.kind == Kind::Scene && response.double_clicked() {
+			changes.push(Change::Open { name: entry.name.clone() });
 		}
 
 		if entry.state != State::Compiled {
@@ -220,7 +243,7 @@ mod tests {
 				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0))),
 				..Default::default()
 			},
-			|ui| browser.show(ui, Some(&project), None),
+			|ui| browser.show(ui, Some(&project), None, &mut Vec::new()),
 		);
 		output.textures_delta.clear();
 
@@ -235,7 +258,8 @@ mod tests {
 		let mut browser = Browser::default();
 		let context = Context::default();
 
-		let mut output = context.run_ui(RawInput::default(), |ui| browser.show(ui, None, None));
+		let mut output = context
+			.run_ui(RawInput::default(), |ui| browser.show(ui, None, None, &mut Vec::new()));
 		output.textures_delta.clear();
 
 		assert!(browser.entries.is_empty());

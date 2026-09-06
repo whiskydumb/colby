@@ -21,6 +21,12 @@ pub(crate) struct Bar {
 	/// read it from: a world does not know which file it came from. Naming the
 	/// file is part of writing it, exactly as it is at a console.
 	filed: String,
+
+	/// Whether somebody has typed in that field since the last write.
+	///
+	/// What keeps a name they are halfway through typing from being replaced
+	/// by the tab's own the moment they move to another scene.
+	typed: bool,
 }
 
 impl Bar {
@@ -38,10 +44,18 @@ impl Bar {
 		world: &World,
 		tool: Tool,
 		steps: Steps<'_>,
+		scene: &str,
 		changes: &mut Vec<Change>,
 	) {
+		// the field follows the tab on screen until somebody types in it, and
+		// then it is theirs: what they typed is a save-as they have not
+		// pressed yet, and a switch that overwrote it would throw it away
+		if !self.typed {
+			scene.clone_into(&mut self.filed);
+		}
+
 		ui.add_space(4.0);
-		strip(ui, world, tool, steps, &mut self.filed, changes);
+		strip(ui, world, tool, steps, &mut self.filed, &mut self.typed, changes);
 		ui.add_space(4.0);
 	}
 }
@@ -63,6 +77,7 @@ fn strip(
 	tool: Tool,
 	steps: Steps<'_>,
 	filed: &mut String,
+	typed: &mut bool,
 	changes: &mut Vec<Change>,
 ) {
 	ui.horizontal(|ui| {
@@ -72,7 +87,7 @@ fn strip(
 		ui.separator();
 		tools(ui, tool, changes);
 		ui.separator();
-		filing(ui, filed, changes);
+		filing(ui, filed, typed, changes);
 		hint(ui);
 	});
 }
@@ -146,20 +161,25 @@ fn tools(ui: &mut Ui, tool: Tool, changes: &mut Vec<Change>) {
 /// a crate that draws panels and the file is the runner's business, and a
 /// console line is the one way across that already exists and already works
 /// from a script, a config file and a document's own program.
-fn filing(ui: &mut Ui, filed: &mut String, changes: &mut Vec<Change>) {
-	if filed.is_empty() {
-		filed.push_str("edited");
+fn filing(ui: &mut Ui, filed: &mut String, typed: &mut bool, changes: &mut Vec<Change>) {
+	ui.label("write to");
+
+	if ui
+		.add(
+			TextEdit::singleline(filed)
+				.desired_width(160.0)
+				.hint_text("name"),
+		)
+		.changed()
+	{
+		*typed = true;
 	}
 
-	ui.label("write to");
-	ui.add(
-		TextEdit::singleline(filed)
-			.desired_width(120.0)
-			.hint_text("name"),
-	);
-
-	if ui.button("assets/scenes").clicked() {
-		changes.push(Change::Write(filed.clone()));
+	if ui.button("assets/scenes").clicked() && !filed.trim().is_empty() {
+		changes.push(Change::Write(filed.trim().to_owned()));
+		// written, so the field goes back to following the tab - which is
+		// about to be the name that was just written to
+		*typed = false;
 	}
 }
 

@@ -67,13 +67,15 @@ mod inspector;
 pub mod launcher;
 pub mod loading;
 mod select;
+mod session;
 mod settings;
 mod shell;
 mod stats;
+mod tabs;
 mod thumbs;
 mod viewport;
 
-use self::{bar::Steps, browser::Dropped, gizmo::Tool, history::History, select::Pick};
+use self::{bar::Steps, browser::Dropped, gizmo::Tool, select::Pick, tabs::Tabs};
 pub use self::{
 	launcher::{Action, Launcher},
 	loading::{Loading, State, Step},
@@ -93,6 +95,14 @@ pub const SHOW: &str = "editor.show";
 /// and the console reach the mode by one path.
 const EDIT: &str = "sim.edit";
 
+/// What a tab is called before anybody has written it anywhere.
+///
+/// A window can come up on a world the project named, and it can come up on
+/// one nothing named at all - a fresh project, a game that built its own. The
+/// name is what `scene.write` writes to, so a world nobody named is offered
+/// this one and whoever writes it may change it.
+const UNNAMED: &str = "edited";
+
 /// The variable that decides whether a stop keeps what the game did.
 ///
 /// The runner's as well: the editor never writes it and only says which of
@@ -100,15 +110,6 @@ const EDIT: &str = "sim.edit";
 /// one thing a panel can get wrong without anybody noticing until the work is
 /// gone.
 const KEEP: &str = "sim.keep";
-
-/// How wide the hierarchy starts out, in points.
-const HIERARCHY_WIDTH: f32 = 240.0;
-
-/// How wide the inspector starts out, in points.
-const INSPECTOR_WIDTH: f32 = 320.0;
-
-/// How tall the bottom panel starts out, in points.
-const BOTTOM_HEIGHT: f32 = 220.0;
 
 /// What the window lends the editor for one frame: the pacing, the
 /// project and the device.
@@ -191,6 +192,24 @@ pub(crate) enum Change {
 	/// Take a step forward again.
 	Redo,
 
+	/// Move to a scene, opening it if it is not open.
+	Open {
+		/// The scene source's asset name.
+		name: String,
+	},
+
+	/// Move to the tab in this place in the row.
+	Show {
+		/// Which tab.
+		which: usize,
+	},
+
+	/// Close the tab in this place in the row.
+	Shut {
+		/// Which tab.
+		which: usize,
+	},
+
 	/// Put an asset into the world, where it was dropped.
 	Drop {
 		/// The asset name.
@@ -204,9 +223,9 @@ pub(crate) enum Change {
 	},
 }
 
-/// Which of the bottom panel's tabs is up.
+/// Which of the bottom panel's panes is up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Tab {
+enum Pane {
 	/// The console.
 	#[default]
 	Console,
@@ -221,7 +240,7 @@ enum Tab {
 	Settings,
 }
 
-impl Tab {
+impl Pane {
 	/// What the tab is called.
 	const fn name(self) -> &'static str {
 		match self {
@@ -253,8 +272,10 @@ pub(crate) struct Panels {
 	hierarchy: hierarchy::Hierarchy,
 	viewport: viewport::Viewport,
 	settings: settings::Settings,
-	history: History,
-	tab: Tab,
+	/// Every scene open, and the history of each. The one on screen is the
+	/// live world; @ref [`tabs`].
+	tabs: Tabs,
+	pane: Pane,
 	/// Whether the name field takes the keyboard this frame: F2 was pressed
 	/// last frame, and the inspector is what answers it.
 	rename: bool,
@@ -263,6 +284,18 @@ pub(crate) struct Panels {
 	was_editing: bool,
 	/// A world to put back, because a step was taken this frame.
 	restore: Option<Box<SceneData>>,
+	/// How wide the three panels are, as read off the last frame and written
+	/// to `.colby/editor.json` when the window stops.
+	sizes: session::Sizes,
+
+	/// Scenes the last run had open, waiting for the registry to hold them.
+	///
+	/// A window comes up before its assets do, so a name read out of the file
+	/// cannot be opened on the first frame. Each is tried once a frame until
+	/// the compiler has produced it or the list gives up on it; @ref
+	/// `catching_up`.
+	waiting: Vec<String>,
+
 	/// The part of the screen the world was drawn into last frame, in
 	/// points.
 	///
@@ -284,10 +317,12 @@ impl Default for Panels {
 			hierarchy: hierarchy::Hierarchy::default(),
 			viewport: viewport::Viewport::default(),
 			settings: settings::Settings::default(),
-			history: History::default(),
-			tab: Tab::default(),
+			tabs: Tabs::new(UNNAMED),
+			pane: Pane::default(),
 			rename: false,
 			was_editing: false,
+			sizes: session::Sizes::default(),
+			waiting: Vec::new(),
 			restore: None,
 			// nowhere, until the first frame has laid the panels out: a
 			// rectangle of no size at the corner, so that a pointer measured
@@ -309,6 +344,55 @@ impl Editor {
 		Self {
 			shell: shell::Shell::new(window, device, format),
 			panels: Panels::default(),
+		}
+	}
+
+	/// Puts back what the editor was left with for this project.
+	///
+	/// Called once, before the first frame: the panels take the widths they
+	/// were dragged to and the tabs are the scenes that were open, minus the
+	/// one the window came up on, which is already the world. The scenes are
+	/// only named here - each is opened by name on the frame that reaches it,
+	/// because a scene the compiler no longer produces is a name and nothing
+	/// more.
+	///
+	/// @param project - whose file
+	/// @param scene - the scene the world came up on, which is tab one
+	pub fn remember(&mut self, project: &Project, scene: &str) {
+		let session = session::Session::open(project);
+
+		self.panels.sizes = session.panels;
+		self.panels.tabs = Tabs::new(if scene.is_empty() { UNNAMED } else { scene });
+		self.panels.waiting = session
+			.tabs
+			.iter()
+			.filter(|name| *name != scene)
+			.cloned()
+			.collect();
+	}
+
+	/// Writes down what to put back next time.
+	///
+	/// Called as the window goes down, beside the console's own config. A
+	/// failure is a line and not a stop: this is a convenience, and a project
+	/// whose derived tree cannot be written has worse problems than a panel
+	/// width.
+	///
+	/// @param project - whose file
+	pub fn forget_not(&self, project: &Project) {
+		let session = session::Session {
+			tabs: self
+				.panels
+				.tabs
+				.names()
+				.map(str::to_owned)
+				.collect(),
+			current: self.panels.tabs.at(),
+			panels: self.panels.sizes,
+		};
+
+		if let Err(failure) = session.save(project) {
+			warn!(%failure, "the editor's file was not written");
 		}
 	}
 
@@ -415,7 +499,7 @@ impl Panels {
 		// rather than replacing it, out here as in the hierarchy.
 		if let Some(pick) =
 			self.viewport
-				.run(&context, world, &self.selection, self.view, &mut self.history)
+				.run(&context, world, &self.selection, self.view, self.tabs.history())
 		{
 			if context.input(|input| input.modifiers.command) {
 				self.selection.toggle(world, pick);
@@ -424,35 +508,45 @@ impl Panels {
 			}
 		}
 
+		// the window as it stands, taken before a panel has eaten into it:
+		// what a panel was dragged to is the difference between this and what
+		// is left over at the end of the frame
+		let whole = ui.max_rect();
 		let mut changes = Vec::new();
 		let tool = self.viewport.tool();
+		let scene = self.tabs.current().name.clone();
+		let history = self.tabs.history();
 		let steps = Steps {
-			undo: self.history.undoable(),
-			redo: self.history.redoable(),
+			undo: history.undoable(),
+			redo: history.redoable(),
 		};
 
 		Panel::top("bar").show(ui, |ui| {
 			self.bar
-				.show(ui, world, tool, steps, &mut changes);
+				.show(ui, world, tool, steps, &scene, &mut changes);
+		});
+		Panel::top("tabs").show(ui, |ui| {
+			tabs::strip(ui, &self.tabs, &mut changes);
 		});
 		Panel::left("hierarchy")
-			.default_size(HIERARCHY_WIDTH)
+			.default_size(points(self.sizes.left))
 			.show(ui, |ui| {
 				self.hierarchy
 					.show(ui, world, &self.selection, &mut changes);
 			});
 		Panel::right("inspector")
-			.default_size(INSPECTOR_WIDTH)
+			.default_size(points(self.sizes.right))
 			.show(ui, |ui| {
-				inspector::show(ui, world, &self.selection, &mut self.history, self.rename);
+				inspector::show(ui, world, &self.selection, self.tabs.history(), self.rename);
 			});
 		// answered, whether or not the field took it
 		self.rename = false;
 		Panel::bottom("bottom")
 			.resizable(true)
-			.default_size(BOTTOM_HEIGHT)
-			.show(ui, |ui| self.bottom(ui, world, host));
+			.default_size(points(self.sizes.bottom))
+			.show(ui, |ui| self.bottom(ui, world, host, &mut changes));
 
+		changes.extend(self.catching_up(world));
 		changes.extend(stepped(&context));
 		changes.extend(self.dropped(&context, world));
 
@@ -462,8 +556,8 @@ impl Panels {
 
 		// the frame is over for the history: a gesture nothing wrote to this
 		// frame is a record now.
-		if self.history.settle(world) {
-			debug!(undo = self.history.undoable(), "written down");
+		if self.tabs.history().settle(world) {
+			debug!(undo = self.tabs.history().undoable(), "written down");
 		}
 
 		// what is left is the world's. Nothing is laid out there on purpose:
@@ -471,6 +565,17 @@ impl Panels {
 		// does not own, and that is what lets a drag out there be a camera's
 		// rather than a widget's.
 		self.view = ui.available_rect_before_wrap();
+		// the three widths as they now stand, read off the leftover rather
+		// than asked of egui: whatever the panels were dragged to is the
+		// difference between the window and what they left for the picture,
+		// and that is one subtraction rather than three lookups into a
+		// memory whose keys this crate would have to keep in step
+		let screen = whole;
+		self.sizes = session::Sizes {
+			left: pixels(self.view.min.x - screen.min.x),
+			right: pixels(screen.max.x - self.view.max.x),
+			bottom: pixels(screen.max.y - self.view.max.y),
+		};
 
 		self.view
 	}
@@ -483,7 +588,7 @@ impl Panels {
 			return;
 		}
 
-		self.history.begin("delete", world);
+		self.tabs.history().begin("delete", world);
 		let went = select::delete(world, &picks);
 		self.selection.clear();
 
@@ -497,7 +602,7 @@ impl Panels {
 			return;
 		}
 
-		self.history.begin("duplicate", world);
+		self.tabs.history().begin("duplicate", world);
 		let copies = select::duplicate(world, &picks);
 		self.selection.clear();
 
@@ -519,7 +624,7 @@ impl Panels {
 	/// somewhere else - a typed line, a config file - held nothing, and there
 	/// is nothing here to close. @ref [`history`].
 	fn follow(&mut self, world: &World) {
-		if self.was_editing && !world.editing && !self.history.holding() {
+		if self.was_editing && !world.editing && !self.tabs.history().holding() {
 			// play was started by something that is not the editor - a typed
 			// `sim.edit 0`, a config file, a game that asked for it - so
 			// nobody wrote the world down and there is nothing to close. The
@@ -528,29 +633,37 @@ impl Panels {
 			debug!("playing; nobody wrote this play down, so there is no step back over it");
 		}
 
-		if !self.was_editing && world.editing && self.history.release(world) {
+		if !self.was_editing && world.editing && self.tabs.history().release(world) {
 			info!("editing; the play is one step to go back over, because sim.keep is on");
 		}
 
 		self.was_editing = world.editing;
 	}
 
-	/// The bottom panel: four tabs, and whichever is up.
-	fn bottom(&mut self, ui: &mut Ui, world: &mut World, host: &Host<'_>) {
+	/// The bottom panel: four panes, and whichever is up.
+	fn bottom(
+		&mut self,
+		ui: &mut Ui,
+		world: &mut World,
+		host: &Host<'_>,
+		changes: &mut Vec<Change>,
+	) {
 		ui.add_space(4.0);
 		ui.horizontal(|ui| {
-			tab(ui, &mut self.tab, Tab::Console);
-			tab(ui, &mut self.tab, Tab::Statistics);
-			tab(ui, &mut self.tab, Tab::Assets);
-			tab(ui, &mut self.tab, Tab::Settings);
+			pane(ui, &mut self.pane, Pane::Console);
+			pane(ui, &mut self.pane, Pane::Statistics);
+			pane(ui, &mut self.pane, Pane::Assets);
+			pane(ui, &mut self.pane, Pane::Settings);
 		});
 		ui.separator();
 
-		match self.tab {
-			| Tab::Console => self.console.show(ui, world),
-			| Tab::Statistics => stats::show(ui, world, host.clock, host.frames),
-			| Tab::Assets => self.browser.show(ui, host.project, host.gpu),
-			| Tab::Settings => self.settings.show(ui, world),
+		match self.pane {
+			| Pane::Console => self.console.show(ui, world),
+			| Pane::Statistics => stats::show(ui, world, host.clock, host.frames),
+			| Pane::Assets => self
+				.browser
+				.show(ui, host.project, host.gpu, changes),
+			| Pane::Settings => self.settings.show(ui, world),
 		}
 	}
 
@@ -600,7 +713,7 @@ impl Panels {
 			| Change::Duplicate => self.duplicate(world),
 			| Change::Rename => self.rename = true,
 			| Change::Hang { child, parent } => {
-				self.history.begin("hang", world);
+				self.tabs.history().begin("hang", world);
 
 				if !select::hang(world, child, parent) {
 					// a stale handle, a loop, or a thing hung off itself: the
@@ -612,10 +725,18 @@ impl Panels {
 			},
 			| Change::Tool(tool) => self.viewport.set_tool(tool),
 			| Change::Edit(editing) => self.set_mode(world, editing),
-			| Change::Write(name) =>
-				colby_core::abi::console::run(world, &format!("scene.write {name}")),
-			| Change::Undo => self.restore = self.history.undo(world),
-			| Change::Redo => self.restore = self.history.redo(),
+			| Change::Write(name) => {
+				// the scene the tab is, from now on: a write under a new name
+				// is a save-as, and what is on screen afterwards is what was
+				// just written rather than what it came from
+				colby_core::abi::console::run(world, &format!("scene.write {name}"));
+				self.tabs.rename(&name);
+			},
+			| Change::Undo => self.restore = self.tabs.history().undo(world),
+			| Change::Redo => self.restore = self.tabs.history().redo(),
+			| Change::Open { name } => self.reach(world, &name),
+			| Change::Show { which } => self.restore = self.tabs.switch(world, which),
+			| Change::Shut { which } => self.restore = self.tabs.close(which),
 			| Change::Drop { name, kind, at } => self.drop(world, &name, kind, at),
 		}
 	}
@@ -636,7 +757,7 @@ impl Panels {
 	/// @param editing - the mode being asked for
 	fn set_mode(&mut self, world: &mut World, editing: bool) {
 		if !editing {
-			self.history.hold("play", world);
+			self.tabs.history().hold("play", world);
 		}
 
 		world
@@ -644,8 +765,59 @@ impl Panels {
 			.set(EDIT, if editing { "true" } else { "false" });
 	}
 
+	/// One scene from the last run, if the compiler has caught up with it.
+	///
+	/// A window comes up before its assets do, so a name out of the file
+	/// cannot be opened on the first frame; one is tried a frame, in the
+	/// order they were written down, and a name the registry still does not
+	/// know stays in the list. A name it *never* knows stays there for the
+	/// life of the window and costs one lookup a frame, which is a linear
+	/// walk of tens of entries and not worth a second mechanism to avoid.
+	///
+	/// The scene opened this way does not become the one on screen: they are
+	/// opened in order and the tab that was current is chosen at the end, so
+	/// opening them one at a time would otherwise walk the window through
+	/// every scene the last run had.
+	fn catching_up(&mut self, world: &World) -> Vec<Change> {
+		let Some(index) = self
+			.waiting
+			.iter()
+			.position(|name| world.scenes.find(name).is_some())
+		else {
+			return Vec::new();
+		};
+
+		let name = self.waiting.remove(index);
+
+		vec![Change::Open { name }]
+	}
+
+	/// Opens a scene by name, or moves to it if it is already open.
+	///
+	/// The compiled scene is the tab's world, taken out of the registry the
+	/// asset loop fills. A name the registry does not know is a scene that
+	/// has not compiled - the browser says so on the row - and nothing
+	/// happens beyond a line saying which name it was.
+	///
+	/// @param world - the world being left, written down by the tabs
+	/// @param name - the scene source's asset name
+	fn reach(&mut self, world: &World, name: &str) {
+		let id = world.scenes.find(name);
+		if !id.is_some() {
+			warn!(name, "no compiled scene under that name to open");
+
+			return;
+		}
+
+		let data = world.scenes.data(id).clone();
+		self.restore = self.tabs.open(world, name, &data);
+		self.selection.clear();
+
+		info!(name, tabs = self.tabs.len(), "opened");
+	}
+
 	fn drop(&mut self, world: &mut World, name: &str, kind: Kind, at: Vec3) {
-		self.history.begin("drop", world);
+		self.tabs.history().begin("drop", world);
 		let landed = select::drop(world, name, kind, at);
 
 		if landed.is_empty() {
@@ -706,8 +878,8 @@ fn stepped(context: &Context) -> Vec<Change> {
 	})
 }
 
-/// One tab's label, which brings its tab up when pressed.
-fn tab(ui: &mut Ui, current: &mut Tab, this: Tab) {
+/// One pane's label, which brings its pane up when pressed.
+fn pane(ui: &mut Ui, current: &mut Pane, this: Pane) {
 	if ui
 		.selectable_label(*current == this, this.name())
 		.clicked()
@@ -734,6 +906,9 @@ fn physical(rect: Rect, points: f32) -> Viewport {
 		height: pixels(rect.height() * points),
 	}
 }
+
+/// A width the file holds, as the number of points a panel is given.
+fn points(size: u32) -> f32 { f32::from(u16::try_from(size).unwrap_or(u16::MAX)) }
 
 /// A length in pixels as a count of them: rounded, and never less than none.
 #[expect(
@@ -876,6 +1051,56 @@ mod tests {
 		assert!(view.max.y <= prompt.min.y, "and the picture stops above it: {view:?}");
 	}
 
+	#[test]
+	fn opening_a_scene_that_never_compiled_leaves_the_tabs_where_they_are() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut panels = Panels::default();
+
+		panels.apply(&mut world, Change::Open { name: "scenes/never".to_owned() });
+
+		assert_eq!(panels.tabs.len(), 1, "no tab for a name the registry does not know");
+		assert!(panels.restore.is_none(), "and no world to put back");
+	}
+
+	#[test]
+	fn a_scene_the_last_run_had_open_waits_for_the_compiler_to_catch_up() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut panels = Panels {
+			waiting: vec!["scenes/hangar".to_owned()],
+			..Panels::default()
+		};
+
+		assert!(panels.catching_up(&world).is_empty(), "nothing to open yet");
+		assert_eq!(panels.waiting.len(), 1, "and the name is still waiting");
+
+		// the asset loop catches up
+		let mut other = World::new();
+		other
+			.entities
+			.spawn_at(Transform::at(Vec3::Y * 3.0));
+		world
+			.scenes
+			.insert("scenes/hangar", colby_core::abi::scene::capture(&other));
+
+		let asked = panels.catching_up(&world);
+
+		assert_eq!(asked.len(), 1, "now it can be opened");
+		assert!(panels.waiting.is_empty(), "and it is off the list");
+	}
+
+	#[test]
+	fn a_write_renames_the_tab_it_was_written_from() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut panels = Panels::default();
+
+		panels.apply(&mut world, Change::Write("scenes/yard".to_owned()));
+
+		assert_eq!(panels.tabs.current().name, "scenes/yard", "a write is a save-as");
+	}
+
 	/// A world with one thing hung off another and a ball above the floor,
 	/// with that hang already a record.
 	fn hung() -> (World, Panels, EntityId) {
@@ -907,10 +1132,17 @@ mod tests {
 
 		let view = frame(&mut panels, &mut world);
 
-		assert!(view.min.x >= HIERARCHY_WIDTH, "the hierarchy is on the left: {view:?}");
-		assert!(view.max.x <= 1280.0 - INSPECTOR_WIDTH, "the inspector on the right: {view:?}");
+		let starting = session::Sizes::default();
+		assert!(view.min.x >= points(starting.left), "the hierarchy is on the left: {view:?}");
+		assert!(
+			view.max.x <= 1280.0 - points(starting.right),
+			"the inspector on the right: {view:?}"
+		);
 		assert!(view.min.y > 0.0, "the strip along the top: {view:?}");
-		assert!(view.max.y <= 720.0 - BOTTOM_HEIGHT, "the bottom panel below: {view:?}");
+		assert!(
+			view.max.y <= 720.0 - points(starting.bottom),
+			"the bottom panel below: {view:?}"
+		);
 		assert!(view.width() > 400.0 && view.height() > 200.0, "and room for a world: {view:?}");
 		assert_eq!(panels.view, view, "and the viewport is told where for next frame");
 	}
@@ -976,9 +1208,9 @@ mod tests {
 		panels.apply(&mut world, Change::Hang { child: wheel, parent: car });
 		// two quiet frames: the one the hang was written in, and the one
 		// that closes the record
-		assert!(!panels.history.settle(&world));
-		assert!(panels.history.settle(&world), "the hang is a record");
-		assert_eq!(panels.history.undoable(), Some("hang"));
+		assert!(!panels.tabs.history().settle(&world));
+		assert!(panels.tabs.history().settle(&world), "the hang is a record");
+		assert_eq!(panels.tabs.history().undoable(), Some("hang"));
 
 		panels.apply(&mut world, Change::Undo);
 		let described = panels
@@ -994,7 +1226,11 @@ mod tests {
 			"where it was"
 		);
 		assert!(world.entities.alive(wheel), "and its handle still resolves");
-		assert_eq!(panels.history.redoable(), Some("hang"), "and the hang can be done again");
+		assert_eq!(
+			panels.tabs.history().redoable(),
+			Some("hang"),
+			"and the hang can be done again"
+		);
 	}
 
 	#[test]
@@ -1012,7 +1248,7 @@ mod tests {
 		// key down
 		frame(&mut panels, &mut world);
 		frame(&mut panels, &mut world);
-		assert_eq!(panels.history.undoable(), Some("hang"));
+		assert_eq!(panels.tabs.history().undoable(), Some("hang"));
 
 		keyed(&mut panels, &mut world, Key::Z, Modifiers::COMMAND);
 
@@ -1051,7 +1287,7 @@ mod tests {
 		assert!(!world.entities.alive(car) && !world.entities.alive(wheel), "the branch went");
 		assert!(world.entities.alive(bystander), "and nothing else");
 		assert_eq!(panels.selection.at(), Pick::Nothing, "nothing is selected now");
-		assert_eq!(panels.history.undoable(), Some("delete"), "and it is one step back");
+		assert_eq!(panels.tabs.history().undoable(), Some("delete"), "and it is one step back");
 	}
 
 	#[test]
@@ -1075,7 +1311,7 @@ mod tests {
 		};
 		assert_ne!(primary, car);
 		assert_eq!(world.entities.name(primary), "car", "the copy of what was picked last");
-		assert_eq!(panels.history.undoable(), Some("duplicate"));
+		assert_eq!(panels.tabs.history().undoable(), Some("duplicate"));
 	}
 
 	#[test]
@@ -1120,7 +1356,7 @@ mod tests {
 			panic!("and is selected");
 		};
 		assert_eq!(world.entities.name(landed), "crate");
-		assert_eq!(panels.history.undoable(), Some("drop"));
+		assert_eq!(panels.tabs.history().undoable(), Some("drop"));
 
 		panels.apply(&mut world, Change::Drop {
 			name: "textures/wall".to_owned(),
@@ -1130,13 +1366,17 @@ mod tests {
 		frame(&mut panels, &mut world);
 		frame(&mut panels, &mut world);
 		assert_eq!(world.entities.len(), 1, "a texture is nothing to put in the world");
-		assert_eq!(panels.history.undoable(), Some("drop"), "and no record was made of nothing");
+		assert_eq!(
+			panels.tabs.history().undoable(),
+			Some("drop"),
+			"and no record was made of nothing"
+		);
 	}
 
 	#[test]
 	fn a_play_that_puts_the_world_back_leaves_what_was_done_before_it() {
 		let (mut world, mut panels, ball) = hung();
-		assert_eq!(panels.history.undoable(), Some("hang"));
+		assert_eq!(panels.tabs.history().undoable(), Some("hang"));
 
 		// play, through the same call the key and the button make
 		panels.set_mode(&mut world, false);
@@ -1147,7 +1387,7 @@ mod tests {
 		// the game moves something, every step it runs
 		shift(&mut world, ball, Vec3::new(0.0, 9.0, 0.0));
 		frame(&mut panels, &mut world);
-		assert_eq!(panels.history.undoable(), Some("hang"), "and nothing is written down");
+		assert_eq!(panels.tabs.history().undoable(), Some("hang"), "and nothing is written down");
 
 		// stopping puts the world back, which the runner does; the editor
 		// sees the mode change on the frame after. The clock is not put
@@ -1160,7 +1400,7 @@ mod tests {
 		frame(&mut panels, &mut world);
 
 		assert_eq!(
-			panels.history.undoable(),
+			panels.tabs.history().undoable(),
 			Some("hang"),
 			"a play that changed nothing is not a step, and the record before it stands"
 		);
@@ -1179,7 +1419,7 @@ mod tests {
 		world.editing = true;
 		frame(&mut panels, &mut world);
 
-		assert_eq!(panels.history.undoable(), Some("play"), "the whole play is one step");
+		assert_eq!(panels.tabs.history().undoable(), Some("play"), "the whole play is one step");
 
 		panels.apply(&mut world, Change::Undo);
 		let back = panels
@@ -1193,7 +1433,11 @@ mod tests {
 			.expect("the world before the play, with the ball where it was");
 
 		assert!((ball.transform.position.y - 1.0).abs() < 1.0e-5, "at {ball:?}");
-		assert_eq!(panels.history.undoable(), Some("hang"), "and the edit before it is next");
+		assert_eq!(
+			panels.tabs.history().undoable(),
+			Some("hang"),
+			"and the edit before it is next"
+		);
 	}
 
 	#[test]
@@ -1208,6 +1452,6 @@ mod tests {
 		world.editing = true;
 		frame(&mut panels, &mut world);
 
-		assert_eq!(panels.history.undoable(), Some("hang"));
+		assert_eq!(panels.tabs.history().undoable(), Some("hang"));
 	}
 }
