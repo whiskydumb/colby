@@ -48,7 +48,7 @@ use std::path::Path;
 use colby_core::{
 	Result,
 	abi::{
-		BodyKind, Camera, JointKind, Layers, ShapeKind, Transform,
+		BodyKind, Camera, JointKind, Layers, Light, LightKind, ShapeKind, Transform,
 		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
@@ -70,7 +70,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// agreed.
 ///
 /// Six since an entity record says what it hangs off.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -224,11 +224,23 @@ pub struct SceneHeader {
 	/// How many of those bytes there are.
 	pub kept_bytes_length: u32,
 
-	/// Spare, so the header is a round hundred and sixty bytes and every block
-	/// after it inherits the buffer's alignment.
-	pub reserved: [u32; 3],
+	/// Bytes per light record. Must be `size_of::<Lit>()`.
+	pub lit_stride: u32,
+
+	/// Where the light block starts.
+	pub lit_offset: u32,
+
+	/// How many entities carried a light.
+	///
+	/// One record per lamp rather than a wider entity record: a light is the
+	/// rare thing an entity has, and version 6 wrote none at all.
+	pub lit_count: u32,
 }
 
+// the header had three spare words until the light block took them, so the
+// next block added grows it by four rather than three - three words would
+// leave it at a hundred and seventy-two, which is not a multiple of sixteen.
+//
 // the blocks after the header inherit the buffer's alignment only because the
 // header is a multiple of it, and a field added without shrinking the spare
 // would move all of them without anybody noticing until a cast failed. The
@@ -327,6 +339,47 @@ pub struct Stood {
 	/// own. Its position, rotation and scale are then its place inside that
 	/// entity.
 	pub parent: u32,
+}
+
+/// One entity's light, as the file holds it.
+///
+/// Keyed by the entity the way a [`Bulk`] is, rather than folded into
+/// [`Stood`]: nearly every entity in a world carries no light, and a wider
+/// entity record would spend thirty-six bytes on each of them to say so. Both
+/// shapes bump [`FORMAT_VERSION`] once and only once; this one costs a world
+/// of a thousand crates and two lamps seventy-two bytes instead of thirty-six
+/// thousand.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Lit {
+	/// Which entry of the entity block this belongs to.
+	pub thing: u32,
+
+	/// Which shape it throws, as
+	/// [`LightKind`](colby_core::abi::LightKind) in declaration order.
+	///
+	/// A record is only written for a light that is one of the lit kinds, so
+	/// nothing here should be the `none` word - but a reader that finds one
+	/// takes it, because a light of no kind is exactly the absence a missing
+	/// record already means and refusing the file over it would be refusing a
+	/// world for describing nothing twice.
+	pub kind: u32,
+
+	/// Its color, linear RGB.
+	pub color: [f32; 3],
+
+	/// How bright, as a multiplier on the color.
+	pub intensity: f32,
+
+	/// How far its contribution reaches.
+	pub range: f32,
+
+	/// The half-angle of a cone's bright middle, in radians.
+	pub inner: f32,
+
+	/// The half-angle of a cone's edge, in radians.
+	pub outer: f32,
 }
 
 /// One posed skeleton, as the file holds it.
@@ -595,6 +648,10 @@ impl SceneFile {
 		self.block(self.header.stood_offset, self.header.stood_count)
 	}
 
+	/// The light block, one record per entity that carries one.
+	#[must_use]
+	pub fn lit(&self) -> &[Lit] { self.block(self.header.lit_offset, self.header.lit_count) }
+
 	/// The body block.
 	#[must_use]
 	pub fn bulk(&self) -> &[Bulk] { self.block(self.header.bulk_offset, self.header.bulk_count) }
@@ -717,14 +774,30 @@ impl SceneFile {
 		let after_ties = stood.saturating_add(bulk).saturating_add(tie);
 		let after_poses = after_ties.saturating_add(bent);
 		let kept = usize::try_from(self.header.kept_slots).unwrap_or(0);
+		// the entities first and the lights onto them afterwards, because a
+		// light record names its entity by place in the block above. A record
+		// naming a place that is not there is dropped rather than refused: the
+		// block's length was checked against the file, so what is left is a
+		// record disagreeing with the entity block, and a world missing one
+		// lamp is a better answer than a load that did not happen. The same
+		// argument a pose's run of bones is read with.
+		let mut things: Vec<Thing> = self
+			.stood()
+			.iter()
+			.map(|it| self.thing(it))
+			.collect();
+		for record in self.lit() {
+			if let Some(thing) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+			{
+				thing.light = light_of(record);
+			}
+		}
 
 		SceneData {
 			stage: stage_of(self.setting()),
-			things: self
-				.stood()
-				.iter()
-				.map(|it| self.thing(it))
-				.collect(),
+			things,
 			solids: self
 				.bulk()
 				.iter()
@@ -779,6 +852,8 @@ impl SceneFile {
 			mesh: self.name(stood.mesh).to_owned(),
 			material: self.name(stood.material).to_owned(),
 			color: Vec3::from_array(stood.color),
+			// put on afterwards by the caller, out of the light block.
+			light: Light::NONE,
 			pose: stood.pose,
 			parent: stood.parent,
 		}
@@ -926,6 +1001,17 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 			parent: thing.parent,
 		})
 		.collect();
+	// one record per lamp, and the index is the entity's place in the block
+	// above rather than its slot: a piece grafted somewhere else keeps its
+	// entities' order and not their slots, and a light has to follow the
+	// entity it is on. The same choice a body's `thing` makes.
+	let lit: Vec<Lit> = data
+		.things
+		.iter()
+		.enumerate()
+		.filter(|(_, thing)| thing.light.kind.is_lit())
+		.map(|(index, thing)| lit_of(index, thing.light))
+		.collect::<Result<Vec<_>>>()?;
 	let bulk: Vec<Bulk> = data
 		.solids
 		.iter()
@@ -959,6 +1045,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 
 	let blocks = Blocks {
 		stood: &stood,
+		lit: &lit,
 		bulk: &bulk,
 		tie: &tie,
 		bent: &bent,
@@ -973,6 +1060,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::bytes_of(&setting_of(data.stage)));
 	out.extend_from_slice(bytemuck::cast_slice(&stood));
+	out.extend_from_slice(bytemuck::cast_slice(&lit));
 	out.extend_from_slice(bytemuck::cast_slice(&bulk));
 	out.extend_from_slice(bytemuck::cast_slice(&tie));
 	out.extend_from_slice(bytemuck::cast_slice(&bent));
@@ -993,6 +1081,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 struct Places {
 	setting: usize,
 	stood: usize,
+	lit: usize,
 	bulk: usize,
 	tie: usize,
 	bent: usize,
@@ -1009,6 +1098,7 @@ impl Places {
 	fn of(blocks: &Blocks<'_>, generations: &[u32], arena: Option<&Arena>) -> Self {
 		let Blocks {
 			stood,
+			lit,
 			bulk,
 			tie,
 			bent,
@@ -1018,7 +1108,11 @@ impl Places {
 		} = *blocks;
 		let setting = HEADER_BYTES;
 		let stood_at = setting + size_of::<Setting>();
-		let bulk_at = stood_at + size_of_val(stood);
+		// beside the entities and before the bodies, because that is the order
+		// the world reads in. Every offset is stored, so where a block lands is
+		// a matter of what is legible rather than of what a reader can find.
+		let lit_at = stood_at + size_of_val(stood);
+		let bulk_at = lit_at + size_of_val(lit);
 		let tie_at = bulk_at + size_of_val(bulk);
 		let bent_at = tie_at + size_of_val(tie);
 		let locals_at = bent_at + size_of_val(bent);
@@ -1037,6 +1131,7 @@ impl Places {
 		Self {
 			setting,
 			stood: stood_at,
+			lit: lit_at,
 			bulk: bulk_at,
 			tie: tie_at,
 			bent: bent_at,
@@ -1053,6 +1148,7 @@ impl Places {
 /// Every record block, handed to the header filler as one argument.
 struct Blocks<'a> {
 	stood: &'a [Stood],
+	lit: &'a [Lit],
 	bulk: &'a [Bulk],
 	tie: &'a [Tie],
 	bent: &'a [Bent],
@@ -1070,6 +1166,7 @@ fn head(
 ) -> Result<SceneHeader> {
 	let Blocks {
 		stood,
+		lit,
 		bulk,
 		tie,
 		bent,
@@ -1127,7 +1224,9 @@ fn head(
 		kept_slots: count(data.peer_generations.len(), "a scene's records")?,
 		kept_bytes_offset: count(places.kept_bytes, "a scene's records")?,
 		kept_bytes_length: count(kept_bytes, "a scene's records")?,
-		reserved: [0; 3],
+		lit_stride: width::<Lit>("a scene's records")?,
+		lit_offset: count(places.lit, "a scene's records")?,
+		lit_count: count(lit.len(), "a scene's records")?,
 	})
 }
 
@@ -1171,6 +1270,19 @@ fn bent_of(posed: &Posed, names: &mut Names, locals: &mut Vec<Local>) -> Bent {
 }
 
 /// One body, as the file holds it.
+fn lit_of(index: usize, light: Light) -> Result<Lit> {
+	Ok(Lit {
+		thing: count(index, "a scene's records")?,
+		kind: light.kind.index(),
+		color: light.color.to_array(),
+		intensity: light.intensity,
+		range: light.range,
+		inner: light.inner,
+		outer: light.outer,
+	})
+}
+
+/// One body, with its names put in the blob.
 fn bulk_of(solid: &Solid, names: &mut Names) -> Bulk {
 	let mut flags = 0;
 	if solid.sensor {
@@ -1265,6 +1377,24 @@ fn stage_of(setting: Setting) -> Stage {
 		gravity: Vec3::from_array(setting.gravity),
 		time: setting.time,
 		steps: setting.steps,
+	}
+}
+
+/// One light record, as the world holds it.
+///
+/// A kind the list does not have reads as no light at all rather than as a
+/// refusal, for the reason a `.cscene` refuses a *code* elsewhere and ignores
+/// a flag bit: this build knowing fewer kinds than the writer did is the one
+/// thing a version number already caught, and what is left is a file the
+/// version agrees with carrying a number nothing in it means.
+fn light_of(record: &Lit) -> Light {
+	Light {
+		kind: LightKind::at(record.kind).unwrap_or(LightKind::None),
+		color: Vec3::from_array(record.color),
+		intensity: record.intensity,
+		range: record.range,
+		inner: record.inner,
+		outer: record.outer,
 	}
 }
 
@@ -1457,6 +1587,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 	let widths = [
 		(header.setting_stride, size_of::<Setting>(), "settings"),
 		(header.stood_stride, size_of::<Stood>(), "entities"),
+		(header.lit_stride, size_of::<Lit>(), "lights"),
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
 		(header.bent_stride, size_of::<Bent>(), "poses"),
@@ -1526,6 +1657,7 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 
 	fits::<Setting>(bytes, HEADER_BYTES, (header.setting_offset, 1), "settings")?;
 	fits::<Stood>(bytes, HEADER_BYTES, (header.stood_offset, header.stood_count), "entities")?;
+	fits::<Lit>(bytes, HEADER_BYTES, (header.lit_offset, header.lit_count), "lights")?;
 	fits::<Bulk>(bytes, HEADER_BYTES, (header.bulk_offset, header.bulk_count), "bodies")?;
 	fits::<Tie>(bytes, HEADER_BYTES, (header.tie_offset, header.tie_count), "joints")?;
 	fits::<Bent>(bytes, HEADER_BYTES, (header.bent_offset, header.bent_count), "poses")?;
@@ -1632,6 +1764,7 @@ mod tests {
 				mesh: "meshes/crystal".to_owned(),
 				material: "brass".to_owned(),
 				color: Vec3::new(0.8, 0.7, 0.6),
+				light: Light::point(Vec3::new(1.0, 0.9, 0.7), 2.5, 12.0),
 				pose: 0,
 				parent: scene::NO_INDEX,
 			},
@@ -1647,6 +1780,10 @@ mod tests {
 				mesh: "meshes/crystal".to_owned(),
 				material: String::new(),
 				color: Vec3::ONE,
+				// on the second one on purpose: its slot is 2 and its place in
+				// the block is 1, so a writer keying a light by slot rather
+				// than by index puts this record on nobody.
+				light: Light::spot(Vec3::new(0.2, 0.4, 1.0), 4.0, 30.0, 0.3, 0.6),
 				pose: scene::NO_INDEX,
 				// hanging off the first, so the field carries something a
 				// round trip could lose
@@ -1963,6 +2100,66 @@ mod tests {
 				"a body code nothing answers to is refused rather than read as the first kind"
 			);
 		}
+	}
+
+	/// The sample written out, with one word of its first light record
+	/// overwritten.
+	///
+	/// @param at - the record's own field offset, in bytes
+	/// @param word - what to put there
+	fn light_word_changed(at: usize, word: u32) -> SceneData {
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let first = usize::try_from(header.lit_offset).expect("it is an offset") + at;
+
+		assert_eq!(header.lit_count, 2, "the sample stands two lamps");
+		bytes[first..first + 4].copy_from_slice(&word.to_le_bytes());
+
+		SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a changed word is not a broken file")
+			.to_scene_data()
+	}
+
+	#[test]
+	fn a_light_naming_an_entity_that_is_not_there_is_dropped() {
+		let read = light_word_changed(offset_of!(Lit, thing), 99);
+
+		assert_eq!(read.things[0].light, Light::NONE, "the record went nowhere");
+		assert_eq!(
+			read.things[1].light,
+			sample_things()[1].light,
+			"and the one beside it landed as it always did"
+		);
+	}
+
+	#[test]
+	fn a_light_of_a_kind_this_build_does_not_know_reads_as_no_light() {
+		let read = light_word_changed(offset_of!(Lit, kind), 9);
+
+		assert_eq!(
+			read.things[0].light.kind,
+			LightKind::None,
+			"a word off the end of the list is nothing rather than a refusal"
+		);
+		assert!(
+			(read.things[0].light.range - sample_things()[0].light.range).abs() < 1.0e-6,
+			"and the numbers beside it are still read"
+		);
+	}
+
+	#[test]
+	fn a_world_of_a_thousand_crates_and_no_lamp_writes_no_light_block() {
+		let mut data = sample();
+		for thing in &mut data.things {
+			thing.light = Light::NONE;
+		}
+
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+
+		assert_eq!(header.lit_count, 0, "nothing shines, so nothing is written down");
+		assert_eq!(round_trip(&data), data, "and it comes back the same way");
 	}
 
 	#[test]

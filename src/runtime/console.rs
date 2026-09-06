@@ -299,7 +299,8 @@ pub(crate) fn install(world: &mut World) {
 	install_scripts(world);
 }
 
-/// The renderer's variables: the shadows, and which graphics APIs to draw with.
+/// The renderer's variables: the shadows, the lights, and which graphics APIs
+/// to draw with.
 ///
 /// Registered whether or not there is a window, like everything else here: a
 /// host writes them into its config untouched, and a config is one file for a
@@ -324,6 +325,14 @@ fn install_render(world: &mut World) {
 		colby_engine::shadow::TINT,
 		Value::Bool(false),
 		"color every pixel by the shadow cascade it read",
+	);
+	// how many point and cone lights one frame may carry. A ceiling rather
+	// than a switch: the array is the frame's whole budget for them, so the
+	// number a machine can afford is the thing worth being able to say.
+	world.cvars.var(
+		colby_engine::scene::LAMPS,
+		Value::Float(colby_engine::scene::DEFAULT_LAMPS),
+		"how many of the nearest point and cone lights a frame draws with",
 	);
 	// which graphics APIs the window may draw with. Saved, because it is a
 	// property of the machine rather than of a session; and read once, when

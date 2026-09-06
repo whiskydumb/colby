@@ -11,9 +11,15 @@
 //
 // Shading is metallic-roughness: Cook-Torrance specular with GGX, Smith
 // visibility and Schlick's Fresnel, over a Lambert diffuse. One directional
-// light, no shadows, no image-based lighting - the ambient term stands in for
-// everything the scene does not simulate, which is why it is a color and not a
-// number.
+// light with cascaded shadows, up to MAX_LAMPS local ones with none, and no
+// image-based lighting - the ambient term stands in for everything the scene
+// does not simulate, which is why it is a color and not a number.
+//
+// The local lights are a flat array walked by every fragment: no tiles, no
+// clusters, no per-object list. What keeps that affordable is that the CPU
+// sends only the nearest few, and what keeps it honest is that the number is
+// a console variable. A cell of a light grid is the next step and it is not
+// this one.
 //
 // The normal a pixel is shaded with is the geometry's, turned by whatever the
 // normal map says. The frame that turn happens in is built per vertex from the
@@ -40,6 +46,33 @@ struct Globals {
     // x is one texel in map coordinates, y is unused, z is whether shadows are
     // on at all, w is whether to color every pixel by the cascade it read.
     shadow: vec4<f32>,
+    // x is how many of the lamps below are real; the rest is unused.
+    counts: vec4<u32>,
+    // The local lights, nearest first. Everything from `counts.x` up is
+    // whatever was in the buffer last frame and is never read.
+    lamps: array<Lamp, MAX_LAMPS>,
+};
+
+// How many local lights one frame may carry.
+//
+// Matched by `colby_engine::scene::MAX_LAMPS`, and the two have to agree: this
+// sizes the uniform and that fills it.
+const MAX_LAMPS: u32 = 32u;
+
+// One point or cone, packed into three vectors.
+//
+// The kind is not a field, and that is the point: a cone's falloff is
+// `saturate(cos * scale + offset)`, and a point is that same line with a scale
+// of nought and an offset of one - which answers one everywhere and costs the
+// loop no branch at all. Filament's packing, and bevy's.
+struct Lamp {
+    // xyz is where it is in the world; w is how far it reaches.
+    position_range: vec4<f32>,
+    // rgb is its color times its intensity; w is the cone's scale.
+    color: vec4<f32>,
+    // xyz is the way a cone points, which is the entity's own -z; w is the
+    // cone's offset.
+    direction: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -353,6 +386,106 @@ fn fresnel_ambient(normal_dot_view: f32, f0: vec3<f32>, roughness: f32) -> vec3<
     return f0 + (ceiling - f0) * pow(clamp(1.0 - normal_dot_view, 0.0, 1.0), 5.0);
 }
 
+// What one light of any kind does to a surface, before its own color and
+// before anything in the way of it.
+//
+// Pulled out of `shade` when the second kind of light arrived: the sun and a
+// lamp differ in where the direction comes from and in what multiplies the
+// result, and in nothing at all between those two points. The pi is the
+// convention this shader already had - the diffuse term is divided by it and
+// the whole is multiplied back - and it is kept so that a lamp of intensity
+// one and the sun are the same brightness head on.
+fn lit_by(
+    normal: vec3<f32>,
+    towards_eye: vec3<f32>,
+    towards_light: vec3<f32>,
+    f0: vec3<f32>,
+    diffuse_color: vec3<f32>,
+    roughness: f32,
+    normal_dot_view: f32,
+) -> vec3<f32> {
+    let half_vector = normalize(towards_light + towards_eye);
+    let normal_dot_light = max(dot(normal, towards_light), 0.0);
+    let normal_dot_half = max(dot(normal, half_vector), 0.0);
+    let view_dot_half = max(dot(towards_eye, half_vector), 0.0);
+
+    let fresnel = fresnel_schlick(view_dot_half, f0);
+    let specular = fresnel
+        * distribution_ggx(normal_dot_half, roughness)
+        * visibility_smith(normal_dot_view, normal_dot_light, roughness);
+    let diffuse = (vec3<f32>(1.0) - fresnel) * diffuse_color / 3.14159265;
+
+    return (diffuse + specular) * normal_dot_light * 3.14159265;
+}
+
+// How much of a lamp survives the distance to a point.
+//
+// An inverse square with a window closed smoothly at the range, which is
+// Karis's and Filament's and what bevy ships: the plain inverse square never
+// reaches zero, so a lamp with no window either lights the whole world by a
+// millionth or ends in a visible ring where somebody clipped it. The fourth
+// power falls off slowly at first and steeply at the edge, so the window is
+// invisible where the light is bright and complete where it is not.
+fn lamp_falloff(distance_square: f32, range_square: f32) -> f32 {
+    let factor = distance_square / max(range_square, 0.0001);
+    let smoothed = clamp(1.0 - factor * factor, 0.0, 1.0);
+
+    return smoothed * smoothed / max(distance_square, 0.0001);
+}
+
+// Everything the local lights add at one point.
+//
+// The whole array is walked and the ones past `counts.x` are not there. A
+// fragment outside a lamp's range leaves the loop early rather than
+// multiplying by a zero it already knows about, which is worth doing because
+// the branch is coherent - neighboring fragments are inside or outside the
+// same sphere together.
+fn lamps_at(
+    world_position: vec3<f32>,
+    normal: vec3<f32>,
+    towards_eye: vec3<f32>,
+    f0: vec3<f32>,
+    diffuse_color: vec3<f32>,
+    roughness: f32,
+    normal_dot_view: f32,
+) -> vec3<f32> {
+    var total = vec3<f32>(0.0);
+    let count = min(globals.counts.x, MAX_LAMPS);
+
+    for (var index = 0u; index < count; index++) {
+        let lamp = globals.lamps[index];
+        let towards = lamp.position_range.xyz - world_position;
+        let distance_square = dot(towards, towards);
+        let range_square = lamp.position_range.w * lamp.position_range.w;
+
+        if (distance_square >= range_square) {
+            continue;
+        }
+
+        let towards_light = towards * inverseSqrt(max(distance_square, 1.0e-8));
+        // a point light packs a scale of nought and an offset of one, so this
+        // is one for it whatever the angle is. @ref `Lamp`.
+        let along = dot(-lamp.direction.xyz, towards_light);
+        let cone = clamp(along * lamp.color.w + lamp.direction.w, 0.0, 1.0);
+
+        total += lit_by(
+            normal,
+            towards_eye,
+            towards_light,
+            f0,
+            diffuse_color,
+            roughness,
+            normal_dot_view,
+        )
+            * lamp.color.rgb
+            * lamp_falloff(distance_square, range_square)
+            * cone
+            * cone;
+    }
+
+    return total;
+}
+
 // How much alpha a texel needs before a masked surface draws it at all.
 //
 // A constant rather than a number on the material: moving the picture's own
@@ -420,33 +553,41 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
     let normal = shading_normal(input);
     let towards_light = normalize(-globals.light.xyz);
     let towards_eye = normalize(globals.eye.xyz - input.world_position);
-    let half_vector = normalize(towards_light + towards_eye);
 
     let normal_dot_light = max(dot(normal, towards_light), 0.0);
     let normal_dot_view = max(dot(normal, towards_eye), 0.0001);
-    let normal_dot_half = max(dot(normal, half_vector), 0.0);
-    let view_dot_half = max(dot(towards_eye, half_vector), 0.0);
 
     // a dielectric reflects four percent head on and is white doing it; a metal
     // reflects its own color and has no diffuse term at all.
     let f0 = mix(vec3<f32>(0.04), base_color, metallic);
     let diffuse_color = base_color * (1.0 - metallic);
 
-    let fresnel = fresnel_schlick(view_dot_half, f0);
-    let specular = fresnel
-        * distribution_ggx(normal_dot_half, roughness)
-        * visibility_smith(normal_dot_view, normal_dot_light, roughness);
-
-    // how much of the one light this point can see. It multiplies the direct
-    // term and nothing else: what a shadow takes away is the light's own
-    // contribution, and the ambient below stands in for everything that reaches
-    // a surface by some other route.
+    // how much of the *sun* this point can see. It multiplies the sun's term
+    // and nothing else: what a shadow takes away is that light's own
+    // contribution, the lamps below cast none at all, and the ambient stands in
+    // for everything that reaches a surface by some other route.
     let view_depth = dot(input.world_position - globals.eye.xyz, globals.forward.xyz);
     let slice = cascade_of(view_depth);
     let reaching = shadowing(input.world_position, normal, 1.0 - normal_dot_light, slice);
 
-    let diffuse = (vec3<f32>(1.0) - fresnel) * diffuse_color / 3.14159265;
-    let direct = (diffuse + specular) * normal_dot_light * 3.14159265 * reaching;
+    let direct = lit_by(
+        normal,
+        towards_eye,
+        towards_light,
+        f0,
+        diffuse_color,
+        roughness,
+        normal_dot_view,
+    ) * reaching
+        + lamps_at(
+            input.world_position,
+            normal,
+            towards_eye,
+            f0,
+            diffuse_color,
+            roughness,
+            normal_dot_view,
+        );
 
     // everything this renderer does not simulate, in one term, standing in for
     // an environment there is no map of.

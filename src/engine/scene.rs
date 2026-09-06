@@ -22,8 +22,8 @@ use core::mem::offset_of;
 use colby_core::{
 	Result,
 	abi::{
-		EntityId, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes, SkinVertex, Texel,
-		TextureData, TextureId, Textures, World,
+		EntityId, Light, LightKind, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes,
+		SkinVertex, Texel, TextureData, TextureId, Textures, Transform, World,
 		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
 	},
@@ -133,6 +133,89 @@ impl Viewport {
 	pub fn aspect(self) -> f32 { self.width.max(1) as f32 / self.height.max(1) as f32 }
 }
 
+/// How many local lights one frame may carry.
+///
+/// Matched by `MAX_LAMPS` in `shader.wgsl`, which sizes the uniform this
+/// fills. Thirty-two is the smallest number in the field that is a *frame*
+/// budget rather than a tile's: Unreal's forward grid allows thirty-two per
+/// sixty-four-pixel cell, Godot's mobile path eight per object. A whole-frame
+/// array is a weaker mechanism than either, so the number it carries is the
+/// generous end rather than the mean one.
+pub const MAX_LAMPS: usize = 32;
+
+/// What [`LAMPS`] holds until somebody sets it, as a console variable holds it.
+///
+/// Written out rather than converted from [`MAX_LAMPS`], so that the whole
+/// number and the number a variable holds are the same literal and the const
+/// below is what checks they agree.
+pub const DEFAULT_LAMPS: f32 = 32.0;
+
+/// The console variable that says how many of them a frame actually sends.
+///
+/// A ceiling on the ceiling, so that the cost of a room full of lamps can be
+/// measured rather than guessed at, and so that a machine which cannot afford
+/// the loop has somewhere to say so.
+pub const LAMPS: &str = "r.lights";
+
+/// One local light, as the shader reads it.
+///
+/// Three vectors, and the kind is not one of them: a cone is
+/// `saturate(cos * scale + offset)` and a point is that line with a scale of
+/// nought and an offset of one. @ref `Lamp` in `shader.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+struct Lamp {
+	/// `[x, y, z, range]`.
+	position_range: [f32; 4],
+
+	/// `[r, g, b, cone scale]`, the color already multiplied by the intensity.
+	color: [f32; 4],
+
+	/// `[x, y, z, cone offset]`, the way a cone points.
+	direction: [f32; 4],
+}
+
+impl Lamp {
+	/// A lamp that is not there, for the tail of the array.
+	const DARK: Self = Self {
+		position_range: [0.0; 4],
+		color: [0.0; 4],
+		direction: [0.0, 0.0, -1.0, 1.0],
+	};
+
+	/// One light in the world, packed.
+	///
+	/// @param light - what it shines
+	/// @param at - where it stands and which way it is turned, in the world
+	fn of(light: Light, at: Transform) -> Self {
+		let mut packed = Self {
+			position_range: at.position.extend(light.range).to_array(),
+			color: (light.color * light.intensity)
+				.extend(0.0)
+				.to_array(),
+			direction: (at.rotation * Vec3::NEG_Z)
+				.normalize_or(Vec3::NEG_Z)
+				.extend(1.0)
+				.to_array(),
+		};
+
+		if light.kind == LightKind::Spot {
+			let (inner, outer) = light.cone();
+			let (cos_inner, cos_outer) = (inner.cos(), outer.cos());
+			// one over the width of the falloff band, and the offset that puts
+			// the far edge of it at nought. Filament's two numbers, worked out
+			// here so the shader does no trigonometry per fragment.
+			let scale = 1.0 / (cos_inner - cos_outer).max(1.0e-4);
+
+			packed.color[3] = scale;
+			packed.direction[3] = -cos_outer * scale;
+		}
+
+		packed
+	}
+}
+
 /// What the shader needs to know that is neither per-vertex nor per-instance.
 ///
 /// @note: the `crate` attribute points the derive at colby_core's re-export.
@@ -160,6 +243,12 @@ struct Globals {
 	cascade_texels: [f32; CASCADES],
 	/// `[one texel in map coordinates, unused, shadows on, tint by cascade]`.
 	shadow: [f32; 4],
+
+	/// `[how many lamps are real, unused, unused, unused]`.
+	counts: [u32; 4],
+
+	/// The local lights, nearest first; the rest is [`Lamp::DARK`].
+	lamps: [Lamp; MAX_LAMPS],
 }
 
 /// One entity, flattened into what the vertex stage reads.
@@ -444,6 +533,9 @@ pub struct Scene {
 	/// Every drawn entity, sorted. Sorting twenty-byte keys and looking the
 	/// entities up again beats sorting the hundred-and-twelve-byte placements.
 	order: Vec<Sorted>,
+	/// Every lit entity with how far its reach is from the eye, kept so it
+	/// allocates once. @ref [`Scene::lamps`].
+	lit: Vec<(f32, Lamp)>,
 }
 
 impl Scene {
@@ -545,6 +637,7 @@ impl Scene {
 			batches: Vec::new(),
 			blended: Vec::new(),
 			order: Vec::with_capacity(MAX_ENTITIES),
+			lit: Vec::with_capacity(MAX_LAMPS),
 		})
 	}
 
@@ -677,6 +770,24 @@ impl Scene {
 
 		drop(pass);
 		self.queue.submit([encoder.finish()]);
+	}
+
+	/// Which local lights this frame carries, nearest first.
+	///
+	/// The scratch list is the only thing about this that belongs to a
+	/// `Scene`; the rule itself is [`chosen`], which needs no device and is
+	/// therefore testable.
+	///
+	/// @param world - the world being drawn
+	/// @param eye - where the camera is
+	/// @return the array the uniform holds, and how many of it is real
+	fn lamps(&mut self, world: &World, eye: Vec3) -> ([Lamp; MAX_LAMPS], u32) {
+		let room = world
+			.cvars
+			.float(LAMPS)
+			.map_or(MAX_LAMPS, lamp_room);
+
+		chosen(world, eye, room, &mut self.lit)
 	}
 
 	/// Records one list of batches into a pass that is already set up.
@@ -879,6 +990,8 @@ impl Scene {
 			*slot = matrix.to_cols_array_2d();
 		}
 
+		let (lamps, count) = self.lamps(world, camera.position);
+
 		self.queue.write_buffer(
 			&self.globals,
 			0,
@@ -906,6 +1019,8 @@ impl Scene {
 						0.0
 					},
 				],
+				counts: [count, 0, 0, 0],
+				lamps,
 			}),
 		);
 
@@ -1539,6 +1654,97 @@ fn grain(depth: f32) -> i32 {
 	scaled.clamp(f32::from(i16::MIN) * DEPTH_GRAIN, f32::from(i16::MAX) * DEPTH_GRAIN) as i32
 }
 
+/// Which lamps a frame carries, and in what order.
+///
+/// **The nearest by the edge of their reach, not by their middle.** A lamp
+/// whose sphere the camera is standing inside scores negative and comes first
+/// however far its origin is, which is the answer wanted: what decides whether
+/// a light matters to a picture is whether the picture is in it. Sorting by
+/// the origin would drop the huge lamp the room is lit by in favor of a small
+/// one behind the eye.
+///
+/// There is no frustum test. A sphere behind the camera lights nothing, but
+/// working that out costs six plane tests per lamp per frame to save a slot in
+/// an array that is rarely full, and a lamp just off the edge of the screen
+/// still lights what is on it through a surface facing away from the eye. When
+/// a frame is measured to be spending real time in this loop the answer is a
+/// light grid rather than a better sort.
+///
+/// @param world - the world being drawn
+/// @param eye - where the camera is
+/// @param room - how many the frame may carry
+/// @param scratch - the caller's list, so this allocates nothing per frame
+/// @return the array the uniform holds, and how many of it is real
+fn chosen(
+	world: &World,
+	eye: Vec3,
+	room: usize,
+	scratch: &mut Vec<(f32, Lamp)>,
+) -> ([Lamp; MAX_LAMPS], u32) {
+	scratch.clear();
+
+	for (id, ..) in world.entities.iter() {
+		let Some(light) = world
+			.entities
+			.light(id)
+			.copied()
+			.filter(|it| it.is_lit())
+		else {
+			continue;
+		};
+
+		let Some(at) = world.render_transform(id) else {
+			continue;
+		};
+
+		scratch.push(((at.position - eye).length() - light.range, Lamp::of(light, at)));
+	}
+
+	// `total_cmp` rather than a partial compare: a lamp at a nan distance is a
+	// world that has blown up, and it should sort somewhere definite rather
+	// than making the order depend on which pairs were compared.
+	scratch.sort_by(|(near, _), (other, _)| near.total_cmp(other));
+
+	let mut lamps = [Lamp::DARK; MAX_LAMPS];
+	let mut count = 0;
+
+	for (slot, (_, lamp)) in lamps
+		.iter_mut()
+		.zip(scratch.iter().take(room.min(MAX_LAMPS)))
+	{
+		*slot = *lamp;
+		count += 1;
+	}
+
+	(lamps, u32::try_from(count).unwrap_or(0))
+}
+
+/// How many lamps a console variable is asking for.
+///
+/// A variable holds a number rather than a count, so this is where the two
+/// meet. Anything below nought is none and anything above the ceiling is the
+/// ceiling; a nan is the ceiling too, because a variable nobody meant to set
+/// should not put the lights out.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "clamped to the array's own length first, so the cast cannot lose anything or go 	          negative"
+)]
+fn lamp_room(asked: f32) -> usize {
+	if asked.is_nan() {
+		return MAX_LAMPS;
+	}
+
+	#[expect(
+		clippy::cast_precision_loss,
+		reason = "thirty-two is exact in an f32"
+	)]
+	let ceiling = MAX_LAMPS as f32;
+
+	asked.clamp(0.0, ceiling) as usize
+}
+
 /// Builds one render pipeline and reports whether wgpu accepted it.
 ///
 /// wgpu's default answer to a bad shader is to log the error and hand back a
@@ -1830,8 +2036,17 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 			"Placement is no longer a mat4, three vec4s and four words"
 		);
 		assert!(align_of::<Placement>() == 4, "Placement gained padding");
-		assert!(size_of::<Globals>() == 432, "a uniform struct has to be a multiple of 16");
-		assert!(size_of::<Globals>().is_multiple_of(16), "and this one is not");
+		assert!(size_of::<Lamp>() == 48, "a Lamp is no longer three vec4s");
+		// a uniform array's stride is its element rounded up to sixteen, so an
+		// element that is already a multiple of it is laid out here exactly as
+		// the shader reads it - which is the whole reason a lamp is three
+		// vectors rather than a struct of named floats.
+		assert!(size_of::<Lamp>().is_multiple_of(16), "and a uniform array's stride is not it");
+		assert!(
+			size_of::<Globals>() == 448 + size_of::<Lamp>() * MAX_LAMPS,
+			"the camera, the light, the cascades, the counts and the lamps"
+		);
+		assert!(size_of::<Globals>().is_multiple_of(16), "and a uniform struct has to be");
 		// lines.wgsl declares only the first field of this struct and reads
 		// only that, which a uniform binding allows: what it needs is for the
 		// field to stay first, and this is where that is checked.
@@ -1848,6 +2063,191 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A short count as a distance, without an `as`.
+	fn far(step: usize) -> f32 { f32::from(u8::try_from(step).expect("a short count")) }
+
+	/// A world with a lamp of that range standing that far along x.
+	fn lit_world(lamps: &[(f32, f32)]) -> World {
+		let mut world = World::new();
+
+		for &(along, range) in lamps {
+			let id = world
+				.entities
+				.spawn_at(Transform::at(Vec3::X * along));
+
+			world
+				.entities
+				.set_light(id, Light::point(Vec3::ONE, 1.0, range));
+		}
+
+		world
+	}
+
+	#[test]
+	fn a_lamp_the_eye_is_standing_inside_comes_before_a_nearer_one_it_is_not() {
+		// the small one is four units away and the big one is ten, but the big
+		// one's sphere reaches the camera and the small one's does not. The
+		// picture is inside the big one, so it is the one that matters.
+		let world = lit_world(&[(4.0, 1.0), (10.0, 20.0)]);
+		let mut scratch = Vec::new();
+		let (lamps, count) = chosen(&world, Vec3::ZERO, MAX_LAMPS, &mut scratch);
+
+		assert_eq!(count, 2, "both are carried");
+		assert!(
+			(lamps[0].position_range[3] - 20.0).abs() < 1.0e-6,
+			"and the one the eye is inside is first: {:?}",
+			lamps[0].position_range
+		);
+	}
+
+	#[test]
+	fn a_frame_carries_the_nearest_of_more_lamps_than_it_has_room_for() {
+		let standing: Vec<(f32, f32)> = (0..MAX_LAMPS + 8)
+			.map(|step| (2.0 + far(step), 1.0))
+			.collect();
+		let world = lit_world(&standing);
+		let mut scratch = Vec::new();
+		let (lamps, count) = chosen(&world, Vec3::ZERO, MAX_LAMPS, &mut scratch);
+
+		assert_eq!(usize::try_from(count), Ok(MAX_LAMPS), "the array fills and no further");
+		assert!(
+			(lamps[0].position_range[0] - 2.0).abs() < 1.0e-6,
+			"the nearest is first: {:?}",
+			lamps[0].position_range
+		);
+		assert!(
+			(lamps[MAX_LAMPS - 1].position_range[0] - (1.0 + far(MAX_LAMPS))).abs() < 1.0e-6,
+			"and the last one carried is the last one that fits: {:?}",
+			lamps[MAX_LAMPS - 1].position_range
+		);
+	}
+
+	#[test]
+	fn the_variable_takes_lamps_away_from_a_frame_nearest_last() {
+		let world = lit_world(&[(2.0, 1.0), (4.0, 1.0), (6.0, 1.0)]);
+		let mut scratch = Vec::new();
+
+		for room in 0..=3 {
+			let (lamps, count) = chosen(&world, Vec3::ZERO, room, &mut scratch);
+
+			assert_eq!(usize::try_from(count), Ok(room), "asking for {room} carries {room}");
+
+			for (slot, lamp) in lamps.iter().enumerate().take(room) {
+				assert!(
+					(lamp.position_range[0] - 2.0_f32.mul_add(far(slot), 2.0)).abs() < 1.0e-6,
+					"and what it drops is the far end: {:?}",
+					lamp.position_range
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn an_entity_that_is_not_a_lamp_is_not_sent_to_the_shader() {
+		let mut world = lit_world(&[(3.0, 5.0)]);
+		// three that are not: no kind, no reach, and turned all the way down
+		world.entities.spawn_at(Transform::at(Vec3::Y));
+		let dark = world.entities.spawn_at(Transform::at(Vec3::Z));
+		world
+			.entities
+			.set_light(dark, Light::point(Vec3::ONE, 1.0, 0.0));
+		let off = world.entities.spawn_at(Transform::at(-Vec3::Z));
+		world
+			.entities
+			.set_light(off, Light::point(Vec3::ONE, 0.0, 5.0));
+
+		let mut scratch = Vec::new();
+		let (_, count) = chosen(&world, Vec3::ZERO, MAX_LAMPS, &mut scratch);
+
+		assert_eq!(count, 1, "one lamp among four entities");
+	}
+
+	#[test]
+	fn the_lamp_ceiling_and_what_the_variable_starts_at_are_the_same_number() {
+		assert_eq!(
+			lamp_room(DEFAULT_LAMPS),
+			MAX_LAMPS,
+			"a fresh config asks for exactly what the array holds"
+		);
+	}
+
+	#[test]
+	fn asking_for_a_number_of_lamps_nobody_could_mean_lands_somewhere_definite() {
+		assert_eq!(lamp_room(-4.0), 0, "below nought is none");
+		assert_eq!(lamp_room(0.0), 0, "and so is nought");
+		assert_eq!(lamp_room(3.9), 3, "a fraction is the whole number under it");
+		assert_eq!(lamp_room(1.0e9), MAX_LAMPS, "past the ceiling is the ceiling");
+		assert_eq!(lamp_room(f32::INFINITY), MAX_LAMPS, "and so is an infinity");
+		assert_eq!(
+			lamp_room(f32::NAN),
+			MAX_LAMPS,
+			"a nan is the ceiling rather than none: a variable nobody meant to set should not 			 put the lights out"
+		);
+	}
+
+	#[test]
+	fn a_point_light_packs_a_cone_that_answers_one_at_every_angle() {
+		let packed = Lamp::of(Light::point(Vec3::ONE, 2.0, 5.0), Transform::IDENTITY);
+
+		let near = |written: [f32; 4], wanted: [f32; 4]| {
+			written
+				.iter()
+				.zip(wanted)
+				.all(|(held, want)| (held - want).abs() < 1.0e-6)
+		};
+
+		assert!(
+			near(packed.position_range, [0.0, 0.0, 0.0, 5.0]),
+			"where it is and how far: {:?}",
+			packed.position_range
+		);
+		assert!(
+			near(packed.color, [2.0, 2.0, 2.0, 0.0]),
+			"the color times the intensity: {:?}",
+			packed.color
+		);
+		assert!(
+			(packed.direction[3] - 1.0).abs() < 1.0e-6,
+			"and the offset is one, which is the whole of how a point avoids a branch"
+		);
+
+		// the shader's line, with the scale of nought and the offset of one
+		for along in [-1.0, 0.0, 0.5, 1.0_f32] {
+			let cone = along.mul_add(packed.color[3], packed.direction[3]);
+
+			assert!((cone - 1.0).abs() < 1.0e-6, "a point is lit at {along} along its axis");
+		}
+	}
+
+	#[test]
+	fn a_cone_is_full_inside_its_middle_and_nothing_past_its_edge() {
+		let (inner, outer) = (0.3_f32, 0.6_f32);
+		let packed =
+			Lamp::of(Light::spot(Vec3::ONE, 1.0, 5.0, inner, outer), Transform::IDENTITY);
+		let cone = |angle: f32| {
+			angle
+				.cos()
+				.mul_add(packed.color[3], packed.direction[3])
+				.clamp(0.0, 1.0)
+		};
+
+		assert!((cone(0.0) - 1.0).abs() < 1.0e-6, "straight down the axis is the whole light");
+		assert!((cone(inner) - 1.0).abs() < 1.0e-6, "and so is the edge of the bright middle");
+		assert!(cone(outer) < 1.0e-6, "the edge of the cone is nothing");
+		assert!(cone(outer + 0.1) < 1.0e-6, "and so is past it");
+
+		let between = cone((inner + outer) * 0.5);
+
+		assert!(between > 0.0 && between < 1.0, "and in between it falls off: {between}");
+		assert!(
+			(packed.direction[2] + 1.0).abs() < 1.0e-6
+				&& packed.direction[0].abs() < 1.0e-6
+				&& packed.direction[1].abs() < 1.0e-6,
+			"a cone points down the entity's own -z: {:?}",
+			packed.direction
+		);
+	}
 
 	#[test]
 	fn a_distance_is_measured_in_thousandths_and_never_wraps() {

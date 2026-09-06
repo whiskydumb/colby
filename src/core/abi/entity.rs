@@ -27,6 +27,7 @@
 
 use super::{
 	field::{Field, field},
+	light::Light,
 	material::MaterialId,
 	mesh::MeshId,
 	names::Names,
@@ -357,6 +358,13 @@ pub struct Entities {
 	/// `transforms`, and the same length; the renderer draws between the two.
 	previous: Vec<Transform>,
 	renderables: Vec<Renderable>,
+	/// What each slot shines, or [`Light::NONE`] for a slot that is not a
+	/// lamp. The same slots again, and almost every one of them holds the
+	/// nothing: a light is rare where a transform is universal, and this is
+	/// an array anyway for the reason the others are - a slot is addressed
+	/// by index, and a side table would be a second lookup on the one path
+	/// the renderer walks every frame. @ref [`light`](super::light).
+	lights: Vec<Light>,
 	/// What each slot hangs off, or [`EntityId::NONE`] for a thing standing
 	/// on its own. The same slots again. A handle rather than a slot number,
 	/// so that a parent which died and whose slot something else took is a
@@ -388,6 +396,7 @@ impl Entities {
 			transforms: Vec::new(),
 			previous: Vec::new(),
 			renderables: Vec::new(),
+			lights: Vec::new(),
 			parents: Vec::new(),
 			names: Names::new(),
 			generations: Vec::new(),
@@ -428,6 +437,7 @@ impl Entities {
 		self.previous[slot] = transform;
 		self.pending.push(slot);
 		self.renderables[slot] = Renderable::NOTHING;
+		self.lights[slot] = Light::NONE;
 		// and it hangs off nothing, whatever the previous occupant did.
 		self.parents[slot] = EntityId::NONE;
 		// whatever the previous occupant of this slot was called is not what
@@ -456,6 +466,7 @@ impl Entities {
 		self.transforms[slot] = Transform::IDENTITY;
 		self.previous[slot] = Transform::IDENTITY;
 		self.renderables[slot] = Renderable::NOTHING;
+		self.lights[slot] = Light::NONE;
 		self.parents[slot] = EntityId::NONE;
 		self.free.push(id.index);
 		self.live -= 1;
@@ -474,6 +485,7 @@ impl Entities {
 			self.transforms[slot] = Transform::IDENTITY;
 			self.previous[slot] = Transform::IDENTITY;
 			self.renderables[slot] = Renderable::NOTHING;
+			self.lights[slot] = Light::NONE;
 			self.parents[slot] = EntityId::NONE;
 			if let Ok(index) = u32::try_from(slot) {
 				self.free.push(index);
@@ -532,6 +544,37 @@ impl Entities {
 		};
 
 		self.renderables[slot] = renderable;
+
+		true
+	}
+
+	/// What an entity shines, or [`Light::NONE`] for one that shines nothing.
+	///
+	/// Every living slot answers this, and almost every answer is the nothing:
+	/// carrying a light is the rare case, and a caller that walks the table
+	/// asks [`Light::is_lit`] rather than this. @ref [`light`](super::light)
+	/// for why the position and the direction are not in the answer.
+	#[must_use]
+	pub fn light(&self, id: EntityId) -> Option<&Light> {
+		self.slot(id).map(|slot| &self.lights[slot])
+	}
+
+	/// What an entity shines, to change.
+	pub fn light_mut(&mut self, id: EntityId) -> Option<&mut Light> {
+		self.slot(id).map(|slot| &mut self.lights[slot])
+	}
+
+	/// Makes an entity a lamp, or stops it being one.
+	///
+	/// @param id - which entity
+	/// @param light - what it shines; [`Light::NONE`] puts it out
+	/// @return `true` if the handle resolved
+	pub fn set_light(&mut self, id: EntityId, light: Light) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.lights[slot] = light;
 
 		true
 	}
@@ -860,6 +903,8 @@ impl Entities {
 		self.renderables.clear();
 		self.renderables
 			.resize(slots, Renderable::NOTHING);
+		self.lights.clear();
+		self.lights.resize(slots, Light::NONE);
 		self.parents.clear();
 		self.parents.resize(slots, EntityId::NONE);
 		self.names.reset(slots);
@@ -917,6 +962,7 @@ impl Entities {
 			self.transforms.push(Transform::IDENTITY);
 			self.previous.push(Transform::IDENTITY);
 			self.renderables.push(Renderable::NOTHING);
+			self.lights.push(Light::NONE);
 			self.parents.push(EntityId::NONE);
 			self.names.push();
 			self.generations.push(0);
@@ -964,6 +1010,10 @@ impl Entities {
 		self.transforms[slot] = transform;
 		self.previous[slot] = transform;
 		self.renderables[slot] = renderable;
+		// and it shines nothing until whoever put it back says otherwise, for
+		// the reason the parent below is left alone: a restore hands the table
+		// slots and plain records, and a light is set by handle afterwards.
+		self.lights[slot] = Light::NONE;
 		// off nothing until whoever put it back says otherwise, which a
 		// restore does once every record has landed. @ref `scene::restore`.
 		self.parents[slot] = EntityId::NONE;
@@ -1034,6 +1084,7 @@ impl Entities {
 		self.transforms.push(Transform::IDENTITY);
 		self.previous.push(Transform::IDENTITY);
 		self.renderables.push(Renderable::NOTHING);
+		self.lights.push(Light::NONE);
 		self.parents.push(EntityId::NONE);
 		self.names.push();
 		self.generations.push(0);

@@ -20,7 +20,7 @@
 
 use colby_core::{
 	abi::{
-		Body, BodyId, EntityId, Field, Joint, JointId, Renderable, Transform, World,
+		Body, BodyId, EntityId, Field, Joint, JointId, Light, Renderable, Transform, World,
 		field::{Kind, Value},
 	},
 	glam::{EulerRot, Quat, Vec3},
@@ -82,6 +82,7 @@ fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History, ren
 			hanging(ui, world, id);
 			placing(ui, world, pick, history);
 			look(ui, world, id, history);
+			lamp(ui, world, id, history);
 		},
 		| Pick::Body(id) => {
 			naming(ui, world, pick, history, rename);
@@ -178,6 +179,24 @@ fn look(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 	if inspect(ui, "renderable", &mut renderable, Renderable::FIELDS) {
 		history.begin("tint", world);
 		world.entities.set_renderable(id, renderable);
+	}
+}
+
+/// What an entity shines, if anything.
+///
+/// Always drawn, whatever the entity is: turning a crate into a lamp is
+/// picking a word in a drop-down, and a section that appeared only for
+/// entities that were already lights would leave nowhere to do it. Every
+/// field is plain, so the whole of it is the table. @ref
+/// `colby_core::abi::light`.
+fn lamp(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+	let Some(mut light) = world.entities.light(id).copied() else {
+		return;
+	};
+
+	if inspect(ui, "light", &mut light, Light::FIELDS) {
+		history.begin("light", world);
+		world.entities.set_light(id, light);
 	}
 }
 

@@ -37,11 +37,11 @@
 //! [`gizmo`](crate::gizmo), which is where the arithmetic and the tests are.
 
 use colby_core::{
-	abi::{Camera, Transform, World},
+	abi::{Camera, LightKind, Transform, World},
 	glam::{Vec2, Vec3},
 	trace,
 };
-use egui::{Color32, Context, Key, LayerId, PointerButton, Pos2, Rect, Stroke, vec2};
+use egui::{Color32, Context, Key, LayerId, Painter, PointerButton, Pos2, Rect, Stroke, vec2};
 
 use crate::{
 	aim::{self, View},
@@ -58,6 +58,13 @@ const TIP: f32 = 4.5;
 
 /// What a handle under the pointer is drawn in.
 const LIT: Color32 = Color32::from_rgb(255, 235, 120);
+
+/// What a lamp's reach is drawn in.
+///
+/// Dimmer than [`LIT`] and the same hue: it is a fact about the scene rather
+/// than something under the pointer, and it has to read as ink that is not
+/// asking to be grabbed.
+const LAMP: Color32 = Color32::from_rgb(190, 170, 70);
 
 /// What the pointer does outside every window.
 #[derive(Debug, Default)]
@@ -282,6 +289,7 @@ impl Viewport {
 			self.pull(world, pick, &camera, point, viewport, history);
 		}
 
+		lamps(context, world, selection, &camera, viewport, view);
 		handles.paint(
 			context,
 			self.grab
@@ -367,6 +375,107 @@ impl Viewport {
 		history.begin(tool.word(), world);
 		select::drag_all(world, pick, from, put, &others);
 	}
+}
+
+/// How far every selected lamp reaches, drawn over the world.
+///
+/// The one thing in this file that is not a handle: it cannot be grabbed and
+/// nothing hit-tests it. A light has no geometry, so without this the only
+/// evidence that an entity is one is a row in a panel and whatever the picture
+/// happens to look like - and the number a person is dragging, `range`, has no
+/// visible meaning at all. Every reference editor draws exactly this shape for
+/// exactly this reason.
+///
+/// Drawn for the whole selection rather than for the primary alone, so that
+/// two lamps being moved together both say where they reach.
+fn lamps(
+	context: &Context,
+	world: &World,
+	selection: &Selection,
+	camera: &Camera,
+	viewport: Vec2,
+	view: Rect,
+) {
+	let painter = context
+		.layer_painter(LayerId::background())
+		.with_clip_rect(view);
+	let corner = Vec2::new(view.min.x, view.min.y);
+	let stroke = Stroke::new(INK.0, LAMP);
+
+	for pick in selection.picks() {
+		let Pick::Entity(id) = pick else {
+			continue;
+		};
+
+		let Some(light) = world
+			.entities
+			.light(id)
+			.copied()
+			.filter(|it| it.is_lit())
+		else {
+			continue;
+		};
+
+		let at = world.entities.placed(id).unwrap_or_default();
+
+		if light.kind == LightKind::Spot {
+			let (_, outer) = light.cone();
+			let way = (at.rotation * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
+
+			// four segments out of the apex rather than a polyline through all
+			// five points, which would trace the rim as well and close nothing
+			let edges = gizmo::cone(camera, at, light.range, outer, viewport);
+			for rim in edges.iter().skip(1) {
+				painter.line_segment([spot(edges[0] + corner), spot(*rim + corner)], stroke);
+			}
+
+			// and the mouth, in the plane the cone points at
+			outline(
+				&painter,
+				&gizmo::circle(
+					camera,
+					at.position + way * light.range,
+					way,
+					light.range * outer.tan(),
+					viewport,
+				),
+				corner,
+				stroke,
+			);
+
+			continue;
+		}
+
+		// three circles rather than one facing the eye: a sphere read off a
+		// single circle is a disc, and which of the two it is happens to be
+		// the whole question when a lamp is inside a wall.
+		for normal in [Vec3::X, Vec3::Y, Vec3::Z] {
+			outline(
+				&painter,
+				&gizmo::circle(camera, at.position, normal, light.range, viewport),
+				corner,
+				stroke,
+			);
+		}
+	}
+}
+
+/// One closed polyline, moved to where the picture is and drawn.
+///
+/// An empty list is a shape some part of which is behind the eye. @ref
+/// `gizmo::circle`, which is what decides that.
+fn outline(painter: &Painter, points: &[Vec2], corner: Vec2, stroke: Stroke) {
+	if points.is_empty() {
+		return;
+	}
+
+	painter.line(
+		points
+			.iter()
+			.map(|point| spot(*point + corner))
+			.collect(),
+		stroke,
+	);
 }
 
 /// The gizmo's handles, projected, ready to be drawn and hit.

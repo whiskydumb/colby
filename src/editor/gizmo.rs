@@ -236,6 +236,96 @@ pub(crate) fn ring(camera: &Camera, at: Transform, axis: Axis, viewport: Vec2) -
 	points
 }
 
+/// A circle in the world, projected, of a radius the world decides.
+///
+/// The rotate ring's twin, and the difference is the whole point: a ring is a
+/// handle and is drawn the same size however far away it is, while this is a
+/// *thing* - how far a lamp reaches - and has to shrink with distance or it is
+/// telling a lie about the world. So the radius is a world number here and
+/// [`reach`] is not called.
+///
+/// Nothing hit-tests this. It is not a handle, and drawing something that
+/// cannot be grabbed is exactly what an editor should do for a fact about the
+/// scene that has no visible geometry of its own.
+///
+/// @param camera - what the picture is drawn through
+/// @param center - where in the world
+/// @param normal - the way the circle faces; need not be a unit vector
+/// @param radius - how wide, in world units
+/// @param viewport - the picture, in points
+/// @return the points of a closed polyline, or an empty list if any of it
+/// cannot be put on the screen
+pub(crate) fn circle(
+	camera: &Camera,
+	center: Vec3,
+	normal: Vec3,
+	radius: f32,
+	viewport: Vec2,
+) -> Vec<Vec2> {
+	let view = camera.view_projection(ratio(viewport));
+	let facing = normal.normalize_or(Vec3::Z);
+	let first = facing.any_orthonormal_vector();
+	let second = facing.cross(first);
+	let mut points = Vec::with_capacity(RING_STEPS + 1);
+
+	for step in 0..=RING_STEPS {
+		let angle = std::f32::consts::TAU * step_of(step);
+		let (sin, cos) = angle.sin_cos();
+		let on = center + (first * cos + second * sin) * radius;
+
+		let Some(point) = project(view, on, viewport) else {
+			return Vec::new();
+		};
+
+		points.push(point);
+	}
+
+	points
+}
+
+/// The four edges of a cone, from its apex to the rim of its mouth.
+///
+/// A cone points down the thing's own -z, which is the direction a light, a
+/// camera and a listener in this engine all agree on.
+///
+/// @param camera - what the picture is drawn through
+/// @param at - the apex and which way it is turned
+/// @param range - how far down the axis the mouth is
+/// @param angle - the half-angle of the mouth, in radians
+/// @param viewport - the picture, in points
+/// @return the apex and the four rim points on screen, or an empty list if any
+/// of them cannot be put there
+pub(crate) fn cone(
+	camera: &Camera,
+	at: Transform,
+	range: f32,
+	angle: f32,
+	viewport: Vec2,
+) -> Vec<Vec2> {
+	let view = camera.view_projection(ratio(viewport));
+	let way = (at.rotation * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
+	let across = way.any_orthonormal_vector();
+	let other = way.cross(across);
+	let middle = at.position + way * range;
+	let wide = range * angle.tan();
+
+	let Some(apex) = project(view, at.position, viewport) else {
+		return Vec::new();
+	};
+
+	let mut points = vec![apex];
+
+	for corner in [across, other, -across, -other] {
+		let Some(point) = project(view, middle + corner * wide, viewport) else {
+			return Vec::new();
+		};
+
+		points.push(point);
+	}
+
+	points
+}
+
 /// Which arm the pointer is on, if it is on one.
 ///
 /// The nearest within [`GRAB`], so that two arms crossing on screen resolve to

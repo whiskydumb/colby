@@ -33,6 +33,7 @@ pub mod field;
 pub mod font;
 pub mod input;
 pub mod joint;
+pub mod light;
 pub mod material;
 pub mod mesh;
 pub mod model;
@@ -68,6 +69,7 @@ pub use self::{
 	font::{Font, FontData, FontId, Fonts, Glyph},
 	input::{Button, Input, Key},
 	joint::{Joint, JointId, JointKind, Joints, MAX_JOINTS},
+	light::{Light, LightKind, MAX_CONE, MIN_SPREAD},
 	material::{Material, MaterialId, Materials},
 	mesh::{BONES_PER_VERTEX, Mesh, MeshData, MeshId, MeshVertex, Meshes, SkinVertex},
 	model::{Model, ModelData, ModelId, Models, Placement},
@@ -98,7 +100,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 53;
+pub const ABI_VERSION: u32 = 54;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";

@@ -680,6 +680,10 @@ fn copy_entities(world: &mut World, sources: &[EntityId]) -> Vec<(EntityId, Enti
 			world.entities.set_renderable(copy, renderable);
 		}
 
+		if let Some(light) = world.entities.light(source).copied() {
+			world.entities.set_light(copy, light);
+		}
+
 		let name = world.entities.name(source).to_owned();
 		world.entities.set_name(copy, &name);
 		copies.push((source, copy));

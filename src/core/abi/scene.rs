@@ -69,8 +69,8 @@ use crate::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
-		MaterialId, MeshId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind, Transform,
-		World,
+		Light, MaterialId, MeshId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind,
+		Transform, World,
 		field::{Field, field},
 		net::MAX_PEERS,
 		state::STATE_BYTES,
@@ -178,6 +178,16 @@ pub struct Thing {
 	/// Its own tint, linear RGB.
 	pub color: Vec3,
 
+	/// What it shines, or [`Light::NONE`] for an entity that is not a lamp.
+	///
+	/// Inline rather than a list of its own, unlike a body: a light has no
+	/// existence apart from the entity carrying it, so there is nothing for a
+	/// separate record to be addressed by. What the *file* does is another
+	/// question - it writes one record per lamp rather than a wider record
+	/// per entity, because almost no entity is one. @ref
+	/// `colby_asset::scene::Lit`.
+	pub light: Light,
+
 	/// Which entry of [`SceneData::posed`] moves it, or [`NO_INDEX`].
 	pub pose: u32,
 
@@ -203,6 +213,7 @@ impl Default for Thing {
 			mesh: String::new(),
 			material: String::new(),
 			color: Vec3::ZERO,
+			light: Light::NONE,
 			pose: NO_INDEX,
 			parent: NO_INDEX,
 		}
@@ -1119,6 +1130,11 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 		.entities
 		.iter()
 		.map(|(id, transform, renderable)| Thing {
+			light: world
+				.entities
+				.light(id)
+				.copied()
+				.unwrap_or(Light::NONE),
 			pose: pose_of
 				.get(renderable.pose.slot())
 				.copied()
@@ -1392,6 +1408,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	// back as a null handle and names nothing.
 	for (id, thing) in things.iter().zip(&scene.things) {
 		world.entities.set_name(*id, &thing.name);
+		world.entities.set_light(*id, thing.light);
 	}
 
 	for (id, solid) in solids.iter().zip(&scene.solids) {
@@ -1559,12 +1576,19 @@ fn grafted_things(world: &mut World, piece: &SceneData) -> Vec<EntityId> {
 				pose: PoseId::NONE,
 			};
 
-			world.entities.graft(
+			let id = world.entities.graft(
 				usize::try_from(thing.slot).unwrap_or(usize::MAX),
 				thing.generation,
 				thing.transform,
 				renderable,
-			)
+			);
+
+			// beside the name a graft sets afterwards, and here rather than
+			// there because a refused slot hands back a null handle that
+			// `set_light` reads as nobody - which is the answer wanted.
+			world.entities.set_light(id, thing.light);
+
+			id
 		})
 		.collect()
 }
@@ -2169,6 +2193,7 @@ fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> 
 		color: thing.color,
 		pose,
 	});
+	world.entities.set_light(id, thing.light);
 
 	id
 }
@@ -3579,6 +3604,78 @@ mod tests {
 		assert!(
 			restore(&mut running, &unclaimed).is_ok(),
 			"and a description written before any game ran disagrees with nobody"
+		);
+	}
+
+	#[test]
+	fn a_lamp_is_written_down_and_put_back_on_the_entity_that_carried_it() {
+		let mut source = peopled();
+		let lamp = source
+			.entities
+			.iter()
+			.map(|(id, ..)| id)
+			.last()
+			.expect("the world stands two");
+		let shining = Light::spot(Vec3::new(0.1, 0.2, 0.3), 7.0, 21.0, 0.25, 0.75);
+
+		assert!(source.entities.set_light(lamp, shining), "the handle resolves");
+
+		let scene = capture(&source);
+		let mut other = furnished();
+
+		restore(&mut other, &scene).expect("the layouts agree");
+
+		let put = other.entities.at(lamp.slot());
+
+		assert_eq!(
+			other.entities.light(put).copied(),
+			Some(shining),
+			"the lamp came back on the slot it was on"
+		);
+		assert_eq!(
+			other
+				.entities
+				.iter()
+				.filter(|(id, ..)| other
+					.entities
+					.light(*id)
+					.is_some_and(|it| it.kind.is_lit()))
+				.count(),
+			1,
+			"and nothing else in the world was lit by the restore"
+		);
+	}
+
+	#[test]
+	fn a_lamp_that_is_instantiated_shines_the_same_as_the_one_it_was_copied_from() {
+		let mut source = furnished();
+		let first = source.entities.spawn_at(Transform::at(Vec3::X));
+		let shining = Light::point(Vec3::new(0.4, 0.5, 0.6), 3.0, 8.0);
+		source.entities.set_light(first, shining);
+		// a second one carrying nothing, so a copy that lights everything it
+		// touches is caught rather than passed
+		source.entities.spawn_at(Transform::at(Vec3::Y));
+
+		let scene = capture(&source);
+		let made = instantiate(&mut source, &scene, Vec3::Z * 5.0);
+		let copied = made
+			.things
+			.last()
+			.map_or(EntityId::NONE, |(_, id)| *id);
+		let copy_of_first = made
+			.things
+			.first()
+			.map_or(EntityId::NONE, |(_, id)| *id);
+
+		assert_eq!(
+			source.entities.light(copy_of_first).copied(),
+			Some(shining),
+			"the copy of the lamp is a lamp"
+		);
+		assert_eq!(
+			source.entities.light(copied).copied(),
+			Some(Light::NONE),
+			"and the copy of the thing beside it is not"
 		);
 	}
 

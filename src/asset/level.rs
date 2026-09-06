@@ -76,7 +76,7 @@
 use colby_core::{
 	Result,
 	abi::{
-		Body, BodyId, BodyKind, Camera, EntityId, Field, Joint, JointKind, Layers, MeshId,
+		Body, BodyId, BodyKind, Camera, EntityId, Field, Joint, JointKind, Layers, Light, MeshId,
 		Renderable, Shape, Transform,
 		field::{self, Kind},
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
@@ -250,7 +250,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 		check(
 			entry,
 			&[names(Transform::FIELDS, &[]), names(Renderable::FIELDS, &[])],
-			&["name", "parent"],
+			&["name", "parent", "light"],
 			"an entity",
 		)?;
 
@@ -278,6 +278,16 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 		let mut look = Renderable::NOTHING;
 		read(&mut look, entry, Renderable::FIELDS, "an entity")?;
 
+		// nested rather than folded in beside the other two tables, because a
+		// light has a `color` and so does a renderable, and one flat namespace
+		// would have to rename one of them. The stage's camera is nested for
+		// the same reason and by the same two calls.
+		let mut lamp = Light::NONE;
+		if let Some(shining) = entry.get("light") {
+			check(shining, &[names(Light::FIELDS, &[])], &[], "a light")?;
+			read(&mut lamp, shining, Light::FIELDS, "a light")?;
+		}
+
 		things.push(Thing {
 			name,
 			slot: count(index, "a scene's records")?,
@@ -286,6 +296,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			mesh: text(entry.get("mesh")),
 			material: text(entry.get("material")),
 			color: look.color,
+			light: lamp,
 			pose,
 			parent: NO_INDEX,
 		});
@@ -1003,6 +1014,22 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> R
 			| _ => None,
 		},
 	)?;
+	// under its own key, and nothing at all for an entity that is not a lamp:
+	// every field matches the default, so `put_all` writes no row and the
+	// object never appears. @ref `Rows::text`, which gathers a dotted name
+	// into a nested object.
+	put_all(
+		&mut rows,
+		&thing.light,
+		&Light::NONE,
+		Light::FIELDS,
+		&Writing {
+			prefix: "light.",
+			what: "an entity's light",
+			skipped: &[],
+		},
+		|_| None,
+	)?;
 
 	Ok(rows.text())
 }
@@ -1400,7 +1427,7 @@ fn as_text(value: &str) -> String { json::quoted(value) }
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{ShapeKind, scene::Form};
+	use colby_core::abi::{LightKind, ShapeKind, scene::Form};
 
 	use super::*;
 
@@ -2370,6 +2397,57 @@ mod tests {
 	}
 
 	#[test]
+	fn a_light_is_read_out_of_its_own_object_and_written_back_into_one() {
+		let scene = import(
+			r#"{ "entities": [
+				{ "name": "lamp", "color": [1, 0, 0], "light": {
+					"kind": "spot", "color": [0, 0.5, 1], "intensity": 3,
+					"range": 12, "inner": 0.2, "outer": 0.5 } },
+				{ "name": "crate", "mesh": "cube" }
+			] }"#,
+		)
+		.expect("it is a scene");
+
+		let lamp = scene.things[0].light;
+
+		assert_eq!(lamp.kind, LightKind::Spot, "the word is the kind");
+		assert_eq!(lamp.color, Vec3::new(0.0, 0.5, 1.0), "and the light has its own color");
+		assert_eq!(
+			scene.things[0].color,
+			Vec3::new(1.0, 0.0, 0.0),
+			"which is not the entity's tint, the one thing a flat namespace could not keep apart"
+		);
+		assert!((lamp.intensity - 3.0).abs() < 1.0e-6 && (lamp.range - 12.0).abs() < 1.0e-6);
+		assert!((lamp.inner - 0.2).abs() < 1.0e-6 && (lamp.outer - 0.5).abs() < 1.0e-6);
+		assert_eq!(
+			scene.things[1].light,
+			Light::NONE,
+			"and an entity without one shines nothing"
+		);
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains("\"light\": {"), "the lamp is written under its own key");
+		assert_eq!(
+			text.matches("\"light\": {").count(),
+			1,
+			"and the crate, whose light is the default, gets no key at all"
+		);
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_light_field_nobody_declared_is_refused_by_name() {
+		let refused = import(r#"{ "entities": [ { "name": "a", "light": { "watts": 60 } } ] }"#)
+			.expect_err("a light has no watts");
+
+		assert!(
+			format!("{refused}").contains("watts"),
+			"and the message says which word it was: {refused}"
+		);
+	}
+
+	#[test]
 	fn every_plain_field_of_every_table_survives_the_text() {
 		// the test the tables make possible: nothing here names a field, so a
 		// field added to a table tomorrow is read and written by this today,
@@ -2389,6 +2467,8 @@ mod tests {
 		fill(&mut transform, Transform::FIELDS, &[]);
 		let mut look = Renderable::NOTHING;
 		fill(&mut look, Renderable::FIELDS, &[]);
+		let mut lamp = Light::NONE;
+		fill(&mut lamp, Light::FIELDS, &[]);
 
 		let mut stage = Stage::DEFAULT;
 		fill(&mut stage, Stage::FIELDS, &[]);
@@ -2403,6 +2483,7 @@ mod tests {
 				mesh: "cube".to_owned(),
 				material: "plastic".to_owned(),
 				color: look.color,
+				light: lamp,
 				..Thing::default()
 			}],
 			solids: vec![Solid {
