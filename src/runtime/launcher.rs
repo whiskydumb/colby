@@ -147,7 +147,9 @@ impl Hub {
 
 		let overlay: &mut dyn Overlay = launcher;
 
-		renderer.render(&self.world, &mut [overlay], None)
+		// the launcher's world is empty and never changes, so its eye opens on
+		// the first frame and stays where it landed.
+		renderer.render(&self.world, &mut [overlay], None, 0.0)
 	}
 
 	/// Records a failure and asks the loop to stop.

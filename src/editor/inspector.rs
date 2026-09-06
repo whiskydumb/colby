@@ -20,7 +20,8 @@
 
 use colby_core::{
 	abi::{
-		Body, BodyId, EntityId, Field, Joint, JointId, Light, Renderable, Sky, Transform, World,
+		Body, BodyId, EntityId, Field, Joint, JointId, Light, Post, Renderable, Sky, Transform,
+		World,
 		field::{Kind, Value},
 		scene::{self, Stage},
 	},
@@ -200,6 +201,7 @@ fn settings(ui: &mut Ui, world: &mut World, history: &mut History) {
 	let mut moved = inspect(ui, "world", &mut stage, Stage::FIELDS);
 
 	moved |= inspect(ui, "sky", &mut stage.sky, Sky::FIELDS);
+	moved |= inspect(ui, "post", &mut stage.post, Post::FIELDS);
 
 	if moved {
 		history.begin("world", world);
@@ -515,6 +517,10 @@ mod tests {
 				Sky::FIELDS
 			),
 			"and a sky"
+		);
+		assert!(
+			!untouched(&Post::DEFAULT, Post::FIELDS),
+			"and the post-processing, its word, its checkbox and its ten numbers included"
 		);
 	}
 

@@ -48,8 +48,8 @@ use std::path::Path;
 use colby_core::{
 	Result,
 	abi::{
-		BodyKind, Camera, JointKind, Layers, Light, LightKind, ShapeKind, Sky, SkyKind,
-		Transform,
+		BodyKind, Camera, JointKind, Layers, Light, LightKind, Post, ShapeKind, Sky, SkyKind,
+		ToneMap, Transform,
 		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
@@ -71,7 +71,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// agreed.
 ///
 /// Six since an entity record says what it hangs off.
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -307,6 +307,46 @@ pub struct Setting {
 
 	/// The color straight down.
 	pub sky_ground: [f32; 3],
+
+	/// Which curve squeezes the picture, as
+	/// [`ToneMap`](colby_core::abi::ToneMap) in declaration order.
+	pub tonemap: u32,
+
+	/// The value the reinhard curve maps to white.
+	pub white: f32,
+
+	/// Whether the exposure is measured, as nought or one.
+	///
+	/// A word rather than a byte, because every field of this record is four
+	/// bytes and a bool that is one byte would put padding in it.
+	pub auto_exposure: u32,
+
+	/// The multiplier used when it is not.
+	pub exposure: f32,
+
+	/// Stops added to a measured one.
+	pub exposure_bias: f32,
+
+	/// The smallest a measured exposure may be.
+	pub exposure_min: f32,
+
+	/// The largest it may be.
+	pub exposure_max: f32,
+
+	/// How fast the eye adapts, per second.
+	pub exposure_rate: f32,
+
+	/// How much of the bright pass is added back.
+	pub bloom: f32,
+
+	/// How bright a pixel has to be to bloom.
+	pub bloom_threshold: f32,
+
+	/// The color a distant surface fades towards, linear RGB.
+	pub fog: [f32; 3],
+
+	/// How quickly it fades, per unit of distance.
+	pub fog_density: f32,
 
 	/// Spare, and the reason this record has no padding in it: the eight-byte
 	/// `steps` at the top makes the record eight-aligned, so its length has to
@@ -1003,6 +1043,18 @@ const EMPTY_SETTING: Setting = Setting {
 	sky_zenith: [0.0; 3],
 	sky_horizon: [0.0; 3],
 	sky_ground: [0.0; 3],
+	tonemap: 0,
+	white: 1.0,
+	auto_exposure: 0,
+	exposure: 1.0,
+	exposure_bias: 0.0,
+	exposure_min: 0.0,
+	exposure_max: 1.0,
+	exposure_rate: 0.0,
+	bloom: 0.0,
+	bloom_threshold: 1.0,
+	fog: [0.0; 3],
+	fog_density: 0.0,
 	reserved: 0,
 };
 
@@ -1388,6 +1440,18 @@ fn setting_of(stage: Stage) -> Setting {
 		sky_zenith: stage.sky.zenith.to_array(),
 		sky_horizon: stage.sky.horizon.to_array(),
 		sky_ground: stage.sky.ground.to_array(),
+		tonemap: stage.post.tonemap.index(),
+		white: stage.post.white,
+		auto_exposure: u32::from(stage.post.auto_exposure),
+		exposure: stage.post.exposure,
+		exposure_bias: stage.post.exposure_bias,
+		exposure_min: stage.post.exposure_min,
+		exposure_max: stage.post.exposure_max,
+		exposure_rate: stage.post.exposure_rate,
+		bloom: stage.post.bloom,
+		bloom_threshold: stage.post.bloom_threshold,
+		fog: stage.post.fog.to_array(),
+		fog_density: stage.post.fog_density,
 		reserved: 0,
 	}
 }
@@ -1411,6 +1475,22 @@ fn stage_of(setting: Setting) -> Stage {
 			zenith: Vec3::from_array(setting.sky_zenith),
 			horizon: Vec3::from_array(setting.sky_horizon),
 			ground: Vec3::from_array(setting.sky_ground),
+		},
+		// a curve this build does not know reads as none, the same way an
+		// unknown light or sky kind does. @ref `light_of`.
+		post: Post {
+			tonemap: ToneMap::at(setting.tonemap).unwrap_or(ToneMap::None),
+			white: setting.white,
+			auto_exposure: setting.auto_exposure != 0,
+			exposure: setting.exposure,
+			exposure_bias: setting.exposure_bias,
+			exposure_min: setting.exposure_min,
+			exposure_max: setting.exposure_max,
+			exposure_rate: setting.exposure_rate,
+			bloom: setting.bloom,
+			bloom_threshold: setting.bloom_threshold,
+			fog: Vec3::from_array(setting.fog),
+			fog_density: setting.fog_density,
 		},
 		light: Vec3::from_array(setting.light),
 		ambient: Vec3::from_array(setting.ambient),
@@ -1923,6 +2003,23 @@ mod tests {
 					Vec3::new(0.60, 0.70, 0.85),
 					Vec3::new(0.08, 0.07, 0.06),
 				),
+				// every number moved off its default, so a field the writer
+				// forgot would come back wrong rather than come back right by
+				// accident
+				post: Post {
+					tonemap: ToneMap::Reinhard,
+					white: 6.5,
+					auto_exposure: false,
+					exposure: 1.25,
+					exposure_bias: -0.75,
+					exposure_min: 0.02,
+					exposure_max: 12.0,
+					exposure_rate: 3.5,
+					bloom: 0.4,
+					bloom_threshold: 1.6,
+					fog: Vec3::new(0.31, 0.42, 0.53),
+					fog_density: 0.02,
+				},
 				light: Vec3::new(-0.4, -1.0, -0.3),
 				ambient: Vec3::splat(0.25),
 				gravity: Vec3::new(0.0, -9.81, 0.0),

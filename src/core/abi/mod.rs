@@ -41,6 +41,7 @@ pub mod names;
 pub mod net;
 pub mod physics;
 pub mod pose;
+pub mod post;
 pub mod ragdoll;
 pub mod registry;
 pub mod scene;
@@ -81,6 +82,7 @@ pub use self::{
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
 	},
 	pose::{MAX_POSES, Pose, PoseId, Poses},
+	post::{Post, ToneMap},
 	ragdoll::{Build, MAX_PARTS, NO_PART, Part, Ragdoll, Segment},
 	registry::{Entry, Registry},
 	scene::{
@@ -102,7 +104,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 55;
+pub const ABI_VERSION: u32 = 56;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -307,6 +309,14 @@ pub struct World {
 	/// because a frame whose sky pipeline is not there yet has to look like
 	/// something.
 	pub clear: Vec3,
+
+	/// What happens to the picture after the world is drawn into it.
+	/// Game-written.
+	///
+	/// Beside the four below and for the same reason: it is a property of the
+	/// world rather than of anything standing in it. @ref
+	/// [`post`](crate::abi::post).
+	pub post: Post,
 
 	/// What is drawn behind everything, or nothing at all. Game-written.
 	///
@@ -593,6 +603,7 @@ impl World {
 			asked: Vec::new(),
 			camera: Camera::DEFAULT,
 			clear: Vec3::ZERO,
+			post: Post::DEFAULT,
 			sky: Sky::NONE,
 			light: Vec3::new(-0.4, -1.0, -0.3),
 			ambient: Vec3::splat(0.25),

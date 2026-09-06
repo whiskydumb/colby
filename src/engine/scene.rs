@@ -53,6 +53,7 @@ use wgpu::{
 use crate::{
 	gpu::Gpu,
 	lines::Lines,
+	post,
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, Maps},
 	skin::Joints,
@@ -513,8 +514,6 @@ pub struct Scene {
 	pipelines: Pipelines,
 	globals: Buffer,
 	bindings: BindGroup,
-	/// Kept so the pipelines and the per-material groups can be built again.
-	format: TextureFormat,
 	globals_layout: BindGroupLayout,
 	material_layout: BindGroupLayout,
 	/// One per [`Wrap`], in its discriminant order.
@@ -556,6 +555,9 @@ pub struct Scene {
 	/// Every lit entity with how far its reach is from the eye, kept so it
 	/// allocates once. @ref [`Scene::lamps`].
 	lit: Vec<(f32, Lamp)>,
+	/// The float target the world is drawn into, and everything that squeezes
+	/// it back down. @ref [`post`](crate::post).
+	post: post::Chain,
 	/// Whether this frame draws a sky behind the world.
 	///
 	/// Read off the world once in [`Scene::upload`] rather than again in the
@@ -623,9 +625,13 @@ impl Scene {
 		let shader = Shader::new("shader.wgsl", include_str!("shader.wgsl"));
 		let groups =
 			[&globals_layout, &material_layout, shadows.sample_layout(), joints.layout()];
-		let pipelines = Pipelines::build(&device, format, &groups, shader.source())?;
+		// the six, the sky and the lines all draw into the float target rather
+		// than into the window: what reaches the window is the composite, and
+		// it is the only thing built for the window's own format.
+		let pipelines = Pipelines::build(&device, post::HDR_FORMAT, &groups, shader.source())?;
 		let depth = depth_view(&device, width, height);
-		let lines = Lines::new(&device, format, &globals_layout)?;
+		let lines = Lines::new(&device, post::HDR_FORMAT, &globals_layout)?;
+		let post = post::Chain::new(&device, format, width, height)?;
 
 		let instances = device.create_buffer(&BufferDescriptor {
 			label: Some("placements"),
@@ -640,7 +646,6 @@ impl Scene {
 			pipelines,
 			globals,
 			bindings,
-			format,
 			globals_layout,
 			material_layout,
 			samplers,
@@ -665,6 +670,7 @@ impl Scene {
 			order: Vec::with_capacity(MAX_ENTITIES),
 			lit: Vec::with_capacity(MAX_LAMPS),
 			sky: false,
+			post,
 		})
 	}
 
@@ -672,6 +678,7 @@ impl Scene {
 	pub fn resize(&mut self, width: u32, height: u32) {
 		self.size = (width, height);
 		self.depth = depth_view(&self.device, width, height);
+		self.post.resize(&self.device, width, height);
 	}
 
 	/// Builds the pipelines from new shader source, keeping the ones that work
@@ -694,7 +701,7 @@ impl Scene {
 		// the whole table, and none of it is assigned until all of it has
 		// compiled: half a reload is a world where the crates moved and the
 		// characters did not.
-		self.pipelines = Pipelines::build(&self.device, self.format, &groups, source)?;
+		self.pipelines = Pipelines::build(&self.device, post::HDR_FORMAT, &groups, source)?;
 
 		Ok(())
 	}
@@ -705,7 +712,13 @@ impl Scene {
 	/// @param world - the state to draw
 	/// @param view - the part of the target to draw into, or the whole of it;
 	/// the projection is the caller's to match, through `world.aspect`
-	pub fn render(&mut self, target: &TextureView, world: &World, view: Option<Viewport>) {
+	pub fn render(
+		&mut self,
+		target: &TextureView,
+		world: &World,
+		view: Option<Viewport>,
+		seconds: f32,
+	) {
 		self.reload_shader();
 		self.upload(world);
 
@@ -726,7 +739,7 @@ impl Scene {
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
 			label: Some("scene"),
 			color_attachments: &[Some(RenderPassColorAttachment {
-				view: target,
+				view: self.post.target(),
 				depth_slice: None,
 				resolve_target: None,
 				ops: Operations {
@@ -755,7 +768,14 @@ impl Scene {
 		// window squeezed down to its tools has to show.
 		if let Some(asked) = view {
 			let Some(view) = asked.within(self.size.0, self.size.1) else {
+				// a rectangle with nothing inside the target. The scene pass
+				// has already cleared the float target edge to edge, and the
+				// composite still has to run: what reaches the window is
+				// written by it and by nothing else, so returning here would
+				// leave the frame holding whatever was in it last.
 				drop(pass);
+				self.post
+					.resolve(&mut encoder, &self.queue, world.post, seconds, target);
 				self.queue.submit([encoder.finish()]);
 
 				return;
@@ -807,6 +827,13 @@ impl Scene {
 		self.draw(&mut pass, &self.blended);
 
 		drop(pass);
+
+		// and last: the picture is measured, the eye moves, and the whole
+		// thing is squeezed onto the screen. Everything above this line drew
+		// into sixteen-bit floats, and nothing above it wrote a pixel of the
+		// frame that is about to be shown.
+		self.post
+			.resolve(&mut encoder, &self.queue, world.post, seconds, target);
 		self.queue.submit([encoder.finish()]);
 	}
 

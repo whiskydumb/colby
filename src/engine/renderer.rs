@@ -88,12 +88,17 @@ impl Renderer {
 	/// nobody could use.
 	/// @param view - the part of the window the world is drawn into, or the
 	/// whole of it; an overlay is handed the whole window either way
+	/// @param seconds - how long the last frame took, which is what the eye
+	/// adapts by. Handed in rather than measured here, because a renderer
+	/// holding a clock of its own is a renderer whose picture depends on when
+	/// it was asked for - and one of the three oracles is a picture.
 	/// @return `Ok` once the frame has been submitted and presented
 	pub fn render(
 		&mut self,
 		world: &World,
 		overlays: &mut [&mut dyn Overlay],
 		view: Option<Viewport>,
+		seconds: f32,
 	) -> Result {
 		// whether the swapchain stopped matching the window while this frame
 		// was being handed out. @ref the note where it is acted on, below.
@@ -131,7 +136,7 @@ impl Renderer {
 			.texture
 			.create_view(&TextureViewDescriptor::default());
 
-		self.scene.render(&target, world, view);
+		self.scene.render(&target, world, view, seconds);
 
 		// after the scene and before the surface goes back: an overlay draws
 		// into the frame the scene was just recorded into, and submits its own

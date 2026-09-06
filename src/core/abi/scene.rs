@@ -69,8 +69,8 @@ use crate::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
-		Light, MaterialId, MeshId, Pose, PoseId, Registry, Renderable, Shape, ShapeKind, Sky,
-		Transform, World,
+		Light, MaterialId, MeshId, Pose, PoseId, Post, Registry, Renderable, Shape, ShapeKind,
+		Sky, Transform, World,
 		field::{Field, field},
 		net::MAX_PEERS,
 		state::STATE_BYTES,
@@ -102,6 +102,9 @@ pub struct Stage {
 	/// What is drawn behind everything, or nothing at all.
 	pub sky: Sky,
 
+	/// What happens to the picture once the world is drawn into it.
+	pub post: Post,
+
 	/// The direction the light travels.
 	pub light: Vec3,
 
@@ -127,6 +130,7 @@ impl Stage {
 		camera: Camera::DEFAULT,
 		clear: Vec3::ZERO,
 		sky: Sky::NONE,
+		post: Post::DEFAULT,
 		light: Vec3::new(-0.4, -1.0, -0.3),
 		ambient: Vec3::splat(0.25),
 		gravity: Vec3::new(0.0, -9.81, 0.0),
@@ -136,10 +140,10 @@ impl Stage {
 	/// Its plain fields, for an inspector, a reader and a writer. @ref
 	/// [`field`](super::field).
 	///
-	/// The camera and the sky are records of their own with their own tables,
-	/// [`Camera::FIELDS`] and [`Sky::FIELDS`], and the two counters are the
-	/// host's rather than anything a person sets: a source has no words for
-	/// what time it is.
+	/// The camera, the sky and the post-processing are records of their own
+	/// with their own tables - [`Camera::FIELDS`], [`Sky::FIELDS`] and
+	/// [`Post::FIELDS`] - and the two counters are the host's rather than
+	/// anything a person sets: a source has no words for what time it is.
 	pub const FIELDS: &[Field<Self>] = &[
 		field!(Color, "clear", clear, "the clear color"),
 		field!(Vec3, "light", light, "the direction the light travels"),
@@ -1119,6 +1123,7 @@ pub fn settings(world: &World) -> Stage {
 		camera: world.camera,
 		clear: world.clear,
 		sky: world.sky,
+		post: world.post,
 		light: world.light,
 		ambient: world.ambient,
 		gravity: world.gravity,
@@ -1144,6 +1149,7 @@ pub fn settings(world: &World) -> Stage {
 pub fn set_settings(world: &mut World, stage: Stage) {
 	world.clear = stage.clear;
 	world.sky = stage.sky;
+	world.post = stage.post;
 	world.light = stage.light;
 	world.ambient = stage.ambient;
 	world.gravity = stage.gravity;
@@ -1999,6 +2005,7 @@ fn stage_world(world: &mut World, stage: Stage) {
 	world.camera = stage.camera;
 	world.clear = stage.clear;
 	world.sky = stage.sky;
+	world.post = stage.post;
 	world.light = stage.light;
 	world.ambient = stage.ambient;
 	world.gravity = stage.gravity;

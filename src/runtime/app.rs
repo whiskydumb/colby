@@ -472,7 +472,10 @@ impl Loader {
 			overlays.push(screen);
 		}
 
-		renderer.render(opening.world(), &mut overlays, None)
+		// no time at all while the world is coming up: the picture behind the
+		// loading screen is not moving, so an eye that opens on it and holds
+		// is the right eye.
+		renderer.render(opening.world(), &mut overlays, None, 0.0)
 	}
 
 	/// Takes the window down, the screen before the renderer whose surface
@@ -844,6 +847,7 @@ impl App {
 		// what the drawn pose is a function of, so a sample that wanders by
 		// however long a directory scan took is a picture that wanders with it.
 		let pace = self.clock.tick();
+		let seconds = self.clock.frame().as_secs_f32();
 		self.report(pace);
 
 		self.reload_if_stale();
@@ -941,7 +945,7 @@ impl App {
 			return Ok(());
 		};
 
-		renderer.render(&self.runtime.world, &mut overlays, self.view)
+		renderer.render(&self.runtime.world, &mut overlays, self.view, seconds)
 	}
 
 	/// Where the world's picture begins on the window, in physical pixels.

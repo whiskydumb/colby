@@ -17,6 +17,7 @@ pub mod gpu;
 pub mod image;
 mod lines;
 pub mod overlay;
+mod post;
 pub mod renderer;
 pub mod scene;
 pub mod shader;

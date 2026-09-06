@@ -133,7 +133,10 @@ impl Capture {
 			.color
 			.create_view(&TextureViewDescriptor::default());
 
-		self.scene.render(&view, world, None);
+		// no time at all, which is exactly right: a capture is a fresh surface
+		// with no history, so its eye is set to what it measures rather than
+		// moved towards it, and the answer does not depend on a clock.
+		self.scene.render(&view, world, None, 0.0);
 
 		for overlay in overlays {
 			overlay.draw(self.scene.device(), self.scene.queue(), &view, self.width, self.height);
@@ -302,8 +305,8 @@ pub const fn rgb(red: f32, green: f32, blue: f32) -> Vec3 { Vec3::new(red, green
 mod tests {
 	use colby_core::{
 		abi::{
-			Material, MeshData, MeshId, Pose, PoseId, Renderable, SkinVertex, Sky, SkyKind,
-			Texel, TextureData, Transform,
+			Material, MeshData, MeshId, Pose, PoseId, Post, Renderable, SkinVertex, Sky, SkyKind,
+			Texel, TextureData, ToneMap, Transform,
 			cvar::Value,
 			material::{Blend, MaterialId},
 			mesh,
@@ -329,6 +332,22 @@ mod tests {
 	/// How far above the origin the overhead camera sits.
 	const HEIGHT: f32 = 5.0;
 
+	/// What every test world sets: the picture squeezed by nothing and exposed
+	/// at one.
+	///
+	/// **Every test in this file is about shading, not about metering.** A
+	/// curve is not linear and a measured exposure depends on the average of
+	/// the whole picture, so with either of them on, a pixel compared against
+	/// the same pixel in a second capture of a slightly different world is a
+	/// comparison of two exposures rather than of two surfaces. Turning both
+	/// off is what keeps these tests measuring the thing they are named after;
+	/// the post-processing has tests of its own.
+	fn plainly(world: &mut World) {
+		world.post.tonemap = ToneMap::None;
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+	}
+
 	/// A world with a camera looking at the origin from `+z`, and a light
 	/// traveling the same way the camera does.
 	///
@@ -336,6 +355,7 @@ mod tests {
 	/// facing away is black. That is what makes the winding test decisive.
 	fn looking_world() -> World {
 		let mut world = World::new();
+		plainly(&mut world);
 		world.clear = rgb(0.0, 0.0, 0.2);
 		world.ambient = Vec3::ZERO;
 		world.light = Vec3::NEG_Z;
@@ -381,8 +401,10 @@ mod tests {
 		let mut tall = Capture::new(&gpu, 32, 64).expect("the second capture builds");
 
 		let mut red = World::new();
+		plainly(&mut red);
 		red.clear = rgb(1.0, 0.0, 0.0);
 		let mut blue = World::new();
+		plainly(&mut blue);
 		blue.clear = rgb(0.0, 0.0, 1.0);
 
 		let first = wide
@@ -1091,6 +1113,7 @@ mod tests {
 		// the game crate. It is built to look like one: a floor, a cube in the
 		// middle, a ring around it, lit from above and to one side.
 		let mut world = World::new();
+		plainly(&mut world);
 		world.clear = rgb(0.04, 0.05, 0.07);
 		world.ambient = Vec3::splat(0.22);
 		world.light = Vec3::new(-0.5, -1.0, -0.35);
@@ -1698,6 +1721,196 @@ f 1 4 5
 		world
 	}
 
+	/// A world that is nothing but a flat surface of about this brightness.
+	///
+	/// Two things about it are what make a meter testable. The sun is turned
+	/// to travel *towards* the camera, so the face pointing at it catches none
+	/// of it and what is in front of the lens is the ambient times the surface
+	/// rather than the sum of two terms. And the surface fills the frame: a
+	/// meter reads the whole picture, so a bright thing on a black background
+	/// measures as a dark picture and asks for the ceiling whatever the thing
+	/// is - which is correct, and is not what a test of the ceiling wants.
+	fn glowing(level: f32) -> World {
+		let mut world = looking_world();
+
+		world.post = Post::DEFAULT;
+		world.clear = rgb(0.0, 0.0, 0.0);
+		world.light = Vec3::Z;
+		world.ambient = Vec3::splat(level);
+
+		let wall = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(40.0, 40.0, 1.0),
+		});
+		world
+			.entities
+			.set_renderable(wall, Renderable::new(MeshId::CUBE, rgb(1.0, 1.0, 1.0)));
+
+		world
+	}
+
+	/// The green of the middle pixel, which is the one that moves most per
+	/// unit of light.
+	fn middle(image: &Image) -> u32 { u32::from(image.pixel(SIZE.0 / 2, SIZE.1 / 2)[1]) }
+
+	#[test]
+	fn a_curve_and_no_curve_are_not_the_same_picture() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		let mut world = glowing(0.5);
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+
+		world.post.tonemap = ToneMap::None;
+		let plain = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.tonemap = ToneMap::Aces;
+		let filmic = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.tonemap = ToneMap::Reinhard;
+		let simple = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		assert!(plain > 0 && plain < 255, "a half-lit surface is neither black nor white");
+		assert_ne!(filmic, plain, "and the filmic curve moves it");
+		assert_ne!(simple, plain, "and so does the cheap one");
+		assert_ne!(simple, filmic, "and the two curves are not each other");
+	}
+
+	#[test]
+	fn without_a_curve_two_different_brightnesses_past_white_are_the_same_white() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		// the whole of what the float target bought, in one comparison. Before
+		// it, the target was eight bits and everything past one was the same
+		// white; a curve with a shoulder keeps them apart.
+		let mut dim = glowing(2.0);
+		dim.post.auto_exposure = false;
+		dim.post.exposure = 1.0;
+		let mut blazing = glowing(8.0);
+		blazing.post.auto_exposure = false;
+		blazing.post.exposure = 1.0;
+
+		dim.post.tonemap = ToneMap::None;
+		blazing.post.tonemap = ToneMap::None;
+
+		assert_eq!(middle(&capture.shoot(&mut dim).expect("it renders")), 255);
+		assert_eq!(
+			middle(&capture.shoot(&mut blazing).expect("it renders")),
+			255,
+			"clamped, both of them, which is what an eight-bit target always did"
+		);
+
+		dim.post.tonemap = ToneMap::Aces;
+		blazing.post.tonemap = ToneMap::Aces;
+
+		let softer = middle(&capture.shoot(&mut dim).expect("it renders"));
+		let brighter = middle(&capture.shoot(&mut blazing).expect("it renders"));
+
+		assert!(softer < 255, "the curve has a shoulder, so twice white is not white: {softer}");
+		assert!(brighter > softer, "and eight times is brighter than twice: {brighter}");
+	}
+
+	#[test]
+	fn the_exposure_scales_the_picture_before_the_curve() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		let mut world = glowing(0.2);
+		world.post.auto_exposure = false;
+		world.post.tonemap = ToneMap::None;
+
+		world.post.exposure = 1.0;
+		let one = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.exposure = 2.0;
+		let two = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.exposure = 0.5;
+		let half = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		assert!(half < one && one < two, "{half} then {one} then {two}");
+	}
+
+	#[test]
+	fn an_eye_opens_already_adapted_and_lifts_a_dark_room() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		// the whole of why a process that renders exactly one frame gets a
+		// picture worth looking at. A fresh capture has no history, so the eye
+		// is *set* to what it measures rather than moved towards it.
+		let mut world = glowing(0.02);
+		world.post.tonemap = ToneMap::None;
+
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+		let unaided = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.auto_exposure = true;
+		let adapted = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		assert!(
+			adapted > unaided.saturating_mul(2),
+			"a dark room is opened up rather than left dark: {adapted} against {unaided}"
+		);
+	}
+
+	#[test]
+	fn an_eye_stops_down_in_a_bright_room_and_stays_inside_its_two_numbers() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		let mut world = glowing(4.0);
+		world.post.tonemap = ToneMap::None;
+		world.post.auto_exposure = true;
+		let stopped = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+		let wide = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		assert_eq!(wide, 255, "four times white without a meter is white");
+		assert!(stopped < wide, "and with one it is stopped down: {stopped}");
+
+		// and the floor holds: a room this bright would ask for a twentieth,
+		// and the smallest the eye may be is a twentieth, so the two agree.
+		let mut held = glowing(4.0);
+		held.post.tonemap = ToneMap::None;
+		held.post.exposure_min = 1.0;
+		held.post.exposure_max = 1.0;
+
+		assert_eq!(
+			middle(&capture.shoot(&mut held).expect("it renders")),
+			255,
+			"an eye held at one is an eye that is not metering"
+		);
+	}
+
+	#[test]
+	fn the_bias_moves_a_measured_exposure_by_stops() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		let mut world = glowing(0.1);
+		world.post.tonemap = ToneMap::None;
+
+		let level = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		world.post.exposure_bias = -2.0;
+		let darker = middle(&capture.shoot(&mut world).expect("it renders"));
+
+		assert!(darker < level, "two stops down is darker: {darker} against {level}");
+	}
+
 	#[test]
 	fn a_world_with_no_sky_shows_the_clear_color_behind_it() {
 		let Some((_gpu, mut capture)) = capture() else {
@@ -2011,6 +2224,7 @@ f 1 4 5
 	/// mistake a test like this can make.
 	fn shadowed_world() -> World {
 		let mut world = World::new();
+		plainly(&mut world);
 		world.clear = rgb(0.0, 0.0, 0.2);
 		world.ambient = Vec3::splat(0.12);
 		world.light = Vec3::new(1.0, -1.0, 0.0).normalize();

@@ -77,7 +77,7 @@ use colby_core::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Field, Joint, JointKind, Layers, Light, MeshId,
-		Renderable, Shape, Sky, Transform,
+		Post, Renderable, Shape, Sky, Transform,
 		field::{self, Kind},
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
@@ -199,7 +199,7 @@ fn stage(value: Option<&Value>) -> Result<Stage> {
 		return Ok(Stage::DEFAULT);
 	};
 
-	check(value, &[names(Stage::FIELDS, &[])], &["camera", "sky"], "a stage")?;
+	check(value, &[names(Stage::FIELDS, &[])], &["camera", "sky", "post"], "a stage")?;
 
 	let mut stage = Stage::DEFAULT;
 	read(&mut stage, value, Stage::FIELDS, "a stage")?;
@@ -216,6 +216,11 @@ fn stage(value: Option<&Value>) -> Result<Stage> {
 	if let Some(above) = value.get("sky") {
 		check(above, &[names(Sky::FIELDS, &[])], &[], "a sky")?;
 		read(&mut stage.sky, above, Sky::FIELDS, "a sky")?;
+	}
+
+	if let Some(after) = value.get("post") {
+		check(after, &[names(Post::FIELDS, &[])], &[], "the post-processing")?;
+		read(&mut stage.post, after, Post::FIELDS, "the post-processing")?;
 	}
 
 	Ok(stage)
@@ -998,6 +1003,18 @@ fn stage_of(stage: &Stage) -> Result<Option<String>> {
 		},
 		|_| None,
 	)?;
+	put_all(
+		&mut rows,
+		&stage.post,
+		&Post::DEFAULT,
+		Post::FIELDS,
+		&Writing {
+			prefix: "post.",
+			what: "the post-processing",
+			skipped: &[],
+		},
+		|_| None,
+	)?;
 
 	if rows.is_empty() {
 		return Ok(None);
@@ -1448,7 +1465,7 @@ fn as_text(value: &str) -> String { json::quoted(value) }
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{LightKind, ShapeKind, SkyKind, scene::Form};
+	use colby_core::abi::{LightKind, ShapeKind, SkyKind, ToneMap, scene::Form};
 
 	use super::*;
 
@@ -2418,6 +2435,41 @@ mod tests {
 	}
 
 	#[test]
+	fn the_post_processing_is_read_out_of_its_own_object_and_written_back() {
+		let scene = import(
+			r#"{ "stage": { "post": {
+				"tonemap": "reinhard", "white": 6, "auto_exposure": false,
+				"exposure": 2, "bloom": 0.5, "fog": [0.2, 0.3, 0.4], "fog_density": 0.01
+			} } }"#,
+		)
+		.expect("it is a scene");
+		let post = scene.stage.post;
+
+		assert_eq!(post.tonemap, ToneMap::Reinhard, "the word is the curve");
+		assert!(!post.auto_exposure, "and the checkbox is the checkbox");
+		assert!((post.exposure - 2.0).abs() < 1.0e-6 && (post.white - 6.0).abs() < 1.0e-6);
+		assert_eq!(post.fog, Vec3::new(0.2, 0.3, 0.4), "the fog has a color of its own");
+		assert!(
+			(post.exposure_rate - Post::DEFAULT.exposure_rate).abs() < 1.0e-6,
+			"and a field nobody wrote keeps what a world starts with"
+		);
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains("\"post\": {"), "written under its own key");
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_world_that_asks_for_nothing_unusual_writes_no_post_key() {
+		let scene = import(r#"{ "stage": { "clear": [0.5, 0.5, 0.5] } }"#).expect("a scene");
+		let text = export(&scene).expect("it writes back");
+
+		assert_eq!(scene.stage.post, Post::DEFAULT, "nothing was asked for");
+		assert!(!text.contains("\"post\""), "so nothing is written: {text}");
+	}
+
+	#[test]
 	fn a_sky_is_read_out_of_its_own_object_and_written_back_into_one() {
 		let scene = import(
 			r#"{ "stage": {
@@ -2542,6 +2594,7 @@ mod tests {
 		fill(&mut stage, Stage::FIELDS, &[]);
 		fill(&mut stage.camera, Camera::FIELDS, &[]);
 		fill(&mut stage.sky, Sky::FIELDS, &[]);
+		fill(&mut stage.post, Post::FIELDS, &[]);
 
 		let scene = SceneData {
 			stage,

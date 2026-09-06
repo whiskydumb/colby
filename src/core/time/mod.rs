@@ -202,6 +202,9 @@ pub struct Clock {
 
 	/// Whether the previous frame was one of them.
 	behind: bool,
+
+	/// How long the last frame took, in real time.
+	frame: Duration,
 }
 
 impl Clock {
@@ -210,6 +213,7 @@ impl Clock {
 	pub fn new() -> Self {
 		Self {
 			previous: Instant::now(),
+			frame: Duration::ZERO,
 			accumulator: Duration::ZERO,
 			rate: Rate::DEFAULT,
 			simulated: Duration::ZERO,
@@ -293,6 +297,8 @@ impl Clock {
 	/// @param delta - how much real time to account for
 	/// @return whether the simulation is keeping up
 	pub fn tick_with(&mut self, delta: Duration) -> Pace {
+		self.frame = delta;
+
 		// the stall is judged on the *real* delta, before any scaling: falling
 		// behind is a property of the process, not of how fast the game was
 		// asked to run. Scaling afterwards is what keeps `sim.speed 8` from
@@ -335,6 +341,14 @@ impl Clock {
 
 		Some(self.simulated.as_secs_f32())
 	}
+
+	/// How long the last frame took, in real time.
+	///
+	/// **Unscaled**, unlike everything else here: `sim.speed` and a pause are
+	/// about simulated time, and what this is for is the renderer's eye
+	/// adapting to a picture, which goes on happening while a world is paused.
+	#[must_use]
+	pub const fn frame(&self) -> Duration { self.frame }
 
 	/// How far the frame about to be drawn sits past the last simulated state.
 	///
