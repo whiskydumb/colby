@@ -270,6 +270,24 @@ impl Entry {
 		}
 	}
 
+	/// What the code registered a variable with, or `None` for a command.
+	///
+	/// What [`Cvars::reset`] would put back, and therefore what tells a panel
+	/// whether there is anything to put back. Held beside the value rather
+	/// than worked out from [`is_touched`](Self::is_touched): a value set to
+	/// the default by hand is at the default, whoever set it.
+	#[must_use]
+	pub const fn default_value(&self) -> Option<&Value> {
+		match &self.kind {
+			| Kind::Var { default, .. } => Some(default),
+			| Kind::Command(_) => None,
+		}
+	}
+
+	/// Whether anything has set this since it was registered.
+	#[must_use]
+	pub const fn is_touched(&self) -> bool { self.touched }
+
 	/// Whether this is something to call rather than something to read.
 	#[must_use]
 	pub const fn is_command(&self) -> bool { matches!(self.kind, Kind::Command(_)) }
@@ -693,6 +711,38 @@ mod tests {
 		}
 
 		assert!(!cvars.set("a.flag", "maybe"), "and nothing else is either");
+	}
+
+	#[test]
+	fn an_entry_says_what_it_started_as_and_whether_anybody_has_moved_it() {
+		let mut cvars = Cvars::new();
+		cvars.var("sim.rate", Value::Int(60), "ticks a second");
+		cvars.command("quit", nothing, "stop");
+
+		let started = cvars.get("sim.rate").expect("registered");
+		assert_eq!(started.default_value(), Some(&Value::Int(60)));
+		assert!(!started.is_touched(), "nobody has set it");
+		assert_eq!(
+			cvars
+				.get("quit")
+				.expect("registered")
+				.default_value(),
+			None,
+			"a command has no value to go back to"
+		);
+
+		assert!(cvars.set("sim.rate", "30"));
+
+		let turned = cvars.get("sim.rate").expect("still there");
+		assert_eq!(turned.value(), Some(&Value::Int(30)), "what it holds now");
+		assert_eq!(turned.default_value(), Some(&Value::Int(60)), "and what the code said");
+		assert!(turned.is_touched());
+
+		assert!(cvars.reset("sim.rate"));
+
+		let back = cvars.get("sim.rate").expect("still there");
+		assert_eq!(back.value(), Some(&Value::Int(60)));
+		assert!(!back.is_touched(), "and it follows the code again");
 	}
 
 	#[test]

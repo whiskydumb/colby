@@ -67,6 +67,7 @@ mod inspector;
 pub mod launcher;
 pub mod loading;
 mod select;
+mod settings;
 mod shell;
 mod stats;
 mod thumbs;
@@ -207,6 +208,9 @@ enum Tab {
 
 	/// The asset browser.
 	Assets,
+
+	/// Every console variable, as something to turn.
+	Settings,
 }
 
 impl Tab {
@@ -216,6 +220,7 @@ impl Tab {
 			| Self::Console => "console",
 			| Self::Statistics => "statistics",
 			| Self::Assets => "assets",
+			| Self::Settings => "settings",
 		}
 	}
 }
@@ -239,6 +244,7 @@ pub(crate) struct Panels {
 	selection: select::Selection,
 	hierarchy: hierarchy::Hierarchy,
 	viewport: viewport::Viewport,
+	settings: settings::Settings,
 	history: History,
 	tab: Tab,
 	/// Whether the name field takes the keyboard this frame: F2 was pressed
@@ -269,6 +275,7 @@ impl Default for Panels {
 			selection: select::Selection::default(),
 			hierarchy: hierarchy::Hierarchy::default(),
 			viewport: viewport::Viewport::default(),
+			settings: settings::Settings::default(),
 			history: History::default(),
 			tab: Tab::default(),
 			rename: false,
@@ -495,13 +502,14 @@ impl Panels {
 		self.was_editing = world.editing;
 	}
 
-	/// The bottom panel: three tabs, and whichever is up.
+	/// The bottom panel: four tabs, and whichever is up.
 	fn bottom(&mut self, ui: &mut Ui, world: &mut World, host: &Host<'_>) {
 		ui.add_space(4.0);
 		ui.horizontal(|ui| {
 			tab(ui, &mut self.tab, Tab::Console);
 			tab(ui, &mut self.tab, Tab::Statistics);
 			tab(ui, &mut self.tab, Tab::Assets);
+			tab(ui, &mut self.tab, Tab::Settings);
 		});
 		ui.separator();
 
@@ -509,6 +517,7 @@ impl Panels {
 			| Tab::Console => self.console.show(ui, world),
 			| Tab::Statistics => stats::show(ui, world, host.clock, host.frames),
 			| Tab::Assets => self.browser.show(ui, host.project, host.gpu),
+			| Tab::Settings => self.settings.show(ui, world),
 		}
 	}
 
@@ -765,6 +774,55 @@ mod tests {
 			repeat: false,
 			modifiers,
 		}]);
+	}
+
+	#[test]
+	fn the_console_prompt_is_inside_the_window_and_not_under_its_floor() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut panels = Panels::default();
+		let context = Context::default();
+		let clock = Clock::new();
+		let host = Host {
+			clock: &clock,
+			frames: 1,
+			project: None,
+			gpu: None,
+		};
+		let mut built = false;
+		let mut view = Rect::NOTHING;
+		// a scrollback with more in it than the panel can hold, which is the
+		// state a window is in within a second of starting and the one a
+		// small fixture cannot show
+		for line in 0..300_u32 {
+			info!(line, "a line in the log");
+		}
+
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0))),
+				..Default::default()
+			},
+			|ui| {
+				if !built {
+					built = true;
+					view = panels.frame(ui, &mut world, &host);
+				}
+			},
+		);
+		output.textures_delta.clear();
+
+		// the console is the tab that is up to begin with, so its prompt is
+		// drawn; a bottom panel grows to fit what is in it, and anything
+		// added above the prompt comes out of the scrollback's share rather
+		// than pushing the prompt off the bottom of the window
+		let prompt = context
+			.read_response(egui::Id::new("console prompt"))
+			.expect("the console was drawn")
+			.rect;
+
+		assert!(prompt.max.y <= 720.0, "the prompt is under the window's floor: {prompt:?}");
+		assert!(view.max.y <= prompt.min.y, "and the picture stops above it: {view:?}");
 	}
 
 	#[test]
