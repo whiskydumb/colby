@@ -153,7 +153,7 @@ pub struct Runtime {
 	started: Instant,
 
 	/// The project everything on disk resolves against.
-	project: Project,
+	pub(crate) project: Project,
 }
 
 impl Runtime {

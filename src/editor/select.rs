@@ -19,8 +19,9 @@
 //! the step is the only thing that otherwise copies one into the other, so an
 //! entity dragged on its own would snap back the moment play started.
 
+use colby_asset::compile::Kind;
 use colby_core::{
-	abi::{Body, BodyId, EntityId, JointId, Transform, World},
+	abi::{Body, BodyId, EntityId, JointId, Renderable, Transform, World, scene},
 	glam::Vec3,
 };
 
@@ -784,6 +785,113 @@ fn copy_joints(world: &mut World, body_copies: &[(BodyId, BodyId)]) -> Vec<(Join
 	joint_copies
 }
 
+/// What a row of the asset browser becomes when it is dropped into the
+/// world: a scene laid down there, a mesh as an entity standing there, a
+/// model as an entity with a child per piece. Anything else - a texture, a
+/// sound, a font, a document, a program - is not a thing that stands
+/// anywhere, and becomes nothing.
+///
+/// @param world - the world to write
+/// @param name - the asset name, `meshes/crystal`
+/// @param kind - what it is
+/// @param at - where it lands
+/// @return what was made, for the selection; empty when nothing was
+pub(crate) fn drop(world: &mut World, name: &str, kind: Kind, at: Vec3) -> Vec<Pick> {
+	match kind {
+		| Kind::Scene => drop_scene(world, name, at),
+		| Kind::Mesh => drop_mesh(world, name, at),
+		| Kind::Model => drop_model(world, name, at),
+		| Kind::Texture
+		| Kind::Font
+		| Kind::Document
+		| Kind::Sound
+		| Kind::Skeleton
+		| Kind::Clip
+		| Kind::Script => Vec::new(),
+	}
+}
+
+/// The last part of an asset name, which is what a thing made from it is
+/// called: `crystal` for `meshes/crystal`.
+fn stem(name: &str) -> &str { name.rsplit('/').next().unwrap_or(name) }
+
+/// A scene, created beside what is there with its roots moved to the drop.
+fn drop_scene(world: &mut World, name: &str, at: Vec3) -> Vec<Pick> {
+	let id = world.scenes.find(name);
+	if !id.is_some() {
+		return Vec::new();
+	}
+
+	let data = world.scenes.data(id).clone();
+	let remap = scene::instantiate(world, &data, at);
+	let mut landed: Vec<Pick> = remap.entities().map(Pick::Entity).collect();
+
+	// a scene of bodies alone, a set of colliders, is selected by them
+	if landed.is_empty() {
+		landed.extend(remap.bodies().map(Pick::Body));
+	}
+
+	landed
+}
+
+/// A mesh, as an entity drawing it in the default material, standing where
+/// it was dropped.
+fn drop_mesh(world: &mut World, name: &str, at: Vec3) -> Vec<Pick> {
+	let mesh = world.meshes.find(name);
+	if !mesh.is_some() {
+		return Vec::new();
+	}
+
+	let entity = world.entities.spawn_at(Transform::at(at));
+	if !entity.is_some() {
+		return Vec::new();
+	}
+
+	world
+		.entities
+		.set_renderable(entity, Renderable::new(mesh, Vec3::ONE));
+	world.entities.set_name(entity, stem(name));
+
+	vec![Pick::Entity(entity)]
+}
+
+/// A model, as an entity standing where it was dropped with a child per
+/// piece hanging off it, each drawing its mesh in its material where the
+/// model puts it.
+///
+/// What the table of placements is for: a game writes this loop itself,
+/// and the editor writes it once here. A pose is not given, so a skinned
+/// piece stands in its bind pose.
+fn drop_model(world: &mut World, name: &str, at: Vec3) -> Vec<Pick> {
+	let id = world.models.find(name);
+	let Some(model) = world.models.get(id) else {
+		return Vec::new();
+	};
+	let placements = model.value().placements.clone();
+
+	let parent = world.entities.spawn_at(Transform::at(at));
+	if !parent.is_some() {
+		return Vec::new();
+	}
+
+	world.entities.set_name(parent, stem(name));
+
+	for placement in placements {
+		let child = world.entities.spawn_at(placement.transform);
+		if !child.is_some() {
+			continue;
+		}
+
+		world
+			.entities
+			.set_renderable(child, Renderable::of(placement.mesh, placement.material, Vec3::ONE));
+		world.entities.set_name(child, &placement.name);
+		world.entities.set_parent(child, parent);
+	}
+
+	vec![Pick::Entity(parent)]
+}
+
 /// Puts the primary where a drag took it, and everything else selected
 /// along with it.
 ///
@@ -1408,6 +1516,142 @@ mod tests {
 			Transform::IDENTITY,
 			Transform::at(Vec3::X),
 		)
+	}
+
+	#[test]
+	fn a_dropped_mesh_is_an_entity_drawing_it_where_it_was_dropped() {
+		let mut world = World::new();
+		let mesh = world
+			.meshes
+			.insert("meshes/crystal", colby_core::abi::mesh::cube());
+
+		let landed = drop(&mut world, "meshes/crystal", Kind::Mesh, Vec3::new(2.0, 0.0, -1.0));
+
+		let [Pick::Entity(entity)] = landed[..] else {
+			panic!("one entity: {landed:?}");
+		};
+		assert_eq!(world.entities.name(entity), "crystal", "called after the mesh");
+		assert_eq!(
+			world
+				.entities
+				.transform(entity)
+				.map(|it| it.position),
+			Some(Vec3::new(2.0, 0.0, -1.0))
+		);
+		assert_eq!(
+			world
+				.entities
+				.renderable(entity)
+				.map(|it| it.mesh),
+			Some(mesh)
+		);
+		assert!(
+			drop(&mut world, "meshes/nothing", Kind::Mesh, Vec3::ZERO).is_empty(),
+			"a mesh nobody registered makes nothing"
+		);
+	}
+
+	#[test]
+	fn a_dropped_scene_is_laid_down_with_its_roots_moved_to_the_drop() {
+		let mut world = World::new();
+		let mut described = World::new();
+		let crate_ = described
+			.entities
+			.spawn_at(Transform::at(Vec3::Y));
+		described.entities.set_name(crate_, "crate");
+		let lid = described
+			.entities
+			.spawn_at(Transform::at(Vec3::Y));
+		described.entities.set_name(lid, "lid");
+		assert!(described.entities.set_parent(lid, crate_));
+		world
+			.scenes
+			.insert("scenes/box", scene::capture(&described));
+
+		let landed = drop(&mut world, "scenes/box", Kind::Scene, Vec3::new(5.0, 0.0, 0.0));
+
+		assert_eq!(landed.len(), 2, "both things of the scene");
+		let root = landed
+			.iter()
+			.find_map(|pick| match *pick {
+				| Pick::Entity(id) if world.entities.name(id) == "crate" => Some(id),
+				| _ => None,
+			})
+			.expect("the crate landed");
+		assert_eq!(
+			world.entities.placed(root).map(|it| it.position),
+			Some(Vec3::new(5.0, 1.0, 0.0)),
+			"the root is moved to the drop"
+		);
+		let child = landed
+			.iter()
+			.find_map(|pick| match *pick {
+				| Pick::Entity(id) if world.entities.name(id) == "lid" => Some(id),
+				| _ => None,
+			})
+			.expect("the lid landed");
+		assert_eq!(world.entities.parent(child), root, "still hanging off the crate");
+		assert_eq!(
+			world.entities.placed(child).map(|it| it.position),
+			Some(Vec3::new(5.0, 2.0, 0.0)),
+			"and moved with it, not twice"
+		);
+	}
+
+	#[test]
+	fn a_dropped_model_is_an_entity_with_a_child_per_piece() {
+		use colby_core::abi::{
+			MaterialId, MeshId,
+			model::{ModelData, Placement},
+		};
+
+		let mut world = World::new();
+		world.models.insert("models/lamp", ModelData {
+			placements: vec![
+				Placement {
+					name: "base".to_owned(),
+					mesh: MeshId::CUBE,
+					material: MaterialId::DEFAULT,
+					transform: Transform::at(Vec3::ZERO),
+					..Placement::default()
+				},
+				Placement {
+					name: "shade".to_owned(),
+					mesh: MeshId::CUBE,
+					material: MaterialId::DEFAULT,
+					transform: Transform::at(Vec3::Y * 2.0),
+					..Placement::default()
+				},
+			],
+		});
+
+		let landed = drop(&mut world, "models/lamp", Kind::Model, Vec3::X * 3.0);
+
+		let [Pick::Entity(parent)] = landed[..] else {
+			panic!("the model's own entity: {landed:?}");
+		};
+		assert_eq!(world.entities.name(parent), "lamp");
+		let pieces = descendants(&world, parent);
+		assert_eq!(pieces.len(), 2, "a child per piece");
+		let shade = pieces
+			.iter()
+			.copied()
+			.find(|id| world.entities.name(*id) == "shade")
+			.expect("the shade");
+		assert_eq!(
+			world.entities.placed(shade).map(|it| it.position),
+			Some(Vec3::new(3.0, 2.0, 0.0)),
+			"where the model puts it, from where the model was dropped"
+		);
+		assert_eq!(world.entities.renderable(shade).map(|it| it.mesh), Some(MeshId::CUBE));
+	}
+
+	#[test]
+	fn a_dropped_texture_is_nothing() {
+		let mut world = World::new();
+
+		assert!(drop(&mut world, "textures/wall", Kind::Texture, Vec3::ZERO).is_empty());
+		assert_eq!(world.entities.len(), 0);
 	}
 
 	#[test]

@@ -24,7 +24,7 @@ use colby_core::{
 	warn,
 };
 #[cfg(feature = "editor")]
-use colby_editor::{Editor, Loading, State, Step};
+use colby_editor::{Editor, Host, Loading, State, Step};
 use colby_engine::{
 	Gpu, Overlay, Renderer, Viewport, gpu,
 	winit::{
@@ -709,7 +709,13 @@ impl App {
 		};
 
 		if let Some(editor) = self.editor.as_mut() {
-			let frame = editor.run(&window, &mut self.runtime.world, &self.clock, self.frames);
+			let host = Host {
+				clock: &self.clock,
+				frames: self.frames,
+				project: Some(&self.runtime.project),
+				gpu: self.gpu.as_ref(),
+			};
+			let frame = editor.run(&window, &mut self.runtime.world, &host);
 
 			self.view = Some(frame.view);
 

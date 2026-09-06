@@ -51,6 +51,11 @@ pub const SCHEMA: u32 = 1;
 /// Where saved worlds go, relative to the project root.
 pub const SAVES_DIR: &str = "saves";
 
+/// The directory, under the derived one, the editor keeps its pictures of
+/// the compiled assets in: `.colby/thumbs`. Derived like the compiled tree
+/// beside it, and taken by `just clean` with it.
+pub const THUMBS_DIR: [&str; 2] = [".colby", "thumbs"];
+
 /// The console's archive, relative to the project root.
 pub const SETTINGS_FILE: &str = "settings.cfg";
 
@@ -212,6 +217,14 @@ impl Project {
 	/// Where saved worlds go.
 	#[must_use]
 	pub fn saves(&self) -> PathBuf { self.root.join(SAVES_DIR) }
+
+	/// Where the editor keeps its pictures of the compiled assets.
+	#[must_use]
+	pub fn thumbs(&self) -> PathBuf {
+		THUMBS_DIR
+			.iter()
+			.fold(self.root.clone(), |path, part| path.join(part))
+	}
 
 	/// Where the console keeps its archived variables.
 	#[must_use]

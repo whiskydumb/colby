@@ -264,6 +264,40 @@ pub(crate) fn ray(camera: &Camera, at: Vec2, viewport: Vec2) -> (Vec3, Vec3) {
 	(camera.position, camera.pixel_direction(at, viewport))
 }
 
+/// How far along a ray a drop lands when the ray never meets the floor.
+const DROP_REACH: f32 = 8.0;
+
+/// How far away the floor may be for a drop to land on it rather than in
+/// the air: a ray nearly level with the floor meets it in the far distance,
+/// where nobody meant to put anything.
+const DROP_HORIZON: f32 = 500.0;
+
+/// Where a ray from the pointer meets the floor - the plane through the
+/// origin facing up, which is where most scenes stand - or a point a little
+/// way along it when it never does.
+///
+/// What a thing dragged out of the asset browser lands on. Godot drops onto
+/// whatever geometry the ray hits; here the floor plane is the geometry,
+/// because a scene has no floor until somebody drops one.
+///
+/// @param camera - the camera the picture was drawn through
+/// @param at - where the pointer is, origin top left
+/// @param viewport - how wide and tall the picture is, in the same units
+pub(crate) fn floor(camera: &Camera, at: Vec2, viewport: Vec2) -> Vec3 {
+	let (from, along) = ray(camera, at, viewport);
+	let direction = along.normalize_or(Vec3::NEG_Z);
+
+	if direction.y < -1.0e-4 {
+		let distance = -from.y / direction.y;
+
+		if distance > 0.0 && distance < DROP_HORIZON {
+			return from + direction * distance;
+		}
+	}
+
+	from + direction * DROP_REACH
+}
+
 /// A ray put into an entity's own space.
 ///
 /// A [`Transform`] is translate, rotate, scale in that order, so undoing it is
@@ -317,6 +351,30 @@ fn slab(from: Vec3, along: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
 #[cfg(test)]
 mod tests {
 	use std::f32::consts::FRAC_PI_4;
+
+	#[test]
+	fn a_drop_lands_on_the_floor_under_the_pointer_or_a_little_way_out() {
+		let mut camera = Camera::DEFAULT;
+		camera.position = Vec3::new(0.0, 5.0, 5.0);
+		camera.target = Vec3::ZERO;
+		let viewport = Vec2::new(800.0, 600.0);
+
+		let landed = floor(&camera, viewport * 0.5, viewport);
+		assert!(
+			landed.abs_diff_eq(Vec3::ZERO, 1.0e-3),
+			"the middle of the picture looks at the origin, on the floor: {landed:?}"
+		);
+
+		// level with the floor: the ray never meets it, so the drop is a
+		// little way along it instead
+		camera.position = Vec3::new(0.0, 1.0, 0.0);
+		camera.target = Vec3::new(0.0, 1.0, -5.0);
+		let floated = floor(&camera, viewport * 0.5, viewport);
+		assert!(
+			floated.abs_diff_eq(Vec3::new(0.0, 1.0, -DROP_REACH), 1.0e-3),
+			"eight units out, at the camera's own height: {floated:?}"
+		);
+	}
 
 	use colby_core::{
 		abi::{MeshData, MeshId, Renderable, mesh},

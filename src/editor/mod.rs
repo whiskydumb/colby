@@ -41,18 +41,24 @@
 //! draws its interface with HTML/CSS over taffy, which is a separate subsystem
 //! that happens to arrive through the same [`Overlay`] seam.
 
+use colby_asset::{Project, compile::Kind};
 use colby_core::{
 	abi::{EntityId, World, cvar::Value, scene::SceneData},
-	debug, info,
+	debug,
+	glam::{Vec2, Vec3},
+	info,
 	time::Clock,
+	warn,
 };
-use colby_engine::{Overlay, Viewport};
-use egui::{Context, Key, Modifiers, Panel, Rect, Ui};
+use colby_engine::{Gpu, Overlay, Viewport};
+use egui::{Context, DragAndDrop, Key, Modifiers, Panel, Rect, Ui};
 use wgpu::{Device, Queue, TextureFormat, TextureView};
 use winit::{event::WindowEvent, window::Window};
 
 mod aim;
 mod bar;
+mod browser;
+mod catalog;
 mod console;
 mod gizmo;
 mod hierarchy;
@@ -63,9 +69,10 @@ pub mod loading;
 mod select;
 mod shell;
 mod stats;
+mod thumbs;
 mod viewport;
 
-use self::{bar::Steps, gizmo::Tool, history::History, select::Pick};
+use self::{bar::Steps, browser::Dropped, gizmo::Tool, history::History, select::Pick};
 pub use self::{
 	launcher::{Action, Launcher},
 	loading::{Loading, State, Step},
@@ -93,6 +100,27 @@ const INSPECTOR_WIDTH: f32 = 320.0;
 
 /// How tall the bottom panel starts out, in points.
 const BOTTOM_HEIGHT: f32 = 220.0;
+
+/// What the window lends the editor for one frame: the pacing, the
+/// project and the device.
+///
+/// The clock and the count are for the statistics; the project is where the
+/// asset browser walks and keeps its pictures; the device is what a mesh's
+/// picture is drawn with, and a window with no usable one draws none.
+#[derive(Clone, Copy)]
+pub struct Host<'a> {
+	/// The pacing.
+	pub clock: &'a Clock,
+
+	/// How many frames have been drawn.
+	pub frames: u64,
+
+	/// The project, if the window has one.
+	pub project: Option<&'a Project>,
+
+	/// The device, if there is one.
+	pub gpu: Option<&'a Gpu>,
+}
 
 /// What one frame of the editor came to, for the window that holds it.
 #[derive(Clone, Debug, PartialEq)]
@@ -153,6 +181,18 @@ pub(crate) enum Change {
 
 	/// Take a step forward again.
 	Redo,
+
+	/// Put an asset into the world, where it was dropped.
+	Drop {
+		/// The asset name.
+		name: String,
+
+		/// What it is.
+		kind: Kind,
+
+		/// Where it lands.
+		at: Vec3,
+	},
 }
 
 /// Which of the bottom panel's tabs is up.
@@ -164,6 +204,9 @@ enum Tab {
 
 	/// The statistics.
 	Statistics,
+
+	/// The asset browser.
+	Assets,
 }
 
 impl Tab {
@@ -172,6 +215,7 @@ impl Tab {
 		match self {
 			| Self::Console => "console",
 			| Self::Statistics => "statistics",
+			| Self::Assets => "assets",
 		}
 	}
 }
@@ -188,6 +232,7 @@ pub struct Editor {
 /// Built without a window in a test, and drawn against a headless context.
 pub(crate) struct Panels {
 	bar: bar::Bar,
+	browser: browser::Browser,
 	console: console::Console,
 	/// What is selected, held here rather than in a panel: the viewport picks
 	/// into it and the hierarchy draws it, and two copies could disagree.
@@ -219,6 +264,7 @@ impl Default for Panels {
 	fn default() -> Self {
 		Self {
 			bar: bar::Bar::default(),
+			browser: browser::Browser::default(),
 			console: console::Console::default(),
 			selection: select::Selection::default(),
 			hierarchy: hierarchy::Hierarchy::default(),
@@ -298,21 +344,14 @@ impl Editor {
 	///
 	/// @param window - the window, for input and for the cursor
 	/// @param world - the state the panels show and edit
-	/// @param clock - the pacing, for the statistics
-	/// @param frames - how many frames have been drawn
+	/// @param host - what the window lends for the frame
 	/// @return what the frame came to, which is where the world goes
-	pub fn run(
-		&mut self,
-		window: &Window,
-		world: &mut World,
-		clock: &Clock,
-		frames: u64,
-	) -> Frame {
+	pub fn run(&mut self, window: &Window, world: &mut World, host: &Host<'_>) -> Frame {
 		let Self { shell, panels } = self;
 		let mut view = Rect::NOTHING;
 
 		shell.run(window, |ui| {
-			view = panels.frame(ui, world, clock, frames);
+			view = panels.frame(ui, world, host);
 		});
 
 		Frame {
@@ -327,16 +366,9 @@ impl Panels {
 	///
 	/// @param ui - the whole window, egui's root layout for this frame
 	/// @param world - the state the panels show and edit
-	/// @param clock - the pacing, for the statistics
-	/// @param frames - how many frames have been drawn
+	/// @param host - what the window lends for the frame
 	/// @return the part of the window left for the world, in points
-	pub(crate) fn frame(
-		&mut self,
-		ui: &mut Ui,
-		world: &mut World,
-		clock: &Clock,
-		frames: u64,
-	) -> Rect {
+	pub(crate) fn frame(&mut self, ui: &mut Ui, world: &mut World, host: &Host<'_>) -> Rect {
 		// every panel wants the context rather than the root layout: a
 		// `Context` is a handle, and cloning it is a refcount.
 		let context = ui.ctx().clone();
@@ -389,9 +421,10 @@ impl Panels {
 		Panel::bottom("bottom")
 			.resizable(true)
 			.default_size(BOTTOM_HEIGHT)
-			.show(ui, |ui| self.bottom(ui, world, clock, frames));
+			.show(ui, |ui| self.bottom(ui, world, host));
 
 		changes.extend(stepped(&context));
+		changes.extend(self.dropped(&context, world));
 
 		for change in changes {
 			self.apply(world, change);
@@ -462,19 +495,55 @@ impl Panels {
 		self.was_editing = world.editing;
 	}
 
-	/// The bottom panel: two tabs, and whichever is up.
-	fn bottom(&mut self, ui: &mut Ui, world: &mut World, clock: &Clock, frames: u64) {
+	/// The bottom panel: three tabs, and whichever is up.
+	fn bottom(&mut self, ui: &mut Ui, world: &mut World, host: &Host<'_>) {
 		ui.add_space(4.0);
 		ui.horizontal(|ui| {
 			tab(ui, &mut self.tab, Tab::Console);
 			tab(ui, &mut self.tab, Tab::Statistics);
+			tab(ui, &mut self.tab, Tab::Assets);
 		});
 		ui.separator();
 
 		match self.tab {
 			| Tab::Console => self.console.show(ui, world),
-			| Tab::Statistics => stats::show(ui, world, clock, frames),
+			| Tab::Statistics => stats::show(ui, world, host.clock, host.frames),
+			| Tab::Assets => self.browser.show(ui, host.project, host.gpu),
 		}
+	}
+
+	/// An asset let go of over the picture, if one was this frame.
+	///
+	/// The picture is not a widget, so nothing there can be asked whether a
+	/// payload was released on it; the release is read off the pointer and
+	/// the payload taken by hand, and where it lands is where the ray from
+	/// the pointer meets the floor. @ref [`aim::floor`].
+	fn dropped(&self, context: &Context, world: &World) -> Vec<Change> {
+		if !context.input(|input| input.pointer.any_released()) {
+			return Vec::new();
+		}
+
+		let Some(pointer) = context.pointer_latest_pos() else {
+			return Vec::new();
+		};
+
+		if !self.view.contains(pointer) {
+			return Vec::new();
+		}
+
+		let Some(dropped) = DragAndDrop::take_payload::<Dropped>(context) else {
+			return Vec::new();
+		};
+
+		let local = Vec2::new(pointer.x - self.view.min.x, pointer.y - self.view.min.y);
+		let size = Vec2::new(self.view.width().max(1.0), self.view.height().max(1.0));
+		let at = aim::floor(&world.render_camera(), local, size);
+
+		vec![Change::Drop {
+			name: dropped.name.clone(),
+			kind: dropped.kind,
+			at,
+		}]
 	}
 
 	/// Does what was pressed.
@@ -509,7 +578,30 @@ impl Panels {
 				colby_core::abi::console::run(world, &format!("scene.write {name}")),
 			| Change::Undo => self.restore = self.history.undo(world),
 			| Change::Redo => self.restore = self.history.redo(),
+			| Change::Drop { name, kind, at } => self.drop(world, &name, kind, at),
 		}
+	}
+
+	/// Puts an asset into the world where it was dropped, as one record, and
+	/// selects what it became.
+	fn drop(&mut self, world: &mut World, name: &str, kind: Kind, at: Vec3) {
+		self.history.begin("drop", world);
+		let landed = select::drop(world, name, kind, at);
+
+		if landed.is_empty() {
+			// a texture, a sound, or a scene the loop has not compiled yet:
+			// the record closes empty, because nothing changed
+			warn!(name, kind = catalog::word(kind), "nothing to put in the world for it");
+
+			return;
+		}
+
+		self.selection.clear();
+		for pick in &landed {
+			self.selection.toggle(world, *pick);
+		}
+
+		info!(name, ?at, made = landed.len(), "dropped into the world");
 	}
 }
 
@@ -614,7 +706,7 @@ impl Overlay for Editor {
 
 #[cfg(test)]
 mod tests {
-	use colby_core::{abi::Transform, glam::Vec3};
+	use colby_core::abi::Transform;
 	use egui::{Pos2, RawInput, vec2};
 
 	use super::*;
@@ -629,6 +721,12 @@ mod tests {
 	fn frame_with(panels: &mut Panels, world: &mut World, events: Vec<egui::Event>) -> Rect {
 		let context = Context::default();
 		let clock = Clock::new();
+		let host = Host {
+			clock: &clock,
+			frames: 1,
+			project: None,
+			gpu: None,
+		};
 		let mut view = Rect::NOTHING;
 		let mut built = false;
 
@@ -641,7 +739,7 @@ mod tests {
 			|ui| {
 				if !built {
 					built = true;
-					view = panels.frame(ui, world, &clock, 1);
+					view = panels.frame(ui, world, &host);
 				}
 			},
 		);
@@ -861,6 +959,46 @@ mod tests {
 
 		frame(&mut panels, &mut world);
 		assert!(!panels.rename, "and answered by the next frame");
+	}
+
+	#[test]
+	fn a_dropped_scene_lands_as_one_record_and_is_selected() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut described = World::new();
+		let crate_ = described
+			.entities
+			.spawn_at(Transform::at(Vec3::Y));
+		described.entities.set_name(crate_, "crate");
+		world
+			.scenes
+			.insert("scenes/box", colby_core::abi::scene::capture(&described));
+		let mut panels = Panels::default();
+
+		panels.apply(&mut world, Change::Drop {
+			name: "scenes/box".to_owned(),
+			kind: Kind::Scene,
+			at: Vec3::X * 4.0,
+		});
+		frame(&mut panels, &mut world);
+		frame(&mut panels, &mut world);
+
+		assert_eq!(world.entities.len(), 1, "the crate landed");
+		let Pick::Entity(landed) = panels.selection.at() else {
+			panic!("and is selected");
+		};
+		assert_eq!(world.entities.name(landed), "crate");
+		assert_eq!(panels.history.undoable(), Some("drop"));
+
+		panels.apply(&mut world, Change::Drop {
+			name: "textures/wall".to_owned(),
+			kind: Kind::Texture,
+			at: Vec3::ZERO,
+		});
+		frame(&mut panels, &mut world);
+		frame(&mut panels, &mut world);
+		assert_eq!(world.entities.len(), 1, "a texture is nothing to put in the world");
+		assert_eq!(panels.history.undoable(), Some("drop"), "and no record was made of nothing");
 	}
 
 	#[test]
