@@ -1276,6 +1276,7 @@ impl Net {
 	///
 	/// @param index - which peer
 	/// @return the world as of [`holding`](Self::holding), by slot
+	#[cfg(test)]
 	pub(crate) fn world(&mut self, index: usize) -> &[Slot] {
 		let Some(holding) = self
 			.peers

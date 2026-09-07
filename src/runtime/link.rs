@@ -18,18 +18,38 @@
 //! number of steps, and a hash of everything that got through. Same build, same
 //! number, on any machine.
 //!
-//! **There is a world in it now.** The host describes a small one that moves on
-//! a schedule with nothing random in it, twenty times a second out of sixty,
-//! and the client reads what it is told back. The digest covers what the client
-//! *ended up holding* rather than only what was said, which is the difference
-//! between checking that datagrams crossed and checking that the far end has
-//! the right world.
+//! **There is a world in it now, and since `NET-6` it is a real one.** Both
+//! ends run a `World` with a body table in it; the host moves its own on a
+//! schedule with nothing random in it and hands it to `net::tell`, which is the
+//! function the runtime itself calls, and the client is seated, told what
+//! appeared and given the differences through `net::land` and `Net::arrive` -
+//! the three functions a window uses and the three this mode used to walk
+//! around. The digest covers **where the client would draw things**, which is
+//! the entity for a body that drives one and the body for a body that does not,
+//! so both halves of `arrive` are in it.
+//!
+//! What that buys over the eight hand-written records this used to send: a
+//! change to `Solid::of`, to `records`, to how a generation crosses, to what a
+//! client does with a slot the host emptied, or to the order the three are
+//! called in, now moves a number that `just ci` prints. It used to move
+//! nothing anybody could run.
+//!
+//! **There is deliberately no solver.** A body a client does not own is
+//! kinematic and is driven by writing its *entity*, and what carries an entity
+//! back into its body is `Simulation::step` - which is floating-point
+//! arithmetic, and this is the one oracle whose whole value is printing the
+//! same number on every machine. So the world here moves by whole numbers, the
+//! way it always has, and what is compared is where a thing would be drawn
+//! rather than what a solver would make of it.
 //!
 //! The world is small and it is deliberately awkward: a body that never moves,
 //! one that changes only a late field, one that comes and goes, and a slot
 //! whose occupant is replaced by a different one. Each of those is a case the
 //! encoding treats differently, and a world of things all doing the same thing
-//! would exercise one path and look thorough.
+//! would exercise one path and look thorough. Two of them drive no entity at
+//! all, which is the other branch of what a client does with a record, and one
+//! belongs to the client, which is what makes `Role::of` answer something other
+//! than "somebody else's".
 //!
 //! **The run ends by agreeing.** Nothing new happens for the last two seconds,
 //! the host keeps describing the same world, and the client is asked whether it
@@ -51,14 +71,22 @@ use std::{
 
 use colby_core::{
 	Result,
-	abi::{Aim, Command},
-	bytemuck, info,
+	abi::{Aim, Body, BodyId, BodyKind, Command, Shape, Transform, World},
+	bytemuck,
+	glam::Vec3,
+	info,
 	time::Rate,
 	warn,
 };
-use colby_net::{Conditions, MAX_ASKED, NOTHING, Slot, Solid, every};
+use colby_net::{Conditions, MAX_ASKED, NOTHING, every};
 
 use crate::net::{Loopback, Net, Said, Tally, Wire};
+
+/// Where one slot of a world would be drawn: its generation and its place.
+///
+/// Nothing at all where the slot is empty, which is a different answer from a
+/// slot holding a body at the origin.
+type Placed = Option<(u32, [f32; 3])>;
 
 /// How many steps to run when nobody says.
 ///
@@ -106,11 +134,14 @@ const CLIENT_EVERY: u32 = 90;
 /// thing this mode exists to check.
 const SETTLE: u32 = 120;
 
-/// How many slots the world in this run has.
+/// How many bodies the world in this run has.
 ///
 /// Small on purpose. What is being checked is that every *kind* of change
 /// survives the wire, and a bigger world would say the same thing more slowly.
-const SLOTS: usize = 8;
+/// Nine rather than the eight this used to send by hand: the ninth is the one
+/// the client is given, which is what makes `Role::of` answer something other
+/// than "somebody else's" anywhere in the run.
+const SLOTS: usize = 9;
 
 /// How often the body that comes and goes does so, in steps.
 ///
@@ -186,6 +217,15 @@ pub(crate) struct Outcome {
 	/// How many of the client's snapshots were whole worlds, not differences.
 	pub(crate) baselines: u32,
 
+	/// How many times the host described something that had appeared.
+	///
+	/// **The half of the run that only exists since `NET-6`.** A snapshot
+	/// carries no shape and no mass, so a body that came back after being
+	/// dropped can only reach the far end down the reliable ring as a
+	/// description - and nought here means the client's world was built once
+	/// and never grew, which is a run that says nothing about `net::land`.
+	pub(crate) appeared: u32,
+
 	/// How many commands the client asked for.
 	pub(crate) asked: u32,
 
@@ -248,6 +288,7 @@ pub(crate) fn run(steps: u32) -> Result {
 		nowhere = outcome.nowhere,
 		taken = outcome.taken,
 		baselines = outcome.baselines,
+		appeared = outcome.appeared,
 		asked = outcome.asked,
 		held = outcome.held_commands,
 		agreed = outcome.agreed,
@@ -309,7 +350,20 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 	let mut crooked = 0_u32;
 	let mut taken = 0_u32;
 	let mut held = NOTHING;
-	let mut world = Vec::new();
+	// **two real worlds, since `NET-6`.** Both are built the same way, because
+	// a snapshot names slots and says nothing about what a body is; that is the
+	// arrangement a host and a window that opened the same project have.
+	let mut theirs = World::new();
+	let mut ours = World::new();
+	let mut made = populate(&mut theirs);
+
+	populate(&mut ours);
+
+	// scratch for the records `net::tell` writes, kept out here so that a
+	// snapshot costs no allocation, exactly as the runtime keeps it.
+	let mut records = Vec::new();
+	let mut host_drawn: Vec<Placed> = Vec::new();
+	let mut client_drawn: Vec<Placed> = Vec::new();
 	// what the client is asking for, kept here because there is no world to
 	// keep it in: the two-endpoint run is deliberately two endpoints and
 	// nothing else. @ref `Net::seat`, which is where a real client's window
@@ -337,12 +391,8 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 		// seconds are the same world described over and over - which is what
 		// lets a client that lost the end of the run catch up rather than
 		// being asked to agree with something it was never told.
-		describe(step.min(steps), &mut world);
-
-		// twenty a second out of sixty, and only from the host: a snapshot is
-		// what an authority sends, and the client's blocks carry nothing but
-		// the number of the newest one it has.
-		let telling = step.is_multiple_of(u32::from(EVERY));
+		play(&mut theirs, &mut made, step.min(steps));
+		theirs.steps = u64::from(step);
 
 		// and the client asks for something, every step, the way a client
 		// with somebody at its keyboard would. Its window is never settled,
@@ -358,12 +408,29 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 			asked += 1;
 		}
 
+		// **the runtime's own function, not a hand-rolled send.** `tell` is
+		// what a frame calls: it writes the records off the body table, asks
+		// for what this end is owed, describes anything that has appeared, and
+		// sends - and every one of those is a step this mode used to skip. The
+		// cadence comes out of `world.steps`, which is why it is written above.
+		crate::net::tell(&mut host, &theirs, &mut records, RATE.hz(), now);
 		client.ask(&asking);
-		host.ask(&[]);
-		host.send(now, telling.then_some(world.as_slice()));
 		client.send(now, None);
 		host.receive(now);
 		client.receive(now);
+
+		// and what a window does with what arrived, in the order a window does
+		// it: drained, then seated, then told what appeared, then given the
+		// difference. That is `crate::net::hear` followed by the two calls at
+		// the top of `crate::step`, and `hear` itself is deliberately not
+		// called - it begins by setting the conditions from the console, which
+		// in a world with no console is a perfect wire, and a perfect wire is
+		// the one thing this mode must not have.
+		client.seat(&mut ours);
+		crate::net::land(&mut client, &mut ours);
+		let behind = crate::net::behind(&ours.cvars);
+
+		client.arrive(&mut ours, now.saturating_sub(behind));
 
 		for (side, net) in [(0_u8, &host), (1, &client)] {
 			for said in net.said() {
@@ -375,15 +442,22 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 			}
 		}
 
-		// what the client holds, folded in whenever it changes. Once a
-		// snapshot rather than once a step, because a step in which nothing
-		// arrived says nothing about whether the world crossed.
+		// **what the client's own world came to**, folded in whenever a new
+		// snapshot has moved it. Once a snapshot rather than once a step,
+		// because a step in which nothing arrived says nothing about whether
+		// the world crossed - and the client's world rather than the records
+		// it holds, because the records crossing and a world being built out
+		// of them are two different claims.
 		if client.holding(0) != held {
 			held = client.holding(0);
 			taken += 1;
-			digest = seen(digest, held, client.world(0));
+			drawn(&ours, &mut client_drawn);
+			digest = seen(digest, held, &client_drawn);
 		}
 	}
+
+	drawn(&theirs, &mut host_drawn);
+	drawn(&ours, &mut client_drawn);
 
 	// what the host ended up holding, folded in whole. A count alone would
 	// move for a message arriving; this moves only if the same commands, in
@@ -405,12 +479,75 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 		nowhere: shared.borrow().nowhere(),
 		rtt: (host.rtt(0).as_micros(), client.rtt(0).as_micros()),
 		taken,
-		agreed: same(client.world(0), &world),
+		agreed: same(&client_drawn, &host_drawn),
 		baselines: client.baselines(0),
+		appeared: host.appearances(),
 	}
 }
 
-/// The world at one step, which is the same world at that step every time.
+/// Where every slot of a world would be drawn, or nothing where it is empty.
+///
+/// **The entity for a body that drives one and the body for a body that does
+/// not**, because those are the two things [`Net::arrive`] writes and a run
+/// that looked at only one of them would pass with half of it broken. A
+/// generation goes with the position, so that a slot whose occupant was
+/// replaced is not the same answer as one whose occupant moved.
+///
+/// Not the body's kind, and that is not an oversight: a client turns a body it
+/// does not own kinematic on purpose, so the two ends *must* disagree about it
+/// and a comparison that included it could never be true.
+///
+/// @param world - the world to read
+/// @param into - where the answers go, emptied first
+fn drawn(world: &World, into: &mut Vec<Placed>) {
+	into.clear();
+	into.resize(world.bodies.slots(), None);
+
+	for (id, body) in world.bodies.iter() {
+		let Some(slot) = into.get_mut(id.slot()) else {
+			continue;
+		};
+		let placed = world
+			.entities
+			.transform(body.entity)
+			.map_or(body.transform.position, |transform| transform.position);
+
+		*slot = Some((id.generation(), placed.to_array()));
+	}
+}
+
+/// The world both ends start with, spawned in the order that fixes the slots.
+///
+/// **Both ends build it**, because a snapshot names slots and says nothing
+/// about what a body *is*: a client that had not loaded the same scene would
+/// have nowhere to put the records. That is the arrangement a real pair has -
+/// the host and the window open the same project - and `net::land` is what
+/// carries anything spawned afterwards.
+///
+/// Seven of the nine drive an entity and two do not, which is the fork in
+/// [`Net::arrive`].
+///
+/// @param world - the world to fill
+/// @return the handle of every body, by slot
+fn populate(world: &mut World) -> Vec<BodyId> {
+	let mut made = Vec::with_capacity(SLOTS);
+
+	for slot in 0..SLOTS {
+		let mut body = Body::dynamic(Shape::cuboid(Vec3::splat(0.5)), Transform::IDENTITY, 1.0);
+
+		// the last two drive nothing, so that a record about them is written
+		// into the body itself and the other branch of `arrive` is run
+		if slot + 2 < SLOTS {
+			body.entity = world.entities.spawn();
+		}
+
+		made.push(world.bodies.spawn(body));
+	}
+
+	made
+}
+
+/// Moves the host's world to what it is at this step.
 ///
 /// Six different things happen in it, because six different things are what
 /// the encoding treats differently:
@@ -436,77 +573,122 @@ pub(crate) fn exchange(steps: u32, wire: Conditions) -> Outcome {
 /// world made only of those cannot tell the two decodings apart.
 ///
 /// Slot seven never changes and is never empty, which is what keeps the table
-/// eight long in every snapshot - so a base spread back out reaches the same
-/// distance every time and two worlds can be compared without allowing for a
-/// tail of holes.
+/// long in every snapshot - so a base spread back out reaches the same distance
+/// every time and two worlds can be compared without allowing for a tail of
+/// holes.
+///
+/// **A body's entity is written beside it**, which is what a solver would do
+/// and what nothing here is going to: a proxy is driven by writing the entity,
+/// so a host whose entities lagged its bodies would be comparing two different
+/// worlds and calling the difference a fault on the wire.
 ///
 /// @note: what slots five and six are for is not visible in `agreed`. Both
 /// decodings converge in the end; what they differ on is the world held *in
 /// between*, which only the digest sees, snapshot by snapshot. The direct
 /// version of that check is in `crate::net`'s own tests, over `absorb`.
 ///
+/// @param world - the host's world
+/// @param made - every body's handle, by slot, updated where one is replaced
 /// @param step - which step
-/// @param into - where the world goes, emptied first
-fn describe(step: u32, into: &mut Vec<Slot>) {
-	into.clear();
-	into.resize(SLOTS, None);
-
+fn play(world: &mut World, made: &mut [BodyId], step: u32) {
 	// whole numbers, so that what crosses is exact and a run on another
 	// machine cannot differ by a rounding.
 	let along = f32::from(u16::try_from(step % 512).unwrap_or(0));
-	let still = body(1, [0.0, 0.0, 0.0]);
-
-	into[0] = Some((1, still));
-	into[1] = Some((1, body(1, [along, 0.0, -along])));
-	into[2] = Some((1, Solid { kind: step / 100 % 3, ..still }));
-
-	if (step / BEAT).is_multiple_of(2) {
-		into[3] = Some((1, body(1, [0.0, along, 0.0])));
-	}
-
-	// a new occupant of the same slot, which is a different body and not a
-	// moved one - the generation is what says so.
-	into[4] = Some((1 + step / HANDS, body(2, [along, along, along])));
-
 	// on and off every other snapshot, so that a snapshot written against the
 	// one before last sees them exactly as they were.
 	let back = (step / u32::from(EVERY)).is_multiple_of(2);
 
-	into[5] = Some((1, body(4, if back { [3.0, 0.0, 0.0] } else { [0.0, 3.0, 0.0] })));
-	into[6] = Some((1, Solid {
-		sleeping: u32::from(back),
-		..body(5, [6.0, 6.0, 6.0])
-	}));
-	into[7] = Some((1, body(3, [7.0, 7.0, 7.0])));
+	// the slot that comes and goes, and the one that changes hands. Both first,
+	// so that everything below writes into the table they left.
+	hold(world, made, 3, (step / BEAT).is_multiple_of(2));
+
+	if step > 0 && step.is_multiple_of(HANDS) {
+		hold(world, made, 4, false);
+		hold(world, made, 4, true);
+	}
+
+	place(world, made, 1, Vec3::new(along, 0.0, -along));
+	place(world, made, 3, Vec3::new(0.0, along, 0.0));
+	place(world, made, 4, Vec3::splat(along));
+	place(world, made, 5, if back { Vec3::X * 3.0 } else { Vec3::Y * 3.0 });
+	place(world, made, 6, Vec3::splat(6.0));
+	place(world, made, 7, Vec3::splat(7.0));
+
+	if let Some(body) = made
+		.get(2)
+		.and_then(|id| world.bodies.get_mut(*id))
+	{
+		body.kind = BodyKind::at(step / 100 % 3).unwrap_or(BodyKind::Dynamic);
+	}
+
+	if let Some(body) = made
+		.get(6)
+		.and_then(|id| world.bodies.get_mut(*id))
+	{
+		body.sleeping = back;
+	}
 }
 
-/// Whether two worlds are the same world, ignoring trailing holes.
+/// Puts a body where it belongs, and its entity with it.
 ///
-/// A ring answers only as far as its last occupied slot, so a table with an
-/// empty tail and the same table without one are the same world and would not
-/// be equal. Nothing in the world above ends on a hole, which is what makes
-/// this belt over braces - but it is the kind of coincidence that stops being
-/// true the first time somebody edits the world, and then the failure would
-/// look like a networking bug.
-fn same(left: &[Slot], right: &[Slot]) -> bool {
+/// @param world - the world to write
+/// @param made - every body's handle, by slot
+/// @param slot - which one
+/// @param position - where it goes
+fn place(world: &mut World, made: &[BodyId], slot: usize, position: Vec3) {
+	let Some(id) = made.get(slot).copied() else {
+		return;
+	};
+	let Some(body) = world.bodies.get_mut(id) else {
+		return;
+	};
+
+	body.transform.position = position;
+
+	let entity = body.entity;
+
+	if let Some(transform) = world.entities.transform_mut(entity) {
+		transform.position = position;
+	}
+}
+
+/// Makes a slot occupied or empty, leaving it alone where it already is.
+///
+/// The free list is a stack, so a body despawned and respawned in the same
+/// breath lands back in the slot it left - which is what makes "the same slot,
+/// a different occupant" reachable at all.
+///
+/// @param world - the world to write
+/// @param made - every body's handle, by slot, updated in place
+/// @param slot - which one
+/// @param wanted - whether it should be occupied
+fn hold(world: &mut World, made: &mut [BodyId], slot: usize, wanted: bool) {
+	let Some(held) = made.get_mut(slot) else {
+		return;
+	};
+
+	if world.bodies.get(*held).is_some() == wanted {
+		return;
+	}
+
+	if wanted {
+		let mut body = Body::dynamic(Shape::cuboid(Vec3::splat(0.5)), Transform::IDENTITY, 1.0);
+
+		body.entity = world.entities.spawn();
+		*held = world.bodies.spawn(body);
+	} else {
+		world.bodies.despawn(*held);
+	}
+}
+
+/// Whether two worlds would be drawn the same, ignoring trailing holes.
+///
+/// A table with an empty tail and the same table without one are the same
+/// world and would not be equal.
+fn same(left: &[Placed], right: &[Placed]) -> bool {
 	let reach = left.len().max(right.len());
 
 	(0..reach).all(|slot| left.get(slot).copied().flatten() == right.get(slot).copied().flatten())
-}
-
-/// One body of the world above.
-fn body(entity: u32, position: [f32; 3]) -> Solid {
-	Solid {
-		position,
-		rotation: [0.0, 0.0, 0.0, 1.0],
-		velocity: [0.0, 0.0, 0.0],
-		angular: [0.0, 0.0, 0.0],
-		sleeping: 0,
-		scale: [1.0, 1.0, 1.0],
-		kind: 2,
-		entity: [entity, 1],
-		owner: [0, 0],
-	}
 }
 
 /// One line that arrived, folded into the run's number, and whether it kept
@@ -557,18 +739,18 @@ fn when(text: &str) -> Option<u32> { text.rsplit(' ').next()?.parse().ok() }
 /// Every word of every occupied slot, and the slot's own number with it, so
 /// that a body arriving in the wrong place is a different run rather than the
 /// same one.
-fn seen(hash: u64, number: u32, world: &[Slot]) -> u64 {
+fn seen(hash: u64, number: u32, world: &[Placed]) -> u64 {
 	let mut folded = fold(hash, number, 2, "snapshot");
 
 	for (slot, held) in world.iter().enumerate() {
-		let Some((generation, solid)) = held else {
+		let Some((generation, position)) = held else {
 			continue;
 		};
 		let place = u32::try_from(slot).unwrap_or(u32::MAX);
 
 		folded = fold(folded, place, 3, &format!("{generation}"));
 
-		for word in bytemuck::bytes_of(solid) {
+		for word in bytemuck::bytes_of(position) {
 			folded ^= u64::from(*word);
 			folded = folded.wrapping_mul(0x0000_0100_0000_01B3);
 		}
@@ -700,11 +882,13 @@ mod tests {
 		// so out loud rather than leaving it to be noticed. It last moved when
 		// the world itself started crossing, again when two bodies that change
 		// and change back were put into it, again when the client started
-		// asking for things, and again when a console line grew the aim of
-		// whoever said it.
+		// asking for things, again when a console line grew the aim of whoever
+		// said it, and again at `NET-6` when both ends grew a real `World` and
+		// the number started covering where the client would *draw* things
+		// rather than the records it was holding.
 		let outcome = exchange(600, WIRE);
 
-		assert_eq!(outcome.digest, 0x707D_21BD_12D3_A1B9);
+		assert_eq!(outcome.digest, 0x15C8_8C05_3A94_AB91);
 		// **and the half a digest cannot say.** A number that moved says only
 		// that something changed; this says that each of the sixteen lines
 		// arrived pointing where it was said from. The count is written down
@@ -775,6 +959,42 @@ mod tests {
 	}
 
 	#[test]
+	fn what_appeared_on_the_host_is_made_on_the_client_and_not_only_on_the_wire() {
+		// **the coverage `NET-6` was about.** A snapshot names slots and says
+		// nothing about what a body is, so the body that comes and goes can
+		// only come back as a description down the reliable ring, read by
+		// `net::land` and grafted into the client's own world. Before this the
+		// run held records and never built a world out of them, so none of that
+		// ran at all.
+		let outcome = exchange(600, WIRE);
+
+		assert!(outcome.appeared > 0, "the host described nothing, so nothing was made");
+		assert!(outcome.agreed, "and the client ended up with the world the host has");
+	}
+
+	#[test]
+	fn the_world_this_run_uses_drives_entities_and_some_bodies_drive_none() {
+		// both branches of `Net::arrive`, which writes the *entity* of a body
+		// that drives one and the body itself where it drives nothing. A world
+		// of only one kind would leave half of it unrun and look thorough.
+		let mut world = World::new();
+		let made = populate(&mut world);
+		let driving = made
+			.iter()
+			.filter(|id| {
+				world
+					.bodies
+					.get(**id)
+					.is_some_and(|body| body.entity.is_some())
+			})
+			.count();
+
+		assert_eq!(made.len(), SLOTS, "every slot got a body");
+		assert!(driving > 0, "some of them drive an entity");
+		assert!(driving < made.len(), "and some of them drive nothing");
+	}
+
+	#[test]
 	fn a_wire_that_loses_everything_leaves_the_client_with_no_world_at_all() {
 		// what says the agreement above is worth reading. Two empty worlds are
 		// equal, so a client that was told nothing would agree with a host
@@ -805,10 +1025,18 @@ mod tests {
 		// refused command must not be counted, or the one number this mode
 		// promises - what was said got there - would be counted against a
 		// larger number than was ever really said.
+		//
+		// **Not sixty-four each way any more.** Since `NET-6` the host's ring
+		// carries what appeared as well as what was typed - the body that comes
+		// and goes is described down it every time it comes back - so over a
+		// wire that acknowledges nothing the host's half fills long before its
+		// hundred and eight lines are up. The client sends no descriptions and
+		// still gets its sixty-four. That is the real path's own arithmetic and
+		// not a fault: a ring is one ring.
 		let dead = Conditions { loss: 1.0, ..WIRE };
 		let outcome = exchange(6500, dead);
 
-		assert_eq!(outcome.said, 128, "sixty-four each way, and the rest refused");
+		assert_eq!(outcome.said, 98, "the client's sixty-four, and what the host had room for");
 		assert_eq!(outcome.heard, 0, "and over a wire like that, none of them arrived");
 	}
 
