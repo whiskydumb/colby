@@ -81,6 +81,11 @@ const DARKEST: f32 = 1.0e-4;
 // sixteen taps stand for exactly an eight-by-eight one. A step of anything but
 // eight makes the reduction sixteen evenly spread samples of the block rather
 // than all of it.
+//
+// **Nothing to do with [`METER_TAPS`]**, which is how many the *first* pass
+// takes off the picture. A reduction is exact and wants a regular grid; the
+// first pass is a sample of something much larger than itself and wants an
+// irregular one.
 const TAP_ROWS: i32 = 4;
 
 // Where one tap sits, as a share of what an output texel covers.
@@ -123,9 +128,43 @@ fn reduced(uv: vec2<f32>) -> f32 {
     return total / f32(TAP_ROWS * TAP_ROWS);
 }
 
+// How many taps a texel of the meter takes across each axis: two, so four.
+//
+// **Four rather than the reduction's sixteen, and it is more accurate for it.**
+// `PERF-5` asked whether sixteen was worth its nine microseconds and the answer
+// turned out to be about the pattern rather than the count: sixteen taps sit
+// five pixels apart at seven-twenty, and content that repeats every five pixels
+// beats against them. Measured against a meter with full coverage on a striped
+// wall, sixteen regular taps read the picture **seven percent** too bright and
+// four jittered ones read it a tenth of a percent too bright. Fewer samples,
+// placed irregularly, beat more samples in a row.
+const METER_TAPS: i32 = 2;
+
+// Where inside its own cell one tap lands, from nought to one on each axis.
+//
+// **The whole of what makes the meter unbiased.** Four taps in the four
+// quadrants of the footprint is stratified sampling and would still be a
+// regular grid; moving each one inside its quadrant by a number that depends on
+// where the output texel is turns a beat with the content into noise, and noise
+// over four thousand texels averages away where a beat does not.
+//
+// It depends on the texel and not on the frame, so the pattern is the same
+// every frame and the eye does not shimmer: what this scatters is the *phase*
+// of the sampling across the picture, not the answer across time.
+fn scatter(uv: vec2<f32>, cell: vec2<i32>) -> vec2<f32> {
+    let seed = uv * 4096.0 + vec2<f32>(cell) * 17.0;
+
+    return fract(
+        sin(vec2<f32>(
+            dot(seed, vec2<f32>(12.9898, 78.233)),
+            dot(seed, vec2<f32>(39.3468, 11.135))
+        )) * 43758.5453
+    );
+}
+
 // The picture reduced to a small square of log luminance.
 //
-// Sixteen taps spread over the whole block an output texel stands for: the
+// Four jittered taps over the whole block an output texel stands for: the
 // target is a fixed sixty-four square whatever the window is, so one texel of
 // it covers about two hundred pixels of a seven-twenty picture, and a single
 // sample would be a meter reading one pixel in two hundred.
@@ -135,25 +174,28 @@ fn reduced(uv: vec2<f32>) -> f32 {
 // the offsets were a quarter of an *input* texel, so all four landed within
 // half a pixel of each other and cost four fetches to learn what one would have
 // said. Found while closing `PERF-2` by reading the pass that was being made
-// cheaper.
+// cheaper; the sixteen regular taps that replaced them were themselves
+// replaced by these four while closing `PERF-5`.
 //
 // The log is what makes the average a geometric mean, which is what a meter
 // wants: one white pixel in a dark room should not open the eye all the way.
 @fragment
 fn fragment_luminance(input: ScreenOutput) -> @location(0) vec4<f32> {
     let step = footprint(input.uv);
+    let side = f32(METER_TAPS);
     var total = 0.0;
 
-    for (var y = 0; y < TAP_ROWS; y += 1) {
-        for (var x = 0; x < TAP_ROWS; x += 1) {
-            let at = input.uv + tap(vec2<i32>(x, y)) * step;
-            let bright = luminance(textureSample(source, source_sampler, at).rgb);
+    for (var y = 0; y < METER_TAPS; y += 1) {
+        for (var x = 0; x < METER_TAPS; x += 1) {
+            let cell = vec2<i32>(x, y);
+            let place = (vec2<f32>(cell) + scatter(input.uv, cell)) / side - 0.5;
+            let bright = luminance(textureSample(source, source_sampler, input.uv + place * step).rgb);
 
             total += log2(max(bright, DARKEST));
         }
     }
 
-    return vec4<f32>(total / f32(TAP_ROWS * TAP_ROWS), 0.0, 0.0, 1.0);
+    return vec4<f32>(total / f32(METER_TAPS * METER_TAPS), 0.0, 0.0, 1.0);
 }
 
 // The same picture at an eighth of the width and an eighth of the height.

@@ -1130,6 +1130,52 @@ mod tests {
 	}
 
 	#[test]
+	fn the_first_pass_scatters_its_taps_and_the_reductions_do_not() {
+		// **the whole of what `PERF-5` changed, and the only thing in the tree
+		// that guards it.** The first pass samples a picture two hundred times
+		// larger than itself, so where its taps land has to be irregular: a
+		// regular grid five pixels apart beats with content that repeats every
+		// few pixels and read a striped wall seven percent too bright,
+		// measured against a meter with full coverage. The reductions are the
+		// opposite case - each is exact for a step of eight - and must stay on
+		// their grid.
+		//
+		// **A weak guard, and it is worth saying why it is the one here.** The
+		// difference is a property of a *picture*, and a rendered test could
+		// not be made to show it: at seven-twenty a striped wall and a flat one
+		// of the same average read alike through one tap, through sixteen
+		// regular taps, through four scattered ones and through the original
+		// bug. What did show it was a live sweep against a five-hundred-and-
+		// twelve square meter, which is not a thing a test can stand up. So
+		// this pins the mechanism rather than the property.
+		let source = include_str!("post.wgsl");
+		let luminance = source
+			.split("fn fragment_luminance(")
+			.nth(1)
+			.expect("the pass is there");
+		let reduce = source
+			.split("fn reduced(")
+			.nth(1)
+			.expect("the reduction is there");
+
+		assert!(
+			luminance.contains("scatter("),
+			"the first pass takes its taps off a regular grid again"
+		);
+		assert!(
+			!reduce
+				.split(
+					"
+}"
+				)
+				.next()
+				.unwrap_or(reduce)
+				.contains("scatter("),
+			"a reduction that is exact has nothing to scatter"
+		);
+	}
+
+	#[test]
 	fn the_taps_and_the_step_agree_across_the_two_languages() {
 		// `TAP_ROWS` in the shader is four because the step is eight: every
 		// tap is a two-by-two average, so a row of four covers eight texels.
