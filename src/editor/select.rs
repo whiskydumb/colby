@@ -22,8 +22,8 @@
 use colby_asset::compile::Kind;
 use colby_core::{
 	abi::{
-		Body, BodyId, BodyKind, EntityId, JointId, MaterialId, MeshId, Renderable, Shape,
-		Transform, Water, World, material, scene,
+		Body, BodyId, BodyKind, EntityId, JointId, MaterialId, MeshId, ModelId, Renderable,
+		Shape, Transform, Water, World, material, scene,
 	},
 	glam::Vec3,
 };
@@ -59,6 +59,20 @@ pub(crate) enum Pick {
 	/// beside it in [`Selection`], which is re-read every frame and is what a
 	/// registry rebuilt by a reload would have moved.
 	Material(MaterialId),
+
+	/// A model, which is an *asset* like a material and not a thing standing
+	/// anywhere either.
+	///
+	/// The sixth, and the second of the two that are not in the world. What
+	/// it is worth selecting for is different from a material's: a material
+	/// is shown so that its numbers can be *changed*, and a model is shown so
+	/// that what the compiler made of a file can be *read* - what pieces came
+	/// out of it, what each is made of, and whether a sidecar beside the
+	/// source had a hand in any of it. @ref `colby_asset::import`.
+	///
+	/// A [`ModelId`] is not generational, for the reason a [`MaterialId`] is
+	/// not, and the name beside it in [`Selection`] does the same work.
+	Model(ModelId),
 }
 
 impl Pick {
@@ -74,6 +88,7 @@ impl Pick {
 			// in the slot, which is a different question and the one the name
 			// beside it in `Selection` answers.
 			| Self::Material(id) => world.materials.get(id).is_some(),
+			| Self::Model(id) => world.models.get(id).is_some(),
 		}
 	}
 
@@ -85,6 +100,7 @@ impl Pick {
 			| Self::Body(id) => world.bodies.name(id),
 			| Self::Joint(id) => world.joints.name(id),
 			| Self::Material(id) => world.materials.name(id),
+			| Self::Model(id) => world.models.name(id),
 		}
 	}
 }
@@ -239,6 +255,10 @@ fn again(world: &World, was: Pick, name: &str) -> Pick {
 			| found if found.is_some() => Pick::Material(found),
 			| _ => Pick::Nothing,
 		},
+		| Pick::Model(_) => match world.models.find(name) {
+			| found if found.is_some() => Pick::Model(found),
+			| _ => Pick::Nothing,
+		},
 		| Pick::Joint(_) => world
 			.joints
 			.iter()
@@ -264,7 +284,7 @@ pub(crate) fn transform(world: &World, at: Pick) -> Option<Transform> {
 		| Pick::Body(id) => world.bodies.get(id).map(|body| body.transform),
 		// a material does not stand anywhere, which is the one thing that
 		// separates it from the three above.
-		| Pick::Nothing | Pick::Joint(_) | Pick::Material(_) => None,
+		| Pick::Nothing | Pick::Joint(_) | Pick::Material(_) | Pick::Model(_) => None,
 	}
 }
 
@@ -301,7 +321,7 @@ pub(crate) fn place(world: &mut World, at: Pick, transform: Transform) -> bool {
 			true
 		},
 		| Pick::Body(id) => world.teleport_body(id, transform),
-		| Pick::Nothing | Pick::Joint(_) | Pick::Material(_) => false,
+		| Pick::Nothing | Pick::Joint(_) | Pick::Material(_) | Pick::Model(_) => false,
 	}
 }
 
@@ -352,9 +372,10 @@ pub(crate) fn rename(world: &mut World, at: Pick, name: &str) -> bool {
 		| Pick::Entity(id) => world.entities.set_name(id, name),
 		| Pick::Body(id) => world.bodies.set_name(id, name),
 		| Pick::Joint(id) => world.joints.set_name(id, name),
-		// a material is called what its *file* is called, and renaming a file
-		// is not something a panel does behind somebody's back.
-		| Pick::Nothing | Pick::Material(_) => false,
+		// a material and a model are called what their *files* are called,
+		// and renaming a file is not something a panel does behind
+		// somebody's back.
+		| Pick::Nothing | Pick::Material(_) | Pick::Model(_) => false,
 	}
 }
 
@@ -687,9 +708,9 @@ pub(crate) fn duplicate(world: &mut World, picks: &[Pick]) -> Vec<Pick> {
 			| Pick::Entity(id) => became(&copies, id).map(Pick::Entity),
 			| Pick::Body(id) => became(&body_copies, id).map(Pick::Body),
 			| Pick::Joint(id) => became(&joint_copies, id).map(Pick::Joint),
-			// duplicating a material would be duplicating a *file*, which is
-			// the browser's business and not a selection's.
-			| Pick::Nothing | Pick::Material(_) => None,
+			// duplicating a material or a model would be duplicating a
+			// *file*, which is the browser's business and not a selection's.
+			| Pick::Nothing | Pick::Material(_) | Pick::Model(_) => None,
 		})
 		.collect()
 }

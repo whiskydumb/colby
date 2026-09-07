@@ -57,10 +57,21 @@ pub const MAGIC: [u8; 8] = *b"COLBYMSH";
 ///
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The extension a compiled mesh is written with.
 pub const EXTENSION: &str = "cmesh";
+
+/// [`MeshHeader::flags`]: a sidecar beside the source was read into this.
+///
+/// The same bit a `.cmodel` carries and for the same reason: a `lamp.obj.model`
+/// deleted moves nothing in the source tree, so without this the mesh would go
+/// on standing at the scale of a file nobody can find. @ref
+/// [`model::GUIDED`](crate::model::GUIDED), `crate::compile::is_stale`.
+pub const GUIDED: u32 = 1 << 0;
+
+/// Every flag bit this build knows.
+const KNOWN_FLAGS: u32 = GUIDED;
 
 /// How big [`MeshHeader`] is, and where the vertex block starts.
 pub const HEADER_BYTES: usize = 80;
@@ -232,7 +243,25 @@ impl MeshFile {
 ///
 /// @param data - the geometry to write
 /// @return the whole file, ready to put on disk
-pub fn encode(data: &MeshData) -> Result<Vec<u8>> {
+pub fn encode(data: &MeshData) -> Result<Vec<u8>> { encode_marked(data, 0) }
+
+/// The same, marked as having been imported through a sidecar.
+///
+/// A second entry point rather than a second parameter on [`encode`], because
+/// the mark is a fact about one caller - the compiler, when a `.obj.model`
+/// stood beside the source - and every other caller in the project would have
+/// had to pass `false` forever. What it costs is that the two cannot drift:
+/// this is the one that writes a header, and [`encode`] is it with no bits.
+///
+/// @param data - the geometry to write
+/// @return the whole file, ready to put on disk
+pub fn encode_guided(data: &MeshData) -> Result<Vec<u8>> { encode_marked(data, GUIDED) }
+
+/// Writes a mesh out with the flag bits a caller asked for.
+///
+/// @param data - the geometry to write
+/// @param flags - what to put in [`MeshHeader::flags`]
+fn encode_marked(data: &MeshData, flags: u32) -> Result<Vec<u8>> {
 	sound(data)?;
 
 	let vertex_count = count(data.vertices.len(), "vertices")?;
@@ -258,7 +287,7 @@ pub fn encode(data: &MeshData) -> Result<Vec<u8>> {
 	let header = MeshHeader {
 		magic: MAGIC,
 		version: FORMAT_VERSION,
-		flags: 0,
+		flags,
 		vertex_stride: stride::<MeshVertex>(),
 		index_stride: stride::<u32>(),
 		vertex_count,
@@ -356,6 +385,28 @@ pub fn version_of(path: &Path) -> Option<u32> {
 	Some(u32::from_le_bytes(version))
 }
 
+/// The flag bits the file at this path sets, if it is one at all.
+///
+/// The head alone, so the staleness sweep can ask whether an output was built
+/// through a sidecar without reading a file it may be about to rewrite. @ref
+/// [`GUIDED`], `crate::compile::is_stale`.
+///
+/// @param path - the `.cmesh` to look at
+#[must_use]
+pub fn flags_of(path: &Path) -> Option<u32> {
+	let mut head = [0_u8; 16];
+	let mut file = std::fs::File::open(path).ok()?;
+	std::io::Read::read_exact(&mut file, &mut head).ok()?;
+
+	if head.get(..MAGIC.len()) != Some(&MAGIC[..]) {
+		return None;
+	}
+
+	let flags: [u8; 4] = head.get(12..16)?.try_into().ok()?;
+
+	Some(u32::from_le_bytes(flags))
+}
+
 /// Everything that has to hold before a [`MeshFile`] exists.
 ///
 /// @param bytes - the whole file
@@ -400,10 +451,10 @@ fn check(bytes: &[u8]) -> std::result::Result<MeshHeader, String> {
 		));
 	}
 
-	if header.flags != 0 {
+	if header.flags & !KNOWN_FLAGS != 0 {
 		return Err(format!(
 			"sets flag bits {:#010X} that this build does not know about",
-			header.flags
+			header.flags & !KNOWN_FLAGS
 		));
 	}
 
@@ -948,12 +999,41 @@ mod tests {
 	#[test]
 	fn a_flag_this_build_does_not_know_is_refused() {
 		let mut bytes = encoded();
-		bytes[12..16].copy_from_slice(&1_u32.to_le_bytes());
+
+		// the lowest bit nothing has claimed, worked out rather than typed,
+		// so that this still tests what it says the day a second flag lands
+		bytes[12..16]
+			.copy_from_slice(&(!KNOWN_FLAGS & KNOWN_FLAGS.wrapping_add(1)).to_le_bytes());
 
 		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
 			.expect_err("an unknown flag means an unknown block");
 
 		assert!(error.to_string().contains("flag bits"), "and says which: {error}");
+	}
+
+	#[test]
+	fn the_mark_a_sidecar_leaves_is_read_back_rather_than_refused() {
+		let bytes = encode_guided(&cube()).expect("it writes");
+
+		assert!(
+			MeshFile::from_bytes(AlignedBytes::from_slice(&bytes)).is_ok(),
+			"a bit this build knows is not an unknown block"
+		);
+		assert_eq!(
+			bytes
+				.get(12..16)
+				.and_then(|four| four.try_into().ok()),
+			Some(GUIDED.to_le_bytes()),
+			"and it is the bit the compiler asked for"
+		);
+		assert_eq!(
+			encode(&cube())
+				.expect("it writes")
+				.get(12..16)
+				.and_then(|four| four.try_into().ok()),
+			Some(0_u32.to_le_bytes()),
+			"while a mesh with no sidecar beside it says nothing"
+		);
 	}
 
 	#[test]

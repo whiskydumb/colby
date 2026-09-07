@@ -1396,7 +1396,9 @@ pub(crate) struct Rows {
 
 impl Rows {
 	/// Puts one row, already spelled.
-	fn put(&mut self, name: &str, spelled: String) { self.rows.push((name.to_owned(), spelled)); }
+	pub(crate) fn put(&mut self, name: &str, spelled: String) {
+		self.rows.push((name.to_owned(), spelled));
+	}
 
 	/// Puts a text row, unless the text is empty.
 	fn put_text(&mut self, name: &str, value: &str) {
@@ -1519,7 +1521,7 @@ fn as_turn(value: Quat) -> String {
 }
 
 /// A string, with the four things JSON will not take in one spelled out.
-fn as_text(value: &str) -> String { json::quoted(value) }
+pub(crate) fn as_text(value: &str) -> String { json::quoted(value) }
 
 #[cfg(test)]
 mod tests {

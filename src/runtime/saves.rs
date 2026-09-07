@@ -39,7 +39,7 @@ use std::{
 
 #[cfg(test)]
 use colby_asset::AlignedBytes;
-use colby_asset::{Project, level, material, scene as file};
+use colby_asset::{Project, import, level, material, scene as file};
 use colby_core::{
 	Result,
 	abi::{Asked, World, scene},
@@ -89,8 +89,17 @@ pub(crate) const PROP: &str = "scene.prop";
 /// it.
 pub(crate) const MATERIAL: &str = "material.write";
 
-/// The five names this module answers for, as they wait on the world.
-const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP, MATERIAL];
+/// `model.write <name>` - starts an import sidecar beside a model's source.
+///
+/// The sixth, and the one that writes the *least*: a sidecar that says nothing
+/// changes nothing, and the whole of what this does is put a file with the
+/// right name in the right place so that somebody has one to edit. What it
+/// refuses is overwriting one that is already there, because everything worth
+/// keeping in one of these was typed by hand. @ref `colby_asset::import`.
+pub(crate) const MODEL: &str = "model.write";
+
+/// The six names this module answers for, as they wait on the world.
+const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP, MATERIAL, MODEL];
 
 /// One thing to do with a scene.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +129,16 @@ pub(crate) enum Request {
 	/// on disk. The name is the asset's own, `materials/brass`, so where it
 	/// goes is decided by what it is called and nothing has to be asked.
 	Material(String),
+
+	/// Start an import sidecar beside a model's source.
+	///
+	/// The second of the two that are about an asset rather than about the
+	/// world, and unlike the first it takes nothing *from* the world: the
+	/// numbers in a sidecar are not in a registry anywhere, because what they
+	/// describe is how the file was read rather than what came out of it. So
+	/// this writes a file that says nothing, and the editing happens in the
+	/// file. The name is the model's own, `models/lamp`.
+	Model(String),
 }
 
 impl Request {
@@ -136,6 +155,7 @@ impl Request {
 			| WRITE => Some(Self::Write(name)),
 			| PROP => Some(Self::Prop(name)),
 			| MATERIAL => Some(Self::Material(name)),
+			| MODEL => Some(Self::Model(name)),
 			| _ => None,
 		}
 	}
@@ -169,6 +189,7 @@ pub(crate) fn serve(world: &mut World, simulation: &mut Simulation, project: &Pr
 		| Request::Write(name) => write(world, project, name),
 		| Request::Prop(name) => prop(world, project, name),
 		| Request::Material(name) => material(world, project, name),
+		| Request::Model(name) => model(project, name),
 	};
 
 	if let Err(failure) = outcome {
@@ -448,6 +469,54 @@ fn material(world: &World, project: &Project, name: &str) -> Result {
 
 	fs::write(&path, text.as_bytes())?;
 	info!(path = %path.display(), name, "material written as a source");
+
+	Ok(())
+}
+
+/// Starts an import sidecar beside a model's source.
+///
+/// **It writes an empty one, and that is the whole design.** A sidecar's three
+/// answers are not in any registry - they are how the file was *read*, not what
+/// came out of it - so there is nothing here to take from the world and put on
+/// disk the way a material's numbers are taken. What a person needs is a file
+/// with the right name in the right place, which is the one thing that is
+/// awkward to get right by hand: the name is the source's whole name plus
+/// `.model`, and getting it wrong produces a file the compiler never looks at.
+///
+/// **One that is already there is refused**, because everything worth keeping
+/// in one of these was typed by somebody.
+///
+/// @param project - whose asset tree
+/// @param name - the model's asset name, `models/lamp`
+///
+/// # Errors
+///
+/// If no source under that name is in the tree, if a sidecar is already beside
+/// it, or if the file cannot be written.
+fn model(project: &Project, name: &str) -> Result {
+	let Some(source) = import::source_of(&project.assets(), name) else {
+		return Err(err!(Asset(
+			"nothing under assets/ compiles to {name}, so there is nothing to stand beside"
+		)));
+	};
+	let path = import::beside(&source);
+
+	if path.exists() {
+		return Err(err!(Asset(
+			"{} is already there, and what is in one of these was typed by somebody",
+			path.display()
+		)));
+	}
+
+	let text = import::export(&import::Import::NONE)?;
+
+	fs::write(&path, text.as_bytes())?;
+	info!(
+		path = %path.display(),
+		name,
+		source = %source.display(),
+		"an import sidecar started; it changes nothing until it is edited"
+	);
 
 	Ok(())
 }
@@ -894,5 +963,107 @@ mod tests {
 
 		assert!(failure.to_string().contains("nothing_here"), "the message names it: {failure}");
 		assert_eq!(scene::capture(&world), before, "and the world is untouched");
+	}
+
+	#[test]
+	fn starting_a_sidecar_puts_an_empty_one_beside_the_source() {
+		let project = project("model-write");
+		let models = project.assets().join("models");
+
+		fs::create_dir_all(&models).expect("the tree is made");
+		fs::write(models.join("lamp.glb"), b"not really a model, and nothing here reads one")
+			.expect("a source");
+
+		model(&project, "models/lamp").expect("it writes");
+
+		let path = models.join("lamp.glb.model");
+
+		assert!(path.is_file(), "beside the source, named after the whole of it");
+
+		let text = fs::read_to_string(&path).expect("and it reads");
+		let read = import::import(&text).expect("as a sidecar");
+
+		assert!(
+			read.is_silent(),
+			"saying nothing, so having started one changes nothing: {text}"
+		);
+	}
+
+	#[test]
+	fn a_sidecar_that_is_already_there_is_not_written_over() {
+		// everything worth keeping in one of these was typed by somebody
+		let project = project("model-write-twice");
+		let models = project.assets().join("models");
+
+		fs::create_dir_all(&models).expect("the tree is made");
+		fs::write(models.join("lamp.gltf"), b"a source").expect("a source");
+
+		let path = models.join("lamp.gltf.model");
+		let mine = r#"{ "scale": [0.01, 0.01, 0.01] }"#;
+
+		fs::write(&path, mine).expect("and one somebody wrote");
+
+		let refused = model(&project, "models/lamp").expect_err("it refuses");
+
+		assert!(format!("{refused}").contains("already there"), "saying why: {refused}");
+		assert_eq!(
+			fs::read_to_string(&path).expect("it is still there"),
+			mine,
+			"and what was typed is untouched"
+		);
+	}
+
+	#[test]
+	fn a_name_no_source_answers_to_starts_nothing() {
+		let project = project("model-write-nothing");
+
+		fs::create_dir_all(project.assets().join("models")).expect("the tree is made");
+
+		let refused = model(&project, "models/ghost").expect_err("there is no such source");
+
+		assert!(
+			format!("{refused}").contains("nothing to stand beside"),
+			"saying why: {refused}"
+		);
+	}
+
+	#[test]
+	fn a_sidecar_is_started_beside_whichever_of_the_three_extensions_is_there() {
+		// the panel has a name and the tree has the file; which extension it
+		// wears is a question about the tree
+		for extension in ["gltf", "glb", "obj"] {
+			let project = project(&format!("model-write-{extension}"));
+			let models = project.assets().join("models");
+
+			fs::create_dir_all(&models).expect("the tree is made");
+			fs::write(models.join(format!("lamp.{extension}")), b"a source").expect("a source");
+
+			model(&project, "models/lamp").expect("it writes");
+
+			assert!(
+				models
+					.join(format!("lamp.{extension}.model"))
+					.is_file(),
+				"a {extension} gets one named after itself"
+			);
+		}
+	}
+
+	#[test]
+	fn every_name_this_module_waits_on_is_a_command_somebody_can_type() {
+		// the gap a live run found and these tests did not: the four before it
+		// called `model` straight, so nothing here noticed that `model.write`
+		// was in `NAMES`, parsed by `Request::of`, served by `serve` - and
+		// registered nowhere, so the console answered "not a command".
+		let mut world = World::new();
+
+		crate::console::install(&mut world);
+
+		for name in NAMES {
+			assert!(
+				world.cvars.get(name).is_some(),
+				"{name} is registered, or nobody can ask for it"
+			);
+		}
 	}
 }

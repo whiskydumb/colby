@@ -154,6 +154,15 @@ impl Assets {
 				produced = ?compiled.produced,
 				"asset compiled"
 			);
+
+			// what the file said that could not be used, at the one moment
+			// anybody is told. These have been collected since models were
+			// importable and read by nobody: a compiler that shrugs at a
+			// sheared node in silence is a compiler that taught somebody the
+			// exporter was fine.
+			for said in &compiled.warnings {
+				warn!(name = compiled.name, said, "the compiler had something to say");
+			}
 		}
 
 		for removed in &report.removed {
@@ -611,11 +620,7 @@ fn load_model(world: &mut World, path: &Path, name: &str) {
 		.map(|placement| Placement {
 			name: placement.name.clone(),
 			mesh: reserve_mesh(world, &placement.mesh),
-			material: if placement.material.is_empty() {
-				MaterialId::DEFAULT
-			} else {
-				world.materials.find(&placement.material)
-			},
+			material: reserve_material(world, &placement.material),
 			skeleton: reserve_skeleton(world, &placement.skeleton),
 			transform: placement.transform,
 		})
@@ -739,6 +744,32 @@ fn reserve_mesh(world: &mut World, name: &str) -> MeshId {
 	}
 
 	world.meshes.insert(name, MeshData::default())
+}
+
+/// The handle of a material a model names, claiming the slot when it is not
+/// loaded.
+///
+/// The fourth of these, and the last to be written, because until a sidecar
+/// could send a surface somewhere else every material a model named was one the
+/// model itself had just declared - so `find` always answered. A remap names a
+/// `.cmat` that is a file of its own, and whether that file has been read yet
+/// is a question about the order of a directory walk. A model that compiled
+/// first would have worn the default material for ever.
+///
+/// An empty name is what a placement with no material of its own wrote, and it
+/// means the built-in one rather than a slot to fill.
+fn reserve_material(world: &mut World, name: &str) -> MaterialId {
+	if name.is_empty() {
+		return MaterialId::DEFAULT;
+	}
+
+	let found = world.materials.find(name);
+
+	if found.is_some() {
+		return found;
+	}
+
+	world.materials.insert(name, Material::DEFAULT)
 }
 
 /// The same for a picture. An empty name is what a material with none wrote.
@@ -1419,6 +1450,68 @@ mod tests {
 			.collect();
 
 		assert_eq!(named, vec!["column", "arm", "arm_mirror", "panel_0", "panel_1"]);
+	}
+
+	#[test]
+	fn a_remapped_material_resolves_whatever_order_the_walk_saw_the_two_files_in() {
+		// the claim `reserve_material` exists for. A model names its own
+		// surfaces and used to be the thing that had just declared them, so
+		// `find` always answered; a sidecar sends one at a `.cmat` that is a
+		// file of its own, and whether that file has been read yet is a
+		// question about a directory walk. `zz/` sorts after `models/`, so
+		// this is the order that used to lose.
+		let (source, output) = trees("model-remap");
+
+		put_bytes(&source, "models/lamp.glb", MODEL);
+		put(&source, "models/lamp.glb.model", r#"{ "materials": { "brass": "zz/brass" } }"#);
+		put(&source, "zz/brass.material", r#"{ "roughness": 0.125 }"#);
+
+		let mut world = World::new();
+
+		Assets::at(source, output).sync(&mut world);
+
+		let model = world.models.find("models/lamp");
+		let worn = world
+			.models
+			.placements(model)
+			.iter()
+			.find(|placement| placement.name == "arm")
+			.expect("the arm stands")
+			.material;
+		let named = world.materials.find("zz/brass");
+
+		assert!(named.is_some(), "the material somebody wrote reached the registry");
+		assert_eq!(worn, named, "and the piece wears that slot, not the default one");
+		assert_ne!(worn, MaterialId::DEFAULT, "which is not the built-in one");
+
+		let coat = world
+			.materials
+			.get(worn)
+			.expect("the slot holds something");
+
+		assert!(
+			(coat.roughness - 0.125).abs() < 1e-6,
+			"holding what the file said rather than a reservation nobody filled: {}",
+			coat.roughness
+		);
+	}
+
+	#[test]
+	fn a_placement_naming_no_material_still_wears_the_built_in_one() {
+		// the empty name is not a slot to reserve, and reserving one under it
+		// would put a row called "" in the registry
+		let (world, _) = with_model("model-default-material");
+		let model = world.models.find("models/lamp");
+
+		assert!(
+			world
+				.models
+				.placements(model)
+				.iter()
+				.all(|placement| placement.material.is_some()),
+			"every piece of the fixture names one, so nothing here is the empty case"
+		);
+		assert!(!world.materials.find("").is_some(), "and no row answers to nothing");
 	}
 
 	#[test]

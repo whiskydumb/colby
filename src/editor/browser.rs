@@ -187,10 +187,11 @@ fn row(ui: &mut Ui, entry: &Entry, thumb: Option<egui::TextureId>, changes: &mut
 			changes.push(Change::Open { name: entry.name.clone() });
 		}
 
-		// and a material is the one kind there is something to *edit*: it has
-		// a field table, so the inspector can draw it, and it is the only
-		// asset that does.
-		if entry.kind == Kind::Material && response.clicked() {
+		// the two kinds the inspector has a panel for: a material, whose field
+		// table it can draw and whose numbers it can change, and a model,
+		// which it can only read out - what pieces came out of the file, and
+		// what a sidecar had to do with it.
+		if matches!(entry.kind, Kind::Material | Kind::Model) && response.clicked() {
 			changes.push(Change::Inspect { name: entry.name.clone() });
 		}
 

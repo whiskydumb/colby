@@ -127,6 +127,21 @@ impl Models {
 	#[must_use]
 	pub fn get(&self, id: ModelId) -> Option<&Model> { self.entries.entry(id.index()) }
 
+	/// What a model is called, or the empty string for a handle to nothing.
+	///
+	/// Added when the editor grew a panel over a model: a selection is a
+	/// handle and a name, and the name is what survives a registry a reload
+	/// rebuilt. The same call [`Materials::name`](crate::abi::Materials::name)
+	/// answers for the same reason.
+	///
+	/// @param id - the handle
+	#[must_use]
+	pub fn name(&self, id: ModelId) -> &str {
+		self.entries
+			.entry(id.index())
+			.map_or("", Entry::name)
+	}
+
 	/// What one model stands, by handle.
 	///
 	/// The one call every consumer makes, so it is here rather than in each of

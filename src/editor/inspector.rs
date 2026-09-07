@@ -18,16 +18,17 @@
 //! here is the drawing, and it is checked by looking at it - except that an
 //! inspector nobody touches writes nothing, which a headless frame can check.
 
+use colby_asset::Project;
 use colby_core::{
 	abi::{
-		Body, BodyId, EntityId, Field, Joint, JointId, Light, Material, MaterialId, Post,
-		Renderable, Sky, TextureId, Transform, World,
+		Body, BodyId, EntityId, Field, Joint, JointId, Light, Material, MaterialId, ModelId,
+		Post, Renderable, Sky, TextureId, Transform, World,
 		field::{Kind, Value},
 		scene::{self, Stage},
 	},
 	glam::{EulerRot, Quat, Vec2, Vec3},
 };
-use egui::{ComboBox, DragValue, Grid, ScrollArea, Ui};
+use egui::{ComboBox, DragValue, Grid, Label, RichText, ScrollArea, Ui};
 
 use crate::{
 	history::History,
@@ -57,6 +58,7 @@ pub(crate) fn show(
 	selection: &Selection,
 	history: &mut History,
 	rename: bool,
+	project: Option<&Project>,
 ) {
 	ScrollArea::vertical()
 		.auto_shrink([false, false])
@@ -69,12 +71,19 @@ pub(crate) fn show(
 				ui.separator();
 			}
 
-			detail(ui, world, selection.at(), history, rename);
+			detail(ui, world, selection.at(), history, rename, project);
 		});
 }
 
 /// The selected thing, in detail.
-fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History, rename: bool) {
+fn detail(
+	ui: &mut Ui,
+	world: &mut World,
+	pick: Pick,
+	history: &mut History,
+	rename: bool,
+	project: Option<&Project>,
+) {
 	match pick {
 		| Pick::Nothing => {
 			ui.label("nothing selected, so this is the world itself");
@@ -102,6 +111,7 @@ fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History, ren
 			tie(ui, world, id, history);
 		},
 		| Pick::Material(id) => coat(ui, world, id),
+		| Pick::Model(id) => made_of(ui, world, id, project),
 	}
 
 	ui.separator();
@@ -340,6 +350,157 @@ fn coat(ui: &mut Ui, world: &mut World, id: MaterialId) {
 		&& !name.is_empty()
 	{
 		colby_core::abi::console::run(world, &format!("material.write {name}"));
+	}
+}
+
+/// A model: what came out of the file, and what a sidecar had to do with it.
+///
+/// **The one panel that reads rather than writes**, and that is what a model
+/// is: a `.cmodel` is derived, every number in it was decided by the exporter
+/// or by the sidecar, and a row edited here would be a row the next compile
+/// throws away. What can be changed is the file beside the source, and the
+/// button offers to start one.
+///
+/// @param ui - the panel
+/// @param world - the registries, read only
+/// @param id - which model
+/// @param project - whose asset tree, for the sidecar beside the source
+fn made_of(ui: &mut Ui, world: &mut World, id: ModelId, project: Option<&Project>) {
+	let name = world.models.name(id).to_owned();
+
+	ui.monospace(&name);
+	ui.separator();
+
+	// copied out because the button below needs the world to run a console
+	// line, and a borrowed slice of it would still be alive by then. The
+	// model's own name comes off what it names: five rows saying
+	// `models/lamp/` under a panel titled `models/lamp` is five copies of one
+	// word, and what is left - `column`, `brass` - is what tells them apart. A
+	// name from *outside* the model keeps the whole of itself, which is
+	// exactly the one worth reading in full.
+	let inside = format!("{name}/");
+	let pieces: Vec<(String, String, String)> = world
+		.models
+		.placements(id)
+		.iter()
+		.map(|placement| {
+			let mesh = world
+				.meshes
+				.get(placement.mesh)
+				.map_or("", |entry| entry.name());
+
+			(
+				placement.name.clone(),
+				within(mesh, &inside),
+				within(world.materials.name(placement.material), &inside),
+			)
+		})
+		.collect();
+
+	ui.label(format!("{} standing", counted(pieces.len(), "piece")));
+
+	// **both ways, and the horizontal one is not a nicety.** A `Grid` asks for
+	// the width its widest row wants, and a panel that grants it is a panel
+	// that grew - which is what picking a model in the browser did: the
+	// inspector widened and took the width out of the picture. Inside a
+	// scrolling area the grid asks for nothing.
+	ScrollArea::both()
+		.max_height(PIECES)
+		.auto_shrink([false, false])
+		.show(ui, |ui| {
+			Grid::new("pieces")
+				.num_columns(3)
+				.striped(true)
+				.show(ui, |ui| {
+					for (piece, mesh, material) in &pieces {
+						ui.label(piece);
+						ui.monospace(mesh);
+						ui.monospace(material);
+						ui.end_row();
+					}
+				});
+		});
+
+	ui.separator();
+	guiding(ui, world, &name, project);
+}
+
+/// How tall the list of pieces may get before it scrolls, in points.
+const PIECES: f32 = 220.0;
+
+/// An asset name with the model's own prefix taken off, when it has one.
+///
+/// @param name - the asset name
+/// @param inside - the model's name and a slash
+fn within(name: &str, inside: &str) -> String {
+	name.strip_prefix(inside)
+		.unwrap_or(name)
+		.to_owned()
+}
+
+/// The sidecar beside the model's source, and what it says.
+///
+/// Read off disk each frame it is looked at rather than kept: it is a few
+/// hundred bytes, it is only read while a model is the selection, and the
+/// alternative is a cache that goes stale the moment somebody edits the file
+/// in the editor they actually edit it in. The browser rescans a whole tree
+/// once a second for the same reason.
+///
+/// @param ui - the panel
+/// @param world - the world a console line is run against
+/// @param name - the model's asset name
+/// @param project - whose asset tree
+fn guiding(ui: &mut Ui, world: &mut World, name: &str, project: Option<&Project>) {
+	ui.label("import");
+
+	let Some(project) = project else {
+		ui.weak("no project, so there is no source to stand beside");
+
+		return;
+	};
+	let Some(source) = colby_asset::import::source_of(&project.assets(), name) else {
+		ui.weak("no source under that name in assets/");
+
+		return;
+	};
+	let sidecar = colby_asset::import::beside(&source);
+	let shown = sidecar
+		.strip_prefix(project.root())
+		.unwrap_or(&sidecar)
+		.display()
+		.to_string();
+
+	match std::fs::read_to_string(&sidecar) {
+		| Ok(text) => {
+			ui.monospace(shown);
+			// wrapped, and that is not a nicety either: `ui.code` measures a
+			// long line as the width it wants, a panel that grants it is a
+			// panel that grew, and a sidecar's longest line is a remap - the
+			// one thing worth reading in full and the one thing that is long.
+			ui.add(Label::new(RichText::new(text.trim()).monospace().code()).wrap());
+		},
+		| Err(_) => {
+			ui.weak("none: the file compiles as the exporter wrote it");
+
+			if ui
+				.button("start one")
+				.on_hover_text(format!(
+					"writes {shown}, which changes nothing until it is edited"
+				))
+				.clicked()
+			{
+				colby_core::abi::console::run(world, &format!("model.write {name}"));
+			}
+		},
+	}
+}
+
+/// A count with its noun, pluralized the one way English mostly is.
+fn counted(many: usize, noun: &str) -> String {
+	if many == 1 {
+		format!("1 {noun}")
+	} else {
+		format!("{many} {noun}s")
 	}
 }
 
@@ -725,7 +886,7 @@ mod tests {
 		let was = scene::settings(&world);
 
 		let mut output = context.run_ui(RawInput::default(), |ui| {
-			detail(ui, &mut world, Pick::Nothing, &mut history, false);
+			detail(ui, &mut world, Pick::Nothing, &mut history, false, None);
 		});
 		output.textures_delta.clear();
 
@@ -770,5 +931,63 @@ mod tests {
 		);
 		assert!((world.time - 42.0).abs() < 1.0e-6, "and the clock was not moved");
 		assert_eq!(world.steps, 700, "in either half");
+	}
+
+	#[test]
+	fn a_model_is_drawn_as_what_stands_in_it_and_nothing_is_written_back() {
+		// the one panel that only reads. A `.cmodel` is derived, so a row
+		// edited here would be a row the next compile throws away - and a
+		// frame that quietly wrote one would be the worst kind of that.
+		let mut world = World::new();
+		let mesh = world
+			.meshes
+			.insert("models/lamp/shade", colby_core::abi::mesh::MeshData::default());
+		let material = world
+			.materials
+			.insert("materials/brass", Material::DEFAULT);
+		let id = world
+			.models
+			.insert("models/lamp", colby_core::abi::model::ModelData {
+				placements: vec![colby_core::abi::model::Placement {
+					name: "shade".to_owned(),
+					mesh,
+					material,
+					skeleton: colby_core::abi::SkeletonId::NONE,
+					transform: Transform::IDENTITY,
+				}],
+			});
+		let was = world.models.placements(id).to_vec();
+		let context = Context::default();
+
+		let mut output = context.run_ui(RawInput::default(), |ui| {
+			made_of(ui, &mut world, id, None);
+		});
+		output.textures_delta.clear();
+
+		assert_eq!(
+			world.models.placements(id),
+			was,
+			"a frame nobody touched leaves the model as it stood"
+		);
+		assert_eq!(world.models.name(id), "models/lamp", "and it is still called that");
+	}
+
+	#[test]
+	fn a_models_own_name_comes_off_what_it_names_and_a_strangers_does_not() {
+		assert_eq!(within("models/lamp/column", "models/lamp/"), "column");
+		assert_eq!(
+			within("materials/brass", "models/lamp/"),
+			"materials/brass",
+			"a material from outside the model keeps the whole of itself, which is the one 			 \
+			 worth reading in full"
+		);
+		assert_eq!(within("", "models/lamp/"), "", "and a handle to nothing stays nothing");
+	}
+
+	#[test]
+	fn a_count_reads_as_english() {
+		assert_eq!(counted(0, "piece"), "0 pieces");
+		assert_eq!(counted(1, "piece"), "1 piece");
+		assert_eq!(counted(5, "piece"), "5 pieces");
 	}
 }

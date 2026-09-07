@@ -181,6 +181,15 @@ fn print(options: &Options, report: &Report) {
 		}
 	}
 
+	// beside the failures rather than among the rows: a warning is about one
+	// asset that did compile, and it is the only place anybody running the
+	// compiler by hand is told. @ref `colby_asset::compile::Compiled`.
+	for compiled in &report.compiled {
+		for said in &compiled.warnings {
+			eprintln!("{}: {said}", compiled.name);
+		}
+	}
+
 	for failure in &report.failed {
 		eprintln!("{}", failure.error);
 	}

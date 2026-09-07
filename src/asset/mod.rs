@@ -32,6 +32,7 @@ pub mod font;
 pub mod format;
 pub mod gltf;
 pub mod html;
+pub mod import;
 pub mod jpeg;
 pub mod json;
 pub mod level;

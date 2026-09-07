@@ -22,11 +22,13 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use colby_asset::{MeshFile, TextureFile, compile::Kind, material::MaterialFile, png};
+use colby_asset::{
+	MeshFile, TextureFile, compile::Kind, material::MaterialFile, model::ModelFile, png,
+};
 use colby_core::{
 	Err, Result,
 	abi::{
-		Camera, EntityId, Material, MeshId, Renderable, World,
+		Camera, EntityId, Material, MaterialId, MeshId, Renderable, World,
 		texture::{self, Texel, TextureData},
 	},
 	debug,
@@ -74,8 +76,16 @@ pub(crate) struct Thumbs {
 	/// The world a mesh is drawn in: one entity, whichever mesh is asked for.
 	world: Box<World>,
 
-	/// The entity.
+	/// The entity a mesh or a material is drawn on.
 	entity: EntityId,
+
+	/// One more entity per piece, for a model, grown as models get bigger and
+	/// never shrunk.
+	///
+	/// A pool rather than a spawn and a despawn per picture, for the reason
+	/// the world itself is reused: an entity table that churns hands every
+	/// picture different slots, and a spare is free once it draws nothing.
+	pieces: Vec<EntityId>,
 
 	/// The target, made the first time a mesh is drawn.
 	capture: Option<Capture>,
@@ -98,6 +108,7 @@ impl Thumbs {
 			refused: Vec::new(),
 			world,
 			entity,
+			pieces: Vec::new(),
 			capture: None,
 		}
 	}
@@ -120,7 +131,7 @@ impl Thumbs {
 		entry: &Entry,
 		made: &mut bool,
 	) -> Option<TextureId> {
-		if !matches!(entry.kind, Kind::Mesh | Kind::Texture | Kind::Material)
+		if !matches!(entry.kind, Kind::Mesh | Kind::Texture | Kind::Material | Kind::Model)
 			|| entry.state == State::Uncompiled
 		{
 			return None;
@@ -177,6 +188,7 @@ impl Thumbs {
 		let image = match entry.kind {
 			| Kind::Mesh => self.render(gpu, &entry.output)?,
 			| Kind::Material => self.wearing(gpu, &entry.output, &entry.name)?,
+			| Kind::Model => self.standing(gpu, &entry.output)?,
 			| Kind::Texture => shrink(&entry.output)?,
 			| _ =>
 				return Err!(Asset("nothing draws a picture of a {}", catalog::word(entry.kind))),
@@ -277,6 +289,188 @@ impl Thumbs {
 		capture.shoot(&mut self.world)
 	}
 
+	/// A whole model, every piece of it standing where the model says.
+	///
+	/// **The one picture that is more than one entity**, which is what the
+	/// pool is for: a model is a list of placements and drawing one of them
+	/// would be a picture of a lamp's shade rather than of a lamp. The
+	/// entity a mesh and a material use draws nothing while this runs.
+	///
+	/// Its meshes and its materials are opened from the compiled tree by
+	/// hand, the way a material's two pictures are, and for the same reason:
+	/// a thumbnail world has no loader watching a directory. A piece whose
+	/// mesh is not there is left out rather than refusing the picture.
+	///
+	/// @param gpu - the device, or nothing
+	/// @param output - the `.cmodel` on disk
+	fn standing(&mut self, gpu: Option<&Gpu>, output: &Path) -> Result<Image> {
+		let Some(gpu) = gpu else {
+			return Err!(Graphics("no device to draw a thumbnail with"));
+		};
+
+		let data = ModelFile::open(output)?.to_model_data();
+
+		// the single entity steps aside: a model draws on the pool
+		self.world
+			.entities
+			.set_renderable(self.entity, Renderable::NOTHING);
+
+		while self.pieces.len() < data.placements.len() {
+			let made = self.world.entities.spawn();
+
+			self.pieces.push(made);
+		}
+
+		let mut low = Vec3::splat(f32::INFINITY);
+		let mut high = Vec3::splat(f32::NEG_INFINITY);
+
+		// by index rather than over the pool, because the body reaches back
+		// into `self` to open a mesh
+		for slot in 0..self.pieces.len() {
+			let id = self.pieces[slot];
+			let Some(placement) = data.placements.get(slot) else {
+				self.world
+					.entities
+					.set_renderable(id, Renderable::NOTHING);
+
+				continue;
+			};
+			let mesh = self.mesh_named(&placement.mesh);
+			let material = self.coat_named(&placement.material, &data);
+
+			self.world
+				.entities
+				.set_renderable(id, Renderable::of(mesh, material, Vec3::ONE));
+			self.world
+				.entities
+				.set_placed(id, placement.transform);
+
+			let (min, max) = self
+				.world
+				.meshes
+				.get(mesh)
+				.map_or((Vec3::ZERO, Vec3::ZERO), |entry| entry.value().bounds());
+
+			// the eight corners through the placement, not the two: a box
+			// turned by forty-five degrees has corners its own two do not
+			// reach, and a camera framed on those would cut the model off
+			for corner in corners(min, max) {
+				let at = placement
+					.transform
+					.matrix()
+					.transform_point3(corner);
+
+				low = low.min(at);
+				high = high.max(at);
+			}
+		}
+
+		if !low.is_finite() || !high.is_finite() {
+			return Err!(Asset("this model stands nothing there is geometry for"));
+		}
+
+		// a placement is written straight in rather than stepped toward, so
+		// the one frame this draws is the frame it is meant to be
+		self.world.entities.snap_all();
+		self.world.entities.settle();
+		frame(&mut self.world.camera, low, high);
+
+		if self.capture.is_none() {
+			self.capture = Some(Capture::new(gpu, SIZE, SIZE)?);
+		}
+
+		let Some(capture) = self.capture.as_mut() else {
+			return Err!(Graphics("no target to draw a thumbnail into"));
+		};
+
+		capture.shoot(&mut self.world)
+	}
+
+	/// One of a model's meshes, put in the thumbnail world.
+	///
+	/// @param name - the mesh's asset name
+	/// @return its handle, or [`MeshId::NONE`] for one that is not on disk
+	fn mesh_named(&mut self, name: &str) -> MeshId {
+		let held = self.world.meshes.find(name);
+
+		if held.is_some() {
+			return held;
+		}
+
+		let path = self
+			.compiled
+			.join(name)
+			.with_extension(colby_asset::format::EXTENSION);
+
+		match MeshFile::open(&path) {
+			| Ok(file) => self
+				.world
+				.meshes
+				.insert(name, file.to_mesh_data()),
+			| Err(error) => {
+				debug!(name, %error, "a model's mesh is not on disk");
+
+				MeshId::NONE
+			},
+		}
+	}
+
+	/// One of a model's materials, put in the thumbnail world.
+	///
+	/// **Two places to look, and the order is the point.** A material the
+	/// model declares lives inside the `.cmodel` and has no file of its own;
+	/// one a sidecar sent somewhere else is a `.cmat` in the compiled tree.
+	/// Looking in the model first and on disk second is what makes a remapped
+	/// model draw wearing the thing somebody wrote. @ref
+	/// `colby_asset::import`.
+	///
+	/// @param name - the material's asset name, or empty for the built-in one
+	/// @param data - the model, for the surfaces it declares itself
+	fn coat_named(&mut self, name: &str, data: &colby_asset::model::ModelData) -> MaterialId {
+		if name.is_empty() {
+			return MaterialId::DEFAULT;
+		}
+
+		let held = self.world.materials.find(name);
+
+		if held.is_some() {
+			return held;
+		}
+
+		let described = data
+			.materials
+			.iter()
+			.find(|surface| surface.name == name)
+			.cloned()
+			.or_else(|| {
+				let path = self
+					.compiled
+					.join(name)
+					.with_extension(colby_asset::material::EXTENSION);
+
+				MaterialFile::open(&path)
+					.map(|file| file.to_material(name))
+					.map_err(|error| debug!(name, %error, "a model's material is not on disk"))
+					.ok()
+			});
+		let Some(described) = described else {
+			return MaterialId::DEFAULT;
+		};
+		let albedo = self.picture_named(&described.albedo);
+		let normal = self.picture_named(&described.normal);
+
+		self.world.materials.insert(name, Material {
+			base_color: described.base_color,
+			uv_scale: described.uv_scale,
+			wrap: described.wrap,
+			blend: described.blend,
+			opacity: described.opacity,
+			..Material::textured(albedo)
+				.bumped(normal)
+				.finished(described.metallic, described.roughness)
+		})
+	}
+
 	/// One of a material's two pictures, put in the thumbnail world.
 	///
 	/// @param name - the texture's asset name, or empty for none
@@ -315,6 +509,20 @@ impl Thumbs {
 			},
 		}
 	}
+}
+
+/// The eight corners of a box.
+fn corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
+	[
+		Vec3::new(min.x, min.y, min.z),
+		Vec3::new(max.x, min.y, min.z),
+		Vec3::new(min.x, max.y, min.z),
+		Vec3::new(max.x, max.y, min.z),
+		Vec3::new(min.x, min.y, max.z),
+		Vec3::new(max.x, min.y, max.z),
+		Vec3::new(min.x, max.y, max.z),
+		Vec3::new(max.x, max.y, max.z),
+	]
 }
 
 /// Points the camera at a box so that the whole of it is in the picture.
@@ -540,6 +748,117 @@ mod tests {
 		assert!(
 			again.pixel(SIZE / 2, SIZE / 2)[2] > again.pixel(SIZE / 2, SIZE / 2)[0],
 			"and the second one is the blue"
+		);
+	}
+
+	#[test]
+	fn a_model_is_drawn_as_every_piece_of_itself_standing_where_it_stands() {
+		let Some(gpu) = Gpu::open(gpu::backends(None), None).expect("the adapter query works")
+		else {
+			return;
+		};
+
+		let dir = env::temp_dir().join("colby_thumbs_model");
+		drop(fs::remove_dir_all(&dir));
+		let compiled = dir.join("assets");
+		fs::create_dir_all(compiled.join("models").join("tower"))
+			.expect("a directory to work in");
+
+		let mut thumbs = Thumbs::new(dir.join("thumbs"), compiled.clone());
+
+		// two cubes, one above the other and well apart, so that a picture of
+		// one of them is a different picture from one of both
+		for piece in ["low", "high"] {
+			fs::write(
+				compiled
+					.join("models")
+					.join("tower")
+					.join(format!("{piece}.cmesh")),
+				colby_asset::format::encode(&mesh::cube()).expect("a cube encodes"),
+			)
+			.expect("the mesh");
+		}
+
+		let both = colby_asset::model::ModelData {
+			guided: false,
+			materials: vec![colby_asset::model::Material {
+				name: "models/tower/paint".to_owned(),
+				..brass()
+			}],
+			placements: [("low", 0.0), ("high", 4.0)]
+				.into_iter()
+				.map(|(piece, height)| colby_asset::model::Placement {
+					name: piece.to_owned(),
+					mesh: format!("models/tower/{piece}"),
+					material: "models/tower/paint".to_owned(),
+					skeleton: String::new(),
+					transform: colby_core::abi::Transform::at(Vec3::Y * height),
+				})
+				.collect(),
+		};
+		let output = dir.join("tower.cmodel");
+		fs::write(&output, colby_asset::model::encode(&both).expect("the model encodes"))
+			.expect("the file");
+
+		let image = thumbs
+			.standing(Some(&gpu), &output)
+			.expect("the model draws");
+
+		assert_eq!((image.width, image.height), (SIZE, SIZE));
+		assert_eq!(thumbs.pieces.len(), 2, "an entity per piece");
+
+		// **against each picture's own corner, not against a number.** A
+		// `Capture` meters what it drew and moves its eye, and that eye
+		// carries from one shot to the next - so the same clear color comes
+		// out 136 on a fresh one and 140 on a reused one. Anything compared
+		// across two shots has to be a shape rather than a value.
+		let covered = |image: &Image| {
+			let clear = image.pixel(0, 0);
+
+			image
+				.pixels
+				.chunks_exact(4)
+				.filter(|texel| texel[..3] != clear[..3])
+				.count()
+		};
+
+		assert!(covered(&image) > 0, "something drew: the picture is not one flat color");
+
+		// the negative control, and it is the whole test. The camera frames
+		// whatever the model spans, so a tower of two puts each cube in a
+		// quarter of the height and a tower of one fills the frame with it -
+		// if `standing` had drawn only the first piece both times, the two
+		// pictures would cover the same ground.
+		let one = colby_asset::model::ModelData {
+			placements: both.placements[..1].to_vec(),
+			..both.clone()
+		};
+		fs::write(&output, colby_asset::model::encode(&one).expect("the model encodes"))
+			.expect("the second file");
+
+		let alone = thumbs
+			.standing(Some(&gpu), &output)
+			.expect("the shorter model draws");
+
+		assert!(covered(&alone) > 0, "the shorter one drew something too");
+		assert!(
+			covered(&alone) > covered(&image) * 2,
+			"one cube alone fills far more of the frame than either of two does: {} against {}",
+			covered(&alone),
+			covered(&image)
+		);
+
+		// and the entity the second piece used draws nothing rather than what
+		// it drew last time, which is what a pool costs and what it has to pay
+		assert_eq!(thumbs.pieces.len(), 2, "the pool is not shrunk");
+		assert_eq!(
+			thumbs
+				.world
+				.entities
+				.renderable(thumbs.pieces[1])
+				.map(|renderable| renderable.mesh),
+			Some(MeshId::NONE),
+			"the spare draws nothing"
 		);
 	}
 

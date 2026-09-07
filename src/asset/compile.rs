@@ -41,11 +41,20 @@ use std::{
 	time::SystemTime,
 };
 
-use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
+use colby_core::{
+	Error, Result,
+	abi::{
+		Transform,
+		mesh::{self, MeshData},
+		texture::Texel,
+	},
+	err,
+	glam::Vec3,
+};
 
 use crate::{
-	anim, document, font, format, gltf, html, jpeg, level, lua, material, model, obj, png, scene,
-	script, skeleton, sound, texture, ttf, wav,
+	anim, document, font, format, gltf, html, import, jpeg, level, lua, material, model, obj,
+	png, scene, script, skeleton, sound, texture, ttf, wav,
 };
 
 /// The directory under a workspace that holds editable sources.
@@ -580,18 +589,7 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 
 	let mut warnings = Vec::new();
 	let (bytes, produced) = match kind {
-		| Kind::Mesh => {
-			let data = obj::import_file(source)?;
-			let bytes = format::encode(&data)
-				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
-			let produced = Produced::Mesh {
-				vertices: data.vertices.len(),
-				triangles: data.triangles(),
-				bounds: data.bounds(),
-			};
-
-			(bytes, produced)
-		},
+		| Kind::Mesh => compile_mesh(source)?,
 		| Kind::Texture => {
 			let data = if has_extension(source, &[png::EXTENSION]) {
 				png::import_file(source, texel_of(source))?
@@ -686,6 +684,74 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 	})
 }
 
+/// Reads a `.obj` and writes the `.cmesh` it describes.
+///
+/// Its own function since a sidecar joined it: the arm above is a match over
+/// eleven kinds and this one now has a second input.
+///
+/// **A sidecar beside an OBJ may only move it.** A `.cmesh` is one mesh with
+/// no names and no materials in it, so the other two answers have nothing to
+/// act on and are refused - @ref [`import::check_mesh_only`]. The transform is
+/// worth having on its own: the format carries no unit at all, and Unreal runs
+/// a `.obj` through the same import pipeline as everything else and hands it
+/// the same three offsets.
+///
+/// @param source - the `.obj`, in the source tree
+/// @return the file to write and what to report about it
+fn compile_mesh(source: &Path) -> Result<(Vec<u8>, Produced)> {
+	let mut data = obj::import_file(source)?;
+	let guide = import::read_beside(source)?;
+
+	if let Some(sidecar) = &guide {
+		import::check_mesh_only(sidecar)
+			.map_err(|error| err!(Asset("{}: {error}", import::beside(source).display())))?;
+		moved(&mut data, sidecar);
+	}
+
+	let bytes = match guide {
+		| Some(_) => format::encode_guided(&data),
+		| None => format::encode(&data),
+	}
+	.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+	let produced = Produced::Mesh {
+		vertices: data.vertices.len(),
+		triangles: data.triangles(),
+		bounds: data.bounds(),
+	};
+
+	Ok((bytes, produced))
+}
+
+/// Puts a mesh's own vertices through an import transform.
+///
+/// Positions by the matrix and normals by its rotation, then the tangents
+/// again from scratch: a tangent is built out of the positions, the texture
+/// coordinates and the normal, and rebuilding it is both shorter and more
+/// nearly right than turning the old one. The winding is left alone because
+/// [`import`] refuses a transform that mirrors, which is the only thing that
+/// could have turned a triangle inside out.
+///
+/// @param data - the geometry, edited in place
+/// @param sidecar - what the file beside the source said
+fn moved(data: &mut MeshData, sidecar: &import::Import) {
+	if sidecar.transform == Transform::IDENTITY {
+		return;
+	}
+
+	let matrix = sidecar.matrix();
+	let turn = sidecar.transform.rotation;
+
+	for vertex in &mut data.vertices {
+		let position = matrix.transform_point3(Vec3::from_array(vertex.position));
+		let normal = (turn * Vec3::from_array(vertex.normal)).normalize_or_zero();
+
+		vertex.position = position.to_array();
+		vertex.normal = normal.to_array();
+	}
+
+	mesh::tangents(data);
+}
+
 /// Compiles one model, and everything it is made of, into a directory of its
 /// own.
 ///
@@ -709,11 +775,29 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 	let imported = gltf::import(&file)?;
 	let stem = asset_name(root, source)?;
 	let directory = output.with_extension("");
+	let guide = import::read_beside(source)?;
+	let sidecar = guide.clone().unwrap_or(import::Import::NONE);
+	let mut warnings = imported.warnings.clone();
 
 	drop(fs::remove_dir_all(&directory));
 	fs::create_dir_all(&directory)?;
 
+	let placements = placed(&imported, &sidecar, &stem, &mut warnings);
+	let standing: Vec<&str> = placements
+		.iter()
+		.map(|placement| placement.mesh.as_str())
+		.collect();
+
+	// only what something still stands. A piece the sidecar skipped costs its
+	// `.cmesh` as well as its row, which is most of what skipping is for: a
+	// collision proxy nobody draws is geometry nobody should be shipping.
 	for piece in &imported.meshes {
+		let name = format!("{stem}/{}", piece.name);
+
+		if !standing.contains(&name.as_str()) {
+			continue;
+		}
+
 		let bytes = format::encode(&piece.data)
 			.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 
@@ -752,7 +836,15 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 		fs::write(beside(&directory, &moves.name, anim::EXTENSION), bytes)?;
 	}
 
+	// only the surfaces something still wears. A material the sidecar sent
+	// somewhere else is not written here, because writing it would register a
+	// row under the model's own name that nothing in the file names.
+	let worn: Vec<&str> = placements
+		.iter()
+		.map(|placement| placement.material.as_str())
+		.collect();
 	let data = model::ModelData {
+		guided: guide.is_some(),
 		materials: imported
 			.materials
 			.iter()
@@ -770,33 +862,17 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 				blend: surface.blend,
 				opacity: surface.opacity,
 			})
+			.filter(|surface| worn.contains(&surface.name.as_str()))
 			.collect(),
-		placements: imported
-			.placements
-			.iter()
-			.filter_map(|placement| {
-				let piece = imported.meshes.get(placement.mesh)?;
-
-				Some(model::Placement {
-					name: placement.name.clone(),
-					mesh: format!("{stem}/{}", piece.name),
-					material: piece
-						.material
-						.and_then(|index| imported.materials.get(index))
-						.map(|surface| format!("{stem}/{}", surface.name))
-						.unwrap_or_default(),
-					skeleton: placement
-						.skeleton
-						.and_then(|index| imported.skins.get(index))
-						.map(|rig| format!("{stem}/{}", rig.name))
-						.unwrap_or_default(),
-					transform: placement.transform,
-				})
-			})
-			.collect(),
+		placements,
 	};
 	let produced = Produced::Model {
-		meshes: imported.meshes.len(),
+		meshes: data
+			.placements
+			.iter()
+			.map(|placement| placement.mesh.as_str())
+			.collect::<std::collections::BTreeSet<_>>()
+			.len(),
 		skeletons: imported
 			.skins
 			.iter()
@@ -814,7 +890,73 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 	let bytes =
 		model::encode(&data).map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 
-	Ok((bytes, produced, imported.warnings))
+	Ok((bytes, produced, warnings))
+}
+
+/// Every piece of a model that survives its sidecar, where the sidecar puts it.
+///
+/// Three of the sidecar's answers land here: what to leave out, where the rest
+/// of it goes, and what each surface is really made of.
+///
+/// **A skinned piece is not moved.** The exchange format says a skinned mesh
+/// node's own transform is ignored, because every vertex of it is placed by its
+/// bones instead, so colby writes the identity there - and an import transform
+/// composed onto the identity is still not what draws it. Said out loud rather
+/// than left to be discovered.
+///
+/// @param imported - what the file turned out to hold
+/// @param sidecar - what the file beside it said
+/// @param stem - the model's own asset name, which its pieces are named inside
+/// @param warnings - where a word about a shear or a skin goes
+fn placed(
+	imported: &gltf::Model,
+	sidecar: &import::Import,
+	stem: &str,
+	warnings: &mut Vec<String>,
+) -> Vec<model::Placement> {
+	imported
+		.placements
+		.iter()
+		.filter(|placement| sidecar.takes(&placement.name))
+		.filter_map(|placement| {
+			let piece = imported.meshes.get(placement.mesh)?;
+			let (transform, drift) = sidecar.applied(placement.transform);
+
+			if import::is_sheared(drift) {
+				warnings.push(format!(
+					"{} is sheared by the import transform, by {drift}, and colby places it 					 square",
+					placement.name
+				));
+			}
+
+			if placement.skeleton.is_some() && !sidecar.is_silent() {
+				warnings.push(format!(
+					"{} is moved by bones, so the import transform does not place it",
+					placement.name
+				));
+			}
+
+			Some(model::Placement {
+				name: placement.name.clone(),
+				mesh: format!("{stem}/{}", piece.name),
+				material: piece
+					.material
+					.and_then(|index| imported.materials.get(index))
+					.map(|surface| {
+						sidecar
+							.material(&surface.name)
+							.map_or_else(|| format!("{stem}/{}", surface.name), str::to_owned)
+					})
+					.unwrap_or_default(),
+				skeleton: placement
+					.skeleton
+					.and_then(|index| imported.skins.get(index))
+					.map(|rig| format!("{stem}/{}", rig.name))
+					.unwrap_or_default(),
+				transform,
+			})
+		})
+		.collect()
 }
 
 /// What one compile hands back: the file, what is in it, and what it dropped.
@@ -978,6 +1120,10 @@ fn is_stale(source: &Path, output: &Path, root: &Path) -> bool {
 		return true;
 	}
 
+	if guide_changed(source, output, kind) {
+		return true;
+	}
+
 	if mtime(source)
 		.ok()
 		.is_none_or(|edited| edited >= built)
@@ -1025,12 +1171,20 @@ fn beside_is_stale(output: &Path) -> bool {
 
 /// Everything besides the source itself that an output was built out of.
 ///
-/// A compiler's associated files, and colby has two cases of them. A document
+/// A compiler's associated files, and colby has three cases of them. A document
 /// links stylesheets and scripts, and both are folded into the `.cdoc`. A
 /// model links buffers and pictures, and although those are not folded in,
-/// what is written out of the model is built from them.
+/// what is written out of the model is built from them. And either of the two
+/// geometry kinds may have a sidecar beside it saying how to read the file -
+/// @ref [`import`].
+///
+/// **A sidecar is listed only when it is there.** A path that does not exist
+/// has no time to read, and a caller reads that as stale - so naming one that
+/// is usually absent would rebuild every model on every pass, four times a
+/// second. What happens when one is *deleted* is a different question and is
+/// answered by a mark in the output; @ref [`is_stale`].
 fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
-	match kind {
+	let mut found = match kind {
 		| Kind::Document => {
 			let Ok(text) = fs::read_to_string(source) else {
 				return Vec::new();
@@ -1044,7 +1198,38 @@ fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
 		},
 		| Kind::Model => gltf::linked(source, root),
 		| _ => Vec::new(),
+	};
+
+	if matches!(kind, Kind::Mesh | Kind::Model) {
+		let sidecar = import::beside(source);
+
+		if sidecar.is_file() {
+			found.push(sidecar);
+		}
 	}
+
+	found
+}
+
+/// Whether an output was built through a sidecar that is not there any more.
+///
+/// The one thing the source tree cannot be asked. Deleting `lamp.gltf.model`
+/// moves nothing the sweep looks at - the `.gltf` did not change and the output
+/// is still newer than it - so without this the model would go on standing at
+/// the scale of a file nobody can find. The output says how it was built and
+/// this compares that against what is beside the source now.
+///
+/// @param source - the `.obj`, `.gltf` or `.glb`
+/// @param output - what it compiled to
+/// @param kind - which of the two it is
+fn guide_changed(source: &Path, output: &Path, kind: Kind) -> bool {
+	let was = match kind {
+		| Kind::Mesh => format::flags_of(output).is_some_and(|flags| flags & format::GUIDED != 0),
+		| Kind::Model => model::flags_of(output).is_some_and(|flags| flags & model::GUIDED != 0),
+		| _ => return false,
+	};
+
+	was && !import::beside(source).is_file()
 }
 
 /// Turns one `.lua` into the bytes of a `.clua`.
@@ -1789,6 +1974,128 @@ f 4 1 5 8
 
 		assert!(error.to_string().contains("nowhere"), "{error}");
 	}
+
+	#[test]
+	fn a_sidecar_beside_an_obj_moves_its_vertices() {
+		let workspace = workspace("mesh-guided");
+
+		put(&workspace, "meshes/box.obj", CUBE_OBJ);
+		run(&workspace, false);
+
+		let output = output_root(&workspace)
+			.join("meshes")
+			.join("box.cmesh");
+		let before = MeshFile::open(&output)
+			.expect("it reads")
+			.to_mesh_data();
+
+		fs::write(
+			source_root(&workspace)
+				.join("meshes")
+				.join("box.obj.model"),
+			r#"{ "position": [0, 10, 0], "scale": [2, 2, 2] }"#,
+		)
+		.expect("the sidecar is written");
+
+		let report = run(&workspace, false);
+
+		assert_eq!(report.failed.len(), 0, "{:?}", report.failed);
+
+		let after = MeshFile::open(&output)
+			.expect("it reads")
+			.to_mesh_data();
+
+		assert_eq!(after.vertices.len(), before.vertices.len(), "the same geometry");
+
+		let (low, high) = after.bounds();
+		let (was_low, was_high) = before.bounds();
+
+		assert!(
+			low.abs_diff_eq(was_low * 2.0 + Vec3::Y * 10.0, 1e-4)
+				&& high.abs_diff_eq(was_high * 2.0 + Vec3::Y * 10.0, 1e-4),
+			"twice the size and lifted by ten: {low:?}..{high:?} against \
+			 {was_low:?}..{was_high:?}"
+		);
+		assert!(
+			after
+				.vertices
+				.iter()
+				.all(|vertex| (Vec3::from_array(vertex.normal).length() - 1.0).abs() < 1e-3),
+			"and every normal is still a unit vector"
+		);
+
+		drop(fs::remove_dir_all(&workspace));
+	}
+
+	#[test]
+	fn a_sidecar_beside_an_obj_that_says_more_than_it_can_mean_is_refused() {
+		let workspace = workspace("mesh-guided-too-much");
+
+		put(&workspace, "meshes/box.obj", CUBE_OBJ);
+		fs::write(
+			source_root(&workspace)
+				.join("meshes")
+				.join("box.obj.model"),
+			r#"{ "skip": ["nothing"] }"#,
+		)
+		.expect("the sidecar is written");
+
+		let report = run(&workspace, false);
+
+		assert_eq!(report.failed.len(), 1, "refused rather than half-obeyed");
+		assert!(
+			report.failed[0]
+				.error
+				.to_string()
+				.contains("one mesh with no names"),
+			"saying why: {}",
+			report.failed[0].error
+		);
+
+		drop(fs::remove_dir_all(&workspace));
+	}
+
+	#[test]
+	fn deleting_a_sidecar_rebuilds_the_mesh_it_stood_beside() {
+		let workspace = workspace("mesh-guide-deleted");
+
+		put(&workspace, "meshes/box.obj", CUBE_OBJ);
+
+		let sidecar = source_root(&workspace)
+			.join("meshes")
+			.join("box.obj.model");
+
+		fs::write(&sidecar, r#"{ "scale": [8, 8, 8] }"#).expect("the sidecar is written");
+		run(&workspace, false);
+
+		let output = output_root(&workspace)
+			.join("meshes")
+			.join("box.cmesh");
+
+		assert_eq!(
+			format::flags_of(&output),
+			Some(format::GUIDED),
+			"the mesh says it was built through one"
+		);
+
+		fs::remove_file(&sidecar).expect("and then somebody deletes it");
+
+		assert_eq!(run(&workspace, false).compiled.len(), 1, "which is a rebuild");
+		assert_eq!(format::flags_of(&output), Some(0), "and the mark is gone with the file");
+
+		let (low, high) = MeshFile::open(&output)
+			.expect("it reads")
+			.to_mesh_data()
+			.bounds();
+
+		assert!(
+			low.abs_diff_eq(Vec3::splat(-0.5), 1e-4) && high.abs_diff_eq(Vec3::splat(0.5), 1e-4),
+			"the cube is a unit cube again: {low:?}..{high:?}"
+		);
+		assert_eq!(run(&workspace, false).compiled.len(), 0, "and settles there");
+
+		drop(fs::remove_dir_all(&workspace));
+	}
 }
 
 #[cfg(test)]
@@ -2247,6 +2554,358 @@ mod model_tests {
 				.to_string()
 				.contains("cannot share one asset name"),
 			"got {}",
+			report.failed[0].error
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	// ---------------------------------------------------------------------
+	// the import sidecar
+	// ---------------------------------------------------------------------
+
+	#[test]
+	fn a_piece_bones_move_is_not_moved_by_the_import_and_says_so() {
+		// the fixture has no skin in it, so this is built by hand: a test
+		// that could only be written against a file colby does not have is a
+		// test that does not get written. @ref `colby-verification-loop`.
+		let imported = gltf::Model {
+			meshes: vec![gltf::Piece {
+				name: "torso".to_owned(),
+				..gltf::Piece::default()
+			}],
+			placements: vec![
+				gltf::Placement {
+					name: "torso".to_owned(),
+					mesh: 0,
+					skeleton: Some(0),
+					// what the importer writes for a skinned node, because
+					// the exchange format says its own transform is ignored
+					transform: Transform::IDENTITY,
+				},
+				gltf::Placement {
+					name: "hat".to_owned(),
+					mesh: 0,
+					skeleton: None,
+					transform: Transform::at(Vec3::Y),
+				},
+			],
+			skins: vec![gltf::Skin {
+				name: "rig".to_owned(),
+				..gltf::Skin::default()
+			}],
+			..gltf::Model::default()
+		};
+		let sidecar = import::import(r#"{ "scale": [2, 2, 2] }"#).expect("a sidecar");
+		let mut warnings = Vec::new();
+		let placements = placed(&imported, &sidecar, "models/citizen", &mut warnings);
+
+		assert_eq!(placements.len(), 2, "both pieces are still written");
+		assert!(
+			placements[1]
+				.transform
+				.position
+				.abs_diff_eq(Vec3::Y * 2.0, 1e-4),
+			"the one nothing moves is moved by the import"
+		);
+		assert!(
+			warnings
+				.iter()
+				.any(|said| said.contains("torso") && said.contains("bones")),
+			"and the one bones move is said out loud rather than left to be found: {warnings:?}"
+		);
+		assert!(
+			!warnings.iter().any(|said| said.contains("hat")),
+			"while the other is not complained about: {warnings:?}"
+		);
+
+		let mut quiet = Vec::new();
+
+		drop(placed(&imported, &import::Import::NONE, "models/citizen", &mut quiet));
+		assert!(quiet.is_empty(), "and a model with no sidecar is told nothing: {quiet:?}");
+	}
+
+	#[test]
+	fn a_placement_sheared_by_the_import_is_said_out_loud() {
+		let imported = gltf::Model {
+			meshes: vec![gltf::Piece::default()],
+			placements: vec![gltf::Placement {
+				name: "arm".to_owned(),
+				mesh: 0,
+				skeleton: None,
+				transform: Transform {
+					rotation: colby_core::glam::Quat::from_rotation_z(
+						std::f32::consts::FRAC_PI_4,
+					),
+					..Transform::IDENTITY
+				},
+			}],
+			..gltf::Model::default()
+		};
+		let sidecar = import::import(r#"{ "scale": [1, 4, 1] }"#).expect("an uneven one");
+		let mut warnings = Vec::new();
+
+		drop(placed(&imported, &sidecar, "models/lamp", &mut warnings));
+
+		assert!(
+			warnings
+				.iter()
+				.any(|said| said.contains("arm") && said.contains("sheared")),
+			"the same word the flattening uses, for the same arithmetic: {warnings:?}"
+		);
+	}
+
+	/// Writes a sidecar beside a source already in the tree.
+	fn guide(workspace: &Path, relative: &str, text: &str) -> PathBuf {
+		let source = source_root(workspace).join(relative);
+		let path = import::beside(&source);
+
+		fs::write(&path, text).expect("the sidecar is written");
+
+		path
+	}
+
+	/// Where one of the model's own pieces was written, whether or not it was.
+	fn piece(workspace: &Path, name: &str) -> PathBuf {
+		output_root(workspace)
+			.join("models")
+			.join("lamp")
+			.join(format!("{name}.{}", format::EXTENSION))
+	}
+
+	#[test]
+	fn a_model_with_no_sidecar_beside_it_compiles_as_it_always_did() {
+		// the negative control the rest of these stand on: if this moves, the
+		// comparisons below are measuring the wrong thing
+		let dir = workspace("guide-absent");
+
+		put(&dir, "models/lamp.glb", PACKED);
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.failed.len(), 0, "having none is not a failure: {:?}", report.failed);
+
+		let data = compiled(&dir);
+
+		assert!(!data.guided, "and the file says nobody guided it");
+		assert_eq!(data.placements.len(), 5, "every piece the file stands");
+		assert_eq!(data.materials.len(), 2, "and both of its surfaces");
+		assert_eq!(
+			data.placements[0].transform.scale,
+			Vec3::new(0.5, 1.5, 0.5),
+			"at the scale the file wrote, which is not the identity - so every test below 			 \
+			 that compares against this one is comparing against a real number"
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_sidecar_moves_every_piece_of_the_model() {
+		// against the same tree compiled without one, because the fixture's
+		// own placements are neither at the origin nor unscaled: a test that
+		// asserted absolute numbers would be asserting the fixture
+		let dir = workspace("guide-transform");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		run(&dir, false);
+
+		let before = compiled(&dir);
+
+		guide(&dir, "models/lamp.glb", r#"{ "position": [0, 10, 0], "scale": [2, 2, 2] }"#);
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.failed.len(), 0, "{:?}", report.failed);
+
+		let after = compiled(&dir);
+
+		assert!(after.guided, "the file records that it was built through one");
+		assert!(!before.guided, "and the one before it did not");
+		assert_eq!(after.placements.len(), before.placements.len(), "the same pieces, moved");
+
+		for (was, now) in before.placements.iter().zip(&after.placements) {
+			assert!(
+				now.transform
+					.scale
+					.abs_diff_eq(was.transform.scale * 2.0, 1e-4),
+				"{} is twice the size it was: {:?} against {:?}",
+				now.name,
+				now.transform.scale,
+				was.transform.scale
+			);
+			assert!(
+				now.transform
+					.position
+					.abs_diff_eq(was.transform.position * 2.0 + Vec3::Y * 10.0, 1e-4),
+				"{} is scaled about the origin and then lifted: {:?} against {:?}",
+				now.name,
+				now.transform.position,
+				was.transform.position
+			);
+		}
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_skipped_node_costs_its_row_and_its_mesh() {
+		let dir = workspace("guide-skip");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		run(&dir, false);
+
+		let before = compiled(&dir);
+		let column = before
+			.placements
+			.iter()
+			.find(|placement| placement.name == "column")
+			.expect("the fixture stands a column")
+			.mesh
+			.clone();
+
+		assert!(piece(&dir, "column").is_file(), "whose geometry was written");
+
+		guide(&dir, "models/lamp.glb", r#"{ "skip": ["column"] }"#);
+		run(&dir, false);
+
+		let after = compiled(&dir);
+
+		assert_eq!(after.placements.len(), before.placements.len() - 1, "the row is gone");
+		assert!(
+			!after
+				.placements
+				.iter()
+				.any(|placement| placement.mesh == column),
+			"and nothing stands its mesh"
+		);
+		assert!(
+			!piece(&dir, "column").is_file(),
+			"so the .cmesh is not written either, which is most of what skipping is for"
+		);
+		// a mesh of several primitives is numbered, so the panel is two
+		assert!(piece(&dir, "panel_0").is_file(), "and the rest of the model still is");
+		assert!(piece(&dir, "arm_mirrored").is_file(), "the mirrored copy among it");
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_remapped_material_is_worn_by_name_and_the_models_own_is_not_written() {
+		let dir = workspace("guide-material");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		guide(&dir, "models/lamp.glb", r#"{ "materials": { "brass": "materials/brass" } }"#);
+		run(&dir, false);
+
+		let data = compiled(&dir);
+
+		assert!(
+			data.placements
+				.iter()
+				.any(|placement| placement.material == "materials/brass"),
+			"something wears the one somebody wrote: {:?}",
+			data.placements
+				.iter()
+				.map(|placement| placement.material.as_str())
+				.collect::<Vec<_>>()
+		);
+		assert!(
+			!data
+				.materials
+				.iter()
+				.any(|surface| surface.name == "models/lamp/brass"),
+			"and the model's own is not registered, because nothing in it names one"
+		);
+		assert!(
+			data.materials
+				.iter()
+				.any(|surface| surface.name == "models/lamp/stone"),
+			"while the surface nobody remapped is still the model's own"
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn editing_a_sidecar_rebuilds_the_model_it_stands_beside() {
+		let dir = workspace("guide-edited");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		guide(&dir, "models/lamp.glb", r#"{ "scale": [2, 2, 2] }"#);
+		run(&dir, false);
+
+		assert_eq!(run(&dir, false).compiled.len(), 0, "and settles");
+
+		sleep(Duration::from_millis(1100));
+		guide(&dir, "models/lamp.glb", r#"{ "scale": [4, 4, 4] }"#);
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.compiled.len(), 1, "the sidecar is an input like any other");
+		assert!(
+			compiled(&dir).placements[0]
+				.transform
+				.scale
+				.abs_diff_eq(Vec3::new(0.5, 1.5, 0.5) * 4.0, 1e-4),
+			"and the new number is what the model stands at"
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn deleting_a_sidecar_rebuilds_the_model_it_stood_beside() {
+		// the one thing the source tree cannot be asked: the .glb did not
+		// move and the output is still newer than it, so only the mark in the
+		// output knows the difference
+		let dir = workspace("guide-deleted");
+
+		put(&dir, "models/lamp.glb", PACKED);
+
+		let sidecar = guide(&dir, "models/lamp.glb", r#"{ "scale": [8, 8, 8] }"#);
+
+		run(&dir, false);
+		assert!(compiled(&dir).guided, "built through one");
+
+		fs::remove_file(&sidecar).expect("and then somebody deletes it");
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.compiled.len(), 1, "which is a rebuild, not a silence");
+
+		let data = compiled(&dir);
+
+		assert!(!data.guided, "and the mark is gone with the file");
+		assert!(
+			data.placements[0]
+				.transform
+				.scale
+				.abs_diff_eq(Vec3::new(0.5, 1.5, 0.5), 1e-4),
+			"so the model stands at the size the .glb says again"
+		);
+		assert_eq!(run(&dir, false).compiled.len(), 0, "and settles there");
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_sidecar_the_compiler_cannot_read_is_one_failure_and_not_a_stopped_run() {
+		let dir = workspace("guide-broken");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		guide(&dir, "models/lamp.glb", r#"{ "lods": 4 }"#);
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.compiled.len(), 0, "the model did not compile");
+		assert_eq!(report.failed.len(), 1, "and said why");
+		assert!(
+			report.failed[0]
+				.error
+				.to_string()
+				.contains("lods"),
+			"naming the word: {}",
 			report.failed[0].error
 		);
 

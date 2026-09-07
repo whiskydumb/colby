@@ -554,7 +554,14 @@ impl Panels {
 		Panel::right("inspector")
 			.default_size(points(self.sizes.right))
 			.show(ui, |ui| {
-				inspector::show(ui, world, &self.selection, self.tabs.history(), self.rename);
+				inspector::show(
+					ui,
+					world,
+					&self.selection,
+					self.tabs.history(),
+					self.rename,
+					host.project,
+				);
 			});
 		// answered, whether or not the field took it
 		self.rename = false;
@@ -837,24 +844,36 @@ impl Panels {
 
 	/// Selects an asset so the inspector shows it.
 	///
-	/// Only a material today, which is the only asset with a field table and
-	/// therefore the only one an inspector could draw. A name nothing answers
-	/// to selects nothing, which is what a browser row for a file the engine
-	/// has not loaded yet would ask for.
+	/// A material or a model, which are the two the inspector has a panel for
+	/// and the two members of [`Pick`] that are not in the world. A name
+	/// nothing answers to selects nothing, which is what a browser row for a
+	/// file the engine has not loaded yet would ask for.
+	///
+	/// **The material registry is asked first**, and the two cannot collide
+	/// anyway: a material's name is either its own file's or is inside a
+	/// model's, `models/lamp/brass`, and a model's is the model's.
 	///
 	/// @param world - the registries to look the name up in, read only: what a
 	/// selection points at is not a change to the world
 	/// @param name - the asset name
 	fn inspect(&mut self, world: &World, name: &str) {
-		let found = world.materials.find(name);
+		let coat = world.materials.find(name);
 
-		if !found.is_some() {
-			debug!(name, "nothing in the world answers to that asset");
+		if coat.is_some() {
+			self.selection.set(world, Pick::Material(coat));
 
 			return;
 		}
 
-		self.selection.set(world, Pick::Material(found));
+		let model = world.models.find(name);
+
+		if model.is_some() {
+			self.selection.set(world, Pick::Model(model));
+
+			return;
+		}
+
+		debug!(name, "nothing in the world answers to that asset");
 	}
 
 	fn water(&mut self, world: &mut World) {

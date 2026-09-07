@@ -56,10 +56,23 @@ pub const MAGIC: [u8; 8] = *b"COLBYMDL";
 ///
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The extension a compiled model is written with.
 pub const EXTENSION: &str = "cmodel";
+
+/// [`ModelHeader::flags`]: a sidecar beside the source was read into this.
+///
+/// The one thing the file itself could not otherwise be asked. A sidecar
+/// deleted leaves no trace in the source tree - the `.gltf` did not move, so
+/// the output is still newer than it - and without this bit the model would go
+/// on standing at the scale of a file nobody can find. The staleness sweep
+/// reads it and rebuilds. @ref `crate::compile::is_stale`,
+/// `crate::import`.
+pub const GUIDED: u32 = 1 << 0;
+
+/// Every flag bit this build knows.
+const KNOWN_FLAGS: u32 = GUIDED;
 
 /// How big [`ModelHeader`] is, and where the first block starts.
 pub const HEADER_BYTES: usize = 64;
@@ -86,8 +99,10 @@ pub struct ModelHeader {
 	/// [`FORMAT_VERSION`] at the time the file was written.
 	pub version: u32,
 
-	/// Reserved for optional blocks. Every bit is zero in version one, and a
-	/// reader refuses a bit it does not know rather than ignoring it.
+	/// What was true of this file when it was written, one bit each.
+	///
+	/// [`GUIDED`] is the only one, and a reader refuses a bit it does not know
+	/// rather than ignoring it.
 	pub flags: u32,
 
 	/// Bytes per material record. Must be `size_of::<Coat>()`.
@@ -216,6 +231,14 @@ pub struct ModelData {
 
 	/// Every piece of the model and where it stands.
 	pub placements: Vec<Placement>,
+
+	/// Whether a sidecar beside the source was read into this.
+	///
+	/// Not a description of the model - nothing about what it is made of or
+	/// where it stands depends on it - but a fact about how this file came to
+	/// say what it says, and the only one the compiler cannot work out again
+	/// by looking at the source tree. @ref [`GUIDED`].
+	pub guided: bool,
 }
 
 /// One material, with its pictures named.
@@ -358,6 +381,7 @@ impl ModelFile {
 	#[must_use]
 	pub fn to_model_data(&self) -> ModelData {
 		ModelData {
+			guided: self.header.flags & GUIDED != 0,
 			materials: self
 				.coats()
 				.iter()
@@ -463,7 +487,7 @@ pub fn encode(data: &ModelData) -> Result<Vec<u8>> {
 	let header = ModelHeader {
 		magic: MAGIC,
 		version: FORMAT_VERSION,
-		flags: 0,
+		flags: if data.guided { GUIDED } else { 0 },
 		coat_stride: width::<Coat>("a model's records")?,
 		stand_stride: width::<Stand>("a model's records")?,
 		coat_count: count(coats.len(), "a model's records")?,
@@ -506,6 +530,28 @@ pub fn version_of(path: &Path) -> Option<u32> {
 	Some(u32::from_le_bytes(version))
 }
 
+/// The flag bits the file at this path sets, if it is one at all.
+///
+/// The head alone, so the staleness sweep can ask whether an output was built
+/// through a sidecar without reading a file it may be about to rewrite. @ref
+/// [`GUIDED`], `crate::compile::is_stale`.
+///
+/// @param path - the `.cmodel` to look at
+#[must_use]
+pub fn flags_of(path: &Path) -> Option<u32> {
+	let mut head = [0_u8; 16];
+	let mut file = std::fs::File::open(path).ok()?;
+	std::io::Read::read_exact(&mut file, &mut head).ok()?;
+
+	if head.get(..MAGIC.len()) != Some(&MAGIC[..]) {
+		return None;
+	}
+
+	let flags: [u8; 4] = head.get(12..16)?.try_into().ok()?;
+
+	Some(u32::from_le_bytes(flags))
+}
+
 /// The blob being built, and where each name already in it starts.
 /// Every way a `.cmodel` can be wrong, checked once.
 fn check(bytes: &[u8]) -> std::result::Result<ModelHeader, String> {
@@ -527,10 +573,10 @@ fn check(bytes: &[u8]) -> std::result::Result<ModelHeader, String> {
 		));
 	}
 
-	if header.flags != 0 {
+	if header.flags & !KNOWN_FLAGS != 0 {
 		return Err(format!(
 			"this model uses feature {:#x}, which this build does not",
-			header.flags
+			header.flags & !KNOWN_FLAGS
 		));
 	}
 
@@ -598,6 +644,10 @@ mod tests {
 	/// A model with everything a record can hold in it.
 	fn sample() -> ModelData {
 		ModelData {
+			// on, so that the round trip below covers the mark as well as the
+			// records: a file written without it and read back as `false`
+			// would still have compared equal to a fixture holding `false`.
+			guided: true,
 			materials: vec![
 				Material {
 					name: "models/lamp/brass".to_owned(),
@@ -789,7 +839,11 @@ mod tests {
 	fn a_file_that_is_not_one_of_these_is_refused_by_name() {
 		assert!(corrupt(0, b'X').contains("not a colby model"));
 		assert!(corrupt(8, 9).contains("version 9"));
-		assert!(corrupt(12, 1).contains("feature"));
+		// the lowest bit nothing has claimed, so this still tests what it
+		// says the day a second flag lands
+		let unknown = !KNOWN_FLAGS & KNOWN_FLAGS.wrapping_add(1);
+
+		assert!(corrupt(12, u8::try_from(unknown).expect("the low byte")).contains("feature"));
 		assert!(corrupt(16, 99).contains("not the size this build reads"), "a record width");
 	}
 
