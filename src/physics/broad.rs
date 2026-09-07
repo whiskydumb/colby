@@ -23,11 +23,10 @@
 //! and swept rather than compared all against all: bodies in order of where
 //! their box starts, and each one asked only about the ones that start before
 //! its own box ends. Sweep and prune, which is the oldest trick there is and
-//! the one that fits a flat list of bodies. Box2D and Godot both keep a tree
-//! instead, which is better still and is five hundred lines with an
-//! incremental rebalance; that is a step rather than a debt, and this is what
-//! the crate docs promised when they said "a broadphase and a contact cache
-//! later".
+//! the one that fits a flat list of bodies. Jolt, Box3D and Godot all keep a
+//! tree instead, which is better still and is between eight hundred and two
+//! thousand lines with an incremental rebalance; that is a step rather than a
+//! debt.
 //!
 //! **The order the pairs come out in is exactly the order the square produced
 //! them**, and that is not decoration. A sequential-impulse solver walks its
@@ -37,6 +36,16 @@
 //! a change nothing can check, so this one is made invisible on purpose: two
 //! counting sorts put the candidates back in index order, and a test asserts
 //! the whole list matches what the old square found.
+//!
+//! **And because of that, which axis is swept is free to be chosen from the
+//! world.** @ref [`Broad::widest`]. The pairs a sweep finds are the same set
+//! whatever it sorts along - a pair that touches overlaps on every axis, so it
+//! can never fall past the early stop - and `tidy` below puts them back in the
+//! same order afterwards. So the axis buys time and costs nothing that anything
+//! outside this file can see, which is the opposite of what the debt that
+//! opened this expected.
+
+use std::time::{Duration, Instant};
 
 use colby_core::glam::Vec3;
 
@@ -64,6 +73,15 @@ impl Bounds {
 		low: Vec3::INFINITY,
 		high: Vec3::NEG_INFINITY,
 	};
+
+	/// The middle of it, or nothing at all where there is no box.
+	///
+	/// [`NOWHERE`](Self::NOWHERE) has no middle - its corners average to a NaN
+	/// on every axis - so a body with no bounds is left out of the spread the
+	/// axis is chosen from rather than poisoning it.
+	fn center(self) -> Option<Vec3> {
+		(self.low.x <= self.high.x).then(|| (self.low + self.high) * 0.5)
+	}
 
 	/// Whether two of them share any space.
 	fn touches(self, other: Self) -> bool {
@@ -99,19 +117,85 @@ pub(crate) struct Broad {
 
 	/// How many candidates fall in each bucket, reused by both passes.
 	counts: Vec<usize>,
+
+	/// Which axis the last sweep sorted along. @ref [`Broad::widest`].
+	axis: usize,
+
+	/// How long the last sweep took, for [`Spent`](crate::Spent).
+	///
+	/// Kept here rather than clocked at the call site because the bounds are
+	/// worked out lazily *inside* the sweep - the caller hands over an iterator
+	/// - so a clock outside it would be timing the caller's own loop as well.
+	spent: Duration,
 }
 
 impl Broad {
-	/// Which axis the sweep sorts along.
+	/// How long the last sweep took, bounds and sorts and all.
+	pub(crate) const fn spent(&self) -> Duration { self.spent }
+
+	/// Which axis to sweep along: the one the bodies are most spread out on.
 	///
-	/// **X, fixed, rather than the widest spread measured per step.** Choosing
-	/// per step is one pass over the bounds and it makes the *order* depend on
-	/// the world, which is a second thing that could differ between two runs of
-	/// something that has to be reproducible. A world laid out along one axis
-	/// and swept along another degrades to the square this replaces, which is
-	/// the case to remember if a level ever turns out to be a corridor running
-	/// north.
-	const AXIS: usize = 0;
+	/// **Measured, and it is the whole of what the axis is worth.** A world
+	/// laid out along one axis and swept along another degrades to a square of
+	/// box tests, because no body's box ends before the next one's begins and
+	/// the early stop in [`against`](Self::against) never fires. On this
+	/// machine, at the thousand-and-twenty-four bodies a world can hold, in
+	/// microseconds of the whole narrow phase - a rectangle of crates spaced
+	/// three apart, none of them touching, so all of it is this:
+	///
+	/// | world, all of it along z | swept along x | swept along z |
+	/// |---|---|---|
+	/// | 32 x 32 square | 111 | 124 |
+	/// | 8 x 128 hall | 172 | 67 |
+	/// | 4 x 256 hall | 243 | 67 |
+	/// | 1 x 1024 in single file | **624** | **65** |
+	///
+	/// The sweep's own span, measured apart from the tests it feeds, is 550
+	/// against 27 on the last of those. **Twenty times**, and a third of a
+	/// sixty-hertz frame spent finding out that nothing touches anything. The
+	/// square is a tie and sweeps along x either way, so its two columns are
+	/// the same work twice and are what run-to-run noise looks like.
+	///
+	/// **The spread of the centers, not of the low corners**, which is what
+	/// Jolt does at every node of its tree
+	/// (`QuadTree.cpp:440`, `GetHighestComponentIndex` of the center bounds),
+	/// what Box3D does before its median split (`dynamic_tree.c:1501`), and
+	/// what Godot tries first before falling back to comparing all three
+	/// (`bvh_split.inc:33`, `:70-98`). Centers rather than corners because one
+	/// enormous body - the floor, a pool - has a box that reaches across the
+	/// world on every axis and a center that is simply in the middle of it, so
+	/// it moves a corner spread and barely moves a center one.
+	///
+	/// A tie keeps the lower axis, so a square world sweeps along x exactly as
+	/// it did before this existed.
+	///
+	/// **It costs about three microseconds** at the thousand-and-twenty-four
+	/// bodies a world can hold, measured back to back in one build against a
+	/// run that skipped the pass and took the x axis regardless: 102, 103, 101
+	/// against 100, 102, 96. Three microseconds against five hundred is what
+	/// makes this worth a pass over the boxes rather than an argument.
+	///
+	/// @return which axis of the boxes to sort along
+	fn widest(&self) -> usize {
+		let mut low = Vec3::INFINITY;
+		let mut high = Vec3::NEG_INFINITY;
+
+		for center in self.boxes.iter().filter_map(|held| held.center()) {
+			low = low.min(center);
+			high = high.max(center);
+		}
+
+		let spread = high - low;
+		let mut axis = 0;
+
+		for next in 1..3 {
+			if spread[next] > spread[axis] {
+				axis = next;
+			}
+		}
+
+		axis
+	}
 
 	/// Fills `into` with every pair whose bounds overlap, in index order.
 	///
@@ -124,6 +208,8 @@ impl Broad {
 		bounds: impl ExactSizeIterator<Item = Option<(Vec3, Vec3)>>,
 		into: &mut Vec<(usize, usize)>,
 	) {
+		let began = Instant::now();
+
 		into.clear();
 		self.boxes.clear();
 		self.boxes.extend(
@@ -131,6 +217,8 @@ impl Broad {
 		);
 
 		let count = self.boxes.len();
+
+		self.axis = self.widest();
 
 		// taken out and sorted on its own, because the comparison reads the
 		// boxes and the list being sorted lives beside them on the same struct
@@ -157,6 +245,7 @@ impl Broad {
 		}
 
 		self.tidy(into, count);
+		self.spent = began.elapsed();
 	}
 
 	/// Every candidate for one body, out of the ones that start after it.
@@ -172,7 +261,7 @@ impl Broad {
 		// past the end of this box nothing that starts later can reach back to
 		// touch it, so the walk stops rather than running to the end of the
 		// list. That is the whole of what a sweep buys over a square.
-		let reach = one.high[Self::AXIS];
+		let reach = one.high[self.axis];
 
 		for &second in self.order.iter().skip(at + 1) {
 			if self.start(second) > reach {
@@ -196,7 +285,7 @@ impl Broad {
 	fn start(&self, index: usize) -> f32 {
 		self.boxes
 			.get(index)
-			.map_or(f32::INFINITY, |held| held.low[Self::AXIS])
+			.map_or(f32::INFINITY, |held| held.low[self.axis])
 	}
 
 	/// Puts the candidates back in the order a loop over every pair would have
@@ -436,5 +525,104 @@ mod tests {
 	fn nothing_at_all_sweeps_to_nothing() {
 		assert!(swept(&[]).is_empty());
 		assert!(swept(&[at(0.0)]).is_empty(), "one body is no pair");
+	}
+
+	/// A unit box standing anywhere.
+	fn anywhere(position: Vec3) -> Option<(Vec3, Vec3)> {
+		Some((position - Vec3::splat(0.5), position + Vec3::splat(0.5)))
+	}
+
+	/// A row of boxes along one axis, a little apart.
+	fn line(along: Vec3, count: u8) -> Vec<Option<(Vec3, Vec3)>> {
+		(0..count)
+			.map(|step| anywhere(along * f32::from(step) * 3.0))
+			.collect()
+	}
+
+	/// Which axis a sweep over these bounds would choose.
+	fn chosen(bounds: &[Option<(Vec3, Vec3)>]) -> usize {
+		let mut broad = Broad::default();
+		let mut pairs = Vec::new();
+
+		broad.sweep(bounds.iter().copied(), &mut pairs);
+
+		broad.axis
+	}
+
+	#[test]
+	fn the_axis_is_the_one_the_bodies_are_most_spread_out_on() {
+		// the case `PERF-6` was opened for: a corridor running north, swept
+		// along east, which is a square of box tests and was measured at
+		// twenty-one times the cost of sweeping along the corridor.
+		assert_eq!(chosen(&line(Vec3::X, 20)), 0, "a row along x");
+		assert_eq!(chosen(&line(Vec3::Y, 20)), 1, "a column along y");
+		assert_eq!(chosen(&line(Vec3::Z, 20)), 2, "a corridor along z");
+	}
+
+	#[test]
+	fn a_world_with_no_longest_axis_sweeps_along_x_as_it_always_did() {
+		// the tie, and it is kept deliberately: a square world has to behave
+		// exactly as it did before an axis was ever chosen, or every recorded
+		// number about one stops meaning anything.
+		let cube = [
+			anywhere(Vec3::ZERO),
+			anywhere(Vec3::splat(10.0)),
+			anywhere(Vec3::new(10.0, 0.0, 0.0)),
+			anywhere(Vec3::new(0.0, 10.0, 0.0)),
+		];
+
+		assert_eq!(chosen(&cube), 0);
+		assert_eq!(chosen(&[]), 0, "and a world with nothing in it");
+		assert_eq!(chosen(&[None, None]), 0, "and one whose bodies have no bounds");
+	}
+
+	#[test]
+	fn one_enormous_body_does_not_decide_the_axis_by_itself() {
+		// the floor, and the pool. Its box reaches across the world on every
+		// axis, so a spread of *corners* would be a tie it caused and the
+		// corridor beside it would be swept the wrong way. Its center is simply
+		// in the middle. @ref [`Broad::widest`].
+		let mut bounds = vec![Some((Vec3::new(-60.0, -1.0, -60.0), Vec3::new(60.0, 0.0, 60.0)))];
+
+		bounds.extend(line(Vec3::Z, 20));
+
+		assert_eq!(chosen(&bounds), 2, "the crates decide, not the floor under them");
+	}
+
+	#[test]
+	fn every_axis_finds_the_same_pairs_the_square_does() {
+		// **the property the axis being chosen at all stands on.** A pair that
+		// touches overlaps on every axis, so it can never fall past the early
+		// stop whichever one is swept - and `tidy` puts what is found back in
+		// index order regardless. Three corridors, one per axis, each with
+		// overlaps in it, each checked against the loop over every pair.
+		for along in [Vec3::X, Vec3::Y, Vec3::Z] {
+			let mut bounds = Vec::new();
+
+			for step in 0..12_u8 {
+				// each pair of neighbors a third of a box apart, so half of
+				// them overlap and half do not
+				bounds.push(anywhere(along * f32::from(step) * 0.66));
+			}
+
+			let found = swept(&bounds);
+
+			assert_eq!(found, squared(&bounds), "swept along {along}");
+			assert!(!found.is_empty(), "a fixture that finds nothing proves nothing");
+		}
+	}
+
+	#[test]
+	fn the_sweep_says_how_long_it_took() {
+		// the `cpu broad` row of `--profile`, which is what makes an axis that
+		// went wrong visible without a debugger.
+		let mut broad = Broad::default();
+		let mut pairs = Vec::new();
+
+		assert_eq!(broad.spent(), Duration::ZERO, "before it has ever run");
+
+		broad.sweep(line(Vec3::Z, 40).iter().copied(), &mut pairs);
+
+		assert!(broad.spent() > Duration::ZERO, "and after");
 	}
 }

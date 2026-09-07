@@ -5,7 +5,8 @@
 //! what its surface is like - lives in `World::bodies`, plain data in
 //! `colby_core` that the editor can read and a saved scene could write. This
 //! crate owns only what is derived from that and can be thrown away: baked
-//! collision meshes today, a broadphase and a contact cache later.
+//! collision meshes and the sweep that says which pairs are worth asking about;
+//! a contact cache later.
 //!
 //! That is the opposite of what an external physics library forces. Take one
 //! and every entity's position, rotation and velocity has to be pushed *into*
@@ -102,11 +103,22 @@ const MINIMUM_STEP: f32 = 1.0e-4;
 /// millisecond is a lot or nothing depending on what the other three parts
 /// cost - so the three it sits between are timed as well.
 ///
+/// **[`broad`](Self::broad) is inside [`narrow`](Self::narrow)** the way all
+/// four are inside [`total`](Self::total), and it is here because `PERF-6`
+/// asked which axis the sweep should take and nothing could answer without
+/// separating the sweep from the tests it feeds. A world laid out along one
+/// axis is a *broad* row that has grown while nothing else has.
+///
 /// A wall clock, deliberately. There is no hardware to ask; every part of this
 /// runs on the thread that calls [`Simulation::step`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Spent {
-	/// Finding what touches what, sensors included.
+	/// Deciding which pairs are worth asking about: the bounds, the sort and
+	/// the sweep. Part of [`narrow`](Self::narrow). @ref [`broad`].
+	pub broad: Duration,
+
+	/// Finding what touches what, sensors included - the sweep above and the
+	/// shape tests it fed.
 	pub narrow: Duration,
 
 	/// What the fluids push on what is in them.
@@ -275,6 +287,7 @@ impl Simulation {
 			&mut sensed,
 		);
 		self.spent.narrow = finding.elapsed();
+		self.spent.broad = broad.spent();
 		self.broad = broad;
 		self.candidates = candidates;
 		self.report(world, &manifolds, &sensed);

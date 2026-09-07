@@ -18,13 +18,14 @@
 //! reason somebody can name.
 //!
 //! **No window and no console**, which is `--shot`'s arrangement and is taken
-//! for `--shot`'s reason: what comes out has to depend on the build and on the
-//! project, not on what somebody last typed. The consequence is worth being
-//! plain about - `r.lights`, `r.msaa` and `r.shadows` cannot be set from here.
-//! **The scene is the knob.** Lights, sky, tonemap, exposure, bloom and fog
-//! all live in the `.cscene` since step five, so asking what thirty-two lamps
-//! cost is a question you answer with a project that has thirty-two lamps in
-//! it, and comparing two answers is comparing two projects.
+//! for `--shot`'s reason: what comes out has to depend on the build, on the
+//! project and on the command line, not on what somebody last typed at a
+//! terminal or left in a config file. **The two knobs are the scene and
+//! `--set`**: lights, sky, tonemap, exposure, bloom and fog live in the
+//! `.cscene` since step five, so asking what thirty-two lamps cost is a
+//! question answered with a project that has thirty-two lamps in it - while
+//! `r.msaa`, `r.lights` and `r.shadows` are properties of the machine and are
+//! set on the command line, which is what `--set` was built for in `PERF-4`.
 //!
 //! **Warm frames first.** The pipelines compile on the frame that first needs
 //! them, the eye starts unadapted, and the allocator has not yet grown the
@@ -83,8 +84,8 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Five spans of hardware, two of recording and four of simulation.
-const ROWS: usize = 11;
+/// Five spans of hardware, two of recording and five of simulation.
+const ROWS: usize = 12;
 
 /// One row of the table: what a part of the frame cost over the whole run.
 #[derive(Clone, Copy, Debug, Default)]
@@ -155,6 +156,7 @@ const NAMES: [&str; ROWS] = [
 	"gpu composite",
 	"cpu upload",
 	"cpu record",
+	"cpu broad",
 	"cpu narrow",
 	"cpu buoyancy",
 	"cpu solve",
@@ -196,7 +198,7 @@ impl Table {
 
 		let under = Pass::ALL.len() + Work::ALL.len();
 
-		for (at, took) in [spent.narrow, spent.buoyancy, spent.solve, spent.total]
+		for (at, took) in [spent.broad, spent.narrow, spent.buoyancy, spent.solve, spent.total]
 			.into_iter()
 			.enumerate()
 		{
@@ -237,8 +239,9 @@ impl Table {
 
 		// the three numbers that add up to a frame, and they are three rather
 		// than two because the simulation's rows overlap: `cpu step` is the
-		// whole step and the three above it are parts of it, so adding every
-		// row would count the same microseconds twice.
+		// whole step and the four above it are parts of it - and `cpu broad` is
+		// in turn a part of `cpu narrow` - so adding every row would count the
+		// same microseconds twice over.
 		info!(
 			frames,
 			passes = self.passes.unwrap_or_default(),
@@ -383,7 +386,7 @@ mod tests {
 
 		assert_eq!(names.len(), ROWS, "two rows answer to one name");
 		assert_eq!(
-			Pass::ALL.len() + Work::ALL.len() + 4,
+			Pass::ALL.len() + Work::ALL.len() + 5,
 			ROWS,
 			"the table has a row for every span the renderer and the simulation report"
 		);
@@ -406,6 +409,7 @@ mod tests {
 	fn the_simulation_rows_are_folded_in_beside_the_renderers() {
 		let mut table = Table::new();
 		let spent = Spent {
+			broad: Duration::from_micros(12),
 			narrow: Duration::from_micros(40),
 			buoyancy: Duration::from_micros(7),
 			solve: Duration::from_micros(90),
@@ -416,10 +420,11 @@ mod tests {
 
 		let under = Pass::ALL.len() + Work::ALL.len();
 
-		assert_eq!(table.rows[under].mean(), Duration::from_micros(40), "narrow");
-		assert_eq!(table.rows[under + 1].mean(), Duration::from_micros(7), "buoyancy");
-		assert_eq!(table.rows[under + 2].mean(), Duration::from_micros(90), "solve");
-		assert_eq!(table.rows[under + 3].mean(), Duration::from_micros(200), "the step");
+		assert_eq!(table.rows[under].mean(), Duration::from_micros(12), "broad");
+		assert_eq!(table.rows[under + 1].mean(), Duration::from_micros(40), "narrow");
+		assert_eq!(table.rows[under + 2].mean(), Duration::from_micros(7), "buoyancy");
+		assert_eq!(table.rows[under + 3].mean(), Duration::from_micros(90), "solve");
+		assert_eq!(table.rows[under + 4].mean(), Duration::from_micros(200), "the step");
 	}
 
 	#[test]
