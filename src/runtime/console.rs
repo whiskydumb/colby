@@ -614,7 +614,7 @@ unsafe extern "C-unwind" fn list_sounds(world: *mut World, _args: *const Args) {
 /// for it: putting a world back replaces every table in it and needs the
 /// solver, which a command cannot reach, so every one of these waits for the
 /// frame loop rather than answering inside the line. @ref [`crate::saves`],
-/// which takes them up and is where the six names are written down.
+/// which takes them up and is where the seven names are written down.
 ///
 /// @param world - the table to register into
 fn install_scenes(world: &mut World) {
@@ -647,6 +647,11 @@ fn install_scenes(world: &mut World) {
 		crate::saves::MODEL,
 		console::defer,
 		"start an import sidecar beside the source that compiles to <name>",
+	);
+	world.cvars.command(
+		crate::saves::BLOCKS,
+		console::defer,
+		"write the meshes baked under maps/<name>/ into assets/ as .obj sources",
 	);
 }
 

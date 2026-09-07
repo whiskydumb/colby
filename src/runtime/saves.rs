@@ -39,7 +39,7 @@ use std::{
 
 #[cfg(test)]
 use colby_asset::AlignedBytes;
-use colby_asset::{Project, import, level, material, scene as file};
+use colby_asset::{Project, import, level, material, obj, scene as file};
 use colby_core::{
 	Result,
 	abi::{Asked, World, scene},
@@ -98,8 +98,22 @@ pub(crate) const MATERIAL: &str = "material.write";
 /// keeping in one of these was typed by hand. @ref `colby_asset::import`.
 pub(crate) const MODEL: &str = "model.write";
 
-/// The six names this module answers for, as they wait on the world.
-const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP, MATERIAL, MODEL];
+/// `blocks.write <name>` - writes a bake's meshes out as sources.
+///
+/// The seventh, and the only one that writes **geometry**. Every other source
+/// in this project was typed by a person; a bake makes one, and it has to land
+/// somewhere the compiler will pick it up - which rules out the derived tree,
+/// whose pruning deletes an output with no source within a quarter of a second.
+///
+/// **The mesh crosses through the registry rather than through the line.** The
+/// editor builds the geometry and registers it under `maps/<name>/<material>`;
+/// this walks the registry for that prefix and writes each one as an `.obj`.
+/// So the console carries a name, which is what it is for, and the data crosses
+/// on a surface both sides already share. @ref `colby_editor::bake`.
+pub(crate) const BLOCKS: &str = "blocks.write";
+
+/// The seven names this module answers for, as they wait on the world.
+const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP, MATERIAL, MODEL, BLOCKS];
 
 /// One thing to do with a scene.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +153,13 @@ pub(crate) enum Request {
 	/// this writes a file that says nothing, and the editing happens in the
 	/// file. The name is the model's own, `models/lamp`.
 	Model(String),
+
+	/// Write a bake's meshes out as `.obj` sources.
+	///
+	/// The third about an asset rather than about the world, and the only one
+	/// that writes geometry. What it takes from the world is the mesh registry,
+	/// which is where the editor left what it built.
+	Blocks(String),
 }
 
 impl Request {
@@ -156,6 +177,7 @@ impl Request {
 			| PROP => Some(Self::Prop(name)),
 			| MATERIAL => Some(Self::Material(name)),
 			| MODEL => Some(Self::Model(name)),
+			| BLOCKS => Some(Self::Blocks(name)),
 			| _ => None,
 		}
 	}
@@ -190,6 +212,7 @@ pub(crate) fn serve(world: &mut World, simulation: &mut Simulation, project: &Pr
 		| Request::Prop(name) => prop(world, project, name),
 		| Request::Material(name) => material(world, project, name),
 		| Request::Model(name) => model(project, name),
+		| Request::Blocks(name) => blocks(world, project, name),
 	};
 
 	if let Err(failure) = outcome {
@@ -520,6 +543,74 @@ fn model(project: &Project, name: &str) -> Result {
 
 	Ok(())
 }
+
+/// Writes every mesh of a bake out as an `.obj` the compiler will pick up.
+///
+/// **The registry is the seam.** The editor built the geometry and put it in
+/// `World::meshes` under `maps/<name>/<material>`; this finds them by that
+/// prefix and writes each one under `assets/`, where the compiler turns it back
+/// into a `.cmesh`. Nothing about a mesh crosses the console line - the line
+/// carries the name, and both sides already share the registry.
+///
+/// The path is the asset name, so `maps/room/brass` is
+/// `assets/maps/room/brass.obj` and nothing has to be asked. A name that is not
+/// under `maps/` is refused for the reason a material outside `materials/` is:
+/// writing one anywhere else would put a source beside something that already
+/// produces that name.
+///
+/// @param world - the registry to take the geometry from
+/// @param project - whose asset tree
+/// @param name - the bake's own name, `room`
+///
+/// # Errors
+///
+/// If nothing was baked under that name, or if a file cannot be written.
+fn blocks(world: &World, project: &Project, name: &str) -> Result {
+	let under = format!("{MAPS}{}/", plain(name)?);
+	let baked: Vec<(String, colby_core::abi::mesh::MeshData)> = world
+		.meshes
+		.iter()
+		.filter(|entry| entry.name().starts_with(&under))
+		.map(|entry| (entry.name().to_owned(), entry.value().clone()))
+		.collect();
+
+	if baked.is_empty() {
+		return Err(err!(Asset(
+			"nothing is registered under {under}; bake some blocks before writing them"
+		)));
+	}
+
+	let mut written = 0;
+
+	for (asset, data) in &baked {
+		let path = asset
+			.split('/')
+			.fold(project.assets(), |path, part| path.join(part))
+			.with_extension(obj::EXTENSION);
+
+		if let Some(directory) = path.parent() {
+			fs::create_dir_all(directory)?;
+		}
+
+		fs::write(&path, obj::export(data).as_bytes())?;
+		written += 1;
+
+		info!(
+			path = %path.display(),
+			name = asset,
+			vertices = data.vertices.len(),
+			triangles = data.triangles(),
+			"a baked mesh written as a source"
+		);
+	}
+
+	info!(name, written, "blocks written");
+
+	Ok(())
+}
+
+/// The directory a bake's meshes live in, under the asset tree.
+pub(crate) const MAPS: &str = "maps/";
 
 /// What to write down for one of a material's two pictures.
 ///
@@ -1063,6 +1154,78 @@ mod tests {
 			assert!(
 				world.cvars.get(name).is_some(),
 				"{name} is registered, or nobody can ask for it"
+			);
+		}
+	}
+
+	#[test]
+	fn a_bake_is_written_out_as_one_obj_per_mesh() {
+		let project = project("blocks-write");
+		let mut world = World::new();
+
+		world
+			.meshes
+			.insert("maps/room/default", colby_core::abi::mesh::cube());
+		world
+			.meshes
+			.insert("maps/room/brass", colby_core::abi::mesh::quad());
+		// and one that is not this bake's, to prove the prefix is doing work
+		world
+			.meshes
+			.insert("maps/hall/default", colby_core::abi::mesh::cube());
+
+		blocks(&world, &project, "room").expect("it writes");
+
+		let under = project.assets().join("maps").join("room");
+
+		assert!(under.join("default.obj").is_file(), "one file per mesh");
+		assert!(under.join("brass.obj").is_file(), "named by its material");
+		assert!(
+			!project
+				.assets()
+				.join("maps")
+				.join("hall")
+				.join("default.obj")
+				.is_file(),
+			"and another bake's meshes are left alone"
+		);
+
+		let text = fs::read_to_string(under.join("default.obj")).expect("it reads");
+		let read = obj::import(&text).expect("and it is geometry");
+
+		assert_eq!(
+			read.triangles(),
+			colby_core::abi::mesh::cube().triangles(),
+			"the same geometry the registry held"
+		);
+	}
+
+	#[test]
+	fn writing_a_bake_nobody_made_says_so() {
+		let project = project("blocks-write-nothing");
+		let world = World::new();
+
+		let refused = blocks(&world, &project, "room").expect_err("nothing is registered");
+
+		assert!(
+			format!("{refused}").contains("bake some blocks"),
+			"saying what to do about it: {refused}"
+		);
+	}
+
+	#[test]
+	fn a_bake_name_that_would_escape_the_asset_tree_is_refused() {
+		let project = project("blocks-write-escape");
+		let mut world = World::new();
+
+		world
+			.meshes
+			.insert("maps/room/default", colby_core::abi::mesh::cube());
+
+		for name in ["../room", "a/b", ""] {
+			assert!(
+				blocks(&world, &project, name).is_err(),
+				"{name:?} is not a name a file may be written under"
 			);
 		}
 	}

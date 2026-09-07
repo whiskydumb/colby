@@ -58,6 +58,7 @@ use wgpu::{Device, Queue, TextureFormat, TextureView};
 use winit::{event::WindowEvent, window::Window};
 
 mod aim;
+mod bake;
 mod bar;
 mod browser;
 mod catalog;
@@ -312,6 +313,13 @@ pub(crate) enum Change {
 	/// The same kind of press as [`Water`](Self::Water) and for the same
 	/// reason: a cube is something the engine can make on its own.
 	Block,
+
+	/// Turn the selected blocks into one mesh per material.
+	///
+	/// The name is the bar's write field, which already names what is being
+	/// built - a second name for the same room would be a second thing to keep
+	/// in step.
+	Bake(String),
 
 	/// Put an asset into the world, where it was dropped.
 	Drop {
@@ -886,6 +894,7 @@ impl Panels {
 			| Change::Inspect { name } => self.inspect(world, &name),
 			| Change::Water => self.water(world),
 			| Change::Block => self.block(world),
+			| Change::Bake(name) => self.bake(world, &name),
 			| Change::Drop { name, kind, at } => self.drop(world, &name, kind, at),
 		}
 	}
@@ -1023,6 +1032,59 @@ impl Panels {
 		for pick in &made {
 			self.selection.toggle(world, *pick);
 		}
+	}
+
+	/// Turns the selected blocks into a mesh, and writes it out.
+	///
+	/// **Two halves, and the seam is the mesh registry.** The world work is
+	/// this crate's - @ref [`bake`] - and the files are the runner's, asked for
+	/// with a console line carrying the bake's name. Nothing about a mesh
+	/// crosses that line; both sides already share the registry it was left in.
+	fn bake(&mut self, world: &mut World, name: &str) {
+		// **the last part of the write name, not the whole of it.** The field
+		// holds a *scene* - `scenes/room` - and a bake's name is a directory
+		// under `maps/`, which may not have a slash in it. Taking the last part
+		// is what a person means: the room described by `scenes/room` bakes
+		// into `maps/room/`. Found by pressing the button, which wrote a mesh
+		// into the world and then refused to write the file.
+		let name = name
+			.trim()
+			.rsplit('/')
+			.next()
+			.unwrap_or_default()
+			.to_owned();
+
+		if name.is_empty() {
+			warn!("name the room in the write field first; that is what the files are called");
+
+			return;
+		}
+
+		self.tabs.history().begin("bake", world);
+
+		let baked = bake::bake(world, &self.selection.picks(), &name);
+
+		if baked.made.is_empty() {
+			warn!(blocks = baked.blocks, "there was nothing to bake");
+
+			return;
+		}
+
+		info!(
+			name,
+			blocks = baked.blocks,
+			meshes = baked.made.len(),
+			triangles = baked.triangles,
+			buried = baked.buried,
+			"blocks baked"
+		);
+
+		self.selection.clear();
+		for pick in &baked.made {
+			self.selection.toggle(world, *pick);
+		}
+
+		colby_core::abi::console::run(world, &format!("blocks.write {name}"));
 	}
 
 	fn water(&mut self, world: &mut World) {
@@ -1270,6 +1332,48 @@ mod tests {
 		names.dedup();
 
 		assert_eq!(names.len(), named.len(), "two panes share a name");
+	}
+
+	#[test]
+	fn a_bake_is_named_by_the_last_part_of_the_write_field() {
+		// the write field holds a scene - `scenes/room` - and a bake's name is
+		// a directory under `maps/`, which may not have a slash in it. Found
+		// by pressing the button: the world baked and the file was refused.
+		let mut panels = Panels::default();
+		let mut world = World::new();
+
+		drop(select::block(&mut world, Vec3::ZERO, Some(1.0)));
+		panels.apply(&mut world, Change::Bake("scenes/room".to_owned()));
+
+		assert!(
+			world.meshes.find("maps/room/default").is_some(),
+			"the mesh is under the room, not under a directory called scenes"
+		);
+		assert!(
+			!world
+				.meshes
+				.find("maps/scenes/room/default")
+				.is_some(),
+			"and not under the whole of the field"
+		);
+	}
+
+	#[test]
+	fn a_bake_with_no_name_bakes_nothing() {
+		let mut panels = Panels::default();
+		let mut world = World::new();
+
+		drop(select::block(&mut world, Vec3::ZERO, Some(1.0)));
+
+		let before = world.entities.len();
+
+		panels.apply(&mut world, Change::Bake("   ".to_owned()));
+
+		assert_eq!(
+			world.entities.len(),
+			before,
+			"the blocks are still blocks, because a bake with no name has nowhere to be written"
+		);
 	}
 
 	/// One headless frame with nothing pressed.

@@ -30,7 +30,7 @@
 //! counter-clockwise front faces, which is what the engine's pipeline already
 //! expects, so nothing is flipped on the way in.
 
-use std::{collections::HashMap, fs, path::Path, str::SplitWhitespace};
+use std::{collections::HashMap, fmt::Write as _, fs, path::Path, str::SplitWhitespace};
 
 use colby_core::{
 	Result,
@@ -60,6 +60,84 @@ pub fn import_file(path: &Path) -> Result<MeshData> {
 pub fn import(text: &str) -> Result<MeshData> {
 	parse(text).map_err(|reason| err!(Asset("line {reason}")))
 }
+
+/// Writes geometry out as OBJ text.
+///
+/// **The other direction, and it exists so that something the engine built can
+/// be edited by a person and read back by the compiler.** Nothing else in this
+/// project writes a source: every other format is compiled from one somebody
+/// typed. Baking blocks into a mesh is the first thing that makes geometry
+/// nobody typed, and it has to land somewhere the compiler will pick it up -
+/// which rules out the derived tree, whose pruning deletes an output with no
+/// source within a quarter of a second.
+///
+/// **Every flip the reader does is undone here**, and there is exactly one: the
+/// second texture coordinate is measured from the bottom in OBJ and from the
+/// top everywhere else, so [`texcoord`] stores `1 - v` and this writes `1 - v`
+/// back. Positions, normals and winding pass straight through in both
+/// directions.
+///
+/// One vertex per `v`, `vt` and `vn`, in the mesh's own order, so a face's
+/// three indices are one number written three times - which costs a few bytes
+/// against a file that shares them and makes the round trip exact rather than
+/// nearly exact.
+///
+/// @param data - the geometry to write
+/// @return the whole file
+#[must_use]
+pub fn export(data: &MeshData) -> String {
+	// a rough guess at the size, so a mesh of ten thousand vertices does not
+	// grow this a dozen times on the way out
+	let mut out = String::with_capacity(data.vertices.len() * 96 + data.indices.len() * 8);
+
+	out.push_str("# written by colby\n");
+
+	for vertex in &data.vertices {
+		let [x, y, z] = vertex.position;
+
+		writeln!(out, "v {} {} {}", number(x), number(y), number(z))
+			.expect("a String never fails to be written into");
+	}
+
+	for vertex in &data.vertices {
+		let [u, v] = vertex.uv;
+
+		writeln!(out, "vt {} {}", number(u), number(1.0 - v))
+			.expect("a String never fails to be written into");
+	}
+
+	for vertex in &data.vertices {
+		let [x, y, z] = vertex.normal;
+
+		writeln!(out, "vn {} {} {}", number(x), number(y), number(z))
+			.expect("a String never fails to be written into");
+	}
+
+	for triangle in data.indices.chunks_exact(3) {
+		out.push('f');
+
+		for index in triangle {
+			// OBJ counts from one, and a corner names the same slot for all
+			// three of its attributes because that is how they were written
+			let at = index.saturating_add(1);
+
+			write!(out, " {at}/{at}/{at}").expect("a String never fails to be written into");
+		}
+
+		out.push('\n');
+	}
+
+	out
+}
+
+/// One number, written so that reading it back gives the same one.
+///
+/// `{}` on an `f32` is the shortest text that round-trips, which is what this
+/// wants: a file that is as small as it can be and still exact. A non-finite
+/// number is written as nought rather than as `NaN`, which no OBJ reader
+/// accepts - the geometry is already broken by then and an unreadable file
+/// would only hide it.
+fn number(value: f32) -> f32 { if value.is_finite() { value } else { 0.0 } }
 
 /// The attribute triple a corner names, which is what two corners have to agree
 /// on before they may share a vertex.
@@ -391,6 +469,102 @@ fn resolve(token: &str, declared: usize, what: &str) -> std::result::Result<usiz
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn what_is_written_reads_back_as_the_same_geometry() {
+		// the round trip that makes the writer worth having: a bake writes
+		// this and the compiler reads it, so anything the pair loses is
+		// geometry a person built and the engine then forgot
+		let built = mesh::cube();
+		let text = export(&built);
+		let read = import(&text).unwrap_or_else(|failure| {
+			panic!("what was written did not read back: {failure}\n{text}")
+		});
+
+		assert_eq!(read.vertices.len(), built.vertices.len(), "the same vertices");
+		assert_eq!(read.indices, built.indices, "in the same order, with the same winding");
+
+		for (at, (was, now)) in built
+			.vertices
+			.iter()
+			.zip(&read.vertices)
+			.enumerate()
+		{
+			assert!(
+				Vec3::from_array(was.position)
+					.abs_diff_eq(Vec3::from_array(now.position), 1.0e-6),
+				"vertex {at}'s place"
+			);
+			assert!(
+				Vec2::from_array(was.uv).abs_diff_eq(Vec2::from_array(now.uv), 1.0e-6),
+				"vertex {at}'s texture coordinate, flipped and back"
+			);
+			assert!(
+				Vec3::from_array(was.normal).abs_diff_eq(Vec3::from_array(now.normal), 1.0e-6),
+				"vertex {at}'s normal: {:?} against {:?}",
+				was.normal,
+				now.normal
+			);
+		}
+	}
+
+	#[test]
+	fn the_texture_coordinate_is_flipped_back_on_the_way_out() {
+		// the one flip in the format, and the one thing a writer can get
+		// silently wrong: a texture upside down looks like a texture
+		let mut one = MeshData {
+			vertices: vec![MeshVertex::new(Vec3::ZERO, Vec3::Y, Vec2::new(0.25, 0.75))],
+			indices: Vec::new(),
+			skin: Vec::new(),
+		};
+
+		one.vertices.push(one.vertices[0]);
+		one.vertices.push(one.vertices[0]);
+		one.indices = vec![0, 1, 2];
+
+		let text = export(&one);
+
+		assert!(
+			text.contains("vt 0.25 0.25"),
+			"stored 0.75 from the top is written as 0.25 from the bottom: {text}"
+		);
+		assert!(
+			Vec2::from_array(import(&text).expect("it reads").vertices[0].uv)
+				.abs_diff_eq(Vec2::new(0.25, 0.75), 1.0e-6),
+			"and comes back where it started"
+		);
+	}
+
+	#[test]
+	fn a_number_that_is_not_a_number_is_written_as_nought() {
+		// no OBJ reader accepts NaN, and a file nothing can read hides the
+		// broken geometry instead of showing it
+		let broken = MeshData {
+			vertices: vec![
+				MeshVertex::new(
+					Vec3::new(f32::NAN, 1.0, f32::INFINITY),
+					Vec3::Y,
+					Vec2::ZERO
+				);
+				3
+			],
+			indices: vec![0, 1, 2],
+			skin: Vec::new(),
+		};
+		let text = export(&broken);
+
+		assert!(text.contains("v 0 1 0"), "the two that are not numbers are nought: {text}");
+		assert!(import(&text).is_ok(), "and what comes out is readable");
+	}
+
+	#[test]
+	fn a_mesh_with_nothing_in_it_writes_a_file_that_reads_as_nothing() {
+		let empty = export(&MeshData::default());
+		let read = import(&empty).expect("an empty file is a mesh with no triangles");
+
+		assert_eq!(read.vertices.len(), 0);
+		assert_eq!(read.indices.len(), 0);
+	}
 
 	/// The two triangles of a unit square in the xz plane, wound facing up, and
 	/// written the way a tool would write them.

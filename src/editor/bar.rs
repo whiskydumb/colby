@@ -92,7 +92,7 @@ fn strip(
 		ui.separator();
 		tools(ui, tool, changes);
 		ui.separator();
-		pool = adding(ui, changes);
+		pool = adding(ui, filed, changes);
 		ui.separator();
 		filing(ui, filed, typed, changes);
 		hint(ui);
@@ -172,7 +172,7 @@ fn tools(ui: &mut Ui, tool: Tool, changes: &mut Vec<Change>) {
 ///
 /// @return where the water button landed, so that something other than a hand
 /// can find it and press it
-fn adding(ui: &mut Ui, changes: &mut Vec<Change>) -> Rect {
+fn adding(ui: &mut Ui, filed: &str, changes: &mut Vec<Change>) -> Rect {
 	let response = ui
 		.button("+ water")
 		.on_hover_text("a pool in the middle of the view, floating whatever falls in");
@@ -187,6 +187,17 @@ fn adding(ui: &mut Ui, changes: &mut Vec<Change>) -> Rect {
 		.clicked()
 	{
 		changes.push(Change::Block);
+	}
+
+	if ui
+		.button("bake")
+		.on_hover_text(
+			"turns the selected blocks - or every block, if none are - into one mesh per 			 \
+			 material, written under assets/maps/ with the name in the write field",
+		)
+		.clicked()
+	{
+		changes.push(Change::Bake(filed.to_owned()));
 	}
 
 	response.rect
