@@ -19,6 +19,7 @@ use colby_core::{
 };
 
 use crate::{
+	broad::Broad,
 	Simulation,
 	convex::{Hull, MAX_CONTACTS, Touch, collide},
 	query,
@@ -108,6 +109,8 @@ impl Manifold {
 pub(crate) fn find(
 	bodies: &Bodies,
 	simulation: &Simulation,
+	broad: &mut Broad,
+	candidates: &mut Vec<(u32, u32)>,
 	into: &mut Vec<Manifold>,
 	sensed: &mut Vec<Manifold>,
 ) {
@@ -119,52 +122,69 @@ pub(crate) fn find(
 		.map(|(id, body)| (id, *body))
 		.collect();
 
-	for (index, &(first, ref one)) in handles.iter().enumerate() {
-		for &(second, ref other) in &handles[index + 1..] {
-			// two sensors have nothing to tell each other. Neither pushes, so
-			// neither has anything to notice, and a world full of trigger
-			// volumes would otherwise test every one against every other.
-			if !one.solid() && !other.solid() {
-				continue;
-			}
+	// **the bounding boxes first, and only then the pairs.** This used to be a
+	// loop over every pair in the world, which at two hundred bodies is twenty
+	// thousand hulls built and separating axes tested to decide that nothing
+	// touches anything - two and a quarter milliseconds a step, measured.
+	// @ref [`broad`](crate::broad) for what the sweep is and why the order of
+	// what comes out of it is the order the square produced.
+	broad.sweep(
+		handles
+			.iter()
+			.map(|&(id, ref body)| query::world_bounds(body, simulation.collider(id))),
+		candidates,
+	);
 
-			let sensing = !one.solid() || !other.solid();
+	for &(first_at, second_at) in candidates.iter() {
+		let (Some(&(first, ref one)), Some(&(second, ref other))) =
+			(handles.get(first_at as usize), handles.get(second_at as usize))
+		else {
+			continue;
+		};
 
-			// two bodies neither of which the solver moves can never need
-			// separating, however much they overlap. A sensor is exempt rather
-			// than overlooked: what it produces is an event and not a
-			// separation, and a static body really does move here - it is
-			// written from the entity it is bolted to at the top of every step,
-			// so a trigger a moving prop is carried through has to be asked.
-			if !sensing && !one.movable() && !other.movable() {
-				continue;
-			}
-
-			if one.sleeping && other.sleeping {
-				continue;
-			}
-
-			// and last, the two filters a game set up on purpose. Last because
-			// they are the only ones that are somebody's decision rather than
-			// an arrangement of the world, so a pair skipped here is skipped
-			// for a reason that can be read out of the two bodies and whatever
-			// holds them.
-			if !one.layers.meets(other.layers) {
-				continue;
-			}
-
-			// a joint between them, saying they are held together rather than
-			// pushed apart. Only the solid pair: a sensor does not collide, so
-			// there is no collision here for a joint to have switched off, and
-			// a trigger a welded prop is carried through still notices it.
-			if !sensing && simulation.excused((first, second)) {
-				continue;
-			}
-
-			let list = if sensing { &mut *sensed } else { &mut *into };
-
-			pair(simulation, (first, one), (second, other), list);
+		// two sensors have nothing to tell each other. Neither pushes, so
+		// neither has anything to notice, and a world full of trigger
+		// volumes would otherwise test every one against every other.
+		if !one.solid() && !other.solid() {
+			continue;
 		}
+
+		let sensing = !one.solid() || !other.solid();
+
+		// two bodies neither of which the solver moves can never need
+		// separating, however much they overlap. A sensor is exempt rather
+		// than overlooked: what it produces is an event and not a
+		// separation, and a static body really does move here - it is
+		// written from the entity it is bolted to at the top of every step,
+		// so a trigger a moving prop is carried through has to be asked.
+		if !sensing && !one.movable() && !other.movable() {
+			continue;
+		}
+
+		if one.sleeping && other.sleeping {
+			continue;
+		}
+
+		// and last, the two filters a game set up on purpose. Last because
+		// they are the only ones that are somebody's decision rather than
+		// an arrangement of the world, so a pair skipped here is skipped
+		// for a reason that can be read out of the two bodies and whatever
+		// holds them.
+		if !one.layers.meets(other.layers) {
+			continue;
+		}
+
+		// a joint between them, saying they are held together rather than
+		// pushed apart. Only the solid pair: a sensor does not collide, so
+		// there is no collision here for a joint to have switched off, and
+		// a trigger a welded prop is carried through still notices it.
+		if !sensing && simulation.excused((first, second)) {
+			continue;
+		}
+
+		let list = if sensing { &mut *sensed } else { &mut *into };
+
+		pair(simulation, (first, one), (second, other), list);
 	}
 }
 

@@ -53,6 +53,7 @@ use colby_core::{
 	trace,
 };
 
+mod broad;
 pub mod buoyancy;
 mod contact;
 mod convex;
@@ -61,7 +62,7 @@ mod query;
 mod solve;
 
 pub use self::solve::{MAX_PASSES, VELOCITY_PASSES};
-use self::{contact::Manifold, query::Collider, solve::Solver};
+use self::{broad::Broad, contact::Manifold, query::Collider, solve::Solver};
 
 /// The console variable that says how hard the solver tries.
 ///
@@ -175,6 +176,18 @@ pub struct Simulation {
 	/// The sequential-impulse solver and its per-body scratch.
 	solver: Solver,
 
+	/// The sweep that says which pairs are worth asking about, and its scratch.
+	///
+	/// Kept between steps for its allocations only, the same way the manifold
+	/// lists are. @ref [`broad`].
+	broad: Broad,
+
+	/// Which pairs the sweep found this step, in index order.
+	///
+	/// A field for the allocation. Cleared and refilled every step; it is the
+	/// input to the narrow phase and is worth nothing after it.
+	candidates: Vec<(u32, u32)>,
+
 	/// How long the last step spent where. @ref [`Spent`].
 	spent: Spent,
 }
@@ -193,6 +206,8 @@ impl Simulation {
 			sensed: Vec::new(),
 			held: HashSet::new(),
 			solver: Solver::new(),
+			broad: Broad::default(),
+			candidates: Vec::new(),
 			spent: Spent::default(),
 		}
 	}
@@ -245,9 +260,23 @@ impl Simulation {
 		// reason the list is a field at all.
 		let mut manifolds = core::mem::take(&mut self.manifolds);
 		let mut sensed = core::mem::take(&mut self.sensed);
+		// the sweep and its candidate list travel the same way and for the same
+		// reason: both are borrowed mutably by the phase that borrows the
+		// simulation immutably for its collision meshes.
+		let mut broad = core::mem::take(&mut self.broad);
+		let mut candidates = core::mem::take(&mut self.candidates);
 		let finding = Instant::now();
-		contact::find(&world.bodies, self, &mut manifolds, &mut sensed);
+		contact::find(
+			&world.bodies,
+			self,
+			&mut broad,
+			&mut candidates,
+			&mut manifolds,
+			&mut sensed,
+		);
 		self.spent.narrow = finding.elapsed();
+		self.broad = broad;
+		self.candidates = candidates;
 		self.report(world, &manifolds, &sensed);
 		self.remember_where(&world.bodies);
 
