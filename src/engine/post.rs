@@ -86,9 +86,32 @@ const GLOW_SMALLEST: u32 = 8;
 /// How wide the first rung of the ladder is.
 ///
 /// Fixed rather than a share of the window, so that the number of passes does
-/// not depend on how big somebody's screen is: a hundred and twenty-eight
-/// halves seven times to one, always.
-const METER_SIZE: u32 = 128;
+/// not depend on how big somebody's screen is. **Sixty-four rather than a
+/// hundred and twenty-eight since `PERF-2`**: the ladder reduces by
+/// [`METER_STEP`] a rung now, so the number that matters is how many powers of
+/// eight there are between this and one, and sixty-four is two of them.
+///
+/// It has to be a power of [`METER_STEP`] or the last rung is not the step's
+/// own size and the eye's reduction stops being exact. A test says so.
+const METER_SIZE: u32 = 64;
+
+/// How much narrower each rung of the ladder is than the one before it.
+///
+/// **Eight, and the number was measured rather than chosen.** With halving,
+/// the ladder was eight rungs and an eye - nine passes of one tap each - and it
+/// cost about fifty-three microseconds on an RX 9060 XT at seven-twenty, of
+/// which five to seven belonged to every pass whatever was in it. Sweeping
+/// [`METER_SIZE`] showed the cost was very nearly linear in the *number of
+/// passes* and barely moved with the work inside them, which is the shape of a
+/// barrier rather than of arithmetic. So the fix is fewer passes with more in
+/// each, and eight is what Godot reduces by for the same reason
+/// (`luminance.cpp:91-93`).
+///
+/// Eight and not more because sixteen bilinear taps cover exactly an
+/// eight-by-eight block: each tap is a two-by-two average and sixteen of them
+/// tile sixty-four texels. Reducing by sixteen would need sixty-four taps to
+/// stay exact, or would start guessing.
+const METER_STEP: u32 = 8;
 
 /// The numbers the passes read, laid out the way `post.wgsl` declares them.
 #[repr(C)]
@@ -167,7 +190,7 @@ pub(crate) struct Chain {
 	sampler: Sampler,
 	texture_layout: BindGroupLayout,
 	luminance: RenderPipeline,
-	halve: RenderPipeline,
+	reduce: RenderPipeline,
 	adapt: RenderPipeline,
 	threshold: RenderPipeline,
 	down: RenderPipeline,
@@ -264,7 +287,7 @@ impl Chain {
 			sampler,
 			texture_layout,
 			luminance: built.0,
-			halve: built.1,
+			reduce: built.1,
 			adapt: built.2,
 			threshold: built.3,
 			down: built.4,
@@ -452,7 +475,7 @@ impl Chain {
 			let (pipeline, source) = if step == 0 {
 				(&self.luminance, &self.target_read)
 			} else {
-				(&self.halve, &self.rungs[step - 1].read)
+				(&self.reduce, &self.rungs[step - 1].read)
 			};
 			let marks =
 				timings.writes(Pass::Meter, if step == 0 { Ends::Open } else { Ends::Middle });
@@ -470,7 +493,10 @@ impl Chain {
 		let before = self.eye;
 		let after = 1 - before;
 		// the eye moving is the last thing the meter does, so the span ends
-		// here rather than at the bottom of the ladder
+		// here rather than at the bottom of the ladder. It is also the ladder's
+		// last reduction - the rung it reads is `METER_STEP` texels across and
+		// this target is one - which is what took the pass count from four to
+		// three. @ref `fragment_adapt`.
 		let marks = timings.writes(Pass::Meter, Ends::Close);
 
 		screen_pass(encoder, "post adapt", &self.eyes[after].view, marks, |pass| {
@@ -513,10 +539,11 @@ fn pipelines(
 			None,
 			Some(texture),
 		]);
-	let halve = screen_pipeline(device, module, "post halve", "fragment_halve", METER_FORMAT, &[
-		None,
-		Some(texture),
-	]);
+	let reduce =
+		screen_pipeline(device, module, "post reduce", "fragment_reduce", METER_FORMAT, &[
+			None,
+			Some(texture),
+		]);
 	let adapt = screen_pipeline(device, module, "post adapt", "fragment_adapt", METER_FORMAT, &[
 		Some(numbers),
 		Some(texture),
@@ -546,7 +573,7 @@ fn pipelines(
 			Some(texture),
 		]);
 
-	(luminance, halve, adapt, threshold, down, up, composite)
+	(luminance, reduce, adapt, threshold, down, up, composite)
 }
 
 /// The three ways a pass here is handed something: the numbers, a texture
@@ -770,7 +797,13 @@ fn widest(
 	)
 }
 
-/// Every rung, widest first, ending at one texel.
+/// Every rung, widest first, ending at [`METER_STEP`] texels across.
+///
+/// **It stops one reduction short of a single texel on purpose.** The eye's own
+/// pass reduces as well as blending, so the rung it reads is the step's own
+/// size and the ladder has no reason to produce a one-texel rung nothing would
+/// sample. At [`METER_SIZE`] of sixty-four that is two rungs, sixty-four and
+/// eight, and three passes counting the eye.
 fn ladder(device: &Device, sampler: &Sampler, layout: &BindGroupLayout) -> Vec<Rung> {
 	let mut rungs = Vec::new();
 	let mut side = METER_SIZE;
@@ -795,11 +828,11 @@ fn ladder(device: &Device, sampler: &Sampler, layout: &BindGroupLayout) -> Vec<R
 
 		rungs.push(Rung { view, read });
 
-		if side == 1 {
+		if side <= METER_STEP {
 			return rungs;
 		}
 
-		side /= 2;
+		side /= METER_STEP;
 	}
 }
 
@@ -1007,4 +1040,106 @@ fn built(
 		multiview_mask: None,
 		cache: None,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// How many rungs [`ladder`] builds at the constants in hand, without a
+	/// device to build them on.
+	fn rungs() -> u32 {
+		let mut side = METER_SIZE;
+		let mut count = 1;
+
+		while side > METER_STEP {
+			side /= METER_STEP;
+			count += 1;
+		}
+
+		count
+	}
+
+	/// Where the ladder stops.
+	fn bottom() -> u32 {
+		let mut side = METER_SIZE;
+
+		while side > METER_STEP {
+			side /= METER_STEP;
+		}
+
+		side
+	}
+
+	#[test]
+	fn the_bottom_rung_is_exactly_the_step_so_the_eye_reduces_it_without_guessing() {
+		// the whole of why the eye needs no pass of its own: it reads the last
+		// rung and writes one texel, and sixteen bilinear taps are exactly an
+		// eight-by-eight block. A bottom rung of any other size makes that
+		// last step sixteen samples of a block rather than all of it, and
+		// nothing would say so.
+		assert_eq!(bottom(), METER_STEP, "the ladder does not land on the step");
+	}
+
+	#[test]
+	fn the_size_is_a_power_of_the_step() {
+		// the same statement said the other way round, because this is the one
+		// anybody editing `METER_SIZE` will read first.
+		let mut side = METER_SIZE;
+
+		while side > METER_STEP {
+			assert_eq!(side % METER_STEP, 0, "{side} is not a whole number of steps");
+			side /= METER_STEP;
+		}
+
+		assert_eq!(side, METER_STEP);
+	}
+
+	#[test]
+	fn the_meter_is_three_passes() {
+		// **the number `PERF-2` was about.** It was nine - eight rungs and the
+		// eye - and every one of them cost five to seven microseconds of
+		// barrier whatever was inside it. This is the number `--profile`
+		// prints as part of `passes=`, and the one thing in that table worth
+		// comparing between two runs.
+		assert_eq!(rungs(), 2, "sixty-four and eight");
+		assert_eq!(rungs() + 1, 3, "and the eye, which reduces as well as blending");
+	}
+
+	#[test]
+	fn the_shader_declares_the_entry_points_the_pipelines_ask_for() {
+		// a pipeline naming an entry point that is not there fails when the
+		// device builds it, which is a rendered test away rather than here -
+		// and the rename from `fragment_halve` is exactly the edit that leaves
+		// one behind.
+		let source = include_str!("post.wgsl");
+
+		for entry in [
+			"fragment_luminance",
+			"fragment_reduce",
+			"fragment_adapt",
+			"fragment_threshold",
+			"fragment_down",
+			"fragment_up",
+			"fragment_composite",
+		] {
+			assert!(source.contains(&format!("fn {entry}(")), "{entry} is not in post.wgsl");
+		}
+
+		assert!(!source.contains("fragment_halve"), "the halving pass outlived its pipeline");
+	}
+
+	#[test]
+	fn the_taps_and_the_step_agree_across_the_two_languages() {
+		// `TAP_ROWS` in the shader is four because the step is eight: every
+		// tap is a two-by-two average, so a row of four covers eight texels.
+		// Two files, one number, and nothing but this checks it.
+		let source = include_str!("post.wgsl");
+		let rows = METER_STEP / 2;
+
+		assert!(
+			source.contains(&format!("const TAP_ROWS: i32 = {rows};")),
+			"post.wgsl takes a different number of taps than a step of {METER_STEP} needs"
+		);
+	}
 }

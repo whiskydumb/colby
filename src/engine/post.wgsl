@@ -74,46 +74,110 @@ fn luminance(color: vec3<f32>) -> f32 {
 // of nothing.
 const DARKEST: f32 = 1.0e-4;
 
+// How many taps a reduction takes across each axis: four, so sixteen in all.
+//
+// Matched by `METER_STEP` in `post.rs`, and the two have to agree: with a
+// linear sampler every tap is itself the average of a two-by-two block, so
+// sixteen taps stand for exactly an eight-by-eight one. A step of anything but
+// eight makes the reduction sixteen evenly spread samples of the block rather
+// than all of it.
+const TAP_ROWS: i32 = 4;
+
+// Where one tap sits, as a share of what an output texel covers.
+//
+// A four-by-four grid centred on the texel: at plus and minus an eighth and
+// three eighths, the sixteen of them tile the footprint exactly, with no gap
+// and no overlap. Arithmetic rather than a table because WGSL will not index a
+// module constant with a loop variable.
+fn tap(at: vec2<i32>) -> vec2<f32> {
+    return (vec2<f32>(at) - 1.5) * 0.25;
+}
+
+// What one output texel covers, in the input's texture coordinates.
+//
+// Read off the interpolator rather than passed in: uv runs from nought to one
+// across the target, so its derivative across one pixel *is* one output texel,
+// whatever size the target happens to be. Exact for a full-screen triangle, and
+// it is why nothing here has to be told how big the thing it draws into is.
+fn footprint(uv: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(dpdx(uv).x, dpdy(uv).y);
+}
+
+// The mean of the block one output texel stands for.
+//
+// Shared by the reduction and by the eye, which is the whole reason the eye
+// needs no pass of its own any more: the last rung is eight texels across, the
+// eye is one, and that is a reduction like any other with a blend on the end.
+fn reduced(uv: vec2<f32>) -> f32 {
+    let step = footprint(uv);
+    var total = 0.0;
+
+    for (var y = 0; y < TAP_ROWS; y += 1) {
+        for (var x = 0; x < TAP_ROWS; x += 1) {
+            let at = uv + tap(vec2<i32>(x, y)) * step;
+
+            total += textureSample(source, source_sampler, at).r;
+        }
+    }
+
+    return total / f32(TAP_ROWS * TAP_ROWS);
+}
+
 // The picture reduced to a small square of log luminance.
 //
-// Four taps rather than one: the target is a fixed hundred and twenty-eight
-// square whatever the window is, so one texel of it covers a block of the
-// picture, and a single sample would be a meter reading one pixel out of every
-// eighty. The offsets are a quarter of a texel, so with a linear sampler the
-// four together average a two-by-two block of the *output*, which is sixteen
-// samples of the input for four fetches.
+// Sixteen taps spread over the whole block an output texel stands for: the
+// target is a fixed sixty-four square whatever the window is, so one texel of
+// it covers about two hundred pixels of a seven-twenty picture, and a single
+// sample would be a meter reading one pixel in two hundred.
+//
+// **This used to divide by the size of the *source*, and that was a bug.** The
+// note here claimed the four taps averaged a two-by-two block of the output;
+// the offsets were a quarter of an *input* texel, so all four landed within
+// half a pixel of each other and cost four fetches to learn what one would have
+// said. Found while closing `PERF-2` by reading the pass that was being made
+// cheaper.
 //
 // The log is what makes the average a geometric mean, which is what a meter
 // wants: one white pixel in a dark room should not open the eye all the way.
 @fragment
 fn fragment_luminance(input: ScreenOutput) -> @location(0) vec4<f32> {
-    let step = 0.25 / vec2<f32>(textureDimensions(source, 0));
+    let step = footprint(input.uv);
     var total = 0.0;
 
-    for (var y = -1; y <= 1; y += 2) {
-        for (var x = -1; x <= 1; x += 2) {
-            let at = input.uv + vec2<f32>(f32(x), f32(y)) * step;
+    for (var y = 0; y < TAP_ROWS; y += 1) {
+        for (var x = 0; x < TAP_ROWS; x += 1) {
+            let at = input.uv + tap(vec2<i32>(x, y)) * step;
             let bright = luminance(textureSample(source, source_sampler, at).rgb);
 
             total += log2(max(bright, DARKEST));
         }
     }
 
-    return vec4<f32>(total * 0.25, 0.0, 0.0, 1.0);
+    return vec4<f32>(total / f32(TAP_ROWS * TAP_ROWS), 0.0, 0.0, 1.0);
 }
 
-// The same picture at half the width and half the height.
+// The same picture at an eighth of the width and an eighth of the height.
 //
-// One tap, because the sampler is linear and the target is exactly half the
-// source: a single fetch at the middle of a two-by-two block *is* its average.
-// Run until the target is one texel, at which point it holds the whole
-// picture's log-average.
+// **Eight rather than two, because a pass costs more than what is inside it.**
+// Measured while closing `PERF-2`: the ladder was nine passes of one tap each
+// and cost about fifty-three microseconds, of which five to seven belonged to
+// every pass whatever it did. Halving needs eight rungs to get from a
+// sixty-four square to one and reducing by eight needs two, so the same
+// arithmetic arrives in three passes instead of nine. Godot reduces by eight
+// for the same reason (`luminance.cpp:91-93`); Fyrox halves and pays thirteen
+// taps a pass, which is the same trade made the other way round.
 @fragment
-fn fragment_halve(input: ScreenOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSample(source, source_sampler, input.uv).r, 0.0, 0.0, 1.0);
+fn fragment_reduce(input: ScreenOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(reduced(input.uv), 0.0, 0.0, 1.0);
 }
 
-// Where the eye has got to, one texel.
+// Where the eye has got to, one texel - and the ladder's last reduction, in the
+// same pass.
+//
+// **It reduces as well as blends, which saves a pass.** The bottom rung is
+// eight texels across and this target is one, so the step between them is
+// exactly the reduction every other rung does; doing it here rather than in a
+// pass of its own is one fewer barrier for one changed line.
 //
 // **A frame with no history arrives already adapted.** `tuning.meter.w` is one
 // when nothing has been measured yet, which makes this the measurement rather
@@ -126,7 +190,7 @@ fn fragment_halve(input: ScreenOutput) -> @location(0) vec4<f32> {
 // because a stop is a stop whichever end of the range it is at.
 @fragment
 fn fragment_adapt(input: ScreenOutput) -> @location(0) vec4<f32> {
-    let measured = textureSample(source, source_sampler, input.uv).r;
+    let measured = reduced(input.uv);
     let before = textureLoad(eye, vec2<i32>(0, 0), 0).r;
 
     return vec4<f32>(mix(before, measured, tuning.meter.w), 0.0, 0.0, 1.0);
