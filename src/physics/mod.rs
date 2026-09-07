@@ -50,6 +50,7 @@ use colby_core::{
 	trace,
 };
 
+pub mod buoyancy;
 mod contact;
 mod convex;
 pub mod debug;
@@ -210,6 +211,13 @@ impl Simulation {
 			.float(PASSES)
 			.map_or(VELOCITY_PASSES, asked_for);
 
+		// what the fluids do, between the narrow phase that found them and the
+		// solver that spends what they wrote. It has to be here and nowhere
+		// else: the accumulators are cleared right after `run` below, so a
+		// pass in front of it is felt this step and a pass behind it is felt
+		// never. @ref [`buoyancy`].
+		Self::afloat(world, &sensed, dt);
+
 		self.solver
 			.run(&mut world.bodies, &world.joints, &manifolds, world.gravity, dt, passes);
 		// and everything that was pushing is spent, here rather than beside
@@ -325,6 +333,48 @@ impl Simulation {
 	pub(crate) fn manifolds(&self) -> &[Manifold] { &self.manifolds }
 
 	/// Queues what started and stopped touching since the last step, and
+	/// Pushes on everything that is inside a fluid.
+	///
+	/// Read from the *sensed* manifolds rather than from
+	/// [`Bodies::overlaps`], which matters: that list stops at
+	/// [`MAX_OVERLAPS`](colby_core::abi::MAX_OVERLAPS), and a pool with more
+	/// than two hundred and fifty-six things in it would silently stop
+	/// floating some of them. This one has no ceiling, because it spends what
+	/// the narrow phase already found and keeps nothing.
+	///
+	/// A pair with a fluid on both sides is not here at all: two things that
+	/// push nothing make no manifold, so a pool inside a pool is nothing to
+	/// resolve. A pair with a fluid and an ordinary sensor is, and the sensor
+	/// is refused by [`buoyancy::float`] for having no mass to push.
+	///
+	/// @param world - the body table, written, and the gravity, read
+	/// @param sensed - what the narrow phase found for the sensors
+	/// @param dt - how long a step is
+	fn afloat(world: &mut World, sensed: &[Manifold], dt: f32) {
+		for manifold in sensed {
+			if manifold.count == 0 {
+				continue;
+			}
+
+			// a mesh makes one manifold per triangle, and a fluid is never a
+			// mesh - `surface` has no bounds to answer with - so a pair is
+			// named once here and this needs no set to say so.
+			let Some((pool, wet)) = fluid(&world.bodies, (manifold.first, manifold.second))
+			else {
+				continue;
+			};
+			let Some((water, surface)) = world
+				.bodies
+				.get(pool)
+				.and_then(|body| Some((body.water, buoyancy::surface(body)?)))
+			else {
+				continue;
+			};
+
+			buoyancy::float(&mut world.bodies, wet, &water, surface, world.gravity, dt);
+		}
+	}
+
 	/// rebuilds the list of what is inside a sensor.
 	///
 	/// Edges and state, from the same pass over the same pairs. Neither can be
@@ -639,6 +689,24 @@ fn overlapping(bodies: &Bodies, pair: (BodyId, BodyId)) -> Option<Overlap> {
 	None
 }
 
+/// Which of a pair is the fluid, and what is floating in it.
+///
+/// `None` unless exactly one of them holds a fluid: a pool inside a pool has
+/// nothing to say to itself, and neither half would be the one being pushed.
+///
+/// @param bodies - the table, to look both handles up in
+/// @param pair - the two handles
+/// @return `(the fluid, what is in it)`
+fn fluid(bodies: &Bodies, pair: (BodyId, BodyId)) -> Option<(BodyId, BodyId)> {
+	let wet = (bodies.get(pair.0)?.water.is_wet(), bodies.get(pair.1)?.water.is_wet());
+
+	match wet {
+		| (true, false) => Some((pair.0, pair.1)),
+		| (false, true) => Some((pair.1, pair.0)),
+		| _ => None,
+	}
+}
+
 /// A pair of handles in a fixed order, so that one pair is one key.
 fn ordered(first: BodyId, second: BodyId) -> (BodyId, BodyId) {
 	if first.slot() <= second.slot() {
@@ -762,7 +830,7 @@ mod tests {
 	use colby_core::{
 		abi::{
 			Body, BodyKind, EntityId, Joint, JointKind, Layers, MeshId, Motion, Moved, Transform,
-			character, scene,
+			Water, character, scene,
 		},
 		glam::{Quat, Vec2},
 		time::STEP_SECONDS,
@@ -850,6 +918,112 @@ mod tests {
 		world
 			.bodies
 			.spawn(Body::dynamic(Shape::UNIT, Transform::at(at), mass))
+	}
+
+	/// A pool of a shape, standing at the origin, filled to its own brim.
+	///
+	/// @param world - where to put it
+	/// @param extents - its half-extents, so its top is at `extents.y`
+	fn pool(world: &mut World, extents: Vec3) -> BodyId {
+		let mut body = Body::new(BodyKind::Static, Shape::cuboid(extents), Transform::IDENTITY);
+		body.water = Water::pool();
+
+		world.bodies.spawn(body)
+	}
+
+	#[test]
+	fn a_crate_dropped_in_a_pool_rises_and_settles_at_a_waterline_its_mass_decides() {
+		// the whole of the step, through the real narrow phase and the real
+		// solver rather than by hand: the pass only runs at all if a fluid
+		// body and a crate make a sensed manifold and `fluid` picks the pair
+		// apart the right way round.
+		let mut where_ = [0.0_f32; 2];
+
+		for (index, mass) in [1.0_f32, 1.5].into_iter().enumerate() {
+			let (mut world, mut simulation) = wired();
+			pool(&mut world, Vec3::new(8.0, 4.0, 8.0));
+			// dropped from above the surface, so it has to fall in first
+			let crate_ = floating(&mut world, mass, Vec3::new(0.0, 6.0, 0.0));
+
+			settle(&mut world, &mut simulation, 400);
+			where_[index] = placed(&world, crate_).y;
+		}
+
+		// the pool's top is at four, and the default fluid is twice the
+		// default body's density, so a crate of mass one floats with its
+		// middle on the surface. @ref `colby_core::abi::water::DENSITY`.
+		assert!(
+			(where_[0] - 4.0).abs() < 0.1,
+			"a crate of mass one settles at the waterline, got {}",
+			where_[0]
+		);
+		assert!(
+			where_[1] < where_[0] - 0.1,
+			"and a heavier one sits lower, got {} against {}",
+			where_[1],
+			where_[0]
+		);
+	}
+
+	#[test]
+	fn a_tilted_plank_rights_itself_in_the_water() {
+		// the half a naive buoyancy leaves out, and the reason the push goes
+		// through `apply_force_at` rather than `apply_force`.
+		//
+		// A plank rather than a crate, and the reason is worth writing down
+		// because it reads as a bug otherwise: a body symmetric about its own
+		// middle that floats *exactly* half submerged has no righting torque
+		// at any angle, because the wet half is the mirror of the dry half
+		// and its middle is the body's own. The default crate is exactly that
+		// case - mass one in a fluid of density two - so it floats at
+		// whatever angle it was dropped at, correctly. Righting appears the
+		// moment the waterline is anywhere but the middle, which is what this
+		// plank at a quarter submerged is.
+		let (mut world, mut simulation) = wired();
+		pool(&mut world, Vec3::new(8.0, 4.0, 8.0));
+
+		let mut body = Body::dynamic(
+			Shape::cuboid(Vec3::new(1.0, 0.25, 1.0)),
+			Transform::at(Vec3::new(0.0, 4.0, 0.0)),
+			1.0,
+		);
+		body.transform.rotation = Quat::from_rotation_z(0.6);
+		let plank = world.bodies.spawn(body);
+
+		settle(&mut world, &mut simulation, 900);
+
+		let up = world
+			.bodies
+			.get(plank)
+			.map_or(Vec3::ZERO, |body| body.transform.rotation * Vec3::Y);
+
+		assert!(
+			up.y.abs() > 0.98,
+			"a plank tipped thirty-four degrees comes back flat, got {up}"
+		);
+	}
+
+	#[test]
+	fn a_pool_is_walked_through_rather_than_stood_on() {
+		let (mut world, mut simulation) = wired();
+		let surface = pool(&mut world, Vec3::new(8.0, 4.0, 8.0));
+		// heavier than the fluid can hold, so it has to go all the way down
+		let stone = floating(&mut world, 40.0, Vec3::new(0.0, 3.0, 0.0));
+
+		settle(&mut world, &mut simulation, 300);
+
+		assert!(
+			placed(&world, stone).y < -1.0,
+			"a stone sinks through a pool instead of resting on its lid, got {}",
+			placed(&world, stone).y
+		);
+		assert!(
+			world
+				.bodies
+				.get(surface)
+				.is_some_and(|body| !body.solid()),
+			"which is what a fluid reading as unsolid buys"
+		);
 	}
 
 	#[test]
