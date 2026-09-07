@@ -1291,20 +1291,23 @@ mod tests {
 
 	/// How far the meter may be from the truth, in stops.
 	///
-	/// **This number is the debt.** `PERF-8` said the meter's accuracy had no
-	/// test and that one had been tried and thrown away. This is the test, and
-	/// nine tenths of a stop is what the meter as it stands earns: measured
-	/// against pictures whose average is arithmetic rather than sampled, the
-	/// worst of the eight below is **0.83 stops** out - a factor of one and
-	/// three quarters, on stripes two pixels wide.
+	/// **This number is the debt, and it has moved once already.** `PERF-8`
+	/// said the meter's accuracy had no test and that one had been tried and
+	/// thrown away. The test landed at nine tenths of a stop, which was what
+	/// the meter then earned: every tap of the first pass was read wherever the
+	/// jitter had put it, so it came back through the linear sampler as a blend
+	/// of two texels, and the log of a blend of two brightnesses is above the
+	/// blend of their logs - 0.83 stops of it on stripes two pixels wide.
+	/// Snapping each tap to a texel took the worst of the eight pictures below
+	/// to **0.18**, and this came with it.
 	///
-	/// It is a poor guard and it is an honest one. Every tap of the first pass
-	/// is read wherever the jitter put it, so it comes back through the linear
-	/// sampler as a blend of two texels, and the log of a blend of two
-	/// brightnesses is above the blend of their logs. Sixteen taps on a regular
-	/// grid had the opposite failing and a worse one: exact almost everywhere,
-	/// and **1.6 stops** out where the content resonated with them.
-	const LIMIT: f64 = 0.9;
+	/// A quarter of a stop is about nineteen percent and is still not tight.
+	/// What is left is four samples standing for two hundred pixels, and a hash
+	/// nobody has looked at the distribution of. It is tight enough to fail
+	/// both of the samplings this one replaced: sixteen taps on a regular grid
+	/// go **1.6 stops** out where the content resonates with them, and the
+	/// unsnapped jitter 0.83 where it does not.
+	const LIMIT: f64 = 0.25;
 
 	/// The picture the meter is asked about, which is the size a frame is.
 	///
