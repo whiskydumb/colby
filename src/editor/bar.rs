@@ -166,12 +166,12 @@ fn tools(ui: &mut Ui, tool: Tool, changes: &mut Vec<Change>) {
 
 /// What the engine can put in the world without an asset behind it.
 ///
-/// One button today, and it is here rather than in the asset browser for that
-/// reason: the browser is a view of what is under `assets/`, and a body of
-/// water is not under anything. A second such thing is a second button.
+/// Two buttons, and they are here rather than in the asset browser for the
+/// reason the first one was: the browser is a view of what is under `assets/`,
+/// and neither a body of water nor a block is under anything.
 ///
-/// @return where the button landed, so that something other than a hand can
-/// find it and press it
+/// @return where the water button landed, so that something other than a hand
+/// can find it and press it
 fn adding(ui: &mut Ui, changes: &mut Vec<Change>) -> Rect {
 	let response = ui
 		.button("+ water")
@@ -179,6 +179,14 @@ fn adding(ui: &mut Ui, changes: &mut Vec<Change>) -> Rect {
 
 	if response.clicked() {
 		changes.push(Change::Water);
+	}
+
+	if ui
+		.button("+ block")
+		.on_hover_text("a solid cube on the grid, in the middle of the view")
+		.clicked()
+	{
+		changes.push(Change::Block);
 	}
 
 	response.rect

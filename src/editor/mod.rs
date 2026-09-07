@@ -90,6 +90,19 @@ pub use self::{
 /// works as well as the key, because it is the same variable either way.
 pub const SHOW: &str = "editor.show";
 
+/// How far apart the grid's lines are, in world units.
+///
+/// **The step every placement and every drag lands on.** Nought turns snapping
+/// off, which is what the editor did before this existed and is still what
+/// somebody moving a lamp by eye wants.
+///
+/// A variable rather than a constant because the right number is a property of
+/// what is being built - Unreal keeps a whole power-of-two hierarchy of them
+/// with hotkeys to climb it (`CubeGridTool.h:111`, `GridPower` 0 to 31) and
+/// Godot's editor keeps one in the project. One number and a console line is
+/// the smallest thing that is honestly a grid.
+pub const GRID: &str = "editor.grid";
+
 /// The variable that decides whether the world is being edited rather than
 /// played.
 ///
@@ -113,6 +126,13 @@ const UNNAMED: &str = "edited";
 /// one thing a panel can get wrong without anybody noticing until the work is
 /// gone.
 const KEEP: &str = "sim.keep";
+
+/// What the grid is set to when nobody has said otherwise.
+///
+/// Half a unit, which is half the built-in cube: two blocks side by side meet
+/// exactly, and a block half a step off the grid is visibly off it rather than
+/// arguably off it.
+const GRID_STEP: f32 = 0.5;
 
 /// What the window lends the editor for one frame: the pacing, the
 /// project and the device.
@@ -286,6 +306,12 @@ pub(crate) enum Change {
 	/// something the engine can make on its own, which is why it is a press
 	/// rather than a row in the browser.
 	Water,
+
+	/// Put a block in the middle of what is being looked at, on the grid.
+	///
+	/// The same kind of press as [`Water`](Self::Water) and for the same
+	/// reason: a cube is something the engine can make on its own.
+	Block,
 
 	/// Put an asset into the world, where it was dropped.
 	Drop {
@@ -492,6 +518,19 @@ impl Editor {
 		world
 			.cvars
 			.saved(SHOW, Value::Bool(true), "show the editor; F1 does the same thing");
+		world.cvars.saved(
+			GRID,
+			Value::Float(GRID_STEP),
+			"how far apart the editor's grid is, in world units; 0 turns snapping off",
+		);
+	}
+
+	/// The grid step this world is being edited on, or nothing for no snapping.
+	///
+	/// @param world - where the variable lives
+	#[must_use]
+	pub fn grid(world: &World) -> Option<f32> {
+		world.cvars.float(GRID).filter(|step| *step > 0.0)
 	}
 
 	/// Whether the editor is on screen.
@@ -846,6 +885,7 @@ impl Panels {
 			| Change::Shut { which } => self.restore = self.tabs.close(which),
 			| Change::Inspect { name } => self.inspect(world, &name),
 			| Change::Water => self.water(world),
+			| Change::Block => self.block(world),
 			| Change::Drop { name, kind, at } => self.drop(world, &name, kind, at),
 		}
 	}
@@ -957,6 +997,32 @@ impl Panels {
 		}
 
 		debug!(name, "nothing in the world answers to that asset");
+	}
+
+	/// Puts a block down where the middle of the picture meets the floor.
+	///
+	/// The same arithmetic `water` does, and for its reason: a block put at the
+	/// origin while somebody is looking somewhere else is a block they have to
+	/// go and find.
+	fn block(&mut self, world: &mut World) {
+		let middle = Vec2::new(self.view.width() * 0.5, self.view.height() * 0.5);
+		let size = Vec2::new(self.view.width().max(1.0), self.view.height().max(1.0));
+		let at = aim::floor(&world.render_camera(), middle, size);
+
+		self.tabs.history().begin("block", world);
+
+		let made = select::block(world, at, Editor::grid(world));
+
+		if made.is_empty() {
+			warn!("there was no room in the world for a block");
+
+			return;
+		}
+
+		self.selection.clear();
+		for pick in &made {
+			self.selection.toggle(world, *pick);
+		}
 	}
 
 	fn water(&mut self, world: &mut World) {

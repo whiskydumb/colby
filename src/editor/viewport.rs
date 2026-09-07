@@ -44,6 +44,7 @@ use colby_core::{
 use egui::{Color32, Context, Key, LayerId, Painter, PointerButton, Pos2, Rect, Stroke, vec2};
 
 use crate::{
+	Editor,
 	aim::{self, View},
 	gizmo::{self, Axis, Tool},
 	history::History,
@@ -370,6 +371,7 @@ impl Viewport {
 			| Tool::Size =>
 				gizmo::sized(grab.from, grab.axis, 1.0 + grab.total / grab.arm.max(1.0e-4)),
 		};
+		let put = held(put, grab.tool, Editor::grid(world));
 		let (tool, from, others) = (grab.tool, grab.from, grab.others.clone());
 
 		history.begin(tool.word(), world);
@@ -660,6 +662,39 @@ fn read(
 		},
 	}
 }
+/// A dragged transform put on the grid, if there is one.
+///
+/// **The grid holds a drag, not only a placement.** One that held only what is
+/// put down would be a grid nobody could use a minute later, when the thing
+/// needs moving - so a move lands on a line and a size lands on a whole number
+/// of cells.
+///
+/// **Turning is deliberately not snapped.** An angle is a different unit: a
+/// step in world units says nothing about degrees, and giving it one would be a
+/// second number and a second decision. Unreal keeps its angle snap apart from
+/// its grid for the same reason.
+///
+/// @param put - where the drag has got to
+/// @param tool - which of the three is being dragged
+/// @param step - the grid, or nothing for none
+#[must_use]
+fn held(put: Transform, tool: Tool, step: Option<f32>) -> Transform {
+	let Some(step) = step else {
+		return put;
+	};
+
+	match tool {
+		| Tool::Move => Transform {
+			position: select::snapped(put.position, step),
+			..put
+		},
+		| Tool::Size => Transform {
+			scale: select::sized(put.scale, step),
+			..put
+		},
+		| Tool::Turn => put,
+	}
+}
 
 /// An angle put back into the half turn either side of nothing.
 fn wrapped(angle: f32) -> f32 {
@@ -707,6 +742,50 @@ fn picked(world: &World, at: Vec2, viewport: Vec2) -> Pick {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn the_grid_holds_a_move_and_a_size_and_leaves_a_turn_alone() {
+		let put = Transform {
+			position: Vec3::new(1.2, 0.0, -0.4),
+			rotation: colby_core::glam::Quat::from_rotation_y(0.3),
+			scale: Vec3::new(1.1, 0.2, 2.4),
+		};
+
+		let moved = held(put, Tool::Move, Some(0.5));
+
+		assert_eq!(moved.position, Vec3::new(1.0, 0.0, -0.5), "a move lands on a line");
+		assert_eq!(moved.scale, put.scale, "and leaves the size where it was");
+
+		let sized = held(put, Tool::Size, Some(0.5));
+
+		assert_eq!(
+			sized.scale,
+			Vec3::new(1.0, 0.5, 2.5),
+			"a size lands on whole cells, and never on nought"
+		);
+		assert_eq!(sized.position, put.position, "and leaves the place where it was");
+
+		let turned = held(put, Tool::Turn, Some(0.5));
+
+		assert_eq!(
+			turned, put,
+			"a turn is not snapped at all: an angle is a different unit and wants a step of its \
+			 own"
+		);
+	}
+
+	#[test]
+	fn no_grid_holds_nothing() {
+		let put = Transform {
+			position: Vec3::new(1.237, -0.9, 0.04),
+			rotation: colby_core::glam::Quat::IDENTITY,
+			scale: Vec3::new(0.31, 1.77, 0.02),
+		};
+
+		for tool in [Tool::Move, Tool::Turn, Tool::Size] {
+			assert_eq!(held(put, tool, None), put, "{tool:?} is left alone with no grid");
+		}
+	}
 
 	#[test]
 	fn an_angle_comes_back_inside_the_half_turn_either_side_of_nothing() {

@@ -872,6 +872,118 @@ pub(crate) const POOL: Vec3 = Vec3::new(8.0, 3.0, 8.0);
 /// @param world - the world to write
 /// @param at - where the middle of it goes
 /// @return what was made, for the selection; empty if the tables are full
+/// The nearest point on a grid of this step.
+///
+/// **Half away rounds away from nought**, which is `f32::round`'s rule and is
+/// the one a person expects: a block dragged to 0.25 on a step of 0.5 lands on
+/// 0.5 rather than on nought, and one dragged to -0.25 lands on -0.5. A step of
+/// nought or less is no grid and the point is its own.
+///
+/// @param at - the point
+/// @param step - how far apart the lines are
+#[must_use]
+pub(crate) fn snapped(at: Vec3, step: f32) -> Vec3 {
+	if !step.is_finite() || step <= 0.0 {
+		return at;
+	}
+
+	(at / step).round() * step
+}
+
+/// A size on a grid of this step, never smaller than one step.
+///
+/// **Not [`snapped`], and the difference is what a grid is for.** A size that
+/// rounded to nought would be a block with no thickness, which is a block
+/// nobody can see, click or collide with - so the smallest a block gets is one
+/// cell. The sign is kept, because a negative scale is a mirror and taking that
+/// away is not this function's business.
+///
+/// @param size - how big it is along each axis
+/// @param step - how far apart the lines are
+#[must_use]
+pub(crate) fn sized(size: Vec3, step: f32) -> Vec3 {
+	if !step.is_finite() || step <= 0.0 {
+		return size;
+	}
+
+	Vec3::new(one_cell(size.x, step), one_cell(size.y, step), one_cell(size.z, step))
+}
+
+/// One axis of a size, rounded to the grid and held at one cell.
+fn one_cell(size: f32, step: f32) -> f32 {
+	let rounded = (size.abs() / step).round().max(1.0) * step;
+
+	if size < 0.0 { -rounded } else { rounded }
+}
+
+/// A block: a cube standing on the grid, solid, and nothing else.
+///
+/// **The whole of the block tool, and it is short on purpose.** A block is an
+/// entity with the built-in cube on it and a static box body driving it, which
+/// means the gizmo moves it, the hierarchy lists it, undo remembers it,
+/// duplicate copies it, delete removes it and a saved scene carries it - all
+/// of that for nothing, because a block *is* an entity and every one of those
+/// already works on entities.
+///
+/// **The collider needs no size of its own**: the solver scales a shape by the
+/// transform it stands in (`contact.rs:650`), so a unit box in a transform
+/// scaled to the block is the block.
+///
+/// What the field says about keeping blocks: nobody ships them. Unreal's
+/// brushes kept them in the level and `CSG_Add` and `CSG_Subtract` are marked
+/// "(deprecated, do not use.)" in `Brush.h`; Godot's CSG keeps a tree of
+/// shapes and its own documentation says prototyping only, bake to static
+/// geometry; s&box keeps a half-edge mesh in the scene and no blocks at all.
+/// So this is the editing form and a bake is the shipping one - a card of its
+/// own, and until it exists the honest thing is that a room of these is a room
+/// of entities.
+///
+/// **How big a new one is**: a unit cube whenever the grid divides a unit, and
+/// one cell when the cells are bigger than that - which is [`sized`] applied to
+/// [`Vec3::ONE`] and needs no rule of its own. So a step of a quarter, a half
+/// or a whole all give a unit block, and a step of two gives a two-unit one.
+///
+/// @param world - the world to put it in
+/// @param at - where the pointer is looking, before snapping
+/// @param step - the grid, or nothing for none
+/// @return what was made, for the selection; empty when there was no room
+pub(crate) fn block(world: &mut World, at: Vec3, step: Option<f32>) -> Vec<Pick> {
+	let grid = step.unwrap_or(0.0);
+	let size = sized(Vec3::ONE, grid);
+	// half a block up, so that a block put down on the floor stands on it
+	// rather than half through it - which is where the point under the
+	// pointer is, and is not where a person means
+	let standing = Transform {
+		position: snapped(at, grid) + Vec3::Y * size.y * 0.5,
+		rotation: colby_core::glam::Quat::IDENTITY,
+		scale: size,
+	};
+	let entity = world.entities.spawn_at(standing);
+
+	if !entity.is_some() {
+		return Vec::new();
+	}
+
+	world
+		.entities
+		.set_renderable(entity, Renderable::new(MeshId::CUBE, Vec3::splat(0.8)));
+	world.entities.set_name(entity, "block");
+
+	let body = world
+		.bodies
+		.spawn(Body::new(BodyKind::Static, Shape::UNIT, standing).driving(entity));
+
+	if !body.is_some() {
+		world.entities.despawn(entity);
+
+		return Vec::new();
+	}
+
+	world.bodies.set_name(body, "block");
+
+	vec![Pick::Entity(entity)]
+}
+
 pub(crate) fn water(world: &mut World, at: Vec3) -> Vec<Pick> {
 	let mut standing = Transform::at(at);
 	standing.scale = POOL;
@@ -1839,6 +1951,112 @@ mod tests {
 			"where the model puts it, from where the model was dropped"
 		);
 		assert_eq!(world.entities.renderable(shade).map(|it| it.mesh), Some(MeshId::CUBE));
+	}
+
+	#[test]
+	fn a_point_lands_on_the_nearest_line_and_half_rounds_away_from_nought() {
+		assert_eq!(snapped(Vec3::new(0.24, 0.0, -0.24), 0.5), Vec3::ZERO, "under half");
+		assert_eq!(
+			snapped(Vec3::new(0.25, 0.0, -0.25), 0.5),
+			Vec3::new(0.5, 0.0, -0.5),
+			"half away from nought, which is what a person dragging expects"
+		);
+		assert_eq!(snapped(Vec3::new(1.4, 2.6, -3.9), 1.0), Vec3::new(1.0, 3.0, -4.0));
+	}
+
+	#[test]
+	fn a_step_of_nothing_is_no_grid_at_all() {
+		let loose = Vec3::new(0.137, -2.9, 41.0);
+
+		for step in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+			assert_eq!(snapped(loose, step), loose, "a step of {step} snaps nothing");
+			assert_eq!(sized(loose, step), loose, "and sizes nothing");
+		}
+	}
+
+	#[test]
+	fn a_size_never_rounds_down_to_nothing() {
+		// the difference between a size and a point, and the reason `sized`
+		// exists at all: a block with no thickness cannot be seen, clicked or
+		// collided with, so the smallest one is a cell
+		assert_eq!(sized(Vec3::splat(0.01), 0.5), Vec3::splat(0.5), "one cell, not nought");
+		assert_eq!(sized(Vec3::splat(0.6), 0.5), Vec3::splat(0.5));
+		assert_eq!(sized(Vec3::new(1.2, 2.4, 0.1), 0.5), Vec3::new(1.0, 2.5, 0.5));
+	}
+
+	#[test]
+	fn a_size_keeps_the_sign_it_had() {
+		// a negative scale is a mirror, and taking one away is not this
+		// function's business
+		assert_eq!(sized(Vec3::new(-1.2, 1.2, -0.01), 0.5), Vec3::new(-1.0, 1.0, -0.5));
+	}
+
+	#[test]
+	fn a_block_stands_on_the_floor_rather_than_half_through_it() {
+		let mut world = World::new();
+		let made = block(&mut world, Vec3::new(2.3, 0.0, -1.1), Some(0.5));
+
+		let [Pick::Entity(entity)] = made[..] else {
+			panic!("one entity: {made:?}");
+		};
+		let standing = world
+			.entities
+			.placed(entity)
+			.expect("it stands somewhere");
+
+		assert_eq!(
+			standing.position,
+			Vec3::new(2.5, 0.5, -1.0),
+			"snapped along the floor and lifted by half its height"
+		);
+		assert_eq!(
+			standing.scale,
+			Vec3::ONE,
+			"a unit cube, because a step of half divides a unit; a step bigger than one gives 			 one cell instead"
+		);
+		assert_eq!(world.entities.name(entity), "block");
+	}
+
+	#[test]
+	fn a_block_is_solid_and_its_collider_is_the_block() {
+		// the whole reason this is cheap: the solver scales a shape by the
+		// transform it stands in, so a unit box in the block's transform is
+		// the block, and nothing here has to size a collider
+		let mut world = World::new();
+		let made = block(&mut world, Vec3::ZERO, Some(2.0));
+
+		assert_eq!(made.len(), 1, "one thing selected, and it is the entity");
+
+		let (_, held) = world
+			.bodies
+			.iter()
+			.find(|(id, _)| world.bodies.name(*id) == "block")
+			.expect("a block is solid");
+
+		assert_eq!(held.kind, BodyKind::Static, "and static, because a wall does not fall");
+		assert_eq!(held.shape.kind, ShapeKind::Box);
+		assert_eq!(held.shape.extents, Vec3::splat(0.5), "a unit box");
+		assert_eq!(held.transform.scale, Vec3::splat(2.0), "in a transform that is the block");
+	}
+
+	#[test]
+	fn a_block_put_down_with_no_grid_lands_where_it_was_asked_for() {
+		let mut world = World::new();
+		let made = block(&mut world, Vec3::new(2.3, 0.0, -1.1), None);
+
+		let [Pick::Entity(entity)] = made[..] else {
+			panic!("one entity: {made:?}");
+		};
+
+		assert_eq!(
+			world
+				.entities
+				.placed(entity)
+				.expect("it stands")
+				.position,
+			Vec3::new(2.3, 0.5, -1.1),
+			"unsnapped along the floor, and still lifted by half a unit block"
+		);
 	}
 
 	#[test]
