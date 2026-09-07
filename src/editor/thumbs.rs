@@ -1,6 +1,6 @@
 //! Pictures of what is in the asset tree: a mesh drawn once into a small
-//! target, a texture shrunk to the same size, each kept as a png beside the
-//! compiled tree.
+//! target, a material worn by a ball, a texture shrunk to the same size, each
+//! kept as a png beside the compiled tree.
 //!
 //! **One scene, one world, one entity, reused.** A [`Capture`] is a table of
 //! pipelines and everything it has uploaded, and making one per picture
@@ -22,12 +22,12 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use colby_asset::{MeshFile, TextureFile, compile::Kind, png};
+use colby_asset::{MeshFile, TextureFile, compile::Kind, material::MaterialFile, png};
 use colby_core::{
 	Err, Result,
 	abi::{
-		Camera, EntityId, Renderable, World,
-		texture::{Texel, TextureData},
+		Camera, EntityId, Material, MeshId, Renderable, World,
+		texture::{self, Texel, TextureData},
 	},
 	debug,
 	glam::Vec3,
@@ -45,6 +45,9 @@ pub(crate) const SIZE: u32 = 64;
 /// and again.
 const MESH_NAME: &str = "thumbnail";
 
+/// The same for the one material.
+const MATERIAL_NAME: &str = "thumbnail";
+
 /// From which way a mesh is looked at: a little above, from the front and
 /// the side, so that three faces of a box show.
 const EYE: Vec3 = Vec3::new(1.0, 0.8, 1.3);
@@ -53,6 +56,13 @@ const EYE: Vec3 = Vec3::new(1.0, 0.8, 1.3);
 pub(crate) struct Thumbs {
 	/// Where the pngs go.
 	dir: PathBuf,
+
+	/// The compiled tree, for the pictures a material names.
+	///
+	/// A material is the one asset that points at *another* one, and a
+	/// thumbnail world has no loader watching a directory - so the two
+	/// textures are opened by hand, from here.
+	compiled: PathBuf,
 
 	/// Every picture handed to egui so far, by asset name.
 	loaded: HashMap<String, TextureHandle>,
@@ -75,13 +85,15 @@ impl Thumbs {
 	/// A cache under a directory, with nothing loaded yet.
 	///
 	/// @param dir - where the pngs go, made when the first one is written
-	pub(crate) fn new(dir: PathBuf) -> Self {
+	/// @param compiled - the compiled tree, for a material's own pictures
+	pub(crate) fn new(dir: PathBuf, compiled: PathBuf) -> Self {
 		let mut world = Box::new(World::new());
 		world.clear = Vec3::splat(0.14);
 		let entity = world.entities.spawn();
 
 		Self {
 			dir,
+			compiled,
 			loaded: HashMap::new(),
 			refused: Vec::new(),
 			world,
@@ -108,7 +120,9 @@ impl Thumbs {
 		entry: &Entry,
 		made: &mut bool,
 	) -> Option<TextureId> {
-		if !matches!(entry.kind, Kind::Mesh | Kind::Texture) || entry.state == State::Uncompiled {
+		if !matches!(entry.kind, Kind::Mesh | Kind::Texture | Kind::Material)
+			|| entry.state == State::Uncompiled
+		{
 			return None;
 		}
 
@@ -162,6 +176,7 @@ impl Thumbs {
 
 		let image = match entry.kind {
 			| Kind::Mesh => self.render(gpu, &entry.output)?,
+			| Kind::Material => self.wearing(gpu, &entry.output, &entry.name)?,
 			| Kind::Texture => shrink(&entry.output)?,
 			| _ =>
 				return Err!(Asset("nothing draws a picture of a {}", catalog::word(entry.kind))),
@@ -200,6 +215,105 @@ impl Thumbs {
 		};
 
 		capture.shoot(&mut self.world)
+	}
+
+	/// A ball wearing a material, drawn once.
+	///
+	/// **A ball rather than the cube a mesh gets**, and it is the field's
+	/// shape: Fyrox's material panel has a preview sphere in it, and a sphere
+	/// is the one surface that shows a roughness and a metal at every
+	/// angle at once - a flat face shows one highlight or none.
+	///
+	/// The two pictures it may name are opened from the compiled tree by hand.
+	/// A material is the only asset that points at another, and a thumbnail
+	/// world has no loader watching a directory; one that cannot be read is
+	/// left out rather than refusing the picture, because a material with a
+	/// missing texture is still a material worth looking at.
+	///
+	/// @param gpu - the device, or nothing
+	/// @param output - the `.cmat` on disk
+	/// @param name - its asset name, which the file does not carry
+	fn wearing(&mut self, gpu: Option<&Gpu>, output: &Path, name: &str) -> Result<Image> {
+		let Some(gpu) = gpu else {
+			return Err!(Graphics("no device to draw a thumbnail with"));
+		};
+
+		let described = MaterialFile::open(output)?.to_material(name);
+		let albedo = self.picture_named(&described.albedo);
+		let normal = self.picture_named(&described.normal);
+		let material = self
+			.world
+			.materials
+			.insert(MATERIAL_NAME, Material {
+				base_color: described.base_color,
+				uv_scale: described.uv_scale,
+				wrap: described.wrap,
+				blend: described.blend,
+				opacity: described.opacity,
+				..Material::textured(albedo)
+					.bumped(normal)
+					.finished(described.metallic, described.roughness)
+			});
+
+		self.world
+			.entities
+			.set_renderable(self.entity, Renderable::of(MeshId::SPHERE, material, Vec3::ONE));
+
+		let (min, max) = self
+			.world
+			.meshes
+			.get(MeshId::SPHERE)
+			.map_or((Vec3::ZERO, Vec3::ZERO), |entry| entry.value().bounds());
+		frame(&mut self.world.camera, min, max);
+
+		if self.capture.is_none() {
+			self.capture = Some(Capture::new(gpu, SIZE, SIZE)?);
+		}
+
+		let Some(capture) = self.capture.as_mut() else {
+			return Err!(Graphics("no target to draw a thumbnail into"));
+		};
+
+		capture.shoot(&mut self.world)
+	}
+
+	/// One of a material's two pictures, put in the thumbnail world.
+	///
+	/// @param name - the texture's asset name, or empty for none
+	/// @return its handle, or [`texture::TextureId::NONE`] for a name that is
+	/// empty or that nothing on disk answers to
+	///
+	/// @note: the *engine's* handle, not egui's - this module speaks both, and
+	/// the two are one word apart.
+	fn picture_named(&mut self, name: &str) -> texture::TextureId {
+		if name.is_empty() {
+			return texture::TextureId::NONE;
+		}
+
+		// already in the world, from a material drawn before this one: a
+		// thumbnail world is reused across pictures, which is the whole
+		// reason it is a field.
+		let held = self.world.textures.find(name);
+		if held.is_some() {
+			return held;
+		}
+
+		let path = self
+			.compiled
+			.join(name)
+			.with_extension(colby_asset::texture::EXTENSION);
+
+		match TextureFile::open(&path) {
+			| Ok(file) => self
+				.world
+				.textures
+				.insert(name, file.to_texture_data()),
+			| Err(error) => {
+				debug!(name, %error, "a material's picture is not on disk");
+
+				texture::TextureId::NONE
+			},
+		}
 	}
 }
 
@@ -362,6 +476,107 @@ mod tests {
 		assert!(!fresh(&thumb, &output), "and stale once the output is newer");
 	}
 
+	/// The described form of a material, off its defaults.
+	fn brass() -> colby_asset::model::Material {
+		colby_asset::model::Material {
+			name: "materials/brass".to_owned(),
+			albedo: String::new(),
+			normal: String::new(),
+			base_color: Vec3::new(0.85, 0.62, 0.22),
+			metallic: 1.0,
+			roughness: 0.2,
+			wrap: colby_core::abi::material::Wrap::Repeat,
+			blend: colby_core::abi::material::Blend::Opaque,
+			opacity: 1.0,
+			uv_scale: colby_core::glam::Vec2::ONE,
+		}
+	}
+
+	#[test]
+	fn a_material_is_drawn_on_a_ball_and_two_materials_are_two_pictures() {
+		let Some(gpu) = Gpu::open(gpu::backends(None), None).expect("the adapter query works")
+		else {
+			return;
+		};
+
+		let dir = env::temp_dir().join("colby_thumbs_material");
+		drop(fs::remove_dir_all(&dir));
+		fs::create_dir_all(&dir).expect("a directory to work in");
+		let mut thumbs = Thumbs::new(dir.join("thumbs"), dir.join("assets"));
+
+		let output = dir.join("brass.cmat");
+		fs::write(&output, colby_asset::material::encode(&brass())).expect("the file");
+
+		let image = thumbs
+			.wearing(Some(&gpu), &output, "materials/brass")
+			.expect("the material draws");
+
+		assert_eq!((image.width, image.height), (SIZE, SIZE));
+
+		let middle = image.pixel(SIZE / 2, SIZE / 2);
+		let corner = image.pixel(0, 0);
+
+		assert_ne!(middle, corner, "the ball is in the middle and the clear color in the corner");
+		assert!(
+			middle[0] > middle[2],
+			"and it is the material's own color rather than the default's white: {middle:?}"
+		);
+
+		// the same name, another material: the picture has to move, which is
+		// the registry's revision doing for a material what it does for a mesh
+		let pale = colby_asset::model::Material {
+			base_color: Vec3::new(0.15, 0.3, 0.9),
+			metallic: 0.0,
+			roughness: 0.9,
+			..brass()
+		};
+		fs::write(&output, colby_asset::material::encode(&pale)).expect("the second file");
+
+		let again = thumbs
+			.wearing(Some(&gpu), &output, "materials/brass")
+			.expect("the second material draws");
+
+		assert_ne!(again.pixels, image.pixels, "a blue matte ball is not a brass one");
+		assert!(
+			again.pixel(SIZE / 2, SIZE / 2)[2] > again.pixel(SIZE / 2, SIZE / 2)[0],
+			"and the second one is the blue"
+		);
+	}
+
+	#[test]
+	fn a_material_naming_a_picture_that_is_not_there_still_draws() {
+		// a material with a missing texture is still a material worth looking
+		// at, and the browser is exactly where somebody would find out that
+		// the texture is missing.
+		let Some(gpu) = Gpu::open(gpu::backends(None), None).expect("the adapter query works")
+		else {
+			return;
+		};
+
+		let dir = env::temp_dir().join("colby_thumbs_missing");
+		drop(fs::remove_dir_all(&dir));
+		fs::create_dir_all(&dir).expect("a directory to work in");
+		let mut thumbs = Thumbs::new(dir.join("thumbs"), dir.join("assets"));
+
+		let output = dir.join("lost.cmat");
+		let lost = colby_asset::model::Material {
+			albedo: "textures/nowhere".to_owned(),
+			..brass()
+		};
+		fs::write(&output, colby_asset::material::encode(&lost)).expect("the file");
+
+		let image = thumbs
+			.wearing(Some(&gpu), &output, "materials/lost")
+			.expect("it draws all the same");
+
+		assert_eq!((image.width, image.height), (SIZE, SIZE));
+		assert_ne!(
+			image.pixel(SIZE / 2, SIZE / 2),
+			image.pixel(0, 0),
+			"a ball is still in the middle of it"
+		);
+	}
+
 	#[test]
 	fn a_mesh_is_drawn_into_the_picture_when_there_is_a_device() {
 		let Some(gpu) = Gpu::open(gpu::backends(None), None).expect("the adapter query works")
@@ -371,7 +586,7 @@ mod tests {
 
 		let dir = env::temp_dir().join("colby_thumbs_render");
 		drop(fs::remove_dir_all(&dir));
-		let mut thumbs = Thumbs::new(dir.join("thumbs"));
+		let mut thumbs = Thumbs::new(dir.join("thumbs"), dir.join("assets"));
 
 		// a compiled cube, the way the asset loop would have written it
 		let output = dir.join("cube.cmesh");

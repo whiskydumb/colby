@@ -115,7 +115,7 @@ impl Browser {
 	fn refresh(&mut self, project: &Project) {
 		if self.root.as_deref() != Some(project.root()) {
 			self.root = Some(project.root().to_owned());
-			self.thumbs = Some(Thumbs::new(project.thumbs()));
+			self.thumbs = Some(Thumbs::new(project.thumbs(), project.output()));
 			self.entries.clear();
 			self.scanned = None;
 		}
