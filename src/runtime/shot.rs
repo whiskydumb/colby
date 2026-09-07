@@ -21,7 +21,7 @@ use colby_core::{
 };
 use colby_engine::{Capture, Gpu, Image, Overlay, gpu};
 
-use crate::{Build, Front, Project, Runtime};
+use crate::{Asked, Build, Front, Project, Runtime};
 
 /// Where the picture goes when the flag is given without a path.
 pub(crate) const DEFAULT_PATH: &str = "colby.png";
@@ -40,8 +40,10 @@ const STEPS: u32 = 90;
 /// @param path - where to write the picture
 /// @param project - the project to picture
 /// @param build - what the build script knew
+/// @param asked - the variables the command line set, which is the only way
+/// this run is told anything: there is no console here and no config file
 /// @return `Ok` once the file is on disk
-pub(crate) fn take(path: &Path, project: &Project, build: &Build) -> Result {
+pub(crate) fn take(path: &Path, project: &Project, build: &Build, asked: &Asked) -> Result {
 	// the adapter first, before anything is brought up: a machine with nothing
 	// to render on has no business loading a module to find that out. No
 	// window, so nothing for the adapter to be compatible with; and no console,
@@ -58,7 +60,7 @@ pub(crate) fn take(path: &Path, project: &Project, build: &Build) -> Result {
 	// picture's own size at a scale of one, for the same reason - a screenshot
 	// taken on a display with another scale would otherwise lay the interface
 	// out differently from one taken here. @ref `Front::Fixed`.
-	let mut runtime = Runtime::open(Front::Fixed, project, build)?;
+	let mut runtime = Runtime::open(Front::Fixed, project, build, asked)?;
 	let mut input = Input::default();
 
 	runtime

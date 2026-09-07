@@ -186,7 +186,7 @@ pub struct Simulation {
 	///
 	/// A field for the allocation. Cleared and refilled every step; it is the
 	/// input to the narrow phase and is worth nothing after it.
-	candidates: Vec<(u32, u32)>,
+	candidates: Vec<(usize, usize)>,
 
 	/// How long the last step spent where. @ref [`Spent`].
 	spent: Spent,

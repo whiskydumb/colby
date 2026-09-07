@@ -60,6 +60,12 @@ const LISTEN: &str = "--listen";
 /// `--connect <address>`: a window that talks to a host.
 const CONNECT: &str = "--connect";
 
+/// `--set <name> <value>`: a console variable, before the first frame.
+///
+/// Not a run of its own, like `--project`: every run has a table of variables
+/// and any of them may be worth saying something about from outside.
+const SET: &str = "--set";
+
 /// `--project <dir>`: the project to run, whichever run it is.
 ///
 /// Not a run of its own: a picture, a sound, a host and a window all run
@@ -68,7 +74,8 @@ const CONNECT: &str = "--connect";
 /// which hands it to the process it starts.
 pub(crate) const PROJECT: &str = "--project";
 
-/// What the command line asked for: a run, and the project to run it in.
+/// What the command line asked for: a run, the project to run it in, and
+/// whatever it wanted said to the console table first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Launch {
 	/// Which kind of run.
@@ -76,6 +83,65 @@ pub struct Launch {
 
 	/// The project directory `--project` named, if it did.
 	pub project: Option<PathBuf>,
+
+	/// Every `--set`, in the order they were written.
+	pub asked: Asked,
+}
+
+/// The console variables the command line set, and nothing else.
+///
+/// **This exists because four of the engine's settings had no way in.**
+/// `r.msaa`, `r.lights`, `r.shadows` and the rest are console variables - they
+/// are properties of a machine rather than of a world, which is the same split
+/// `post.rs` makes between a tonemap and a bloom - and a picture, a recording
+/// and a measurement have no console at all. So the only way anybody had ever
+/// set one for a windowless run was to make a project whose *game module*
+/// claimed the name before the engine did, which is a trick and was written up
+/// as `PERF-4`.
+///
+/// **Applied last, after the config file and after the game module has
+/// registered whatever it registers**, for the reason the archive is applied
+/// there: a line may name a variable that did not exist a moment earlier.
+///
+/// **And never written back.** A name given here is unarchived for the life of
+/// the process, so a screenshot taken at one sample does not leave the window
+/// at one sample. @ref
+/// [`Cvars::unarchive`](colby_core::abi::cvar::Cvars::unarchive).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Asked(Vec<(String, String)>);
+
+impl Asked {
+	/// Sets every one of them, and stops all of them being saved.
+	///
+	/// A name nothing registered is a warning rather than a stop, and so is a
+	/// value of the wrong kind: the run is worth having either way, and the
+	/// line says which of the two it was. That is what the console does with
+	/// the same mistake typed at it.
+	///
+	/// @param world - the table to write into
+	pub fn apply(&self, world: &mut colby_core::abi::World) {
+		for (name, value) in &self.0 {
+			if world.cvars.set(name, value) {
+				world.cvars.unarchive(name);
+				colby_core::info!(name, value, "set from the command line");
+
+				continue;
+			}
+
+			warn!(
+				name,
+				value, "nothing on the command line: no such variable, or not a value it takes"
+			);
+		}
+	}
+
+	/// Whether anything was asked for at all.
+	#[must_use]
+	pub fn is_empty(&self) -> bool { self.0.is_empty() }
+
+	/// How many were asked for.
+	#[must_use]
+	pub fn len(&self) -> usize { self.0.len() }
 }
 
 impl Launch {
@@ -90,9 +156,24 @@ impl Launch {
 
 		Self {
 			project: flags.project.clone(),
+			asked: Asked(flags.asked.clone()),
 			run: flags.decide(),
 		}
 	}
+}
+
+/// A name and a value, or nothing when either is empty.
+///
+/// An empty name is `--set =4`, which asks about a variable nothing is called;
+/// an empty value is `--set r.msaa=`, which asks for nothing in particular.
+/// Both are somebody's typo and neither is worth a table entry.
+///
+/// @param name - the variable
+/// @param value - what to set it to
+fn named(name: &str, value: &str) -> Option<(String, String)> {
+	let (name, value) = (name.trim(), value.trim());
+
+	(!name.is_empty() && !value.is_empty()).then(|| (name.to_owned(), value.to_owned()))
 }
 
 /// What kind of run was asked for.
@@ -139,6 +220,7 @@ struct Flags {
 	listen: Option<u16>,
 	connect: Option<SocketAddr>,
 	project: Option<PathBuf>,
+	asked: Vec<(String, String)>,
 }
 
 impl Flags {
@@ -172,6 +254,10 @@ impl Flags {
 				| JOIN => flags.join = words.address(inline, JOIN),
 				| LISTEN => flags.listen = Some(words.port(inline)),
 				| CONNECT => flags.connect = words.address(inline, CONNECT),
+				| SET => match words.setting(inline) {
+					| Some(pair) => flags.asked.push(pair),
+					| None => warn!("{SET} needs a name and a value after it"),
+				},
 				| PROJECT =>
 					flags.project = words.path(inline).or_else(|| {
 						warn!("{PROJECT} needs a directory after it");
@@ -305,6 +391,36 @@ impl<'a> Words<'a> {
 		Some(PathBuf::from(next))
 	}
 
+	/// A variable and a value: `--set name value` or `--set name=value`.
+	///
+	/// Both spellings, because the rest of the flags take both and because a
+	/// name with an equals sign in it is not a thing a variable is called. A
+	/// value is taken whatever it looks like - a variable may hold a word that
+	/// starts with a dash, and refusing one here would be this reader having
+	/// an opinion about the table's contents.
+	///
+	/// @param inline - what followed `--set=`, if anything
+	/// @return the pair, or nothing when there is no name or no value
+	fn setting(&mut self, inline: Option<&str>) -> Option<(String, String)> {
+		if let Some(inline) = inline {
+			let (name, value) = inline.split_once('=')?;
+
+			return named(name, value);
+		}
+
+		let word = self.peek()?;
+		self.at += 1;
+
+		if let Some((name, value)) = word.split_once('=') {
+			return named(name, value);
+		}
+
+		let value = self.peek()?;
+		self.at += 1;
+
+		named(word, value)
+	}
+
 	/// A recording: a path and then a count, both optional and in that order.
 	///
 	/// The count is only read after a path: `--record 300` is a recording into
@@ -365,6 +481,8 @@ impl<'a> Words<'a> {
 mod tests {
 	use std::net::{IpAddr, Ipv4Addr};
 
+	use colby_core::abi::{World, cvar::Value};
+
 	use super::*;
 
 	/// The command line, as words.
@@ -381,6 +499,135 @@ mod tests {
 
 	/// What the command line came to, as a run.
 	fn parse(line: &[&str]) -> Run { Launch::parse(&words(line)).run }
+
+	/// What `--set` made of a command line.
+	fn sets(words: &[&str]) -> Vec<(String, String)> {
+		let arguments: Vec<String> = words
+			.iter()
+			.map(|word| (*word).to_owned())
+			.collect();
+
+		Launch::parse(&arguments).asked.0
+	}
+
+	#[test]
+	fn a_variable_is_set_by_two_words_or_by_one_with_an_equals_in_it() {
+		let expected = vec![("r.msaa".to_owned(), "1".to_owned())];
+
+		assert_eq!(sets(&["--set", "r.msaa", "1"]), expected);
+		assert_eq!(sets(&["--set", "r.msaa=1"]), expected);
+		assert_eq!(sets(&["--set=r.msaa=1"]), expected);
+	}
+
+	#[test]
+	fn several_are_kept_in_the_order_they_were_written() {
+		// the order is the whole of what happens when two lines name one
+		// variable, and it is the order a console would have run them in.
+		assert_eq!(
+			sets(&["--set", "r.msaa", "1", "--set", "r.lights", "0", "--set", "r.msaa", "4"]),
+			vec![
+				("r.msaa".to_owned(), "1".to_owned()),
+				("r.lights".to_owned(), "0".to_owned()),
+				("r.msaa".to_owned(), "4".to_owned()),
+			]
+		);
+	}
+
+	#[test]
+	fn a_value_that_looks_like_a_flag_is_still_a_value() {
+		// a variable may hold a word that starts with a dash, and the reader
+		// refusing one would be it having an opinion about the table.
+		assert_eq!(sets(&["--set", "phys.gravity", "-9.8"]), vec![(
+			"phys.gravity".to_owned(),
+			"-9.8".to_owned()
+		)]);
+	}
+
+	#[test]
+	fn a_set_with_nothing_after_it_is_a_warning_and_not_a_pair() {
+		assert!(sets(&["--set"]).is_empty(), "no name and no value");
+		assert!(sets(&["--set", "r.msaa"]).is_empty(), "a name and no value");
+		assert!(sets(&["--set", "=4"]).is_empty(), "no name");
+		assert!(sets(&["--set", "r.msaa="]).is_empty(), "no value");
+	}
+
+	#[test]
+	fn setting_a_variable_is_not_a_run_of_its_own() {
+		// like `--project`: it says something about whichever run was named
+		// rather than naming one, so a command line that is only sets is still
+		// a window.
+		assert_eq!(parse(&["--set", "r.msaa", "1"]), Run::Window(Standing::Alone));
+		assert_eq!(
+			Launch::parse(&["--set".to_owned(), "r.msaa".to_owned(), "1".to_owned()]).run,
+			Run::Window(Standing::Alone)
+		);
+	}
+
+	#[test]
+	fn a_set_survives_beside_a_run_and_a_project() {
+		let arguments: Vec<String> =
+			["--shot", "a.png", "--set", "r.msaa", "1", "--project", "p"]
+				.iter()
+				.map(|word| (*word).to_owned())
+				.collect();
+		let launch = Launch::parse(&arguments);
+
+		assert_eq!(launch.run, Run::Shot(PathBuf::from("a.png")));
+		assert_eq!(launch.project, Some(PathBuf::from("p")));
+		assert_eq!(launch.asked.len(), 1);
+	}
+
+	#[test]
+	fn a_run_with_no_sets_asks_for_nothing() {
+		// the property the three oracles rest on: `just shot` passes none of
+		// these, so what it draws is what it drew.
+		assert!(
+			Launch::parse(&["--shot".to_owned()])
+				.asked
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn what_is_asked_for_is_set_and_stops_being_saved() {
+		let mut world = World::default();
+		world
+			.cvars
+			.saved("r.test", Value::Float(4.0), "a saved number");
+		world
+			.cvars
+			.var("r.plain", Value::Bool(false), "an unsaved flag");
+
+		Asked(vec![
+			("r.test".to_owned(), "1".to_owned()),
+			("r.plain".to_owned(), "true".to_owned()),
+			("r.nothing".to_owned(), "7".to_owned()),
+		])
+		.apply(&mut world);
+
+		assert_eq!(world.cvars.float("r.test"), Some(1.0), "the value is set");
+		assert_eq!(world.cvars.bool("r.plain"), Some(true), "and so is the other kind");
+
+		assert!(
+			!world
+				.cvars
+				.iter()
+				.filter(|entry| entry.is_archived())
+				.any(|entry| entry.name() == "r.test"),
+			"a screenshot at one sample would have left the window at one sample"
+		);
+	}
+
+	#[test]
+	fn a_variable_nothing_registered_is_a_warning_rather_than_a_stop() {
+		// a typo on the command line should not lose the run, which is what
+		// the console does with the same typo.
+		let mut world = World::default();
+
+		Asked(vec![("r.nothing".to_owned(), "1".to_owned())]).apply(&mut world);
+
+		assert_eq!(world.cvars.iter().count(), 0, "nothing was invented to hold it");
+	}
 
 	/// Every flag on it, before one run is chosen.
 	fn read(line: &[&str]) -> Flags { Flags::read(&words(line)) }

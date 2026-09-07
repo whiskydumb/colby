@@ -475,6 +475,34 @@ impl Cvars {
 		true
 	}
 
+	/// Stops a variable being written to the config when the process ends.
+	///
+	/// **For a value that came from the command line.** `--set r.msaa 1` is a
+	/// thing somebody asked for this run, and a run is not a decision about
+	/// the machine: without this, taking one screenshot at a sample a pixel
+	/// would quietly leave the window at one sample for good, and the cause
+	/// would be a week behind by the time anybody noticed. Once cleared it
+	/// stays cleared for the life of the process, so a name given on the
+	/// command line is not saved even if somebody types it again afterwards -
+	/// which is the rule stated plainly rather than a rule that depends on
+	/// what happened in between.
+	///
+	/// @param name - the variable
+	/// @return `false` if there is no such variable
+	pub fn unarchive(&mut self, name: &str) -> bool {
+		let Some(entry) = self
+			.entries
+			.iter_mut()
+			.find(|entry| entry.name == name)
+		else {
+			return false;
+		};
+
+		entry.archived = false;
+
+		true
+	}
+
 	/// Puts a variable back to the value the code registered it with.
 	///
 	/// @return `false` if there is no such variable

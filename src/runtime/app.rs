@@ -42,7 +42,7 @@ use crate::runtime::Stage;
 #[cfg(feature = "hot_reload")]
 use crate::watch::Watch;
 use crate::{
-	Build, Front, Project, Runtime, input,
+	Asked, Build, Front, Project, Runtime, input,
 	mode::Mode,
 	net::Standing,
 	runtime::{Opening, Progress},
@@ -136,7 +136,7 @@ pub(crate) fn paced(cvars: &Cvars, client: bool) -> Rate {
 /// @param build - what the build script of the executable knew
 /// @param standing - which end of a wire this window is, if either
 /// @param project - the project to run
-pub(crate) fn run(build: Build, standing: Standing, project: &Project) -> Result {
+pub(crate) fn run(build: Build, standing: Standing, project: &Project, asked: &Asked) -> Result {
 	let event_loop =
 		EventLoop::new().map_err(|error| err!(Graphics("creating the event loop: {error}")))?;
 
@@ -145,7 +145,7 @@ pub(crate) fn run(build: Build, standing: Standing, project: &Project) -> Result
 	// the window has anything to say.
 	event_loop.set_control_flow(ControlFlow::Poll);
 
-	let mut boot = Boot::new(build, standing, project);
+	let mut boot = Boot::new(build, standing, project, asked);
 
 	event_loop
 		.run_app(&mut boot)
@@ -174,9 +174,9 @@ struct Boot {
 
 impl Boot {
 	/// A window waiting to be made, and a world waiting to come up behind it.
-	fn new(build: Build, standing: Standing, project: &Project) -> Self {
+	fn new(build: Build, standing: Standing, project: &Project, asked: &Asked) -> Self {
 		Self {
-			phase: Phase::Loading(Box::new(Loader::new(build, standing, project))),
+			phase: Phase::Loading(Box::new(Loader::new(build, standing, project, asked))),
 			failure: None,
 		}
 	}
@@ -269,15 +269,18 @@ struct Loader {
 	screen: Option<Loading>,
 	opening: Option<Opening>,
 	failure: Option<Error>,
+	/// The variables the command line set, handed to the world as it comes up.
+	asked: Asked,
 }
 
 impl Loader {
 	/// A world waiting for its window.
-	fn new(build: Build, standing: Standing, project: &Project) -> Self {
+	fn new(build: Build, standing: Standing, project: &Project, asked: &Asked) -> Self {
 		Self {
 			build,
 			standing,
 			project: project.clone(),
+			asked: asked.clone(),
 			gpu: None,
 			renderer: None,
 			#[cfg(feature = "editor")]
@@ -317,8 +320,12 @@ impl Loader {
 
 		self.start_screen(&renderer);
 
-		let mut opening =
-			Opening::start(Front::Window(self.standing), &self.project, &self.build)?;
+		let mut opening = Opening::start(
+			Front::Window(self.standing),
+			&self.project,
+			&self.build,
+			&self.asked,
+		)?;
 		opening.world_mut().aspect = renderer.aspect();
 
 		self.gpu = Some(gpu);

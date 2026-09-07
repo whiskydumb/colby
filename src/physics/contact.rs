@@ -19,8 +19,8 @@ use colby_core::{
 };
 
 use crate::{
-	broad::Broad,
 	Simulation,
+	broad::Broad,
 	convex::{Hull, MAX_CONTACTS, Touch, collide},
 	query,
 };
@@ -110,7 +110,7 @@ pub(crate) fn find(
 	bodies: &Bodies,
 	simulation: &Simulation,
 	broad: &mut Broad,
-	candidates: &mut Vec<(u32, u32)>,
+	candidates: &mut Vec<(usize, usize)>,
 	into: &mut Vec<Manifold>,
 	sensed: &mut Vec<Manifold>,
 ) {
@@ -137,7 +137,7 @@ pub(crate) fn find(
 
 	for &(first_at, second_at) in candidates.iter() {
 		let (Some(&(first, ref one)), Some(&(second, ref other))) =
-			(handles.get(first_at as usize), handles.get(second_at as usize))
+			(handles.get(first_at), handles.get(second_at))
 		else {
 			continue;
 		};

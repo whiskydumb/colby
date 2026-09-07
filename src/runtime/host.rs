@@ -30,7 +30,7 @@ use std::{thread, time::Duration};
 
 use colby_core::{Result, abi::Input, info, time::Clock};
 
-use crate::{Build, Front, Project, Runtime};
+use crate::{Asked, Build, Front, Project, Runtime};
 
 /// How long a pass that ran no step waits before looking again.
 ///
@@ -53,8 +53,9 @@ const IDLE: Duration = Duration::from_millis(1);
 /// [`Front::Join`], and nothing else opens no window
 /// @param project - the project to serve, or to ask for
 /// @param build - what the build script knew
-pub(crate) fn run(front: Front, project: &Project, build: &Build) -> Result {
-	let mut runtime = Runtime::open(front, project, build)?;
+/// @param asked - the variables the command line set
+pub(crate) fn run(front: Front, project: &Project, build: &Build, asked: &Asked) -> Result {
+	let mut runtime = Runtime::open(front, project, build, asked)?;
 	let following = runtime.following();
 	let mut input = Input::default();
 	let mut clock = Clock::new();

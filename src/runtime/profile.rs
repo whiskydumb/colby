@@ -53,7 +53,7 @@ use colby_engine::{
 };
 use colby_physics::Spent;
 
-use crate::{Build, Front, Project, Runtime};
+use crate::{Asked, Build, Front, Project, Runtime};
 
 /// How big the frames are.
 ///
@@ -273,9 +273,11 @@ impl Table {
 ///
 /// @param project - the project to measure
 /// @param build - what the build script knew
+/// @param asked - the variables the command line set, which since `PERF-4` is
+/// how this run is told to draw with one sample or eight lamps
 /// @param frames - how many frames to measure, after the warm-up
 /// @return `Ok` once the table has been printed
-pub(crate) fn take(project: &Project, build: &Build, frames: u32) -> Result {
+pub(crate) fn take(project: &Project, build: &Build, asked: &Asked, frames: u32) -> Result {
 	// the adapter first, exactly as a screenshot does: a machine with nothing
 	// to render on has no business loading a module to find that out.
 	let Some(gpu) = Gpu::open(gpu::backends(None), None)? else {
@@ -293,7 +295,7 @@ pub(crate) fn take(project: &Project, build: &Build, frames: u32) -> Result {
 
 	// no console and no device, which is `Front::Fixed` and is the whole of
 	// why the scene is the only knob. @ref the module note.
-	let mut runtime = Runtime::open(Front::Fixed, project, build)?;
+	let mut runtime = Runtime::open(Front::Fixed, project, build, asked)?;
 	let mut input = Input::default();
 
 	runtime

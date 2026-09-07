@@ -85,7 +85,7 @@ const TAP_ROWS: i32 = 4;
 
 // Where one tap sits, as a share of what an output texel covers.
 //
-// A four-by-four grid centred on the texel: at plus and minus an eighth and
+// A four-by-four grid centered on the texel: at plus and minus an eighth and
 // three eighths, the sixteen of them tile the footprint exactly, with no gap
 // and no overlap. Arithmetic rather than a table because WGSL will not index a
 // module constant with a loop variable.

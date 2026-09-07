@@ -44,6 +44,7 @@ use crate::{
 	assets::Assets,
 	console::Console,
 	game::Game,
+	launch::Asked,
 	net::{Net, Standing},
 	step,
 };
@@ -170,8 +171,8 @@ impl Runtime {
 	/// @param build - what the build script knew, which says where the engine
 	/// is: the game crate is mounted there and built there
 	/// @return the runtime, or the first thing that would not come up
-	pub fn open(front: Front, project: &Project, build: &Build) -> Result<Self> {
-		let mut opening = Opening::start(front, project, build)?;
+	pub fn open(front: Front, project: &Project, build: &Build, asked: &Asked) -> Result<Self> {
+		let mut opening = Opening::start(front, project, build, asked)?;
 
 		loop {
 			match opening.advance()? {
@@ -432,6 +433,8 @@ pub enum Progress {
 pub struct Opening {
 	front: Front,
 	project: Project,
+	/// The variables the command line asked for, applied at the last stage.
+	asked: Asked,
 	#[cfg(feature = "hot_reload")]
 	build: Build,
 
@@ -469,7 +472,7 @@ impl Opening {
 			          have to agree on a signature"
 		)
 	)]
-	pub fn start(front: Front, project: &Project, build: &Build) -> Result<Self> {
+	pub fn start(front: Front, project: &Project, build: &Build, asked: &Asked) -> Result<Self> {
 		// boxed and installed before anything else touches the world: the
 		// world keeps this address. Once, here, and never again - the pointers
 		// in the table address this executable rather than the game module, so
@@ -499,6 +502,7 @@ impl Opening {
 		Ok(Self {
 			front,
 			project: project.clone(),
+			asked: asked.clone(),
 			#[cfg(feature = "hot_reload")]
 			build: build.clone(),
 			next: Some(Stage::Assets),
@@ -610,9 +614,16 @@ impl Opening {
 			self.audio = listen(&self.world);
 		}
 
-		if self.front.has_console() {
-			crate::console::install(&mut self.world);
-		}
+		// **the table always, the terminal and the config file only where
+		// there is one.** These are two different things and they used to be
+		// one: a picture and a recording had no table at all, so every reader
+		// in the engine carried its own copy of the default it would have
+		// found there, and the only way to set one of them from outside was to
+		// make a project whose game module claimed the name first. Registering
+		// changes no answer - every fallback is the same constant the
+		// registration uses, and a test says so - and it is what lets `--set`
+		// mean something in a run with no console. @ref `PERF-4`.
+		crate::console::install(&mut self.world);
 
 		#[cfg(feature = "editor")]
 		if self.front.is_window() {
@@ -635,14 +646,23 @@ impl Opening {
 		}
 	}
 
-	/// The settings archive, run against the table.
+	/// The settings archive, run against the table, and then the command line.
 	///
 	/// Last of the three that register, because a line in it may name a
-	/// variable the game registered a moment ago.
+	/// variable the game registered a moment ago - and the command line is
+	/// after the file for the same reason one place further along: what
+	/// somebody wrote on the line they started this run with beats what a file
+	/// remembers and what a module asked for. @ref [`Asked`].
+	///
+	/// **The command line is applied whether or not there is a console**, and
+	/// that is the whole of `PERF-4`: a picture, a recording and a measurement
+	/// have no terminal and no config file, and they still have a table.
 	fn settings_stage(&mut self) {
 		if self.front.has_console() {
 			self.console = Some(Console::open(&mut self.world, &self.project.settings()));
 		}
+
+		self.asked.apply(&mut self.world);
 	}
 
 	/// Mounts the project in the engine's workspace and builds its crate.
@@ -885,7 +905,8 @@ mod tests {
 			package: "colby".to_owned(),
 		};
 
-		let opening = Opening::start(Front::Fixed, &project, &build).expect("started");
+		let opening =
+			Opening::start(Front::Fixed, &project, &build, &Asked::default()).expect("started");
 
 		assert_eq!(opening.next(), Some(Stage::Assets), "nothing has run");
 		assert!(

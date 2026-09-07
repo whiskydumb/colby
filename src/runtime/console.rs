@@ -1026,6 +1026,106 @@ mod tests {
 
 	use super::*;
 
+	/// What a reader falls back to when it finds no entry, beside the value
+	/// the registration gives it.
+	///
+	/// **The two used to be able to drift and nothing said so.** A picture and
+	/// a recording had no table at all, so every one of these readers took its
+	/// own branch and the constant beside it was the only thing that ran;
+	/// since `PERF-4` the table is registered in every front, so both branches
+	/// are live and they have to agree. A row here is one reader, named in the
+	/// comment beside it.
+	const FALLBACKS: &[(&str, Value)] = &[
+		// `crate::app::pay`
+		(crate::app::PAUSE, Value::Bool(false)),
+		(crate::app::SPEED, Value::Float(1.0)),
+		// `crate::mode::wanted` and `crate::mode::kept`
+		(crate::mode::EDIT, Value::Bool(false)),
+		(crate::mode::KEEP, Value::Bool(false)),
+		// `colby_physics::debug::draw`
+		(colby_physics::debug::SHAPES, Value::Bool(false)),
+		(colby_physics::debug::CONTACTS, Value::Bool(false)),
+		(colby_physics::debug::JOINTS, Value::Bool(false)),
+		(colby_physics::debug::WATER, Value::Bool(false)),
+		// `colby_engine::scene::Scene::upload`
+		(colby_engine::shadow::ENABLED, Value::Bool(true)),
+		(colby_engine::shadow::TINT, Value::Bool(false)),
+		// `crate::console::volumes`, all four
+		(colby_audio::MASTER, Value::Float(1.0)),
+		(colby_audio::EFFECTS, Value::Float(1.0)),
+		(colby_audio::MUSIC, Value::Float(1.0)),
+		(colby_audio::INTERFACE, Value::Float(1.0)),
+	];
+
+	#[test]
+	fn every_reader_falls_back_to_what_the_registration_would_have_given_it() {
+		let mut world = World::default();
+		install(&mut world);
+
+		for (name, expected) in FALLBACKS {
+			let entry = world
+				.cvars
+				.iter()
+				.find(|entry| entry.name() == *name)
+				.unwrap_or_else(|| panic!("{name} is not registered at all"));
+
+			assert_eq!(
+				entry.value(),
+				Some(expected),
+				"{name} registers one number and its reader falls back to another"
+			);
+		}
+	}
+
+	#[test]
+	fn the_four_numbers_a_reader_computes_come_out_the_same_either_way() {
+		// the three rows above cannot cover: these readers do arithmetic on
+		// what they find, so what has to match is the *answer* rather than the
+		// value. A world with no table and a world with one have to agree.
+		let mut world = World::default();
+		let bare = volumes(&world.cvars);
+
+		install(&mut world);
+
+		assert_eq!(volumes(&world.cvars), bare, "the mixer hears something different");
+		assert_eq!(
+			world.cvars.float(colby_engine::scene::LAMPS),
+			Some(colby_engine::scene::DEFAULT_LAMPS),
+			"the lamp ceiling"
+		);
+		assert_eq!(
+			world.cvars.float(colby_engine::scene::MSAA),
+			Some(colby_engine::scene::DEFAULT_MSAA),
+			"the sample count"
+		);
+		assert_eq!(
+			world
+				.cvars
+				.float(colby_physics::PASSES)
+				.map(asked_passes),
+			Some(colby_physics::VELOCITY_PASSES),
+			"the solver runs the same number of passes with a table and without one"
+		);
+	}
+
+	/// What the solver would make of the registered value.
+	///
+	/// The solver's own reader is private to `colby_physics`; this is the same
+	/// arithmetic, and the point of the row is that the registration lands on
+	/// the default rather than a step either side of it.
+	fn asked_passes(asked: f32) -> usize {
+		let rounded = asked.round();
+
+		if !rounded.is_finite() || rounded < 1.0 {
+			return colby_physics::VELOCITY_PASSES;
+		}
+
+		(1..=colby_physics::MAX_PASSES)
+			.rev()
+			.find(|held| rounded >= f32::from(u16::try_from(*held).unwrap_or(u16::MAX)))
+			.unwrap_or(colby_physics::VELOCITY_PASSES)
+	}
+
 	#[test]
 	fn the_one_variable_a_window_needs_before_the_table_is_read_from_the_archive_by_name() {
 		let dir = std::env::temp_dir().join("colby_console_archived");

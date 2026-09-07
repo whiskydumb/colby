@@ -88,13 +88,17 @@ pub(crate) struct Broad {
 	boxes: Vec<Bounds>,
 
 	/// Body indices, sorted by where their box starts along the sweep axis.
-	order: Vec<u32>,
+	///
+	/// A position in the list the caller handed over rather than a
+	/// [`BodyId`](colby_core::abi::BodyId): the sweep never looks at a body and
+	/// has no reason to know what one is.
+	order: Vec<usize>,
 
 	/// Somewhere to scatter into while sorting.
-	scratch: Vec<(u32, u32)>,
+	scratch: Vec<(usize, usize)>,
 
 	/// How many candidates fall in each bucket, reused by both passes.
-	counts: Vec<u32>,
+	counts: Vec<usize>,
 }
 
 impl Broad {
@@ -118,13 +122,13 @@ impl Broad {
 	pub(crate) fn sweep(
 		&mut self,
 		bounds: impl ExactSizeIterator<Item = Option<(Vec3, Vec3)>>,
-		into: &mut Vec<(u32, u32)>,
+		into: &mut Vec<(usize, usize)>,
 	) {
 		into.clear();
 		self.boxes.clear();
-		self.boxes.extend(bounds.map(|found| {
-			found.map_or(Bounds::NOWHERE, |(low, high)| Bounds { low, high })
-		}));
+		self.boxes.extend(
+			bounds.map(|found| found.map_or(Bounds::NOWHERE, |(low, high)| Bounds { low, high })),
+		);
 
 		let count = self.boxes.len();
 
@@ -132,7 +136,7 @@ impl Broad {
 		// boxes and the list being sorted lives beside them on the same struct
 		let mut order = core::mem::take(&mut self.order);
 		order.clear();
-		order.extend(0..u32::try_from(count).unwrap_or(u32::MAX));
+		order.extend(0..count);
 		// by where each box starts, and by index where two start together, so
 		// that the walk below is a total order and not a nearly-total one.
 		// `sort_unstable_by` over a few hundred integers is nothing beside
@@ -145,40 +149,53 @@ impl Broad {
 		self.order = order;
 
 		for (at, &first) in self.order.iter().enumerate() {
-			let one = self.boxes.get(first as usize).copied();
-			let Some(one) = one else {
+			let Some(one) = self.boxes.get(first).copied() else {
 				continue;
 			};
-			// the whole of the pruning: past the end of this box nothing that
-			// starts later can reach back to touch it, so the walk stops
-			// rather than running to the end of the list.
-			let reach = one.high[Self::AXIS];
 
-			for &second in self.order.iter().skip(at + 1) {
-				if self.start(second) > reach {
-					break;
-				}
-
-				let Some(other) = self.boxes.get(second as usize).copied() else {
-					continue;
-				};
-
-				if one.touches(other) {
-					into.push((first.min(second), first.max(second)));
-				}
-			}
+			self.against(at, first, one, into);
 		}
 
 		self.tidy(into, count);
+	}
+
+	/// Every candidate for one body, out of the ones that start after it.
+	///
+	/// A method of its own rather than the inner half of a loop, which is what
+	/// a walk that stops early wants anyway: the `return` here is the pruning.
+	///
+	/// @param at - where this body sits in the sorted order
+	/// @param first - which body it is
+	/// @param one - its bounds
+	/// @param into - where a candidate pair is appended
+	fn against(&self, at: usize, first: usize, one: Bounds, into: &mut Vec<(usize, usize)>) {
+		// past the end of this box nothing that starts later can reach back to
+		// touch it, so the walk stops rather than running to the end of the
+		// list. That is the whole of what a sweep buys over a square.
+		let reach = one.high[Self::AXIS];
+
+		for &second in self.order.iter().skip(at + 1) {
+			if self.start(second) > reach {
+				return;
+			}
+
+			if self
+				.boxes
+				.get(second)
+				.is_some_and(|other| one.touches(*other))
+			{
+				into.push((first.min(second), first.max(second)));
+			}
+		}
 	}
 
 	/// Where one body's box starts along the sweep axis.
 	///
 	/// Infinity for a body with no bounds, which sorts it to the end where its
 	/// own missing box excludes it anyway.
-	fn start(&self, index: u32) -> f32 {
+	fn start(&self, index: usize) -> f32 {
 		self.boxes
-			.get(index as usize)
+			.get(index)
 			.map_or(f32::INFINITY, |held| held.low[Self::AXIS])
 	}
 
@@ -193,7 +210,7 @@ impl Broad {
 	///
 	/// @param into - the candidates, reordered in place
 	/// @param count - how many bodies there are, which is how many buckets
-	fn tidy(&mut self, into: &mut Vec<(u32, u32)>, count: usize) {
+	fn tidy(&mut self, into: &mut Vec<(usize, usize)>, count: usize) {
 		self.pass(into, count, false);
 		self.pass(into, count, true);
 	}
@@ -203,12 +220,12 @@ impl Broad {
 	/// @param into - the candidates, reordered in place
 	/// @param count - how many buckets
 	/// @param leading - whether to sort by the first index or the second
-	fn pass(&mut self, into: &mut Vec<(u32, u32)>, count: usize, leading: bool) {
+	fn pass(&mut self, into: &mut Vec<(usize, usize)>, count: usize, leading: bool) {
 		self.counts.clear();
 		self.counts.resize(count + 1, 0);
 
 		for &(first, second) in into.iter() {
-			let key = if leading { first } else { second } as usize;
+			let key = if leading { first } else { second };
 
 			if let Some(bucket) = self.counts.get_mut(key) {
 				*bucket += 1;
@@ -230,11 +247,11 @@ impl Broad {
 		// in input order, which is what makes this stable and therefore what
 		// lets the second pass keep the first one's work
 		for &pair in into.iter() {
-			let key = if leading { pair.0 } else { pair.1 } as usize;
+			let key = if leading { pair.0 } else { pair.1 };
 			let Some(bucket) = self.counts.get_mut(key) else {
 				continue;
 			};
-			let at = *bucket as usize;
+			let at = *bucket;
 			*bucket += 1;
 
 			if let Some(slot) = self.scratch.get_mut(at) {
@@ -256,15 +273,12 @@ impl Broad {
 /// @param count - how many bodies there are
 /// @return every `(first, second)` with first below second, in order
 #[cfg(test)]
-fn every_pair(count: usize) -> Vec<(u32, u32)> {
+fn every_pair(count: usize) -> Vec<(usize, usize)> {
 	let mut pairs = Vec::new();
 
 	for first in 0..count {
 		for second in first + 1..count {
-			pairs.push((
-				u32::try_from(first).unwrap_or(u32::MAX),
-				u32::try_from(second).unwrap_or(u32::MAX),
-			));
+			pairs.push((first, second));
 		}
 	}
 
@@ -284,10 +298,7 @@ fn overlapping(one: Option<(Vec3, Vec3)>, other: Option<(Vec3, Vec3)>) -> bool {
 		return false;
 	};
 
-	Bounds { low, high }.touches(Bounds {
-		low: other_low,
-		high: other_high,
-	})
+	Bounds { low, high }.touches(Bounds { low: other_low, high: other_high })
 }
 
 #[cfg(test)]
@@ -300,7 +311,7 @@ mod tests {
 	}
 
 	/// Runs a sweep over a list of bounds.
-	fn swept(bounds: &[Option<(Vec3, Vec3)>]) -> Vec<(u32, u32)> {
+	fn swept(bounds: &[Option<(Vec3, Vec3)>]) -> Vec<(usize, usize)> {
 		let mut broad = Broad::default();
 		let mut pairs = Vec::new();
 
@@ -310,12 +321,10 @@ mod tests {
 	}
 
 	/// What a loop over every pair would have kept, with the same test.
-	fn squared(bounds: &[Option<(Vec3, Vec3)>]) -> Vec<(u32, u32)> {
+	fn squared(bounds: &[Option<(Vec3, Vec3)>]) -> Vec<(usize, usize)> {
 		every_pair(bounds.len())
 			.into_iter()
-			.filter(|&(first, second)| {
-				overlapping(bounds[first as usize], bounds[second as usize])
-			})
+			.filter(|&(first, second)| overlapping(bounds[first], bounds[second]))
 			.collect()
 	}
 
@@ -372,7 +381,11 @@ mod tests {
 		let found = swept(&bounds);
 
 		assert_eq!(found, squared(&bounds));
-		assert_eq!(found.len(), 19, "the floor pairs with every one of them and they with nobody");
+		assert_eq!(
+			found.len(),
+			19,
+			"the floor pairs with every one of them and they with nobody"
+		);
 	}
 
 	#[test]

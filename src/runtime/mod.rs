@@ -61,7 +61,7 @@ pub use colby_asset::Project;
 use colby_core::{Result, log};
 
 pub use crate::{
-	launch::{Launch, Run},
+	launch::{Asked, Launch, Run},
 	net::Standing,
 	runtime::{Front, Opening, Progress, Runtime, Stage, VIEWPORT},
 };
@@ -113,7 +113,7 @@ pub struct Build {
 pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 	log::init()?;
 
-	let Launch { run, project } = Launch::parse(arguments);
+	let Launch { run, project, asked } = Launch::parse(arguments);
 
 	// a two-endpoint run before anything else, including the check that this
 	// process is laid out for hot-reload and the project itself: it loads no
@@ -149,17 +149,17 @@ pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 		// neither does a recording, which additionally opens no device, because
 		// what it writes has to be the same file on a machine with speakers and
 		// one without.
-		| Run::Shot(path) => shot::take(&path, &project, &build),
+		| Run::Shot(path) => shot::take(&path, &project, &build, &asked),
 		// and neither does a measurement, for the same reason a screenshot
 		// does not: what a frame costs must not depend on what somebody last
 		// typed at a console. @ref `crate::profile`.
-		| Run::Profile(frames) => profile::take(&project, &build, frames),
-		| Run::Record { path, steps } => record::take(&path, steps, &project, &build),
+		| Run::Profile(frames) => profile::take(&project, &build, &asked, frames),
+		| Run::Record { path, steps } => record::take(&path, steps, &project, &build, &asked),
 		// a socket instead of a window, which is a run rather than a build: the
 		// same executable, the same module, the same step. @ref `crate::host`.
-		| Run::Host(port) => host::run(Front::Host(port), &project, &build),
-		| Run::Join(address) => host::run(Front::Join(address), &project, &build),
-		| Run::Window(standing) => app::run(build, standing, &project),
+		| Run::Host(port) => host::run(Front::Host(port), &project, &build, &asked),
+		| Run::Join(address) => host::run(Front::Join(address), &project, &build, &asked),
+		| Run::Window(standing) => app::run(build, standing, &project, &asked),
 	};
 
 	finish();
