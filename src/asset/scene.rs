@@ -49,7 +49,7 @@ use colby_core::{
 	Result,
 	abi::{
 		BodyKind, Camera, JointKind, Layers, Light, LightKind, Post, ShapeKind, Sky, SkyKind,
-		ToneMap, Transform,
+		ToneMap, Transform, Water, WaterKind,
 		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
@@ -70,14 +70,14 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// different number is refused with a message rather than read as if it
 /// agreed.
 ///
-/// Six since an entity record says what it hangs off.
-pub const FORMAT_VERSION: u32 = 9;
+/// Ten since a body record can say what fluid fills it.
+pub const FORMAT_VERSION: u32 = 10;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
 
 /// How big [`SceneHeader`] is, and where the first block starts.
-pub const HEADER_BYTES: usize = 160;
+pub const HEADER_BYTES: usize = 176;
 
 /// The bit in [`SceneHeader::flags`] that says the file carries a game's arena.
 ///
@@ -236,11 +236,33 @@ pub struct SceneHeader {
 	/// One record per lamp rather than a wider entity record: a light is the
 	/// rare thing an entity has, and version 6 wrote none at all.
 	pub lit_count: u32,
+
+	/// Bytes per water record. Must be `size_of::<Wet>()`.
+	pub wet_stride: u32,
+
+	/// Where the water block starts.
+	pub wet_offset: u32,
+
+	/// How many bodies held a fluid.
+	///
+	/// One record per pool rather than a wider body record, for the light
+	/// block's reason: water is the rare thing a body has, and every version
+	/// before this one wrote none at all.
+	pub wet_count: u32,
+
+	/// Nothing, and written as nothing.
+	///
+	/// Kept so the header stays a multiple of sixteen: the light block took
+	/// the last three spare words, so this block had to grow it by four. A
+	/// reader ignores it and a writer zeroes it, which is what makes it the
+	/// first word the next block added takes rather than a field anybody has
+	/// to think about.
+	pub spare: u32,
 }
 
-// the header had three spare words until the light block took them, so the
-// next block added grows it by four rather than three - three words would
-// leave it at a hundred and seventy-two, which is not a multiple of sixteen.
+// the light block took the header's last three spare words and this one grew
+// it by four, back to a multiple of sixteen with one word over. The next block
+// added takes that word and three more.
 //
 // the blocks after the header inherit the buffer's alignment only because the
 // header is a multiple of it, and a field added without shrinking the spare
@@ -249,7 +271,7 @@ pub struct SceneHeader {
 // the first one whose length a game chooses. @ref `Places::of`.
 const _: () = assert!(
 	size_of::<SceneHeader>() == HEADER_BYTES,
-	"the header has to stay a hundred and sixty bytes"
+	"the header has to stay a hundred and seventy-six bytes"
 );
 
 /// The world's own settings: where it looks from, what lights it, how hard it
@@ -444,6 +466,42 @@ pub struct Lit {
 
 	/// The half-angle of a cone's edge, in radians.
 	pub outer: f32,
+}
+
+/// One body's fluid, as the file holds it.
+///
+/// Written only for a body whose water is one of the filled kinds, so the
+/// ordinary world carries none of these at all - which is the whole reason it
+/// is a block of its own rather than six more words on every [`Bulk`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Wet {
+	/// Which entry of the body block this belongs to.
+	pub body: u32,
+
+	/// What fills it, as [`WaterKind`](colby_core::abi::WaterKind) in
+	/// declaration order.
+	///
+	/// A record is only written for water that is one of the filled kinds, so
+	/// nothing here should be the `none` word - but a reader that finds one
+	/// takes it, for the reason [`Lit::kind`] gives.
+	pub kind: u32,
+
+	/// How heavy the fluid is, in mass per cubic unit.
+	pub density: f32,
+
+	/// How hard it stops something bobbing.
+	pub damp: f32,
+
+	/// How hard it resists being moved through.
+	pub linear_drag: f32,
+
+	/// How hard it resists being turned in.
+	pub angular_drag: f32,
+
+	/// Which way it runs, in units a second.
+	pub flow: [f32; 3],
 }
 
 /// One posed skeleton, as the file holds it.
@@ -720,6 +778,10 @@ impl SceneFile {
 	#[must_use]
 	pub fn bulk(&self) -> &[Bulk] { self.block(self.header.bulk_offset, self.header.bulk_count) }
 
+	/// The water block, one record per body that holds a fluid.
+	#[must_use]
+	pub fn wet(&self) -> &[Wet] { self.block(self.header.wet_offset, self.header.wet_count) }
+
 	/// The joint block.
 	#[must_use]
 	pub fn tie(&self) -> &[Tie] { self.block(self.header.tie_offset, self.header.tie_count) }
@@ -859,14 +921,28 @@ impl SceneFile {
 			}
 		}
 
+		// the bodies first and the water into them afterwards, for the reason
+		// the lights go onto the entities afterwards and by the same rule: a
+		// record naming a place the body block does not have is dropped rather
+		// than refused.
+		let mut solids: Vec<Solid> = self
+			.bulk()
+			.iter()
+			.map(|it| self.solid(it))
+			.collect();
+		for record in self.wet() {
+			if let Some(solid) = usize::try_from(record.body)
+				.ok()
+				.and_then(|index| solids.get_mut(index))
+			{
+				solid.water = water_of(record);
+			}
+		}
+
 		SceneData {
 			stage: stage_of(self.setting()),
 			things,
-			solids: self
-				.bulk()
-				.iter()
-				.map(|it| self.solid(it))
-				.collect(),
+			solids,
 			links: self
 				.tie()
 				.iter()
@@ -972,6 +1048,8 @@ impl SceneFile {
 			weightless: bulk.flags & BULK_WEIGHTLESS != 0,
 			sleeping: bulk.flags & BULK_SLEEPING != 0,
 			layers: Layers::new(bulk.layer, bulk.mask),
+			// filled from the water block afterwards, the way a light is.
+			water: Water::NONE,
 			thing: bulk.thing,
 		}
 	}
@@ -1097,6 +1175,16 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		.iter()
 		.map(|solid| bulk_of(solid, &mut names))
 		.collect();
+	// one record per pool, indexed by the body's place in the block above, for
+	// the reason a light's index is the entity's place: a piece grafted
+	// somewhere else keeps its bodies' order and not their slots.
+	let wet: Vec<Wet> = data
+		.solids
+		.iter()
+		.enumerate()
+		.filter(|(_, solid)| solid.water.kind.is_wet())
+		.map(|(index, solid)| wet_of(index, solid.water))
+		.collect::<Result<Vec<_>>>()?;
 	let tie: Vec<Tie> = data
 		.links
 		.iter()
@@ -1127,6 +1215,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		stood: &stood,
 		lit: &lit,
 		bulk: &bulk,
+		wet: &wet,
 		tie: &tie,
 		bent: &bent,
 		locals: &locals,
@@ -1142,6 +1231,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::cast_slice(&stood));
 	out.extend_from_slice(bytemuck::cast_slice(&lit));
 	out.extend_from_slice(bytemuck::cast_slice(&bulk));
+	out.extend_from_slice(bytemuck::cast_slice(&wet));
 	out.extend_from_slice(bytemuck::cast_slice(&tie));
 	out.extend_from_slice(bytemuck::cast_slice(&bent));
 	out.extend_from_slice(bytemuck::cast_slice(&locals));
@@ -1163,6 +1253,7 @@ struct Places {
 	stood: usize,
 	lit: usize,
 	bulk: usize,
+	wet: usize,
 	tie: usize,
 	bent: usize,
 	locals: usize,
@@ -1180,6 +1271,7 @@ impl Places {
 			stood,
 			lit,
 			bulk,
+			wet,
 			tie,
 			bent,
 			locals,
@@ -1193,7 +1285,8 @@ impl Places {
 		// a matter of what is legible rather than of what a reader can find.
 		let lit_at = stood_at + size_of_val(stood);
 		let bulk_at = lit_at + size_of_val(lit);
-		let tie_at = bulk_at + size_of_val(bulk);
+		let wet_at = bulk_at + size_of_val(bulk);
+		let tie_at = wet_at + size_of_val(wet);
 		let bent_at = tie_at + size_of_val(tie);
 		let locals_at = bent_at + size_of_val(bent);
 		let generations_at = locals_at + size_of_val(locals);
@@ -1213,6 +1306,7 @@ impl Places {
 			stood: stood_at,
 			lit: lit_at,
 			bulk: bulk_at,
+			wet: wet_at,
 			tie: tie_at,
 			bent: bent_at,
 			locals: locals_at,
@@ -1230,6 +1324,7 @@ struct Blocks<'a> {
 	stood: &'a [Stood],
 	lit: &'a [Lit],
 	bulk: &'a [Bulk],
+	wet: &'a [Wet],
 	tie: &'a [Tie],
 	bent: &'a [Bent],
 	locals: &'a [Local],
@@ -1248,6 +1343,7 @@ fn head(
 		stood,
 		lit,
 		bulk,
+		wet,
 		tie,
 		bent,
 		locals,
@@ -1307,6 +1403,10 @@ fn head(
 		lit_stride: width::<Lit>("a scene's records")?,
 		lit_offset: count(places.lit, "a scene's records")?,
 		lit_count: count(lit.len(), "a scene's records")?,
+		wet_stride: width::<Wet>("a scene's records")?,
+		wet_offset: count(places.wet, "a scene's records")?,
+		wet_count: count(wet.len(), "a scene's records")?,
+		spare: 0,
 	})
 }
 
@@ -1349,7 +1449,20 @@ fn bent_of(posed: &Posed, names: &mut Names, locals: &mut Vec<Local>) -> Bent {
 	}
 }
 
-/// One body, as the file holds it.
+/// One body's fluid, as the file holds it.
+fn wet_of(index: usize, water: Water) -> Result<Wet> {
+	Ok(Wet {
+		body: count(index, "a scene's records")?,
+		kind: water.kind.index(),
+		density: water.density,
+		damp: water.damp,
+		linear_drag: water.linear_drag,
+		angular_drag: water.angular_drag,
+		flow: water.flow.to_array(),
+	})
+}
+
+/// One light, as the file holds it.
 fn lit_of(index: usize, light: Light) -> Result<Lit> {
 	Ok(Lit {
 		thing: count(index, "a scene's records")?,
@@ -1507,6 +1620,18 @@ fn stage_of(setting: Setting) -> Stage {
 /// a flag bit: this build knowing fewer kinds than the writer did is the one
 /// thing a version number already caught, and what is left is a file the
 /// version agrees with carrying a number nothing in it means.
+fn water_of(record: &Wet) -> Water {
+	Water {
+		kind: WaterKind::at(record.kind).unwrap_or(WaterKind::None),
+		density: record.density,
+		damp: record.damp,
+		linear_drag: record.linear_drag,
+		angular_drag: record.angular_drag,
+		flow: Vec3::from_array(record.flow),
+	}
+}
+
+/// One light, as the world holds it.
 fn light_of(record: &Lit) -> Light {
 	Light {
 		kind: LightKind::at(record.kind).unwrap_or(LightKind::None),
@@ -1709,6 +1834,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 		(header.stood_stride, size_of::<Stood>(), "entities"),
 		(header.lit_stride, size_of::<Lit>(), "lights"),
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
+		(header.wet_stride, size_of::<Wet>(), "waters"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
 		(header.bent_stride, size_of::<Bent>(), "poses"),
 		(header.kept_stride, size_of::<Kept>(), "peers"),
@@ -1779,6 +1905,7 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 	fits::<Stood>(bytes, HEADER_BYTES, (header.stood_offset, header.stood_count), "entities")?;
 	fits::<Lit>(bytes, HEADER_BYTES, (header.lit_offset, header.lit_count), "lights")?;
 	fits::<Bulk>(bytes, HEADER_BYTES, (header.bulk_offset, header.bulk_count), "bodies")?;
+	fits::<Wet>(bytes, HEADER_BYTES, (header.wet_offset, header.wet_count), "waters")?;
 	fits::<Tie>(bytes, HEADER_BYTES, (header.tie_offset, header.tie_count), "joints")?;
 	fits::<Bent>(bytes, HEADER_BYTES, (header.bent_offset, header.bent_count), "poses")?;
 	fits::<Local>(bytes, HEADER_BYTES, (header.locals_offset, header.locals_count), "bones")?;
@@ -1936,6 +2063,7 @@ mod tests {
 				weightless: false,
 				sleeping: false,
 				layers: Layers::new(4, 12),
+				water: Water::NONE,
 				thing: 1,
 			},
 			Solid {
@@ -1961,6 +2089,19 @@ mod tests {
 				weightless: true,
 				sleeping: true,
 				layers: Layers::DEFAULT,
+				// on the second one for the reason the light is on the second
+				// entity: its slot is 4 and its place in the block is 1, so a
+				// writer keying water by slot rather than by index puts this
+				// record on nobody. Every number is off its default, so a
+				// round trip that dropped any of them would show it.
+				water: Water {
+					kind: WaterKind::Volume,
+					density: 3.5,
+					damp: 6.25,
+					linear_drag: 0.44,
+					angular_drag: 0.11,
+					flow: Vec3::new(0.0, 0.0, -2.0),
+				},
 				thing: scene::NO_INDEX,
 			},
 		]
@@ -2328,6 +2469,86 @@ mod tests {
 		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
 
 		assert_eq!(header.lit_count, 0, "nothing shines, so nothing is written down");
+		assert_eq!(round_trip(&data), data, "and it comes back the same way");
+	}
+
+	#[test]
+	fn a_pool_is_written_against_its_place_in_the_body_block_and_not_its_slot() {
+		let data = sample();
+		let bytes = encode(&data).expect("it fits in one file");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+
+		assert_eq!(file.wet().len(), 1, "one of the two bodies holds a fluid");
+		assert_eq!(
+			file.wet()[0].body,
+			1,
+			"and it is named by its place in the block, not by its slot of four"
+		);
+		assert_eq!(
+			data.solids[1].water,
+			round_trip(&data).solids[1].water,
+			"every number of it comes back"
+		);
+	}
+
+	#[test]
+	fn water_of_a_kind_this_build_does_not_know_reads_as_no_water() {
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let at =
+			usize::try_from(header.wet_offset).expect("it is an offset") + offset_of!(Wet, kind);
+
+		bytes[at..at + 4].copy_from_slice(&9_u32.to_le_bytes());
+
+		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a changed word is not a broken file")
+			.to_scene_data();
+
+		assert_eq!(
+			read.solids[1].water.kind,
+			WaterKind::None,
+			"a word off the end of the list is nothing rather than a refusal"
+		);
+		assert!(
+			(read.solids[1].water.density - sample_solids()[1].water.density).abs() < 1.0e-6,
+			"and the numbers beside it are still read"
+		);
+	}
+
+	#[test]
+	fn a_pool_named_at_a_body_that_is_not_there_is_dropped_rather_than_refused() {
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let at =
+			usize::try_from(header.wet_offset).expect("it is an offset") + offset_of!(Wet, body);
+
+		bytes[at..at + 4].copy_from_slice(&99_u32.to_le_bytes());
+
+		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a changed word is not a broken file")
+			.to_scene_data();
+
+		assert!(
+			read.solids
+				.iter()
+				.all(|solid| !solid.water.is_wet()),
+			"a world short one pool is a better answer than a load that did not happen"
+		);
+	}
+
+	#[test]
+	fn a_world_of_bodies_and_no_pool_writes_no_water_block() {
+		let mut data = sample();
+		for solid in &mut data.solids {
+			solid.water = Water::NONE;
+		}
+
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+
+		assert_eq!(header.wet_count, 0, "nothing is wet, so nothing is written down");
 		assert_eq!(round_trip(&data), data, "and it comes back the same way");
 	}
 

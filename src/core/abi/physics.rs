@@ -46,6 +46,7 @@ use super::{
 	mesh::MeshId,
 	names::Names,
 	net::{PeerId, Role},
+	water::{Water, WaterKind},
 };
 use crate::{
 	abi::Transform,
@@ -626,6 +627,22 @@ pub struct Body {
 	/// its owner says, so `role` answers what may be done and this answers who
 	/// asked for it.
 	pub owner: PeerId,
+
+	/// What fills it, or [`Water::NONE`] for a body that is not a fluid.
+	///
+	/// **A body that holds a fluid does not push**: [`solid`](Self::solid)
+	/// reads this beside [`sensor`](Self::sensor), so a pool is noticed by the
+	/// narrow phase, reported as an overlap and walked through. Which of those
+	/// two makes a body pass-through is a different question from what the
+	/// body then *does* to what is inside it, and only the second is here.
+	///
+	/// On the body rather than in a table beside it, unlike a light on an
+	/// entity: this is read once per overlapping pair rather than once per
+	/// slot per frame, [`Solid`](super::scene::Solid) already carries every
+	/// plain field of a body between the live record and the written one, and
+	/// a dotted row in [`FIELDS`](Self::FIELDS) gives the inspector and the
+	/// scene source their nesting for nothing. @ref [`water`](super::water).
+	pub water: Water,
 }
 
 impl Body {
@@ -691,6 +708,34 @@ impl Body {
 			set: |body, value| put_bits(&mut body.layers.mask, &value),
 		},
 		field!(Entity, "entity", entity, "the entity it drives, or none"),
+		word!(
+			"water.kind",
+			water.kind,
+			WaterKind::WORDS,
+			WaterKind::at,
+			WaterKind::index,
+			"what fluid fills it, or none"
+		),
+		field!(
+			Float,
+			"water.density",
+			water.density,
+			"how heavy the fluid is, in mass per cubic unit"
+		),
+		field!(Float, "water.damp", water.damp, "how hard the fluid stops something bobbing"),
+		field!(
+			Float,
+			"water.linear_drag",
+			water.linear_drag,
+			"how hard the fluid resists being moved through"
+		),
+		field!(
+			Float,
+			"water.angular_drag",
+			water.angular_drag,
+			"how hard the fluid resists being turned in"
+		),
+		field!(Vec3, "water.flow", water.flow, "which way the fluid runs, in units a second"),
 	];
 	/// How much a body grips unless it says otherwise.
 	pub const FRICTION: f32 = 0.5;
@@ -723,6 +768,7 @@ impl Body {
 			force: Vec3::ZERO,
 			torque: Vec3::ZERO,
 			owner: PeerId::NONE,
+			water: Water::NONE,
 		}
 	}
 
@@ -842,8 +888,13 @@ impl Body {
 	/// The question every piece of the solver asks, written once so that the
 	/// negation is not spelled out at each of them. @ref
 	/// [`movable`](Self::movable), which is the other half of the same shape.
+	///
+	/// **Water answers it as well as the sensor flag.** A pool that shoved
+	/// things back out of itself is nobody's idea of a pool, and making a
+	/// person tick two boxes to get one behavior is how one of them ends up
+	/// unticked. @ref [`water`](Self::water).
 	#[must_use]
-	pub const fn solid(&self) -> bool { !self.sensor }
+	pub const fn solid(&self) -> bool { !self.sensor && !self.water.is_wet() }
 
 	/// The smallest axis-aligned box in world space that holds this body.
 	///
@@ -2029,6 +2080,43 @@ mod tests {
 		assert!(solid.solid(), "a body is solid unless it says otherwise");
 		assert!(!sensor.solid(), "and a sensor says otherwise");
 		assert!(!solid.sensor, "which is one flag and not a kind");
+	}
+
+	#[test]
+	fn the_bodys_table_carries_every_field_water_has() {
+		// two tables that have to agree, because the rows here are written by
+		// hand rather than lifted off `Water::FIELDS` - a `Field` is two plain
+		// function pointers and there is no way to wrap one without a closure
+		// that captures. So the guard is this rather than the type system: a
+		// field added to water and forgotten here is a field an inspector and
+		// a scene source would both silently drop.
+		for entry in Water::FIELDS {
+			let dotted = format!("water.{}", entry.name);
+
+			assert!(
+				Body::FIELDS.iter().any(|row| row.name == dotted),
+				"{dotted} is a row of a body's own table too"
+			);
+		}
+
+		assert_eq!(
+			Body::FIELDS
+				.iter()
+				.filter(|row| row.name.starts_with("water."))
+				.count(),
+			Water::FIELDS.len(),
+			"and there is no row here that water does not have"
+		);
+	}
+
+	#[test]
+	fn a_body_that_holds_a_fluid_pushes_nothing_either() {
+		let mut pool = Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY);
+		pool.water = Water::pool();
+
+		assert!(!pool.solid(), "a pool that shoved things out of itself is nobody's pool");
+		assert!(!pool.sensor, "and it did not have to be ticked as a sensor as well");
+		assert!(Body::default().solid(), "while a body holding nothing is unchanged");
 	}
 
 	#[test]

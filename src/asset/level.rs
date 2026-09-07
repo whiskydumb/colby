@@ -1465,7 +1465,9 @@ fn as_text(value: &str) -> String { json::quoted(value) }
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{LightKind, ShapeKind, SkyKind, ToneMap, scene::Form};
+	use colby_core::abi::{
+		LightKind, ShapeKind, SkyKind, ToneMap, Water, WaterKind, scene::Form,
+	};
 
 	use super::*;
 
@@ -2554,6 +2556,54 @@ mod tests {
 			"and the crate, whose light is the default, gets no key at all"
 		);
 		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_pool_is_read_out_of_its_own_object_and_written_back_into_one() {
+		// unlike a light, nothing in this module names water: the rows are
+		// dotted names on the body's own table and `Rows::text` gathers them,
+		// so this pins the spelling a person types rather than any code path.
+		let scene = import(
+			r#"{ "bodies": [
+				{ "name": "pool", "kind": "static", "water": {
+					"kind": "volume", "density": 3, "damp": 5, "linear_drag": 0.4,
+					"angular_drag": 0.1, "flow": [0, 0, -2] } },
+				{ "name": "crate" }
+			] }"#,
+		)
+		.expect("it is a scene");
+
+		let pool = scene.solids[0].water;
+
+		assert_eq!(pool.kind, WaterKind::Volume, "the word is the kind");
+		assert!((pool.density - 3.0).abs() < 1.0e-6, "and the fluid has its own density");
+		assert!((pool.damp - 5.0).abs() < 1.0e-6, "and its own damping");
+		assert!(
+			(pool.linear_drag - 0.4).abs() < 1.0e-6 && (pool.angular_drag - 0.1).abs() < 1.0e-6,
+		);
+		assert_eq!(pool.flow, Vec3::new(0.0, 0.0, -2.0), "and its current");
+		assert_eq!(scene.solids[1].water, Water::NONE, "a body without one holds nothing");
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains("\"water\": {"), "the pool is written under its own key");
+		assert_eq!(
+			text.matches("\"water\": {").count(),
+			1,
+			"and the crate, whose water is the default, gets no key at all"
+		);
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_water_field_nobody_declared_is_refused_by_name() {
+		let refused = import(r#"{ "bodies": [ { "water": { "viscosity": 2 } } ] }"#)
+			.expect_err("water has no viscosity");
+
+		assert!(
+			format!("{refused}").contains("viscosity"),
+			"and the message says which word it was: {refused}"
+		);
 	}
 
 	#[test]

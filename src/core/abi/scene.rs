@@ -70,7 +70,7 @@ use crate::{
 	abi::{
 		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
 		Light, MaterialId, MeshId, Pose, PoseId, Post, Registry, Renderable, Shape, ShapeKind,
-		Sky, Transform, World,
+		Sky, Transform, Water, World,
 		field::{Field, field},
 		net::MAX_PEERS,
 		state::STATE_BYTES,
@@ -345,6 +345,9 @@ pub struct Solid {
 	/// Which layers it is on and which it interacts with.
 	pub layers: Layers,
 
+	/// What fluid fills it, or [`Water::NONE`].
+	pub water: Water,
+
 	/// Which entry of [`SceneData::things`] it drives, or [`NO_INDEX`].
 	pub thing: u32,
 }
@@ -390,6 +393,7 @@ impl Solid {
 			weightless: body.weightless,
 			sleeping: body.sleeping,
 			layers: body.layers,
+			water: body.water,
 			thing,
 		}
 	}
@@ -417,6 +421,7 @@ impl Solid {
 		body.weightless = self.weightless;
 		body.sleeping = self.sleeping;
 		body.layers = self.layers;
+		body.water = self.water;
 		body.entity = entity;
 
 		body
