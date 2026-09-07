@@ -210,6 +210,13 @@ pub(crate) enum Change {
 		which: usize,
 	},
 
+	/// Put a body of water in the middle of what is being looked at.
+	///
+	/// No asset behind it and so not a [`Drop`](Self::Drop): a fluid is
+	/// something the engine can make on its own, which is why it is a press
+	/// rather than a row in the browser.
+	Water,
+
 	/// Put an asset into the world, where it was dropped.
 	Drop {
 		/// The asset name.
@@ -737,6 +744,7 @@ impl Panels {
 			| Change::Open { name } => self.reach(world, &name),
 			| Change::Show { which } => self.restore = self.tabs.switch(world, which),
 			| Change::Shut { which } => self.restore = self.tabs.close(which),
+			| Change::Water => self.water(world),
 			| Change::Drop { name, kind, at } => self.drop(world, &name, kind, at),
 		}
 	}
@@ -816,6 +824,34 @@ impl Panels {
 		info!(name, tabs = self.tabs.len(), "opened");
 	}
 
+	fn water(&mut self, world: &mut World) {
+		// where the middle of the picture meets the ground, which is where a
+		// drop with no pointer would land: a pool put down at the origin
+		// while somebody is looking somewhere else is a pool they have to go
+		// and find. @ref `aim::floor`.
+		let middle = Vec2::new(self.view.width() * 0.5, self.view.height() * 0.5);
+		let size = Vec2::new(self.view.width().max(1.0), self.view.height().max(1.0));
+		let at = aim::floor(&world.render_camera(), middle, size);
+
+		self.tabs.history().begin("water", world);
+		let made = select::water(world, at);
+
+		if made.is_empty() {
+			warn!("there was no room in the world for a pool");
+
+			return;
+		}
+
+		self.selection.clear();
+		for pick in &made {
+			self.selection.toggle(world, *pick);
+		}
+
+		info!(?at, "a pool was put in the world");
+	}
+
+	/// Puts an asset into the world where it was dropped, as one record, and
+	/// selects what it became.
 	fn drop(&mut self, world: &mut World, name: &str, kind: Kind, at: Vec3) {
 		self.tabs.history().begin("drop", world);
 		let landed = select::drop(world, name, kind, at);
@@ -1000,6 +1036,46 @@ mod tests {
 			repeat: false,
 			modifiers,
 		}]);
+	}
+
+	#[test]
+	fn asking_for_water_puts_a_pool_in_front_of_the_camera_and_selects_it() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut panels = Panels::default();
+
+		// one frame first, so the viewport has a size for the middle of it to
+		// be worked out from: a pool asked for before anything was drawn
+		// would land wherever a camera with no picture points.
+		frame(&mut panels, &mut world);
+		panels.apply(&mut world, Change::Water);
+
+		let (id, body) = world
+			.bodies
+			.iter()
+			.find(|(_, body)| body.water.is_wet())
+			.expect("a pool was made");
+
+		assert!(!body.solid(), "which nothing is pushed out of");
+		assert!(body.entity.is_some(), "and it drives something to look at");
+		assert_eq!(world.bodies.len(), 1, "one body and no more");
+		assert!(
+			panels.selection.is(Pick::Entity(body.entity)),
+			"and what was made is what is selected"
+		);
+
+		// and it is a step, so it can be taken back
+		panels.apply(&mut world, Change::Undo);
+		let put_back = panels
+			.restore
+			.take()
+			.expect("an undo hands a world back");
+		colby_core::abi::scene::restore(&mut world, &put_back).expect("the layouts agree");
+
+		assert!(
+			world.bodies.get(id).is_none(),
+			"a pool put down by mistake is one step back, like everything else"
+		);
 	}
 
 	#[test]

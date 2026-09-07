@@ -21,7 +21,10 @@
 
 use colby_asset::compile::Kind;
 use colby_core::{
-	abi::{Body, BodyId, EntityId, JointId, Renderable, Transform, World, scene},
+	abi::{
+		Body, BodyId, BodyKind, EntityId, JointId, MeshId, Renderable, Shape, Transform, Water,
+		World, material, scene,
+	},
 	glam::Vec3,
 };
 
@@ -789,6 +792,67 @@ fn copy_joints(world: &mut World, body_copies: &[(BodyId, BodyId)]) -> Vec<(Join
 	joint_copies
 }
 
+/// How big a pool is when somebody asks for one, in world units.
+///
+/// Wide, shallow and not square: a pool that came out a cube would have to be
+/// dragged into shape before it looked like anything, and the shape a person
+/// is going to want is a body of water rather than a tank.
+pub(crate) const POOL: Vec3 = Vec3::new(8.0, 3.0, 8.0);
+
+/// Puts a body of water in the world, and gives it something to look at.
+///
+/// **One entity and one body, and the two agree by construction.** The body's
+/// shape is the unit cube and its size is the transform's scale, which is
+/// exactly what the cube mesh the entity draws is - so the box that is drawn
+/// and the box that floats things are the same box, and the gizmo's size tool
+/// moves both at once. A shape with its own extents beside a mesh with its own
+/// scale would be two numbers a person has to keep equal by hand.
+///
+/// A cube rather than a quad at the surface, and it is worth saying why: a
+/// fluid is a *volume*, its walls are where things stop being in it, and a
+/// single plane at the top would draw a world where a pool and a puddle look
+/// identical. @ref [`Material::WATER`](colby_core::abi::Material::WATER) for
+/// the three rules that make it see-through.
+///
+/// @param world - the world to write
+/// @param at - where the middle of it goes
+/// @return what was made, for the selection; empty if the tables are full
+pub(crate) fn water(world: &mut World, at: Vec3) -> Vec<Pick> {
+	let mut standing = Transform::at(at);
+	standing.scale = POOL;
+
+	let entity = world.entities.spawn_at(standing);
+	if !entity.is_some() {
+		return Vec::new();
+	}
+
+	let mut look = Renderable::new(MeshId::CUBE, Vec3::ONE);
+	look.material = world.materials.find(material::WATER_NAME);
+	world.entities.set_renderable(entity, look);
+	world.entities.set_name(entity, "water");
+
+	// static, because a body of water that fell would be a body of water with
+	// nowhere to be. A person who wants one that moves says so in the
+	// inspector, and everything about it already works if they do.
+	let body = world
+		.bodies
+		.spawn(Body::new(BodyKind::Static, Shape::UNIT, standing).driving(entity));
+
+	if !body.is_some() {
+		world.entities.despawn(entity);
+
+		return Vec::new();
+	}
+
+	if let Some(held) = world.bodies.get_mut(body) {
+		held.water = Water::pool();
+	}
+
+	world.bodies.set_name(body, "water");
+
+	vec![Pick::Entity(entity)]
+}
+
 /// What a row of the asset browser becomes when it is dropped into the
 /// world: a scene laid down there, a mesh as an entity standing there, a
 /// model as an entity with a child per piece. Anything else - a texture, a
@@ -956,9 +1020,80 @@ fn ratio(now: f32, before: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{BodyKind, Joint, Shape};
+	use colby_core::abi::{Joint, ShapeKind};
 
 	use super::*;
+
+	#[test]
+	fn a_pool_is_one_body_and_one_entity_whose_two_boxes_are_the_same_box() {
+		let mut world = World::new();
+		let made = water(&mut world, Vec3::new(3.0, -1.0, 0.0));
+
+		assert_eq!(made.len(), 1, "one thing is selected, and it is the entity");
+
+		let Some(Pick::Entity(entity)) = made.first().copied() else {
+			panic!("a pool is picked by its entity");
+		};
+		let (_, body) = world
+			.bodies
+			.iter()
+			.find(|(_, body)| body.water.is_wet())
+			.expect("and there is a body under it");
+
+		assert_eq!(body.entity, entity, "the body drives the entity");
+		assert_eq!(body.shape.kind, ShapeKind::Box, "and it is a box");
+		assert_eq!(
+			body.shape.extents.abs() * body.transform.scale.abs(),
+			POOL * 0.5,
+			"whose half-extents are half the drawn cube, which is what makes the two agree"
+		);
+		assert_eq!(body.transform.position, Vec3::new(3.0, -1.0, 0.0), "where it was asked for");
+		assert!(!body.solid(), "and nothing is pushed out of it");
+
+		let look = world
+			.entities
+			.renderable(entity)
+			.expect("the entity draws something");
+
+		assert_eq!(look.mesh, MeshId::CUBE, "a volume rather than a plane at the top of one");
+		assert_eq!(
+			look.material,
+			world.materials.find(material::WATER_NAME),
+			"in the one built-in material that is not solid"
+		);
+	}
+
+	#[test]
+	fn a_pool_can_be_resized_by_the_one_number_that_moves_both_halves() {
+		// the whole reason the shape is the unit cube: a size gizmo writes the
+		// transform's scale, and both the box that is drawn and the box that
+		// floats things are that scale.
+		let mut world = World::new();
+		let Some(Pick::Entity(entity)) = water(&mut world, Vec3::ZERO).first().copied() else {
+			panic!("a pool is picked by its entity");
+		};
+		let (id, _) = world
+			.bodies
+			.iter()
+			.find(|(_, body)| body.water.is_wet())
+			.expect("a body is under it");
+
+		if let Some(body) = world.bodies.get_mut(id) {
+			body.transform.scale = Vec3::new(20.0, 1.0, 20.0);
+		}
+
+		let body = world.bodies.get(id).expect("it is alive");
+
+		assert_eq!(
+			body.surface(),
+			Some(0.5),
+			"the surface follows the scale, so a shallower pool floats things lower"
+		);
+		assert!(
+			world.entities.placed(entity).is_some(),
+			"and the entity the renderer walks is still there to be scaled with it"
+		);
+	}
 
 	/// A world with a named entity, the body under it, and a joint.
 	fn peopled() -> (World, EntityId, BodyId, JointId) {

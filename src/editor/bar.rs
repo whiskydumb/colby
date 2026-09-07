@@ -8,7 +8,7 @@
 //! without a window and keeps the world written in one place.
 
 use colby_core::abi::World;
-use egui::{Align, Button, Layout, RichText, TextEdit, Ui};
+use egui::{Align, Button, Layout, Rect, RichText, TextEdit, Ui};
 
 use crate::{Change, KEEP, gizmo::Tool};
 
@@ -38,6 +38,7 @@ impl Bar {
 	/// @param steps - what an undo would undo and what a redo would do again,
 	/// for the two buttons
 	/// @param changes - where a press is written down
+	/// @return where the button that puts water in the world landed
 	pub(crate) fn show(
 		&mut self,
 		ui: &mut Ui,
@@ -46,7 +47,7 @@ impl Bar {
 		steps: Steps<'_>,
 		scene: &str,
 		changes: &mut Vec<Change>,
-	) {
+	) -> Rect {
 		// the field follows the tab on screen until somebody types in it, and
 		// then it is theirs: what they typed is a save-as they have not
 		// pressed yet, and a switch that overwrote it would throw it away
@@ -55,8 +56,10 @@ impl Bar {
 		}
 
 		ui.add_space(4.0);
-		strip(ui, world, tool, steps, &mut self.filed, &mut self.typed, changes);
+		let pool = strip(ui, world, tool, steps, &mut self.filed, &mut self.typed, changes);
 		ui.add_space(4.0);
+
+		pool
 	}
 }
 
@@ -79,7 +82,9 @@ fn strip(
 	filed: &mut String,
 	typed: &mut bool,
 	changes: &mut Vec<Change>,
-) {
+) -> Rect {
+	let mut pool = Rect::NOTHING;
+
 	ui.horizontal(|ui| {
 		mode(ui, world, changes);
 		ui.separator();
@@ -87,9 +92,13 @@ fn strip(
 		ui.separator();
 		tools(ui, tool, changes);
 		ui.separator();
+		pool = adding(ui, changes);
+		ui.separator();
 		filing(ui, filed, typed, changes);
 		hint(ui);
 	});
+
+	pool
 }
 
 /// Play or stop, and which of the two the world is in.
@@ -155,6 +164,26 @@ fn tools(ui: &mut Ui, tool: Tool, changes: &mut Vec<Change>) {
 	}
 }
 
+/// What the engine can put in the world without an asset behind it.
+///
+/// One button today, and it is here rather than in the asset browser for that
+/// reason: the browser is a view of what is under `assets/`, and a body of
+/// water is not under anything. A second such thing is a second button.
+///
+/// @return where the button landed, so that something other than a hand can
+/// find it and press it
+fn adding(ui: &mut Ui, changes: &mut Vec<Change>) -> Rect {
+	let response = ui
+		.button("+ water")
+		.on_hover_text("a pool in the middle of the view, floating whatever falls in");
+
+	if response.clicked() {
+		changes.push(Change::Water);
+	}
+
+	response.rect
+}
+
 /// The row that writes the world back out as something a person can read.
 ///
 /// Through the console rather than by calling into the runner: the editor is
@@ -192,4 +221,88 @@ fn hint(ui: &mut Ui) {
 		ui.add_space(8.0);
 		ui.label(RichText::new("F1 hides the editor, F5 plays and stops").weak());
 	});
+}
+
+#[cfg(test)]
+mod tests {
+	use egui::{Context, Modifiers, Pos2, RawInput, vec2};
+
+	use super::*;
+
+	/// One headless frame of the strip, with these events in it.
+	///
+	/// @return what was pressed, and where the water button landed
+	fn framed(bar: &mut Bar, context: &Context, events: Vec<egui::Event>) -> (Vec<Change>, Rect) {
+		let world = World::new();
+		let mut changes = Vec::new();
+		let mut pool = Rect::NOTHING;
+		let mut drawn = false;
+
+		// built once whatever egui asks: a context may run the closure twice
+		// in one call, and a strip built twice would answer a click twice.
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 40.0))),
+				events,
+				..Default::default()
+			},
+			|ui| {
+				if !drawn {
+					drawn = true;
+					pool = bar.show(
+						ui,
+						&world,
+						Tool::Move,
+						Steps::default(),
+						"scenes/one",
+						&mut changes,
+					);
+				}
+			},
+		);
+		// epaint asserts that a texture delta is applied rather than dropped,
+		// and nothing here paints. @ref the hierarchy's own frame test.
+		output.textures_delta.clear();
+
+		(changes, pool)
+	}
+
+	#[test]
+	fn the_strip_draws_without_a_window_and_offers_a_pool() {
+		let context = Context::default();
+		let (changes, pool) = framed(&mut Bar::default(), &context, Vec::new());
+
+		assert!(changes.is_empty(), "nobody pressed anything");
+		assert!(pool.is_positive(), "and the button is somewhere to be pressed");
+	}
+
+	#[test]
+	fn pressing_the_button_asks_for_water_and_writes_nothing_itself() {
+		// the rule the whole strip is built on: a press is an intent handed
+		// back rather than a world written, which is what lets the strip be
+		// driven here with no world behind it worth the name.
+		let mut bar = Bar::default();
+		let context = Context::default();
+		// one frame to find out where the button landed, and a second to
+		// press there: egui answers where a widget is only after it has drawn
+		let (_, pool) = framed(&mut bar, &context, Vec::new());
+		let at = pool.center();
+		let (changes, _) = framed(&mut bar, &context, vec![
+			egui::Event::PointerMoved(at),
+			egui::Event::PointerButton {
+				pos: at,
+				button: egui::PointerButton::Primary,
+				pressed: true,
+				modifiers: Modifiers::NONE,
+			},
+			egui::Event::PointerButton {
+				pos: at,
+				button: egui::PointerButton::Primary,
+				pressed: false,
+				modifiers: Modifiers::NONE,
+			},
+		]);
+
+		assert_eq!(changes, vec![Change::Water], "and that is the only thing it asks for");
+	}
 }

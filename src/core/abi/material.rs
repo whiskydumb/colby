@@ -22,6 +22,15 @@ use crate::{
 /// The name the always-present default material is registered under.
 pub const DEFAULT_NAME: &str = "default";
 
+/// The name the always-present water material is registered under.
+///
+/// A second built-in, and the only other one, because water is the only thing
+/// this engine can make on its own that has to be *drawn* a particular way:
+/// every other surface is what somebody's material says it is, and a fluid
+/// that came out opaque would hide the very thing it is there to show. @ref
+/// [`Material::WATER`] and `colby_core::abi::water`.
+pub const WATER_NAME: &str = "water";
+
 /// What a sampler does past the edge of a texture.
 ///
 /// Two, because there are two answers anybody wants: a tiled surface repeats
@@ -246,6 +255,22 @@ impl Material {
 		blend: Blend::Opaque,
 		opacity: 1.0,
 	};
+	/// What a fluid is drawn as: blue-green, smooth, and half see-through.
+	///
+	/// [`Blend::Alpha`], so it reads the depth buffer and does not write it,
+	/// is drawn after everything solid, sorted far to near, and casts no
+	/// shadow - which is what a surface you can see the bottom through has to
+	/// do. @ref [`Blend::Alpha`] for the three rules and why none is optional.
+	///
+	/// Smooth rather than rough, because the one thing a person recognizes
+	/// water by at a glance is that the sky is in it.
+	pub const WATER: Self = Self {
+		base_color: Vec3::new(0.16, 0.38, 0.45),
+		roughness: 0.08,
+		blend: Blend::Alpha,
+		opacity: 0.55,
+		..Self::DEFAULT
+	};
 
 	/// A material in a color, with nothing else set.
 	#[must_use]
@@ -346,6 +371,7 @@ impl Materials {
 			entries: Registry::new(Material::DEFAULT),
 		};
 		materials.insert(DEFAULT_NAME, Material::DEFAULT);
+		materials.insert(WATER_NAME, Material::WATER);
 
 		materials
 	}
@@ -547,7 +573,7 @@ mod tests {
 	fn a_new_registry_has_a_default_at_the_handle_that_names_it() {
 		let materials = Materials::new();
 
-		assert_eq!(materials.len(), 2, "the null material and the default one");
+		assert_eq!(materials.len(), 3, "the null material, the default one and water");
 		assert_eq!(
 			materials.find(DEFAULT_NAME),
 			MaterialId::DEFAULT,
@@ -555,6 +581,21 @@ mod tests {
 		);
 		assert_eq!(materials.get(MaterialId::DEFAULT), Some(&Material::DEFAULT), "and match");
 		assert_eq!(materials.find("stone"), MaterialId::NONE, "nothing else is registered");
+	}
+
+	#[test]
+	fn water_is_registered_too_and_is_the_one_built_in_surface_that_is_not_solid() {
+		let materials = Materials::new();
+		let found = materials.find(WATER_NAME);
+
+		assert!(found.is_some(), "a world can name it without compiling anything");
+		assert_eq!(materials.get(found), Some(&Material::WATER), "and it is the constant");
+		assert_eq!(
+			Material::WATER.blend,
+			Blend::Alpha,
+			"a fluid that came out opaque would hide what it is there to show"
+		);
+		assert_eq!(Material::DEFAULT.blend, Blend::Opaque, "while everything else is solid");
 	}
 
 	#[test]
