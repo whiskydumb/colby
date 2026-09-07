@@ -28,7 +28,7 @@ use colby_core::warn;
 use crate::{
 	link,
 	net::{DEFAULT_PORT, Standing},
-	record, shot,
+	profile, record, shot,
 };
 
 /// `--link [steps]`: two endpoints in one process, and a hash at the end.
@@ -39,6 +39,9 @@ const SHOT: &str = "--shot";
 
 /// `--record [path [steps]]`: what a run sounds like, to a file.
 const RECORD: &str = "--record";
+
+/// `--profile [frames]`: what a frame of this project costs, as a table.
+const PROFILE: &str = "--profile";
 
 /// `--host [port]`: a windowless authority.
 const HOST: &str = "--host";
@@ -102,6 +105,9 @@ pub enum Run {
 	/// One frame, to this file.
 	Shot(PathBuf),
 
+	/// What a frame of this project costs, over this many frames.
+	Profile(u32),
+
 	/// A run's sound, to this file, for this many steps.
 	Record {
 		/// Where to write the file.
@@ -126,6 +132,7 @@ pub enum Run {
 struct Flags {
 	link: Option<u32>,
 	shot: Option<PathBuf>,
+	profile: Option<u32>,
 	record: Option<(PathBuf, u32)>,
 	host: Option<u16>,
 	join: Option<SocketAddr>,
@@ -154,6 +161,12 @@ impl Flags {
 							.path(inline)
 							.unwrap_or_else(|| PathBuf::from(shot::DEFAULT_PATH)),
 					),
+				| PROFILE =>
+					flags.profile = Some(
+						words
+							.count(inline, profile::FRAMES)
+							.clamp(1, profile::MAX_FRAMES),
+					),
 				| RECORD => flags.record = Some(words.recording(inline)),
 				| HOST => flags.host = Some(words.port(inline)),
 				| JOIN => flags.join = words.address(inline, JOIN),
@@ -177,6 +190,7 @@ impl Flags {
 		let Self {
 			link,
 			shot,
+			profile,
 			record,
 			host,
 			join,
@@ -184,24 +198,31 @@ impl Flags {
 			connect,
 			..
 		} = self;
-		let named =
-			[link.is_some(), shot.is_some(), record.is_some(), host.is_some(), join.is_some()]
-				.into_iter()
-				.filter(|named| *named)
-				.count();
+		let named = [
+			link.is_some(),
+			shot.is_some(),
+			profile.is_some(),
+			record.is_some(),
+			host.is_some(),
+			join.is_some(),
+		]
+		.into_iter()
+		.filter(|named| *named)
+		.count();
 
 		// the precedence, as a table: the first run named in dispatch order.
-		let chosen = match (link, shot, record, host, join, listen, connect) {
+		let chosen = match (link, shot, profile, record, host, join, listen, connect) {
 			| (Some(steps), ..) => Run::Link(steps),
 			| (None, Some(path), ..) => Run::Shot(path),
-			| (None, None, Some((path, steps)), ..) => Run::Record { path, steps },
-			| (None, None, None, Some(port), ..) => Run::Host(port),
-			| (None, None, None, None, Some(address), ..) => Run::Join(address),
-			| (None, None, None, None, None, Some(port), _) =>
+			| (None, None, Some(frames), ..) => Run::Profile(frames),
+			| (None, None, None, Some((path, steps)), ..) => Run::Record { path, steps },
+			| (None, None, None, None, Some(port), ..) => Run::Host(port),
+			| (None, None, None, None, None, Some(address), ..) => Run::Join(address),
+			| (None, None, None, None, None, None, Some(port), _) =>
 				Run::Window(Standing::Serving(port)),
-			| (None, None, None, None, None, None, Some(address)) =>
+			| (None, None, None, None, None, None, None, Some(address)) =>
 				Run::Window(Standing::Talking(address)),
-			| (None, None, None, None, None, None, None) => Run::Window(Standing::Alone),
+			| (None, None, None, None, None, None, None, None) => Run::Window(Standing::Alone),
 		};
 
 		if named > 1 {

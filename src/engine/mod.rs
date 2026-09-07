@@ -23,6 +23,7 @@ pub mod scene;
 pub mod shader;
 pub mod shadow;
 mod skin;
+pub mod timing;
 
 pub use ::wgpu;
 pub use ::winit;
@@ -36,4 +37,5 @@ pub use self::{
 	renderer::Renderer,
 	scene::{Scene, Viewport},
 	shader::Shader,
+	timing::Timings,
 };

@@ -297,6 +297,25 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 
+# An optimized hot-reload build, which exists so that `just profile` measures a
+# frame rather than a debug build. It has to be a profile of its own and not
+# `release` with the hot flags added: cargo tracks the encoded rustflags in its
+# fingerprints, so alternating between a `just release` without them and a
+# measurement with them would relink the whole workspace every time.
+#
+# Everything `release` has except its link-time optimization, and that is not a
+# choice: rustc refuses `-Cprefer-dynamic` together with plugin-based LTO on
+# Windows outright. So a measured frame is optimized within each crate and not
+# across them, which is the one way it is not the build anybody ships - and it
+# is the same trade `just hot` already makes to be able to load a module at
+# all. @ref src/runtime/profile.rs.
+[profile.measure]
+inherits = "release"
+lto = false
+
+[profile.measure.package.colby_core]
+incremental = false
+
 # Hot-reload build. `-Cprefer-dynamic` is not set here because cargo only honours
 # per-profile rustflags on nightly; `just hot` exports RUSTFLAGS instead.
 [profile.hot]

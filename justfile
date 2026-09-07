@@ -22,9 +22,17 @@ hot_profile := "hot"
 hot_flags := "-Cprefer-dynamic"
 hot_dir := "target" / hot_profile
 
+# the same arrangement built optimized, for `just profile`. A profile of its
+# own rather than `release` with the flags on: cargo fingerprints the encoded
+# rustflags, so sharing a directory with `just release` would relink the
+# workspace on every alternation.
+measure_profile := "measure"
+measure_dir := "target" / measure_profile
+
 # the executable as this platform spells it
 exe := "colby" + if os_family() == "windows" { ".exe" } else { "" }
 hot_exe := hot_dir / exe
+measure_exe := measure_dir / exe
 
 # the project every recipe that runs the engine opens: the Blank fixture, the
 # one project that always lives in this tree. The engine checkout is not a
@@ -133,6 +141,26 @@ hear path="colby.wav" steps="90": hot-build
 # tool. Pass a step count for a longer run.
 link steps="600":
     cargo run --quiet --package colby {{locked}} -- --link {{steps}}
+
+# build every crate optimized, and still able to load a game module
+measure-build $CARGO_ENCODED_RUSTFLAGS=hot_flags:
+    cargo build --profile {{measure_profile}} {{locked}}
+
+# measure what a frame of the project costs, as a table
+#
+# @note: the fourth of the family, after `just shot`, `just hear` and
+# `just link`, and the only one whose numbers are not the same on every
+# machine - so it is not compared byte for byte and it is not in the gate. The
+# one stable thing it prints is how many render passes a frame recorded.
+#
+# Optimized rather than hot-reload, and that is not a preference:
+# `[profile.hot]` inherits `dev` and `package."*"` lifts only the dependencies,
+# so under `just hot` and `just shot` every colby crate is at opt-level nought.
+# The GPU rows would be right and every CPU row would be a number about a debug
+# build. It still passes -Cprefer-dynamic, because a measurement that cannot
+# open a project with a game in it is a measurement of an empty world.
+profile frames="120": measure-build
+    ./{{measure_exe}} --project "{{project}}" --profile {{frames}}
 
 # build and open the documentation
 doc:

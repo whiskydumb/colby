@@ -243,7 +243,7 @@ impl Gpu {
 		let (device, queue) = adapter
 			.request_device(&DeviceDescriptor {
 				label: Some("colby"),
-				required_features: Features::empty(),
+				required_features: timing_features(&adapter),
 				required_limits: Limits::default(),
 				experimental_features: ExperimentalFeatures::disabled(),
 				memory_hints: MemoryHints::Performance,
@@ -254,6 +254,28 @@ impl Gpu {
 
 		Ok(Some(Self { instance, adapter, device, queue }))
 	}
+}
+
+/// The one feature this asks for beyond what every device has.
+///
+/// **Asked for at every start, whether or not anybody measures anything.** A
+/// feature can only be requested when the device is made, and the device is
+/// made before there is a console to type at, before a project is open and
+/// long before anybody has a frame they think is slow - so requesting it later
+/// is not a thing that exists. What it costs when nothing measures is the flag
+/// and nothing else: no query set is created until [`Timings::start`] is
+/// called, and every pass writes the same `None` it did before.
+///
+/// Asked for only where the adapter has it, because a device asked for a
+/// feature its adapter lacks is refused outright - and a machine that cannot
+/// time a pass should still draw. That is bevy's arrangement too: it never
+/// requests this by name, it checks `device.features()` and keeps a wall clock
+/// where the answer is no (`diagnostic/internal.rs:54,248,523-545`).
+///
+/// @param adapter - the adapter the device is about to be made on
+/// @return the feature when it is there, and nothing when it is not
+fn timing_features(adapter: &Adapter) -> Features {
+	adapter.features() & Features::TIMESTAMP_QUERY
 }
 
 #[cfg(test)]

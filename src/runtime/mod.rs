@@ -45,6 +45,7 @@ mod mode;
 #[cfg(feature = "hot_reload")]
 mod mount;
 mod net;
+mod profile;
 mod record;
 mod runtime;
 mod saves;
@@ -149,6 +150,10 @@ pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 		// what it writes has to be the same file on a machine with speakers and
 		// one without.
 		| Run::Shot(path) => shot::take(&path, &project, &build),
+		// and neither does a measurement, for the same reason a screenshot
+		// does not: what a frame costs must not depend on what somebody last
+		// typed at a console. @ref `crate::profile`.
+		| Run::Profile(frames) => profile::take(&project, &build, frames),
 		| Run::Record { path, steps } => record::take(&path, steps, &project, &build),
 		// a socket instead of a window, which is a run rather than a build: the
 		// same executable, the same module, the same step. @ref `crate::host`.

@@ -32,11 +32,14 @@ use wgpu::{
 	BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites, CommandEncoder, Device,
 	ErrorFilter, Extent3d, FilterMode, FragmentState, LoadOp, MultisampleState, Operations,
 	PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, Queue,
-	RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-	Sampler, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
-	ShaderStages, StoreOp, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
-	TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
+	RenderPassColorAttachment, RenderPassDescriptor, RenderPassTimestampWrites, RenderPipeline,
+	RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
+	ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TextureDescriptor,
+	TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+	TextureViewDescriptor, TextureViewDimension, VertexState,
 };
+
+use crate::timing::{Ends, Pass, Timings};
 
 /// The format the world is drawn into.
 ///
@@ -341,6 +344,8 @@ impl Chain {
 	/// @param post - what the world asks for
 	/// @param seconds - how long this frame was, for the eye
 	/// @param out - the window's or the capture's own view
+	/// @param timings - what to write this frame's marks into, which is
+	/// nothing at all until somebody has asked to be told
 	pub(crate) fn resolve(
 		&mut self,
 		encoder: &mut CommandEncoder,
@@ -348,6 +353,7 @@ impl Chain {
 		post: Post,
 		seconds: f32,
 		out: &TextureView,
+		timings: &Timings,
 	) {
 		// the eye is measured first and read by the composite in the same
 		// encoder, so the tuning block has to describe the frame that is about
@@ -357,13 +363,14 @@ impl Chain {
 		queue.write_buffer(&self.tuning, 0, bytemuck::bytes_of(&tuning_of(post, moving)));
 
 		if post.auto_exposure {
-			self.measure(encoder);
+			self.measure(encoder, timings);
 		}
 
 		if post.is_blooming() {
-			self.gather(encoder);
+			self.gather(encoder, timings);
 		}
 
+		let composite = timings.writes(Pass::Composite, Ends::Both);
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
 			label: Some("post composite"),
 			color_attachments: &[Some(RenderPassColorAttachment {
@@ -379,7 +386,7 @@ impl Chain {
 				},
 			})],
 			depth_stencil_attachment: None,
-			timestamp_writes: None,
+			timestamp_writes: composite,
 			occlusion_query_set: None,
 			multiview_mask: None,
 		});
@@ -398,15 +405,25 @@ impl Chain {
 	/// adding each rung into the one under it. The widest rung is what the
 	/// composite reads, and it holds every rung above it by the time this
 	/// returns.
-	fn gather(&self, encoder: &mut CommandEncoder) {
+	fn gather(&self, encoder: &mut CommandEncoder, timings: &Timings) {
+		// the span opens on the first pass down and closes on the last pass
+		// up, so a chain of one rung - a target too small to halve twice - is
+		// both ends of its own span rather than an opening nothing closes.
+		let alone = self.glow.len() < 2;
+
 		for (step, rung) in self.glow.iter().enumerate() {
 			let (pipeline, source) = if step == 0 {
 				(&self.threshold, &self.target_read)
 			} else {
 				(&self.down, &self.glow[step - 1].read)
 			};
+			let marks = match (step, alone) {
+				| (0, true) => timings.writes(Pass::Glow, Ends::Both),
+				| (0, false) => timings.writes(Pass::Glow, Ends::Open),
+				| _ => timings.writes(Pass::Glow, Ends::Middle),
+			};
 
-			screen_pass(encoder, "post glow down", &rung.view, |pass| {
+			screen_pass(encoder, "post glow down", &rung.view, marks, |pass| {
 				pass.set_pipeline(pipeline);
 				pass.set_bind_group(0, &self.numbers, &[]);
 				pass.set_bind_group(1, source, &[]);
@@ -418,8 +435,11 @@ impl Chain {
 		// its own half of the answer.
 		for step in (1..self.glow.len()).rev() {
 			let source = &self.glow[step].read;
+			// the widest rung is written last, so that is where the span ends
+			let marks =
+				timings.writes(Pass::Glow, if step == 1 { Ends::Close } else { Ends::Middle });
 
-			over_pass(encoder, "post glow up", &self.glow[step - 1].view, |pass| {
+			over_pass(encoder, "post glow up", &self.glow[step - 1].view, marks, |pass| {
 				pass.set_pipeline(&self.up);
 				pass.set_bind_group(1, source, &[]);
 			});
@@ -427,15 +447,17 @@ impl Chain {
 	}
 
 	/// The ladder and the eye, for a frame that measures.
-	fn measure(&mut self, encoder: &mut CommandEncoder) {
+	fn measure(&mut self, encoder: &mut CommandEncoder, timings: &Timings) {
 		for (step, rung) in self.rungs.iter().enumerate() {
 			let (pipeline, source) = if step == 0 {
 				(&self.luminance, &self.target_read)
 			} else {
 				(&self.halve, &self.rungs[step - 1].read)
 			};
+			let marks =
+				timings.writes(Pass::Meter, if step == 0 { Ends::Open } else { Ends::Middle });
 
-			screen_pass(encoder, "post meter", &rung.view, |pass| {
+			screen_pass(encoder, "post meter", &rung.view, marks, |pass| {
 				pass.set_pipeline(pipeline);
 				pass.set_bind_group(1, source, &[]);
 			});
@@ -447,8 +469,11 @@ impl Chain {
 
 		let before = self.eye;
 		let after = 1 - before;
+		// the eye moving is the last thing the meter does, so the span ends
+		// here rather than at the bottom of the ladder
+		let marks = timings.writes(Pass::Meter, Ends::Close);
 
-		screen_pass(encoder, "post adapt", &self.eyes[after].view, |pass| {
+		screen_pass(encoder, "post adapt", &self.eyes[after].view, marks, |pass| {
 			pass.set_pipeline(&self.adapt);
 			pass.set_bind_group(0, &self.numbers, &[]);
 			pass.set_bind_group(1, &bottom.read, &[]);
@@ -834,8 +859,15 @@ fn sampled(
 }
 
 /// One pass over one triangle covering its target.
-fn screen_pass<F>(encoder: &mut CommandEncoder, label: &str, view: &TextureView, setup: F)
-where
+///
+/// @param marks - which end of a timed span this pass carries, if any
+fn screen_pass<F>(
+	encoder: &mut CommandEncoder,
+	label: &str,
+	view: &TextureView,
+	marks: Option<RenderPassTimestampWrites<'_>>,
+	setup: F,
+) where
 	F: FnOnce(&mut wgpu::RenderPass<'_>),
 {
 	let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -850,7 +882,7 @@ where
 			},
 		})],
 		depth_stencil_attachment: None,
-		timestamp_writes: None,
+		timestamp_writes: marks,
 		occlusion_query_set: None,
 		multiview_mask: None,
 	});
@@ -863,8 +895,13 @@ where
 ///
 /// The upsample's, and the only one here that loads: a rung on the way up is
 /// written over its own half of the answer rather than instead of it.
-fn over_pass<F>(encoder: &mut CommandEncoder, label: &str, view: &TextureView, setup: F)
-where
+fn over_pass<F>(
+	encoder: &mut CommandEncoder,
+	label: &str,
+	view: &TextureView,
+	marks: Option<RenderPassTimestampWrites<'_>>,
+	setup: F,
+) where
 	F: FnOnce(&mut wgpu::RenderPass<'_>),
 {
 	let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -879,7 +916,7 @@ where
 			},
 		})],
 		depth_stencil_attachment: None,
-		timestamp_writes: None,
+		timestamp_writes: marks,
 		occlusion_query_set: None,
 		multiview_mask: None,
 	});

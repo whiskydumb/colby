@@ -127,6 +127,22 @@ impl Capture {
 		world: &mut World,
 		overlays: &mut [&mut dyn Overlay],
 	) -> Result<Image> {
+		self.draw(world, overlays);
+		self.copy_out();
+
+		self.read_back()
+	}
+
+	/// Draws a frame and leaves it on the GPU.
+	///
+	/// What [`shoot_with`](Self::shoot_with) does without the three and a half
+	/// megabytes of readback, which a measuring run must not pay for: a copy
+	/// to a mappable buffer is not part of any frame anybody plays, and it
+	/// would be by far the largest thing in a table of what a frame costs.
+	///
+	/// @param world - the state to draw; its `aspect` is overwritten to match
+	/// @param overlays - drawn in order, after the scene
+	pub fn draw(&mut self, world: &mut World, overlays: &mut [&mut dyn Overlay]) {
 		world.aspect = self.aspect();
 
 		let view = self
@@ -141,10 +157,6 @@ impl Capture {
 		for overlay in overlays {
 			overlay.draw(self.scene.device(), self.scene.queue(), &view, self.width, self.height);
 		}
-
-		self.copy_out();
-
-		self.read_back()
 	}
 
 	/// The device this capture draws with.

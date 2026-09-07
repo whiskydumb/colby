@@ -41,8 +41,8 @@ use wgpu::{
 	FragmentState, FrontFace, IndexFormat, LoadOp, MipmapFilterMode, MultisampleState,
 	Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode,
 	PrimitiveState, PrimitiveTopology, Queue, RenderPass, RenderPassColorAttachment,
-	RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
-	RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
+	RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPassTimestampWrites,
+	RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
 	ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, StoreOp,
 	TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
 	TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
@@ -57,6 +57,7 @@ use crate::{
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, Maps},
 	skin::Joints,
+	timing::{Ends, Pass, Timings, Work},
 };
 
 /// The depth format. Thirty-two bits is more than a scene this size needs and
@@ -615,6 +616,11 @@ pub struct Scene {
 	/// pass, for the reason the shadow flag is: what the frame does and what
 	/// its uniform says have to be the same answer.
 	sky: bool,
+	/// What each part of the frame costs, once somebody has asked.
+	///
+	/// Inert until [`Timings::start`], and inert forever on an adapter with no
+	/// timestamps. @ref [`timing`](crate::timing).
+	timings: Timings,
 }
 
 impl Scene {
@@ -734,6 +740,11 @@ impl Scene {
 			lit: Vec::with_capacity(MAX_LAMPS),
 			sky: false,
 			post,
+			// the period is a property of the queue and never changes, so it
+			// is read once here rather than per frame. It is nought on an
+			// adapter with no timestamps, which the apparatus knows to treat
+			// as "nothing was measured" rather than as "every pass is free".
+			timings: Timings::new(gpu.queue().get_timestamp_period()),
 		})
 	}
 
@@ -846,9 +857,19 @@ impl Scene {
 		view: Option<Viewport>,
 		seconds: f32,
 	) {
+		self.timings.begin();
 		self.reload_shader();
 		self.sampling(world);
+
+		self.timings.open(Work::Upload);
 		self.upload(world);
+		self.timings.close(Work::Upload);
+
+		// from here to the submit, which is what the label means: how long
+		// this thread takes to describe the frame, not how long the hardware
+		// takes to run it. The two are separate answers and a frame can be
+		// short of either. @ref [`timing`](crate::timing).
+		self.timings.open(Work::Record);
 
 		let mut encoder = self
 			.device
@@ -860,10 +881,14 @@ impl Scene {
 		// whatever was in them and is safe because nothing then reads them.
 		if self.shadowing {
 			for slice in 0..CASCADES {
-				self.cast(&mut encoder, slice);
+				// one span over all four rather than four spans: they are one
+				// feature and one console variable, and what anybody wants to
+				// know is what shadows cost.
+				self.cast(&mut encoder, slice, self.timings.writes(Pass::Shadow, cascade(slice)));
 			}
 		}
 
+		let scene_marks = self.timings.writes(Pass::Scene, Ends::Both);
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
 			label: Some("scene"),
 			color_attachments: &[Some(RenderPassColorAttachment {
@@ -898,7 +923,7 @@ impl Scene {
 				}),
 				stencil_ops: None,
 			}),
-			timestamp_writes: None,
+			timestamp_writes: scene_marks,
 			occlusion_query_set: None,
 			multiview_mask: None,
 		});
@@ -915,8 +940,16 @@ impl Scene {
 				// written by it and by nothing else, so returning here would
 				// leave the frame holding whatever was in it last.
 				drop(pass);
-				self.post
-					.resolve(&mut encoder, &self.queue, world.post, seconds, target);
+				self.post.resolve(
+					&mut encoder,
+					&self.queue,
+					world.post,
+					seconds,
+					target,
+					&self.timings,
+				);
+				self.timings.resolve(&mut encoder);
+				self.timings.close(Work::Record);
 				self.queue.submit([encoder.finish()]);
 
 				return;
@@ -974,9 +1007,31 @@ impl Scene {
 		// into sixteen-bit floats, and nothing above it wrote a pixel of the
 		// frame that is about to be shown.
 		self.post
-			.resolve(&mut encoder, &self.queue, world.post, seconds, target);
+			.resolve(&mut encoder, &self.queue, world.post, seconds, target, &self.timings);
+
+		// last of all, and into this frame's own encoder: the ten timestamps
+		// are copied out of the query set where the passes that wrote them can
+		// still be told apart. Nothing at all when nobody is measuring.
+		self.timings.resolve(&mut encoder);
+		self.timings.close(Work::Record);
 		self.queue.submit([encoder.finish()]);
 	}
+
+	/// What this frame cost, for whoever asked to be told.
+	///
+	/// Blocks on the queue. @ref [`Timings::settle`] for why, and for why the
+	/// mode that calls it opens no window.
+	pub fn settle(&mut self) -> crate::timing::Frame {
+		let device = self.device.clone();
+
+		self.timings.settle(&device)
+	}
+
+	/// Starts measuring what a frame costs.
+	///
+	/// @return whether the hardware side came up; the wall clock works either
+	/// way
+	pub fn measure(&mut self) -> bool { self.timings.start(&self.device.clone()) }
 
 	/// Which local lights this frame carries, nearest first.
 	///
@@ -1069,7 +1124,14 @@ impl Scene {
 	///
 	/// @param encoder - what to record into
 	/// @param slice - which cascade, nearest first
-	fn cast(&self, encoder: &mut CommandEncoder, slice: usize) {
+	/// @param marks - which end of the shadow span this cascade carries, and
+	/// `None` in a frame nobody is measuring
+	fn cast(
+		&self,
+		encoder: &mut CommandEncoder,
+		slice: usize,
+		marks: Option<RenderPassTimestampWrites<'_>>,
+	) {
 		let (Some(layer), Some(slot)) = (self.shadows.layer(slice), self.shadows.slot(slice))
 		else {
 			return;
@@ -1086,7 +1148,7 @@ impl Scene {
 				}),
 				stencil_ops: None,
 			}),
-			timestamp_writes: None,
+			timestamp_writes: marks,
 			occlusion_query_set: None,
 			multiview_mask: None,
 		});
@@ -1809,6 +1871,24 @@ fn create_buffer(
 	}
 
 	buffer
+}
+
+/// Which end of the shadow span one cascade carries.
+///
+/// The first cascade opens it, the last closes it and the ones between are
+/// only counted, so four passes are timed as the one feature they are. A build
+/// with a single cascade is both ends of its own span, which is not a case
+/// that exists today and is one `CASCADES` could be edited into.
+///
+/// @param slice - which cascade, nearest first
+/// @return what this cascade's pass writes
+const fn cascade(slice: usize) -> Ends {
+	match (slice, CASCADES) {
+		| (0, 1) => Ends::Both,
+		| (0, _) => Ends::Open,
+		| (at, all) if at + 1 == all => Ends::Close,
+		| _ => Ends::Middle,
+	}
 }
 
 /// Creates a depth buffer of a given size.

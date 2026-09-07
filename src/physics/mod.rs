@@ -39,7 +39,10 @@
 #![allow(unsafe_code)]
 
 use core::ffi::c_void;
-use std::collections::HashSet;
+use std::{
+	collections::HashSet,
+	time::{Duration, Instant},
+};
 
 use colby_core::{
 	abi::{
@@ -87,6 +90,33 @@ const SWEEP_SKIN: f32 = 0.01;
 /// A step of zero is a world nobody paced, and the overlap recovery term is one
 /// over it.
 const MINIMUM_STEP: f32 = 1.0e-4;
+
+/// How long the last step spent in each of its parts.
+///
+/// **Here because nothing had measured the buoyancy pass.** It is a loop over
+/// every sensed manifold with eight cells, an inverse inertia and two square
+/// roots per floating body, it runs for a body that has settled at its
+/// waterline because such a body never sleeps, and no number had ever been
+/// taken for it. On its own that number would be unreadable - a tenth of a
+/// millisecond is a lot or nothing depending on what the other three parts
+/// cost - so the three it sits between are timed as well.
+///
+/// A wall clock, deliberately. There is no hardware to ask; every part of this
+/// runs on the thread that calls [`Simulation::step`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spent {
+	/// Finding what touches what, sensors included.
+	pub narrow: Duration,
+
+	/// What the fluids push on what is in them.
+	pub buoyancy: Duration,
+
+	/// The sequential-impulse solver, every pass of it.
+	pub solve: Duration,
+
+	/// The whole of [`Simulation::step`], the three above included.
+	pub total: Duration,
+}
 
 /// The host's physics state.
 ///
@@ -144,6 +174,9 @@ pub struct Simulation {
 
 	/// The sequential-impulse solver and its per-body scratch.
 	solver: Solver,
+
+	/// How long the last step spent where. @ref [`Spent`].
+	spent: Spent,
 }
 
 impl Simulation {
@@ -160,8 +193,17 @@ impl Simulation {
 			sensed: Vec::new(),
 			held: HashSet::new(),
 			solver: Solver::new(),
+			spent: Spent::default(),
 		}
 	}
+
+	/// How long the last step spent in each of its parts.
+	///
+	/// Always taken, because the cost of taking it is four clock reads a step
+	/// against a step that walks every pair of bodies in the world. @ref
+	/// [`Spent`].
+	#[must_use]
+	pub const fn spent(&self) -> Spent { self.spent }
 
 	/// The table a [`World`] is given so the game can ask questions.
 	///
@@ -191,6 +233,8 @@ impl Simulation {
 	///
 	/// @param world - the host state; `bodies` is read, `entities` written
 	pub fn step(&mut self, world: &mut World) {
+		let began = Instant::now();
+
 		self.sync(world);
 		self.excuse(&world.joints);
 		Self::pull(world);
@@ -201,7 +245,9 @@ impl Simulation {
 		// reason the list is a field at all.
 		let mut manifolds = core::mem::take(&mut self.manifolds);
 		let mut sensed = core::mem::take(&mut self.sensed);
+		let finding = Instant::now();
 		contact::find(&world.bodies, self, &mut manifolds, &mut sensed);
+		self.spent.narrow = finding.elapsed();
 		self.report(world, &manifolds, &sensed);
 		self.remember_where(&world.bodies);
 
@@ -216,10 +262,14 @@ impl Simulation {
 		// else: the accumulators are cleared right after `run` below, so a
 		// pass in front of it is felt this step and a pass behind it is felt
 		// never. @ref [`buoyancy`].
+		let floating = Instant::now();
 		Self::afloat(world, &sensed, dt);
+		self.spent.buoyancy = floating.elapsed();
 
+		let solving = Instant::now();
 		self.solver
 			.run(&mut world.bodies, &world.joints, &manifolds, world.gravity, dt, passes);
+		self.spent.solve = solving.elapsed();
 		// and everything that was pushing is spent, here rather than beside
 		// `Bodies::end_step`. The step runs this function *before* the game's
 		// `update`, so a sweep down there would clear what was written for the
@@ -238,6 +288,8 @@ impl Simulation {
 		// rather than the one the last frame did. Costs one console lookup per
 		// variable when it is off, which is what off should cost.
 		debug::draw(world, self);
+
+		self.spent.total = began.elapsed();
 	}
 
 	/// Notes which pairs are not to be collided this step.
