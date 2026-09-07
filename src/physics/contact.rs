@@ -90,10 +90,12 @@ impl Manifold {
 
 /// Every pair of bodies that touches.
 ///
-/// Every pair is tested against every other, which is a broad phase in the
-/// sense that a linear scan is a search. With a bounds rejection in front of it
-/// that is a few hundred nanoseconds for the scenes this engine has; the day it
-/// is not, a grid goes here and nothing above it changes.
+/// Only the pairs whose bounds overlap are tested, and which those are comes
+/// from [`broad`](crate::broad) - a sweep along whichever axis the bodies are
+/// most spread out on, whose candidates arrive in the order a loop over every
+/// pair would have produced them. What is left here is the five filters and the
+/// shape tests. The day a sweep is not enough, a tree goes in there and nothing
+/// in this function changes.
 ///
 /// What a sensor makes goes in a second list rather than being marked in the
 /// first. Two lists because the solver must never be handed one, and a flag it
@@ -117,10 +119,21 @@ pub(crate) fn find(
 	into.clear();
 	sensed.clear();
 
-	let handles: Vec<(BodyId, Body)> = bodies
-		.iter()
-		.map(|(id, body)| (id, *body))
-		.collect();
+	// **borrowed, and with room asked for in advance.** This used to collect
+	// `(BodyId, Body)` - two hundred and eight bytes a body, so two hundred
+	// kilobytes at the thousand-and-twenty-four a world can hold - into a
+	// vector allocated from nothing every step, and `Bodies::iter` skips dead
+	// slots so its lower size hint is nought and the vector doubled its way up
+	// from empty. Measured while closing `PERF-7`: eighteen microseconds of a
+	// forty-seven microsecond narrow phase at four hundred bodies, and
+	// thirty-three of eighty-five at the cap. Borrowing costs sixteen bytes an
+	// entry instead and takes those to 2.4 and 3.5.
+	//
+	// The list has to exist at all because the sweep hands back *positions* in
+	// it and the loop below indexes it twice per candidate; what it does not
+	// have to be is a copy.
+	let mut handles: Vec<(BodyId, &Body)> = Vec::with_capacity(bodies.len());
+	handles.extend(bodies.iter());
 
 	// **the bounding boxes first, and only then the pairs.** This used to be a
 	// loop over every pair in the world, which at two hundred bodies is twenty
@@ -131,12 +144,12 @@ pub(crate) fn find(
 	broad.sweep(
 		handles
 			.iter()
-			.map(|&(id, ref body)| query::world_bounds(body, simulation.collider(id))),
+			.map(|&(id, body)| query::world_bounds(body, simulation.collider(id))),
 		candidates,
 	);
 
 	for &(first_at, second_at) in candidates.iter() {
-		let (Some(&(first, ref one)), Some(&(second, ref other))) =
+		let (Some(&(first, one)), Some(&(second, other))) =
 			(handles.get(first_at), handles.get(second_at))
 		else {
 			continue;
