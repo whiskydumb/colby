@@ -39,6 +39,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
+	/// The scene it draws with.
+	///
+	/// Reached for the timings and nothing else: the apparatus lives on the
+	/// scene because a window and a capture both have one, and the runner is
+	/// what turns it on. @ref [`Scene::measure`].
+	pub fn scene_mut(&mut self) -> &mut Scene { &mut self.scene }
+
 	/// Makes a surface for the window on the shared device, and a scene to
 	/// draw into it.
 	///

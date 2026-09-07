@@ -45,6 +45,10 @@
 
 use std::{
 	cell::Cell,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -304,6 +308,30 @@ pub struct Timings {
 
 	/// The frame most recently settled.
 	last: Frame,
+
+	/// The frame whose timestamps are being read back, and the mask of which
+	/// spans ran in it, held until the numbers arrive.
+	///
+	/// **A frame's answers stay together.** The readback lands two or three
+	/// frames after the frame it is about, and the wall-clock half of that
+	/// frame is long gone from [`last`](Self::last), which [`begin`] clears -
+	/// so the whole of it is stashed here when the map is asked for and handed
+	/// back complete. The alternative, GPU numbers from one frame beside CPU
+	/// numbers from another, is a table describing two things.
+	awaiting: Option<(Frame, u32)>,
+
+	/// Whether a map has been asked for and not yet read.
+	///
+	/// A [`Cell`] because [`resolve`](Self::resolve) reads it through a shared
+	/// reference, for the reason `ran` and `passes` are cells: the encoder,
+	/// the target and the bind groups are fields of one struct and a `&mut`
+	/// here would lock the rest of the frame out.
+	mapping: Cell<bool>,
+
+	/// Set by the map callback when the buffer is readable.
+	///
+	/// Shared with a closure wgpu keeps, so an `Arc` rather than a `Cell`.
+	ready: Arc<AtomicBool>,
 }
 
 impl Timings {
@@ -326,6 +354,9 @@ impl Timings {
 			passes: Cell::new(0),
 			marks: [None; 2],
 			last: Frame::default(),
+			awaiting: None,
+			mapping: Cell::new(false),
+			ready: Arc::new(AtomicBool::new(false)),
 		}
 	}
 
@@ -463,6 +494,18 @@ impl Timings {
 		};
 
 		encoder.resolve_query_set(set, 0..Self::QUERIES, resolved, 0);
+
+		// **not into a buffer somebody is mapping.** The query set is resolved
+		// every frame whatever happens, because it is the hardware's own
+		// staging and nothing else reads it; the copy out is what would be a
+		// write to a mapped buffer, and wgpu refuses that. While a readback is
+		// in flight this frame's numbers are simply not collected, which is
+		// what makes the live path sample rather than take every frame. @ref
+		// [`poll`](Self::poll).
+		if self.mapping.get() {
+			return;
+		}
+
 		encoder.copy_buffer_to_buffer(
 			resolved,
 			0,
@@ -470,6 +513,142 @@ impl Timings {
 			0,
 			u64::from(Self::QUERIES) * QUERY_SIZE,
 		);
+	}
+
+	/// This frame's wall-clock spans, as they stand.
+	///
+	/// No device and no waiting: the two recording spans are written by
+	/// [`close`](Self::close) as the frame is recorded, so they are already
+	/// here. The pass count is taken from the same tally the frame kept.
+	#[must_use]
+	pub fn spans(&self) -> Frame { Frame { count: self.passes.get(), ..self.last } }
+
+	/// Gives the query set and both buffers back, and forgets what was in
+	/// flight.
+	///
+	/// The other end of [`start`](Self::start), so that a panel that turns
+	/// measuring on when it opens can turn it off when it closes. A buffer
+	/// still mapped is unmapped first: wgpu will not free one that is, and a
+	/// readback nobody is going to read is not worth waiting for.
+	pub fn stop(&mut self) {
+		if self.mapping.get()
+			&& let Some(read) = self.read.as_ref()
+			&& self.ready.load(Ordering::Acquire)
+		{
+			read.unmap();
+		}
+
+		self.set = None;
+		self.resolved = None;
+		self.read = None;
+		self.awaiting = None;
+		self.mapping.set(false);
+		self.ready.store(false, Ordering::Release);
+		self.last = Frame::default();
+	}
+
+	/// Asks for the numbers without waiting, and hands back a frame's worth
+	/// when one has arrived.
+	///
+	/// **The other half of [`settle`](Self::settle), and the difference is the
+	/// whole point.** `settle` blocks on the queue so that each frame's
+	/// numbers are its own, which is what a measuring run wants and what a
+	/// window cannot afford: a window that waits on the queue every frame has
+	/// given up the pipelining that makes it a window, and the numbers it then
+	/// reads are about a stalled frame rather than a real one.
+	///
+	/// So this does what every engine read for `PERF-1` does and colby did not
+	/// need until now - bevy collects on a later frame's `begin_frame`, Godot
+	/// after that frame's fence, Wicked from the previous swapchain cycle:
+	/// **the answer arrives late and nothing waits.** A frame's numbers come
+	/// back two or three frames after it, complete, or not at all.
+	///
+	/// Call it once a frame, after the frame has been submitted.
+	///
+	/// @param device - the device whose callbacks are pumped
+	/// @return the frame a readback has just completed for, if one has
+	pub fn poll(&mut self, device: &Device) -> Option<Frame> {
+		// nothing to read from means nothing was ever started, which is what
+		// every frame of every window that never opened the panel looks like
+		self.read.as_ref()?;
+
+		// callbacks fire on a poll and nowhere else, and this is the
+		// non-blocking one: a queue with nothing finished says so and the
+		// frame goes on.
+		drop(device.poll(PollType::Poll));
+
+		if !self.mapping.get() {
+			self.request();
+
+			return None;
+		}
+
+		if !self.ready.load(Ordering::Acquire) {
+			return None;
+		}
+
+		self.collect()
+	}
+
+	/// Asks for the map that a later [`poll`](Self::poll) reads.
+	///
+	/// The frame being stashed is the one whose copy the encoder has just
+	/// recorded, so what comes back later is that frame and not the one it
+	/// arrives in.
+	fn request(&mut self) {
+		let Some(read) = self.read.as_ref() else {
+			return;
+		};
+
+		self.last.count = self.passes.get();
+		self.awaiting = Some((self.last, self.ran.get()));
+		self.ready.store(false, Ordering::Release);
+		self.mapping.set(true);
+
+		let ready = Arc::clone(&self.ready);
+
+		read.slice(..)
+			.map_async(MapMode::Read, move |outcome| {
+				// a failed map is still an answer: the flag says the buffer is
+				// no longer in flight, and `collect` finds no numbers in it
+				// and hands back the wall-clock half alone.
+				drop(outcome);
+				ready.store(true, Ordering::Release);
+			});
+	}
+
+	/// Reads the mapped buffer, frees it, and completes the stashed frame.
+	fn collect(&mut self) -> Option<Frame> {
+		let ticks = {
+			let read = self.read.as_ref()?;
+			let ticks = read
+				.slice(..)
+				.get_mapped_range()
+				.map_or_else(|_| [0_u64; Self::TICKS], |view| unpack(&view));
+
+			read.unmap();
+
+			ticks
+		};
+
+		self.mapping.set(false);
+		self.ready.store(false, Ordering::Release);
+
+		let (mut frame, ran) = self.awaiting.take()?;
+		// against the mask the stashed frame was taken with, not the one this
+		// frame left behind: a span that ran two frames ago is what these
+		// ticks are about.
+		let was = self.ran.replace(ran);
+
+		for pass in Pass::ALL {
+			if let Some(held) = frame.passes.get_mut(pass.slot()) {
+				*held = self.span(&ticks, pass);
+			}
+		}
+
+		self.ran.set(was);
+
+		Some(frame)
 	}
 
 	/// Waits for the queue and reads what the hardware said.
@@ -560,6 +739,105 @@ impl Timings {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn polling_an_apparatus_nobody_started_is_nothing_rather_than_a_panic() {
+		// the window calls this every frame whether the tab is open or not,
+		// and on an adapter with no timestamps it never becomes anything
+		let mut timings = Timings::new(1.0);
+		let Some(gpu) = device() else {
+			return;
+		};
+
+		assert!(timings.poll(gpu.device()).is_none(), "nothing was asked for");
+		assert!(!timings.mapping.get(), "and nothing is in flight");
+	}
+
+	#[test]
+	fn a_frame_polled_for_comes_back_late_and_whole() {
+		let Some(gpu) = device() else {
+			return;
+		};
+		let mut capture = match crate::Capture::new(&gpu, 32, 32) {
+			| Ok(capture) => capture,
+			| Err(error) => panic!("building the capture failed: {error}"),
+		};
+
+		if !capture.scene_mut().measure() {
+			// no timestamp queries on this adapter, which the module treats as
+			// the wall clock alone
+			return;
+		}
+
+		let mut world = colby_core::abi::World::new();
+		let mut got = None;
+
+		// twenty frames is far more than the two or three a readback takes,
+		// and a loop that never gets one is the failure this asserts against
+		for _ in 0..20 {
+			capture.draw(&mut world, &mut []);
+
+			if let Some(frame) = capture.scene_mut().collect() {
+				got = Some(frame);
+
+				break;
+			}
+		}
+
+		let frame = got.expect("a readback landed inside twenty frames without anything waiting");
+
+		assert!(frame.passes() > 0, "the frame recorded passes: {}", frame.passes());
+		assert!(
+			Pass::ALL
+				.into_iter()
+				.any(|pass| frame.pass(pass).is_some()),
+			"and at least one hardware span came back with a number in it"
+		);
+		assert!(
+			frame.work(Work::Record).is_some(),
+			"with the wall-clock half of the very same frame beside it, which is what the stash \
+			 is for"
+		);
+	}
+
+	#[test]
+	fn nothing_is_copied_into_the_buffer_while_it_is_being_mapped() {
+		// the one hazard in the arrangement: wgpu refuses a copy into a mapped
+		// buffer, and `resolve` runs every frame whatever the readback is doing
+		let mut timings = Timings::new(1.0);
+		let Some(gpu) = device() else {
+			return;
+		};
+
+		if !timings.start(gpu.device()) {
+			return;
+		}
+
+		let mut encoder = gpu
+			.device()
+			.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+		timings.mapping.set(false);
+		timings.resolve(&mut encoder);
+		timings.mapping.set(true);
+		timings.resolve(&mut encoder);
+
+		// the assertion is that the second call returned without recording a
+		// copy, which is what keeps the submit below legal
+		gpu.queue().submit([encoder.finish()]);
+		drop(
+			gpu.device()
+				.poll(PollType::Wait { submission_index: None, timeout: None }),
+		);
+	}
+
+	/// A device, or nothing on a machine with no usable adapter.
+	fn device() -> Option<crate::Gpu> {
+		match crate::Gpu::open(crate::gpu::backends(None), None) {
+			| Ok(gpu) => gpu,
+			| Err(error) => panic!("opening the device failed: {error}"),
+		}
+	}
 
 	#[test]
 	fn every_span_has_a_slot_of_its_own_and_the_set_is_big_enough_for_all_of_them() {

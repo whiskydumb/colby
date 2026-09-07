@@ -1027,11 +1027,40 @@ impl Scene {
 		self.timings.settle(&device)
 	}
 
+	/// What a frame cost, for whoever asked without being able to wait.
+	///
+	/// **Does not block.** The window's half of [`settle`](Self::settle): it
+	/// pumps the device's callbacks and hands back a frame two or three frames
+	/// after the frame it is about, or nothing. @ref [`Timings::poll`].
+	pub fn collect(&mut self) -> Option<crate::timing::Frame> {
+		let device = self.device.clone();
+
+		self.timings.poll(&device)
+	}
+
+	/// What this frame's wall clock said, without waiting for anything.
+	///
+	/// The half of a frame's cost that needs no readback: the two recording
+	/// spans, ready the moment the frame has been recorded. The hardware half
+	/// arrives later through [`collect`](Self::collect).
+	pub fn spans(&self) -> crate::timing::Frame { self.timings.spans() }
+
+	/// Whether anything is being measured.
+	pub const fn measuring(&self) -> bool { self.timings.timing() }
+
 	/// Starts measuring what a frame costs.
 	///
 	/// @return whether the hardware side came up; the wall clock works either
 	/// way
 	pub fn measure(&mut self) -> bool { self.timings.start(&self.device.clone()) }
+
+	/// Stops measuring, and gives the query set and both buffers back.
+	///
+	/// The apparatus is documented as inert until it is started, and a panel
+	/// that turns it on when it opens has to be able to turn it off when it
+	/// closes - otherwise every window that ever showed the profiler goes on
+	/// paying a query set and two buffers for the rest of the run.
+	pub fn unmeasure(&mut self) { self.timings.stop(); }
 
 	/// Which local lights this frame carries, nearest first.
 	///

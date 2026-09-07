@@ -48,6 +48,8 @@ use colby_core::{
 	time::{Rate, STEP},
 	warn,
 };
+#[cfg(feature = "editor")]
+use colby_editor::{Part, Profile};
 use colby_engine::{
 	Capture, Gpu, Overlay, gpu,
 	timing::{Frame, Pass, Work},
@@ -86,6 +88,187 @@ const WARMUP: u32 = 30;
 ///
 /// Five spans of hardware, two of recording and five of simulation.
 const ROWS: usize = 12;
+
+/// How many frames the live table averages over.
+///
+/// @note: everything from here to [`Row`] is the editor's half of this module
+/// and is compiled with it - a build with no editor in it has no panel to show
+/// a window of frames to, and `--profile` is the other half and is always
+/// here.
+///
+/// Wicked's window (`wiProfiler.cpp:48`, `float times[20]`), and taken for its
+/// reason: a single frame's number is nobody's headline, and a window short
+/// enough to react is worth more here than a mean over a whole run. What
+/// `--profile` does instead - average everything after a warm-up - is right
+/// for a run that ends, and wrong for a panel somebody is watching while they
+/// change something.
+#[cfg(feature = "editor")]
+const WINDOW: usize = 20;
+
+/// The table a window keeps while somebody is looking at it.
+///
+/// **A window rather than a total**, which is the whole difference from
+/// [`Table`]: that one answers "what did this run cost" and this one answers
+/// "what is it costing now". They share the names and the rule that a part
+/// which never ran has no number - anything else would be two vocabularies for
+/// one frame.
+///
+/// Frames arrive at two rates and it does not matter: the wall-clock halves
+/// come every frame and the hardware halves every second or third, because the
+/// readback does not wait. Each row counts its own samples.
+#[cfg(feature = "editor")]
+#[derive(Debug)]
+pub(crate) struct Live {
+	/// The last [`WINDOW`] samples of each row, newest last.
+	rows: [Vec<Duration>; ROWS],
+
+	/// The worst single sample of each, over the whole time the pane has been
+	/// up rather than over the window: a hitch is worth remembering after it
+	/// has scrolled out of the mean.
+	worst: [Duration; ROWS],
+
+	/// How many render passes the last frame read back recorded.
+	passes: Option<u32>,
+
+	/// What the panel is handed, rebuilt when a frame is folded in.
+	parts: Vec<Part>,
+
+	/// Whether the hardware side ever answered.
+	hardware: bool,
+}
+
+#[cfg(feature = "editor")]
+impl Live {
+	/// A table nothing has been folded into.
+	pub(crate) fn new() -> Self {
+		Self {
+			rows: core::array::from_fn(|_| Vec::with_capacity(WINDOW)),
+			worst: [Duration::ZERO; ROWS],
+			passes: None,
+			parts: Vec::new(),
+			hardware: false,
+		}
+	}
+
+	/// Forgets everything, for a pane that has just been opened again.
+	///
+	/// A window that showed the profiler, went away for ten minutes and came
+	/// back should not average what a frame cost before lunch.
+	pub(crate) fn clear(&mut self) {
+		for row in &mut self.rows {
+			row.clear();
+		}
+
+		self.worst = [Duration::ZERO; ROWS];
+		self.passes = None;
+		self.parts.clear();
+		self.hardware = false;
+	}
+
+	/// Folds one frame's wall-clock halves in.
+	///
+	/// Called every frame: the two recording spans and the five the step
+	/// underneath cost need no readback and are this frame's own.
+	///
+	/// **Durations rather than a `Frame`**, and that is not a convenience: a
+	/// table of numbers has no business knowing the renderer's type, and the
+	/// caller has public accessors for every one of these. What it buys is
+	/// that the whole of this is testable with no device anywhere near it.
+	///
+	/// @param record - what this thread spent, per [`Work`] in slot order
+	/// @param spent - what the last simulation step cost
+	pub(crate) fn walls(&mut self, record: [Option<Duration>; 2], spent: Spent) {
+		for (at, took) in record.into_iter().enumerate() {
+			if let Some(took) = took {
+				self.add(Pass::ALL.len() + at, took);
+			}
+		}
+
+		let under = Pass::ALL.len() + Work::ALL.len();
+
+		for (at, took) in [spent.broad, spent.narrow, spent.buoyancy, spent.solve, spent.total]
+			.into_iter()
+			.enumerate()
+		{
+			self.add(under + at, took);
+		}
+
+		self.rebuild();
+	}
+
+	/// Folds one frame's hardware halves in, when a readback has landed.
+	///
+	/// @param passes - what the hardware spent, per [`Pass`] in slot order,
+	/// from a frame two or three behind the one this is called in
+	/// @param count - how many render passes that frame recorded
+	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 5], count: u32) {
+		self.passes = Some(count);
+
+		for (at, took) in passes.into_iter().enumerate() {
+			if let Some(took) = took {
+				self.hardware = true;
+				self.add(at, took);
+			}
+		}
+
+		self.rebuild();
+	}
+
+	/// What the panel is handed.
+	pub(crate) fn profile(&self) -> Profile<'_> {
+		Profile {
+			parts: &self.parts,
+			passes: self.passes,
+			hardware: self.hardware,
+		}
+	}
+
+	/// Puts one sample in one row, dropping the oldest when the window is
+	/// full.
+	fn add(&mut self, at: usize, took: Duration) {
+		let Some(row) = self.rows.get_mut(at) else {
+			return;
+		};
+
+		if row.len() >= WINDOW {
+			row.remove(0);
+		}
+
+		row.push(took);
+
+		if let Some(worst) = self.worst.get_mut(at) {
+			*worst = (*worst).max(took);
+		}
+	}
+
+	/// Builds the list the panel reads, one entry per name.
+	fn rebuild(&mut self) {
+		self.parts.clear();
+		self.parts
+			.extend(NAMES.into_iter().enumerate().map(|(at, name)| {
+				Part {
+					name,
+					mean: self.rows.get(at).and_then(|row| mean(row)),
+					worst: self
+						.rows
+						.get(at)
+						.filter(|row| !row.is_empty())
+						.and_then(|_| self.worst.get(at).copied()),
+				}
+			}));
+	}
+}
+
+/// The mean of a window, or nothing for a part that never ran.
+#[cfg(feature = "editor")]
+fn mean(row: &[Duration]) -> Option<Duration> {
+	let count = u32::try_from(row.len()).ok()?;
+
+	row.iter()
+		.copied()
+		.try_fold(Duration::ZERO, Duration::checked_add)?
+		.checked_div(count)
+}
 
 /// One row of the table: what a part of the frame cost over the whole run.
 #[derive(Clone, Copy, Debug, Default)]
@@ -148,7 +331,10 @@ struct Table {
 /// The five hardware spans first, then what this thread spent recording them,
 /// then what the step underneath cost - which is the order a frame actually
 /// happens in, read from the outside in.
-const NAMES: [&str; ROWS] = [
+///
+/// `pub(crate)` because the editor's pane shows the same twelve, and a panel
+/// with a list of its own would be a second place to add a row to.
+pub(crate) const NAMES: [&str; ROWS] = [
 	"gpu shadow",
 	"gpu scene",
 	"gpu meter",
@@ -354,6 +540,126 @@ pub(crate) fn take(project: &Project, build: &Build, asked: &Asked, frames: u32)
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(feature = "editor")]
+	#[test]
+	fn a_live_row_is_the_mean_of_its_last_twenty_and_the_worst_of_all_of_them() {
+		let mut live = Live::new();
+
+		// thirty samples, the first of them the biggest: the window forgets
+		// it and the worst does not
+		for step in 0..30_u64 {
+			live.add(0, Duration::from_micros(if step == 0 { 5_000 } else { 100 + step }));
+		}
+
+		live.rebuild();
+
+		let part = live.profile().parts[0];
+
+		assert_eq!(part.name, NAMES[0], "the first row is the first name");
+
+		let mean = part.mean.expect("it ran");
+
+		assert!(
+			mean < Duration::from_micros(200),
+			"the hitch has scrolled out of the mean: {mean:?}"
+		);
+		assert_eq!(
+			part.worst,
+			Some(Duration::from_millis(5)),
+			"and the worst remembers it, which is the whole reason it is not a window too"
+		);
+	}
+
+	#[cfg(feature = "editor")]
+	#[test]
+	fn a_live_part_that_never_ran_has_no_number_rather_than_nought() {
+		// the same rule the printed table keeps: a glow chain in a project
+		// that does not bloom is absent, and a nought there would read as the
+		// cheapest thing in the frame
+		let mut live = Live::new();
+
+		live.add(1, Duration::from_micros(50));
+		live.rebuild();
+
+		let parts = live.profile().parts;
+
+		assert_eq!(parts.len(), ROWS, "a row per name, always");
+		assert_eq!(parts[1].mean, Some(Duration::from_micros(50)), "the one that ran");
+		assert_eq!(parts[0].mean, None, "and the one that did not");
+		assert_eq!(parts[0].worst, None, "with no worst either");
+	}
+
+	#[cfg(feature = "editor")]
+	#[test]
+	fn the_two_halves_of_a_frame_arrive_at_two_rates_and_both_land() {
+		// what the arrangement actually is: the wall clock every frame, the
+		// hardware every second or third, and neither waiting for the other
+		let mut live = Live::new();
+		// the recording span, which is the second of the two wall-clock ones
+		live.walls([None, Some(Duration::from_micros(300))], Spent::default());
+
+		assert!(!live.profile().hardware, "nothing hardware has answered yet");
+		assert_eq!(
+			live.profile().parts[Pass::ALL.len() + 1].mean,
+			Some(Duration::from_micros(300)),
+			"but the wall clock has"
+		);
+		assert_eq!(
+			live.profile().parts[Pass::ALL.len() + 1].name,
+			"cpu record",
+			"in the row that name belongs to"
+		);
+		assert_eq!(live.profile().passes, None, "and no frame has been read back");
+
+		live.hardware([None, Some(Duration::from_micros(800)), None, None, None], 15);
+
+		assert!(live.profile().hardware, "now it has");
+		assert_eq!(live.profile().parts[1].mean, Some(Duration::from_micros(800)));
+		assert_eq!(live.profile().parts[1].name, "gpu scene", "in the second row");
+		assert_eq!(live.profile().passes, Some(15), "and the count came with it");
+	}
+
+	#[cfg(feature = "editor")]
+	#[test]
+	fn a_pane_opened_again_does_not_average_what_a_frame_cost_before_lunch() {
+		let mut live = Live::new();
+
+		live.add(0, Duration::from_micros(900));
+		live.rebuild();
+		assert!(live.profile().parts[0].mean.is_some());
+
+		live.clear();
+
+		assert_eq!(live.profile().parts.len(), 0, "nothing is handed out at all");
+		assert_eq!(live.profile().passes, None);
+		assert!(!live.profile().hardware);
+	}
+
+	#[cfg(feature = "editor")]
+	#[test]
+	fn the_live_table_and_the_printed_one_name_the_same_twelve_parts() {
+		// one vocabulary for one frame: a panel with a list of its own would
+		// be a second place to add a row to, and the day they disagreed
+		// somebody would be comparing two tables that are not about the same
+		// thing
+		let mut live = Live::new();
+
+		for at in 0..ROWS {
+			live.add(at, Duration::from_micros(10));
+		}
+
+		live.rebuild();
+
+		let named: Vec<&str> = live
+			.profile()
+			.parts
+			.iter()
+			.map(|part| part.name)
+			.collect();
+
+		assert_eq!(named, NAMES.to_vec());
+	}
 
 	#[test]
 	fn a_row_reports_the_mean_of_what_went_into_it_and_the_worst_of_it() {

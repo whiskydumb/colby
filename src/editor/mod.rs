@@ -41,6 +41,8 @@
 //! draws its interface with HTML/CSS over taffy, which is a separate subsystem
 //! that happens to arrive through the same [`Overlay`] seam.
 
+use std::time::Duration;
+
 use colby_asset::{Project, compile::Kind};
 use colby_core::{
 	abi::{EntityId, World, cvar::Value, scene::SceneData},
@@ -66,6 +68,7 @@ mod history;
 mod inspector;
 pub mod launcher;
 pub mod loading;
+mod profiler;
 mod select;
 mod session;
 mod settings;
@@ -130,6 +133,55 @@ pub struct Host<'a> {
 
 	/// The device, if there is one.
 	pub gpu: Option<&'a Gpu>,
+
+	/// What a frame is costing, when anything is measuring it.
+	///
+	/// Filled by the runner, because the two halves of it live where this
+	/// crate cannot reach: the hardware spans are on the scene's own
+	/// apparatus and the simulation's are on the solver. What arrives here is
+	/// already averaged - @ref `Part`.
+	pub profile: Profile<'a>,
+}
+
+/// What a frame is costing, as the panel shows it.
+///
+/// Owned by this crate rather than by the runner, because [`Host`] is this
+/// crate's and a panel cannot name a type from the crate that holds it. The
+/// runner fills it; nothing here knows where a number came from.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Profile<'a> {
+	/// One per part of the frame, in the order a frame happens in.
+	pub parts: &'a [Part],
+
+	/// How many render passes the last measured frame recorded.
+	///
+	/// The one number here that does not move between two runs of the same
+	/// scene, which is what makes it the part worth comparing.
+	pub passes: Option<u32>,
+
+	/// Whether the hardware side answered at all.
+	///
+	/// False on an adapter with no timestamp queries, where the five hardware
+	/// rows are empty and the wall clock is the whole answer.
+	pub hardware: bool,
+}
+
+/// One part of a frame, averaged over the frames it was measured in.
+#[derive(Clone, Copy, Debug)]
+pub struct Part {
+	/// What it is called: `gpu scene`, `cpu solve`.
+	pub name: &'static str,
+
+	/// The mean, or nothing for a part that never ran.
+	pub mean: Option<Duration>,
+
+	/// The worst single one of them.
+	///
+	/// Beside the mean because they answer different questions, which is the
+	/// reason `--profile` prints both: a part that is cheap on average and
+	/// occasionally enormous is invisible in the first and obvious in the
+	/// second.
+	pub worst: Option<Duration>,
 }
 
 /// What one frame of the editor came to, for the window that holds it.
@@ -145,6 +197,14 @@ pub struct Frame {
 	/// puts a world back when play stops - and to tell the solver to forget
 	/// what it derived, which nothing in this crate can reach.
 	pub restore: Option<Box<SceneData>>,
+
+	/// Whether anything on screen wants a frame measured.
+	///
+	/// The profiler panel's whole gate, and it is a gate rather than a switch
+	/// because measuring costs a query set, two buffers and a readback a
+	/// frame: a window that showed the panel once should not pay for it for
+	/// the rest of the run. The runner starts and stops the apparatus on this.
+	pub measuring: bool,
 }
 
 /// Something that was pressed on a panel.
@@ -255,6 +315,14 @@ enum Pane {
 
 	/// Every console variable, as something to turn.
 	Settings,
+
+	/// What a frame costs, one row per part of it.
+	///
+	/// **The last of the five, and the only one whose being up costs
+	/// anything**: measuring a frame builds a query set and two buffers and
+	/// reads one back. That is why it is a pane rather than a section of the
+	/// statistics, which somebody may leave open all day.
+	Profiler,
 }
 
 impl Pane {
@@ -265,6 +333,7 @@ impl Pane {
 			| Self::Statistics => "statistics",
 			| Self::Assets => "assets",
 			| Self::Settings => "settings",
+			| Self::Profiler => "profiler",
 		}
 	}
 }
@@ -488,6 +557,11 @@ impl Editor {
 		Frame {
 			view: physical(view, shell.points()),
 			restore: panels.restore.take(),
+			// the pane being up is the whole of the gate, and it is read here
+			// rather than kept as a flag: a pane that was closed this frame
+			// stops being measured for the next one, with nothing to keep in
+			// step.
+			measuring: panels.measuring(),
 		}
 	}
 }
@@ -678,6 +752,7 @@ impl Panels {
 			pane(ui, &mut self.pane, Pane::Statistics);
 			pane(ui, &mut self.pane, Pane::Assets);
 			pane(ui, &mut self.pane, Pane::Settings);
+			pane(ui, &mut self.pane, Pane::Profiler);
 		});
 		ui.separator();
 
@@ -688,8 +763,16 @@ impl Panels {
 				.browser
 				.show(ui, host.project, host.gpu, changes),
 			| Pane::Settings => self.settings.show(ui, world),
+			| Pane::Profiler => profiler::show(ui, host.profile),
 		}
 	}
+
+	/// Whether anything on screen wants a frame measured.
+	///
+	/// One pane and nothing else, which is what makes the gate cheap to reason
+	/// about: the profiler is up or it is not, and there is no flag anywhere
+	/// that can disagree with what is on screen.
+	fn measuring(&self) -> bool { self.pane == Pane::Profiler }
 
 	/// An asset let go of over the picture, if one was this frame.
 	///
@@ -1049,6 +1132,7 @@ mod tests {
 			frames: 1,
 			project: None,
 			gpu: None,
+			profile: Profile::default(),
 		};
 		let mut view = Rect::NOTHING;
 		let mut built = false;
@@ -1072,6 +1156,54 @@ mod tests {
 		output.textures_delta.clear();
 
 		view
+	}
+
+	#[test]
+	fn the_profiler_pane_being_up_is_the_whole_of_the_gate() {
+		// what the runner starts and stops the apparatus on. A flag kept
+		// beside the pane could disagree with what is on screen; this cannot,
+		// because it is the pane.
+		let mut panels = Panels::default();
+
+		assert!(!panels.measuring(), "the console is up, and nothing is being measured");
+
+		for pane in [Pane::Statistics, Pane::Assets, Pane::Settings] {
+			panels.pane = pane;
+
+			assert!(!panels.measuring(), "{} costs nothing", pane.name());
+		}
+
+		panels.pane = Pane::Profiler;
+
+		assert!(panels.measuring(), "and the one pane that does say so");
+	}
+
+	#[test]
+	fn a_frame_with_the_profiler_up_draws_it_and_asks_to_be_measured() {
+		let mut panels = Panels::default();
+		let mut world = World::new();
+
+		panels.pane = Pane::Profiler;
+
+		// the pane draws over a profile nothing has filled in, which is what
+		// the first frame after it is opened always looks like
+		let view = frame(&mut panels, &mut world);
+
+		assert!(view.width() > 0.0, "the picture still has room beside the panels");
+
+		assert!(panels.measuring(), "and it is still asking after a frame of it");
+	}
+
+	#[test]
+	fn every_pane_has_a_name_of_its_own() {
+		let named =
+			[Pane::Console, Pane::Statistics, Pane::Assets, Pane::Settings, Pane::Profiler];
+		let mut names: Vec<&str> = named.iter().map(|pane| pane.name()).collect();
+
+		names.sort_unstable();
+		names.dedup();
+
+		assert_eq!(names.len(), named.len(), "two panes share a name");
 	}
 
 	/// One headless frame with nothing pressed.
@@ -1142,6 +1274,7 @@ mod tests {
 			frames: 1,
 			project: None,
 			gpu: None,
+			profile: Profile::default(),
 		};
 		let mut built = false;
 		let mut view = Rect::NOTHING;

@@ -560,6 +560,13 @@ pub(crate) struct App {
 	/// frame behind the panels, which is invisible, because a panel's edge
 	/// moves at most a few pixels between two frames.
 	view: Option<Viewport>,
+	/// Whether the profiler pane was up on the last frame that laid the editor
+	/// out, which is what the apparatus is started and stopped on.
+	#[cfg(feature = "editor")]
+	measuring: bool,
+	/// The window of frames the profiler pane shows, empty until it is opened.
+	#[cfg(feature = "editor")]
+	live: crate::profile::Live,
 	#[cfg(feature = "hot_reload")]
 	watch: Option<Watch>,
 	/// The volumes the console last asked for. @ref
@@ -626,6 +633,10 @@ impl App {
 			#[cfg(feature = "editor")]
 			editor: None,
 			view: None,
+			#[cfg(feature = "editor")]
+			measuring: false,
+			#[cfg(feature = "editor")]
+			live: crate::profile::Live::new(),
 			#[cfg(feature = "hot_reload")]
 			watch: None,
 			mix: Mix::FULL,
@@ -735,10 +746,12 @@ impl App {
 				frames: self.frames,
 				project: Some(&self.runtime.project),
 				gpu: self.gpu.as_ref(),
+				profile: self.live.profile(),
 			};
 			let frame = editor.run(&window, &mut self.runtime.world, &host);
 
 			self.view = Some(frame.view);
+			self.measuring = frame.measuring;
 
 			if let Some(described) = frame.restore {
 				self.put_back(&described);
@@ -951,8 +964,59 @@ impl App {
 		let Some(renderer) = self.renderer.as_mut() else {
 			return Ok(());
 		};
+		let drawn = renderer.render(&self.runtime.world, &mut overlays, self.view, seconds);
 
-		renderer.render(&self.runtime.world, &mut overlays, self.view, seconds)
+		#[cfg(feature = "editor")]
+		self.measured();
+
+		drawn
+	}
+
+	/// Turns the apparatus on and off with the pane, and takes what it says.
+	///
+	/// **After the frame has been submitted**, which is where the readback has
+	/// to be asked for, and after the editor has been laid out, which is where
+	/// the pane said whether it is up.
+	///
+	/// The two halves arrive at two rates and that is the arrangement rather
+	/// than a compromise: the wall-clock spans are this frame's and are folded
+	/// in every frame, and the hardware spans belong to a frame two or three
+	/// back and are folded in when they land. @ref
+	/// [`Timings::poll`](colby_engine::Timings::poll).
+	#[cfg(feature = "editor")]
+	fn measured(&mut self) {
+		let Some(renderer) = self.renderer.as_mut() else {
+			return;
+		};
+
+		if !self.measuring {
+			if renderer.scene_mut().measuring() {
+				renderer.scene_mut().unmeasure();
+				self.live.clear();
+				debug!("the profiler pane is closed; the frame is no longer measured");
+			}
+
+			return;
+		}
+
+		if !renderer.scene_mut().measuring() {
+			let hardware = renderer.scene_mut().measure();
+
+			info!(hardware, "the profiler pane is open; measuring the frame");
+		}
+
+		let spent = self.runtime.simulation.spent();
+		let frame = renderer.scene_mut().spans();
+
+		self.live
+			.walls(colby_engine::timing::Work::ALL.map(|work| frame.work(work)), spent);
+
+		if let Some(landed) = renderer.scene_mut().collect() {
+			self.live.hardware(
+				colby_engine::timing::Pass::ALL.map(|pass| landed.pass(pass)),
+				landed.passes(),
+			);
+		}
 	}
 
 	/// Where the world's picture begins on the window, in physical pixels.
