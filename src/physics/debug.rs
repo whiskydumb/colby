@@ -33,6 +33,17 @@ pub const CONTACTS: &str = "phys.draw_contacts";
 /// The console variable that marks every joint and its two anchors.
 pub const JOINTS: &str = "phys.draw_joints";
 
+/// The console variable that draws every fluid and its waterline.
+///
+/// Its own rather than a color inside [`SHAPES`], because water is the one
+/// thing in a world that has nothing to look at until something is drawn for
+/// it, and wireframing every body to find out where a pool ends is the wrong
+/// trade. @ref `colby_core::abi::water`.
+pub const WATER: &str = "phys.draw_water";
+
+/// How many lines the hatch across a waterline is drawn with, each way.
+const HATCH: u8 = 8;
+
 /// How long the arm of a contact's cross is, in world units.
 const CONTACT_SIZE: f32 = 0.04;
 
@@ -58,9 +69,10 @@ const ANCHOR_SIZE: f32 = 0.05;
 /// @param simulation - the baked collision meshes and the manifolds
 pub(crate) fn draw(world: &mut World, simulation: &Simulation) {
 	let asked = |name| world.cvars.bool(name).unwrap_or(false);
-	let (shapes, contacts, joints) = (asked(SHAPES), asked(CONTACTS), asked(JOINTS));
+	let (shapes, contacts) = (asked(SHAPES), asked(CONTACTS));
+	let (joints, water) = (asked(JOINTS), asked(WATER));
 
-	if !(shapes || contacts || joints) {
+	if !(shapes || contacts || joints || water) {
 		return;
 	}
 
@@ -82,6 +94,10 @@ pub(crate) fn draw(world: &mut World, simulation: &Simulation) {
 
 	if joints {
 		draw_joints(&mut table, world);
+	}
+
+	if water {
+		draw_water(&mut table, world);
 	}
 
 	world.debug = table;
@@ -126,6 +142,46 @@ fn draw_shapes(table: &mut debug::Debug, world: &World, simulation: &Simulation)
 					pen.line(third, first, color);
 				}
 			},
+		}
+	}
+}
+
+/// Outlines every fluid and hatches the surface it is filled to.
+///
+/// The outline says where the fluid is and the hatch says where its top is,
+/// and the second is the one worth drawing: a pool is a box like any other
+/// until you need to know at what height something will start to float, and
+/// that height is a property of the shape's *bounds* rather than of the shape,
+/// so it is not on screen anywhere else. @ref
+/// [`Body::surface`](colby_core::abi::Body::surface).
+fn draw_water(table: &mut debug::Debug, world: &World) {
+	let mut pen = table.pen();
+
+	for (_, body) in world.bodies.iter() {
+		let (Some(surface), Some((low, high))) = (body.surface(), body.bounds()) else {
+			continue;
+		};
+
+		pen.cuboid(
+			body.transform.position,
+			body.shape.extents.abs() * body.transform.scale.abs(),
+			body.transform.rotation,
+			debug::BLUE,
+		);
+
+		// the hatch is drawn across the world-space bounds rather than across
+		// the shape, because the surface is level whatever the shape is turned
+		// to and a hatch that followed the rotation would be a picture of a
+		// sloping surface there is no such thing as.
+		let rungs = f32::from(HATCH);
+
+		for step in 0..=HATCH {
+			let along = f32::from(step) / rungs;
+			let x = (high.x - low.x).mul_add(along, low.x);
+			let z = (high.z - low.z).mul_add(along, low.z);
+
+			pen.line(Vec3::new(x, surface, low.z), Vec3::new(x, surface, high.z), debug::CYAN);
+			pen.line(Vec3::new(low.x, surface, z), Vec3::new(high.x, surface, z), debug::CYAN);
 		}
 	}
 }
@@ -272,6 +328,66 @@ mod tests {
 				line.from.x
 			);
 		}
+	}
+
+	#[test]
+	fn a_fluid_is_outlined_and_its_waterline_is_hatched_at_the_top_of_it() {
+		let mut world = asking(&[WATER]);
+		let mut pool = Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::new(4.0, 2.0, 4.0)),
+			Transform::at(Vec3::new(0.0, 2.0, 0.0)),
+		);
+		pool.water = colby_core::abi::Water::pool();
+		world.bodies.spawn(pool);
+		// and an ordinary body beside it, which this tool has nothing to say
+		// about however solid it is
+		world.bodies.spawn(Body::new(
+			BodyKind::Static,
+			Shape::UNIT,
+			Transform::at(Vec3::X * 20.0),
+		));
+
+		draw(&mut world, &Simulation::new());
+
+		let lines = world.debug.lines();
+
+		let rungs = usize::from(HATCH + 1) * 2;
+
+		assert_eq!(lines.len(), 12 + rungs, "twelve edges and the hatch across");
+
+		let hatched = lines
+			.iter()
+			.filter(|line| (line.from.y - 4.0).abs() < 1.0e-4 && (line.to.y - 4.0).abs() < 1.0e-4)
+			.count();
+
+		assert_eq!(
+			hatched,
+			rungs + 4,
+			"the hatch is at the top of the pool, and the box's own top edges are there too"
+		);
+	}
+
+	#[test]
+	fn a_fluid_is_not_drawn_by_the_tool_that_outlines_bodies_and_the_other_way_round() {
+		// two variables, because a person looking for where a pool ends should
+		// not have to wireframe the world to find out. @ref `WATER`.
+		let mut pool = Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY);
+		pool.water = colby_core::abi::Water::pool();
+
+		let mut shapes = asking(&[SHAPES]);
+		shapes.bodies.spawn(pool);
+		draw(&mut shapes, &Simulation::new());
+
+		let mut water = asking(&[WATER]);
+		water.bodies.spawn(pool);
+		draw(&mut water, &Simulation::new());
+
+		assert_eq!(shapes.debug.lines().len(), 12, "the outline tool draws the box and no hatch");
+		assert!(
+			water.debug.lines().len() > 12,
+			"and the water tool draws the box and its waterline"
+		);
 	}
 
 	#[test]

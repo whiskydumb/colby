@@ -357,8 +357,8 @@ impl Simulation {
 			}
 
 			// a mesh makes one manifold per triangle, and a fluid is never a
-			// mesh - `surface` has no bounds to answer with - so a pair is
-			// named once here and this needs no set to say so.
+			// mesh - `Body::surface` has no bounds to answer with - so a pair
+			// is named once here and this needs no set to say so.
 			let Some((pool, wet)) = fluid(&world.bodies, (manifold.first, manifold.second))
 			else {
 				continue;
@@ -366,7 +366,7 @@ impl Simulation {
 			let Some((water, surface)) = world
 				.bodies
 				.get(pool)
-				.and_then(|body| Some((body.water, buoyancy::surface(body)?)))
+				.and_then(|body| Some((body.water, body.surface()?)))
 			else {
 				continue;
 			};

@@ -896,6 +896,57 @@ impl Body {
 	#[must_use]
 	pub const fn solid(&self) -> bool { !self.sensor && !self.water.is_wet() }
 
+	/// Whether a point is inside this body's shape.
+	///
+	/// Exact rather than against the bounds: a point is asked about one shape
+	/// at a time, so there is nothing to gain by approximating and a rotated
+	/// pool would answer wrongly along its corners if this did. A mesh is
+	/// never inside anything - a triangle soup has no inside, which is the
+	/// same fact that keeps it from having a mass distribution.
+	///
+	/// @param point - where to ask, in world space
+	#[must_use]
+	pub fn holds(&self, point: Vec3) -> bool {
+		let local = self
+			.transform
+			.rotation
+			.inverse()
+			.mul_vec3(point - self.transform.position);
+
+		match self.shape.kind {
+			| ShapeKind::Box => {
+				let extents = self.shape.extents.abs() * self.transform.scale.abs();
+
+				local.abs().cmple(extents).all()
+			},
+			| ShapeKind::Sphere => {
+				let reach = self.shape.radius.abs() * self.transform.scale.abs().max_element();
+
+				local.length_squared() <= reach * reach
+			},
+			| ShapeKind::Mesh => false,
+		}
+	}
+
+	/// The height of the fluid this body holds, if it holds one.
+	///
+	/// The top of its world-space bounds, and level:
+	/// [`WaterKind::Volume`](super::WaterKind::Volume) is filled to the brim,
+	/// so where the fluid ends is where the shape does. A tipped-up pool has a
+	/// level surface and sloping walls rather than a slope of water, which is
+	/// what makes this one number instead of a plane.
+	///
+	/// @return where its top is, or nothing for a body holding no fluid and
+	/// for a shape with no bounds
+	#[must_use]
+	pub fn surface(&self) -> Option<f32> {
+		if !self.water.is_wet() {
+			return None;
+		}
+
+		self.bounds().map(|(_, high)| high.y)
+	}
+
 	/// The smallest axis-aligned box in world space that holds this body.
 	///
 	/// A rotated box is bounded by the box around its rotated corners, which is
@@ -1251,6 +1302,97 @@ impl Bodies {
 		if self.overlaps.len() < MAX_OVERLAPS {
 			self.overlaps.push(overlap);
 		}
+	}
+
+	/// What fluid is at a point, and which body holds it.
+	///
+	/// The one a game asks before deciding that somebody is swimming. `None`
+	/// is dry land, which is nearly everywhere.
+	///
+	/// Walks the table, because a fluid is rare and there is no index to keep:
+	/// the same shape [`inside`](Self::inside) has. A point in two fluids at
+	/// once answers with the one whose surface is highest, for
+	/// [`submersion`](Self::submersion)'s reason.
+	///
+	/// @param point - where to ask, in world space
+	/// @return the body and what fills it
+	#[must_use]
+	pub fn fluid_at(&self, point: Vec3) -> Option<(BodyId, Water)> {
+		let mut best: Option<(BodyId, Water, f32)> = None;
+
+		for (id, body) in self.iter() {
+			let Some(surface) = body.surface() else {
+				continue;
+			};
+
+			if !body.holds(point) {
+				continue;
+			}
+
+			if best.is_none_or(|(_, _, held)| surface > held) {
+				best = Some((id, body.water, surface));
+			}
+		}
+
+		best.map(|(id, water, _)| (id, water))
+	}
+
+	/// How much of a standing box is under a fluid's surface, nought to one.
+	///
+	/// **What a character asks, and the answer Unreal's `ImmersionDepth()`
+	/// gives** (`CharacterMovementComponent.cpp:3807-3836`, a trace down the
+	/// capsule's own height). What a game does with it is the two lines that
+	/// engine writes at `:4638`: scale gravity by `1 - buoyancy * depth`, and
+	/// clamp the speed to a swimming one. Those are the caller's, and
+	/// deliberately so: [`move_and_slide`](super::character::move_and_slide)
+	/// applies no gravity at all, so a swimming *mode* inside it would have
+	/// nothing to modulate, and a number the game reads is the smaller and
+	/// more honest boundary.
+	///
+	/// **Asked of the box's middle column** where the solver's buoyancy asks
+	/// about the whole shape: this is one containment test per fluid at the
+	/// height its surface crosses the box, which is exact for a pool standing
+	/// level and is what a capsule needs. A pool tilted so far that its corner
+	/// covers a character its middle does not is not a case this answers.
+	///
+	/// Two fluids over one box answer with the deeper reading rather than the
+	/// first found, so the order of the table cannot decide it.
+	///
+	/// @param min - the low corner of the box, world space
+	/// @param max - the high corner
+	/// @return nought outside, one for wholly under
+	#[must_use]
+	pub fn submersion(&self, min: Vec3, max: Vec3) -> f32 {
+		let middle = (min + max) * 0.5;
+		let span = max.y - min.y;
+		let mut deepest = 0.0_f32;
+
+		for (_, body) in self.iter() {
+			let Some(surface) = body.surface() else {
+				continue;
+			};
+
+			// asked where the fluid actually is, pulled into the box's own
+			// span: a character standing waist-deep is in the fluid at the
+			// waterline and out of it at the head, and asking at either end
+			// alone would answer one of those two cases wrongly.
+			let at = Vec3::new(middle.x, surface.clamp(min.y, max.y), middle.z);
+
+			if !body.holds(at) {
+				continue;
+			}
+
+			// a box of no height is in or out, with nothing between
+			let under = if span <= 0.0 {
+				f32::from(u8::from(surface >= min.y))
+			} else {
+				((surface - min.y) / span).clamp(0.0, 1.0)
+			};
+
+			deepest = deepest.max(under);
+		}
+
+		deepest
 	}
 
 	/// Forgets every overlap, so the solver can say what is true now.
@@ -2080,6 +2222,143 @@ mod tests {
 		assert!(solid.solid(), "a body is solid unless it says otherwise");
 		assert!(!sensor.solid(), "and a sensor says otherwise");
 		assert!(!solid.sensor, "which is one flag and not a kind");
+	}
+
+	/// A pool of half-extents, standing where its top is at `top`.
+	fn pool(extents: Vec3, top: f32) -> Body {
+		let mut body = Body::new(
+			BodyKind::Static,
+			Shape::cuboid(extents),
+			Transform::at(Vec3::new(0.0, top - extents.y, 0.0)),
+		);
+		body.water = Water::pool();
+
+		body
+	}
+
+	#[test]
+	fn a_point_is_inside_a_shape_or_it_is_not_and_a_turned_box_knows_which() {
+		let mut box_ = Body::new(BodyKind::Static, Shape::UNIT, Transform::IDENTITY);
+
+		assert!(box_.holds(Vec3::ZERO), "the middle is inside");
+		assert!(box_.holds(Vec3::new(0.49, 0.49, 0.49)), "and so is just inside a corner");
+		assert!(!box_.holds(Vec3::new(0.51, 0.0, 0.0)), "and just outside a face is not");
+
+		// turned forty-five degrees, the old corner is outside and the point
+		// the corner moved to is inside - which an axis-aligned bound could
+		// not tell apart, and is why this is not one
+		box_.transform.rotation = Quat::from_rotation_y(core::f32::consts::FRAC_PI_4);
+
+		assert!(!box_.holds(Vec3::new(0.49, 0.0, 0.49)), "the old corner is out in the air");
+		assert!(box_.holds(Vec3::new(0.69, 0.0, 0.0)), "and the new one reaches further");
+
+		let ball = Body::new(BodyKind::Static, Shape::ball(2.0), Transform::IDENTITY);
+
+		assert!(ball.holds(Vec3::X * 1.9), "inside a ball is a distance");
+		assert!(!ball.holds(Vec3::X * 2.1), "and outside it is the same distance");
+		assert!(
+			!Body::new(BodyKind::Static, Shape::mesh(MeshId::CUBE), Transform::IDENTITY)
+				.holds(Vec3::ZERO),
+			"a triangle soup has no inside at all"
+		);
+	}
+
+	#[test]
+	fn only_a_body_holding_a_fluid_has_a_surface_and_it_is_the_top_of_it() {
+		assert_eq!(
+			pool(Vec3::new(4.0, 1.0, 4.0), 3.0).surface(),
+			Some(3.0),
+			"filled to the brim"
+		);
+		assert_eq!(Body::default().surface(), None, "an ordinary body holds nothing");
+
+		let mut soup =
+			Body::new(BodyKind::Static, Shape::mesh(MeshId::CUBE), Transform::IDENTITY);
+		soup.water = Water::pool();
+
+		assert_eq!(soup.surface(), None, "and a triangle soup has no bounds to fill to");
+	}
+
+	#[test]
+	fn how_much_of_a_standing_box_is_under_is_the_fraction_of_its_own_height() {
+		let mut bodies = Bodies::default();
+		bodies.spawn(pool(Vec3::new(8.0, 4.0, 8.0), 4.0));
+
+		// a two-unit capsule's box, walked from clear of the surface down to
+		// the bottom of the pool
+		let at = |bottom: f32| {
+			bodies.submersion(Vec3::new(0.0, bottom, 0.0), Vec3::new(0.4, bottom + 2.0, 0.4))
+		};
+
+		assert!((at(4.0) - 0.0).abs() < 1.0e-5, "standing on the surface is dry");
+		assert!((at(3.0) - 0.5).abs() < 1.0e-5, "waist deep is a half, got {}", at(3.0));
+		assert!((at(2.5) - 0.75).abs() < 1.0e-5, "up to the neck is three quarters");
+		assert!((at(0.0) - 1.0).abs() < 1.0e-5, "and under it is all of it");
+		assert!(
+			bodies
+				.submersion(Vec3::new(40.0, 0.0, 0.0), Vec3::new(40.4, 2.0, 0.4))
+				.abs() < 1.0e-5,
+			"a box beside the pool rather than in it is dry"
+		);
+	}
+
+	#[test]
+	fn two_fluids_over_one_box_answer_with_the_deeper_reading() {
+		// so that the order of the table cannot decide it, which is what a
+		// first-found answer would let it do
+		let mut shallow = Bodies::default();
+		shallow.spawn(pool(Vec3::new(8.0, 1.0, 8.0), 1.0));
+		shallow.spawn(pool(Vec3::new(8.0, 4.0, 8.0), 4.0));
+
+		let mut other_way = Bodies::default();
+		other_way.spawn(pool(Vec3::new(8.0, 4.0, 8.0), 4.0));
+		other_way.spawn(pool(Vec3::new(8.0, 1.0, 8.0), 1.0));
+
+		let (low, high) = (Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.4, 4.0, 0.4));
+
+		assert!(
+			(shallow.submersion(low, high) - 1.0).abs() < 1.0e-5,
+			"the deep one is what counts"
+		);
+		assert!(
+			(shallow.submersion(low, high) - other_way.submersion(low, high)).abs() < 1.0e-6,
+			"whichever order they were spawned in"
+		);
+	}
+
+	#[test]
+	fn what_fluid_is_at_a_point_is_the_body_that_holds_it_or_nothing() {
+		let mut bodies = Bodies::default();
+		let deep = bodies.spawn(pool(Vec3::new(8.0, 4.0, 8.0), 4.0));
+
+		let (found, water) = bodies
+			.fluid_at(Vec3::new(0.0, 2.0, 0.0))
+			.expect("a point inside the pool is in the pool");
+
+		assert_eq!(found, deep, "and it names which body it was");
+		assert!((water.density - Water::pool().density).abs() < 1.0e-6, "with its own numbers");
+		assert!(
+			bodies
+				.fluid_at(Vec3::new(0.0, 5.0, 0.0))
+				.is_none(),
+			"above it is air"
+		);
+		assert!(
+			bodies
+				.fluid_at(Vec3::new(40.0, 2.0, 0.0))
+				.is_none(),
+			"and beside it is too"
+		);
+
+		// an ordinary body is not a fluid however far into it you ask
+		let mut dry = Bodies::default();
+		dry.spawn(Body::new(
+			BodyKind::Static,
+			Shape::cuboid(Vec3::splat(8.0)),
+			Transform::IDENTITY,
+		));
+
+		assert!(dry.fluid_at(Vec3::ZERO).is_none(), "a wall is not water");
 	}
 
 	#[test]

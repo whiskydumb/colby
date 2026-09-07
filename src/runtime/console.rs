@@ -282,6 +282,11 @@ pub(crate) fn install(world: &mut World) {
 		"mark every joint and the two anchors it holds",
 	);
 	world.cvars.var(
+		colby_physics::debug::WATER,
+		Value::Bool(false),
+		"outline every fluid and hatch the surface it is filled to",
+	);
+	world.cvars.var(
 		colby_ui::world_text::TEXT_SIZE,
 		Value::Float(colby_ui::world_text::DEFAULT_TEXT_SIZE),
 		"how big a label anchored in the world is drawn, in layout pixels",

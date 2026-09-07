@@ -180,6 +180,7 @@ where
 	bodies(scope, tables, world)?;
 	moving(scope, tables, world)?;
 	pushing(scope, tables, world)?;
+	wading(scope, tables, world)?;
 	resting(scope, tables, world)?;
 	touching(scope, tables, world)?;
 	asking(scope, tables, world)?;
@@ -957,6 +958,65 @@ where
 /// @param scope - the scope every callback is built in
 /// @param tables - the tables to fill
 /// @param world - the world the callbacks reach through
+/// `body.submersion` and `colby.water_at` - what a program asks about a
+/// fluid.
+///
+/// A fifth `body` function rather than a row in `pushing`, by that file's own
+/// rule that these split by subject: being in water is a different subject
+/// from being pushed, and the second of the two is not about a body at all.
+///
+/// **These read where [`push`](pushing) writes**, which is why a program that
+/// wants to swim can be written entirely here: it asks how deep it is, and
+/// then pushes. Neither half needs the engine to have a swimming mode. @ref
+/// [`Bodies::submersion`](colby_core::abi::Bodies::submersion) for the two
+/// lines Unreal writes with the same number.
+fn wading<'scope, 'env, 'world>(
+	scope: &'scope Scope<'scope, 'env>,
+	tables: &Tables,
+	world: &'env RefCell<&'world mut World>,
+) -> Result<()>
+where
+	'world: 'env,
+{
+	// how much of a body is under a surface, from its own bounds. A handle
+	// rather than two corners, because a program that has a body has the
+	// handle and would otherwise have to spell its box out itself - and get
+	// the rotation wrong doing it.
+	let submersion = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Body)? else {
+			return Ok(0.0);
+		};
+		let world = world.borrow();
+		let Some((low, high)) = world
+			.bodies
+			.get(handle.body())
+			.and_then(Body::bounds)
+		else {
+			return Ok(0.0);
+		};
+
+		Ok(world.bodies.submersion(low, high))
+	})?;
+
+	// and the point question, which is the one a program asks about somewhere
+	// it is thinking of going rather than about something already there. The
+	// density is handed back rather than a bare `true`, because a program that
+	// wants to know whether it is in water is served by either and one that
+	// wants to work out its own buoyancy is served by only one.
+	let water_at = scope.create_function(move |_, (x, y, z): (f32, f32, f32)| {
+		Ok(world
+			.borrow()
+			.bodies
+			.fluid_at(Vec3::new(x, y, z))
+			.map(|(_, water)| water.density))
+	})?;
+
+	tables.bodies.set("submersion", submersion)?;
+	tables.engine.set("water_at", water_at)?;
+
+	Ok(())
+}
+
 fn pushing<'scope, 'env, 'world>(
 	scope: &'scope Scope<'scope, 'env>,
 	tables: &Tables,

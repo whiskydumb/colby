@@ -2655,6 +2655,67 @@ fn the_thruster_adds_to_what_is_already_pushing_rather_than_replacing_it() {
 }
 
 #[test]
+fn a_program_can_ask_how_deep_something_is_and_what_fluid_is_where() {
+	// the whole of what a swimming program needs from the engine: a number
+	// for how far under it is, and a question about somewhere it has not gone
+	// yet. What it does with either is its own, which is the point - there is
+	// no swimming mode here for it to be inside of.
+	let mut world = running(
+		r#"function tick(dt)
+			local it = body.find("swimmer")
+			colby.command(string.format(
+				"script.said %.3f/%s",
+				body.submersion(it),
+				tostring(colby.water_at(0, 1, 0))
+			))
+		end"#,
+	);
+
+	let mut pool = Body::new(
+		colby_core::abi::BodyKind::Static,
+		Shape::cuboid(colby_core::glam::Vec3::new(8.0, 4.0, 8.0)),
+		Transform::IDENTITY,
+	);
+	pool.water = colby_core::abi::Water::pool();
+	world.bodies.spawn(pool);
+
+	// a two-unit box with its middle at the pool's surface, so exactly half
+	// of it is under
+	let swimmer = world.bodies.spawn(Body::dynamic(
+		Shape::cuboid(colby_core::glam::Vec3::new(0.2, 1.0, 0.2)),
+		Transform::at(colby_core::glam::Vec3::new(0.0, 4.0, 0.0)),
+		1.0,
+	));
+
+	world.bodies.set_name(swimmer, "swimmer");
+	world.dt = 1.0 / 60.0;
+	listen(&mut world);
+
+	let mut scripts = machine();
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("0.500/2.0"),
+		"half under, and the fluid at a point in it hands back its density"
+	);
+
+	// and above the surface both answers go away rather than going wrong
+	if let Some(body) = world.bodies.get_mut(swimmer) {
+		body.transform.position.y = 20.0;
+	}
+
+	scripts.gameplay(&mut world, &[]);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("0.000/2.0"),
+		"out of the water it is dry, while the point asked about is still wet"
+	);
+}
+
+#[test]
 fn a_program_can_turn_a_body_without_moving_it() {
 	// the two calls are one line apart and take the same three numbers, so
 	// what tells them apart is which field they land in. A test that only

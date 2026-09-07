@@ -364,22 +364,9 @@ pub fn float(
 	pushed
 }
 
-/// The height of a fluid body's surface.
-///
-/// The top of its world-space bounds, and level: a
-/// [`WaterKind::Volume`](colby_core::abi::WaterKind::Volume) is filled to the
-/// brim, so where the fluid ends is where the shape does. A tipped-up pool has
-/// a level surface and sloping walls rather than a slope of water, which is
-/// what makes this one number instead of a plane.
-///
-/// @param body - the fluid body
-/// @return where its top is, or nothing for a shape with no bounds
-#[must_use]
-pub fn surface(body: &Body) -> Option<f32> { body.bounds().map(|(_, high)| high.y) }
-
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{BodyKind, Shape, Transform, WaterKind};
+	use colby_core::abi::{Shape, Transform};
 
 	use super::*;
 
@@ -627,28 +614,6 @@ mod tests {
 		assert!(
 			force.x > 1.0e-3,
 			"something still in a running river is pushed downstream, got {force}"
-		);
-	}
-
-	#[test]
-	fn a_surface_is_the_top_of_the_pool_and_a_soup_has_none() {
-		let mut pool = Body::new(
-			BodyKind::Static,
-			Shape::cuboid(Vec3::new(4.0, 1.0, 4.0)),
-			Transform::at(Vec3::new(0.0, 3.0, 0.0)),
-		);
-		pool.water = Water::pool();
-
-		assert_eq!(surface(&pool), Some(4.0), "filled to the brim");
-		assert_eq!(pool.water.kind, WaterKind::Volume, "and it is a pool");
-		assert_eq!(
-			surface(&Body::new(
-				BodyKind::Static,
-				Shape::mesh(colby_core::abi::MeshId::NONE),
-				Transform::IDENTITY
-			)),
-			None,
-			"a triangle soup has no bounds to fill to"
 		);
 	}
 }
