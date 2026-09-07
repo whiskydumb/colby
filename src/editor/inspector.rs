@@ -25,7 +25,7 @@ use colby_core::{
 		field::{Kind, Value},
 		scene::{self, Stage},
 	},
-	glam::{EulerRot, Quat, Vec3},
+	glam::{EulerRot, Quat, Vec2, Vec3},
 };
 use egui::{ComboBox, DragValue, Grid, ScrollArea, Ui};
 
@@ -342,6 +342,7 @@ fn widget<T>(ui: &mut Ui, field: &Field<T>, value: &mut Value) {
 		| Value::Text(held) => {
 			ui.text_edit_singleline(held);
 		},
+		| Value::Vec2(held) => couple(ui, held),
 		| Value::Vec3(held) => vector(ui, held, MOVE_SPEED),
 		| Value::Quat(held) => turn(ui, held),
 		| Value::Color(held) => color(ui, held),
@@ -353,10 +354,30 @@ fn widget<T>(ui: &mut Ui, field: &Field<T>, value: &mut Value) {
 		| Value::Joint(_)
 		| Value::Pose(_)
 		| Value::Mesh(_)
-		| Value::Material(_) => {
+		| Value::Material(_)
+		| Value::Texture(_) => {
 			ui.monospace("a reference");
 		},
 	}
+}
+
+/// Two numbers on one row.
+///
+/// Its own speed rather than [`MOVE_SPEED`]: the only pair in the tables is a
+/// texture's repeat, and a tenth of a tile a pixel is a drag nobody can aim.
+fn couple(ui: &mut Ui, value: &mut Vec2) {
+	ui.horizontal(|ui| {
+		ui.add(
+			DragValue::new(&mut value.x)
+				.speed(STEP_SPEED)
+				.prefix("u "),
+		);
+		ui.add(
+			DragValue::new(&mut value.y)
+				.speed(STEP_SPEED)
+				.prefix("v "),
+		);
+	});
 }
 
 /// Three numbers on one row.

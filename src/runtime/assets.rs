@@ -27,8 +27,8 @@ use std::{
 
 use colby_asset::{
 	MeshFile, Project, TextureFile, anim::ClipFile, compile, compile::Kind,
-	document::DocumentFile, font::FontFile, model::ModelFile, scene::SceneFile,
-	script::ScriptFile, skeleton::SkeletonFile, sound::SoundFile,
+	document::DocumentFile, font::FontFile, material::MaterialFile, model::ModelFile,
+	scene::SceneFile, script::ScriptFile, skeleton::SkeletonFile, sound::SoundFile,
 };
 use colby_core::{
 	abi::{
@@ -224,6 +224,7 @@ impl Assets {
 			| Kind::Document => load_document(world, path, &name),
 			| Kind::Model => load_model(world, path, &name),
 			| Kind::Scene => load_scene(world, path, &name),
+			| Kind::Material => load_material(world, path, &name),
 			| Kind::Skeleton => load_skeleton(world, path, &name),
 			| Kind::Clip => load_clip(world, path, &name),
 			| Kind::Script => load_script(world, path, &name),
@@ -256,6 +257,7 @@ impl Assets {
 				| Kind::Document => drop(world.ui.insert(&name, DocumentData::empty())),
 				| Kind::Model => drop(world.models.insert(&name, ModelData::default())),
 				| Kind::Scene => drop(world.scenes.insert(&name, SceneData::default())),
+				| Kind::Material => drop(world.materials.insert(&name, Material::DEFAULT)),
 				| Kind::Skeleton => drop(
 					world
 						.skeletons
@@ -535,6 +537,44 @@ fn load_scene(world: &mut World, path: &Path, name: &str) {
 /// a mesh that arrives after its model would otherwise leave the model
 /// standing on nothing forever, because nothing re-resolves a placement.
 ///
+/// A material a person wrote, registered under its own asset name.
+///
+/// **The same three lines a model's own materials go through**, which is the
+/// whole of why a `.cmat` describes the record a `.cmodel` writes: the two
+/// producers of a material meet here, and neither knows the other exists.
+///
+/// A name cannot collide with a model's: a model's are written inside its own
+/// path - `models/lamp/brass` - and this one is the file's, `materials/brass`.
+///
+/// @param world - the tables to write
+/// @param path - the `.cmat` on disk
+/// @param name - the asset name it registers under
+fn load_material(world: &mut World, path: &Path, name: &str) {
+	let described = match MaterialFile::open(path) {
+		| Ok(file) => file.to_material(name),
+		| Err(error) => {
+			warn!(%error, "the material on disk could not be read");
+
+			return;
+		},
+	};
+
+	let albedo = reserve_texture(world, &described.albedo);
+	let normal = reserve_texture(world, &described.normal);
+	let id = world.materials.insert(name, Material {
+		base_color: described.base_color,
+		uv_scale: described.uv_scale,
+		wrap: described.wrap,
+		blend: described.blend,
+		opacity: described.opacity,
+		..Material::textured(albedo)
+			.bumped(normal)
+			.finished(described.metallic, described.roughness)
+	});
+
+	info!(name, slot = id.index(), "material loaded");
+}
+
 /// A model's materials land in `World::materials` beside the game's own. They
 /// are named inside the model's own path, so nothing a game declares can
 /// collide with one.

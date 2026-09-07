@@ -872,6 +872,7 @@ pub(crate) fn drop(world: &mut World, name: &str, kind: Kind, at: Vec3) -> Vec<P
 		| Kind::Texture
 		| Kind::Font
 		| Kind::Document
+		| Kind::Material
 		| Kind::Sound
 		| Kind::Skeleton
 		| Kind::Clip

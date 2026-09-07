@@ -82,7 +82,7 @@ use colby_core::{
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
 	err,
-	glam::{Quat, Vec3},
+	glam::{Quat, Vec2, Vec3},
 };
 
 use crate::{
@@ -551,7 +551,7 @@ fn layers(value: &Value) -> Result<Layers> {
 /// @param table - the record's table
 /// @param skipped - the plain fields the text spells by hand under other
 /// keys, which are therefore not keys
-fn names<T>(table: &[Field<T>], skipped: &[&str]) -> Vec<&'static str> {
+pub(crate) fn names<T>(table: &[Field<T>], skipped: &[&str]) -> Vec<&'static str> {
 	table
 		.iter()
 		.map(|field| field.name)
@@ -570,7 +570,12 @@ fn names<T>(table: &[Field<T>], skipped: &[&str]) -> Vec<&'static str> {
 /// @param tables - the keys each of the record's tables gives it
 /// @param hand - the keys read by hand beside the tables
 /// @param what - what to call the record in a message
-fn check(value: &Value, tables: &[Vec<&'static str>], hand: &[&str], what: &str) -> Result<()> {
+pub(crate) fn check(
+	value: &Value,
+	tables: &[Vec<&'static str>],
+	hand: &[&str],
+	what: &str,
+) -> Result<()> {
 	for (key, held) in value.as_object() {
 		let key = key.as_str();
 
@@ -625,7 +630,12 @@ fn unknown(what: &str, key: &str) -> colby_core::Error {
 /// @param entry - the record's object
 /// @param table - the record's table
 /// @param what - what to call the record in a message
-fn read<T>(record: &mut T, entry: &Value, table: &[Field<T>], what: &str) -> Result<()> {
+pub(crate) fn read<T>(
+	record: &mut T,
+	entry: &Value,
+	table: &[Field<T>],
+	what: &str,
+) -> Result<()> {
 	for field in table {
 		if field.kind.is_reference() {
 			continue;
@@ -699,8 +709,20 @@ fn parsed(
 
 			field::Value::Word(index)
 		},
-		| Kind::Entity | Kind::Body | Kind::Joint | Kind::Pose | Kind::Mesh | Kind::Material =>
-			return Err(wrong()),
+		| Kind::Vec2 => {
+			let field::Value::Vec2(held) = *current else {
+				return Err(wrong());
+			};
+
+			field::Value::Vec2(pair(Some(written), held, what, name)?)
+		},
+		| Kind::Entity
+		| Kind::Body
+		| Kind::Joint
+		| Kind::Pose
+		| Kind::Mesh
+		| Kind::Material
+		| Kind::Texture => return Err(wrong()),
 	})
 }
 
@@ -731,6 +753,35 @@ fn whole(value: &Value) -> Option<i64> {
 /// @param default - what the axes not written hold
 /// @param what - what to call the record in a message
 /// @param name - what to call the field
+fn pair(value: Option<&Value>, default: Vec2, what: &str, name: &str) -> Result<Vec2> {
+	let Some(value) = value else {
+		return Ok(default);
+	};
+
+	let wrong = || err!(Asset("{what}'s {name} should be two numbers"));
+
+	let Value::Array(parts) = value else {
+		return Err(wrong());
+	};
+
+	if parts.len() > 2 {
+		return Err(wrong());
+	}
+
+	let mut out = default.to_array();
+	for (slot, part) in out.iter_mut().zip(parts) {
+		*slot = part.as_f32().ok_or_else(wrong)?;
+	}
+
+	Ok(Vec2::from_array(out))
+}
+
+/// The same for three, which is a position, a direction, a size or a color.
+///
+/// @param value - what the file said, or nothing for a field it left out
+/// @param default - what to keep for a part the file did not write
+/// @param what - the record, for the message
+/// @param name - the field, for the message
 fn triple(value: Option<&Value>, default: Vec3, what: &str, name: &str) -> Result<Vec3> {
 	let Some(value) = value else {
 		return Ok(default);
@@ -1200,7 +1251,7 @@ fn collides_row(layers: Layers) -> Option<(&'static str, String)> {
 }
 
 /// A row naming something, or nothing when there is nothing to name.
-fn named_row(name: &'static str, value: &str) -> Option<(&'static str, String)> {
+pub(crate) fn named_row(name: &'static str, value: &str) -> Option<(&'static str, String)> {
 	if value.is_empty() {
 		return None;
 	}
@@ -1240,16 +1291,16 @@ fn put_place(
 
 /// How one table is written: under what prefix, called what, and which of
 /// its plain fields are spelled by hand under other keys instead.
-struct Writing<'a> {
+pub(crate) struct Writing<'a> {
 	/// What goes in front of every key, `camera.` for a record inside another.
-	prefix: &'a str,
+	pub(crate) prefix: &'a str,
 
 	/// What to call the record in a message.
-	what: &'a str,
+	pub(crate) what: &'a str,
 
 	/// The plain fields the text spells by hand, which the table never
 	/// writes; the same list the reader skips, so the two agree.
-	skipped: &'a [&'a str],
+	pub(crate) skipped: &'a [&'a str],
 }
 
 /// Writes every plain field of a record's table that differs from what the
@@ -1265,7 +1316,7 @@ struct Writing<'a> {
 /// @param table - the record's table
 /// @param writing - the prefix, the name and the hand-written fields
 /// @param hand - a row for a field the table cannot spell, or nothing
-fn put_all<T, F>(
+pub(crate) fn put_all<T, F>(
 	rows: &mut Rows,
 	record: &T,
 	otherwise: &T,
@@ -1312,6 +1363,7 @@ fn spelling(kind: Kind, value: &field::Value) -> Option<String> {
 		| field::Value::Int(held) => held.to_string(),
 		| field::Value::Float(held) => as_number(*held),
 		| field::Value::Text(held) => as_text(held),
+		| field::Value::Vec2(held) => as_couple(*held),
 		| field::Value::Vec3(held) | field::Value::Color(held) => as_vector(*held),
 		| field::Value::Quat(held) => as_turn(*held),
 		| field::Value::Word(index) => {
@@ -1326,7 +1378,8 @@ fn spelling(kind: Kind, value: &field::Value) -> Option<String> {
 		| field::Value::Joint(_)
 		| field::Value::Pose(_)
 		| field::Value::Mesh(_)
-		| field::Value::Material(_) => return None,
+		| field::Value::Material(_)
+		| field::Value::Texture(_) => return None,
 	})
 }
 
@@ -1337,7 +1390,7 @@ fn spelling(kind: Kind, value: &field::Value) -> Option<String> {
 /// them was put, so that `shape.kind` and `shape.radius` come out as one
 /// `shape`.
 #[derive(Default)]
-struct Rows {
+pub(crate) struct Rows {
 	rows: Vec<(String, String)>,
 }
 
@@ -1358,7 +1411,7 @@ impl Rows {
 	fn is_empty(&self) -> bool { self.rows.is_empty() }
 
 	/// The record as one line of JSON.
-	fn text(&self) -> String {
+	pub(crate) fn text(&self) -> String {
 		let mut written: Vec<String> = Vec::new();
 		let mut gathered: Vec<&str> = Vec::new();
 
@@ -1445,6 +1498,11 @@ fn as_number(value: f32) -> String {
 }
 
 /// Three numbers.
+pub(crate) fn as_couple(value: Vec2) -> String {
+	format!("[{}, {}]", as_number(value.x), as_number(value.y))
+}
+
+/// Three numbers, in the order the reader wants them.
 fn as_vector(value: Vec3) -> String {
 	format!("[{}, {}, {}]", as_number(value.x), as_number(value.y), as_number(value.z))
 }
@@ -2409,10 +2467,12 @@ mod tests {
 			| Kind::Int => field::Value::Int(6),
 			| Kind::Float => field::Value::Float(2.5),
 			| Kind::Text => field::Value::Text("hello".to_owned()),
+			| Kind::Vec2 => field::Value::Vec2(Vec2::new(1.5, 2.5)),
 			| Kind::Vec3 => field::Value::Vec3(Vec3::new(1.0, 2.0, 3.0)),
 			| Kind::Quat => field::Value::Quat(Quat::from_rotation_y(0.5)),
 			| Kind::Color => field::Value::Color(Vec3::new(0.2, 0.4, 0.6)),
 			| Kind::Word(words) => field::Value::Word(u32::try_from(words.len()).ok()? - 1),
+			| Kind::Texture
 			| Kind::Entity
 			| Kind::Body
 			| Kind::Joint

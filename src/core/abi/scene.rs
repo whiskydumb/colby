@@ -2310,9 +2310,12 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::abi::{
-		Command, MAX_ENTITIES, Material, MeshData, PeerId, Role, mesh,
-		skeleton::{Bone, SkeletonData, SkeletonId},
+	use crate::{
+		abi::{
+			Command, MAX_ENTITIES, Material, MeshData, PeerId, Role, mesh,
+			skeleton::{Bone, SkeletonData, SkeletonId},
+		},
+		glam::Vec2,
 	};
 
 	/// Something for an arena to hold, for the tests about the three of them.
@@ -4960,6 +4963,7 @@ mod tests {
 				| Kind::Int => Value::Int(6),
 				| Kind::Float => Value::Float(2.5),
 				| Kind::Text => Value::Text("hello".to_owned()),
+				| Kind::Vec2 => Value::Vec2(Vec2::new(1.0, 2.0)),
 				| Kind::Vec3 => Value::Vec3(Vec3::new(1.0, 2.0, 3.0)),
 				| Kind::Quat => Value::Quat(Quat::from_rotation_y(0.5)),
 				| Kind::Color => Value::Color(Vec3::new(0.2, 0.4, 0.6)),
@@ -4969,7 +4973,8 @@ mod tests {
 				| Kind::Joint
 				| Kind::Pose
 				| Kind::Mesh
-				| Kind::Material => return None,
+				| Kind::Material
+				| Kind::Texture => return None,
 			})
 		};
 

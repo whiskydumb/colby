@@ -44,7 +44,7 @@ use colby_core::{
 	},
 	bytemuck::{self, Pod, Zeroable},
 	err,
-	glam::{Quat, Vec3},
+	glam::{Quat, Vec2, Vec3},
 };
 
 use crate::bytes::{AlignedBytes, Names, count, fits, span, width};
@@ -56,7 +56,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYMDL";
 ///
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The extension a compiled model is written with.
 pub const EXTENSION: &str = "cmodel";
@@ -165,6 +165,16 @@ pub struct Coat {
 
 	/// How much of the surface there is, where the mode above reads it.
 	pub opacity: f32,
+
+	/// How many times the textures repeat across the mesh's own `0..1`.
+	///
+	/// Added with the `.material` source, and the reason it is here rather
+	/// than only there is that this record is *the* described material - the
+	/// live one has had the field since materials had textures, and two
+	/// described forms of one record is two things to keep in step. What a
+	/// glTF sets it to is one, because the exchange format puts a texture
+	/// transform in an extension nothing here reads yet.
+	pub uv_scale: [f32; 2],
 }
 
 /// One piece of a model standing somewhere.
@@ -237,6 +247,9 @@ pub struct Material {
 
 	/// How much of the surface there is, where the mode above reads it.
 	pub opacity: f32,
+
+	/// How many times its textures repeat across the mesh's own `0..1`.
+	pub uv_scale: Vec2,
 }
 
 /// One piece of a model, and where it stands.
@@ -365,6 +378,7 @@ impl ModelFile {
 					// here every one of them resolves.
 					blend: Blend::from_code(coat.blend).unwrap_or_default(),
 					opacity: coat.opacity,
+					uv_scale: Vec2::from_array(coat.uv_scale),
 				})
 				.collect(),
 			placements: self
@@ -426,6 +440,7 @@ pub fn encode(data: &ModelData) -> Result<Vec<u8>> {
 			roughness: material.roughness,
 			blend: material.blend.code(),
 			opacity: material.opacity,
+			uv_scale: material.uv_scale.to_array(),
 		})
 		.collect();
 	let stands: Vec<Stand> = data
@@ -599,6 +614,7 @@ mod tests {
 					// matched.
 					blend: Blend::Mask,
 					opacity: 1.0,
+					uv_scale: Vec2::new(4.0, 2.0),
 				},
 				Material {
 					name: "models/lamp/glass".to_owned(),
@@ -611,6 +627,7 @@ mod tests {
 					wrap: Wrap::Repeat,
 					blend: Blend::Alpha,
 					opacity: 0.35,
+					uv_scale: Vec2::ONE,
 				},
 			],
 			placements: vec![

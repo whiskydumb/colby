@@ -32,9 +32,9 @@
 
 use super::{
 	cvar, entity::EntityId, joint::JointId, material::MaterialId, mesh::MeshId, physics::BodyId,
-	pose::PoseId,
+	pose::PoseId, texture::TextureId,
 };
-use crate::glam::{Quat, Vec3};
+use crate::glam::{Quat, Vec2, Vec3};
 
 /// What kind of value a field holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +50,9 @@ pub enum Kind {
 
 	/// Text.
 	Text,
+
+	/// Two numbers: how far a texture repeats, a point on a picture.
+	Vec2,
 
 	/// Three numbers: a position, a direction, a size.
 	Vec3,
@@ -90,6 +93,9 @@ pub enum Kind {
 
 	/// A handle to a material.
 	Material,
+
+	/// A handle to a texture.
+	Texture,
 }
 
 impl Kind {
@@ -103,7 +109,11 @@ impl Kind {
 	pub const fn is_reference(self) -> bool {
 		matches!(
 			self,
-			Self::Entity | Self::Body | Self::Joint | Self::Pose | Self::Mesh | Self::Material
+			Self::Entity
+				| Self::Body | Self::Joint
+				| Self::Pose | Self::Mesh
+				| Self::Material
+				| Self::Texture
 		)
 	}
 
@@ -136,6 +146,7 @@ impl Kind {
 			| Self::Int => "a whole number",
 			| Self::Float => "a number",
 			| Self::Text => "text",
+			| Self::Vec2 => "two numbers",
 			| Self::Vec3 => "three numbers",
 			| Self::Quat => "a rotation, four numbers xyzw",
 			| Self::Color => "a color, three numbers",
@@ -146,6 +157,7 @@ impl Kind {
 			| Self::Pose => "a pose",
 			| Self::Mesh => "a mesh",
 			| Self::Material => "a material",
+			| Self::Texture => "a texture",
 		}
 	}
 }
@@ -168,6 +180,9 @@ pub enum Value {
 
 	/// Text.
 	Text(String),
+
+	/// Two numbers.
+	Vec2(Vec2),
 
 	/// Three numbers.
 	Vec3(Vec3),
@@ -198,6 +213,9 @@ pub enum Value {
 
 	/// A handle to a material.
 	Material(MaterialId),
+
+	/// A handle to a texture.
+	Texture(TextureId),
 }
 
 impl Value {
@@ -216,6 +234,7 @@ impl Value {
 				| (Self::Int(_), Kind::Int)
 				| (Self::Float(_), Kind::Float)
 				| (Self::Text(_), Kind::Text)
+				| (Self::Vec2(_), Kind::Vec2)
 				| (Self::Vec3(_), Kind::Vec3)
 				| (Self::Quat(_), Kind::Quat)
 				| (Self::Color(_), Kind::Color)
@@ -226,6 +245,7 @@ impl Value {
 				| (Self::Pose(_), Kind::Pose)
 				| (Self::Mesh(_), Kind::Mesh)
 				| (Self::Material(_), Kind::Material)
+				| (Self::Texture(_), Kind::Texture)
 		)
 	}
 
@@ -413,6 +433,7 @@ mod tests {
 			| Kind::Int => Value::Int(6),
 			| Kind::Float => Value::Float(2.5),
 			| Kind::Text => Value::Text("hello".to_owned()),
+			| Kind::Vec2 => Value::Vec2(Vec2::new(1.5, 2.5)),
 			| Kind::Vec3 => Value::Vec3(Vec3::new(1.0, 2.0, 3.0)),
 			| Kind::Quat => Value::Quat(Quat::from_rotation_y(0.5)),
 			| Kind::Color => Value::Color(Vec3::new(0.2, 0.4, 0.6)),
@@ -423,6 +444,7 @@ mod tests {
 			| Kind::Pose => Value::Pose(PoseId::NONE),
 			| Kind::Mesh => Value::Mesh(MeshId::new(4)),
 			| Kind::Material => Value::Material(MaterialId::new(2)),
+			| Kind::Texture => Value::Texture(TextureId::new(5)),
 		}
 	}
 

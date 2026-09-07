@@ -44,8 +44,8 @@ use std::{
 use colby_core::{Error, Result, abi::texture::Texel, err, glam::Vec3};
 
 use crate::{
-	anim, document, font, format, gltf, html, jpeg, level, lua, model, obj, png, scene, script,
-	skeleton, sound, texture, ttf, wav,
+	anim, document, font, format, gltf, html, jpeg, level, lua, material, model, obj, png, scene,
+	script, skeleton, sound, texture, ttf, wav,
 };
 
 /// The directory under a workspace that holds editable sources.
@@ -78,6 +78,7 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
 	level::EXTENSION,
 	wav::EXTENSION,
 	lua::EXTENSION,
+	material::SOURCE_EXTENSION,
 ];
 
 /// The extensions it writes.
@@ -92,6 +93,7 @@ pub const OUTPUT_EXTENSIONS: &[&str] = &[
 	anim::EXTENSION,
 	sound::EXTENSION,
 	script::EXTENSION,
+	material::EXTENSION,
 ];
 
 /// Which of colby's formats a source compiles into.
@@ -133,6 +135,15 @@ pub enum Kind {
 	/// format is one rather than two: a level and a saved game are the same
 	/// list of things standing in the same places.
 	Scene,
+
+	/// A `.material` becomes a `.cmat`.
+	///
+	/// The one kind whose source and output hold the same nine numbers: what
+	/// compiling buys here is not a cheaper parse but a *uniform* one, so the
+	/// browser's compiled-or-not, the staleness sweep and
+	/// [`of_output`](Self::of_output) all work on a material without learning
+	/// that it is small.
+	Material,
 
 	/// A `.cskel`, which **no source compiles into**.
 	///
@@ -178,6 +189,7 @@ impl Kind {
 			| html::EXTENSION => Some(Self::Document),
 			| gltf::EXTENSION | gltf::BINARY_EXTENSION => Some(Self::Model),
 			| level::EXTENSION => Some(Self::Scene),
+			| material::SOURCE_EXTENSION => Some(Self::Material),
 			| lua::EXTENSION => Some(Self::Script),
 			| _ => None,
 		}
@@ -194,6 +206,7 @@ impl Kind {
 			| Self::Document => document::EXTENSION,
 			| Self::Model => model::EXTENSION,
 			| Self::Scene => scene::EXTENSION,
+			| Self::Material => material::EXTENSION,
 			| Self::Skeleton => skeleton::EXTENSION,
 			| Self::Clip => anim::EXTENSION,
 			| Self::Script => script::EXTENSION,
@@ -216,6 +229,7 @@ impl Kind {
 			| document::EXTENSION => Some(Self::Document),
 			| model::EXTENSION => Some(Self::Model),
 			| scene::EXTENSION => Some(Self::Scene),
+			| material::EXTENSION => Some(Self::Material),
 			| skeleton::EXTENSION => Some(Self::Skeleton),
 			| anim::EXTENSION => Some(Self::Clip),
 			| script::EXTENSION => Some(Self::Script),
@@ -234,6 +248,7 @@ impl Kind {
 			| Self::Document => document::version_of(path),
 			| Self::Model => model::version_of(path),
 			| Self::Scene => scene::version_of(path),
+			| Self::Material => material::version_of(path),
 			| Self::Skeleton => skeleton::version_of(path),
 			| Self::Clip => anim::version_of(path),
 			| Self::Script => script::version_of(path),
@@ -251,6 +266,7 @@ impl Kind {
 			| Self::Document => document::FORMAT_VERSION,
 			| Self::Model => model::FORMAT_VERSION,
 			| Self::Scene => scene::FORMAT_VERSION,
+			| Self::Material => material::FORMAT_VERSION,
 			| Self::Skeleton => skeleton::FORMAT_VERSION,
 			| Self::Clip => anim::FORMAT_VERSION,
 			| Self::Script => script::FORMAT_VERSION,
@@ -296,6 +312,12 @@ pub enum Produced {
 
 		/// How many style rules apply to them.
 		rules: usize,
+	},
+
+	/// A surface: what it is made of, and the pictures it wears.
+	Material {
+		/// How many of its two pictures it names.
+		textures: usize,
 	},
 
 	/// A world: what stands where, what collides and what is held together.
@@ -629,19 +651,8 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 			(document::encode(&text), produced)
 		},
 		| Kind::Script => compile_script(source)?,
-		| Kind::Scene => {
-			let data = level::import(&fs::read_to_string(source)?)
-				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
-			let bytes = scene::encode(&data)
-				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
-			let produced = Produced::Scene {
-				entities: data.things.len(),
-				bodies: data.solids.len(),
-				joints: data.links.len(),
-			};
-
-			(bytes, produced)
-		},
+		| Kind::Material => compile_material(source)?,
+		| Kind::Scene => compile_scene(source)?,
 		| Kind::Model => {
 			let (bytes, produced, said) = compile_model(source, output, root)?;
 
@@ -752,6 +763,9 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 				base_color: surface.base_color,
 				metallic: surface.metallic,
 				roughness: surface.roughness,
+				// one, and the exchange format is why: a texture transform
+				// lives in `KHR_texture_transform`, which nothing here reads.
+				uv_scale: colby_core::glam::Vec2::ONE,
 				wrap: surface.wrap,
 				blend: surface.blend,
 				opacity: surface.opacity,
@@ -1048,6 +1062,44 @@ fn compile_script(source: &Path) -> Result<(Vec<u8>, Produced)> {
 	Ok((script::encode(&text), produced))
 }
 
+/// Reads a `.scene` and writes the `.cscene` it describes.
+///
+/// Its own function for [`compile_material`]'s reason, and it went out of the
+/// match on the same day: eleven kinds is more than a match with bodies in it
+/// can hold.
+///
+/// @param source - the `.scene`, in the source tree
+/// @return the file to write and what to report about it
+fn compile_scene(source: &Path) -> Result<(Vec<u8>, Produced)> {
+	let data = level::import(&fs::read_to_string(source)?)
+		.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+	let bytes =
+		scene::encode(&data).map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+	let produced = Produced::Scene {
+		entities: data.things.len(),
+		bodies: data.solids.len(),
+		joints: data.links.len(),
+	};
+
+	Ok((bytes, produced))
+}
+
+/// Reads a `.material` and writes the `.cmat` it describes.
+///
+/// Its own function for the reason [`compile_script`] is: the arm above is a
+/// match over eleven kinds, and a body of more than two lines in any of them
+/// is what pushes the whole of it past what one function may be.
+///
+/// @param source - the `.material`, in the source tree
+/// @return the file to write and what to report about it
+fn compile_material(source: &Path) -> Result<(Vec<u8>, Produced)> {
+	let coat = material::import(&fs::read_to_string(source)?)
+		.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+	let named = usize::from(!coat.albedo.is_empty()) + usize::from(!coat.normal.is_empty());
+
+	Ok((material::encode(&coat), Produced::Material { textures: named }))
+}
+
 /// A file's modification time.
 fn mtime(path: &Path) -> Result<SystemTime> { Ok(fs::metadata(path)?.modified()?) }
 
@@ -1099,7 +1151,7 @@ mod tests {
 	/// [`the_list_of_kinds_holds_every_one_there_is`], which indexes into it
 	/// through an exhaustive match: a variant added to [`Kind`] has to be given
 	/// an index, and the only index left over is one this array does not have.
-	const EVERY_KIND: [Kind; 10] = [
+	const EVERY_KIND: [Kind; 11] = [
 		Kind::Mesh,
 		Kind::Texture,
 		Kind::Font,
@@ -1107,6 +1159,7 @@ mod tests {
 		Kind::Document,
 		Kind::Model,
 		Kind::Scene,
+		Kind::Material,
 		Kind::Skeleton,
 		Kind::Clip,
 		Kind::Script,
@@ -1122,9 +1175,10 @@ mod tests {
 			| Kind::Document => 4,
 			| Kind::Model => 5,
 			| Kind::Scene => 6,
-			| Kind::Skeleton => 7,
-			| Kind::Clip => 8,
-			| Kind::Script => 9,
+			| Kind::Material => 7,
+			| Kind::Skeleton => 8,
+			| Kind::Clip => 9,
+			| Kind::Script => 10,
 		}
 	}
 

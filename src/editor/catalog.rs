@@ -71,6 +71,7 @@ pub(crate) const fn word(kind: Kind) -> &'static str {
 		| Kind::Model => "model",
 		| Kind::Sound => "sound",
 		| Kind::Scene => "scene",
+		| Kind::Material => "material",
 		| Kind::Skeleton => "skeleton",
 		| Kind::Clip => "clip",
 		| Kind::Script => "program",

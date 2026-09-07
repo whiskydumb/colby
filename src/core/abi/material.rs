@@ -11,6 +11,7 @@
 //! [`textures`](super::texture) for what the handle points at.
 
 use super::{
+	field::{Field, field, word},
 	registry::{Entry, Registry},
 	texture::TextureId,
 };
@@ -49,6 +50,41 @@ pub enum Wrap {
 }
 
 impl Wrap {
+	/// The word each one is written as, in declaration order.
+	///
+	/// A file's vocabulary and an inspector's drop-down. @ref
+	/// [`field::Kind::Word`](super::field::Kind::Word).
+	pub const WORDS: &[&str] = &["repeat", "clamp"];
+
+	/// The one at a place in [`WORDS`](Self::WORDS), if there is one.
+	///
+	/// @param index - the place
+	#[must_use]
+	pub const fn at(index: u32) -> Option<Self> {
+		match index {
+			| 0 => Some(Self::Repeat),
+			| 1 => Some(Self::Clamp),
+			| _ => None,
+		}
+	}
+
+	/// Where this one is in [`WORDS`](Self::WORDS).
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "the discriminant is the place in the list, by declaration order"
+	)]
+	pub const fn index(self) -> u32 { self as u32 }
+
+	/// The word this one is written as.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "u32 to usize is lossless on every target this builds for, and try_from is not \
+		          available in a const fn"
+	)]
+	pub const fn word(self) -> &'static str { Self::WORDS[self.index() as usize] }
+
 	/// The number the renderer indexes its sampler table with.
 	#[must_use]
 	#[expect(
@@ -104,6 +140,42 @@ impl Blend {
 	/// @note: a mode added above has to be counted here as well - nothing in
 	/// the language can do it, and the test below is what notices.
 	pub const COUNT: usize = 3;
+	/// The word each mode is written as, in declaration order.
+	///
+	/// A file's vocabulary and an inspector's drop-down. @ref
+	/// [`field::Kind::Word`](super::field::Kind::Word).
+	pub const WORDS: &[&str] = &["opaque", "mask", "alpha"];
+
+	/// The mode at a place in [`WORDS`](Self::WORDS), if there is one.
+	///
+	/// @param index - the place
+	#[must_use]
+	pub const fn at(index: u32) -> Option<Self> {
+		match index {
+			| 0 => Some(Self::Opaque),
+			| 1 => Some(Self::Mask),
+			| 2 => Some(Self::Alpha),
+			| _ => None,
+		}
+	}
+
+	/// Where this mode is in [`WORDS`](Self::WORDS).
+	///
+	/// The same number [`code`](Self::code) hands back, and deliberately so:
+	/// the file's word, the inspector's row and the byte a `.cmesh` carries
+	/// are one order, so a mode appended below is one line in three places
+	/// instead of a translation table.
+	#[must_use]
+	pub const fn index(self) -> u32 { self.code() }
+
+	/// The word this mode is written as.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		reason = "u32 to usize is lossless on every target this builds for, and try_from is not \
+		          available in a const fn"
+	)]
+	pub const fn word(self) -> &'static str { Self::WORDS[self.index() as usize] }
 
 	/// The row of the renderer's pipeline table this mode is built into.
 	///
@@ -255,6 +327,44 @@ impl Material {
 		blend: Blend::Opaque,
 		opacity: 1.0,
 	};
+	/// Its fields, for an inspector, a reader and a writer. @ref
+	/// [`field`](super::field).
+	///
+	/// **The whole record**, unlike every other table in this crate: a
+	/// material has no transform, no handle to itself and no counter the host
+	/// keeps, so there is nothing about it that is a moment rather than a
+	/// thing. The two textures are references, described here and named by
+	/// hand beside the table, exactly as a body's entity is.
+	pub const FIELDS: &[Field<Self>] = &[
+		field!(Color, "base_color", base_color, "the surface's own color, linear RGB"),
+		field!(Float, "metallic", metallic, "nought for a dielectric, one for a metal"),
+		field!(Float, "roughness", roughness, "nought is a mirror, one is chalk"),
+		field!(Texture, "albedo", albedo, "the color picture, or none for a flat color"),
+		field!(Texture, "normal", normal, "the normal map, or none for a flat surface"),
+		field!(
+			Vec2,
+			"uv_scale",
+			uv_scale,
+			"how many times the textures repeat across the mesh's own nought to one"
+		),
+		word!(
+			"wrap",
+			wrap,
+			Wrap::WORDS,
+			Wrap::at,
+			Wrap::index,
+			"what happens past the edge of both textures"
+		),
+		word!(
+			"blend",
+			blend,
+			Blend::WORDS,
+			Blend::at,
+			Blend::index,
+			"how the albedo's alpha is read"
+		),
+		field!(Float, "opacity", opacity, "how much of the surface there is; alpha mode only"),
+	];
 	/// What a fluid is drawn as: blue-green, smooth, and half see-through.
 	///
 	/// [`Blend::Alpha`], so it reads the depth buffer and does not write it,
@@ -430,7 +540,10 @@ impl Default for Materials {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use super::{
+		super::field::{Kind, Value},
+		*,
+	};
 
 	#[test]
 	fn the_default_material_is_a_plain_white_dielectric() {
@@ -581,6 +694,60 @@ mod tests {
 		);
 		assert_eq!(materials.get(MaterialId::DEFAULT), Some(&Material::DEFAULT), "and match");
 		assert_eq!(materials.find("stone"), MaterialId::NONE, "nothing else is registered");
+	}
+
+	#[test]
+	fn every_field_reads_back_what_it_was_written() {
+		let mut material = Material::DEFAULT;
+
+		for entry in Material::FIELDS {
+			let written = match entry.kind {
+				| Kind::Word(words) =>
+					Value::Word(u32::try_from(words.len()).expect("a short list") - 1),
+				| Kind::Float => Value::Float(0.75),
+				| Kind::Color => Value::Color(Vec3::new(0.25, 0.5, 0.75)),
+				| Kind::Vec2 => Value::Vec2(Vec2::new(3.0, 4.0)),
+				// a reference is described and never written down as text; a
+				// value of one still has to survive the table.
+				| Kind::Texture => Value::Texture(TextureId::new(7)),
+				| kind => panic!("a material has no field of {kind:?}"),
+			};
+
+			assert!(
+				entry.set(&mut material, written.clone()),
+				"{} takes its own kind",
+				entry.name
+			);
+			assert_eq!(entry.get(&material), written, "{} hands back what it took", entry.name);
+		}
+
+		assert_eq!(material.wrap, Wrap::Clamp, "the last word is the last one");
+		assert_eq!(material.blend, Blend::Alpha, "for both of them");
+	}
+
+	#[test]
+	fn the_two_word_lists_are_their_enumerations_in_order() {
+		for (index, word) in Wrap::WORDS.iter().enumerate() {
+			let index = u32::try_from(index).expect("two of them");
+			let held = Wrap::at(index).expect("every place has one");
+
+			assert_eq!(held.index(), index, "{word} is at {index}");
+			assert_eq!(held.word(), *word, "and is written as itself");
+		}
+
+		for (index, word) in Blend::WORDS.iter().enumerate() {
+			let index = u32::try_from(index).expect("three of them");
+			let held = Blend::at(index).expect("every place has a mode");
+
+			assert_eq!(held.index(), index, "{word} is at {index}");
+			assert_eq!(held.word(), *word, "and is written as itself");
+			// the file's word, the inspector's row and the byte a `.cmesh`
+			// carries are deliberately one order
+			assert_eq!(held.code(), index, "and the code is the same number");
+		}
+
+		assert_eq!(Blend::WORDS.len(), Blend::COUNT, "every mode has a word");
+		assert!(Wrap::at(2).is_none() && Blend::at(3).is_none(), "one past the end is nothing");
 	}
 
 	#[test]

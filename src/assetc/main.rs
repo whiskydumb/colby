@@ -211,6 +211,7 @@ fn describe(produced: Produced) -> String {
 				corner(bounds.1)
 			)
 		},
+		| Produced::Material { textures } => format!("{textures:>6} pictures named"),
 		| Produced::Texture { width, height, levels } =>
 			format!("{width:>6} x {height:<6} {levels} mip levels"),
 		| Produced::Sound { frames, rate, channels } => format!(
