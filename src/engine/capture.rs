@@ -317,6 +317,7 @@ mod tests {
 
 	use super::*;
 	use crate::{
+		scene::MSAA,
 		shadow,
 		skin::{self, Joints},
 	};
@@ -1236,6 +1237,102 @@ f 1 4 5
 		drop(std::fs::remove_file(&path));
 	}
 
+	/// A world with one big triangle turned so that its edge crosses the
+	/// middle of the picture at an angle no pixel grid agrees with.
+	///
+	/// A diagonal on purpose: a vertical or a horizontal edge lands on the
+	/// grid and is not aliased at any sample count, so it would say nothing
+	/// about either.
+	fn a_slanted_edge() -> World {
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(1.0);
+
+		let mesh = world.meshes.insert(
+			"test/slant",
+			colby_asset::obj::import("v -4.0 -1.7 0\nv 4.0 -6.0 0\nv 4.0 2.3 0\nf 1 2 3\n")
+				.expect("the slanted triangle imports"),
+		);
+		let entity = world.entities.spawn_at(Transform::at(Vec3::ZERO));
+		world
+			.entities
+			.set_renderable(entity, Renderable::new(mesh, rgb(0.9, 0.9, 0.9)));
+
+		world
+	}
+
+	/// How many pixels down the middle column are neither the triangle nor the
+	/// background but something in between.
+	///
+	/// The whole of what anti-aliasing produces and the whole of what its
+	/// absence cannot: a hard edge has no partial pixels at all, whatever
+	/// resolution it is drawn at.
+	fn part_covered(image: &Image) -> usize {
+		(0..SIZE.1)
+			.map(|y| image.pixel(SIZE.0 / 2, y)[0])
+			.filter(|red| *red > 20 && *red < 235)
+			.count()
+	}
+
+	#[test]
+	fn a_slanted_edge_has_pixels_between_the_two_sides_of_it_and_a_hard_one_has_none() {
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		let mut world = a_slanted_edge();
+		// off first, so what the picture looks like without any is measured on
+		// the same device and the same triangle rather than remembered
+		world.cvars.var(MSAA, Value::Float(1.0), "");
+
+		let hard = part_covered(
+			&capture
+				.shoot(&mut world)
+				.expect("the capture renders"),
+		);
+
+		world.cvars.set(MSAA, "4");
+
+		let smooth = part_covered(
+			&capture
+				.shoot(&mut world)
+				.expect("the capture renders again"),
+		);
+
+		assert_eq!(hard, 0, "a hard edge is one side or the other and nothing between");
+		assert!(
+			smooth > 0,
+			"and four samples a pixel put something between them: {smooth} pixels"
+		);
+	}
+
+	#[test]
+	fn turning_it_off_again_puts_the_hard_edge_back() {
+		// the half that says the rebuild goes both ways: eight pipelines and
+		// two targets are replaced each time, and a pass whose attachments
+		// disagreed with its pipeline would be a validation error rather than
+		// a picture anybody could look at.
+		let Some((_gpu, mut capture)) = capture() else {
+			return;
+		};
+
+		let mut world = a_slanted_edge();
+		let mut seen = Vec::new();
+
+		for asked in ["4", "1", "4", "1"] {
+			world.cvars.var(MSAA, Value::Float(1.0), "");
+			world.cvars.set(MSAA, asked);
+			seen.push(part_covered(
+				&capture
+					.shoot(&mut world)
+					.expect("the capture renders"),
+			));
+		}
+
+		assert!(seen[0] > 0 && seen[2] > 0, "on is on both times: {seen:?}");
+		assert_eq!((seen[1], seen[3]), (0, 0), "and off is off both times: {seen:?}");
+		assert_eq!(seen[0], seen[2], "and the same picture comes back: {seen:?}");
+	}
+
 	#[test]
 	fn replacing_a_mesh_in_the_registry_changes_what_is_drawn() {
 		let Some((_gpu, mut capture)) = capture() else {
@@ -1262,10 +1359,14 @@ f 1 4 5
 		// the same name, so the same handle and the same entity - only the
 		// geometry behind it moves. This is what editing a file under `assets/`
 		// does to a running process.
-		let tiny = colby_asset::obj::import(
-			"v -0.02 -0.02 0\nv 0.02 -0.02 0\nv 0.0 -0.015 0\nf 1 2 3\n",
-		)
-		.expect("the replacement imports");
+		// small, and *clear of the middle pixel* rather than merely small: the
+		// old triangle stopped a fiftieth of a unit short of the origin, which is
+		// inside the pixel this test reads, and with four samples a pixel one of
+		// them caught its top edge and tinted the answer. What the fixture always
+		// meant is that the geometry is no longer where the test looks.
+		let tiny =
+			colby_asset::obj::import("v -0.02 -0.12 0\nv 0.02 -0.12 0\nv 0.0 -0.10 0\nf 1 2 3\n")
+				.expect("the replacement imports");
 		let again = world.meshes.insert("test/swap", tiny);
 
 		assert_eq!(again, mesh, "the handle survived, so nothing had to be told");
@@ -1689,23 +1790,84 @@ f 1 4 5
 	/// middle of a two-hundred-and-forty-row image is the boundary between two
 	/// of them, and which one a rasterizer picks is not something a test should
 	/// have an opinion about.
-	fn green_across_the_middle(image: &Image) -> bool {
-		let middle = SIZE.1 / 2;
-
-		(middle - 6..=middle + 6).any(|y| {
-			let pixel = image.pixel(SIZE.0 / 2, y);
-
-			dominant(pixel) == 1 && pixel[1] > 100
-		})
+	/// Whether the segment in this world reaches the middle of the picture.
+	///
+	/// **Asked as a comparison against the same world with no segment in it**,
+	/// and the reason is anti-aliasing. A segment one pixel wide that lands
+	/// between two rows of samples is drawn as two half-covered rows, and half
+	/// a green line over a red cube is a grey pixel - no threshold on one
+	/// pixel of one row can tell that from the cube on its own, and a
+	/// threshold that could would be asking where the samples happened to
+	/// fall. What the picture does conserve is how much *more* green there is
+	/// down the column with the line than without it, and that is this.
+	///
+	/// @param capture - the same capture, so both pictures are the same device
+	/// @param world - the world with the segment in it
+	/// @param bare - the same world with none
+	fn green_across_the_middle(
+		capture: &mut Capture,
+		world: &mut World,
+		bare: &mut World,
+	) -> bool {
+		green_gain(capture, world, bare) > MARGIN
 	}
 
+	/// How much more green a world's middle column has than the same world
+	/// with no segment in it.
+	///
+	/// @param capture - the same capture, so both pictures are one device
+	/// @param world - the world with the segment in it
+	/// @param bare - the same world with none
+	fn green_gain(capture: &mut Capture, world: &mut World, bare: &mut World) -> u32 {
+		let lined = green_down_the_middle(&capture.shoot(world).expect("the capture renders"));
+		let plain = green_down_the_middle(
+			&capture
+				.shoot(bare)
+				.expect("the capture renders the second time"),
+		);
+
+		lined.saturating_sub(plain)
+	}
+
+	/// How much green there is down the middle column, over the rows a debug
+	/// segment could be on.
+	fn green_down_the_middle(image: &Image) -> u32 {
+		let middle = SIZE.1 / 2;
+
+		(middle - 6..=middle + 6)
+			.map(|y| u32::from(image.pixel(SIZE.0 / 2, y)[1]))
+			.sum()
+	}
+
+	/// How much more green down the middle column counts as a segment.
+	///
+	/// **Small on purpose, and it is the sample count that makes it so**: a
+	/// segment one pixel wide covers a fraction of the samples of the two rows
+	/// it falls between, so what it adds over a lit red cube is tens rather
+	/// than hundreds. The case it has to be told apart from adds exactly
+	/// nothing - a segment the depth buffer threw away leaves the column bit
+	/// for bit as it was - so any margin above the noise separates them, and
+	/// this one is measured to be about half of the smallest real gain.
+	const MARGIN: u32 = 25;
+
 	/// A world holding one debug segment along x, at a given depth.
-	fn with_a_line(at_z: f32, on_top: bool) -> World {
+	fn with_a_line(at_z: f32, on_top: bool) -> World { lined(at_z, on_top, true) }
+
+	/// The same world with no segment in it: what every one of these is
+	/// measured against.
+	fn with_no_line() -> World { lined(0.0, false, false) }
+
+	/// One of the two, so that the only difference between them is the line.
+	fn lined(at_z: f32, on_top: bool, drawn: bool) -> World {
 		let mut world = looking_world();
 		world.ambient = Vec3::splat(1.0);
 
 		let (from, to) = (Vec3::new(-3.0, 0.0, at_z), Vec3::new(3.0, 0.0, at_z));
 		let green = rgb(0.1, 0.9, 0.1);
+
+		if !drawn {
+			return world;
+		}
 
 		if on_top {
 			world.debug.on_top().line(from, to, green);
@@ -1714,6 +1876,18 @@ f 1 4 5
 		}
 
 		world
+	}
+
+	/// A red cube two units across, standing at the origin.
+	fn blocking(world: &mut World) {
+		let cube = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(2.0),
+		});
+		world
+			.entities
+			.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.1, 0.1)));
 	}
 
 	/// A world with a sky of three flat, unmistakable colors.
@@ -2141,13 +2315,10 @@ f 1 4 5
 			return;
 		};
 
-		let mut world = with_a_line(0.0, false);
-		let image = capture
-			.shoot(&mut world)
-			.expect("the capture renders");
+		let (mut world, mut bare) = (with_a_line(0.0, false), with_no_line());
 
 		assert!(
-			green_across_the_middle(&image),
+			green_across_the_middle(&mut capture, &mut world, &mut bare),
 			"a segment through the origin, drawn by a camera aimed at the origin, crosses the \
 			 middle of the picture"
 		);
@@ -2161,24 +2332,19 @@ f 1 4 5
 
 		// the segment is two units behind the origin and the cube spans one
 		// either side of it, so the cube is squarely in the way.
-		let mut world = with_a_line(-2.0, false);
-		let cube = world.entities.spawn_at(Transform {
-			position: Vec3::ZERO,
-			rotation: Quat::IDENTITY,
-			scale: Vec3::splat(2.0),
-		});
-		world
-			.entities
-			.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.1, 0.1)));
+		let (mut world, mut bare) = (with_a_line(-2.0, false), with_no_line());
+		blocking(&mut world);
+		blocking(&mut bare);
+
+		assert!(
+			!green_across_the_middle(&mut capture, &mut world, &mut bare),
+			"the whole point of drawing inside the scene's pass is that the depth buffer applies"
+		);
 
 		let image = capture
 			.shoot(&mut world)
 			.expect("the capture renders");
 
-		assert!(
-			!green_across_the_middle(&image),
-			"the whole point of drawing inside the scene's pass is that the depth buffer applies"
-		);
 		assert_eq!(
 			dominant(image.pixel(SIZE.0 / 2, SIZE.1 / 2)),
 			0,
@@ -2193,22 +2359,12 @@ f 1 4 5
 		};
 
 		// the same scene as the test above, with the one bit flipped.
-		let mut world = with_a_line(-2.0, true);
-		let cube = world.entities.spawn_at(Transform {
-			position: Vec3::ZERO,
-			rotation: Quat::IDENTITY,
-			scale: Vec3::splat(2.0),
-		});
-		world
-			.entities
-			.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.1, 0.1)));
-
-		let image = capture
-			.shoot(&mut world)
-			.expect("the capture renders");
+		let (mut world, mut bare) = (with_a_line(-2.0, true), with_no_line());
+		blocking(&mut world);
+		blocking(&mut bare);
 
 		assert!(
-			green_across_the_middle(&image),
+			green_across_the_middle(&mut capture, &mut world, &mut bare),
 			"a contact normal starts on the surface that made it, so half of the debug drawing \
 			 would be invisible without this"
 		);
@@ -2993,32 +3149,54 @@ f 1 4 5
 			.entities
 			.set_renderable(sheet, Renderable::of(MeshId::CUBE, material, Vec3::ONE));
 
+		// the same pane over a world with no segment in it, so that what is
+		// compared is the segment's own contribution rather than a column a
+		// red pane is tinting. @ref `green_gain`.
+		let mut paned = with_no_line();
+		paned.materials.insert("test/glass", Material {
+			blend: Blend::Alpha,
+			opacity: HALF,
+			..Material::colored(rgb(0.9, 0.05, 0.05))
+		});
+		let bare_sheet = paned.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, 0.0, 2.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(8.0, 8.0, 0.05),
+		});
+		let glass = paned.materials.find("test/glass");
+		paned
+			.entities
+			.set_renderable(bare_sheet, Renderable::of(MeshId::CUBE, glass, Vec3::ONE));
+
+		let mut alone = with_a_line(0.0, false);
+		let mut nothing = with_no_line();
+		let through = green_gain(&mut capture, &mut glassed, &mut paned);
+		let clear = green_gain(&mut capture, &mut alone, &mut nothing);
+
 		let behind = capture
 			.shoot(&mut glassed)
 			.expect("the capture renders");
-
-		let mut bare = with_a_line(0.0, false);
-		let alone = capture
-			.shoot(&mut bare)
-			.expect("the second capture renders");
-
+		let picture = capture
+			.shoot(&mut alone)
+			.expect("the capture renders again");
 		let row = (SIZE.1 / 2 - 6..=SIZE.1 / 2 + 6)
-			.max_by_key(|y| alone.pixel(SIZE.0 / 2, *y)[1])
+			.max_by_key(|y| picture.pixel(SIZE.0 / 2, *y)[1])
 			.expect("the range is not empty");
-		let (through, clear) = (behind.pixel(SIZE.0 / 2, row), alone.pixel(SIZE.0 / 2, row));
+
+		assert!(clear > MARGIN, "the segment is there with nothing in front of it: {clear}");
+		assert!(
+			through * 10 < clear * 8,
+			"and behind the pane it is dimmed by it rather than drawn over it: {through} \
+			 against {clear}"
+		);
+		// the red half is still a pixel question rather than a column one: the
+		// pane covers the whole row, so its own color is on every one of them
+		// and there is nothing for anti-aliasing to spread.
+		let (tinted, bare) = (behind.pixel(SIZE.0 / 2, row), picture.pixel(SIZE.0 / 2, row));
 
 		assert!(
-			clear[1] > 100,
-			"the segment is on that row with nothing in front of it: {clear:?}"
-		);
-		assert!(
-			u32::from(through[1]) * 10 < u32::from(clear[1]) * 8,
-			"and behind the pane it is dimmed by it rather than drawn over it: {through:?} \
-			 against {clear:?}"
-		);
-		assert!(
-			u32::from(through[0]) > u32::from(clear[0]) + 40,
-			"which is the pane's own color arriving on top of it: {through:?} against {clear:?}"
+			u32::from(tinted[0]) > u32::from(bare[0]) + 40,
+			"which is the pane's own color arriving on top of it: {tinted:?} against {bare:?}"
 		);
 	}
 

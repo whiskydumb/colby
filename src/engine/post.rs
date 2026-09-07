@@ -46,6 +46,23 @@ use wgpu::{
 /// blended pass needs.
 pub(crate) const HDR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
+/// How many samples a pixel is drawn with when the console asks for none.
+pub(crate) const NO_SAMPLES: u32 = 1;
+
+/// How many it is drawn with when the console asks for any.
+///
+/// **Four and only four, and that is wgpu's number rather than a taste.**
+/// `MULTISAMPLE_X4` is what the WebGPU specification guarantees for a format
+/// at all (`wgpu-types/src/texture/format.rs:917`), and
+/// [`HDR_FORMAT`] is guaranteed `MULTISAMPLE_X4 | MULTISAMPLE_RESOLVE`
+/// (`:991`) while `Depth32Float` is guaranteed the first of the two (`:1000`),
+/// which is exactly what a multisampled scene needs, because a depth buffer is
+/// never resolved. Two and eight would each need
+/// `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` asked for and then checked per
+/// format per adapter, which is three branches and three sets of pipelines to
+/// buy "slightly worse" and "slightly better".
+pub(crate) const SAMPLES: u32 = 4;
+
 /// The format the meter and the eye are kept in.
 ///
 /// One channel of half float holding a base-two logarithm: half a stop of
@@ -95,8 +112,22 @@ struct Rung {
 
 /// The target the world is drawn into, and everything that reads it.
 pub(crate) struct Chain {
-	/// What every pass of the scene draws into.
+	/// What every pass of the scene draws into, and what the composite reads.
+	///
+	/// When the scene is multisampled this is what it *resolves into* rather
+	/// than what it draws into, and everything downstream is unchanged either
+	/// way. @ref [`multi`](Self::multi).
 	target: TextureView,
+
+	/// The multisampled target the scene draws into, when it is multisampled.
+	///
+	/// `None` is one sample a pixel and no resolve. Nothing samples this and
+	/// nothing may: it is written by the scene's one pass and resolved into
+	/// [`target`](Self::target) by the same pass.
+	multi: Option<TextureView>,
+
+	/// How many samples a pixel of the scene is drawn with.
+	samples: u32,
 
 	/// The way the composite reads that target.
 	target_read: BindGroup,
@@ -207,12 +238,18 @@ impl Chain {
 		];
 		let rungs = ladder(device, &sampler, &texture_layout);
 		let (target, target_read) = colors(device, &sampler, &texture_layout, width, height);
+		// none until somebody asks: a fresh surface is built before the world
+		// it will draw exists, so it cannot know what the console says yet.
+		// @ref `set_samples`, which the scene calls every frame.
+		let multi = None;
 		let glow = chain(device, &sampler, &texture_layout, width, height);
 		let glow_read = widest(device, &sampler, &texture_layout, &glow, &target);
 
 		Ok(Self {
 			target,
 			target_read,
+			multi,
+			samples: NO_SAMPLES,
 			rungs,
 			glow,
 			glow_read,
@@ -235,7 +272,46 @@ impl Chain {
 	}
 
 	/// What the scene's passes draw into.
-	pub(crate) const fn target(&self) -> &TextureView { &self.target }
+	///
+	/// The multisampled target when there is one, and the plain one when there
+	/// is not. Everything downstream reads the *plain* one either way, which is
+	/// the whole reason the resolve happens at the end of the scene's own pass
+	/// rather than in a pass of its own: the chain, the composite, the overlay
+	/// and the interface never learn that any of this happened.
+	pub(crate) const fn target(&self) -> &TextureView {
+		match &self.multi {
+			| Some(view) => view,
+			| None => &self.target,
+		}
+	}
+
+	/// Where the scene's pass resolves to, or nothing when it is not
+	/// multisampled.
+	pub(crate) const fn resolve_into(&self) -> Option<&TextureView> {
+		match &self.multi {
+			| Some(_) => Some(&self.target),
+			| None => None,
+		}
+	}
+
+	/// Draws the scene with this many samples a pixel from now on.
+	///
+	/// Nothing but the one extra texture: the plain target it resolves into is
+	/// the same texture the chain has always read, so a change here costs no
+	/// bind group and no pass. **The pipelines are the caller's** - a pipeline
+	/// records a sample count of its own and wgpu refuses a pass whose
+	/// attachments disagree with it.
+	///
+	/// @param device - the device to build against
+	/// @param samples - [`SAMPLES`] or [`NO_SAMPLES`]
+	pub(crate) fn set_samples(&mut self, device: &Device, samples: u32) {
+		if self.samples == samples {
+			return;
+		}
+
+		self.samples = samples;
+		self.multi = multisampled(device, samples, self.size.0, self.size.1);
+	}
 
 	/// Rebuilds the target for a new size.
 	///
@@ -251,6 +327,7 @@ impl Chain {
 
 		self.target = target;
 		self.target_read = read;
+		self.multi = multisampled(device, self.samples, width, height);
 		self.glow = chain(device, &self.sampler, &self.texture_layout, width, height);
 		self.glow_read =
 			widest(device, &self.sampler, &self.texture_layout, &self.glow, &self.target);
@@ -546,6 +623,38 @@ fn index_of(curve: ToneMap) -> f32 {
 }
 
 /// The world's target and the way to read it.
+/// The multisampled target the scene draws into, when it is multisampled.
+///
+/// No `TEXTURE_BINDING`: nothing samples it and nothing may - a multisampled
+/// texture is read with a different binding type and a different shader, and
+/// the only thing that ever touches this one is the resolve at the end of the
+/// pass that wrote it.
+///
+/// @param samples - how many a pixel is drawn with; one is no target at all
+/// @return the view, or `None` when a pixel is one sample
+fn multisampled(device: &Device, samples: u32, width: u32, height: u32) -> Option<TextureView> {
+	if samples <= 1 {
+		return None;
+	}
+
+	let texture = device.create_texture(&TextureDescriptor {
+		label: Some("hdr multisampled"),
+		size: Extent3d {
+			width: width.max(1),
+			height: height.max(1),
+			depth_or_array_layers: 1,
+		},
+		mip_level_count: 1,
+		sample_count: samples,
+		dimension: TextureDimension::D2,
+		format: HDR_FORMAT,
+		usage: TextureUsages::RENDER_ATTACHMENT,
+		view_formats: &[],
+	});
+
+	Some(texture.create_view(&TextureViewDescriptor::default()))
+}
+
 fn colors(
 	device: &Device,
 	sampler: &Sampler,

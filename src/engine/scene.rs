@@ -30,7 +30,7 @@ use colby_core::{
 	bytemuck::{self, Pod, Zeroable},
 	err, error,
 	glam::Vec3,
-	info,
+	info, warn,
 };
 use wgpu::{
 	AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
@@ -157,6 +157,30 @@ pub const DEFAULT_LAMPS: f32 = 32.0;
 /// measured rather than guessed at, and so that a machine which cannot afford
 /// the loop has somewhere to say so.
 pub const LAMPS: &str = "r.lights";
+
+/// The console variable that says how many samples a pixel is drawn with.
+///
+/// **Off or four**, and the two are the only answers: @ref
+/// [`post::SAMPLES`](crate::post::SAMPLES) for why wgpu makes it so. Anything
+/// above one is read as four rather than refused, so `r.msaa 8` on a machine
+/// that would like eight gets the four it can have instead of an error nobody
+/// can act on.
+///
+/// A number rather than a switch, because the day two and eight are asked for
+/// behind a feature this reads the same and means more.
+pub const MSAA: &str = "r.msaa";
+
+/// How many samples a pixel is drawn with until somebody says otherwise.
+///
+/// **On**, which is bevy's answer (`Msaa::Sample4` is its `#[default]`,
+/// `bevy_render/src/view/mod.rs:248-253`) and not Godot's or Wicked's, and it
+/// is the one that follows from what this renderer is: colby is forward, and
+/// forward is the one shading path Unreal *forces* MSAA for when you pick it
+/// (`RendererSettings.cpp:202-206`) and the only one it allows MSAA in at all
+/// (`SceneUtils.h:49`). A world of hard-edged boxes with no anti-aliasing
+/// looks unfinished, and the cost is four times the bandwidth of one pass in
+/// a renderer whose passes nobody has yet measured.
+pub const DEFAULT_MSAA: f32 = 4.0;
 
 /// One local light, as the shader reads it.
 ///
@@ -465,6 +489,14 @@ struct Pipelines {
 	/// the same struct all the same, so that a shader edit rebuilds all seven
 	/// together or none of them.
 	sky: RenderPipeline,
+
+	/// How many samples every one of them was built for.
+	///
+	/// Kept so the scene can tell whether the table it is holding still
+	/// matches the target it is about to draw into: wgpu refuses a pass whose
+	/// attachments disagree with its pipeline, and it refuses it as a
+	/// validation error rather than as a wrong picture.
+	samples: u32,
 }
 
 impl Pipelines {
@@ -483,17 +515,23 @@ impl Pipelines {
 		format: TextureFormat,
 		layouts: &[&BindGroupLayout],
 		source: &str,
+		samples: u32,
 	) -> Result<Self> {
+		let at = |blend, skinned| {
+			compile_pipeline(device, format, layouts, source, blend, skinned, samples)
+		};
+
 		Ok(Self {
 			entries: [
-				compile_pipeline(device, format, layouts, source, Blend::Opaque, false)?,
-				compile_pipeline(device, format, layouts, source, Blend::Opaque, true)?,
-				compile_pipeline(device, format, layouts, source, Blend::Mask, false)?,
-				compile_pipeline(device, format, layouts, source, Blend::Mask, true)?,
-				compile_pipeline(device, format, layouts, source, Blend::Alpha, false)?,
-				compile_pipeline(device, format, layouts, source, Blend::Alpha, true)?,
+				at(Blend::Opaque, false)?,
+				at(Blend::Opaque, true)?,
+				at(Blend::Mask, false)?,
+				at(Blend::Mask, true)?,
+				at(Blend::Alpha, false)?,
+				at(Blend::Alpha, true)?,
 			],
-			sky: compile_sky(device, format, layouts, source)?,
+			sky: compile_sky(device, format, layouts, source, samples)?,
+			samples,
 		})
 	}
 
@@ -522,6 +560,16 @@ pub struct Scene {
 	/// One per [`Wrap`], in its discriminant order.
 	samplers: [Sampler; 2],
 	shader: Shader,
+
+	/// The WGSL the table in hand was built from.
+	///
+	/// **Not `shader.source()`**, and the difference is the whole point: that
+	/// is what is on disk, and this is what is on the GPU. A caller may install
+	/// source of its own through [`set_shader`](Self::set_shader) - a test
+	/// does, and so would a material editor - and anything that rebuilds the
+	/// table for a reason of its own has to rebuild *that* rather than
+	/// quietly reverting to the file.
+	built: String,
 	/// The target's size, which the depth buffer was built for and which a
 	/// viewport is cut down to.
 	size: (u32, u32),
@@ -631,9 +679,20 @@ impl Scene {
 		// the six, the sky and the lines all draw into the float target rather
 		// than into the window: what reaches the window is the composite, and
 		// it is the only thing built for the window's own format.
-		let pipelines = Pipelines::build(&device, post::HDR_FORMAT, &groups, shader.source())?;
-		let depth = depth_view(&device, width, height);
-		let lines = Lines::new(&device, post::HDR_FORMAT, &globals_layout)?;
+		// one sample here whatever the console will say, because there is no
+		// console yet: a `Scene` is built before the world it draws exists.
+		// The first frame reads the variable and rebuilds if it has to, which
+		// is the same path a person turning it on mid-run takes. @ref
+		// `sampling`.
+		let pipelines = Pipelines::build(
+			&device,
+			post::HDR_FORMAT,
+			&groups,
+			shader.source(),
+			post::NO_SAMPLES,
+		)?;
+		let depth = depth_view(&device, post::NO_SAMPLES, width, height);
+		let lines = Lines::new(&device, post::HDR_FORMAT, &globals_layout, post::NO_SAMPLES)?;
 		let post = post::Chain::new(&device, format, width, height)?;
 
 		let instances = device.create_buffer(&BufferDescriptor {
@@ -647,6 +706,7 @@ impl Scene {
 			device,
 			queue,
 			pipelines,
+			built: shader.source().to_owned(),
 			globals,
 			bindings,
 			globals_layout,
@@ -680,8 +740,69 @@ impl Scene {
 	/// Rebuilds the depth buffer for a new target size.
 	pub fn resize(&mut self, width: u32, height: u32) {
 		self.size = (width, height);
-		self.depth = depth_view(&self.device, width, height);
+		self.depth = depth_view(&self.device, self.pipelines.samples, width, height);
 		self.post.resize(&self.device, width, height);
+	}
+
+	/// Rebuilds everything that has to agree about how many samples a pixel is.
+	///
+	/// **Three things have to agree or wgpu refuses the pass**: the color
+	/// attachment, the depth attachment, and every pipeline recorded into it.
+	/// So a change here is the target, the depth buffer and eight pipelines,
+	/// and it is all of them or none - a table half rebuilt is a validation
+	/// error on the next draw rather than a picture anybody can see is wrong.
+	///
+	/// Called at the top of every frame. It costs one console lookup and a
+	/// comparison when the answer has not moved, which is every frame but the
+	/// first and the one somebody turns it on in.
+	///
+	/// @param world - for the console variable
+	fn sampling(&mut self, world: &World) {
+		let asked = world
+			.cvars
+			.float(MSAA)
+			.map_or_else(|| samples_of(DEFAULT_MSAA), samples_of);
+
+		if asked == self.pipelines.samples {
+			return;
+		}
+
+		let groups = [
+			&self.globals_layout,
+			&self.material_layout,
+			self.shadows.sample_layout(),
+			self.joints.layout(),
+		];
+
+		match Pipelines::build(&self.device, post::HDR_FORMAT, &groups, &self.built, asked) {
+			| Ok(table) => {
+				self.pipelines = table;
+				// after the table and not before: if the lines refuse, the
+				// scene's own pipelines are already the new count and the
+				// pass would disagree with itself. This one cannot fail for a
+				// reason the table did not, which is why it is a line rather
+				// than a second arm.
+				if let Err(complaint) = self.lines.set_samples(
+					&self.device,
+					post::HDR_FORMAT,
+					&self.globals_layout,
+					asked,
+				) {
+					warn!(%complaint, "the debug lines kept the pipelines they had");
+				}
+
+				self.depth = depth_view(&self.device, asked, self.size.0, self.size.1);
+				self.post.set_samples(&self.device, asked);
+
+				info!(samples = asked, "the scene is drawn with this many samples a pixel");
+			},
+			// the source has not changed, so this is a device that will not
+			// build a multisampled pipeline at all. Said once, and the old
+			// table is kept: a picture with hard edges beats no picture.
+			| Err(complaint) => {
+				warn!(samples = asked, %complaint, "the pipelines could not be rebuilt");
+			},
+		}
 	}
 
 	/// Builds the pipelines from new shader source, keeping the ones that work
@@ -695,6 +816,7 @@ impl Scene {
 	/// @param source - the whole WGSL
 	/// @return the compiler's complaint, if it had one
 	pub fn set_shader(&mut self, source: &str) -> Result {
+		let samples = self.pipelines.samples;
 		let groups = [
 			&self.globals_layout,
 			&self.material_layout,
@@ -704,7 +826,9 @@ impl Scene {
 		// the whole table, and none of it is assigned until all of it has
 		// compiled: half a reload is a world where the crates moved and the
 		// characters did not.
-		self.pipelines = Pipelines::build(&self.device, post::HDR_FORMAT, &groups, source)?;
+		self.pipelines =
+			Pipelines::build(&self.device, post::HDR_FORMAT, &groups, source, samples)?;
+		source.clone_into(&mut self.built);
 
 		Ok(())
 	}
@@ -723,6 +847,7 @@ impl Scene {
 		seconds: f32,
 	) {
 		self.reload_shader();
+		self.sampling(world);
 		self.upload(world);
 
 		let mut encoder = self
@@ -744,10 +869,23 @@ impl Scene {
 			color_attachments: &[Some(RenderPassColorAttachment {
 				view: self.post.target(),
 				depth_slice: None,
-				resolve_target: None,
+				// at the end of this pass rather than in one of its own, which
+				// is what makes multisampling cost no pass at all: the
+				// hardware averages the samples as the attachment is stored,
+				// and everything after this reads the plain texture it wrote.
+				resolve_target: self.post.resolve_into(),
 				ops: Operations {
 					load: LoadOp::Clear(clear_color(world)),
-					store: StoreOp::Store,
+					// nothing reads the multisampled texture afterwards, so
+					// the samples themselves need not survive the pass that
+					// resolved them. On a tiled device that is the difference
+					// between four samples living in tile memory and four
+					// samples being written to main memory for nobody.
+					store: if self.post.resolve_into().is_some() {
+						StoreOp::Discard
+					} else {
+						StoreOp::Store
+					},
 				},
 			})],
 			depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
@@ -1674,7 +1812,7 @@ fn create_buffer(
 }
 
 /// Creates a depth buffer of a given size.
-fn depth_view(device: &Device, width: u32, height: u32) -> TextureView {
+fn depth_view(device: &Device, samples: u32, width: u32, height: u32) -> TextureView {
 	let texture = device.create_texture(&TextureDescriptor {
 		label: Some("depth"),
 		size: Extent3d {
@@ -1683,7 +1821,10 @@ fn depth_view(device: &Device, width: u32, height: u32) -> TextureView {
 			depth_or_array_layers: 1,
 		},
 		mip_level_count: 1,
-		sample_count: 1,
+		// and never resolved: a depth buffer is read by the pass that writes
+		// it and by nothing after it, which is why `Depth32Float` needing no
+		// `MULTISAMPLE_RESOLVE` costs nothing here.
+		sample_count: samples,
 		dimension: TextureDimension::D2,
 		format: DEPTH_FORMAT,
 		usage: TextureUsages::RENDER_ATTACHMENT,
@@ -1691,6 +1832,22 @@ fn depth_view(device: &Device, width: u32, height: u32) -> TextureView {
 	});
 
 	texture.create_view(&TextureViewDescriptor::default())
+}
+
+/// How many samples a console variable is asking for.
+///
+/// Anything above one is four, because four is the only count above one that
+/// needs no feature. A number below one, a nought, or something that is not a
+/// number at all is one sample - which is the answer that always works.
+///
+/// @param asked - what the variable holds
+#[must_use]
+fn samples_of(asked: f32) -> u32 {
+	if asked.is_finite() && asked > 1.0 {
+		post::SAMPLES
+	} else {
+		post::NO_SAMPLES
+	}
 }
 
 /// The size in bytes of `count` values of `T`, as a buffer size.
@@ -1843,6 +2000,7 @@ fn lamp_room(asked: f32) -> usize {
 /// @param source - the whole WGSL
 /// @param blend - how the fragment stage reads the albedo's alpha
 /// @param skinned - whether to build the variant that reads bones
+/// @param samples - how many samples the target it draws into has
 fn compile_pipeline(
 	device: &Device,
 	format: TextureFormat,
@@ -1850,9 +2008,10 @@ fn compile_pipeline(
 	source: &str,
 	blend: Blend,
 	skinned: bool,
+	samples: u32,
 ) -> Result<RenderPipeline> {
 	let scope = device.push_error_scope(ErrorFilter::Validation);
-	let pipeline = build_pipeline(device, format, layouts, source, blend, skinned);
+	let pipeline = build_pipeline(device, format, layouts, source, blend, skinned, samples);
 
 	match pollster::block_on(scope.pop()) {
 		| Some(complaint) => Err(err!(Graphics("{complaint}"))),
@@ -1869,9 +2028,10 @@ fn compile_sky(
 	format: TextureFormat,
 	layouts: &[&BindGroupLayout],
 	source: &str,
+	samples: u32,
 ) -> Result<RenderPipeline> {
 	let scope = device.push_error_scope(ErrorFilter::Validation);
-	let pipeline = build_sky(device, format, layouts, source);
+	let pipeline = build_sky(device, format, layouts, source, samples);
 
 	match pollster::block_on(scope.pop()) {
 		| Some(complaint) => Err(err!(Graphics("{complaint}"))),
@@ -1903,6 +2063,7 @@ fn build_sky(
 	format: TextureFormat,
 	layouts: &[&BindGroupLayout],
 	source: &str,
+	samples: u32,
 ) -> RenderPipeline {
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
 		label: Some("sky"),
@@ -1943,7 +2104,10 @@ fn build_sky(
 			stencil: StencilState::default(),
 			bias: DepthBiasState::default(),
 		}),
-		multisample: MultisampleState::default(),
+		multisample: MultisampleState {
+			count: samples,
+			..MultisampleState::default()
+		},
 		fragment: Some(FragmentState {
 			module: &shader,
 			entry_point: Some("fragment_sky"),
@@ -1990,6 +2154,7 @@ fn build_pipeline(
 	source: &str,
 	blend: Blend,
 	skinned: bool,
+	samples: u32,
 ) -> RenderPipeline {
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
 		label: Some("scene"),
@@ -2062,7 +2227,21 @@ fn build_pipeline(
 			stencil: StencilState::default(),
 			bias: DepthBiasState::default(),
 		}),
-		multisample: MultisampleState::default(),
+		multisample: MultisampleState {
+			count: samples,
+			// **and this is the whole of what anti-aliases a cutout.** A
+			// masked fragment is kept or thrown away whole, so multisampling
+			// alone leaves a leaf's edge exactly as hard as it was; alpha to
+			// coverage turns the alpha into how many of the pixel's samples
+			// survive, which is the thing every renderer with a mask mode
+			// reaches for the moment it has samples to spend. Off where there
+			// is one sample, because with one sample it is the same hard
+			// threshold with a slower path to it. @ref
+			// `colby_core::abi::Blend::Mask`, whose own note says this is what
+			// its threshold falls back from.
+			alpha_to_coverage_enabled: samples > 1 && blend == Blend::Mask,
+			..MultisampleState::default()
+		},
 		fragment: Some(FragmentState {
 			module: &shader,
 			entry_point: Some(match blend {

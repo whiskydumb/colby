@@ -339,6 +339,19 @@ fn install_render(world: &mut World) {
 		Value::Float(colby_engine::scene::DEFAULT_LAMPS),
 		"how many of the nearest point and cone lights a frame draws with",
 	);
+	// how many samples a pixel of the world is drawn with. **Saved**, unlike
+	// the two above and like `r.backend`: how much a machine can afford to
+	// spend on smooth edges is a property of the machine rather than of a
+	// session, which is what every engine that has this setting treats it as.
+	// Unlike `r.backend` it takes effect at once - the scene rebuilds the
+	// eight pipelines and the two targets that have to agree about it on the
+	// next frame - because a picture setting nobody can compare by turning it
+	// on and off is one nobody turns on.
+	world.cvars.saved(
+		colby_engine::scene::MSAA,
+		Value::Float(colby_engine::scene::DEFAULT_MSAA),
+		"how many samples a pixel is drawn with: one is off, anything more is four",
+	);
 	// which graphics APIs the window may draw with. Saved, because it is a
 	// property of the machine rather than of a session; and read once, when
 	// the device is made, so a value typed at a running window takes effect

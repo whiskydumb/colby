@@ -87,14 +87,9 @@ impl Lines {
 		device: &Device,
 		format: TextureFormat,
 		globals: &BindGroupLayout,
+		samples: u32,
 	) -> Result<Self> {
-		let scope = device.push_error_scope(ErrorFilter::Validation);
-		let behind = build_pipeline(device, format, globals, true);
-		let over = build_pipeline(device, format, globals, false);
-
-		if let Some(complaint) = pollster::block_on(scope.pop()) {
-			return Err(err!(Graphics("the debug line pipeline: {complaint}")));
-		}
+		let (behind, over) = pipelines(device, format, globals, samples)?;
 
 		Ok(Self {
 			behind,
@@ -104,6 +99,33 @@ impl Lines {
 			scratch: Vec::new(),
 			tested: 0,
 		})
+	}
+
+	/// Rebuilds the two pipelines for a target with this many samples.
+	///
+	/// The pipelines and nothing else: the vertex buffer and the scratch are
+	/// what a frame of lines costs to *allocate*, and a person turning
+	/// anti-aliasing on should not pay for them again. Kept as they were if
+	/// the device refuses the new pair, for the reason the scene keeps its own
+	/// table - a picture with hard edges beats no picture.
+	///
+	/// @param device - the device to build against
+	/// @param format - the color format the fragment stage writes
+	/// @param globals - the layout of group nought
+	/// @param samples - how many the target has
+	pub(crate) fn set_samples(
+		&mut self,
+		device: &Device,
+		format: TextureFormat,
+		globals: &BindGroupLayout,
+		samples: u32,
+	) -> Result {
+		let (behind, over) = pipelines(device, format, globals, samples)?;
+
+		self.behind = behind;
+		self.over = over;
+
+		Ok(())
 	}
 
 	/// Lays this frame's segments out and writes them to the GPU.
@@ -203,11 +225,38 @@ fn buffer(device: &Device, vertices: u64) -> Buffer {
 /// @param depth - whether the world is allowed to hide what it draws. The pass
 /// that ignores depth also does not *write* it, so a line drawn over everything
 /// does not go on to hide the one behind it.
+/// The two of them, or the first complaint wgpu had.
+///
+/// One error scope over both, because a table half built is the thing this
+/// module has no way to draw with. @ref [`Lines::set_samples`].
+///
+/// @param device - the device to build against
+/// @param format - the color format the fragment stage writes
+/// @param globals - the layout of group nought
+/// @param samples - how many the target has
+fn pipelines(
+	device: &Device,
+	format: TextureFormat,
+	globals: &BindGroupLayout,
+	samples: u32,
+) -> Result<(RenderPipeline, RenderPipeline)> {
+	let scope = device.push_error_scope(ErrorFilter::Validation);
+	let behind = build_pipeline(device, format, globals, true, samples);
+	let over = build_pipeline(device, format, globals, false, samples);
+
+	if let Some(complaint) = pollster::block_on(scope.pop()) {
+		return Err(err!(Graphics("the debug line pipeline: {complaint}")));
+	}
+
+	Ok((behind, over))
+}
+
 fn build_pipeline(
 	device: &Device,
 	format: TextureFormat,
 	globals: &BindGroupLayout,
 	depth: bool,
+	samples: u32,
 ) -> RenderPipeline {
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
 		label: Some("debug lines"),
@@ -254,7 +303,10 @@ fn build_pipeline(
 			stencil: StencilState::default(),
 			bias: DepthBiasState::default(),
 		}),
-		multisample: MultisampleState::default(),
+		multisample: MultisampleState {
+			count: samples,
+			..MultisampleState::default()
+		},
 		fragment: Some(FragmentState {
 			module: &shader,
 			entry_point: Some("fragment_main"),
