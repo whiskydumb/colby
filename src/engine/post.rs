@@ -34,7 +34,7 @@ use wgpu::{
 	PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, Queue,
 	RenderPassColorAttachment, RenderPassDescriptor, RenderPassTimestampWrites, RenderPipeline,
 	RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
-	ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TextureDescriptor,
+	ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor,
 	TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
 	TextureViewDescriptor, TextureViewDimension, VertexState,
 };
@@ -134,6 +134,12 @@ struct Tuning {
 struct Rung {
 	view: TextureView,
 	read: BindGroup,
+
+	/// The texture behind the view, kept only so that a test can copy the
+	/// eye's one texel back and read what the meter decided. @ref
+	/// [`Chain::measured`].
+	#[cfg(test)]
+	texture: Texture,
 }
 
 /// The target the world is drawn into, and everything that reads it.
@@ -178,6 +184,14 @@ pub(crate) struct Chain {
 
 	/// Which of the two holds the answer.
 	eye: usize,
+
+	/// The picture itself, behind [`target`](Self::target).
+	///
+	/// Kept only so that a test can write an exact picture into it and ask the
+	/// meter what it makes of it. @ref [`Chain::paint`], and the test that uses
+	/// it for why the property is not reachable through a rendered scene.
+	#[cfg(test)]
+	hdr: Texture,
 
 	/// Whether anything has ever been measured into it.
 	///
@@ -263,7 +277,8 @@ impl Chain {
 			one_texel(device, &eye_layout, "post eye 1"),
 		];
 		let rungs = ladder(device, &sampler, &texture_layout);
-		let (target, target_read) = colors(device, &sampler, &texture_layout, width, height);
+		let colors = colors(device, &sampler, &texture_layout, width, height);
+		let (target, target_read) = (colors.1, colors.2);
 		// none until somebody asks: a fresh surface is built before the world
 		// it will draw exists, so it cannot know what the console says yet.
 		// @ref `set_samples`, which the scene calls every frame.
@@ -281,6 +296,8 @@ impl Chain {
 			glow_read,
 			eyes,
 			eye: 0,
+			#[cfg(test)]
+			hdr: colors.0,
 			adapted: false,
 			tuning,
 			numbers,
@@ -349,10 +366,14 @@ impl Chain {
 			return;
 		}
 
-		let (target, read) = colors(device, &self.sampler, &self.texture_layout, width, height);
+		let colors = colors(device, &self.sampler, &self.texture_layout, width, height);
 
-		self.target = target;
-		self.target_read = read;
+		#[cfg(test)]
+		{
+			self.hdr = colors.0;
+		};
+		self.target = colors.1;
+		self.target_read = colors.2;
 		self.multi = multisampled(device, self.samples, width, height);
 		self.glow = chain(device, &self.sampler, &self.texture_layout, width, height);
 		self.glow_read =
@@ -509,6 +530,170 @@ impl Chain {
 		self.eye = after;
 		self.adapted = true;
 	}
+
+	/// Writes an exact grey picture into the target, for a test.
+	///
+	/// **The only way to ask the meter about a picture nobody can render.**
+	/// What the first pass does wrong is a resonance between where its taps
+	/// land and how often the content repeats, and at seven-twenty it is sharp
+	/// enough that a tenth of a pixel either side of the period hides it
+	/// entirely - so a rendered wall would have to have its projected stripe
+	/// land on five pixels exactly, through a perspective camera, a field of
+	/// view and a resolve. Painting the picture instead removes the geometry,
+	/// the camera, the samples and the curve, and leaves the pass under test.
+	///
+	/// @param queue - where the upload goes
+	/// @param levels - one luminance per pixel, row by row, as long as the
+	/// target is wide times high
+	#[cfg(test)]
+	fn paint(&self, queue: &Queue, levels: &[f32]) {
+		let (width, height) = self.size;
+		let mut bytes = Vec::with_capacity(levels.len() * 8);
+
+		// grey, so that whatever weights `luminance` uses in the shader the
+		// answer is the level itself: the three of them sum to one.
+		for level in levels {
+			let half = half_from(*level).to_le_bytes();
+
+			for _ in 0..3 {
+				bytes.extend_from_slice(&half);
+			}
+
+			bytes.extend_from_slice(&half_from(1.0).to_le_bytes());
+		}
+
+		queue.write_texture(
+			wgpu::TexelCopyTextureInfo {
+				texture: &self.hdr,
+				mip_level: 0,
+				origin: wgpu::Origin3d::ZERO,
+				aspect: wgpu::TextureAspect::All,
+			},
+			&bytes,
+			wgpu::TexelCopyBufferLayout {
+				offset: 0,
+				bytes_per_row: Some(width * 8),
+				rows_per_image: Some(height),
+			},
+			Extent3d { width, height, depth_or_array_layers: 1 },
+		);
+	}
+
+	/// What the eye holds, in stops.
+	///
+	/// The one texel is `mix(before, measured, ..)` of the *log* of the
+	/// luminance, and on a chain that has never measured anything the blend is
+	/// one - so a single frame's answer is the measurement itself and not a
+	/// step towards it. @ref `fragment_adapt`.
+	///
+	/// @param device - to build the staging buffer on
+	/// @param queue - to submit the copy and to poll
+	/// @return the mean of the log base two of the picture's luminance
+	#[cfg(test)]
+	fn measured(&self, device: &Device, queue: &Queue) -> f32 {
+		// one texel of two bytes, padded to the row alignment a texture copy
+		// insists on
+		let staging = device.create_buffer(&BufferDescriptor {
+			label: Some("post eye readback"),
+			size: 256,
+			usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+			mapped_at_creation: false,
+		});
+		let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+			label: Some("post eye readback"),
+		});
+
+		encoder.copy_texture_to_buffer(
+			wgpu::TexelCopyTextureInfo {
+				texture: &self.eyes[self.eye].texture,
+				mip_level: 0,
+				origin: wgpu::Origin3d::ZERO,
+				aspect: wgpu::TextureAspect::All,
+			},
+			wgpu::TexelCopyBufferInfo {
+				buffer: &staging,
+				layout: wgpu::TexelCopyBufferLayout {
+					offset: 0,
+					bytes_per_row: Some(256),
+					rows_per_image: Some(1),
+				},
+			},
+			Extent3d {
+				width: 1,
+				height: 1,
+				depth_or_array_layers: 1,
+			},
+		);
+		queue.submit([encoder.finish()]);
+
+		let slice = staging.slice(..);
+		slice.map_async(wgpu::MapMode::Read, |_| {});
+		device
+			.poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+			.expect("the readback completes");
+
+		let view = slice
+			.get_mapped_range()
+			.expect("the readback maps");
+		let bits = u16::from_le_bytes([view[0], view[1]]);
+
+		drop(view);
+		staging.unmap();
+
+		half_into(bits)
+	}
+}
+
+/// A float as the sixteen bits [`HDR_FORMAT`] and [`METER_FORMAT`] hold.
+///
+/// Written out because `f16` is still unstable and a dependency for twenty
+/// lines of bit arithmetic is not a trade this workspace makes. Only a test
+/// uses it, and only on values a test chose.
+#[cfg(test)]
+fn half_from(value: f32) -> u16 {
+	let bits = value.to_bits();
+	let sign = u16::try_from((bits >> 16) & 0x8000).unwrap_or(0);
+	let exponent = i32::try_from((bits >> 23) & 0xFF).unwrap_or(0) - 127;
+	let mantissa = bits & 0x007F_FFFF;
+
+	if exponent > 15 {
+		// past what a half holds, which is infinity with a full exponent
+		return sign | 0x7C00;
+	}
+
+	if exponent < -14 {
+		// subnormal, or nought
+		let shift = u32::try_from(-14 - exponent).unwrap_or(24) + 14;
+		let scaled = if shift < 32 {
+			(mantissa | 0x0080_0000) >> shift
+		} else {
+			0
+		};
+
+		return sign | u16::try_from(scaled).unwrap_or(0);
+	}
+
+	let biased = u16::try_from(exponent + 15).unwrap_or(0) << 10;
+
+	sign | biased | u16::try_from(mantissa >> 13).unwrap_or(0)
+}
+
+/// The other way: sixteen bits back into a float.
+#[cfg(test)]
+fn half_into(bits: u16) -> f32 {
+	let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+	let exponent = i32::from((bits >> 10) & 0x1F);
+	let mantissa = f32::from(bits & 0x03FF);
+
+	if exponent == 0 {
+		return sign * mantissa * 2.0_f32.powi(-24);
+	}
+
+	if exponent == 31 {
+		return sign * f32::INFINITY;
+	}
+
+	sign * (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent - 15)
 }
 
 /// The seven pipelines, all against one shader module.
@@ -713,7 +898,7 @@ fn colors(
 	layout: &BindGroupLayout,
 	width: u32,
 	height: u32,
-) -> (TextureView, BindGroup) {
+) -> (Texture, TextureView, BindGroup) {
 	let texture = device.create_texture(&TextureDescriptor {
 		label: Some("hdr"),
 		size: Extent3d {
@@ -725,13 +910,23 @@ fn colors(
 		sample_count: 1,
 		dimension: TextureDimension::D2,
 		format: HDR_FORMAT,
-		usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+		// **the copy bit is a test's and only a test's.** A picture painted
+		// from the outside is the only way to ask the meter about content
+		// nobody can render exactly, and `cfg!` is what keeps the shipping
+		// texture's usage the two flags a frame actually needs.
+		usage: TextureUsages::RENDER_ATTACHMENT
+			| TextureUsages::TEXTURE_BINDING
+			| if cfg!(test) {
+				TextureUsages::COPY_DST
+			} else {
+				TextureUsages::empty()
+			},
 		view_formats: &[],
 	});
 	let view = texture.create_view(&TextureViewDescriptor::default());
 	let read = sampled(device, sampler, layout, &view, "hdr");
 
-	(view, read)
+	(texture, view, read)
 }
 
 /// The bloom chain: half the target, halving until it is too small to be worth
@@ -769,7 +964,12 @@ fn chain(
 		let view = texture.create_view(&TextureViewDescriptor::default());
 		let read = sampled(device, sampler, layout, &view, "post glow");
 
-		rungs.push(Rung { view, read });
+		rungs.push(Rung {
+			view,
+			read,
+			#[cfg(test)]
+			texture,
+		});
 		wide /= 2;
 		tall /= 2;
 	}
@@ -826,7 +1026,12 @@ fn ladder(device: &Device, sampler: &Sampler, layout: &BindGroupLayout) -> Vec<R
 		let view = texture.create_view(&TextureViewDescriptor::default());
 		let read = sampled(device, sampler, layout, &view, "post meter");
 
-		rungs.push(Rung { view, read });
+		rungs.push(Rung {
+			view,
+			read,
+			#[cfg(test)]
+			texture,
+		});
 
 		if side <= METER_STEP {
 			return rungs;
@@ -849,7 +1054,15 @@ fn one_texel(device: &Device, layout: &BindGroupLayout, label: &str) -> Rung {
 		sample_count: 1,
 		dimension: TextureDimension::D2,
 		format: METER_FORMAT,
-		usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+		// as `colors`: the copy bit is a test's, so that the one texel the eye
+		// holds can be read back and compared with arithmetic.
+		usage: TextureUsages::RENDER_ATTACHMENT
+			| TextureUsages::TEXTURE_BINDING
+			| if cfg!(test) {
+				TextureUsages::COPY_SRC
+			} else {
+				TextureUsages::empty()
+			},
 		view_formats: &[],
 	});
 	let view = texture.create_view(&TextureViewDescriptor::default());
@@ -864,7 +1077,12 @@ fn one_texel(device: &Device, layout: &BindGroupLayout, label: &str) -> Rung {
 		}],
 	});
 
-	Rung { view, read }
+	Rung {
+		view,
+		read,
+		#[cfg(test)]
+		texture,
+	}
 }
 
 /// A texture and the sampler beside it.
@@ -1071,6 +1289,194 @@ mod tests {
 		side
 	}
 
+	/// How far the meter may be from the truth, in stops.
+	///
+	/// **This number is the debt.** `PERF-8` said the meter's accuracy had no
+	/// test and that one had been tried and thrown away. This is the test, and
+	/// nine tenths of a stop is what the meter as it stands earns: measured
+	/// against pictures whose average is arithmetic rather than sampled, the
+	/// worst of the eight below is **0.83 stops** out - a factor of one and
+	/// three quarters, on stripes two pixels wide.
+	///
+	/// It is a poor guard and it is an honest one. Every tap of the first pass
+	/// is read wherever the jitter put it, so it comes back through the linear
+	/// sampler as a blend of two texels, and the log of a blend of two
+	/// brightnesses is above the blend of their logs. Sixteen taps on a regular
+	/// grid had the opposite failing and a worse one: exact almost everywhere,
+	/// and **1.6 stops** out where the content resonated with them.
+	const LIMIT: f64 = 0.9;
+
+	/// The picture the meter is asked about, which is the size a frame is.
+	///
+	/// **Seven-twenty and not the 320 by 240 the pixel tests use**, because the
+	/// thing being measured is a resonance between how far apart the first
+	/// pass puts its taps and how often the content repeats, and both scale
+	/// with the picture. One texel of a sixty-four square meter covers twenty
+	/// pixels of this, and the taps of a regular grid would sit five apart at
+	/// pixels 2, 7, 12 and 17 of every one - so a stripe repeating every five
+	/// pixels lands all four on the same phase, and the meter reads the wall
+	/// **1.6 stops too dark**, measured. At 320 by 240 the same taps sit one
+	/// and a quarter pixels apart and no stripe anybody can draw beats with
+	/// them, which is why the test that was thrown away saw nothing.
+	const WIDTH: usize = 1280;
+
+	/// And its height.
+	const HEIGHT: usize = 720;
+
+	/// A device, a chain at the size a frame is, and somewhere to composite to.
+	///
+	/// `None` where the machine has no adapter, which is how every rendered
+	/// test in this workspace skips rather than fails.
+	fn metering() -> Option<(crate::Gpu, Chain, TextureView)> {
+		let gpu = match crate::Gpu::open(crate::gpu::backends(None), None) {
+			| Ok(Some(gpu)) => gpu,
+			| Ok(None) => return None,
+			| Err(error) => panic!("opening the device failed: {error}"),
+		};
+		let format = TextureFormat::Rgba8UnormSrgb;
+		let width = u32::try_from(WIDTH).unwrap_or(1280);
+		let height = u32::try_from(HEIGHT).unwrap_or(720);
+		let chain = Chain::new(gpu.device(), format, width, height).expect("the chain builds");
+		let out = gpu
+			.device()
+			.create_texture(&TextureDescriptor {
+				label: Some("post test target"),
+				size: Extent3d { width, height, depth_or_array_layers: 1 },
+				mip_level_count: 1,
+				sample_count: 1,
+				dimension: TextureDimension::D2,
+				format,
+				usage: TextureUsages::RENDER_ATTACHMENT,
+				view_formats: &[],
+			})
+			.create_view(&TextureViewDescriptor::default());
+
+		Some((gpu, chain, out))
+	}
+
+	/// Vertical stripes of two luminances, half and half, at a pixel period.
+	///
+	/// A period of nought is a flat picture of the first level, which is the
+	/// control: a meter that cannot read a wall of one brightness is broken in
+	/// a way no sampling argument explains.
+	fn striped(period: usize, bright: f32, dim: f32) -> Vec<f32> {
+		let lit = |x: usize| period == 0 || x % period < period / 2;
+		let row: Vec<f32> = (0..WIDTH)
+			.map(|x| if lit(x) { bright } else { dim })
+			.collect();
+		let mut levels = Vec::with_capacity(WIDTH * HEIGHT);
+
+		for _ in 0..HEIGHT {
+			levels.extend_from_slice(&row);
+		}
+
+		levels
+	}
+
+	/// The mean of the log of every pixel: what the meter is trying to find.
+	///
+	/// Arithmetic over the whole picture rather than a second sampling of it,
+	/// which is the half `PERF-5` could not have: its ground truth was the same
+	/// pass at a bigger meter, so it shared whatever the pass itself got wrong.
+	fn truth(levels: &[f32]) -> f64 {
+		let total: f64 = levels
+			.iter()
+			.map(|level| f64::from(level.max(colby_core::abi::post::DARKEST).log2()))
+			.sum();
+		let count = f64::from(u32::try_from(levels.len()).unwrap_or(1));
+
+		total / count
+	}
+
+	/// How many frames a picture is metered for before the eye is read.
+	///
+	/// **One would do on a fresh chain and does not on a used one**, which is
+	/// the trap in driving this from a test: the first frame blends the whole
+	/// way because nothing has been measured yet, and every frame after that
+	/// blends by the rate - eighty-six percent of the way at this step - so a
+	/// second picture metered on the same chain is thirteen percent of the
+	/// first one. Eight frames leave a ten-millionth of it. @ref
+	/// `fragment_adapt` and [`Post::adapt`].
+	const FRAMES: usize = 8;
+
+	/// Paints a picture, meters it until the eye has settled, and reads it.
+	fn eye_on(gpu: &crate::Gpu, chain: &mut Chain, out: &TextureView, levels: &[f32]) -> f32 {
+		chain.paint(gpu.queue(), levels);
+
+		for _ in 0..FRAMES {
+			let mut encoder =
+				gpu.device()
+					.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+						label: Some("post test meter"),
+					});
+
+			chain.resolve(&mut encoder, gpu.queue(), Post::DEFAULT, 1.0, out, &Timings::new(0.0));
+			gpu.queue().submit([encoder.finish()]);
+		}
+
+		chain.measured(gpu.device(), gpu.queue())
+	}
+
+	#[test]
+	fn the_meter_reads_a_picture_within_a_known_number_of_stops_of_the_truth() {
+		// **the test `PERF-8` said could not be built, and why it can be.** The
+		// one that was thrown away drew a striped wall through the camera and
+		// saw nothing, because the failure is a resonance a tenth of a pixel
+		// wide and a wall in perspective has a projected period that is some
+		// real number nobody solved for. So no wall: the picture is painted
+		// into the target the scene would have drawn into, and every pixel of
+		// it is a number this test chose. No camera, no field of view, no
+		// samples a pixel and no curve - the pass under test and nothing else.
+		//
+		// Flat is the control: nothing about where a tap lands can matter when
+		// every pixel is the same. **Five is the resonant period** at this
+		// size - a sixty-four square meter over 1280 makes one texel twenty
+		// pixels and four regular taps five apart, so every tap lands on the
+		// same stripe. Two is the worst case for a tap read through the linear
+		// sampler, which is what the jitter costs; eight is the worst of what
+		// is left once that is cured. Three, seven and twenty are ordinary.
+		let Some((gpu, mut chain, out)) = metering() else {
+			eprintln!("no GPU adapter; skipping the meter test");
+
+			return;
+		};
+
+		for period in [0, 2, 3, 4, 5, 7, 8, 20] {
+			let levels = striped(period, 4.0, 0.25);
+			let want = truth(&levels);
+			let got = f64::from(eye_on(&gpu, &mut chain, &out, &levels));
+			let off = (got - want).abs();
+
+			assert!(
+				off <= LIMIT,
+				"stripes every {period} pixels metered {got} where the picture is {want}, 				 \
+				 which is {off} stops out and the limit is {LIMIT}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_flat_picture_is_metered_exactly_whatever_it_is_worth() {
+		// the control on its own, tighter than the rest by a long way: nothing
+		// about where a tap lands can matter when every pixel is the same, so
+		// what is left is the half floats and the reductions. A failure here is
+		// the apparatus and not the sampling.
+		let Some((gpu, mut chain, out)) = metering() else {
+			return;
+		};
+
+		for level in [0.25_f32, 1.0, 4.0] {
+			let levels = striped(0, level, level);
+			let got = eye_on(&gpu, &mut chain, &out, &levels);
+
+			assert!(
+				(f64::from(got) - f64::from(level.log2())).abs() < 0.01,
+				"a flat picture at {level} metered {got} and should be {}",
+				level.log2()
+			);
+		}
+	}
+
 	#[test]
 	fn the_bottom_rung_is_exactly_the_step_so_the_eye_reduces_it_without_guessing() {
 		// the whole of why the eye needs no pass of its own: it reads the last
@@ -1140,14 +1546,15 @@ mod tests {
 		// opposite case - each is exact for a step of eight - and must stay on
 		// their grid.
 		//
-		// **A weak guard, and it is worth saying why it is the one here.** The
-		// difference is a property of a *picture*, and a rendered test could
-		// not be made to show it: at seven-twenty a striped wall and a flat one
-		// of the same average read alike through one tap, through sixteen
-		// regular taps, through four scattered ones and through the original
-		// bug. What did show it was a live sweep against a five-hundred-and-
-		// twelve square meter, which is not a thing a test can stand up. So
-		// this pins the mechanism rather than the property.
+		// **It pins the mechanism, and the property is pinned next door now.**
+		// This note used to say a rendered test could not be made to show the
+		// difference; that was true of a test that drew a *wall*, because the
+		// failure is a resonance a tenth of a pixel wide and a wall in
+		// perspective has no exact period. Painting the picture instead of
+		// rendering it settles it - @ref
+		// [`the_meter_reads_a_picture_within_a_known_number_of_stops_of_the_truth`].
+		// This one earns its lines by running where there is no adapter at all,
+		// which is where the other silently skips.
 		let source = include_str!("post.wgsl");
 		let luminance = source
 			.split("fn fragment_luminance(")
