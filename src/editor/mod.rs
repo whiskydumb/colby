@@ -210,6 +210,16 @@ pub(crate) enum Change {
 		which: usize,
 	},
 
+	/// Show an asset in the inspector, by the name it registers under.
+	///
+	/// A name rather than a handle, because the browser that asks is a view of
+	/// a *directory* and holds no world: what it knows about a row is what the
+	/// file is called. @ref `Panels::inspect`.
+	Inspect {
+		/// The asset name, `materials/brass`.
+		name: String,
+	},
+
 	/// Put a body of water in the middle of what is being looked at.
 	///
 	/// No asset behind it and so not a [`Drop`](Self::Drop): a fluid is
@@ -744,6 +754,7 @@ impl Panels {
 			| Change::Open { name } => self.reach(world, &name),
 			| Change::Show { which } => self.restore = self.tabs.switch(world, which),
 			| Change::Shut { which } => self.restore = self.tabs.close(which),
+			| Change::Inspect { name } => self.inspect(world, &name),
 			| Change::Water => self.water(world),
 			| Change::Drop { name, kind, at } => self.drop(world, &name, kind, at),
 		}
@@ -822,6 +833,28 @@ impl Panels {
 		self.selection.clear();
 
 		info!(name, tabs = self.tabs.len(), "opened");
+	}
+
+	/// Selects an asset so the inspector shows it.
+	///
+	/// Only a material today, which is the only asset with a field table and
+	/// therefore the only one an inspector could draw. A name nothing answers
+	/// to selects nothing, which is what a browser row for a file the engine
+	/// has not loaded yet would ask for.
+	///
+	/// @param world - the registries to look the name up in, read only: what a
+	/// selection points at is not a change to the world
+	/// @param name - the asset name
+	fn inspect(&mut self, world: &World, name: &str) {
+		let found = world.materials.find(name);
+
+		if !found.is_some() {
+			debug!(name, "nothing in the world answers to that asset");
+
+			return;
+		}
+
+		self.selection.set(world, Pick::Material(found));
 	}
 
 	fn water(&mut self, world: &mut World) {

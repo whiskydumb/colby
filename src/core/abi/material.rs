@@ -522,6 +522,20 @@ impl Materials {
 		self.entries.entry(id.index())
 	}
 
+	/// What one is called, or the empty string for a handle nothing answers
+	/// to.
+	///
+	/// The question a panel asks: a material is picked by name in a browser
+	/// and shown by handle in an inspector, and this is what closes the loop.
+	///
+	/// @param id - which material
+	#[must_use]
+	pub fn name(&self, id: MaterialId) -> &str {
+		self.entries
+			.entry(id.index())
+			.map_or("", Entry::name)
+	}
+
 	/// How many materials there are, counting the null one.
 	#[must_use]
 	pub fn len(&self) -> usize { self.entries.len() }

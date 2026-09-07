@@ -39,7 +39,7 @@ use std::{
 
 #[cfg(test)]
 use colby_asset::AlignedBytes;
-use colby_asset::{Project, level, scene as file};
+use colby_asset::{Project, level, material, scene as file};
 use colby_core::{
 	Result,
 	abi::{Asked, World, scene},
@@ -81,8 +81,16 @@ pub(crate) const WRITE: &str = "scene.write";
 /// [`Request::Prop`].
 pub(crate) const PROP: &str = "scene.prop";
 
-/// The four names this module answers for, as they wait on the world.
-const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP];
+/// `material.write <name>` - writes one registered material back as a source.
+///
+/// **The odd one out beside [`PROP`]**, and for the same reason: it is about
+/// something in a registry rather than about the world. What makes it this
+/// module's is the only thing all five share - a name, and a file to put under
+/// it.
+pub(crate) const MATERIAL: &str = "material.write";
+
+/// The five names this module answers for, as they wait on the world.
+const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP, MATERIAL];
 
 /// One thing to do with a scene.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +112,14 @@ pub(crate) enum Request {
 	/// because what is under somebody's crosshair is the game's business and
 	/// lives in its arena. What the two share is a name.
 	Prop(String),
+
+	/// Write one *registered material* back as the source it came from.
+	///
+	/// A material is the one asset the editor can change in place: the
+	/// inspector writes the registry, and this is what puts the registry back
+	/// on disk. The name is the asset's own, `materials/brass`, so where it
+	/// goes is decided by what it is called and nothing has to be asked.
+	Material(String),
 }
 
 impl Request {
@@ -119,6 +135,7 @@ impl Request {
 			| LOAD => Some(Self::Load(name)),
 			| WRITE => Some(Self::Write(name)),
 			| PROP => Some(Self::Prop(name)),
+			| MATERIAL => Some(Self::Material(name)),
 			| _ => None,
 		}
 	}
@@ -151,6 +168,7 @@ pub(crate) fn serve(world: &mut World, simulation: &mut Simulation, project: &Pr
 		| Request::Load(name) => load(world, simulation, project, name),
 		| Request::Write(name) => write(world, project, name),
 		| Request::Prop(name) => prop(world, project, name),
+		| Request::Material(name) => material(world, project, name),
 	};
 
 	if let Err(failure) = outcome {
@@ -362,6 +380,111 @@ fn source(assets: &Path, name: &str) -> Result<PathBuf> {
 		.with_extension(level::EXTENSION))
 }
 
+/// Writes one registered material back as the `.material` it came from.
+///
+/// **The asset's own name is the path**, which is what makes this need nothing
+/// asked: `materials/brass` is `assets/materials/brass.material`, and a
+/// material that came out of a model - `models/lamp/brass` - would land under
+/// `assets/models/`, where the compiler would then find a source beside a
+/// model that also declares it. So one that is not under `materials/` is
+/// refused rather than written somewhere surprising.
+///
+/// @param world - the registry to take it from
+/// @param project - whose asset tree
+/// @param name - the asset name
+///
+/// # Errors
+///
+/// If nothing answers to the name, if the name is not a material source's, or
+/// if the file cannot be written.
+fn material(world: &World, project: &Project, name: &str) -> Result {
+	// through the handle rather than straight to `get`, because a registry's
+	// null entry answers every handle it does not have: `find` on a name
+	// nobody registered is `NONE`, and `NONE` reads back as the default
+	// material rather than as nothing.
+	let found = world.materials.find(name);
+	let Some(held) = found
+		.is_some()
+		.then(|| world.materials.get(found))
+		.flatten()
+		.copied()
+	else {
+		return Err(err!(Asset("nothing in this world is called {name}")));
+	};
+
+	// the prefix is stripped and the rest checked as a plain name: a material
+	// out of a model is called `models/lamp/brass`, and writing that under
+	// `assets/models/` would put a source beside a model that also declares
+	// it - two producers of one asset, quietly.
+	let Some(stem) = name.strip_prefix(MATERIALS) else {
+		return Err(err!(Asset(
+			"{name} is not under {MATERIALS}; a material a model declared is written by \
+			 rebuilding the model"
+		)));
+	};
+
+	let path = project
+		.assets()
+		.join(MATERIALS.trim_end_matches('/'))
+		.join(plain(stem)?)
+		.with_extension(material::SOURCE_EXTENSION);
+	let described = colby_asset::model::Material {
+		name: name.to_owned(),
+		albedo: pictured(world, held.albedo),
+		normal: pictured(world, held.normal),
+		base_color: held.base_color,
+		metallic: held.metallic,
+		roughness: held.roughness,
+		wrap: held.wrap,
+		blend: held.blend,
+		opacity: held.opacity,
+		uv_scale: held.uv_scale,
+	};
+	let text = material::export(&described)?;
+
+	if let Some(directory) = path.parent() {
+		fs::create_dir_all(directory)?;
+	}
+
+	fs::write(&path, text.as_bytes())?;
+	info!(path = %path.display(), name, "material written as a source");
+
+	Ok(())
+}
+
+/// What to write down for one of a material's two pictures.
+///
+/// **The built-in stand-in is written as nothing**, and that is the whole
+/// point of this being a function rather than a lookup: a material with no
+/// normal map holds [`TextureId::FLAT_NORMAL`], because the ABI rewrites
+/// `NONE` into it so that the shader needs no branch - so a live record never
+/// says "no normal map", it says the name of a texture nobody put in the
+/// tree. Writing that back put `"normal": "flat_normal"` into a file somebody
+/// had written by hand and left empty, which is how this was found.
+///
+/// @param world - the registry to name the handle in
+/// @param id - the handle
+/// @return its asset name, or empty for none and for the stand-in
+fn pictured(world: &World, id: colby_core::abi::TextureId) -> String {
+	use colby_core::abi::TextureId;
+
+	if !id.is_some() || id == TextureId::FLAT_NORMAL {
+		return String::new();
+	}
+
+	world
+		.textures
+		.get(id)
+		.map_or_else(String::new, |entry| entry.name().to_owned())
+}
+
+/// The directory a material somebody wrote lives in, under the source tree.
+///
+/// Not a choice: the compiler names an asset by its own path, so a file at
+/// `assets/materials/brass.material` is `materials/brass` and there is nowhere
+/// else it could be while keeping that name.
+pub(crate) const MATERIALS: &str = "materials/";
+
 /// Where a save by that name is.
 ///
 /// @param saves - the directory saves live in
@@ -461,6 +584,87 @@ mod tests {
 			.spawn(Body::dynamic(Shape::UNIT, Transform::at(Vec3::Y), 2.0).driving(entity));
 
 		(world, simulation)
+	}
+
+	#[test]
+	fn a_material_is_written_back_as_the_source_it_came_from() {
+		let root = project("materials");
+		let mut world = World::new();
+		let brass = colby_core::abi::Material {
+			base_color: Vec3::new(0.85, 0.62, 0.22),
+			metallic: 1.0,
+			roughness: 0.2,
+			..colby_core::abi::Material::DEFAULT
+		};
+		world.materials.insert("materials/brass", brass);
+
+		material(&world, &root, "materials/brass").expect("it writes");
+
+		let path = root
+			.assets()
+			.join("materials")
+			.join("brass.material");
+		let text = fs::read_to_string(&path).expect("the file is there");
+		let read = material::import(&text).expect("and reads back");
+
+		assert_eq!(read.base_color, brass.base_color, "the color survives the round trip");
+		assert!((read.metallic - 1.0).abs() < 1.0e-6, "and the metal");
+		assert!((read.roughness - 0.2).abs() < 1.0e-6, "and the roughness");
+	}
+
+	#[test]
+	fn a_material_with_no_normal_map_writes_no_normal_map() {
+		// the ABI rewrites `NONE` into `flat_normal` so the shader needs no
+		// branch, and a writer that took the live record at its word put the
+		// stand-in's name into a file somebody had left empty.
+		let root = project("flat_normals");
+		let mut world = World::new();
+		world
+			.materials
+			.insert("materials/plain", colby_core::abi::Material::DEFAULT);
+
+		material(&world, &root, "materials/plain").expect("it writes");
+
+		let text = fs::read_to_string(
+			root.assets()
+				.join("materials")
+				.join("plain.material"),
+		)
+		.expect("the file is there");
+
+		assert!(!text.contains("flat_normal"), "no stand-in is named: {text}");
+		assert!(!text.contains("normal"), "and no normal map row at all: {text}");
+	}
+
+	#[test]
+	fn a_material_a_model_declared_is_not_written_over_the_model() {
+		// `models/lamp/brass` would land under `assets/models/`, where the
+		// compiler would then find a source beside a model that declares the
+		// same name - two producers of one asset, quietly.
+		let root = project("model_materials");
+		let mut world = World::new();
+		world
+			.materials
+			.insert("models/lamp/brass", colby_core::abi::Material::DEFAULT);
+
+		let refused =
+			material(&world, &root, "models/lamp/brass").expect_err("it is not a source's name");
+
+		assert!(
+			format!("{refused}").contains("materials/"),
+			"and the message says where one lives: {refused}"
+		);
+	}
+
+	#[test]
+	fn a_material_nobody_registered_is_refused_by_name() {
+		let refused = material(&World::new(), &project("missing_material"), "materials/nowhere")
+			.expect_err("nothing answers to it");
+
+		assert!(
+			format!("{refused}").contains("materials/nowhere"),
+			"and the message says which: {refused}"
+		);
 	}
 
 	#[test]

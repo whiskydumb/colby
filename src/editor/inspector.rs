@@ -20,8 +20,8 @@
 
 use colby_core::{
 	abi::{
-		Body, BodyId, EntityId, Field, Joint, JointId, Light, Post, Renderable, Sky, Transform,
-		World,
+		Body, BodyId, EntityId, Field, Joint, JointId, Light, Material, MaterialId, Post,
+		Renderable, Sky, TextureId, Transform, World,
 		field::{Kind, Value},
 		scene::{self, Stage},
 	},
@@ -101,6 +101,7 @@ fn detail(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History, ren
 			naming(ui, world, pick, history, rename);
 			tie(ui, world, id, history);
 		},
+		| Pick::Material(id) => coat(ui, world, id),
 	}
 
 	ui.separator();
@@ -276,6 +277,118 @@ fn tie(ui: &mut Ui, world: &mut World, id: JointId, history: &mut History) {
 			*held = joint;
 		}
 	}
+}
+
+/// A material: its two pictures by name, then everything else by table.
+///
+/// **No history.** Undo here is a snapshot of the *world*, and a material is a
+/// file the world happens to have loaded - a step back that put the old
+/// numbers into the registry and left the file holding the new ones would be
+/// a world disagreeing with its own assets. What takes an edit back is the
+/// same thing that takes any file edit back, and the button below is what puts
+/// one on disk in the first place.
+///
+/// @param ui - where to draw
+/// @param world - the registry to read and write
+/// @param id - which material
+fn coat(ui: &mut Ui, world: &mut World, id: MaterialId) {
+	let Some(mut material) = world.materials.get(id).copied() else {
+		return;
+	};
+	let name = world.materials.name(id).to_owned();
+
+	ui.monospace(&name);
+	ui.separator();
+
+	let mut edited = false;
+	let mut albedo = world
+		.textures
+		.get(material.albedo)
+		.map_or_else(String::new, |entry| entry.name().to_owned());
+	let mut normal = world
+		.textures
+		.get(material.normal)
+		.map_or_else(String::new, |entry| entry.name().to_owned());
+
+	Grid::new("pictures")
+		.num_columns(2)
+		.show(ui, |ui| {
+			ui.label("albedo").on_hover_text(PICTURE);
+			edited |= named(ui, world, &mut albedo, &mut material.albedo);
+			ui.end_row();
+
+			ui.label("normal").on_hover_text(PICTURE);
+			edited |= named(ui, world, &mut normal, &mut material.normal);
+			ui.end_row();
+		});
+
+	edited |= inspect(ui, "material", &mut material, Material::FIELDS);
+
+	if edited && let Some(held) = world.materials.get_mut(id) {
+		*held = material;
+	}
+
+	ui.separator();
+
+	// through the console, because writing a file is the runner's business and
+	// a console line is the one way across that already exists. The same
+	// bargain the bar's `scene.write` takes. @ref `colby_runtime::saves`.
+	if ui
+		.button("write to assets/")
+		.on_hover_text("puts these numbers back in the .material this came from")
+		.clicked()
+		&& !name.is_empty()
+	{
+		colby_core::abi::console::run(world, &format!("material.write {name}"));
+	}
+}
+
+/// What both picture rows say when hovered.
+const PICTURE: &str = "the asset name of a compiled texture, or empty for none";
+
+/// One texture named by hand, because a handle has no spelling.
+///
+/// The row is a field of text and the handle follows it: a name the registry
+/// answers to is taken, and one it does not is left in the field for the
+/// person to finish typing. **Not refused and not cleared** - a half-typed
+/// name is not an error, and clearing the handle on every keystroke would
+/// take the picture off the ball while somebody spells its name.
+///
+/// @param ui - where to draw
+/// @param world - the registry to look a name up in
+/// @param typed - the text field's contents, kept across frames by the caller
+/// @param handle - the material's own field, written when the name resolves
+/// @return whether the handle moved
+fn named(ui: &mut Ui, world: &World, typed: &mut String, handle: &mut TextureId) -> bool {
+	ui.text_edit_singleline(typed).changed() && resolve(world, typed, handle)
+}
+
+/// The rule behind that row, with no widget in it.
+///
+/// Empty clears the handle; a name the registry answers to takes it; anything
+/// else leaves both alone, which is what a name somebody is halfway through
+/// typing is.
+///
+/// @param world - the registry to look a name up in
+/// @param typed - what is in the field
+/// @param handle - the material's own field, written when the name resolves
+/// @return whether the handle moved
+fn resolve(world: &World, typed: &str, handle: &mut TextureId) -> bool {
+	if typed.trim().is_empty() {
+		let moved = handle.is_some();
+		*handle = TextureId::NONE;
+
+		return moved;
+	}
+
+	let found = world.textures.find(typed.trim());
+	if !found.is_some() || found == *handle {
+		return false;
+	}
+
+	*handle = found;
+
+	true
 }
 
 /// One inspector over any record with a table: a row per plain field, and a
@@ -463,7 +576,7 @@ fn words(ui: &mut Ui, salt: &str, kind: Kind, held: &mut u32) {
 #[cfg(test)]
 mod tests {
 	use colby_core::abi::{MeshId, Shape};
-	use egui::{Context, RawInput};
+	use egui::{Context, Pos2, RawInput, Rect, vec2};
 
 	use super::*;
 
@@ -489,6 +602,63 @@ mod tests {
 		assert_eq!(edited, *record, "nothing was touched, so nothing may have moved");
 
 		written
+	}
+
+	/// A world holding one material under a name, and its handle.
+	fn coated() -> (World, MaterialId) {
+		let mut world = World::new();
+		let id = world
+			.materials
+			.insert("materials/brass", Material {
+				base_color: Vec3::new(0.85, 0.62, 0.22),
+				metallic: 1.0,
+				..Material::DEFAULT
+			});
+
+		(world, id)
+	}
+
+	#[test]
+	fn a_material_is_drawn_from_its_own_table_and_left_as_it_was() {
+		let (mut world, id) = coated();
+		let context = Context::default();
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320.0, 600.0))),
+				..Default::default()
+			},
+			|ui| coat(ui, &mut world, id),
+		);
+		output.textures_delta.clear();
+
+		assert_eq!(
+			world.materials.get(id).map(|held| held.metallic),
+			Some(1.0),
+			"a frame nobody touched leaves the registry as it was"
+		);
+	}
+
+	#[test]
+	fn a_picture_named_is_taken_and_a_half_typed_one_is_left_alone() {
+		// the rule, without the widget: a name somebody is halfway through
+		// typing is not an error and must not take the picture off the ball.
+		let (mut world, _) = coated();
+		world
+			.textures
+			.insert("textures/brass", colby_core::abi::TextureData::white());
+
+		let mut handle = TextureId::NONE;
+
+		assert!(!resolve(&world, "textures/bra", &mut handle), "a half-typed name is nothing");
+		assert!(!handle.is_some(), "and the handle is left where it was");
+		assert!(resolve(&world, "textures/brass", &mut handle), "a whole one is taken");
+		assert!(handle.is_some(), "and the handle is what it resolved to");
+		assert!(
+			!resolve(&world, "textures/brass", &mut handle),
+			"the same name again is no move"
+		);
+		assert!(resolve(&world, "  ", &mut handle), "and nothing at all clears it");
+		assert!(!handle.is_some(), "which is how a picture is taken off");
 	}
 
 	#[test]

@@ -638,6 +638,11 @@ fn install_scenes(world: &mut World) {
 		console::defer,
 		"write the scene registered as props/<name> into assets/props/<name>.scene",
 	);
+	world.cvars.command(
+		crate::saves::MATERIAL,
+		console::defer,
+		"write the material registered as materials/<name> back into assets/",
+	);
 }
 
 /// Runs one line as this machine, pointing where this screen points.

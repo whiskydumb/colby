@@ -22,8 +22,8 @@
 use colby_asset::compile::Kind;
 use colby_core::{
 	abi::{
-		Body, BodyId, BodyKind, EntityId, JointId, MeshId, Renderable, Shape, Transform, Water,
-		World, material, scene,
+		Body, BodyId, BodyKind, EntityId, JointId, MaterialId, MeshId, Renderable, Shape,
+		Transform, Water, World, material, scene,
 	},
 	glam::Vec3,
 };
@@ -43,6 +43,22 @@ pub(crate) enum Pick {
 
 	/// A joint.
 	Joint(JointId),
+
+	/// A material, which is an *asset* rather than a thing standing anywhere.
+	///
+	/// The one member of this enumeration that is not in the world in the
+	/// sense the others are: a material is a row in a registry that a file
+	/// filled, and what selects one is a click in the asset browser rather
+	/// than a click in the picture. It is here all the same, because what
+	/// follows from being selected - the inspector shows you its fields, and
+	/// the field table draws them - is the same thing, and a second mechanism
+	/// beside [`Selection`] would be a second mechanism for one word.
+	///
+	/// **A [`MaterialId`] is not generational**, so this never stops
+	/// resolving the way the three above do; what saves it is the name kept
+	/// beside it in [`Selection`], which is re-read every frame and is what a
+	/// registry rebuilt by a reload would have moved.
+	Material(MaterialId),
 }
 
 impl Pick {
@@ -53,6 +69,11 @@ impl Pick {
 			| Self::Entity(id) => world.entities.alive(id),
 			| Self::Body(id) => world.bodies.alive(id),
 			| Self::Joint(id) => world.joints.alive(id),
+			// a registry hands out no slot it does not hold, and never takes
+			// one back: what a reload does to a material is replace what is
+			// in the slot, which is a different question and the one the name
+			// beside it in `Selection` answers.
+			| Self::Material(id) => world.materials.get(id).is_some(),
 		}
 	}
 
@@ -63,6 +84,7 @@ impl Pick {
 			| Self::Entity(id) => world.entities.name(id),
 			| Self::Body(id) => world.bodies.name(id),
 			| Self::Joint(id) => world.joints.name(id),
+			| Self::Material(id) => world.materials.name(id),
 		}
 	}
 }
@@ -211,6 +233,12 @@ fn again(world: &World, was: Pick, name: &str) -> Pick {
 			.map(|(id, _)| id)
 			.find(|&id| world.bodies.name(id) == name)
 			.map_or(Pick::Nothing, Pick::Body),
+		// a registry's slot for a name is the answer, and a material's is
+		// the only one of the four that a lookup can give directly.
+		| Pick::Material(_) => match world.materials.find(name) {
+			| found if found.is_some() => Pick::Material(found),
+			| _ => Pick::Nothing,
+		},
 		| Pick::Joint(_) => world
 			.joints
 			.iter()
@@ -234,7 +262,9 @@ pub(crate) fn transform(world: &World, at: Pick) -> Option<Transform> {
 	match at {
 		| Pick::Entity(id) => world.entities.placed(id),
 		| Pick::Body(id) => world.bodies.get(id).map(|body| body.transform),
-		| Pick::Nothing | Pick::Joint(_) => None,
+		// a material does not stand anywhere, which is the one thing that
+		// separates it from the three above.
+		| Pick::Nothing | Pick::Joint(_) | Pick::Material(_) => None,
 	}
 }
 
@@ -271,7 +301,7 @@ pub(crate) fn place(world: &mut World, at: Pick, transform: Transform) -> bool {
 			true
 		},
 		| Pick::Body(id) => world.teleport_body(id, transform),
-		| Pick::Nothing | Pick::Joint(_) => false,
+		| Pick::Nothing | Pick::Joint(_) | Pick::Material(_) => false,
 	}
 }
 
@@ -322,7 +352,9 @@ pub(crate) fn rename(world: &mut World, at: Pick, name: &str) -> bool {
 		| Pick::Entity(id) => world.entities.set_name(id, name),
 		| Pick::Body(id) => world.bodies.set_name(id, name),
 		| Pick::Joint(id) => world.joints.set_name(id, name),
-		| Pick::Nothing => false,
+		// a material is called what its *file* is called, and renaming a file
+		// is not something a panel does behind somebody's back.
+		| Pick::Nothing | Pick::Material(_) => false,
 	}
 }
 
@@ -655,7 +687,9 @@ pub(crate) fn duplicate(world: &mut World, picks: &[Pick]) -> Vec<Pick> {
 			| Pick::Entity(id) => became(&copies, id).map(Pick::Entity),
 			| Pick::Body(id) => became(&body_copies, id).map(Pick::Body),
 			| Pick::Joint(id) => became(&joint_copies, id).map(Pick::Joint),
-			| Pick::Nothing => None,
+			// duplicating a material would be duplicating a *file*, which is
+			// the browser's business and not a selection's.
+			| Pick::Nothing | Pick::Material(_) => None,
 		})
 		.collect()
 }

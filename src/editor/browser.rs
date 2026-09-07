@@ -187,6 +187,13 @@ fn row(ui: &mut Ui, entry: &Entry, thumb: Option<egui::TextureId>, changes: &mut
 			changes.push(Change::Open { name: entry.name.clone() });
 		}
 
+		// and a material is the one kind there is something to *edit*: it has
+		// a field table, so the inspector can draw it, and it is the only
+		// asset that does.
+		if entry.kind == Kind::Material && response.clicked() {
+			changes.push(Change::Inspect { name: entry.name.clone() });
+		}
+
 		if entry.state != State::Compiled {
 			ui.label(RichText::new(entry.state.word()).weak());
 		}
