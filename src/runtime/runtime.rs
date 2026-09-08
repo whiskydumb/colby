@@ -45,6 +45,7 @@ use crate::{
 	console::Console,
 	game::Game,
 	launch::Asked,
+	nav::Paths,
 	net::{Net, Standing},
 	step,
 	terrain::Ground,
@@ -161,6 +162,14 @@ pub struct Runtime {
 	/// saying which record they were made from, so that a step which changes
 	/// nothing costs a comparison. @ref `crate::terrain`.
 	pub(crate) ground: Ground,
+
+	/// What the world's static bodies have been baked into.
+	///
+	/// Beside `ground` above and for the same reason, and its state is the
+	/// same shape: what a navmesh *is* lives in the world, and this is only the
+	/// note saying which world it was baked from, so that a step which changes
+	/// nothing costs a fold rather than a bake. @ref `crate::nav`.
+	pub(crate) paths: Paths,
 
 	/// The world as a snapshot describes it, taken down once a step rather
 	/// than allocated per snapshot. Empty off the wire.
@@ -286,6 +295,7 @@ impl Runtime {
 				// is given rather than whether one is.
 				wire: wired(self.net.as_mut(), moment),
 				ground: &mut self.ground,
+				paths: &mut self.paths,
 				sparked: &mut self.sparked,
 			},
 			input,
@@ -624,6 +634,7 @@ impl Opening {
 			audio,
 			sparked: Duration::ZERO,
 			ground: Ground::new(),
+			paths: Paths::new(),
 			records: Vec::new(),
 			started: Instant::now(),
 			project,
@@ -969,6 +980,7 @@ mod tests {
 				audio: None,
 				sparked: Duration::ZERO,
 				ground: Ground::new(),
+				paths: Paths::new(),
 				records: Vec::new(),
 				started: Instant::now(),
 				project: Project::parse(

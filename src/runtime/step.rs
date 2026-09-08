@@ -19,7 +19,7 @@ use colby_physics::Simulation;
 use colby_script::Vm;
 use colby_ui::Interface;
 
-use crate::{game::Game, net::Net, terrain::Ground};
+use crate::{game::Game, nav::Paths, net::Net, terrain::Ground};
 
 /// Everything a step drives that outlives it.
 ///
@@ -81,6 +81,15 @@ pub(crate) struct Parts<'a> {
 	/// @ref `crate::terrain`.
 	pub(crate) ground: &'a mut Ground,
 
+	/// What the world's static bodies have been baked into.
+	///
+	/// Beside `ground` above, read on the same side of the edit-mode guard and
+	/// for the same argument: where a thing can walk is a fact about the world
+	/// rather than something that moves, and a person who has just put a wall
+	/// down has to see the way round it change while the world is stopped.
+	/// @ref `crate::nav`.
+	pub(crate) paths: &'a mut Paths,
+
 	/// Where to leave how long the particles took.
 	///
 	/// A borrow rather than a return, because the caller keeps it across steps
@@ -119,6 +128,7 @@ pub(crate) fn run(
 		audio,
 		wire,
 		ground,
+		paths,
 		sparked,
 	} = parts;
 
@@ -185,6 +195,18 @@ pub(crate) fn run(
 	// fall through. It does nothing at all in a world with no terrain in it,
 	// which is every world but one. @ref `crate::terrain`.
 	crate::terrain::sync(world, ground);
+
+	// and the navmesh after the ground and before everything else, because it
+	// is baked *from* the ground: a terrain built this step is walkable this
+	// step rather than next. Outside the guard for the terrain's reason, and
+	// it costs a world whose static bodies have not moved one fold over them -
+	// which is every step but the ones that changed something.
+	crate::nav::sync(world, paths, crate::nav::asked(world), Some(&mut *simulation));
+
+	// and the tool that draws it, outside the guard with the thing it draws.
+	// Costs one console lookup a step when it is off, which is what off should
+	// cost - the arrangement the solver's own outlines keep.
+	crate::nav::draw(world, paths);
 
 	// and the physics before the game too, and for a related reason: what
 	// `update` reads is then the world as it now stands, and a trace it fires
@@ -395,6 +417,7 @@ mod tests {
 	fn stepped_at(net: &mut Net, world: &mut World, simulation: &mut Simulation, now: u64) {
 		let mut sparked = Duration::ZERO;
 		let mut ground = Ground::new();
+		let mut paths = Paths::new();
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
@@ -402,6 +425,7 @@ mod tests {
 			simulation,
 			audio: None,
 			ground: &mut ground,
+			paths: &mut paths,
 			sparked: &mut sparked,
 			wire: Some(Wired { net, now: Duration::from_millis(now) }),
 		};
@@ -428,6 +452,7 @@ mod tests {
 	fn plain(world: &mut World, simulation: &mut Simulation, editing: bool) {
 		let mut sparked = Duration::ZERO;
 		let mut ground = Ground::new();
+		let mut paths = Paths::new();
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
@@ -435,6 +460,7 @@ mod tests {
 			simulation,
 			audio: None,
 			ground: &mut ground,
+			paths: &mut paths,
 			sparked: &mut sparked,
 			wire: None,
 		};
@@ -678,6 +704,7 @@ mod tests {
 
 			let mut sparked = Duration::ZERO;
 			let mut ground = Ground::new();
+			let mut paths = Paths::new();
 			let parts = Parts {
 				game: None,
 				interface: &mut interface,
@@ -685,6 +712,7 @@ mod tests {
 				simulation,
 				audio: None,
 				ground: &mut ground,
+				paths: &mut paths,
 				sparked: &mut sparked,
 				wire: None,
 			};
@@ -734,6 +762,7 @@ mod tests {
 		for _ in 0..20 {
 			let mut sparked = Duration::ZERO;
 			let mut ground = Ground::new();
+			let mut paths = Paths::new();
 			let parts = Parts {
 				game: None,
 				interface: &mut interface,
@@ -741,6 +770,7 @@ mod tests {
 				simulation: &mut simulation,
 				audio: None,
 				ground: &mut ground,
+				paths: &mut paths,
 				sparked: &mut sparked,
 				wire: None,
 			};
@@ -866,6 +896,7 @@ mod tests {
 			for _ in 0..6 {
 				let mut sparked = Duration::ZERO;
 				let mut ground = Ground::new();
+				let mut paths = Paths::new();
 				let parts = Parts {
 					game: None,
 					interface: &mut interface,
@@ -873,6 +904,7 @@ mod tests {
 					simulation: &mut simulation,
 					audio: None,
 					ground: &mut ground,
+					paths: &mut paths,
 					sparked: &mut sparked,
 					wire: None,
 				};
@@ -973,6 +1005,7 @@ mod tests {
 			Vm::new(colby_core::abi::console::defer).expect("the interpreter starts");
 		let mut sparked = Duration::ZERO;
 		let mut ground = Ground::new();
+		let mut paths = Paths::new();
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
@@ -980,6 +1013,7 @@ mod tests {
 			simulation,
 			audio: None,
 			ground: &mut ground,
+			paths: &mut paths,
 			sparked: &mut sparked,
 			wire: None,
 		};

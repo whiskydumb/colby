@@ -350,6 +350,17 @@ struct Table {
 	/// shows up as bigger numbers in `gpu scene` and `cpu narrow`.
 	ground: u64,
 
+	/// How many cells of the world a thing that walks may stand on.
+	///
+	/// Beside `ground` above and for exactly its argument: a navmesh is baked
+	/// once and is a lookup table from then on, so a `cpu nav` row would read
+	/// nil on every frame this table ever sees. Unlike the terrain it costs
+	/// nothing anywhere else either - nothing asks it a question unless a game
+	/// does - so this is the whole of what the profiler has to say about it,
+	/// and the number is here because it is what says whether the bake was
+	/// about the world somebody thought it was.
+	walkable: u64,
+
 	/// How many render passes each frame recorded, and `None` before the first
 	/// one.
 	passes: Option<u32>,
@@ -400,6 +411,7 @@ impl Table {
 			}; ROWS],
 			sparks: 0,
 			ground: 0,
+			walkable: 0,
 			passes: None,
 			steady: true,
 		}
@@ -410,11 +422,12 @@ impl Table {
 	/// @param frame - what the renderer measured
 	/// @param spent - what the last simulation step cost
 	/// @param sparked - what the particles cost
-	/// @param counts - the two numbers that are about the project rather than
-	/// about a frame
+	/// @param counts - the numbers that are about the project rather than about
+	/// a frame
 	fn fold(&mut self, frame: &Frame, spent: Spent, sparked: Duration, counts: Counts) {
 		self.sparks = self.sparks.max(counts.sparks);
 		self.ground = self.ground.max(counts.ground);
+		self.walkable = self.walkable.max(counts.walkable);
 
 		for (at, pass) in Pass::ALL.into_iter().enumerate() {
 			if let (Some(row), Some(took)) = (self.rows.get_mut(at), frame.pass(pass)) {
@@ -485,6 +498,7 @@ impl Table {
 			passes = self.passes.unwrap_or_default(),
 			sparks = self.sparks,
 			ground = self.ground,
+			walkable = self.walkable,
 			steady = self.steady,
 			gpu_us = self.slice(0..Pass::ALL.len()).as_micros(),
 			cpu_us = self
@@ -525,6 +539,9 @@ struct Counts {
 
 	/// How many triangles the world's terrain has.
 	ground: u64,
+
+	/// How many cells of it a thing that walks may stand on.
+	walkable: u64,
 }
 
 /// Runs the project for a while and prints what a frame of it costs.
@@ -599,6 +616,7 @@ pub(crate) fn take(project: &Project, build: &Build, asked: &Asked, frames: u32)
 			table.fold(&frame, runtime.simulation.spent(), runtime.sparked, Counts {
 				sparks: capture.scene_mut().sparks(),
 				ground: runtime.ground.triangles(),
+				walkable: runtime.paths.cells(),
 			});
 		}
 	}
@@ -802,6 +820,7 @@ mod tests {
 		table.fold(&Frame::default(), spent, Duration::from_micros(31), Counts {
 			sparks: 40,
 			ground: 2048,
+			walkable: 900,
 		});
 
 		let under = Pass::ALL.len() + Work::ALL.len();
@@ -818,6 +837,7 @@ mod tests {
 		);
 		assert_eq!(table.sparks, 40, "and the count is carried beside the times");
 		assert_eq!(table.ground, 2048, "and so is the terrain's size");
+		assert_eq!(table.walkable, 900, "and how much of it can be walked on");
 		assert_eq!(
 			table.rows[under + 5].mean(),
 			Duration::from_micros(31),

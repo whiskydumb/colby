@@ -654,6 +654,27 @@ impl Simulation {
 		self.colliders.get(slot)?.as_ref()
 	}
 
+	/// Brings the baked collision meshes in line with the body table, without
+	/// stepping anything.
+	///
+	/// **What this is for is the navmesh**, and the reason it is public is an
+	/// ordering one rather than a taste one: a bake asks the world where the
+	/// ground is by tracing rays at it, a trace against a mesh body answers
+	/// with whatever [`collider`](Self::collider) holds, and until now the only
+	/// thing that ever filled that was [`step`](Self::step). A navmesh baked
+	/// before the first step therefore came back empty - every ray through a
+	/// landscape missing it - and looked exactly like a world with no ground in
+	/// it. It is also what makes the bake work at all while the world is being
+	/// *edited*, where by design no step ever runs.
+	///
+	/// Idempotent and cheap on a world that has not changed: a resize, a walk
+	/// over the bodies, and nothing baked for a slot that already holds one.
+	/// The caller should still only reach for it when it is about to need the
+	/// answer.
+	///
+	/// @param world - the host state, for the body table and the mesh registry
+	pub fn prepare(&mut self, world: &World) { self.sync(world); }
+
 	/// Bakes what is new, drops what is gone.
 	///
 	/// @param world - the host state, for the body table and the mesh registry

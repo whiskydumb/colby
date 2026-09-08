@@ -45,6 +45,7 @@ mod link;
 mod mode;
 #[cfg(feature = "hot_reload")]
 mod mount;
+mod nav;
 mod net;
 mod profile;
 mod record;

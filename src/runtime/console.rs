@@ -29,8 +29,8 @@ use std::{
 use colby_core::{
 	Error,
 	abi::{
-		Aim, Args, Asked, Cvars, Mix, PeerId, Scripts, Sound, Value, Voice, World, console,
-		cvar::Owner,
+		Aim, Args, Asked, Cvars, Mix, NavSettings, PeerId, Scripts, Sound, Value, Voice, World,
+		console, cvar::Owner, navmesh,
 	},
 	error, info, warn,
 };
@@ -298,11 +298,59 @@ pub(crate) fn install(world: &mut World) {
 	);
 
 	install_render(world);
+	install_nav(world);
 	install_scenes(world);
 	install_code(world);
 	install_audio(world);
 	install_net(world);
 	install_scripts(world);
+}
+
+/// The navmesh's variables: how big the thing that walks is, and one tool.
+///
+/// **The four settings are saved and the drawing is not**, which is the split
+/// `sim.rate` and the debug outlines already keep: how big an agent is belongs
+/// to the project and coming back to a world baked for a different one is the
+/// surprise; a grid of crosses over the ground is a tool, and coming back to a
+/// session still covered in them is the surprise the other way.
+///
+/// There is deliberately no `nav.bake`. A bake happens when the world it is
+/// baked from changes, and the settings are part of that world - so turning
+/// any of the five *is* the way to ask for one, and a command that did the
+/// same thing would be a second way for the two to disagree.
+///
+/// @param world - the table to register into
+fn install_nav(world: &mut World) {
+	world.cvars.saved(
+		crate::nav::CELL,
+		Value::Float(navmesh::CELL),
+		"how wide one cell of the navmesh is, in world units",
+	);
+	world.cvars.saved(
+		crate::nav::RADIUS,
+		Value::Float(navmesh::RADIUS),
+		"how far from a wall a thing that walks must stay, in world units",
+	);
+	world.cvars.saved(
+		crate::nav::STEP,
+		Value::Float(NavSettings::DEFAULT.step),
+		"the tallest lip a thing that walks climbs, in world units",
+	);
+	world.cvars.saved(
+		crate::nav::SLOPE,
+		Value::Float(NavSettings::DEFAULT.slope),
+		"the steepest ground it stands on, as the cosine of the angle from up",
+	);
+	world.cvars.var(
+		crate::nav::DRAW,
+		Value::Bool(false),
+		"mark every cell of the navmesh anything may stand on",
+	);
+	world.cvars.var(
+		crate::nav::SHOW,
+		Value::Text(String::new()),
+		"draw the path between two places on the ground: <x> <z> <x> <z>",
+	);
 }
 
 /// The renderer's variables: the shadows, the lights, and which graphics APIs

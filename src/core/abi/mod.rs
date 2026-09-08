@@ -38,6 +38,7 @@ pub mod material;
 pub mod mesh;
 pub mod model;
 pub mod names;
+pub mod navmesh;
 pub mod net;
 pub mod particles;
 pub mod physics;
@@ -79,6 +80,7 @@ pub use self::{
 	mesh::{BONES_PER_VERTEX, Mesh, MeshData, MeshId, MeshVertex, Meshes, SkinVertex},
 	model::{Model, ModelData, ModelId, Models, Placement},
 	names::MAX_NAME,
+	navmesh::{Column, NavSettings, Navmesh, PathKind},
 	net::{Aim, Command, Commands, PeerId, Role},
 	particles::{Emitter, EmitterKind, MAX_SPARKS, Spark, SparkBlend, Sparks},
 	physics::{
@@ -110,7 +112,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 60;
+pub const ABI_VERSION: u32 = 61;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -559,6 +561,20 @@ pub struct World {
 	/// alone, because where somebody was looking is not part of the world.
 	pub local: GameState,
 
+	/// Where a thing that walks may stand.
+	///
+	/// Private, like [`physics`](Self::physics) below, and for a softer reason
+	/// than the pointers: it is *derived*, and a game writing into it would be
+	/// describing a world other than the one the solver has. Rebuilt by
+	/// [`bake_nav`](Self::bake_nav) whenever the static bodies move, read
+	/// through [`find_path`](Self::find_path) and [`nav`](Self::nav).
+	///
+	/// One rather than one per entity, which is the one place this differs
+	/// from a [`Terrain`]: a path crosses the whole world at once, and two
+	/// navmeshes that do not know about each other are two worlds. @ref
+	/// [`navmesh`].
+	nav: Navmesh,
+
 	/// The two queries the host answers about [`bodies`](Self::bodies).
 	///
 	/// Private, like the interpolation fields and for a stronger reason: it is
@@ -631,6 +647,7 @@ impl World {
 			entities: Entities::new(),
 			sparks: Sparks::new(),
 			bodies: Bodies::new(),
+			nav: Navmesh::new(),
 			joints: Joints::new(),
 			meshes: Meshes::new(),
 			textures: Textures::new(),
@@ -1020,6 +1037,84 @@ impl World {
 	///
 	/// @param physics - the table to install
 	pub const fn install_physics(&mut self, physics: Physics) { self.physics = physics; }
+
+	/// Where a thing that walks may stand.
+	///
+	/// Empty until something bakes it. @ref [`bake_nav`](Self::bake_nav).
+	#[must_use]
+	pub const fn nav(&self) -> &Navmesh { &self.nav }
+
+	/// A path between two points, over the baked navmesh.
+	///
+	/// The whole of what a game needs from navigation, and deliberately the
+	/// whole: crowds, off-mesh links, dynamic obstacles and area costs are each
+	/// a later word, and every one of them is built on this one.
+	///
+	/// @param from - where the walk starts, in world space
+	/// @param to - where it should end
+	/// @param into - where to put the corners; cleared first, and a caller that
+	/// keeps it between calls allocates nothing
+	/// @return how well the answer matches the question
+	pub fn find_path(&self, from: Vec3, to: Vec3, into: &mut Vec<Vec3>) -> PathKind {
+		self.nav.find_path(from, to, into)
+	}
+
+	/// Builds the navmesh from the world's static bodies.
+	///
+	/// **One downward ray a column, through the same
+	/// [`trace_ray`](Self::trace_ray) a game fires** - so what the navmesh says
+	/// is standable is exactly what a trace would have found, and the collision
+	/// grid step 5l put inside every mesh collider is what makes a landscape
+	/// affordable to ask about tens of thousands of times. A column with
+	/// nothing under it, or with a ceiling nearer than the agent is tall, is a
+	/// column nothing stands in.
+	///
+	/// Idempotent, and cheap to call on a world with nothing static in it: the
+	/// bounds come out empty and the navmesh is cleared. That is what lets the
+	/// runtime call this whenever the static world moved rather than making
+	/// somebody remember to.
+	///
+	/// **Nothing here needs the solver's own tables.** The queries go through
+	/// the installed [`Physics`], so a world whose host never installed one
+	/// bakes an empty navmesh rather than a wrong one.
+	///
+	/// @param settings - how big the thing that walks is
+	/// @return how many cells anything may stand on
+	pub fn bake_nav(&mut self, settings: NavSettings) -> usize {
+		let Some((low, high)) = navmesh::ground_bounds(&self.bodies, &self.meshes) else {
+			self.nav = Navmesh::new();
+
+			return 0;
+		};
+
+		let settings = settings.sane();
+		let sky = high.y + navmesh::SKY;
+		let floor = low.y - navmesh::SKY;
+		let built = Navmesh::build(settings, low, high, |at| self.column(at, (sky, floor)));
+
+		self.nav = built;
+		self.nav.walkable()
+	}
+
+	/// What one column of the world offers something that walks.
+	///
+	/// **One ray, and one surface.** The topmost thing in the column, which is
+	/// the whole of what a single-layer grid can hold - so a crate on a floor
+	/// is somewhere to walk and the floor under it is not. @ref [`navmesh`] for
+	/// why that is the shape and what it costs.
+	///
+	/// @param at - the middle of the column, in world space
+	/// @param span - how high the ray starts and how low it ends
+	fn column(&self, at: Vec2, span: (f32, f32)) -> Option<Column> {
+		let (sky, floor) = span;
+		let down = TraceInfo::ray(Vec3::new(at.x, sky, at.y), Vec3::new(at.x, floor, at.y));
+		let ground = self.trace_ray(&down);
+
+		ground.hit.then_some(Column {
+			height: ground.end.y,
+			normal: ground.normal,
+		})
+	}
 
 	/// Traces a ray through the world.
 	///
