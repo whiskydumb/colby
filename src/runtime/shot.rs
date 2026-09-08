@@ -46,9 +46,12 @@ const STEPS: u32 = 90;
 pub(crate) fn take(path: &Path, project: &Project, build: &Build, asked: &Asked) -> Result {
 	// the adapter first, before anything is brought up: a machine with nothing
 	// to render on has no business loading a module to find that out. No
-	// window, so nothing for the adapter to be compatible with; and no console,
-	// so no variable to read - the default, unless the environment says.
-	let Some(gpu) = Gpu::open(gpu::backends(None), None)? else {
+	// window, so nothing for the adapter to be compatible with; and no console
+	// yet, so the command line and the config file are read by name - a
+	// machine set to draw with one API should not quietly take its screenshots
+	// with another. @ref `crate::console::backend`.
+	let backend = crate::console::backend(asked, project);
+	let Some(gpu) = Gpu::open(gpu::backends(backend.as_deref()), None)? else {
 		return Err!(Graphics("no usable adapter, so there is nothing to render with"));
 	};
 	let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1)?;

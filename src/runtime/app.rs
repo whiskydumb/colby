@@ -311,7 +311,7 @@ impl Loader {
 		// against this window, so that the adapter chosen is one that can
 		// present to it; the surface itself is the renderer's. @ref
 		// `colby_engine::gpu`.
-		let asked = crate::console::archived(&self.project.settings(), gpu::BACKEND);
+		let asked = crate::console::backend(&self.asked, &self.project);
 		let Some(gpu) = Gpu::open(gpu::backends(asked.as_deref()), Some(&window))? else {
 			return Err!(Graphics("no usable adapter, so there is nothing to draw with"));
 		};

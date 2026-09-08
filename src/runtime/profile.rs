@@ -554,8 +554,11 @@ struct Counts {
 /// @return `Ok` once the table has been printed
 pub(crate) fn take(project: &Project, build: &Build, asked: &Asked, frames: u32) -> Result {
 	// the adapter first, exactly as a screenshot does: a machine with nothing
-	// to render on has no business loading a module to find that out.
-	let Some(gpu) = Gpu::open(gpu::backends(None), None)? else {
+	// to render on has no business loading a module to find that out - and the
+	// API is read the same way too, which here decides what the numbers are
+	// numbers about. @ref `crate::console::backend`.
+	let backend = crate::console::backend(asked, project);
+	let Some(gpu) = Gpu::open(gpu::backends(backend.as_deref()), None)? else {
 		return Err!(Graphics("no usable adapter, so there is nothing to measure"));
 	};
 	let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1)?;

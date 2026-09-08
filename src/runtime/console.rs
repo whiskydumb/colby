@@ -187,6 +187,30 @@ pub(crate) fn archived(archive: &Path, name: &str) -> Option<String> {
 		.and_then(|words| words.get(1).cloned())
 }
 
+/// Which graphics APIs this run was asked to consider, before there is a table.
+///
+/// **The one variable read this way, and the only place it is read.** The
+/// device is made before the world comes up, so the command line and the
+/// config file are both read by name here rather than through the table that
+/// does not exist yet - and the order is the order the table would have
+/// applied them in, the command line last and therefore first to be asked.
+///
+/// Every path that opens a device goes through this: a window, `--shot` and
+/// `--profile` alike, so a machine set to draw with one API does not quietly
+/// take a screenshot with another. The launcher does not, and cannot: it has
+/// no project open, so there is no `settings.cfg` to read and nothing but the
+/// environment can reach it.
+///
+/// @param asked - what `--set` put on the command line
+/// @param project - the project whose `settings.cfg` to read
+/// @return the value, or `None` for the default
+pub(crate) fn backend(asked: &crate::Asked, project: &crate::Project) -> Option<String> {
+	asked
+		.last(colby_engine::gpu::BACKEND)
+		.map(str::to_owned)
+		.or_else(|| archived(&project.settings(), colby_engine::gpu::BACKEND))
+}
+
 /// Registers everything the host answers for.
 ///
 /// Called before the game module loads, so that these are the engine's and stay
@@ -598,7 +622,9 @@ fn install_render(world: &mut World) {
 	// property of the machine rather than of a session; and read once, when
 	// the device is made, so a value typed at a running window takes effect
 	// at the next start - which is what every engine does with this setting.
-	// The environment's `WGPU_BACKEND` overrides it for one run.
+	// A `--set` on the command line wins over the file and the environment's
+	// `WGPU_BACKEND` wins over both, all three read by name before this table
+	// exists. @ref [`backend`].
 	world.cvars.saved(
 		colby_engine::gpu::BACKEND,
 		Value::Text(colby_engine::gpu::AUTO.to_owned()),
@@ -1448,6 +1474,66 @@ r.backend auto
 			archived(&archive, "r.backend").as_deref(),
 			Some("dx12, vulkan"),
 			"quotes come off, the way the parser takes them off for the table"
+		);
+	}
+
+	/// What `--set` on a command line made of these words comes to.
+	fn asked_on(words: &[&str]) -> crate::Asked {
+		let arguments: Vec<String> = words
+			.iter()
+			.map(|word| (*word).to_owned())
+			.collect();
+
+		crate::Launch::parse(&arguments).asked
+	}
+
+	#[test]
+	fn the_command_line_wins_over_the_file_for_the_one_variable_read_before_the_table() {
+		let dir = std::env::temp_dir().join("colby_console_backend");
+		drop(fs::remove_dir_all(&dir));
+		fs::create_dir_all(&dir).expect("a directory to work in");
+		fs::write(
+			dir.join("colby.project"),
+			"{ \"schema\": 1, \"engine\": \"0.1.0\", \"id\": \"colby_console_backend\", 			 \
+			 \"name\": \"probe\" }",
+		)
+		.expect("a project to read");
+		let project = crate::Project::open(&dir).expect("the project opens");
+
+		let nothing = crate::Asked::default();
+
+		assert_eq!(backend(&nothing, &project), None, "nothing said anywhere is the default");
+
+		fs::write(
+			project.settings(),
+			"r.backend vulkan
+",
+		)
+		.expect("the archive");
+
+		assert_eq!(
+			backend(&nothing, &project).as_deref(),
+			Some("vulkan"),
+			"the file is read when the line says nothing"
+		);
+		assert_eq!(
+			backend(&asked_on(&["--set", "r.backend", "dx12"]), &project).as_deref(),
+			Some("dx12"),
+			"and the line wins over the file, which is the order the table would apply them in"
+		);
+		assert_eq!(
+			backend(
+				&asked_on(&["--set", "r.backend", "dx12", "--set", "r.backend", "vk"]),
+				&project
+			)
+			.as_deref(),
+			Some("vk"),
+			"the last one wins, as the last write to a table would"
+		);
+		assert_eq!(
+			backend(&asked_on(&["--set", "r.msaa", "4"]), &project).as_deref(),
+			Some("vulkan"),
+			"a line about something else leaves the file answering"
 		);
 	}
 

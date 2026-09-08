@@ -103,6 +103,12 @@ pub struct Launch {
 /// registered whatever it registers**, for the reason the archive is applied
 /// there: a line may name a variable that did not exist a moment earlier.
 ///
+/// **With one variable read earlier, by name.** The graphics API is chosen
+/// before the world comes up and cannot be chosen twice, so a
+/// `--set r.backend dx12` applied here would be applied to a device that had
+/// already picked. @ref [`last`](Self::last), which is that door, and
+/// [`crate::console::backend`], which is its only caller.
+///
 /// **And never written back.** A name given here is unarchived for the life of
 /// the process, so a screenshot taken at one sample does not leave the window
 /// at one sample. @ref
@@ -133,6 +139,31 @@ impl Asked {
 				value, "nothing on the command line: no such variable, or not a value it takes"
 			);
 		}
+	}
+
+	/// What the line last set one variable to, without a table.
+	///
+	/// **The one way round [`apply`](Self::apply), and it exists for one
+	/// variable.** The graphics API is read before there is a table to write
+	/// into - the device is made before the world comes up, because the screen
+	/// the world comes up behind needs something to be drawn on - so a
+	/// `--set r.backend vulkan` that waited for `apply` would be applied to a
+	/// device that had already chosen. The archive is read by name for exactly
+	/// the same reason; @ref [`crate::console::archived`], and
+	/// [`crate::console::backend`], which is the two of them in order.
+	///
+	/// The *last* one, because `apply` sets them in order and the last write
+	/// is what a table would hold.
+	///
+	/// @param name - the variable
+	/// @return what the line last set it to, if it set it
+	#[must_use]
+	pub fn last(&self, name: &str) -> Option<&str> {
+		self.0
+			.iter()
+			.rev()
+			.find(|(asked, _)| asked == name)
+			.map(|(_, value)| value.as_str())
 	}
 
 	/// Whether anything was asked for at all.
@@ -508,6 +539,32 @@ mod tests {
 			.collect();
 
 		Launch::parse(&arguments).asked.0
+	}
+
+	#[test]
+	fn the_last_setting_of_a_name_is_what_a_reader_before_the_table_gets() {
+		let asked =
+			Launch::parse(&words(&["--set", "r.backend", "dx12", "--set", "r.msaa", "4"])).asked;
+
+		assert_eq!(asked.last("r.backend"), Some("dx12"));
+		assert_eq!(asked.last("r.msaa"), Some("4"));
+		assert_eq!(asked.last("r.lights"), None, "a name nobody set has no answer");
+
+		let twice = Launch::parse(&words(&[
+			"--set",
+			"r.backend",
+			"dx12",
+			"--set",
+			"r.backend",
+			"vulkan",
+		]))
+		.asked;
+
+		assert_eq!(
+			twice.last("r.backend"),
+			Some("vulkan"),
+			"the last write is what a table would hold, so it is what this hands back"
+		);
 	}
 
 	#[test]
