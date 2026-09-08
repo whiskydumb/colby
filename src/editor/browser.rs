@@ -96,8 +96,11 @@ impl Browser {
 					.hint_text("search"),
 			);
 			ui.label(
-				RichText::new("drag one into the picture, or open a scene by double-clicking")
-					.weak(),
+				RichText::new(
+					"drag one into the picture, or double-click to open a scene or edit a 					 \
+					 source",
+				)
+				.weak(),
 			);
 		});
 		ui.separator();
@@ -181,10 +184,17 @@ fn row(ui: &mut Ui, entry: &Entry, thumb: Option<egui::TextureId>, changes: &mut
 		}
 
 		// a scene is the one kind of asset there is somewhere to go to, so it
-		// is the one kind a double-click opens. The other kinds are dragged
-		// into the picture and nothing else.
-		if entry.kind == Kind::Scene && response.double_clicked() {
-			changes.push(Change::Open { name: entry.name.clone() });
+		// is the one kind a double-click opens *here*; every other kind that
+		// is text goes out to an editor, which is the same gesture Godot's
+		// file system dock uses for the same thing. What is left - a picture,
+		// a sound, a font, a model - is dragged into the picture and nothing
+		// else.
+		if response.double_clicked() {
+			if entry.kind == Kind::Scene {
+				changes.push(Change::Open { name: entry.name.clone() });
+			} else if catalog::is_text(entry.kind) {
+				changes.push(Change::Code { name: entry.name.clone() });
+			}
 		}
 
 		// the two kinds the inspector has a panel for: a material, whose field
@@ -222,9 +232,81 @@ fn ghost(ui: &Ui, name: &str) {
 mod tests {
 	use std::{env, fs};
 
-	use egui::{Context, Pos2, RawInput, Rect};
+	use egui::{Context, Modifiers, PointerButton, Pos2, RawInput, Rect};
 
 	use super::*;
+
+	/// One row drawn on its own, and what pressing it asked for.
+	///
+	/// [`row`] rather than [`Browser::show`], because what is being tested is
+	/// what a gesture on a row *means* and a row is where that is decided; the
+	/// walk, the search and the pictures are the browser's and have their own
+	/// test above. The rectangle is what the row drew, which is where the
+	/// second call clicks.
+	///
+	/// @param context - reused between the two calls, so that egui remembers
+	/// where the widget was and how long ago the last click was
+	/// @param entry - the row
+	/// @param events - what happened this frame
+	/// @return what the row asked for, and where it drew itself
+	fn pressed(
+		context: &Context,
+		entry: &Entry,
+		events: Vec<egui::Event>,
+	) -> (Vec<Change>, Rect) {
+		let mut changes = Vec::new();
+		let mut drawn = Rect::NOTHING;
+		let mut once = false;
+
+		// once whatever egui asks: a context may run the closure twice in one
+		// call, and a row drawn twice would answer a click twice.
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 60.0))),
+				events,
+				..Default::default()
+			},
+			|ui| {
+				if !once {
+					once = true;
+					row(ui, entry, None, &mut changes);
+					drawn = ui.min_rect();
+				}
+			},
+		);
+		output.textures_delta.clear();
+
+		(changes, drawn)
+	}
+
+	/// A row for a source that is not on disk anywhere.
+	fn entry(name: &str, kind: Kind) -> Entry {
+		Entry {
+			name: name.to_owned(),
+			kind,
+			source: PathBuf::from(name),
+			output: PathBuf::from(name),
+			state: State::Compiled,
+		}
+	}
+
+	/// Two presses and two releases in one frame, which is a double click.
+	fn twice(at: Pos2) -> Vec<egui::Event> {
+		let mut events = vec![egui::Event::PointerMoved(at)];
+
+		for _ in 0..2 {
+			for pressed in [true, false] {
+				events.push(egui::Event::PointerButton {
+					pos: at,
+					button: PointerButton::Primary,
+					pressed,
+					modifiers: Modifiers::NONE,
+				});
+			}
+		}
+
+		events
+	}
 
 	#[test]
 	fn the_browser_draws_a_project_without_a_window_and_lists_its_sources() {
@@ -259,6 +341,101 @@ mod tests {
 		assert_eq!(browser.entries[0].name, "meshes/crystal");
 		assert_eq!(browser.entries[0].state, State::Uncompiled, "nothing compiled it");
 		assert_eq!(browser.root.as_deref(), Some(root.as_path()));
+	}
+
+	#[test]
+	fn double_clicking_a_program_asks_for_it_to_be_opened_in_an_editor() {
+		let context = Context::default();
+		let row = entry("scripts/thruster", Kind::Script);
+		// one frame to find out where the row landed, and a second to press
+		// there: egui answers where a widget is only after it has drawn
+		let (_, drawn) = pressed(&context, &row, Vec::new());
+
+		let (changes, _) = pressed(&context, &row, twice(drawn.center()));
+
+		assert_eq!(
+			changes,
+			vec![Change::Code { name: "scripts/thruster".to_owned() }],
+			"and that is the only thing it asks for"
+		);
+	}
+
+	#[test]
+	fn double_clicking_a_scene_still_opens_the_scene_rather_than_its_text() {
+		// the exception, and the reason `catalog::is_text` says no to a scene:
+		// this gesture already meant something on this row.
+		let context = Context::default();
+		let row = entry("scenes/yard", Kind::Scene);
+		let (_, drawn) = pressed(&context, &row, Vec::new());
+
+		let (changes, _) = pressed(&context, &row, twice(drawn.center()));
+
+		assert_eq!(changes, vec![Change::Open { name: "scenes/yard".to_owned() }]);
+	}
+
+	#[test]
+	fn double_clicking_a_material_inspects_it_and_opens_it() {
+		// the one row where two gestures overlap, and the answer is that both
+		// happen: egui counts a double click as a click as well, so the
+		// material's source opens *and* it lands in the inspector.
+		//
+		// **Recorded rather than prevented, because preventing it is not
+		// available.** With a real mouse the first click of the pair lands a
+		// frame before the second and has already asked for the inspector by
+		// the time anything knows a second is coming; suppressing the click on
+		// the frame the double lands would change this test and nothing a
+		// person does. Reading a material's numbers while its text opens is
+		// what whoever pressed it wanted either way.
+		let context = Context::default();
+		let row = entry("materials/brass", Kind::Material);
+		let (_, drawn) = pressed(&context, &row, Vec::new());
+
+		let (changes, _) = pressed(&context, &row, twice(drawn.center()));
+
+		assert_eq!(changes, vec![
+			Change::Code { name: "materials/brass".to_owned() },
+			Change::Inspect { name: "materials/brass".to_owned() },
+		]);
+	}
+
+	#[test]
+	fn double_clicking_a_picture_asks_for_nothing() {
+		let context = Context::default();
+		let row = entry("textures/wall", Kind::Texture);
+		let (_, drawn) = pressed(&context, &row, Vec::new());
+
+		let (changes, _) = pressed(&context, &row, twice(drawn.center()));
+
+		assert!(changes.is_empty(), "a .png in a code editor is a screen of nothing");
+	}
+
+	#[test]
+	fn one_click_on_a_program_asks_for_nothing() {
+		// the negative control for the two above: the same row, the same
+		// place, one press instead of two, and nothing is asked for - so what
+		// those tests saw was the second click and not merely a click.
+		let context = Context::default();
+		let row = entry("scripts/thruster", Kind::Script);
+		let (_, drawn) = pressed(&context, &row, Vec::new());
+		let at = drawn.center();
+
+		let (changes, _) = pressed(&context, &row, vec![
+			egui::Event::PointerMoved(at),
+			egui::Event::PointerButton {
+				pos: at,
+				button: PointerButton::Primary,
+				pressed: true,
+				modifiers: Modifiers::NONE,
+			},
+			egui::Event::PointerButton {
+				pos: at,
+				button: PointerButton::Primary,
+				pressed: false,
+				modifiers: Modifiers::NONE,
+			},
+		]);
+
+		assert!(changes.is_empty());
 	}
 
 	#[test]

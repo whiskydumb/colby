@@ -299,6 +299,7 @@ pub(crate) fn install(world: &mut World) {
 
 	install_render(world);
 	install_scenes(world);
+	install_code(world);
 	install_audio(world);
 	install_net(world);
 	install_scripts(world);
@@ -652,6 +653,33 @@ fn install_scenes(world: &mut World) {
 		crate::saves::BLOCKS,
 		console::defer,
 		"write the meshes baked under maps/<name>/ into assets/ as .obj sources",
+	);
+}
+
+/// The one command and the two variables that open a source in an editor.
+///
+/// Saved rather than plain, because which editor somebody uses is a property
+/// of the machine and not of a session - the same argument `r.backend` is
+/// registered with. It is a *project's* `settings.cfg` all the same, which is
+/// where every setting colby has lives; @ref [`crate::code`] for the rest.
+///
+/// @param world - the table to register into
+fn install_code(world: &mut World) {
+	world.cvars.command(
+		crate::code::OPEN,
+		console::defer,
+		"open the source that compiles to <name> in an editor, at [line] if one is given",
+	);
+	world.cvars.saved(
+		crate::code::EDITOR,
+		Value::Text(String::new()),
+		"the program `code.open` starts; empty hands the file to the platform instead",
+	);
+	world.cvars.saved(
+		crate::code::ARGS,
+		Value::Text(crate::code::DEFAULT_ARGS.to_owned()),
+		"what to pass it, with {file}, {line}, {col} and {project} filled in; quote the whole \
+		 value, as \"{project} {file}:{line}:{col}\" for zed or sublime",
 	);
 }
 

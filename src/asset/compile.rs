@@ -577,6 +577,43 @@ pub fn output_path(root: &Path, out: &Path, source: &Path) -> Result<PathBuf> {
 		.with_extension(kind.extension()))
 }
 
+/// The source a name compiles from, if one is in the tree.
+///
+/// The inverse of [`asset_name`], and it has to try rather than derive: a name
+/// carries no extension, so which file is behind `meshes/crystal` is a question
+/// about what is on disk. The extensions are tried in [`SOURCE_EXTENSIONS`]
+/// order and the first file that is there wins - which is the same answer the
+/// compiler itself would give, since two sources under one name already
+/// compile to two different outputs and neither is more the name's than the
+/// other.
+///
+/// **A name may not leave the tree.** `..` and an absolute path are resolved
+/// away by [`within`] rather than refused by spelling, so a name that climbs
+/// out is nothing rather than a file somewhere else on the disk. @ref
+/// `import::source_of` for the same question asked about a model only.
+///
+/// @param root - the source tree
+/// @param name - the asset name, `scripts/thruster`
+#[must_use]
+pub fn source_of(root: &Path, name: &str) -> Option<PathBuf> {
+	let joined = name
+		.split('/')
+		.fold(root.to_path_buf(), |path, part| path.join(part));
+	let stem = within(&joined, root)?;
+
+	// a name that resolved to the tree itself is no name: without this
+	// `code.open` with nothing after it would go looking for `assets.lua`
+	// beside the tree rather than inside it.
+	if stem == root {
+		return None;
+	}
+
+	SOURCE_EXTENSIONS
+		.iter()
+		.map(|extension| stem.with_extension(extension))
+		.find(|path| path.is_file())
+}
+
 /// Compiles one source into one output, whether or not it needed it.
 ///
 /// @param source - the file to read
@@ -1586,6 +1623,60 @@ f 4 1 5 8
 			asset_name(root, Path::new("C:/elsewhere/thing.obj")).is_err(),
 			"and a file outside the tree has no name here"
 		);
+	}
+
+	#[test]
+	fn a_name_finds_the_source_it_compiles_from_and_will_not_leave_the_tree() {
+		let workspace = workspace("source-of");
+		put(&workspace, "scripts/hello.lua", "function tick(dt) end\n");
+		put(&workspace, "meshes/crystal.obj", "v 0 0 0\n");
+		let root = source_root(&workspace);
+		// **two files outside the tree, and they are the whole point of this
+		// test.** A climbing name and an empty one both come out as nothing
+		// whether or not anything guards them, as long as there is no file
+		// where they land - so a first version of this test passed with the
+		// guards taken away. These are the files they would otherwise reach.
+		fs::write(workspace.join("secret.obj"), "v 9 9 9\n").expect("one beside the tree");
+		fs::write(root.with_extension("obj"), "v 8 8 8\n").expect("and one named after it");
+
+		assert_eq!(
+			source_of(&root, "scripts/hello"),
+			Some(root.join("scripts").join("hello.lua")),
+			"the inverse of `asset_name`, and it answers by looking"
+		);
+		assert_eq!(source_of(&root, "meshes/crystal"), Some(root.join("meshes/crystal.obj")));
+		assert_eq!(source_of(&root, "scripts/missing"), None, "nothing is there");
+		assert_eq!(
+			source_of(&root, "../secret"),
+			None,
+			"a name that climbs out of the tree finds nothing rather than the file it lands on"
+		);
+		assert_eq!(
+			source_of(&root, ""),
+			None,
+			"and no name is no file, rather than whatever is named after the tree itself"
+		);
+	}
+
+	#[test]
+	fn a_source_of_answers_for_every_extension_the_compiler_reads() {
+		// the list is the compiler's own, so a source kind added without a
+		// thought here would be a row in the browser that cannot be opened.
+		let workspace = workspace("source-of-every");
+		let root = source_root(&workspace);
+
+		for extension in SOURCE_EXTENSIONS {
+			let relative = format!("one/thing.{extension}");
+			put(&workspace, &relative, "");
+
+			assert_eq!(
+				source_of(&root, "one/thing"),
+				Some(root.join(&relative)),
+				"a .{extension} is found under its name"
+			);
+
+			fs::remove_file(root.join(&relative)).expect("taken away again");
+		}
 	}
 
 	#[test]

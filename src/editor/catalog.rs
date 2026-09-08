@@ -78,6 +78,25 @@ pub(crate) const fn word(kind: Kind) -> &'static str {
 	}
 }
 
+/// Whether a source is text somebody would open in an editor.
+///
+/// **Not every source is**, which is why this is a question rather than a
+/// blanket yes: a `.png`, a `.wav`, a `.ttf` and a `.glb` are bytes, and
+/// opening one in a code editor shows a screen of replacement characters. The
+/// four that are text are the four the compiler parses as text - geometry,
+/// documents, materials and programs.
+///
+/// A `.scene` is text too and is deliberately **not** here: double-clicking one
+/// already means "open this scene", and a row cannot mean two things. It is
+/// still reachable by name from the console.
+///
+/// A `.gltf` is text and a `.glb` is not, and they are one [`Kind`] - so the
+/// kind says no, because the wrong answer for half of them is a screen of
+/// binary.
+pub(crate) const fn is_text(kind: Kind) -> bool {
+	matches!(kind, Kind::Mesh | Kind::Document | Kind::Material | Kind::Script)
+}
+
 /// Every source under a project's asset tree, by name.
 ///
 /// A tree that is not there, or cannot be walked, is an empty list rather
@@ -204,6 +223,22 @@ mod tests {
 		fs::remove_dir_all(&sources).expect("taken away");
 
 		assert!(scan(&sources, &outputs).is_empty());
+	}
+
+	#[test]
+	fn the_text_kinds_are_the_ones_a_code_editor_can_show() {
+		assert!(is_text(Kind::Script), "a program");
+		assert!(is_text(Kind::Mesh), "an .obj is a list of numbers as text");
+		assert!(is_text(Kind::Material));
+		assert!(is_text(Kind::Document));
+		assert!(!is_text(Kind::Texture), "and a picture is not");
+		assert!(!is_text(Kind::Sound));
+		assert!(!is_text(Kind::Font));
+		assert!(
+			!is_text(Kind::Model),
+			"a .gltf is text and a .glb is not, and one kind cannot answer both"
+		);
+		assert!(!is_text(Kind::Scene), "a scene row already means open the scene");
 	}
 
 	#[test]

@@ -301,6 +301,17 @@ pub(crate) enum Change {
 		name: String,
 	},
 
+	/// Open an asset's source in whatever editor this person uses.
+	///
+	/// A name rather than a path, for the reason
+	/// [`Inspect`](Self::Inspect) carries one: the browser knows what a row is
+	/// called, and the runner is the half that owns the project and can turn a
+	/// name into a file. @ref `colby_runtime`'s `code` module.
+	Code {
+		/// The asset name, `scripts/thruster`.
+		name: String,
+	},
+
 	/// Put a body of water in the middle of what is being looked at.
 	///
 	/// No asset behind it and so not a [`Drop`](Self::Drop): a fluid is
@@ -892,6 +903,12 @@ impl Panels {
 			| Change::Show { which } => self.restore = self.tabs.switch(world, which),
 			| Change::Shut { which } => self.restore = self.tabs.close(which),
 			| Change::Inspect { name } => self.inspect(world, &name),
+			| Change::Code { name } => {
+				// straight to the console, as a write is: the runner is what
+				// holds the project and the two variables, and the editor's
+				// half of this is knowing which row was pressed.
+				colby_core::abi::console::run(world, &format!("code.open {name}"));
+			},
 			| Change::Water => self.water(world),
 			| Change::Block => self.block(world),
 			| Change::Bake(name) => self.bake(world, &name),
@@ -1519,6 +1536,26 @@ mod tests {
 
 		assert_eq!(asked.len(), 1, "now it can be opened");
 		assert!(panels.waiting.is_empty(), "and it is off the list");
+	}
+
+	#[test]
+	fn asking_for_a_source_leaves_a_console_line_for_the_runner() {
+		// the seam between the two halves: the editor knows which row was
+		// pressed and the runner owns the project, so what crosses is a line.
+		// A world with no such command registered - which is what a `World`
+		// out of `new` is - drops it, so the name is registered here the way
+		// the runner registers it.
+		let mut world = World::new();
+		world
+			.cvars
+			.command("code.open", colby_core::abi::console::defer, "");
+		let mut panels = Panels::default();
+
+		panels.apply(&mut world, Change::Code { name: "scripts/thruster".to_owned() });
+
+		assert_eq!(world.asked.len(), 1, "one line waiting for the frame loop");
+		assert_eq!(world.asked[0].name, "code.open");
+		assert_eq!(world.asked[0].words, vec!["scripts/thruster".to_owned()]);
 	}
 
 	#[test]

@@ -33,6 +33,7 @@ compile_error!("colby_runtime needs either the `hot_reload` or the `static_game`
 
 mod app;
 mod assets;
+mod code;
 mod console;
 mod game;
 mod host;
