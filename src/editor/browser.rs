@@ -96,11 +96,8 @@ impl Browser {
 					.hint_text("search"),
 			);
 			ui.label(
-				RichText::new(
-					"drag one into the picture, or double-click to open a scene or edit a 					 \
-					 source",
-				)
-				.weak(),
+				RichText::new("drag one into the picture, or double-click to open or edit one")
+					.weak(),
 			);
 		});
 		ui.separator();
