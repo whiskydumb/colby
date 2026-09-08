@@ -70,7 +70,7 @@ use crate::{
 	abi::{
 		Body, BodyId, BodyKind, Camera, Emitter, EntityId, Entry, Joint, JointId, JointKind,
 		Layers, Light, MaterialId, MeshId, Pose, PoseId, Post, Registry, Renderable, Shape,
-		ShapeKind, Sky, TextureId, Transform, Water, World,
+		ShapeKind, Sky, Terrain, TextureId, Transform, Water, World,
 		field::{Field, field},
 		net::MAX_PEERS,
 		state::STATE_BYTES,
@@ -213,6 +213,22 @@ pub struct Thing {
 	/// The asset name of the emitter's picture, or empty for none.
 	pub emitter_texture: String,
 
+	/// What ground it is, or [`Terrain::NONE`] for an entity that is not
+	/// ground.
+	///
+	/// Inline beside the light and the emitter, for their reason. It names no
+	/// asset, so unlike the emitter it needs nothing beside it - what the
+	/// ground is made of is [`material`](Self::material), which every entity
+	/// has anyway.
+	///
+	/// **The geometry is not written down**, here or in the file: the mesh a
+	/// terrain builds is a function of this record, so a description that
+	/// carried it would carry a derivation. What that costs is one step
+	/// between a world being restored and its ground existing, and what it
+	/// buys is that a landscape is nine numbers in a save rather than twelve
+	/// megabytes. @ref `colby_runtime::terrain`.
+	pub terrain: Terrain,
+
 	/// Which entry of [`SceneData::posed`] moves it, or [`NO_INDEX`].
 	pub pose: u32,
 
@@ -241,6 +257,7 @@ impl Default for Thing {
 			light: Light::NONE,
 			emitter: Emitter::NONE,
 			emitter_texture: String::new(),
+			terrain: Terrain::NONE,
 			pose: NO_INDEX,
 			parent: NO_INDEX,
 		}
@@ -1217,6 +1234,11 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 				.map(|emitter| emitter.texture)
 				.and_then(|handle| world.textures.get(handle))
 				.map_or_else(String::new, |entry| entry.name().to_owned()),
+			terrain: world
+				.entities
+				.terrain(id)
+				.copied()
+				.unwrap_or(Terrain::NONE),
 			pose: pose_of
 				.get(renderable.pose.slot())
 				.copied()
@@ -1502,6 +1524,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 		world
 			.entities
 			.set_emitter(*id, emitter(world, thing));
+		world.entities.set_terrain(*id, thing.terrain);
 	}
 
 	for (id, solid) in solids.iter().zip(&scene.solids) {
@@ -1683,6 +1706,7 @@ fn grafted_things(world: &mut World, piece: &SceneData) -> Vec<EntityId> {
 			world
 				.entities
 				.set_emitter(id, emitter(world, thing));
+			world.entities.set_terrain(id, thing.terrain);
 
 			id
 		})
@@ -2321,6 +2345,11 @@ fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> 
 	world
 		.entities
 		.set_emitter(id, emitter(world, thing));
+	// and the ground, which needs no lookup at all: a terrain names nothing.
+	// What it *builds* is not made here - the runtime's sync notices the record
+	// on the next step and puts a mesh and a body under it, which is the same
+	// path a terrain somebody typed into an inspector takes.
+	world.entities.set_terrain(id, thing.terrain);
 
 	id
 }

@@ -49,7 +49,8 @@ use colby_core::{
 	Result,
 	abi::{
 		BodyKind, Camera, Emitter, EmitterKind, JointKind, Layers, Light, LightKind, Post,
-		ShapeKind, Sky, SkyKind, SparkBlend, TextureId, ToneMap, Transform, Water, WaterKind,
+		ShapeKind, Sky, SkyKind, SparkBlend, Terrain, TerrainKind, TextureId, ToneMap, Transform,
+		Water, WaterKind,
 		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
@@ -70,14 +71,14 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// different number is refused with a message rather than read as if it
 /// agreed.
 ///
-/// Eleven since an entity record can say what it throws off.
-pub const FORMAT_VERSION: u32 = 11;
+/// Twelve since an entity record can say what ground it is.
+pub const FORMAT_VERSION: u32 = 12;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
 
 /// How big [`SceneHeader`] is, and where the first block starts.
-pub const HEADER_BYTES: usize = 192;
+pub const HEADER_BYTES: usize = 208;
 
 /// The bit in [`SceneHeader::flags`] that says the file carries a game's arena.
 ///
@@ -264,22 +265,38 @@ pub struct SceneHeader {
 	/// this one wrote none at all.
 	pub shed_count: u32,
 
+	/// Bytes per terrain record. Must be `size_of::<Sod>()`.
+	pub sod_stride: u32,
+
+	/// Where the terrain block starts.
+	pub sod_offset: u32,
+
+	/// How many entities were ground.
+	///
+	/// One record per terrain rather than a wider entity record, for the
+	/// light block's reason and with far more of it behind it: being ground
+	/// is the rarest thing an entity does - a world has one or none - and
+	/// every version before this one wrote none at all.
+	pub sod_count: u32,
+
 	/// Nothing, and written as nothing.
 	///
-	/// Two of them now. Kept so the header stays a multiple of sixteen: the
+	/// Three of them now. Kept so the header stays a multiple of sixteen: the
 	/// light block took the header's last three spare words, the water block
-	/// grew it by four and left one over, and this block took that one and
-	/// three more - which lands on a hundred and ninety-two with two to
-	/// spare. A reader ignores them and a writer zeroes them, which is what
-	/// makes them the first words the next block added takes rather than
-	/// fields anybody has to think about.
-	pub spare: [u32; 2],
+	/// grew it by four and left one over, the emitter block took that one and
+	/// three more, and this block took the two those left and two more - which
+	/// lands on two hundred and eight with three to spare. A reader ignores
+	/// them and a writer zeroes them, which is what makes them the first words
+	/// the next block added takes rather than fields anybody has to think
+	/// about.
+	pub spare: [u32; 3],
 }
 
 // the light block took the header's last three spare words, the water block
-// grew it by four and left one over, and the emitter block took that one and
-// three more - a hundred and ninety-two bytes with two words to spare. The
-// next block added takes those two and two more.
+// grew it by four and left one over, the emitter block took that one and three
+// more, and the terrain block took the two those left and two more - two
+// hundred and eight bytes with three words to spare. The next block added takes
+// those three and, if it needs a fourth, four more.
 //
 // the blocks after the header inherit the buffer's alignment only because the
 // header is a multiple of it, and a field added without shrinking the spare
@@ -442,6 +459,67 @@ pub struct Stood {
 	/// own. Its position, rotation and scale are then its place inside that
 	/// entity.
 	pub parent: u32,
+}
+
+/// One entity's terrain, as the file holds it.
+///
+/// Written only for an entity that is ground, so the ordinary world carries
+/// none of these at all. **What is not here is the geometry**, and that is the
+/// point of the whole card: the mesh a terrain builds is a function of these
+/// nine numbers, so writing it down would be writing down a derivation - and a
+/// megabyte of it. `colby_runtime::terrain` builds it back on the first step
+/// after a load, which is also the step the body's mesh handle is corrected on.
+///
+/// The body itself **is** written, like any other body, and that is not a
+/// contradiction: it is a thing in the world with a name, a layer mask and a
+/// friction somebody may have changed, and the only field of it the terrain
+/// owns is which mesh it collides against.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Sod {
+	/// Which entry of the entity block this belongs to.
+	pub thing: u32,
+
+	/// What shape of ground it is, as
+	/// [`TerrainKind`](colby_core::abi::TerrainKind) in declaration order.
+	///
+	/// A record is only written for ground, so nothing here should be the
+	/// `none` word - but a reader that finds one takes it, for the reason
+	/// [`Lit::kind`] gives.
+	pub kind: u32,
+
+	/// How wide the ground is on a side, in world units.
+	pub size: f32,
+
+	/// How far it rises and falls from end to end.
+	pub height: f32,
+
+	/// How many vertices there are on each side.
+	pub side: u32,
+
+	/// What the noise is seeded with.
+	pub seed: u32,
+
+	/// How many hills fit across it.
+	pub frequency: f32,
+
+	/// How many octaves are summed.
+	pub octaves: u32,
+
+	/// How loud each octave is against the last.
+	pub roughness: f32,
+
+	/// How many units of ground one texture repeat covers.
+	pub tiling: f32,
+
+	/// Whether anything can stand on it, as one or nought.
+	///
+	/// A word rather than a byte, because every other field of every other
+	/// record here is four bytes wide and a `bool` in a `repr(C)` struct is a
+	/// hole waiting for a padding byte to be read as data. Anything but nought
+	/// is read as `true`, which is the rule a flag bit already keeps.
+	pub solid: u32,
 }
 
 /// One entity's light, as the file holds it.
@@ -871,6 +949,10 @@ impl SceneFile {
 	#[must_use]
 	pub fn shed(&self) -> &[Shed] { self.block(self.header.shed_offset, self.header.shed_count) }
 
+	/// Every terrain record.
+	#[must_use]
+	pub fn sod(&self) -> &[Sod] { self.block(self.header.sod_offset, self.header.sod_count) }
+
 	/// The body block.
 	#[must_use]
 	pub fn bulk(&self) -> &[Bulk] { self.block(self.header.bulk_offset, self.header.bulk_count) }
@@ -1033,6 +1115,17 @@ impl SceneFile {
 			}
 		}
 
+		// and the ground last of the three, in the file's own order again. It
+		// names no asset at all, so there is nothing beside it to look up.
+		for record in self.sod() {
+			if let Some(thing) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+			{
+				thing.terrain = terrain_of(record);
+			}
+		}
+
 		// the bodies first and the water into them afterwards, for the reason
 		// the lights go onto the entities afterwards and by the same rule: a
 		// record naming a place the body block does not have is dropped rather
@@ -1109,6 +1202,8 @@ impl SceneFile {
 			// and the same, out of the emitter block.
 			emitter: Emitter::NONE,
 			emitter_texture: String::new(),
+			// and the same again, out of the terrain block.
+			terrain: Terrain::NONE,
 			pose: stood.pose,
 			parent: stood.parent,
 		}
@@ -1260,19 +1355,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	let stood: Vec<Stood> = data
 		.things
 		.iter()
-		.map(|thing| Stood {
-			name: names.put(&thing.name),
-			slot: thing.slot,
-			generation: thing.generation,
-			mesh: names.put(&thing.mesh),
-			material: names.put(&thing.material),
-			position: thing.transform.position.to_array(),
-			rotation: thing.transform.rotation.to_array(),
-			scale: thing.transform.scale.to_array(),
-			color: thing.color.to_array(),
-			pose: thing.pose,
-			parent: thing.parent,
-		})
+		.map(|thing| stood_of(thing, &mut names))
 		.collect();
 	// one record per lamp, and the index is the entity's place in the block
 	// above rather than its slot: a piece grafted somewhere else keeps its
@@ -1294,6 +1377,15 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		.enumerate()
 		.filter(|(_, thing)| thing.emitter.kind.throws())
 		.map(|(index, thing)| shed_of(index, thing, &mut names))
+		.collect::<Result<Vec<_>>>()?;
+	// and one per entity that is ground, keyed the same way and for the same
+	// reason.
+	let sod: Vec<Sod> = data
+		.things
+		.iter()
+		.enumerate()
+		.filter(|(_, thing)| thing.terrain.is_ground())
+		.map(|(index, thing)| sod_of(index, thing))
 		.collect::<Result<Vec<_>>>()?;
 	let bulk: Vec<Bulk> = data
 		.solids
@@ -1340,6 +1432,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		stood: &stood,
 		lit: &lit,
 		shed: &shed,
+		sod: &sod,
 		bulk: &bulk,
 		wet: &wet,
 		tie: &tie,
@@ -1357,6 +1450,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::cast_slice(&stood));
 	out.extend_from_slice(bytemuck::cast_slice(&lit));
 	out.extend_from_slice(bytemuck::cast_slice(&shed));
+	out.extend_from_slice(bytemuck::cast_slice(&sod));
 	out.extend_from_slice(bytemuck::cast_slice(&bulk));
 	out.extend_from_slice(bytemuck::cast_slice(&wet));
 	out.extend_from_slice(bytemuck::cast_slice(&tie));
@@ -1380,6 +1474,7 @@ struct Places {
 	stood: usize,
 	lit: usize,
 	shed: usize,
+	sod: usize,
 	bulk: usize,
 	wet: usize,
 	tie: usize,
@@ -1399,6 +1494,7 @@ impl Places {
 			stood,
 			lit,
 			shed,
+			sod,
 			bulk,
 			wet,
 			tie,
@@ -1416,7 +1512,9 @@ impl Places {
 		// and the emitters beside the lights, for the same argument: both hang
 		// off an entity and both are read once the entity table is back.
 		let shed_at = lit_at + size_of_val(lit);
-		let bulk_at = shed_at + size_of_val(shed);
+		// and the ground beside both, for the same argument a third time.
+		let sod_at = shed_at + size_of_val(shed);
+		let bulk_at = sod_at + size_of_val(sod);
 		let wet_at = bulk_at + size_of_val(bulk);
 		let tie_at = wet_at + size_of_val(wet);
 		let bent_at = tie_at + size_of_val(tie);
@@ -1438,6 +1536,7 @@ impl Places {
 			stood: stood_at,
 			lit: lit_at,
 			shed: shed_at,
+			sod: sod_at,
 			bulk: bulk_at,
 			wet: wet_at,
 			tie: tie_at,
@@ -1457,6 +1556,7 @@ struct Blocks<'a> {
 	stood: &'a [Stood],
 	lit: &'a [Lit],
 	shed: &'a [Shed],
+	sod: &'a [Sod],
 	bulk: &'a [Bulk],
 	wet: &'a [Wet],
 	tie: &'a [Tie],
@@ -1477,6 +1577,7 @@ fn head(
 		stood,
 		lit,
 		shed,
+		sod,
 		bulk,
 		wet,
 		tie,
@@ -1544,7 +1645,10 @@ fn head(
 		shed_stride: width::<Shed>("a scene's records")?,
 		shed_offset: count(places.shed, "a scene's records")?,
 		shed_count: count(shed.len(), "a scene's records")?,
-		spare: [0; 2],
+		sod_stride: width::<Sod>("a scene's records")?,
+		sod_offset: count(places.sod, "a scene's records")?,
+		sod_count: count(sod.len(), "a scene's records")?,
+		spare: [0; 3],
 	})
 }
 
@@ -1800,6 +1904,74 @@ fn shed_of(index: usize, thing: &Thing, names: &mut Names) -> Result<Shed> {
 	})
 }
 
+/// One entity, as a record, with its three names put in the blob.
+///
+/// Lifted out of [`encode`] rather than left inline, because that function
+/// counts its lines and this is the longest of the six things it builds.
+///
+/// @param thing - the description it came off
+/// @param names - the blob its name, mesh and material are appended to
+fn stood_of(thing: &Thing, names: &mut Names) -> Stood {
+	Stood {
+		name: names.put(&thing.name),
+		slot: thing.slot,
+		generation: thing.generation,
+		mesh: names.put(&thing.mesh),
+		material: names.put(&thing.material),
+		position: thing.transform.position.to_array(),
+		rotation: thing.transform.rotation.to_array(),
+		scale: thing.transform.scale.to_array(),
+		color: thing.color.to_array(),
+		pose: thing.pose,
+		parent: thing.parent,
+	}
+}
+
+/// One entity's terrain, as a record.
+///
+/// No blob at all, which is the one thing here that differs from
+/// [`shed_of`]: a terrain names no asset. What it is made of is the entity's
+/// own material, already written into its [`Stood`].
+///
+/// @param index - the entity's place in the entity block
+/// @param thing - the description it came off
+fn sod_of(index: usize, thing: &Thing) -> Result<Sod> {
+	let terrain = thing.terrain;
+
+	Ok(Sod {
+		thing: count(index, "a scene's records")?,
+		kind: terrain.kind.index(),
+		size: terrain.size,
+		height: terrain.height,
+		side: terrain.side,
+		seed: terrain.seed,
+		frequency: terrain.frequency,
+		octaves: terrain.octaves,
+		roughness: terrain.roughness,
+		tiling: terrain.tiling,
+		solid: u32::from(terrain.solid),
+	})
+}
+
+/// One terrain record, as a description holds it.
+fn terrain_of(record: &Sod) -> Terrain {
+	Terrain {
+		kind: TerrainKind::at(record.kind).unwrap_or(TerrainKind::None),
+		size: record.size,
+		height: record.height,
+		side: record.side,
+		seed: record.seed,
+		frequency: record.frequency,
+		octaves: record.octaves,
+		roughness: record.roughness,
+		tiling: record.tiling,
+		// anything but nought, for a flag bit's reason: a byte written by a
+		// later version that means something more is still, today, a terrain
+		// somebody can stand on.
+		solid: record.solid != 0,
+	}
+}
+
 /// One emitter record, as a description holds it.
 ///
 /// The picture is left to the caller, which is the one thing here that needs
@@ -2029,6 +2201,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 		(header.stood_stride, size_of::<Stood>(), "entities"),
 		(header.lit_stride, size_of::<Lit>(), "lights"),
 		(header.shed_stride, size_of::<Shed>(), "emitters"),
+		(header.sod_stride, size_of::<Sod>(), "terrains"),
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
 		(header.wet_stride, size_of::<Wet>(), "waters"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
@@ -2211,6 +2384,7 @@ mod tests {
 				light: Light::point(Vec3::new(1.0, 0.9, 0.7), 2.5, 12.0),
 				emitter: Emitter::NONE,
 				emitter_texture: String::new(),
+				terrain: Terrain::NONE,
 				pose: 0,
 				parent: scene::NO_INDEX,
 			},
@@ -2252,6 +2426,20 @@ mod tests {
 					..Emitter::cone(40.5, 2.25, 0.35)
 				},
 				emitter_texture: "textures/smoke".to_owned(),
+				// on the second one for the light's reason, and with every
+				// number moved off its default for the emitter's
+				terrain: Terrain {
+					size: 96.5,
+					height: 12.25,
+					side: 65,
+					seed: 7,
+					frequency: 5.5,
+					octaves: 3,
+					roughness: 0.35,
+					tiling: 4.5,
+					solid: false,
+					..Terrain::hills()
+				},
 				pose: scene::NO_INDEX,
 				// hanging off the first, so the field carries something a
 				// round trip could lose
@@ -2737,6 +2925,103 @@ mod tests {
 		);
 	}
 
+	/// The sample written out, with one word of its first terrain record
+	/// overwritten.
+	///
+	/// @param at - the record's own field offset, in bytes
+	/// @param word - what to put there
+	fn sod_word_changed(at: usize, word: u32) -> SceneData {
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let first = usize::try_from(header.sod_offset).expect("it is an offset") + at;
+
+		assert_eq!(header.sod_count, 1, "the sample carries one terrain");
+		bytes[first..first + 4].copy_from_slice(&word.to_le_bytes());
+
+		SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a changed word is not a broken file")
+			.to_scene_data()
+	}
+
+	#[test]
+	fn a_terrain_is_written_against_its_place_in_the_entity_block_and_not_its_slot() {
+		// the same trap the light and the emitter blocks both have: the
+		// sample's ground is on the second entity, whose slot is two and whose
+		// place in the block is one.
+		let data = sample();
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+
+		assert_eq!(header.sod_count, 1, "one entity is ground");
+		assert_eq!(file.sod()[0].thing, 1, "and it is the second entry, not slot two");
+		assert_eq!(
+			round_trip(&data).things[1].terrain,
+			data.things[1].terrain,
+			"and every number of it comes back"
+		);
+	}
+
+	#[test]
+	fn a_world_with_no_ground_writes_no_terrain_block_at_all() {
+		let mut data = sample();
+		for thing in &mut data.things {
+			thing.terrain = Terrain::NONE;
+		}
+
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+
+		assert_eq!(header.sod_count, 0, "nothing is ground, so nothing is written down");
+		assert_eq!(round_trip(&data), data, "and it comes back the same way");
+	}
+
+	#[test]
+	fn a_terrain_naming_an_entity_that_is_not_there_is_dropped() {
+		let read = sod_word_changed(offset_of!(Sod, thing), 99);
+
+		assert_eq!(read.things[1].terrain, Terrain::NONE, "the record went nowhere");
+	}
+
+	#[test]
+	fn a_terrain_of_a_kind_this_build_does_not_know_reads_as_no_terrain() {
+		let read = sod_word_changed(offset_of!(Sod, kind), 9);
+
+		assert_eq!(
+			read.things[1].terrain.kind,
+			TerrainKind::None,
+			"a word this build has no spelling for is no ground"
+		);
+		assert!(
+			(read.things[1].terrain.height - 12.25).abs() < 1.0e-4,
+			"and the numbers beside it are still read, the way a light's are"
+		);
+	}
+
+	#[test]
+	fn anything_but_nought_in_the_solid_word_is_ground_to_stand_on() {
+		// a flag's rule rather than a code's: a later version writing something
+		// more into this word still means a terrain somebody can stand on.
+		let read = sod_word_changed(offset_of!(Sod, solid), 7);
+
+		assert!(read.things[1].terrain.solid, "seven is not nought");
+	}
+
+	#[test]
+	fn a_terrain_carries_none_of_its_geometry_into_the_file() {
+		// the whole argument of the card, as a number: a default terrain is
+		// thirty-two thousand triangles and the file it is written into is
+		// nine kilobytes.
+		let mut data = sample();
+		data.things[1].terrain = Terrain::hills();
+
+		let bytes = encode(&data).expect("it fits in one file");
+
+		assert!(data.things[1].terrain.triangles() > 30_000, "the terrain really is a big one");
+		assert!(bytes.len() < 64 * 1024, "and the file is {} bytes", bytes.len());
+	}
+
 	#[test]
 	fn an_emitter_naming_an_entity_that_is_not_there_is_dropped() {
 		let read = shed_word_changed(offset_of!(Shed, thing), 99);
@@ -2786,7 +3071,7 @@ mod tests {
 		let bytes = encode(&sample()).expect("it fits in one file");
 		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
 
-		assert_eq!(header.spare, [0; 2], "and a writer zeroes what it does not use");
+		assert_eq!(header.spare, [0; 3], "and a writer zeroes what it does not use");
 		assert!(
 			header.shed_offset > header.lit_offset,
 			"the emitters are written after the lights"

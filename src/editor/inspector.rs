@@ -22,7 +22,7 @@ use colby_asset::Project;
 use colby_core::{
 	abi::{
 		Body, BodyId, Emitter, EntityId, Field, Joint, JointId, Light, Material, MaterialId,
-		ModelId, Post, Renderable, Sky, TextureId, Transform, World,
+		ModelId, Post, Renderable, Sky, Terrain, TextureId, Transform, World,
 		field::{Kind, Value},
 		scene::{self, Stage},
 	},
@@ -97,6 +97,7 @@ fn detail(
 			look(ui, world, id, history);
 			lamp(ui, world, id, history);
 			thrower(ui, world, id, history);
+			land(ui, world, id, history);
 		},
 		| Pick::Body(id) => {
 			naming(ui, world, pick, history, rename);
@@ -253,6 +254,25 @@ fn thrower(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) 
 	if inspect(ui, "emitter", &mut emitter, Emitter::FIELDS) {
 		history.begin("emitter", world);
 		world.entities.set_emitter(id, emitter);
+	}
+}
+
+/// What ground an entity is, if any.
+///
+/// Always drawn, for the light's reason a third time. **What a change here
+/// costs is not a field write**: the runtime notices the new record on the next
+/// step and rebuilds the mesh, so dragging `side` through five hundred rebuilds
+/// half a million triangles once per drag event. That is what the ceiling in
+/// `colby_core::abi::terrain` is for, and it is the reason this section has no
+/// live preview of its own - the world *is* the preview.
+fn land(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+	let Some(mut terrain) = world.entities.terrain(id).copied() else {
+		return;
+	};
+
+	if inspect(ui, "terrain", &mut terrain, Terrain::FIELDS) {
+		history.begin("terrain", world);
+		world.entities.set_terrain(id, terrain);
 	}
 }
 

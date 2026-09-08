@@ -77,7 +77,7 @@ use colby_core::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, Emitter, EntityId, Field, Joint, JointKind, Layers,
-		Light, MeshId, Post, Renderable, Shape, Sky, Transform,
+		Light, MeshId, Post, Renderable, Shape, Sky, Terrain, Transform,
 		field::{self, Kind},
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
@@ -264,7 +264,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 		check(
 			entry,
 			&[names(Transform::FIELDS, &[]), names(Renderable::FIELDS, &[])],
-			&["name", "parent", "light", "emitter"],
+			&["name", "parent", "light", "emitter", "terrain"],
 			"an entity",
 		)?;
 
@@ -319,6 +319,16 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			String::new()
 		};
 
+		// and the ground under a key of its own, for the emitter's reason: a
+		// terrain has a `size` and a `height`, and both words are spoken for
+		// elsewhere in this file. Nothing by hand here at all - a terrain
+		// names no asset, so every field goes through the table.
+		let mut terrain = Terrain::NONE;
+		if let Some(ground) = entry.get("terrain") {
+			check(ground, &[names(Terrain::FIELDS, &[])], &[], "a terrain")?;
+			read(&mut terrain, ground, Terrain::FIELDS, "a terrain")?;
+		}
+
 		things.push(Thing {
 			name,
 			slot: count(index, "a scene's records")?,
@@ -330,6 +340,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			light: lamp,
 			emitter,
 			emitter_texture: picture,
+			terrain,
 			pose,
 			parent: NO_INDEX,
 		});
@@ -1158,6 +1169,22 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> R
 			| _ => None,
 		},
 	)?;
+	// and the ground under its own key, on the same terms and with nothing by
+	// hand: a terrain names no asset, so there is no reference for the closure
+	// to write. An entity that is not ground matches the default in every
+	// field and so gets no object at all.
+	put_all(
+		&mut rows,
+		&thing.terrain,
+		&Terrain::NONE,
+		Terrain::FIELDS,
+		&Writing {
+			prefix: "terrain.",
+			what: "an entity's terrain",
+			skipped: &[],
+		},
+		|_| None,
+	)?;
 
 	Ok(rows.text())
 }
@@ -1565,8 +1592,8 @@ pub(crate) fn as_text(value: &str) -> String { json::quoted(value) }
 #[cfg(test)]
 mod tests {
 	use colby_core::abi::{
-		EmitterKind, LightKind, ShapeKind, SkyKind, SparkBlend, TextureId, ToneMap, Water,
-		WaterKind, scene::Form,
+		EmitterKind, LightKind, ShapeKind, SkyKind, SparkBlend, TerrainKind, TextureId, ToneMap,
+		Water, WaterKind, scene::Form,
 	};
 
 	use super::*;
@@ -2762,6 +2789,75 @@ mod tests {
 			"and the crate, whose emitter is the default, gets no key at all"
 		);
 		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_terrain_is_read_out_of_its_own_object_and_written_back_into_one() {
+		let scene = import(
+			r#"{ "entities": [
+				{ "name": "ground", "material": "grass", "terrain": {
+					"kind": "noise", "size": 96, "height": 12, "side": 65,
+					"seed": 7, "frequency": 5.5, "octaves": 3,
+					"roughness": 0.35, "tiling": 4, "solid": true } },
+				{ "name": "crate", "mesh": "cube" }
+			] }"#,
+		)
+		.expect("it is a scene");
+
+		let ground = scene.things[0].terrain;
+
+		assert_eq!(ground.kind, TerrainKind::Noise, "the word is the kind");
+		assert_eq!(ground.side, 65, "and every number beside it");
+		assert_eq!(ground.seed, 7);
+		assert!((ground.height - 12.0).abs() < 1.0e-4);
+		assert_eq!(
+			scene.things[0].material, "grass",
+			"what the ground is made of is the entity's own material, not a field of its own"
+		);
+		assert_eq!(scene.things[1].terrain, Terrain::NONE, "and a crate is not ground");
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains("\"terrain\": {"), "the ground is written under its own key");
+		assert_eq!(
+			text.matches("\"terrain\": {").count(),
+			1,
+			"and the crate, whose terrain is the default, gets no key at all"
+		);
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_terrain_field_nobody_declared_is_refused_by_name() {
+		let refused = import(r#"{ "entities": [ { "terrain": { "erosion": 2 } } ] }"#)
+			.expect_err("a terrain has no erosion");
+
+		assert!(
+			format!("{refused}").contains("erosion"),
+			"and the message says which word it was: {refused}"
+		);
+	}
+
+	#[test]
+	fn a_terrain_resolution_a_mesh_could_not_hold_is_clamped_rather_than_refused() {
+		// the field row clamps where the emitter's `cap` refuses, and the
+		// difference is what the wrong answer costs: a cap of minus one is
+		// somebody asking for something impossible, where a side of a million
+		// is somebody asking for something bigger than this build makes.
+		let scene =
+			import(r#"{ "entities": [ { "terrain": { "kind": "noise", "side": 100000 } } ] }"#)
+				.expect("a big number is not a broken file");
+
+		assert_eq!(scene.things[0].terrain.side, colby_core::abi::terrain::MAX_SIDE);
+	}
+
+	#[test]
+	fn a_negative_terrain_resolution_is_refused_rather_than_read_as_nought() {
+		let refused =
+			import(r#"{ "entities": [ { "terrain": { "kind": "noise", "side": -1 } } ] }"#)
+				.expect_err("a side of minus one is not a landscape");
+
+		assert!(format!("{refused}").contains("side"), "{refused}");
 	}
 
 	#[test]

@@ -19,7 +19,7 @@ use colby_physics::Simulation;
 use colby_script::Vm;
 use colby_ui::Interface;
 
-use crate::{game::Game, net::Net};
+use crate::{game::Game, net::Net, terrain::Ground};
 
 /// Everything a step drives that outlives it.
 ///
@@ -73,6 +73,14 @@ pub(crate) struct Parts<'a> {
 	/// screenshot reproducible.
 	pub(crate) audio: Option<&'a mut Device>,
 
+	/// What the world's terrain records have been built into.
+	///
+	/// A borrow because the caller keeps it across steps, exactly as `sparked`
+	/// below is - and it is read every step on **both** sides of the edit-mode
+	/// guard, which is the one thing that makes ground different from a cloud.
+	/// @ref `crate::terrain`.
+	pub(crate) ground: &'a mut Ground,
+
 	/// Where to leave how long the particles took.
 	///
 	/// A borrow rather than a return, because the caller keeps it across steps
@@ -110,6 +118,7 @@ pub(crate) fn run(
 		simulation,
 		audio,
 		wire,
+		ground,
 		sparked,
 	} = parts;
 
@@ -166,6 +175,16 @@ pub(crate) fn run(
 	if let Some(scripts) = scripts.as_deref_mut() {
 		scripts.interface(world);
 	}
+
+	// the terrain's geometry before any of it, and **outside** the edit-mode
+	// guard below. A terrain is a description and its mesh is derived from it,
+	// so a person who has just dragged the height slider has to see the hill
+	// move while the world is stopped - which is the whole difference between
+	// this and the particles further down. Before the solver too, so that
+	// ground built this step is ground this step's bodies land on rather than
+	// fall through. It does nothing at all in a world with no terrain in it,
+	// which is every world but one. @ref `crate::terrain`.
+	crate::terrain::sync(world, ground);
 
 	// and the physics before the game too, and for a related reason: what
 	// `update` reads is then the world as it now stands, and a trace it fires
@@ -375,12 +394,14 @@ mod tests {
 	/// Runs one step of a client at a moment on the wire's clock.
 	fn stepped_at(net: &mut Net, world: &mut World, simulation: &mut Simulation, now: u64) {
 		let mut sparked = Duration::ZERO;
+		let mut ground = Ground::new();
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
 			scripts: None,
 			simulation,
 			audio: None,
+			ground: &mut ground,
 			sparked: &mut sparked,
 			wire: Some(Wired { net, now: Duration::from_millis(now) }),
 		};
@@ -406,12 +427,14 @@ mod tests {
 	/// the step body rather than about the wire.
 	fn plain(world: &mut World, simulation: &mut Simulation, editing: bool) {
 		let mut sparked = Duration::ZERO;
+		let mut ground = Ground::new();
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
 			scripts: None,
 			simulation,
 			audio: None,
+			ground: &mut ground,
 			sparked: &mut sparked,
 			wire: None,
 		};
@@ -654,12 +677,14 @@ mod tests {
 			let time = (colby_core::time::STEP * ended).as_secs_f32();
 
 			let mut sparked = Duration::ZERO;
+			let mut ground = Ground::new();
 			let parts = Parts {
 				game: None,
 				interface: &mut interface,
 				scripts: None,
 				simulation,
 				audio: None,
+				ground: &mut ground,
 				sparked: &mut sparked,
 				wire: None,
 			};
@@ -708,12 +733,14 @@ mod tests {
 		let mut interface = Interface::new();
 		for _ in 0..20 {
 			let mut sparked = Duration::ZERO;
+			let mut ground = Ground::new();
 			let parts = Parts {
 				game: None,
 				interface: &mut interface,
 				scripts: Some(&mut scripts),
 				simulation: &mut simulation,
 				audio: None,
+				ground: &mut ground,
 				sparked: &mut sparked,
 				wire: None,
 			};
@@ -838,12 +865,14 @@ mod tests {
 
 			for _ in 0..6 {
 				let mut sparked = Duration::ZERO;
+				let mut ground = Ground::new();
 				let parts = Parts {
 					game: None,
 					interface: &mut interface,
 					scripts: None,
 					simulation: &mut simulation,
 					audio: None,
+					ground: &mut ground,
 					sparked: &mut sparked,
 					wire: None,
 				};
@@ -943,12 +972,14 @@ mod tests {
 		let mut scripts =
 			Vm::new(colby_core::abi::console::defer).expect("the interpreter starts");
 		let mut sparked = Duration::ZERO;
+		let mut ground = Ground::new();
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
 			scripts: Some(&mut scripts),
 			simulation,
 			audio: None,
+			ground: &mut ground,
 			sparked: &mut sparked,
 			wire: None,
 		};

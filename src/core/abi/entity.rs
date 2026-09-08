@@ -33,6 +33,7 @@ use super::{
 	names::Names,
 	particles::Emitter,
 	pose::PoseId,
+	terrain::Terrain,
 };
 use crate::{
 	bytemuck::{Pod, Zeroable},
@@ -374,6 +375,15 @@ pub struct Entities {
 	/// this is only the description of it. @ref
 	/// [`particles`](super::particles).
 	emitters: Vec<Emitter>,
+	/// What ground each slot is, or [`Terrain::NONE`] for a slot that is not
+	/// ground. The same slots again, and the light's argument a third time: a
+	/// terrain is rarer than an emitter and the array is still what the sync
+	/// walks. **What it built is not here** - the mesh is an entry in
+	/// [`Meshes`](super::Meshes) under a name and the body is a row in
+	/// [`Bodies`](super::Bodies), so a terrain that has been built is
+	/// indistinguishable from a hill somebody modeled. @ref
+	/// [`terrain`](super::terrain).
+	terrains: Vec<Terrain>,
 	/// What each slot hangs off, or [`EntityId::NONE`] for a thing standing
 	/// on its own. The same slots again. A handle rather than a slot number,
 	/// so that a parent which died and whose slot something else took is a
@@ -407,6 +417,7 @@ impl Entities {
 			renderables: Vec::new(),
 			lights: Vec::new(),
 			emitters: Vec::new(),
+			terrains: Vec::new(),
 			parents: Vec::new(),
 			names: Names::new(),
 			generations: Vec::new(),
@@ -449,6 +460,7 @@ impl Entities {
 		self.renderables[slot] = Renderable::NOTHING;
 		self.lights[slot] = Light::NONE;
 		self.emitters[slot] = Emitter::NONE;
+		self.terrains[slot] = Terrain::NONE;
 		// and it hangs off nothing, whatever the previous occupant did.
 		self.parents[slot] = EntityId::NONE;
 		// whatever the previous occupant of this slot was called is not what
@@ -479,6 +491,7 @@ impl Entities {
 		self.renderables[slot] = Renderable::NOTHING;
 		self.lights[slot] = Light::NONE;
 		self.emitters[slot] = Emitter::NONE;
+		self.terrains[slot] = Terrain::NONE;
 		self.parents[slot] = EntityId::NONE;
 		self.free.push(id.index);
 		self.live -= 1;
@@ -499,6 +512,8 @@ impl Entities {
 			self.renderables[slot] = Renderable::NOTHING;
 			self.lights[slot] = Light::NONE;
 			self.emitters[slot] = Emitter::NONE;
+			self.terrains[slot] = Terrain::NONE;
+			self.terrains[slot] = Terrain::NONE;
 			self.parents[slot] = EntityId::NONE;
 			if let Ok(index) = u32::try_from(slot) {
 				self.free.push(index);
@@ -628,6 +643,44 @@ impl Entities {
 		};
 
 		self.emitters[slot] = emitter;
+
+		true
+	}
+
+	/// What ground an entity is, or [`Terrain::NONE`] for one that is not
+	/// ground.
+	///
+	/// Every living slot answers this and almost every answer is the nothing,
+	/// exactly as [`emitter`](Self::emitter) is. @ref
+	/// [`terrain`](super::terrain) for why the mesh it describes is not in the
+	/// answer.
+	#[must_use]
+	pub fn terrain(&self, id: EntityId) -> Option<&Terrain> {
+		self.slot(id).map(|slot| &self.terrains[slot])
+	}
+
+	/// What ground an entity is, to change.
+	pub fn terrain_mut(&mut self, id: EntityId) -> Option<&mut Terrain> {
+		self.slot(id).map(|slot| &mut self.terrains[slot])
+	}
+
+	/// Makes an entity ground, or stops it being ground.
+	///
+	/// **What it had built is not touched here.** The mesh in the registry and
+	/// the body in the table both belong to whoever builds them, and that is
+	/// `colby_runtime::terrain` on the next step: it notices that the record
+	/// no longer matches what it built and unmakes it. This table has no reach
+	/// into either, exactly as it has none into the particle pool.
+	///
+	/// @param id - which entity
+	/// @param terrain - what ground it is; [`Terrain::NONE`] for none
+	/// @return `true` if the handle resolved
+	pub fn set_terrain(&mut self, id: EntityId, terrain: Terrain) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.terrains[slot] = terrain;
 
 		true
 	}
@@ -960,6 +1013,8 @@ impl Entities {
 		self.lights.resize(slots, Light::NONE);
 		self.emitters.clear();
 		self.emitters.resize(slots, Emitter::NONE);
+		self.terrains.clear();
+		self.terrains.resize(slots, Terrain::NONE);
 		self.parents.clear();
 		self.parents.resize(slots, EntityId::NONE);
 		self.names.reset(slots);
@@ -1019,6 +1074,8 @@ impl Entities {
 			self.renderables.push(Renderable::NOTHING);
 			self.lights.push(Light::NONE);
 			self.emitters.push(Emitter::NONE);
+			self.terrains.push(Terrain::NONE);
+			self.terrains.push(Terrain::NONE);
 			self.parents.push(EntityId::NONE);
 			self.names.push();
 			self.generations.push(0);
@@ -1071,6 +1128,7 @@ impl Entities {
 		// slots and plain records, and a light is set by handle afterwards.
 		self.lights[slot] = Light::NONE;
 		self.emitters[slot] = Emitter::NONE;
+		self.terrains[slot] = Terrain::NONE;
 		// off nothing until whoever put it back says otherwise, which a
 		// restore does once every record has landed. @ref `scene::restore`.
 		self.parents[slot] = EntityId::NONE;
@@ -1143,6 +1201,7 @@ impl Entities {
 		self.renderables.push(Renderable::NOTHING);
 		self.lights.push(Light::NONE);
 		self.emitters.push(Emitter::NONE);
+		self.terrains.push(Terrain::NONE);
 		self.parents.push(EntityId::NONE);
 		self.names.push();
 		self.generations.push(0);

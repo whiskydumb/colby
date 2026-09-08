@@ -956,6 +956,94 @@ mod tests {
 	}
 
 	#[test]
+	fn a_world_saved_with_its_ground_built_comes_back_with_one_terrain_and_one_body() {
+		// **the whole file path, which no unit test in `crate::terrain` reaches
+		// and no oracle here can see.** A `--shot` run serves console requests
+		// once, in its single frame, so a save and a load typed in the same run
+		// collapse into whichever was last - the live probe that was meant to
+		// drive this proved nothing, and this is what replaced it.
+		//
+		// What has to hold: the geometry is *not* in the file, the record is,
+		// and the sync after the load finds the body the file brought rather
+		// than making a second.
+		let project = project("terrain_round_trip");
+		let mut simulation = Box::new(Simulation::new());
+		let mut world = Box::new(console());
+		let mut ground = crate::terrain::Ground::new();
+
+		world.install_physics(simulation.table());
+
+		let hill = world.entities.spawn_at(Transform::IDENTITY);
+		let terrain = colby_core::abi::Terrain {
+			size: 24.0,
+			height: 5.0,
+			side: 33,
+			..colby_core::abi::Terrain::of(19)
+		};
+
+		world.entities.set_terrain(hill, terrain);
+		world.entities.set_name(hill, "ground");
+		crate::terrain::sync(&mut world, &mut ground);
+
+		assert_eq!(world.bodies.len(), 1, "the ground stands before it is saved");
+
+		let mesh = world.meshes.find("terrain.0");
+		let before = world
+			.meshes
+			.get(mesh)
+			.map(|entry| entry.value().triangles());
+
+		colby_core::abi::console::run(&mut world, "scene.save hills");
+		serve(&mut world, &mut simulation, &project);
+
+		let file = project
+			.saves()
+			.join("hills")
+			.with_extension(colby_asset::scene::EXTENSION);
+		let bytes = fs::metadata(&file)
+			.expect("a save was written")
+			.len();
+
+		// the geometry alone would be about seventy-five kilobytes: a thousand
+		// and eighty-nine vertices at forty-eight bytes each, and two thousand
+		// and forty-eight triangles at twelve. What is in the file is the
+		// record, and everything else in it is the fixed blocks a save has
+		// whatever is standing in it.
+		assert!(
+			bytes < 32 * 1024,
+			"a save of a terrain of {} triangles is {bytes} bytes: the geometry got into the \
+			 file",
+			terrain.triangles()
+		);
+
+		colby_core::abi::console::run(&mut world, "scene.load hills");
+		serve(&mut world, &mut simulation, &project);
+
+		assert_eq!(
+			world.entities.terrain(hill).map(|it| it.kind),
+			Some(colby_core::abi::TerrainKind::Noise),
+			"the record came back"
+		);
+
+		crate::terrain::sync(&mut world, &mut ground);
+
+		assert_eq!(world.bodies.len(), 1, "one body afterwards, not two");
+		assert_eq!(
+			world
+				.meshes
+				.get(world.meshes.find("terrain.0"))
+				.map(|entry| entry.value().triangles()),
+			before,
+			"and the same geometry under the same name"
+		);
+		assert_eq!(
+			world.entities.renderable(hill).map(|it| it.mesh),
+			Some(mesh),
+			"drawn with it, too"
+		);
+	}
+
+	#[test]
 	fn a_scene_line_waits_on_the_world_and_reads_as_what_it_asked_for() {
 		let mut world = console();
 

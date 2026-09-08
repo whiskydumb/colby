@@ -750,6 +750,14 @@ fn copy_entities(world: &mut World, sources: &[EntityId]) -> Vec<(EntityId, Enti
 			world.entities.set_emitter(copy, emitter);
 		}
 
+		// and its ground, beside both and on the same terms. What it *built*
+		// is not copied either, and for a reason nearer the emitter's than it
+		// looks: a mesh and a body are what a record turned into, and the copy
+		// gets its own pair on the next step under its own slot's name.
+		if let Some(terrain) = world.entities.terrain(source).copied() {
+			world.entities.set_terrain(copy, terrain);
+		}
+
 		let name = world.entities.name(source).to_owned();
 		world.entities.set_name(copy, &name);
 		copies.push((source, copy));

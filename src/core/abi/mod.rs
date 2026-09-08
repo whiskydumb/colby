@@ -50,6 +50,7 @@ pub mod script;
 pub mod skeleton;
 pub mod sky;
 pub mod state;
+pub mod terrain;
 pub mod texture;
 pub mod ui;
 pub mod water;
@@ -98,6 +99,7 @@ pub use self::{
 	},
 	sky::{Sky, SkyKind},
 	state::{GameState, Players},
+	terrain::{Terrain, TerrainKind},
 	texture::{Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},
 	water::{Water, WaterKind},
@@ -108,7 +110,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 59;
+pub const ABI_VERSION: u32 = 60;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";

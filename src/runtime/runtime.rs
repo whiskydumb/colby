@@ -47,6 +47,7 @@ use crate::{
 	launch::Asked,
 	net::{Net, Standing},
 	step,
+	terrain::Ground,
 };
 
 /// The viewport a process with no window lays its documents out against.
@@ -150,6 +151,16 @@ pub struct Runtime {
 	/// theirs in, so it lives beside the thing that drives them. @ref
 	/// `crate::sparks`.
 	pub(crate) sparked: Duration,
+
+	/// What the world's terrain records have been built into.
+	///
+	/// Beside `sparked` above and for the same reason, plus one of its own: it
+	/// is state rather than a measurement, and the state has nowhere else to
+	/// live. What a terrain *is* lives in the world; what has been *made* of it
+	/// lives in the world too, as a mesh and a body; this is only the note
+	/// saying which record they were made from, so that a step which changes
+	/// nothing costs a comparison. @ref `crate::terrain`.
+	pub(crate) ground: Ground,
 
 	/// The world as a snapshot describes it, taken down once a step rather
 	/// than allocated per snapshot. Empty off the wire.
@@ -274,6 +285,7 @@ impl Runtime {
 				// refuses a host anyway - so at that end this is which answer
 				// is given rather than whether one is.
 				wire: wired(self.net.as_mut(), moment),
+				ground: &mut self.ground,
 				sparked: &mut self.sparked,
 			},
 			input,
@@ -611,6 +623,7 @@ impl Opening {
 			net,
 			audio,
 			sparked: Duration::ZERO,
+			ground: Ground::new(),
 			records: Vec::new(),
 			started: Instant::now(),
 			project,
@@ -955,6 +968,7 @@ mod tests {
 				net: None,
 				audio: None,
 				sparked: Duration::ZERO,
+				ground: Ground::new(),
 				records: Vec::new(),
 				started: Instant::now(),
 				project: Project::parse(

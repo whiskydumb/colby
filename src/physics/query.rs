@@ -17,7 +17,7 @@
 
 use colby_core::{
 	abi::{Bodies, Body, BodyId, Shape, ShapeKind, TraceInfo, TraceResult, Transform},
-	glam::{Mat3, Vec3},
+	glam::{Mat3, Mat4, Vec3},
 };
 
 use crate::{
@@ -71,10 +71,16 @@ struct Hit {
 /// @param info - the trace
 /// @return the nearest contact, or a miss
 pub(crate) fn ray(bodies: &Bodies, simulation: &Simulation, info: &TraceInfo) -> TraceResult {
+	// one scratch for the whole trace rather than one per body, and empty
+	// until a mesh body is actually reached: `Vec::new` allocates nothing, so a
+	// world of boxes and balls pays for this exactly nothing. @ref
+	// [`Collider::candidates`].
+	let mut shards = Vec::new();
+
 	nearest(bodies, info, |id, body| {
 		let collider = simulation.collider(id);
 
-		ray_body(body, collider, info.start, info.end)
+		ray_body(body, collider, info.start, info.end, &mut shards)
 	})
 }
 
@@ -100,13 +106,15 @@ pub(crate) fn swept(bodies: &Bodies, simulation: &Simulation, info: &TraceInfo) 
 		extents: info.extents.abs(),
 	};
 
+	let mut shards = Vec::new();
+
 	nearest(bodies, info, |id, body| {
 		let collider = simulation.collider(id);
 		let (low, high) = world_bounds(body, collider)?;
 		let (low, high) = (low - sweep.extents, high + sweep.extents);
 		let (enter, exit, coarse) = span(sweep.start, sweep.direction, low, high)?;
 
-		refine(body, collider, sweep, (enter, exit), coarse)
+		refine(body, collider, sweep, (enter, exit), coarse, &mut shards)
 	})
 }
 
@@ -146,8 +154,13 @@ fn refine(
 	sweep: Sweep,
 	bracket: (f32, f32),
 	coarse: Vec3,
+	shards: &mut Vec<u32>,
 ) -> Option<Hit> {
-	let touching = |fraction: f32| overlap(body, collider, sweep.at(fraction), sweep.extents);
+	// the scratch is borrowed by the test, so the test is `FnMut` and `walk`
+	// below takes it by mutable reference. That is the whole cost of letting a
+	// swept box ask the grid instead of every triangle.
+	let mut touching =
+		|fraction: f32| overlap(body, collider, sweep.at(fraction), sweep.extents, shards);
 	let ended_solid = touching(1.0).is_some();
 
 	if touching(0.0).is_some() {
@@ -167,7 +180,8 @@ fn refine(
 	let reach = sweep.direction.length().max(EPSILON);
 	let stride = if thickness > EPSILON { thickness } else { SWEEP_STEP } / reach;
 
-	let Some((mut clear, mut solid, mut normal)) = walk(&touching, (enter, exit), stride) else {
+	let Some((mut clear, mut solid, mut normal)) = walk(&mut touching, (enter, exit), stride)
+	else {
 		// either nothing along the bracket touched it, or the walk ran out of
 		// samples before reaching the end of one. The second is the case that
 		// keeps the answer the bounds gave.
@@ -210,7 +224,7 @@ fn refine(
 /// @return the last fraction that was clear, the first that was not, and the
 /// normal there; `None` if nothing touched or the walk ran out of samples
 fn walk(
-	touching: &impl Fn(f32) -> Option<Vec3>,
+	touching: &mut impl FnMut(f32) -> Option<Vec3>,
 	bracket: (f32, f32),
 	stride: f32,
 ) -> Option<(f32, f32, Vec3)> {
@@ -246,8 +260,15 @@ fn count_of(index: usize) -> f32 { f32::from(u16::try_from(index).unwrap_or(u16:
 /// @param collider - its baked triangles, if it is a mesh
 /// @param at - where the box's middle is
 /// @param extents - its half-extents
+/// @param shards - the caller's scratch for a mesh's candidate triangles
 /// @return the surface normal out of the body, or `None` if they are apart
-fn overlap(body: &Body, collider: Option<&Collider>, at: Vec3, extents: Vec3) -> Option<Vec3> {
+fn overlap(
+	body: &Body,
+	collider: Option<&Collider>,
+	at: Vec3,
+	extents: Vec3,
+	shards: &mut Vec<u32>,
+) -> Option<Vec3> {
 	match body.shape.kind {
 		// the solver's ball rather than the ray's ellipsoid, deliberately. A
 		// sweep that disagreed with the solver about how big a ball is would put
@@ -258,7 +279,7 @@ fn overlap(body: &Body, collider: Option<&Collider>, at: Vec3, extents: Vec3) ->
 			&Hull::cuboid(&body.transform, body.shape.extents),
 		)
 		.map(|(normal, ..)| -normal),
-		| ShapeKind::Mesh => triangles(body, collider?, at, extents),
+		| ShapeKind::Mesh => triangles(body, collider?, at, extents, shards),
 	}
 }
 
@@ -288,20 +309,38 @@ fn ball(center: Vec3, radius: f32, at: Vec3, extents: Vec3) -> Option<Vec3> {
 
 /// Whether an axis-aligned box overlaps any triangle of a collision mesh.
 ///
-/// Linear, behind the same bounds rejection the narrow phase uses. A hierarchy
-/// goes in [`Collider`] when something wants one, and this does not change.
+/// Through the collider's grid, behind the same bounds rejection the narrow
+/// phase uses - and in the same order it always was, because a sweep answers
+/// with the **first** triangle it finds overlapping and another order would be
+/// another normal.
 ///
 /// @param body - the mesh body, for its transform
 /// @param collider - its baked triangles
 /// @param at - where the box's middle is
 /// @param extents - its half-extents
+/// @param shards - the caller's scratch for the candidates
 /// @return the normal out of the first triangle that overlaps, or `None`
-fn triangles(body: &Body, collider: &Collider, at: Vec3, extents: Vec3) -> Option<Vec3> {
+fn triangles(
+	body: &Body,
+	collider: &Collider,
+	at: Vec3,
+	extents: Vec3,
+	shards: &mut Vec<u32>,
+) -> Option<Vec3> {
 	let matrix = body.transform.matrix();
 	let cast = Hull::cuboid(&Transform::at(at), extents);
 	let (low, high) = (at - extents, at + extents);
+	let (near, far) = local_bounds(&matrix, low, high)?;
 
-	for corners in collider.triangles() {
+	collider.candidates(near, far, shards);
+
+	for shard in 0..shards.len() {
+		let Some(corners) = shards
+			.get(shard)
+			.and_then(|&it| collider.triangle(it))
+		else {
+			continue;
+		};
 		let placed = corners.map(|corner| matrix.transform_point3(corner));
 
 		if contact::apart(placed, low, high) {
@@ -385,7 +424,14 @@ fn nearest(
 /// @param collider - its baked triangles, if it is a mesh
 /// @param start - where the ray begins, in world space
 /// @param end - where it stops
-fn ray_body(body: &Body, collider: Option<&Collider>, start: Vec3, end: Vec3) -> Option<Hit> {
+/// @param shards - the caller's scratch for a mesh's candidate triangles
+fn ray_body(
+	body: &Body,
+	collider: Option<&Collider>,
+	start: Vec3,
+	end: Vec3,
+	shards: &mut Vec<u32>,
+) -> Option<Hit> {
 	let matrix = body.transform.matrix();
 	let inverse = matrix.inverse();
 
@@ -401,7 +447,7 @@ fn ray_body(body: &Body, collider: Option<&Collider>, start: Vec3, end: Vec3) ->
 	let (fraction, normal) = match body.shape.kind {
 		| ShapeKind::Box => local_box(local_start, local, body.shape.extents.abs()),
 		| ShapeKind::Sphere => local_sphere(local_start, local, body.shape.radius.abs()),
-		| ShapeKind::Mesh => collider.and_then(|it| it.trace(local_start, local)),
+		| ShapeKind::Mesh => collider.and_then(|it| it.trace(local_start, local, shards)),
 	}?;
 
 	let normals = Mat3::from_mat4(matrix).inverse().transpose();
@@ -670,14 +716,72 @@ pub(crate) fn world_bounds(body: &Body, collider: Option<&Collider>) -> Option<(
 	Some((low, high))
 }
 
+/// A world-space box in a body's own space, made axis-aligned again.
+///
+/// The eight corners through the inverse, and the bounds of where they land -
+/// conservative under rotation, which is exactly what a grid query wants and
+/// is the same trick [`world_bounds`] plays in the other direction.
+///
+/// @param matrix - the body's transform
+/// @param low - the box's low corner, in world space
+/// @param high - its high corner
+/// @return `(low, high)` in the body's own space, or `None` for a transform
+/// with no inverse
+pub(crate) fn local_bounds(matrix: &Mat4, low: Vec3, high: Vec3) -> Option<(Vec3, Vec3)> {
+	let inverse = matrix.inverse();
+
+	if !inverse.is_finite() {
+		return None;
+	}
+
+	let mut near = Vec3::splat(f32::INFINITY);
+	let mut far = Vec3::splat(f32::NEG_INFINITY);
+
+	for index in 0..8_u32 {
+		let corner = Vec3::new(
+			if index & 1 == 0 { low.x } else { high.x },
+			if index & 2 == 0 { low.y } else { high.y },
+			if index & 4 == 0 { low.z } else { high.z },
+		);
+		let placed = inverse.transform_point3(corner);
+
+		near = near.min(placed);
+		far = far.max(placed);
+	}
+
+	Some((near, far))
+}
+
 /// A body's geometry, baked once and kept in the body's own space.
 ///
 /// Its own copy rather than a look into [`Meshes`](colby_core::abi::Meshes),
 /// and that is a rule rather than an accident: recompiling an `.obj` replaces
 /// what is drawn and leaves what is collided against alone until the body is
-/// created again. A collision mesh is a resource with its own preparation - a
-/// hierarchy over it is the next thing that goes in here - not a second view
-/// onto a vertex buffer that may be halfway through being rewritten.
+/// created again. A collision mesh is a resource with its own preparation -
+/// the grid below is that preparation - not a second view onto a vertex buffer
+/// that may be halfway through being rewritten.
+///
+/// **The grid is what makes a mesh bigger than a floor usable at all.** Both
+/// things that read a collider used to walk every triangle it holds: the
+/// narrow phase transformed each one into world space to reject it against a
+/// box, and [`Collider::trace`] tested each one against the segment behind a
+/// single bounds check. At the thirty-two thousand triangles a default
+/// [`Terrain`](colby_core::abi::Terrain) builds, that is a per-pair cost in
+/// the hundreds of microseconds and a ray that pays for the whole landscape to
+/// find the hill in front of it. Both comments in this file said a hierarchy
+/// went here; this is it, and it is a uniform grid rather than a tree for the
+/// reason the broad phase is a sweep rather than a tree - it fits a flat list,
+/// it is a hundred lines, and the shape it is best at is exactly the shape
+/// terrain has.
+///
+/// **What comes out of it is the same set, in the same order, as walking them
+/// all.** [`candidates`](Self::candidates) hands back ascending triangle
+/// indices with no repeats, so the manifolds the narrow phase builds are the
+/// ones it built before and the solver walks them in the order it walked them
+/// in. That is not decoration: a sequential-impulse solver settles a pile
+/// differently if the order moves, and `--link` never steps a simulation, so a
+/// change there is a change nothing could see. Same discipline
+/// [`broad`](crate::broad) keeps for its pairs.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Collider {
 	/// Every triangle, in the body's own space.
@@ -688,7 +792,52 @@ pub(crate) struct Collider {
 
 	/// The high corner.
 	high: Vec3,
+
+	/// How many cells the grid has on each axis, all at least one.
+	divisions: [u32; 3],
+
+	/// How wide one cell is on each axis.
+	///
+	/// Kept rather than divided out per query: a query does three multiplies
+	/// by the reciprocal instead of three divisions, and the reciprocal of a
+	/// span that is nil would be an infinity that indexes nothing.
+	scale: Vec3,
+
+	/// Where each cell's triangles start in [`members`](Self::members), one
+	/// longer than the number of cells so the last cell has an end.
+	starts: Vec<u32>,
+
+	/// The triangle indices, cell by cell and ascending inside each cell.
+	///
+	/// A triangle whose bounds cross a cell boundary is filed in every cell it
+	/// touches, which is what makes a query conservative and is why
+	/// [`candidates`](Self::candidates) has to remove repeats.
+	members: Vec<u32>,
 }
+
+/// About how many triangles one cell should hold.
+///
+/// Four. Below it the grid is mostly empty cells and the `starts` array costs
+/// more than the walk it saves; above it a query hands the caller triangles it
+/// is going to reject anyway.
+const PER_CELL: usize = 4;
+
+/// The most cells a grid may have.
+///
+/// Two hundred and sixty-two thousand one hundred and forty-four, so the
+/// `starts` array is a megabyte at the very worst - which is the biggest mesh
+/// [`MAX_SIDE`](colby_core::abi::terrain::MAX_SIDE) allows and then some.
+const MAX_CELLS: usize = 262_144;
+
+/// The most cells on any one axis.
+///
+/// Two hundred and fifty-six, so that a mesh which is a thin sheet - a
+/// terrain is exactly that - cannot spend its whole cell budget along one
+/// direction.
+const MAX_AXIS: u32 = 256;
+
+/// Spans below this are treated as nil, and their axis gets one cell.
+const FLAT: f32 = 1.0e-6;
 
 impl Collider {
 	/// Bakes the triangles of a mesh.
@@ -710,31 +859,133 @@ impl Collider {
 			high = Vec3::ZERO;
 		}
 
-		Self { triangles, low, high }
+		let (divisions, scale) = shape_of(&triangles, low, high);
+		let (starts, members) = file(&triangles, low, divisions, scale);
+
+		Self {
+			triangles,
+			low,
+			high,
+			divisions,
+			scale,
+			starts,
+			members,
+		}
 	}
 
 	/// How many triangles this collides with.
 	pub(crate) fn count(&self) -> usize { self.triangles.len() }
 
 	/// Every triangle, in the body's own space.
+	///
+	/// The whole mesh, in order, with no grid in front of it: the one caller is
+	/// the debug renderer, which is drawing all of them on purpose.
 	pub(crate) fn triangles(&self) -> impl Iterator<Item = [Vec3; 3]> {
 		self.triangles.iter().copied()
 	}
 
-	/// A segment against every triangle.
+	/// One triangle, by the index [`candidates`](Self::candidates) handed out.
 	///
-	/// Linear, with a bounds rejection in front of it. A hierarchy is what goes
-	/// here when a collision mesh is bigger than a floor, and nothing above
-	/// this function would notice it arriving.
+	/// @param shard - which triangle
+	pub(crate) fn triangle(&self, shard: u32) -> Option<[Vec3; 3]> {
+		usize::try_from(shard)
+			.ok()
+			.and_then(|at| self.triangles.get(at))
+			.copied()
+	}
+
+	/// Which triangles could possibly meet a box, in the body's own space.
+	///
+	/// **Conservative and ordered.** Every triangle whose own bounds meet the
+	/// box is in the answer; some that do not may be too, because a cell is
+	/// bigger than a triangle. What is guaranteed is that the answer is the
+	/// triangle indices in ascending order with no repeats, which is what
+	/// makes a caller that filters it further produce exactly what walking all
+	/// of them would have produced. @ref the type's own documentation for why
+	/// the order is load-bearing.
+	///
+	/// @param low - the box's low corner, in the body's own space
+	/// @param high - its high corner
+	/// @param into - where to put them; cleared first, and the caller keeps
+	/// the allocation between steps
+	pub(crate) fn candidates(&self, low: Vec3, high: Vec3, into: &mut Vec<u32>) {
+		into.clear();
+
+		if self.triangles.is_empty() || low.cmpgt(self.high).any() || high.cmplt(self.low).any() {
+			return;
+		}
+
+		let first = cell_in(low, self.low, self.divisions, self.scale);
+		let last = cell_in(high, self.low, self.divisions, self.scale);
+
+		for z in first[2]..=last[2] {
+			for y in first[1]..=last[1] {
+				self.row(first[0]..=last[0], (y, z), into);
+			}
+		}
+
+		// a triangle straddling a boundary is filed in each cell it touches,
+		// so the walk above can hand the same one out several times. Sorting
+		// is what puts the list back into the order the linear scan produced,
+		// and the sort is over tens of entries rather than tens of thousands.
+		into.sort_unstable();
+		into.dedup();
+	}
+
+	/// Appends one run of cells along the first axis.
+	///
+	/// A method rather than a third nested loop, which is one level past what
+	/// this workspace allows and is the right call anyway - the innermost of
+	/// three loops is where a reader stops being able to see the shape.
+	///
+	/// @param across - the first and last cell on the first axis
+	/// @param at - which row and which layer
+	/// @param into - where to append
+	fn row(&self, across: core::ops::RangeInclusive<u32>, at: (u32, u32), into: &mut Vec<u32>) {
+		let (y, z) = at;
+
+		for x in across {
+			if let Some(span) = self.cell(place(self.divisions, [x, y, z])) {
+				into.extend_from_slice(span);
+			}
+		}
+	}
+
+	/// One cell's triangle indices.
+	///
+	/// @param at - where the cell is in [`starts`](Self::starts)
+	fn cell(&self, at: usize) -> Option<&[u32]> {
+		let from = usize::try_from(*self.starts.get(at)?).ok()?;
+		let to = usize::try_from(*self.starts.get(at + 1)?).ok()?;
+
+		self.members.get(from..to)
+	}
+
+	/// A segment against the triangles the grid says are near it.
+	///
+	/// The candidate box is the segment's own bounds, which is conservative
+	/// and is not a walk along the ray: a ray straight down at a landscape
+	/// touches a column of cells and pays for almost nothing, and a ray along
+	/// one touches a slab. Walking the grid cell by cell is what goes here if
+	/// a long horizontal trace ever measures badly; nothing above this
+	/// function would notice it arriving.
 	///
 	/// @param origin - where the segment begins, in the body's own space
 	/// @param direction - the whole segment
-	fn trace(&self, origin: Vec3, direction: Vec3) -> Option<(f32, Vec3)> {
+	/// @param shards - the caller's scratch, so a trace allocates nothing
+	fn trace(&self, origin: Vec3, direction: Vec3, shards: &mut Vec<u32>) -> Option<(f32, Vec3)> {
 		slab(origin, direction, self.low, self.high)?;
+
+		let far = origin + direction;
+
+		self.candidates(origin.min(far), origin.max(far), shards);
 
 		let mut best: Option<(f32, Vec3)> = None;
 
-		for &corners in &self.triangles {
+		for &shard in shards.iter() {
+			let Some(corners) = self.triangle(shard) else {
+				continue;
+			};
 			let Some(hit) = triangle(origin, direction, corners) else {
 				continue;
 			};
@@ -745,5 +996,421 @@ impl Collider {
 		}
 
 		best
+	}
+}
+
+/// How many cells a mesh's grid gets on each axis, and how wide one is.
+///
+/// The cells are as near cubes as the bounds allow, and their count is aimed
+/// at [`PER_CELL`] triangles each: a mesh whose bounds are a thin sheet gets
+/// many cells across and few through, which is what a landscape wants and what
+/// a cube grid over the same bounds would spend its budget on.
+///
+/// @param triangles - the mesh, for how many there are
+/// @param low - the low corner of its bounds
+/// @param high - the high corner
+/// @return the divisions and the reciprocal of one cell's size on each axis
+fn shape_of(triangles: &[[Vec3; 3]], low: Vec3, high: Vec3) -> ([u32; 3], Vec3) {
+	let span = (high - low).max(Vec3::ZERO);
+	let wanted = (triangles.len() / PER_CELL).clamp(1, MAX_CELLS);
+	// the extent of the axes that have one, spread over the cells asked for
+	// and rooted by how many those are: the edge of a cube of that volume. An
+	// axis with no extent is left out, so a perfectly flat mesh still gets a
+	// sensible edge rather than a nil one.
+	let mut volume = 1.0_f32;
+	let mut axes = 0_u32;
+
+	for along in span.to_array() {
+		if along > FLAT {
+			volume *= along;
+			axes += 1;
+		}
+	}
+
+	let edge = match u8::try_from(axes) {
+		| Ok(0) | Err(_) => 1.0,
+		| Ok(axes) => (volume / fraction(wanted)).powf(1.0 / f32::from(axes)),
+	}
+	.max(FLAT);
+	let mut divisions = [1_u32; 3];
+	let mut scale = Vec3::ONE;
+
+	for (axis, slot) in divisions.iter_mut().enumerate() {
+		let along = span.to_array().get(axis).copied().unwrap_or(0.0);
+
+		if along <= FLAT {
+			continue;
+		}
+
+		let count = whole((along / edge).ceil()).clamp(1, MAX_AXIS);
+
+		*slot = count;
+		scale[axis] = fraction_of(count) / along;
+	}
+
+	(divisions, scale)
+}
+
+/// Files every triangle into every cell its bounds touch.
+///
+/// Two passes and two allocations: one to count what each cell holds, one to
+/// fill it. Filling in triangle order is what makes each cell's own list
+/// ascending, which is half of what [`Collider::candidates`] promises.
+///
+/// @param triangles - the mesh
+/// @param low - the low corner of its bounds
+/// @param divisions - how many cells on each axis
+/// @param scale - the reciprocal of one cell's size on each axis
+/// @return where each cell starts, and the members
+fn file(
+	triangles: &[[Vec3; 3]],
+	low: Vec3,
+	divisions: [u32; 3],
+	scale: Vec3,
+) -> (Vec<u32>, Vec<u32>) {
+	let cells = cells_in(divisions);
+	let mut counts = vec![0_u32; cells + 1];
+
+	for corners in triangles {
+		spread(corners, low, divisions, scale, |at| {
+			if let Some(count) = counts.get_mut(at + 1) {
+				*count = count.saturating_add(1);
+			}
+		});
+	}
+
+	for at in 1..counts.len() {
+		counts[at] = counts[at].saturating_add(counts[at - 1]);
+	}
+
+	let starts = counts.clone();
+	let total = usize::try_from(counts.last().copied().unwrap_or(0)).unwrap_or(0);
+	let mut members = vec![0_u32; total];
+
+	for (shard, corners) in triangles.iter().enumerate() {
+		let Ok(shard) = u32::try_from(shard) else {
+			continue;
+		};
+
+		spread(corners, low, divisions, scale, |at| {
+			let Some(cursor) = counts.get_mut(at) else {
+				return;
+			};
+			let Ok(free) = usize::try_from(*cursor) else {
+				return;
+			};
+
+			if let Some(slot) = members.get_mut(free) {
+				*slot = shard;
+				*cursor += 1;
+			}
+		});
+	}
+
+	(starts, members)
+}
+
+/// Calls back once for every cell one triangle's bounds touch.
+///
+/// Named for what it does to a triangle rather than for the loop it is, because
+/// the sweep above already has a `walk` and the two have nothing to do with
+/// each other.
+///
+/// @param corners - the triangle, in the body's own space
+/// @param low - the low corner of the mesh's bounds
+/// @param divisions - how many cells on each axis
+/// @param scale - the reciprocal of one cell's size on each axis
+/// @param visit - what to do with each cell's place in the arrays
+fn spread(
+	corners: &[Vec3; 3],
+	low: Vec3,
+	divisions: [u32; 3],
+	scale: Vec3,
+	mut visit: impl FnMut(usize),
+) {
+	let least = corners[0].min(corners[1]).min(corners[2]);
+	let most = corners[0].max(corners[1]).max(corners[2]);
+	let first = cell_in(least, low, divisions, scale);
+	let last = cell_in(most, low, divisions, scale);
+
+	for z in first[2]..=last[2] {
+		for y in first[1]..=last[1] {
+			for x in first[0]..=last[0] {
+				visit(place(divisions, [x, y, z]));
+			}
+		}
+	}
+}
+
+/// How many cells a grid of these divisions has.
+fn cells_in(divisions: [u32; 3]) -> usize {
+	let count = u64::from(divisions[0]) * u64::from(divisions[1]) * u64::from(divisions[2]);
+
+	usize::try_from(count).unwrap_or(1).max(1)
+}
+
+/// Where a cell is in the flat arrays.
+///
+/// @param divisions - how many cells on each axis
+/// @param cell - the cell, already held inside the grid
+fn place(divisions: [u32; 3], cell: [u32; 3]) -> usize {
+	let [x, y, z] = cell;
+	let [across, up, _] = divisions;
+	let index = u64::from(z) * u64::from(across) * u64::from(up)
+		+ u64::from(y) * u64::from(across)
+		+ u64::from(x);
+
+	usize::try_from(index).unwrap_or(0)
+}
+
+/// Which cell a point falls in, held inside the grid.
+///
+/// A free function rather than a method, because the grid has to be walked
+/// while it is being built and before the collider that owns it exists.
+///
+/// @param point - where, in the body's own space
+/// @param low - the low corner of the mesh's bounds
+/// @param divisions - how many cells on each axis
+/// @param scale - the reciprocal of one cell's size on each axis
+fn cell_in(point: Vec3, low: Vec3, divisions: [u32; 3], scale: Vec3) -> [u32; 3] {
+	let inside = ((point - low) * scale).to_array();
+	let mut cell = [0_u32; 3];
+
+	for (axis, slot) in cell.iter_mut().enumerate() {
+		let along = inside
+			.get(axis)
+			.copied()
+			.unwrap_or(0.0)
+			.floor()
+			.clamp(0.0, f32::from(u16::MAX));
+		let last = divisions
+			.get(axis)
+			.copied()
+			.unwrap_or(1)
+			.saturating_sub(1);
+
+		*slot = whole(along).min(last);
+	}
+
+	cell
+}
+
+/// A whole number out of a float that is already whole and already in range.
+///
+/// The binary decomposition, written out, because this workspace refuses `as`
+/// and `try_from` is not implemented from a float. Each power of two is taken
+/// at most once, which is what a binary representation *is*, so seventeen
+/// subtractions give the exact answer for every whole number a caller clamps
+/// itself to.
+///
+/// @param value - clamped by the caller into `0.0 ..= 65535.0`
+fn whole(value: f32) -> u32 {
+	let mut count = 0_u32;
+	let mut left = value.max(0.0);
+
+	for step in (0..=16_u32).rev() {
+		let stride = 1_u32 << step;
+		let width = fraction_of(stride);
+
+		if left >= width {
+			left -= width;
+			count = count.saturating_add(stride);
+		}
+	}
+
+	count
+}
+
+/// A count as a float.
+///
+/// Through two `u16`s, which is what `mesh`'s own helper does and for the same
+/// reason: this workspace refuses `as`, and the halves are each exact.
+///
+/// @param count - how many
+fn fraction(count: usize) -> f32 {
+	f32::from(u16::try_from(count >> 16).unwrap_or(u16::MAX)) * 65_536.0
+		+ f32::from(u16::try_from(count & 0xFFFF).unwrap_or(u16::MAX))
+}
+
+/// The same, for a `u32`.
+fn fraction_of(count: u32) -> f32 { fraction(usize::try_from(count).unwrap_or(0)) }
+#[cfg(test)]
+mod tests {
+	use colby_core::abi::{MeshData, Terrain};
+
+	use super::*;
+
+	/// The triangles of a mesh, in the body's own space, the way
+	/// [`crate::bake`] makes them.
+	fn shards_of(mesh: &MeshData) -> Vec<[Vec3; 3]> {
+		mesh.indices
+			.chunks_exact(3)
+			.filter_map(|corners| {
+				let mut shard = [Vec3::ZERO; 3];
+
+				for (slot, &index) in shard.iter_mut().zip(corners) {
+					let vertex = mesh.vertices.get(usize::try_from(index).ok()?)?;
+
+					*slot = Vec3::from_array(vertex.position);
+				}
+
+				Some(shard)
+			})
+			.collect()
+	}
+
+	/// Every triangle whose own bounds meet a box, found by walking all of
+	/// them. What the grid has to agree with.
+	fn linearly(collider: &Collider, low: Vec3, high: Vec3) -> Vec<u32> {
+		collider
+			.triangles()
+			.enumerate()
+			.filter(|(_, corners)| !contact::apart(*corners, low, high))
+			.filter_map(|(at, _)| u32::try_from(at).ok())
+			.collect()
+	}
+
+	fn landscape(side: u32) -> Collider {
+		let ground = Terrain { side, ..Terrain::of(4) };
+
+		Collider::new(shards_of(&ground.build()))
+	}
+
+	#[test]
+	fn the_grid_never_misses_a_triangle_the_linear_scan_finds() {
+		let collider = landscape(33);
+		let mut found = Vec::new();
+
+		for step in 0..24_i16 {
+			let along = f32::from(step).mul_add(5.0, -60.0);
+			let low = Vec3::new(along, -20.0, along * 0.5);
+			let high = low + Vec3::new(3.0, 40.0, 3.0);
+
+			collider.candidates(low, high, &mut found);
+
+			for shard in linearly(&collider, low, high) {
+				assert!(found.contains(&shard), "the grid lost triangle {shard} at {low:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn what_the_grid_hands_back_is_ascending_and_has_no_repeats() {
+		// the load-bearing half: a triangle straddling a cell boundary is filed
+		// in each of them, and the narrow phase walks manifolds in the order it
+		// is given them.
+		let collider = landscape(33);
+		let mut found = Vec::new();
+
+		collider.candidates(Vec3::splat(-200.0), Vec3::splat(200.0), &mut found);
+
+		assert!(!found.is_empty(), "the whole landscape is in a box that holds it");
+		assert!(found.is_sorted(), "ascending, which is the order the linear scan had");
+
+		let mut once = found.clone();
+		once.dedup();
+
+		assert_eq!(once, found, "and each one only once");
+	}
+
+	#[test]
+	fn a_box_that_holds_the_whole_mesh_finds_every_triangle() {
+		let collider = landscape(17);
+		let mut found = Vec::new();
+
+		collider.candidates(Vec3::splat(-500.0), Vec3::splat(500.0), &mut found);
+
+		assert_eq!(found.len(), collider.count(), "all of them, filed exactly once each");
+	}
+
+	#[test]
+	fn a_box_nowhere_near_the_mesh_finds_nothing() {
+		let collider = landscape(17);
+		let mut found = vec![7, 8, 9];
+
+		collider.candidates(Vec3::splat(500.0), Vec3::splat(600.0), &mut found);
+
+		assert!(found.is_empty(), "and the scratch is cleared even so");
+	}
+
+	#[test]
+	fn a_collider_with_no_triangles_answers_nothing_rather_than_panicking() {
+		let collider = Collider::new(Vec::new());
+		let mut found = Vec::new();
+
+		collider.candidates(Vec3::splat(-1.0), Vec3::splat(1.0), &mut found);
+
+		assert!(found.is_empty());
+		assert_eq!(collider.count(), 0);
+	}
+
+	#[test]
+	fn the_grid_cuts_the_work_by_orders_of_magnitude() {
+		// the whole reason this exists. A crate-sized box on a default-sized
+		// landscape used to be tested against every triangle in it.
+		let collider = landscape(65);
+		let mut found = Vec::new();
+
+		collider.candidates(Vec3::new(-1.0, -20.0, -1.0), Vec3::new(1.0, 20.0, 1.0), &mut found);
+
+		assert!(
+			found.len() * 50 < collider.count(),
+			"{} of {} triangles is not a saving",
+			found.len(),
+			collider.count()
+		);
+	}
+
+	#[test]
+	fn a_flat_sheet_gets_its_cells_across_rather_than_through() {
+		// a mesh with no thickness would spend its whole budget on one axis of
+		// a cube grid, and a landscape is exactly that mesh.
+		let collider = landscape(65);
+		let [across, up, along] = collider.divisions;
+
+		assert!(across > 1 && along > 1, "the wide axes are divided: {across} by {along}");
+		assert!(up <= across, "and the thin one is not: {up}");
+	}
+
+	#[test]
+	fn a_ray_through_the_grid_hits_where_the_surface_is() {
+		let ground = Terrain { side: 33, ..Terrain::of(4) };
+		let collider = Collider::new(shards_of(&ground.build()));
+		let mut shards = Vec::new();
+		let flat = colby_core::glam::Vec2::new(3.0, -5.0);
+		let above = Vec3::new(flat.x, 50.0, flat.y);
+		let hit = collider
+			.trace(above, Vec3::NEG_Y * 100.0, &mut shards)
+			.expect("a ray straight down at ground hits it");
+		let landed = (Vec3::NEG_Y.y * 100.0).mul_add(hit.0, above.y);
+
+		assert!(
+			(landed - ground.height_at(flat)).abs() < 0.5,
+			"landed at {landed}, the field says {}",
+			ground.height_at(flat)
+		);
+	}
+
+	#[test]
+	fn a_ray_that_misses_the_mesh_misses_it() {
+		let collider = landscape(17);
+		let mut shards = Vec::new();
+
+		assert!(
+			collider
+				.trace(Vec3::new(500.0, 50.0, 500.0), Vec3::NEG_Y * 100.0, &mut shards)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn a_whole_number_out_of_a_float_is_the_number() {
+		for value in [0.0, 1.0, 2.0, 7.0, 255.0, 256.0, 4095.0, 65_535.0] {
+			let counted = whole(value);
+			let back = fraction_of(counted);
+
+			assert!((back - value).abs() < 0.5, "{value} came back as {back}");
+		}
+		assert_eq!(whole(-3.0), 0, "and nothing below nought");
 	}
 }

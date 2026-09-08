@@ -340,6 +340,16 @@ struct Table {
 	/// fact about the afternoon, and this is a fact about the project.
 	sparks: usize,
 
+	/// How many triangles the world's terrain has.
+	///
+	/// Beside `sparks` and for its reason: a stable number about the project,
+	/// printed on the frame line rather than folded into a mean. It gets no
+	/// **row**, and that is the honest answer rather than an omission - a
+	/// terrain is built once and is geometry from then on, so a `cpu terrain`
+	/// row would read nil on every frame this table ever sees. What it costs
+	/// shows up as bigger numbers in `gpu scene` and `cpu narrow`.
+	ground: u64,
+
 	/// How many render passes each frame recorded, and `None` before the first
 	/// one.
 	passes: Option<u32>,
@@ -389,6 +399,7 @@ impl Table {
 				frames: 0,
 			}; ROWS],
 			sparks: 0,
+			ground: 0,
 			passes: None,
 			steady: true,
 		}
@@ -398,8 +409,12 @@ impl Table {
 	///
 	/// @param frame - what the renderer measured
 	/// @param spent - what the last simulation step cost
-	fn fold(&mut self, frame: &Frame, spent: Spent, sparked: Duration, sparks: usize) {
-		self.sparks = self.sparks.max(sparks);
+	/// @param sparked - what the particles cost
+	/// @param counts - the two numbers that are about the project rather than
+	/// about a frame
+	fn fold(&mut self, frame: &Frame, spent: Spent, sparked: Duration, counts: Counts) {
+		self.sparks = self.sparks.max(counts.sparks);
+		self.ground = self.ground.max(counts.ground);
 
 		for (at, pass) in Pass::ALL.into_iter().enumerate() {
 			if let (Some(row), Some(took)) = (self.rows.get_mut(at), frame.pass(pass)) {
@@ -469,6 +484,7 @@ impl Table {
 			frames,
 			passes = self.passes.unwrap_or_default(),
 			sparks = self.sparks,
+			ground = self.ground,
 			steady = self.steady,
 			gpu_us = self.slice(0..Pass::ALL.len()).as_micros(),
 			cpu_us = self
@@ -495,6 +511,20 @@ impl Table {
 			.iter()
 			.fold(Duration::ZERO, |sum, row| sum.saturating_add(row.mean()))
 	}
+}
+
+/// The two counts a run reports that are not times.
+///
+/// One struct rather than two arguments, because both are the same kind of
+/// thing - a number about the world rather than about a frame - and a fold
+/// whose signature grows one scalar per feature is a call nobody reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct Counts {
+	/// The most particles any measured frame drew.
+	sparks: usize,
+
+	/// How many triangles the world's terrain has.
+	ground: u64,
 }
 
 /// Runs the project for a while and prints what a frame of it costs.
@@ -566,12 +596,10 @@ pub(crate) fn take(project: &Project, build: &Build, asked: &Asked, frames: u32)
 		let frame = capture.scene_mut().settle();
 
 		if number > WARMUP {
-			table.fold(
-				&frame,
-				runtime.simulation.spent(),
-				runtime.sparked,
-				capture.scene_mut().sparks(),
-			);
+			table.fold(&frame, runtime.simulation.spent(), runtime.sparked, Counts {
+				sparks: capture.scene_mut().sparks(),
+				ground: runtime.ground.triangles(),
+			});
 		}
 	}
 
@@ -753,8 +781,8 @@ mod tests {
 		// worth comparing while it holds still for the whole of one.
 		let mut table = Table::new();
 
-		table.fold(&Frame::default(), Spent::default(), Duration::ZERO, 0);
-		table.fold(&Frame::default(), Spent::default(), Duration::ZERO, 0);
+		table.fold(&Frame::default(), Spent::default(), Duration::ZERO, Counts::default());
+		table.fold(&Frame::default(), Spent::default(), Duration::ZERO, Counts::default());
 
 		assert!(table.steady, "two frames that recorded the same passes");
 		assert_eq!(table.passes, Some(0));
@@ -771,7 +799,10 @@ mod tests {
 			total: Duration::from_micros(200),
 		};
 
-		table.fold(&Frame::default(), spent, Duration::from_micros(31), 40);
+		table.fold(&Frame::default(), spent, Duration::from_micros(31), Counts {
+			sparks: 40,
+			ground: 2048,
+		});
 
 		let under = Pass::ALL.len() + Work::ALL.len();
 
@@ -786,6 +817,7 @@ mod tests {
 			"and the particles, which are beside the solver rather than inside it"
 		);
 		assert_eq!(table.sparks, 40, "and the count is carried beside the times");
+		assert_eq!(table.ground, 2048, "and so is the terrain's size");
 		assert_eq!(
 			table.rows[under + 5].mean(),
 			Duration::from_micros(31),

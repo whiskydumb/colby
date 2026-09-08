@@ -12,6 +12,15 @@
 //! mesh body is never dynamic - see
 //! [`Body::movable`](colby_core::abi::Body::movable) - and why the triangles it
 //! produces are tested only against the bounds of the other body first.
+//!
+//! **Which triangles those are comes from the collider's grid rather than from
+//! all of them.** A landscape is thirty thousand triangles and a crate standing
+//! on it touches four; asking each one whether it is near the crate is a bill
+//! in the hundreds of microseconds paid every step by every body on the ground.
+//! The grid hands back the few that could be, in ascending index order, so the
+//! manifolds below are the ones this file has always produced and the solver
+//! walks them in the order it always did. @ref
+//! [`Collider::candidates`](crate::query::Collider::candidates).
 
 use colby_core::{
 	abi::{Bodies, Body, BodyId, Shape, ShapeKind, Transform},
@@ -113,6 +122,7 @@ pub(crate) fn find(
 	simulation: &Simulation,
 	broad: &mut Broad,
 	candidates: &mut Vec<(usize, usize)>,
+	shards: &mut Vec<u32>,
 	into: &mut Vec<Manifold>,
 	sensed: &mut Vec<Manifold>,
 ) {
@@ -197,7 +207,7 @@ pub(crate) fn find(
 
 		let list = if sensing { &mut *sensed } else { &mut *into };
 
-		pair(simulation, (first, one), (second, other), list);
+		pair(simulation, (first, one), (second, other), shards, list);
 	}
 }
 
@@ -211,6 +221,7 @@ fn pair(
 	simulation: &Simulation,
 	first: (BodyId, &Body),
 	second: (BodyId, &Body),
+	shards: &mut Vec<u32>,
 	into: &mut Vec<Manifold>,
 ) {
 	let (one, other) = (first.1, second.1);
@@ -219,8 +230,8 @@ fn pair(
 	// on one side and looping there rather than writing the loop twice.
 	match (one.shape.kind, other.shape.kind) {
 		| (ShapeKind::Mesh, ShapeKind::Mesh) => (),
-		| (ShapeKind::Mesh, _) => mesh(simulation, first, second, true, into),
-		| (_, ShapeKind::Mesh) => mesh(simulation, second, first, false, into),
+		| (ShapeKind::Mesh, _) => mesh(simulation, first, second, true, shards, into),
+		| (_, ShapeKind::Mesh) => mesh(simulation, second, first, false, shards, into),
 		| _ =>
 			if let Some(found) = solids(first, second) {
 				into.push(found);
@@ -235,12 +246,14 @@ fn pair(
 /// @param solid - the other body and its handle
 /// @param leading - whether the mesh is the *first* body of the reported pair,
 /// which is what decides the sign of every normal produced
+/// @param shards - the caller's scratch for the grid's answer
 /// @param into - where to append
 fn mesh(
 	simulation: &Simulation,
 	mesh: (BodyId, &Body),
 	solid: (BodyId, &Body),
 	leading: bool,
+	shards: &mut Vec<u32>,
 	into: &mut Vec<Manifold>,
 ) {
 	let Some(collider) = simulation.collider(mesh.0) else {
@@ -253,8 +266,21 @@ fn mesh(
 
 	let matrix = mesh.1.transform.matrix();
 	let surface = surface_of(mesh.1, solid.1);
+	let Some((near, far)) = query::local_bounds(&matrix, low, high) else {
+		return;
+	};
 
-	for (shard, corners) in collider.triangles().enumerate() {
+	collider.candidates(near, far, shards);
+
+	// by index rather than by iterator, because the scratch is borrowed for the
+	// whole loop and the collider is read inside it.
+	for at in 0..shards.len() {
+		let Some(shard) = shards.get(at).copied() else {
+			continue;
+		};
+		let Some(corners) = collider.triangle(shard) else {
+			continue;
+		};
 		let placed = corners.map(|corner| matrix.transform_point3(corner));
 
 		if apart(placed, low, high) {
@@ -277,7 +303,7 @@ fn mesh(
 		};
 
 		let mut manifold = assemble(first, second, normal, points, count, surface);
-		manifold.shard = u32::try_from(shard).unwrap_or(0);
+		manifold.shard = shard;
 
 		into.push(manifold);
 	}

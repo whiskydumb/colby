@@ -200,6 +200,15 @@ pub struct Simulation {
 	/// input to the narrow phase and is worth nothing after it.
 	candidates: Vec<(usize, usize)>,
 
+	/// Which triangles of one collision mesh could meet the body being tested
+	/// against it.
+	///
+	/// A field for the allocation, exactly as `candidates` above is: the narrow
+	/// phase fills and empties it once per pair involving a mesh, and it is
+	/// worth nothing between them. @ref
+	/// `crate::query::Collider::candidates`.
+	shards: Vec<u32>,
+
 	/// How long the last step spent where. @ref [`Spent`].
 	spent: Spent,
 }
@@ -220,6 +229,7 @@ impl Simulation {
 			solver: Solver::new(),
 			broad: Broad::default(),
 			candidates: Vec::new(),
+			shards: Vec::new(),
 			spent: Spent::default(),
 		}
 	}
@@ -277,12 +287,17 @@ impl Simulation {
 		// simulation immutably for its collision meshes.
 		let mut broad = core::mem::take(&mut self.broad);
 		let mut candidates = core::mem::take(&mut self.candidates);
+		// and the narrow phase's own scratch, for the triangles a collider's grid
+		// hands back. The same round trip as the two above and for the same
+		// reason: it is written by a phase that reads the simulation.
+		let mut shards = core::mem::take(&mut self.shards);
 		let finding = Instant::now();
 		contact::find(
 			&world.bodies,
 			self,
 			&mut broad,
 			&mut candidates,
+			&mut shards,
 			&mut manifolds,
 			&mut sensed,
 		);
@@ -290,6 +305,7 @@ impl Simulation {
 		self.spent.broad = broad.spent();
 		self.broad = broad;
 		self.candidates = candidates;
+		self.shards = shards;
 		self.report(world, &manifolds, &sensed);
 		self.remember_where(&world.bodies);
 
