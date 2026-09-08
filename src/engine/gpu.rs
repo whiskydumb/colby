@@ -18,11 +18,11 @@
 
 use std::env;
 
-use colby_core::{Result, debug, err, warn};
+use colby_core::{Result, debug, err, info, warn};
 use wgpu::{
-	Adapter, Backends, Device, DeviceDescriptor, ExperimentalFeatures, Features, Instance,
-	InstanceDescriptor, Limits, MemoryHints, PowerPreference, Queue, RequestAdapterOptions,
-	Trace,
+	Adapter, BackendOptions, Backends, Device, DeviceDescriptor, ExperimentalFeatures, Features,
+	Instance, InstanceDescriptor, Limits, MemoryHints, NoopBackendOptions, PowerPreference,
+	Queue, RequestAdapterOptions, Trace,
 };
 use winit::window::Window;
 
@@ -108,29 +108,100 @@ pub fn backends(asked: Option<&str>) -> Backends {
 /// @param forced - what [`BACKEND_VAR`] holds, if it is set
 /// @param have - the APIs this build compiled in for this platform
 fn choose(asked: Option<&str>, forced: Option<&str>, have: Backends) -> (Backends, By) {
-	if let Some(text) = forced.filter(|text| !text.trim().is_empty()) {
-		match parse(text).and_then(|set| here(set, have)) {
-			| Some(set) => return (set, By::Environment),
-			| None =>
-				warn!(text, "{BACKEND_VAR} names no graphics API this build has; ignoring it"),
-		}
+	if let Some(text) = forced.filter(|text| !text.trim().is_empty())
+		&& let Some(set) = taken(BACKEND_VAR, text, have)
+	{
+		return (set, By::Environment);
 	}
 
-	if let Some(text) = asked {
-		match parse(text).and_then(|set| here(set, have)) {
-			| Some(set) => return (set, By::Variable),
-			| None => warn!(text, "{BACKEND} names no graphics API this build has; using {AUTO}"),
-		}
+	if let Some(text) = asked
+		&& let Some(set) = taken(BACKEND, text, have)
+	{
+		return (set, By::Variable);
 	}
 
 	(DEFAULT & have, By::Default)
 }
 
-/// The part of a set this build has, or nothing when none of it is.
-fn here(set: Backends, have: Backends) -> Option<Backends> {
-	let kept = set & have;
+/// The one device a test binary draws with.
+///
+/// **Because the alternative was measured and it crashes.** Every rendered
+/// test in this workspace used to open a device of its own; the engine's
+/// suite alone opened more than fifty of them, up to sixteen alive at once on
+/// this machine, and the driver fell over on `STATUS_ACCESS_VIOLATION` with no
+/// panic and no failing test. Measured 2026-09-08 before this existed: **six
+/// crashes in twenty runs** of the engine's binary back to back.
+///
+/// One `OnceLock` a test binary, so three of them in this workspace - the
+/// engine's, the interface's and the editor's - because a `cfg(test)` item is
+/// not visible to another crate and the alternative was one more shipped
+/// function that only a test calls. @ref `colby-gate-gotchas` for the
+/// measurement, which is the whole argument for this.
+///
+/// It is never dropped, which for a test binary is the point: a device that
+/// outlives every test on it cannot be the thing a later test is waiting for.
+///
+/// @return the device, or `None` on a machine with no adapter - which every
+/// caller skips on rather than failing
+#[cfg(test)]
+pub(crate) fn shared() -> Option<&'static Gpu> {
+	static SHARED: std::sync::OnceLock<Option<Gpu>> = std::sync::OnceLock::new();
 
-	(!kept.is_empty()).then_some(kept)
+	SHARED
+		.get_or_init(|| match Gpu::open(backends(None), None) {
+			| Ok(gpu) => gpu,
+			| Err(error) => panic!("opening the device failed: {error}"),
+		})
+		.as_ref()
+}
+
+/// What one level comes to, with a line said when it comes to nothing.
+///
+/// **Three refusals and not one**, which is the whole of why this is a
+/// function: `gl` is a word wgpu knows that this build was not compiled with,
+/// `noop` is a word wgpu knows that draws nothing anybody could look at, and
+/// `dx11` is nobody's word at all. All three used to say "names no graphics
+/// API this build has", which is true of one of them and misleading about the
+/// other two - and the one a person hits is the one the answer matters for.
+///
+/// @param source - what the value came from, for the log
+/// @param text - the value
+/// @param have - the APIs this build compiled in for this platform
+/// @return the part of it this build has, or nothing with a reason said
+fn taken(source: &str, text: &str, have: Backends) -> Option<Backends> {
+	match parse(text) {
+		| Read::Apis(set) => {
+			let kept = set & have;
+
+			if !kept.is_empty() {
+				return Some(kept);
+			}
+
+			warn!(
+				source,
+				text,
+				missing = ?set.difference(have),
+				"this build was not compiled with that graphics API"
+			);
+		},
+		| Read::NotDrawn(why) => warn!(source, text, "{why}"),
+		| Read::Unknown => warn!(source, text, "no graphics API goes by that name"),
+	}
+
+	None
+}
+
+/// What a value of [`BACKEND`] turned out to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Read {
+	/// wgpu's words for APIs a picture could come out of.
+	Apis(Backends),
+
+	/// A word wgpu knows for something no picture comes out of, and why.
+	NotDrawn(&'static str),
+
+	/// A word nothing here knows.
+	Unknown,
 }
 
 /// Reads a value of [`BACKEND`]: [`AUTO`], or a comma list of wgpu's words.
@@ -140,13 +211,14 @@ fn here(set: Backends, have: Backends) -> Option<Backends> {
 /// it knows; this one refuses the whole value on the first word it does not
 /// know, so that a list with a misspelling in it is a warning rather than a
 /// quiet subset. `webgpu` and `noop` are wgpu's words too and are refused on
-/// purpose: one is a browser and the other draws nothing.
+/// purpose, each with its own sentence: one is a browser and the other draws
+/// nothing.
 ///
 /// @param text - the value
-/// @return the set, or `None` for a word nothing here knows
-fn parse(text: &str) -> Option<Backends> {
+/// @return the set, or which kind of word it stopped on
+fn parse(text: &str) -> Read {
 	if text.trim().eq_ignore_ascii_case(AUTO) {
-		return Some(DEFAULT);
+		return Read::Apis(DEFAULT);
 	}
 
 	let mut set = Backends::empty();
@@ -156,11 +228,17 @@ fn parse(text: &str) -> Option<Backends> {
 			| "dx12" | "d3d12" => Backends::DX12,
 			| "metal" | "mtl" => Backends::METAL,
 			| "gl" | "gles" | "opengl" => Backends::GL,
-			| _ => return None,
+			| "webgpu" =>
+				return Read::NotDrawn("webgpu is a browser's API, and this is not one"),
+			| "noop" =>
+				return Read::NotDrawn(
+					"noop draws nothing; it is what the headless tests build pipelines on",
+				),
+			| _ => return Read::Unknown,
 		};
 	}
 
-	Some(set)
+	Read::Apis(set)
 }
 
 /// The instance, the adapter, the device and its queue.
@@ -191,6 +269,27 @@ impl Gpu {
 		pollster::block_on(Self::create(backends, present_to))
 	}
 
+	/// A device that validates everything and draws nothing.
+	///
+	/// wgpu's `noop` backend: every operation is an empty body except making
+	/// and mapping a buffer, so a [`Capture`](crate::Capture) on this comes
+	/// back all zeros and no test may look at a pixel of it. What still runs
+	/// is all of wgpu's validation and all of naga's - a shader that does not
+	/// compile, a bind group that does not match the layout it was built
+	/// against, a pipeline whose fragment stage writes a format its target
+	/// does not have - so the question "does every pipeline this engine builds
+	/// still build" has an answer here, **on a machine with no graphics
+	/// hardware at all**.
+	///
+	/// That is the whole of what it is for, and it is why it is a function of
+	/// its own rather than a word [`BACKEND`] takes: a person who typed
+	/// `r.backend noop` at a window would get a black screen and no reason
+	/// for it, so the variable refuses the word and says why.
+	///
+	/// @return the device, or `None` when this build has no `noop` feature -
+	/// which a test skips on, the same way it skips on a machine with no GPU
+	pub fn headless() -> Result<Option<Self>> { Self::open(Backends::NOOP, None) }
+
 	/// The device everything built on this draws with.
 	#[must_use]
 	pub const fn device(&self) -> &Device { &self.device }
@@ -209,6 +308,19 @@ impl Gpu {
 	async fn create(backends: Backends, present_to: Option<&Window>) -> Result<Option<Self>> {
 		let instance = Instance::new(InstanceDescriptor {
 			backends,
+			// **the one backend that has to be asked for twice**, and that is
+			// wgpu's decision rather than this one: a stub that draws nothing
+			// must not be reachable by a set of flags somebody widened, so it
+			// stays out until an instance says the word. Which means the only
+			// way here is [`headless`](Self::headless) - `DEFAULT` does not
+			// hold it and `parse` refuses to read it.
+			backend_options: BackendOptions {
+				noop: NoopBackendOptions {
+					enable: backends.contains(Backends::NOOP),
+					..NoopBackendOptions::default()
+				},
+				..BackendOptions::default()
+			},
 			..InstanceDescriptor::new_without_display_handle()
 		});
 
@@ -237,8 +349,25 @@ impl Gpu {
 			},
 		};
 
+		// **at `info`, and once a process.** Which graphics API a machine ended
+		// up drawing with is the first thing anybody asks about a picture that
+		// looks wrong or a frame that is slow, and it is not something a person
+		// should have to raise the log level to find out afterwards. The driver
+		// with it, because "Vulkan on this AMD card" and "Vulkan on that AMD
+		// card six months later" are different answers.
+		//
+		// Two strings joined and not one, because the backends do not agree
+		// which of them holds it: DX12 writes the version into `driver` and
+		// leaves `driver_info` empty, Vulkan fills both. Either alone reads as
+		// a machine with no driver on the other one.
 		let info = adapter.get_info();
-		debug!(adapter = %info.name, backend = ?info.backend, "adapter selected");
+		let driver = [info.driver.as_str(), info.driver_info.as_str()]
+			.into_iter()
+			.filter(|part| !part.is_empty())
+			.collect::<Vec<_>>()
+			.join(" ");
+
+		info!(adapter = %info.name, backend = %info.backend, driver, "drawing with");
 
 		let (device, queue) = adapter
 			.request_device(&DeviceDescriptor {
@@ -334,24 +463,71 @@ mod tests {
 
 	#[test]
 	fn the_words_are_wgpus_own_and_a_list_is_a_union() {
-		assert_eq!(parse("vulkan"), Some(Backends::VULKAN));
-		assert_eq!(parse("DX12"), Some(Backends::DX12));
-		assert_eq!(parse("dx12, vk"), Some(Backends::DX12 | Backends::VULKAN));
-		assert_eq!(parse("metal"), Some(Backends::METAL));
-		assert_eq!(parse("opengl"), Some(Backends::GL));
+		assert_eq!(parse("vulkan"), Read::Apis(Backends::VULKAN));
+		assert_eq!(parse("DX12"), Read::Apis(Backends::DX12));
+		assert_eq!(parse("dx12, vk"), Read::Apis(Backends::DX12 | Backends::VULKAN));
+		assert_eq!(parse("metal"), Read::Apis(Backends::METAL));
+		assert_eq!(parse("opengl"), Read::Apis(Backends::GL));
 	}
 
 	#[test]
 	fn a_word_nobody_knows_refuses_the_whole_value() {
-		assert_eq!(parse("dx11"), None);
-		assert_eq!(parse("vulkan,dx11"), None, "one bad word is a bad value, not vulkan");
-		assert_eq!(parse(""), None);
-		assert_eq!(parse("webgpu"), None, "a browser is not an API this draws with");
-		assert_eq!(parse("noop"), None, "and nothing is not one either");
+		assert_eq!(parse("dx11"), Read::Unknown);
+		assert_eq!(
+			parse("vulkan,dx11"),
+			Read::Unknown,
+			"one bad word is a bad value, not vulkan"
+		);
+		assert_eq!(parse(""), Read::Unknown);
 		assert_eq!(
 			choose(Some("dx11"), None, EVERY),
 			(DEFAULT, By::Default),
 			"a bad variable draws with the default"
+		);
+	}
+
+	#[test]
+	fn a_word_that_draws_nothing_is_refused_with_a_reason_of_its_own() {
+		// the three refusals are three, and this is the pair that used to be
+		// told apart from a typo by nothing: both are words wgpu reads, and
+		// neither is a thing a person could look at.
+		let Read::NotDrawn(browser) = parse("webgpu") else {
+			panic!("a browser is not an API this draws with");
+		};
+		let Read::NotDrawn(nothing) = parse("noop") else {
+			panic!("and nothing is not one either");
+		};
+
+		assert_ne!(browser, nothing, "and the two say different things");
+		assert_eq!(
+			parse("vulkan,noop"),
+			Read::NotDrawn(nothing),
+			"a list stops on the first word it cannot draw with, as it does on a typo"
+		);
+		assert_eq!(
+			choose(Some("noop"), None, EVERY),
+			(DEFAULT, By::Default),
+			"and the run draws with the default rather than with nothing"
+		);
+	}
+
+	#[test]
+	fn a_build_without_an_api_says_so_and_is_not_a_typo() {
+		// what `taken` exists for: `dx12` in a `settings.cfg` carried over
+		// from Windows and `dx11` typed by hand both end at the default, and
+		// used to say the same sentence on the way. The set survives the
+		// parse in one case and not the other, which is what the two lines
+		// are drawn from.
+		assert_eq!(parse("dx12"), Read::Apis(Backends::DX12), "the word is known");
+		assert_eq!(
+			taken(BACKEND, "dx12", Backends::VULKAN),
+			None,
+			"and this build still has no such API"
+		);
+		assert_eq!(
+			taken(BACKEND, "dx12", Backends::DX12 | Backends::VULKAN),
+			Some(Backends::DX12),
+			"where it does, the same value is taken"
 		);
 	}
 

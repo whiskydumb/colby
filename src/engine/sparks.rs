@@ -386,6 +386,22 @@ impl Sparks {
 
 	/// How many particles this frame drew, for a report.
 	pub(crate) fn drawn(&self) -> usize { self.scratch.len() }
+
+	/// Whether the two pipelines are there.
+	///
+	/// `false` before the first cloud this device has seen, and `false` again
+	/// after one whose shader would not compile - [`ensure`](Self::ensure)
+	/// warns and draws nothing rather than stopping a running window over a
+	/// shader somebody is editing, so the count above cannot tell the two
+	/// apart: it is filled before the pipelines are asked for. @ref
+	/// `crate::headless`, which is the only thing that asks, and which without
+	/// this would pass over a `sparks.wgsl` that does not compile at all.
+	///
+	/// **Under `cfg(test)`, because that is the whole truth about it**: a
+	/// running window has no use for the answer, and the alternative was one
+	/// more line of shipped surface that only a test reads.
+	#[cfg(test)]
+	pub(crate) const fn built(&self) -> bool { self.pipelines.is_some() }
 }
 
 /// One number some of the way to another.

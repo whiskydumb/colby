@@ -14,6 +14,7 @@
 
 pub mod capture;
 pub mod gpu;
+mod headless;
 pub mod image;
 mod lines;
 pub mod overlay;

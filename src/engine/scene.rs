@@ -1080,6 +1080,15 @@ impl Scene {
 	#[must_use]
 	pub fn sparks(&self) -> usize { self.sparks.drawn() }
 
+	/// Whether the particle pipelines have been built.
+	///
+	/// The one table here built lazily, and the one whose failure to build is
+	/// a warning rather than an error - so this is what says a frame with a
+	/// cloud in it drew the cloud rather than warning about it. @ref
+	/// `Sparks::built`, which like this is only there for a test.
+	#[cfg(test)]
+	pub(crate) const fn sparks_built(&self) -> bool { self.sparks.built() }
+
 	/// Whether anything is being measured.
 	pub const fn measuring(&self) -> bool { self.timings.timing() }
 

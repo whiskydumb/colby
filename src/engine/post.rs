@@ -1330,12 +1330,8 @@ mod tests {
 	///
 	/// `None` where the machine has no adapter, which is how every rendered
 	/// test in this workspace skips rather than fails.
-	fn metering() -> Option<(crate::Gpu, Chain, TextureView)> {
-		let gpu = match crate::Gpu::open(crate::gpu::backends(None), None) {
-			| Ok(Some(gpu)) => gpu,
-			| Ok(None) => return None,
-			| Err(error) => panic!("opening the device failed: {error}"),
-		};
+	fn metering() -> Option<(&'static crate::Gpu, Chain, TextureView)> {
+		let gpu = crate::gpu::shared()?;
 		let format = TextureFormat::Rgba8UnormSrgb;
 		let width = u32::try_from(WIDTH).unwrap_or(1280);
 		let height = u32::try_from(HEIGHT).unwrap_or(720);
@@ -1447,7 +1443,7 @@ mod tests {
 		for period in [0, 2, 3, 4, 5, 7, 8, 20] {
 			let levels = striped(period, 4.0, 0.25);
 			let want = truth(&levels);
-			let got = f64::from(eye_on(&gpu, &mut chain, &out, &levels));
+			let got = f64::from(eye_on(gpu, &mut chain, &out, &levels));
 			let off = (got - want).abs();
 
 			assert!(
@@ -1470,7 +1466,7 @@ mod tests {
 
 		for level in [0.25_f32, 1.0, 4.0] {
 			let levels = striped(0, level, level);
-			let got = eye_on(&gpu, &mut chain, &out, &levels);
+			let got = eye_on(gpu, &mut chain, &out, &levels);
 
 			assert!(
 				(f64::from(got) - f64::from(level.log2())).abs() < 0.01,

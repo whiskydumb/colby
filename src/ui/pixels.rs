@@ -9,10 +9,16 @@
 //!
 //! Every test here skips itself on a machine with no adapter, the same way the
 //! renderer's own pixel tests do: a build with no GPU should report the tests
-//! that could not run rather than failing them.
+//! that could not run rather than failing them. One does not, and it is the
+//! last in the file: `ui.wgsl` has to *compile* on a machine with no GPU too,
+//! and that has an answer without one. @ref
+//! [`Gpu::headless`](colby_engine::Gpu::headless) and `colby_engine::headless`,
+//! which is the same arrangement for the renderer's own five shaders.
 
 #[cfg(test)]
 mod tests {
+	use std::sync::OnceLock;
+
 	use colby_asset::html;
 	use colby_core::{
 		abi::{FontData, Glyph, World},
@@ -25,12 +31,31 @@ mod tests {
 	/// How big every test picture is.
 	const SIZE: (u32, u32) = (256, 256);
 
-	/// A device and a capture on it, or `None` when this machine has no GPU.
-	fn capture() -> Option<(Gpu, Capture)> {
-		let gpu = Gpu::open(gpu::backends(None), None).expect("the adapter query works")?;
-		let capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+	/// The one device this test binary draws with.
+	///
+	/// A `OnceLock` and not a device a test, because a suite that opens one
+	/// per test opens dozens at once and the driver falls over on it - which
+	/// was measured rather than guessed. @ref
+	/// [`colby_engine::gpu::shared`]'s own note, and `colby-gate-gotchas`; the
+	/// interface's tests and the renderer's each keep a copy of this, because
+	/// a `cfg(test)` item is not visible to another crate.
+	///
+	/// @return the device, or `None` on a machine with no adapter
+	fn shared() -> Option<&'static Gpu> {
+		static SHARED: OnceLock<Option<Gpu>> = OnceLock::new();
 
-		Some((gpu, capture))
+		SHARED
+			.get_or_init(|| {
+				Gpu::open(gpu::backends(None), None).expect("the adapter query works")
+			})
+			.as_ref()
+	}
+
+	/// A capture on it, or `None` when this machine has no GPU.
+	fn capture() -> Option<Capture> {
+		let gpu = shared()?;
+
+		Some(Capture::new(gpu, SIZE.0, SIZE.1).expect("the capture builds"))
 	}
 
 	/// A font of solid square glyphs, so that "is there ink here" has an answer
@@ -100,7 +125,7 @@ mod tests {
 		focused: &str,
 		caret: u32,
 	) -> Option<Image> {
-		let (_gpu, mut capture) = capture()?;
+		let mut capture = capture()?;
 
 		let mut world = Box::new(World::new());
 		world.clear = Vec3::ZERO;
@@ -142,7 +167,7 @@ mod tests {
 	///
 	/// @return the pixels, or `None` when this machine has no GPU
 	fn shoot_label() -> Option<Image> {
-		let (_gpu, mut capture) = capture()?;
+		let mut capture = capture()?;
 
 		let mut world = Box::new(World::new());
 		world.clear = Vec3::ZERO;
@@ -180,6 +205,25 @@ mod tests {
 	/// Whether anything was drawn inside a rectangle of the picture.
 	fn ink(image: &Image, left: u32, top: u32, right: u32, bottom: u32) -> bool {
 		(top..bottom).any(|y| (left..right).any(|x| image.pixel(x, y)[0] > 60))
+	}
+
+	#[test]
+	fn the_interface_pipeline_builds_on_a_device_with_no_gpu_at_all() {
+		// the one test in this file that does not skip on a machine with no
+		// adapter, because it does not need one: wgpu's stub backend runs all
+		// of naga's validation and none of the drawing, so "does `ui.wgsl`
+		// still compile, and does the pipeline still match the layouts it is
+		// built against" is answerable where nothing else here is. Nothing is
+		// looked at: every pixel this device produces is zero.
+		let Some(gpu) = Gpu::headless().expect("the stub adapter query works") else {
+			return;
+		};
+		let capture = Capture::new(&gpu, 16, 16).expect("the capture builds");
+		let mut interface = Interface::new();
+
+		interface
+			.attach(capture.device(), capture.format())
+			.expect("the interface pipeline builds");
 	}
 
 	#[test]

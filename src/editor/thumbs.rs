@@ -613,6 +613,7 @@ mod tests {
 	use std::{
 		env,
 		fs::File,
+		sync::OnceLock,
 		time::{Duration, SystemTime},
 	};
 
@@ -620,6 +621,26 @@ mod tests {
 	use colby_engine::gpu;
 
 	use super::*;
+
+	/// The one device this test binary draws with.
+	///
+	/// A `OnceLock` and not a device a test, because a suite that opens one
+	/// per test opens several at once and the driver falls over on it - which
+	/// was measured rather than guessed. @ref [`colby_engine::gpu::shared`]'s
+	/// own note, and `colby-gate-gotchas`; the renderer's tests and the
+	/// interface's each keep a copy of this, because a `cfg(test)` item is not
+	/// visible to another crate.
+	///
+	/// @return the device, or `None` on a machine with no adapter
+	fn shared() -> Option<&'static Gpu> {
+		static SHARED: OnceLock<Option<Gpu>> = OnceLock::new();
+
+		SHARED
+			.get_or_init(|| {
+				Gpu::open(gpu::backends(None), None).expect("the adapter query works")
+			})
+			.as_ref()
+	}
 
 	#[test]
 	fn the_camera_is_moved_back_far_enough_to_see_the_whole_box() {
@@ -702,8 +723,7 @@ mod tests {
 
 	#[test]
 	fn a_material_is_drawn_on_a_ball_and_two_materials_are_two_pictures() {
-		let Some(gpu) = Gpu::open(gpu::backends(None), None).expect("the adapter query works")
-		else {
+		let Some(gpu) = shared() else {
 			return;
 		};
 
@@ -716,7 +736,7 @@ mod tests {
 		fs::write(&output, colby_asset::material::encode(&brass())).expect("the file");
 
 		let image = thumbs
-			.wearing(Some(&gpu), &output, "materials/brass")
+			.wearing(Some(gpu), &output, "materials/brass")
 			.expect("the material draws");
 
 		assert_eq!((image.width, image.height), (SIZE, SIZE));
@@ -741,7 +761,7 @@ mod tests {
 		fs::write(&output, colby_asset::material::encode(&pale)).expect("the second file");
 
 		let again = thumbs
-			.wearing(Some(&gpu), &output, "materials/brass")
+			.wearing(Some(gpu), &output, "materials/brass")
 			.expect("the second material draws");
 
 		assert_ne!(again.pixels, image.pixels, "a blue matte ball is not a brass one");
@@ -753,8 +773,7 @@ mod tests {
 
 	#[test]
 	fn a_model_is_drawn_as_every_piece_of_itself_standing_where_it_stands() {
-		let Some(gpu) = Gpu::open(gpu::backends(None), None).expect("the adapter query works")
-		else {
+		let Some(gpu) = shared() else {
 			return;
 		};
 
@@ -801,7 +820,7 @@ mod tests {
 			.expect("the file");
 
 		let image = thumbs
-			.standing(Some(&gpu), &output)
+			.standing(Some(gpu), &output)
 			.expect("the model draws");
 
 		assert_eq!((image.width, image.height), (SIZE, SIZE));
@@ -837,7 +856,7 @@ mod tests {
 			.expect("the second file");
 
 		let alone = thumbs
-			.standing(Some(&gpu), &output)
+			.standing(Some(gpu), &output)
 			.expect("the shorter model draws");
 
 		assert!(covered(&alone) > 0, "the shorter one drew something too");
@@ -867,8 +886,7 @@ mod tests {
 		// a material with a missing texture is still a material worth looking
 		// at, and the browser is exactly where somebody would find out that
 		// the texture is missing.
-		let Some(gpu) = Gpu::open(gpu::backends(None), None).expect("the adapter query works")
-		else {
+		let Some(gpu) = shared() else {
 			return;
 		};
 
@@ -885,7 +903,7 @@ mod tests {
 		fs::write(&output, colby_asset::material::encode(&lost)).expect("the file");
 
 		let image = thumbs
-			.wearing(Some(&gpu), &output, "materials/lost")
+			.wearing(Some(gpu), &output, "materials/lost")
 			.expect("it draws all the same");
 
 		assert_eq!((image.width, image.height), (SIZE, SIZE));
@@ -898,8 +916,7 @@ mod tests {
 
 	#[test]
 	fn a_mesh_is_drawn_into_the_picture_when_there_is_a_device() {
-		let Some(gpu) = Gpu::open(gpu::backends(None), None).expect("the adapter query works")
-		else {
+		let Some(gpu) = shared() else {
 			return;
 		};
 
@@ -914,7 +931,7 @@ mod tests {
 			.expect("the file");
 
 		let image = thumbs
-			.render(Some(&gpu), &output)
+			.render(Some(gpu), &output)
 			.expect("the cube draws");
 
 		assert_eq!((image.width, image.height), (SIZE, SIZE));
@@ -931,7 +948,7 @@ mod tests {
 		)
 		.expect("the file");
 		let again = thumbs
-			.render(Some(&gpu), &output)
+			.render(Some(gpu), &output)
 			.expect("the sphere draws");
 		assert_ne!(again.pixels, image.pixels, "a sphere is not a cube");
 	}

@@ -220,10 +220,23 @@ features = ["std", "fmt", "ansi", "env-filter", "smallvec"]
 # @note: which of these a build really has is decided by wgpu's own build
 # script from the target: `dx12` is Windows-only there, so on Linux the word
 # is inert and `vulkan` is the whole of it. @ref `colby_engine::gpu`.
+#
+# **`noop` is not a fourth API and nothing draws with it.** It is wgpu's own
+# stub backend: every operation is an empty body except making and mapping a
+# buffer, so a picture taken through it comes back all zeros. What it *does*
+# do is run the whole of wgpu's validation and the whole of naga's - a shader
+# that does not compile and a bind group that does not match its layout are
+# both refused on it exactly as they are on a real device - which makes it the
+# one way to ask "does every pipeline this engine builds still build" on a
+# machine with no graphics hardware at all. Measured 2026-09-08: **zero new
+# lock entries**, because the `smallvec` it wants is already here.
+#
+# `gles` is deliberately not in this list; @ref the pre-commit audit list for
+# what enabling it was measured to do.
 [workspace.dependencies.wgpu]
 version = "30.0"
 default-features = false
-features = ["std", "parking_lot", "wgpu-core", "dx12", "vulkan", "wgsl"]
+features = ["std", "parking_lot", "wgpu-core", "dx12", "vulkan", "noop", "wgsl"]
 
 # @note: winit's own default set, spelled out. `x11` and `wayland` are the
 # two ways a Linux desktop has a window, and both are opened at run time: X11,

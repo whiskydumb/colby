@@ -758,7 +758,7 @@ mod tests {
 		let Some(gpu) = device() else {
 			return;
 		};
-		let mut capture = match crate::Capture::new(&gpu, 32, 32) {
+		let mut capture = match crate::Capture::new(gpu, 32, 32) {
 			| Ok(capture) => capture,
 			| Err(error) => panic!("building the capture failed: {error}"),
 		};
@@ -832,12 +832,7 @@ mod tests {
 	}
 
 	/// A device, or nothing on a machine with no usable adapter.
-	fn device() -> Option<crate::Gpu> {
-		match crate::Gpu::open(crate::gpu::backends(None), None) {
-			| Ok(gpu) => gpu,
-			| Err(error) => panic!("opening the device failed: {error}"),
-		}
-	}
+	fn device() -> Option<&'static crate::Gpu> { crate::gpu::shared() }
 
 	#[test]
 	fn every_span_has_a_slot_of_its_own_and_the_set_is_big_enough_for_all_of_them() {
