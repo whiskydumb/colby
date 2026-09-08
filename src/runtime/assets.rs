@@ -22,14 +22,14 @@
 
 use std::{
 	path::{Path, PathBuf},
-	time::{Duration, Instant, SystemTime},
+	time::{Duration, Instant},
 };
 
 use colby_asset::{
 	MeshFile, Project, TextureFile, anim::ClipFile, compile, compile::Kind,
 	document::DocumentFile, font::FontFile, loc::LangFile, material::MaterialFile,
 	model::ModelFile, scene::SceneFile, script::ScriptFile, skeleton::SkeletonFile,
-	sound::SoundFile,
+	sound::SoundFile, stamp::Input,
 };
 use colby_core::{
 	abi::{
@@ -52,7 +52,10 @@ struct Loaded {
 	name: String,
 	path: PathBuf,
 	kind: Kind,
-	stamp: SystemTime,
+
+	/// how the file looked when it was read, and the whole of what "this is
+	/// the one we already have" comes to - @ref [`Assets::load_one`]
+	seen: Input,
 }
 
 /// The compile-and-load loop's view of the two asset trees.
@@ -192,17 +195,25 @@ impl Assets {
 
 	/// Loads one compiled asset if it is new or has moved since it was last
 	/// read.
+	///
+	/// **Moved is a different file, not a later one**, and it is the compiler
+	/// that says what different means - @ref `colby_asset::stamp`. A rule that
+	/// waited for a later time would read a file rewritten inside one tick of
+	/// the filesystem's clock, and one restored from a backup, as "the one I
+	/// already have", and the world would go on holding what was replaced with
+	/// nothing anywhere to say so.
 	fn load_one(&mut self, world: &mut World, path: &Path) {
-		let Ok(stamp) = mtime(path) else {
+		let seen = Input::of(path, &self.output);
+		if seen.found.is_none() {
 			return;
-		};
+		}
 
 		let known = self
 			.loaded
 			.iter()
 			.position(|loaded| loaded.path == *path);
 
-		if known.is_some_and(|index| self.loaded[index].stamp >= stamp) {
+		if known.is_some_and(|index| self.loaded[index].seen == seen) {
 			return;
 		}
 
@@ -217,12 +228,12 @@ impl Assets {
 		// second would fill the log; the next write moves the stamp and it is
 		// tried again.
 		match known {
-			| Some(index) => self.loaded[index].stamp = stamp,
+			| Some(index) => self.loaded[index].seen = seen,
 			| None => self.loaded.push(Loaded {
 				name: name.clone(),
 				path: path.to_path_buf(),
 				kind,
-				stamp,
+				seen,
 			}),
 		}
 
@@ -831,12 +842,9 @@ fn reserve_texture(world: &mut World, name: &str) -> TextureId {
 	world.textures.insert(name, TextureData::white())
 }
 
-/// A file's modification time.
-fn mtime(path: &Path) -> std::io::Result<SystemTime> { path.metadata()?.modified() }
-
 #[cfg(test)]
 mod tests {
-	use std::{fs, thread::sleep};
+	use std::{fs, fs::File, thread::sleep};
 
 	use colby_core::abi::{Clip, Mesh, Model, Script, Texture};
 
@@ -943,6 +951,64 @@ mod tests {
 				.map(|mesh| mesh.value().triangles()),
 			Some(1),
 			"with the geometry the source described"
+		);
+	}
+
+	#[test]
+	fn a_compiled_asset_put_back_older_is_read_again() {
+		// "moved" is a different time, not a later one. An output tree
+		// restored from a backup, or a filesystem that handed two writes one
+		// time, gives the loader a file it has never read under a time that is
+		// not newer - and a rule waiting for a later time leaves the world
+		// holding what was replaced, with nothing anywhere to say so.
+		let (source, output) = trees("older");
+
+		put(&source, "meshes/thing.obj", &triangle(1.0));
+		put(&source, "meshes/other.obj", QUAD);
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source, output.clone());
+
+		assets.sync(&mut world);
+
+		let thing = world.meshes.find("meshes/thing");
+
+		assert_eq!(
+			world
+				.meshes
+				.get(thing)
+				.map(|mesh| mesh.value().triangles()),
+			Some(1),
+			"the triangle is what was loaded"
+		);
+
+		// the quad's own output, put where the triangle's was and dated back.
+		// Neither source moved, so the compiler leaves both outputs alone and
+		// the loader is the only thing deciding.
+		let standing = output.join("meshes").join("thing.cmesh");
+		let older = fs::metadata(&standing)
+			.and_then(|meta| meta.modified())
+			.expect("the output has a time")
+			- Duration::from_mins(1);
+
+		fs::copy(output.join("meshes").join("other.cmesh"), &standing)
+			.expect("the other one is put in its place");
+		File::options()
+			.write(true)
+			.open(&standing)
+			.expect("the file opens")
+			.set_modified(older)
+			.expect("and takes an older time");
+
+		assets.sync(&mut world);
+
+		assert_eq!(
+			world
+				.meshes
+				.get(thing)
+				.map(|mesh| mesh.value().triangles()),
+			Some(2),
+			"and what is in the tree is what the world holds"
 		);
 	}
 
