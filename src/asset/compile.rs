@@ -53,8 +53,8 @@ use colby_core::{
 };
 
 use crate::{
-	anim, document, font, format, gltf, html, import, jpeg, level, lua, material, model, obj,
-	png, scene, script, skeleton, sound, texture, ttf, wav,
+	anim, document, font, format, gltf, html, import, jpeg, level, loc, lua, material, model,
+	obj, png, scene, script, skeleton, sound, texture, ttf, wav,
 };
 
 /// The directory under a workspace that holds editable sources.
@@ -88,6 +88,7 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
 	wav::EXTENSION,
 	lua::EXTENSION,
 	material::SOURCE_EXTENSION,
+	loc::SOURCE_EXTENSION,
 ];
 
 /// The extensions it writes.
@@ -103,6 +104,7 @@ pub const OUTPUT_EXTENSIONS: &[&str] = &[
 	sound::EXTENSION,
 	script::EXTENSION,
 	material::EXTENSION,
+	loc::EXTENSION,
 ];
 
 /// Which of colby's formats a source compiles into.
@@ -179,6 +181,15 @@ pub enum Kind {
 	/// [`script`](crate::script) for why the output is text rather than
 	/// bytecode.
 	Script,
+
+	/// A `.loc` becomes a `.cloc`.
+	///
+	/// The second kind whose compiler does almost nothing, and a kind for the
+	/// reasons a program is one plus a fourth: sorting and checking the table
+	/// offline is what lets the reader binary-search it without sorting, and
+	/// what makes a key written twice an error at the file rather than a
+	/// coin toss at the lookup. @ref [`loc`](crate::loc).
+	Translation,
 }
 
 impl Kind {
@@ -200,6 +211,7 @@ impl Kind {
 			| level::EXTENSION => Some(Self::Scene),
 			| material::SOURCE_EXTENSION => Some(Self::Material),
 			| lua::EXTENSION => Some(Self::Script),
+			| loc::SOURCE_EXTENSION => Some(Self::Translation),
 			| _ => None,
 		}
 	}
@@ -219,6 +231,7 @@ impl Kind {
 			| Self::Skeleton => skeleton::EXTENSION,
 			| Self::Clip => anim::EXTENSION,
 			| Self::Script => script::EXTENSION,
+			| Self::Translation => loc::EXTENSION,
 		}
 	}
 
@@ -242,6 +255,7 @@ impl Kind {
 			| skeleton::EXTENSION => Some(Self::Skeleton),
 			| anim::EXTENSION => Some(Self::Clip),
 			| script::EXTENSION => Some(Self::Script),
+			| loc::EXTENSION => Some(Self::Translation),
 			| _ => None,
 		}
 	}
@@ -261,6 +275,7 @@ impl Kind {
 			| Self::Skeleton => skeleton::version_of(path),
 			| Self::Clip => anim::version_of(path),
 			| Self::Script => script::version_of(path),
+			| Self::Translation => loc::version_of(path),
 		}
 	}
 
@@ -279,6 +294,7 @@ impl Kind {
 			| Self::Skeleton => skeleton::FORMAT_VERSION,
 			| Self::Clip => anim::FORMAT_VERSION,
 			| Self::Script => script::FORMAT_VERSION,
+			| Self::Translation => loc::FORMAT_VERSION,
 		}
 	}
 }
@@ -384,6 +400,12 @@ pub enum Produced {
 
 		/// The atlas height.
 		height: u32,
+	},
+
+	/// A language.
+	Translation {
+		/// How many keys somebody translated.
+		keys: usize,
 	},
 
 	/// A program.
@@ -686,6 +708,7 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 			(document::encode(&text), produced)
 		},
 		| Kind::Script => compile_script(source)?,
+		| Kind::Translation => compile_translation(source)?,
 		| Kind::Material => compile_material(source)?,
 		| Kind::Scene => compile_scene(source)?,
 		| Kind::Model => {
@@ -1284,6 +1307,22 @@ fn compile_script(source: &Path) -> Result<(Vec<u8>, Produced)> {
 	Ok((script::encode(&text), produced))
 }
 
+/// Turns one `.loc` into the bytes of a `.cloc`.
+///
+/// Its own function for [`compile_script`]'s reason, and the whole of what
+/// compiling a translation comes to is reading it, sorting it and refusing a
+/// key written twice - all three of which happen inside [`loc::import`].
+///
+/// @param source - the `.loc`, in the source tree
+/// @return the file to write and what to report about it
+fn compile_translation(source: &Path) -> Result<(Vec<u8>, Produced)> {
+	let data = loc::import(&fs::read_to_string(source)?)
+		.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
+	let produced = Produced::Translation { keys: data.len() };
+
+	Ok((loc::encode(&data), produced))
+}
+
 /// Reads a `.scene` and writes the `.cscene` it describes.
 ///
 /// Its own function for [`compile_material`]'s reason, and it went out of the
@@ -1373,7 +1412,7 @@ mod tests {
 	/// [`the_list_of_kinds_holds_every_one_there_is`], which indexes into it
 	/// through an exhaustive match: a variant added to [`Kind`] has to be given
 	/// an index, and the only index left over is one this array does not have.
-	const EVERY_KIND: [Kind; 11] = [
+	const EVERY_KIND: [Kind; 12] = [
 		Kind::Mesh,
 		Kind::Texture,
 		Kind::Font,
@@ -1385,6 +1424,7 @@ mod tests {
 		Kind::Skeleton,
 		Kind::Clip,
 		Kind::Script,
+		Kind::Translation,
 	];
 
 	/// Where a kind sits in [`EVERY_KIND`].
@@ -1401,6 +1441,7 @@ mod tests {
 			| Kind::Skeleton => 8,
 			| Kind::Clip => 9,
 			| Kind::Script => 10,
+			| Kind::Translation => 11,
 		}
 	}
 
@@ -1879,6 +1920,61 @@ f 4 1 5 8
 
 		assert_eq!(third.compiled.len(), 1, "an edited source is compiled again");
 		assert_eq!(third.unchanged, 0, "and nothing is skipped");
+	}
+
+	#[test]
+	fn a_translation_compiles_into_a_sorted_table_under_its_own_name() {
+		let workspace = workspace("translation");
+		put(
+			&workspace,
+			"lang/ru.loc",
+			"{ \"menu.quit\": \"Vyhod\", \"menu.play\": \"Igrat\" }",
+		);
+
+		let report = run(&workspace, false);
+
+		assert_eq!(report.compiled.len(), 1, "one file in, one out");
+		assert_eq!(report.compiled[0].name, "lang/ru", "named by the file, not by a field");
+		assert_eq!(
+			report.compiled[0].produced,
+			Produced::Translation { keys: 2 },
+			"and the count is what a broken table would not have"
+		);
+
+		assert_eq!(
+			report.compiled[0]
+				.output
+				.extension()
+				.and_then(|extension| extension.to_str()),
+			Some("cloc"),
+			"written with its own extension"
+		);
+
+		let file =
+			loc::LangFile::open(&report.compiled[0].output).expect("the output is a translation");
+
+		assert_eq!(file.data().get("menu.play"), Some("Igrat"));
+		assert_eq!(
+			file.data()
+				.strings
+				.first()
+				.map(|pair| pair.0.as_str()),
+			Some("menu.play"),
+			"sorted by the compiler, whatever order it was written in"
+		);
+	}
+
+	#[test]
+	fn a_translation_that_cannot_be_read_fails_the_file_and_not_the_tree() {
+		let workspace = workspace("translation-broken");
+		put(&workspace, "lang/en.loc", "{ \"a\": \"one\", \"a\": \"two\" }");
+		put(&workspace, "lang/ru.loc", "{ \"a\": \"odin\" }");
+
+		let report = run(&workspace, false);
+
+		assert_eq!(report.compiled.len(), 1, "the good one is still compiled");
+		assert_eq!(report.compiled[0].name, "lang/ru");
+		assert_eq!(report.failed.len(), 1, "and the other is reported rather than fatal");
 	}
 
 	#[test]

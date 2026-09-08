@@ -380,11 +380,21 @@ fn build(
 	// the box a person wrote the identifier on: `set_text(hud, "score", ..)` is
 	// meant to replace what is inside `<div id="score">`, and the words under it
 	// are a child nobody named.
+	//
+	// A run of words is then put through `World::worded`, which is the whole of
+	// where a translation is reached: the words in the `.html` and whatever a
+	// game last wrote with `set_text` both arrive here, so one rule covers
+	// both. **A field's value deliberately does not go through it**: that is
+	// what somebody typed, the editing keys write it back through the same
+	// `set_text`, and a value translated on the way out would be replaced by
+	// its key the first time a key was pressed. @ref `colby_core::abi::loc`.
 	let text = if node.is_text() {
-		panel
+		let written = panel
 			.bind(named(document, index).unwrap_or_default())
 			.and_then(|bind| bind.text.clone())
-			.unwrap_or_else(|| node.text.clone())
+			.unwrap_or_else(|| node.text.clone());
+
+		world.worded(&written).to_owned()
 	} else {
 		panel.text(node).to_owned()
 	};

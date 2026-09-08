@@ -30,7 +30,7 @@ use colby_core::{
 	Error,
 	abi::{
 		Aim, Args, Asked, Bound, Cvars, Mix, NavSettings, PeerId, Scripts, Sound, Value, Voice,
-		World, console, cvar::Owner, input, navmesh,
+		World, console, cvar::Owner, input, loc, navmesh,
 	},
 	error, info, warn,
 };
@@ -299,6 +299,7 @@ pub(crate) fn install(world: &mut World) {
 
 	install_render(world);
 	install_input(world);
+	install_loc(world);
 	install_nav(world);
 	install_scenes(world);
 	install_code(world);
@@ -389,6 +390,115 @@ unsafe extern "C-unwind" fn actions(world: *mut World, _args: *const Args) {
 
 	info!(actions = names.len(), bound, map = listed.join(" "), "the input map");
 }
+/// The language being read, the one to fall back to, and one tool.
+///
+/// **Two variables and no negotiation with the operating system**, which is
+/// the one answer here that a reference could have gone either way on. Godot
+/// asks - `set_locale(OS::get_singleton()->get_locale())` - and so does
+/// Unreal through ICU; s&box does not, and its comment says the code comes
+/// from the options menu; the fourth engine with any of this reads a file a
+/// person picked in a dialog. So the field is split two and two, and the two
+/// that do not ask are the two nearest this engine's size.
+///
+/// The cost of asking, measured rather than guessed: on Windows there is no
+/// environment variable holding a locale, so it is `GetUserDefaultLocaleName`
+/// through the `windows` crate - already in the lock, so **no new lock
+/// entries** - but a direct dependency, a feature, and an `allow` in a
+/// workspace that denies unsafe code. Against that, a person types one line
+/// once and `settings.cfg` remembers it. The trigger to revisit is an options
+/// screen or a build meant to be handed to somebody who did not compile it.
+///
+/// **Saved, like the input map**, and for the same reason: which language a
+/// person reads is theirs, and coming back to a world that has forgotten it is
+/// the surprise. `loc.showkeys` is saved too, which is the split
+/// `debug.outlines` does not get - it is a *variable* rather than a command
+/// precisely so that `--shot --set loc.showkeys=1` can take a picture of it,
+/// and a mode you can be left in has to be a mode you can be left in on
+/// purpose.
+///
+/// @param world - the table to register into
+fn install_loc(world: &mut World) {
+	world.cvars.saved(
+		loc::LANGUAGE,
+		Value::Text(loc::DEFAULT_LANGUAGE.to_owned()),
+		"which language to read, by the tail of its asset name: `ru` is `lang/ru`",
+	);
+	world.cvars.saved(
+		loc::FALLBACK,
+		Value::Text(loc::DEFAULT_LANGUAGE.to_owned()),
+		"the language to look in for a key the one above has not got",
+	);
+	world.cvars.saved(
+		loc::SHOW_KEYS,
+		Value::Bool(false),
+		"draw every key instead of the words it stands for",
+	);
+
+	world.cvars.command(
+		"loc.list",
+		languages,
+		"report every language there is and how many keys each one holds",
+	);
+}
+
+/// `loc.list` - reports every language, its key count, and which is in use.
+///
+/// One line rather than one a language, for the reason `in.list` is one line:
+/// the question anybody has is "why is this still in English", and the answer
+/// is the whole table. **The counts are the point.** A language whose file
+/// failed to compile, a language nobody wrote, and a language that is simply
+/// not the one selected all put the same English on the screen; `keys=0` on a
+/// row that should have hundreds is the only thing that tells them apart, and
+/// nothing else in the engine can.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn languages(world: *mut World, _args: *const Args) {
+	// SAFETY: as help.
+	let world = unsafe { &mut *world };
+	let language = world
+		.cvars
+		.text(loc::LANGUAGE)
+		.unwrap_or_default()
+		.to_owned();
+	let fallback = world
+		.cvars
+		.text(loc::FALLBACK)
+		.unwrap_or_default()
+		.to_owned();
+
+	// slot zero is the null language and is nobody's, so it is skipped rather
+	// than listed as a language with no keys - which is exactly what a broken
+	// one looks like, and the two must not be confused on this line.
+	let listed = world
+		.translations
+		.iter()
+		.skip(1)
+		.map(|lang| {
+			format!(
+				"{}={}{}",
+				lang.name(),
+				lang.value().len(),
+				if lang.name() == format!("{}{language}", loc::PREFIX) {
+					"*"
+				} else {
+					""
+				}
+			)
+		})
+		.collect::<Vec<_>>();
+
+	info!(
+		language,
+		fallback,
+		showkeys = world.cvars.bool(loc::SHOW_KEYS).unwrap_or(false),
+		languages = listed.len(),
+		table = listed.join(" "),
+		"the translations"
+	);
+}
+
 /// The navmesh's variables: how big the thing that walks is, and one tool.
 ///
 /// **The four settings are saved and the drawing is not**, which is the split
@@ -1189,7 +1299,7 @@ unsafe extern "C-unwind" fn step(world: *mut World, args: *const Args) {
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::SoundData,
+		abi::{LangData, SoundData},
 		glam::{Vec2, Vec3},
 	};
 
@@ -1724,5 +1834,58 @@ r.backend auto
 		// it ran against a world it could read and left it alone.
 		assert!(world.action("jump"), "space is down and jump is bound to it");
 		assert_eq!(world.bound("attack").map(Bound::name), Some("mouse1"));
+	}
+
+	#[test]
+	fn the_three_translation_variables_are_registered_and_survive_a_restart() {
+		let world = engine();
+
+		for name in [loc::LANGUAGE, loc::FALLBACK, loc::SHOW_KEYS] {
+			let entry = world
+				.cvars
+				.get(name)
+				.unwrap_or_else(|| panic!("{name} is not registered"));
+
+			assert!(entry.is_archived(), "{name} has to survive a restart");
+		}
+
+		assert_eq!(
+			world.cvars.text(loc::LANGUAGE),
+			Some(loc::DEFAULT_LANGUAGE),
+			"and a project that has never been told reads the one the engine ships"
+		);
+	}
+
+	#[test]
+	fn the_language_can_be_changed_from_the_console_and_takes_effect_at_once() {
+		let mut world = engine();
+
+		world.translations.insert("lang/ru", LangData {
+			strings: vec![("menu.play".to_owned(), "Igrat".to_owned())],
+		});
+
+		assert_eq!(world.text("menu.play"), "menu.play", "nothing is in English either");
+
+		console::run(&mut world, &format!("{} ru", loc::LANGUAGE));
+
+		assert_eq!(world.text("menu.play"), "Igrat", "one line, no reload");
+
+		console::run(&mut world, &format!("{} 1", loc::SHOW_KEYS));
+
+		assert_eq!(world.text("menu.play"), "menu.play", "and the tool wins over the language");
+	}
+
+	#[test]
+	fn listing_the_languages_leaves_them_alone() {
+		let mut world = engine();
+
+		world.translations.insert("lang/ru", LangData {
+			strings: vec![("menu.play".to_owned(), "Igrat".to_owned())],
+		});
+
+		console::run(&mut world, "loc.list");
+
+		assert_eq!(world.translations.len(), 2, "the null one and the one that was loaded");
+		assert_eq!(world.text("menu.play"), "menu.play", "and it is still English");
 	}
 }

@@ -34,6 +34,7 @@ pub mod font;
 pub mod input;
 pub mod joint;
 pub mod light;
+pub mod loc;
 pub mod material;
 pub mod mesh;
 pub mod model;
@@ -76,6 +77,7 @@ pub use self::{
 	input::{Bound, Button, Input, Key},
 	joint::{Joint, JointId, JointKind, Joints, MAX_JOINTS},
 	light::{Light, LightKind, MAX_CONE, MIN_SPREAD},
+	loc::{Lang, LangData, LangId, Translations},
 	material::{Material, MaterialId, Materials},
 	mesh::{BONES_PER_VERTEX, Mesh, MeshData, MeshId, MeshVertex, Meshes, SkinVertex},
 	model::{Model, ModelData, ModelId, Models, Placement},
@@ -112,7 +114,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 62;
+pub const ABI_VERSION: u32 = 63;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -525,6 +527,15 @@ pub struct World {
 	/// [`script`](crate::abi::script).
 	pub scripts: Scripts,
 
+	/// Every language the host has loaded, reached by handle.
+	///
+	/// Filled from the asset tree like the meshes are: an `assets/lang/ru.loc`
+	/// compiles into a `.cloc` and lands here under `lang/ru`. Which of them
+	/// is being read is a console variable rather than a field, because a
+	/// language belongs to the person in front of the screen and not to the
+	/// world. @ref [`loc`](crate::abi::loc) and [`World::text`].
+	pub translations: Translations,
+
 	/// Lines, shapes and words to draw over the world.
 	///
 	/// Host-owned plain data anyone with the world may write: the solver
@@ -665,6 +676,7 @@ impl World {
 			cvars: Cvars::new(),
 			ui: Ui::new(),
 			scripts: Scripts::new(),
+			translations: Translations::new(),
 			debug: Debug::new(),
 			state: GameState::new(),
 			players: Players::new(),
@@ -1186,6 +1198,72 @@ impl World {
 		}
 
 		axis
+	}
+
+	/// What a key stands for in the language being read.
+	///
+	/// The one lookup, and everything that shows a person words goes through
+	/// it: the interface resolves a run of text with it, and a game that
+	/// builds a sentence of its own calls it directly.
+	///
+	/// Three steps, and the third is the answer no engine read for this
+	/// avoids: the language, then [`loc::FALLBACK`], then **the key itself**.
+	/// A translation is always missing something, and a project that has no
+	/// `assets/lang/` at all still reads as the keys somebody typed rather
+	/// than as blank boxes.
+	///
+	/// Two binary searches at worst, over a table of a few hundred. The
+	/// alternative - merging the fallback under the language once, the way
+	/// s&box does - is one search and a derived table that every reload of
+	/// either file has to invalidate; a lookup that owns nothing cannot go
+	/// stale.
+	///
+	/// @param key - the key, without [`loc::SIGIL`]
+	/// @return the words, or `key` when nobody translated it
+	#[must_use]
+	pub fn text<'a>(&'a self, key: &'a str) -> &'a str {
+		if self.cvars.bool(loc::SHOW_KEYS).unwrap_or(false) {
+			return key;
+		}
+
+		let language = self.cvars.text(loc::LANGUAGE).unwrap_or_default();
+		if let Some(words) = self
+			.translations
+			.data(self.translations.of_language(language))
+			.get(key)
+		{
+			return words;
+		}
+
+		let fallback = self.cvars.text(loc::FALLBACK).unwrap_or_default();
+		if fallback != language
+			&& let Some(words) = self
+				.translations
+				.data(self.translations.of_language(fallback))
+				.get(key)
+		{
+			return words;
+		}
+
+		key
+	}
+
+	/// Whatever somebody wrote, as the words it should be drawn as.
+	///
+	/// [`text`](Self::text) with the marking in front of it: a string
+	/// beginning with [`loc::SIGIL`] is looked up, a doubled sigil is a
+	/// literal one, and anything else is its own words. This is what the
+	/// interface calls, and it is deliberately the same function for a run of
+	/// text in a document and for whatever a game last handed
+	/// [`Ui::set_text`](ui::Ui::set_text) - one rule, every surface.
+	///
+	/// @param written - a run of text, a value, or what a game wrote
+	#[must_use]
+	pub fn worded<'a>(&'a self, written: &'a str) -> &'a str {
+		match loc::key_of(written) {
+			| Some(key) => self.text(key),
+			| None => loc::unescape(written),
+		}
 	}
 
 	/// Traces a ray through the world.

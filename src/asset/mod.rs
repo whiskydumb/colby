@@ -36,6 +36,7 @@ pub mod import;
 pub mod jpeg;
 pub mod json;
 pub mod level;
+pub mod loc;
 pub mod lua;
 pub mod material;
 pub mod model;

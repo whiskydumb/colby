@@ -573,7 +573,7 @@ impl Overlay for Interface {
 #[cfg(test)]
 mod tests {
 	use colby_core::abi::{
-		FontData, Glyph,
+		FontData, Glyph, LangData, Value, loc,
 		ui::{Length, style::Color},
 	};
 
@@ -1286,5 +1286,121 @@ mod tests {
 
 		assert!(!interface.is_attached(), "no pipeline");
 		assert!(!interface.placed().is_empty(), "and the layout happened anyway");
+	}
+
+	/// The words the layout put in a named box's run of text.
+	///
+	/// Through the real layout rather than through `Ui::text`, which is the
+	/// distinction these tests are for: a translation that never reached the
+	/// layout is a translation nobody can read.
+	fn drawn(interface: &Interface, world: &World, id: &str) -> String {
+		let document = world
+			.ui
+			.panels()
+			.next()
+			.and_then(|(_, panel)| world.ui.document(panel.document()))
+			.map(colby_core::abi::Entry::value)
+			.expect("the panel has a document");
+		let box_of = document.find(id).expect("the box is in it");
+
+		interface
+			.placed()
+			.iter()
+			.filter(|placed| {
+				document
+					.children(box_of)
+					.any(|child| child == placed.node)
+			})
+			.map(|placed| placed.text.clone())
+			.collect()
+	}
+
+	/// One box holding a key, and one holding words that only look like one.
+	const WORDS: &str = "<div id=\"a\">#menu.play</div><div id=\"b\">##1</div>";
+
+	#[test]
+	fn a_run_of_text_naming_a_key_is_laid_out_as_the_words_it_stands_for() {
+		let (mut world, _) = showing(WORDS, Vec2::new(800.0, 600.0));
+
+		world.translations.insert("lang/ru", ru());
+		world
+			.cvars
+			.saved(loc::LANGUAGE, Value::Text("ru".to_owned()), "");
+
+		let mut interface = Interface::new();
+		interface.run(&world);
+
+		assert_eq!(
+			drawn(&interface, &world, "a"),
+			"Igrat",
+			"the one hook is in the layout, so this is what a person reads"
+		);
+		assert_eq!(drawn(&interface, &world, "b"), "#1", "and a doubled sigil is a literal one");
+	}
+
+	#[test]
+	fn a_key_nobody_translated_is_laid_out_as_the_key() {
+		// the negative control, and the one that says what a *missing*
+		// translation looks like: not a blank box, which is what a font with
+		// no glyphs would give, and not the previous language's words.
+		let (world, _) = showing(WORDS, Vec2::new(800.0, 600.0));
+
+		let mut interface = Interface::new();
+		interface.run(&world);
+
+		assert_eq!(drawn(&interface, &world, "a"), "menu.play");
+	}
+
+	#[test]
+	fn what_a_game_wrote_is_translated_by_the_same_hook() {
+		let (mut world, panel) = showing("<div id=\"a\">nothing</div>", Vec2::new(800.0, 600.0));
+
+		world.translations.insert("lang/ru", ru());
+		world
+			.cvars
+			.saved(loc::LANGUAGE, Value::Text("ru".to_owned()), "");
+		world.ui.set_text(panel, "a", "#menu.play");
+
+		let mut interface = Interface::new();
+		interface.run(&world);
+
+		assert_eq!(
+			drawn(&interface, &world, "a"),
+			"Igrat",
+			"an attribute in the markup would have reached the document and not this"
+		);
+	}
+
+	#[test]
+	fn a_fields_value_is_never_put_through_the_lookup() {
+		// what typing into a field would otherwise do: the editing keys write
+		// the value back through `set_text`, so a value translated on its way
+		// out would be replaced by its own key at the first keypress.
+		let (mut world, panel) =
+			showing("<input id=\"one\" value=\"#menu.play\">", Vec2::new(800.0, 600.0));
+
+		world.translations.insert("lang/ru", ru());
+		world
+			.cvars
+			.saved(loc::LANGUAGE, Value::Text("ru".to_owned()), "");
+
+		let mut interface = Interface::new();
+		interface.run(&world);
+
+		let field = interface
+			.placed()
+			.iter()
+			.find(|placed| placed.text == "#menu.play")
+			.map(|placed| placed.text.clone());
+
+		assert_eq!(field.as_deref(), Some("#menu.play"), "left exactly as it is stored");
+		assert_eq!(world.ui.text(panel, "one"), "#menu.play", "and so is what is stored");
+	}
+
+	/// A language with one key in it, sorted the way the compiler leaves one.
+	fn ru() -> LangData {
+		LangData {
+			strings: vec![("menu.play".to_owned(), "Igrat".to_owned())],
+		}
 	}
 }

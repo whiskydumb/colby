@@ -1039,8 +1039,8 @@ pub(crate) fn water(world: &mut World, at: Vec3) -> Vec<Pick> {
 /// What a row of the asset browser becomes when it is dropped into the
 /// world: a scene laid down there, a mesh as an entity standing there, a
 /// model as an entity with a child per piece. Anything else - a texture, a
-/// sound, a font, a document, a program - is not a thing that stands
-/// anywhere, and becomes nothing.
+/// sound, a font, a document, a program, a translation - is not a thing that
+/// stands anywhere, and becomes nothing.
 ///
 /// @param world - the world to write
 /// @param name - the asset name, `meshes/crystal`
@@ -1059,7 +1059,8 @@ pub(crate) fn drop(world: &mut World, name: &str, kind: Kind, at: Vec3) -> Vec<P
 		| Kind::Sound
 		| Kind::Skeleton
 		| Kind::Clip
-		| Kind::Script => Vec::new(),
+		| Kind::Script
+		| Kind::Translation => Vec::new(),
 	}
 }
 

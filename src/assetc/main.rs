@@ -244,5 +244,6 @@ fn describe(produced: Produced) -> String {
 		| Produced::Scene { entities, bodies, joints } =>
 			format!("{entities:>6} entities {bodies} bodies {joints} joints"),
 		| Produced::Script { lines } => format!("{lines:>6} lines"),
+		| Produced::Translation { keys } => format!("{keys:>6} keys"),
 	}
 }

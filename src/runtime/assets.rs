@@ -27,14 +27,15 @@ use std::{
 
 use colby_asset::{
 	MeshFile, Project, TextureFile, anim::ClipFile, compile, compile::Kind,
-	document::DocumentFile, font::FontFile, material::MaterialFile, model::ModelFile,
-	scene::SceneFile, script::ScriptFile, skeleton::SkeletonFile, sound::SoundFile,
+	document::DocumentFile, font::FontFile, loc::LangFile, material::MaterialFile,
+	model::ModelFile, scene::SceneFile, script::ScriptFile, skeleton::SkeletonFile,
+	sound::SoundFile,
 };
 use colby_core::{
 	abi::{
-		ClipData, DocumentData, FontData, Material, MaterialId, MeshData, MeshId, ModelData,
-		Placement, SceneData, ScriptData, SkeletonData, SkeletonId, SoundData, TextureData,
-		TextureId, World,
+		ClipData, DocumentData, FontData, LangData, Material, MaterialId, MeshData, MeshId,
+		ModelData, Placement, SceneData, ScriptData, SkeletonData, SkeletonId, SoundData,
+		TextureData, TextureId, World,
 	},
 	debug, info, warn,
 };
@@ -237,6 +238,7 @@ impl Assets {
 			| Kind::Skeleton => load_skeleton(world, path, &name),
 			| Kind::Clip => load_clip(world, path, &name),
 			| Kind::Script => load_script(world, path, &name),
+			| Kind::Translation => load_translation(world, path, &name),
 		}
 	}
 
@@ -274,6 +276,11 @@ impl Assets {
 				),
 				| Kind::Clip => drop(world.clips.insert(&name, ClipData::default())),
 				| Kind::Script => drop(world.scripts.insert(&name, ScriptData::empty())),
+				| Kind::Translation => drop(
+					world
+						.translations
+						.insert(&name, LangData::empty()),
+				),
 			}
 
 			info!(name, ?kind, "asset unloaded; its file is gone");
@@ -493,6 +500,43 @@ fn load_script(world: &mut World, path: &Path, name: &str) {
 	// log nobody can grep. This one is the file arriving; that one is the
 	// program being run.
 	info!(name, slot = id.index(), lines, "program loaded");
+}
+
+/// Reads one `.cloc` into the world's translation table.
+///
+/// The count is in the log on purpose, and it is the one number that tells a
+/// table that loaded from a table that did not: a language whose file failed
+/// to compile and a language nobody translated anything into both answer every
+/// key with the key, and from the screen they are the same picture.
+fn load_translation(world: &mut World, path: &Path, name: &str) {
+	let file = match LangFile::open(path) {
+		| Ok(file) => file,
+		| Err(error) => {
+			warn!(%error, "the translation on disk could not be read");
+
+			return;
+		},
+	};
+
+	let data = file.to_lang_data();
+
+	let existing = world.translations.find(name);
+	if existing.is_some()
+		&& world
+			.translations
+			.get(existing)
+			.is_some_and(|lang| *lang.value() == data)
+	{
+		// the guard every other loader has: an unchanged table does not need
+		// its revision moved, and here that is what keeps a compile pass from
+		// looking like a language change.
+		return;
+	}
+
+	let keys = data.len();
+	let id = world.translations.insert(name, data);
+
+	info!(name, slot = id.index(), keys, "translation loaded");
 }
 
 /// Reads one `.cscene` into the world's scene table.

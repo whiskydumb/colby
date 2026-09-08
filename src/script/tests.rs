@@ -8,7 +8,8 @@
 //! collided yet.
 
 use colby_core::abi::{
-	Aim, Asked, Body, BodyId, EntityId, PeerId, ScriptData, Shape, Transform, Value, World,
+	Aim, Asked, Body, BodyId, EntityId, LangData, PeerId, ScriptData, Shape, Transform, Value,
+	World, loc,
 	ui::{DocumentData, Event, EventKind, PanelId},
 };
 
@@ -582,6 +583,41 @@ fn a_program_under_the_world_directory_runs_with_nobody_showing_it() {
 
 	assert_eq!(said(&world).as_deref(), Some("hello"), "the chunk ran");
 	assert_eq!(scripts.loaded.len(), 1, "and one program is being kept track of");
+}
+
+#[test]
+fn a_program_reaches_a_translation_through_the_engine_table() {
+	// the case a `#` in front of a string does not cover: a sentence a program
+	// builds itself. Reachable from a world program and from a panel's alike,
+	// because it is in the one table both are given.
+	let mut world = running(r#"colby.command("script.said " .. colby.text("menu.play"))"#);
+	listen(&mut world);
+	world.translations.insert("lang/ru", LangData {
+		strings: vec![("menu.play".to_owned(), "Igrat".to_owned())],
+	});
+	world
+		.cvars
+		.saved(loc::LANGUAGE, Value::Text("ru".to_owned()), "");
+
+	let mut scripts = machine();
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("Igrat"));
+}
+
+#[test]
+fn a_program_asking_for_a_key_nobody_has_gets_the_key() {
+	let mut world = running(r#"colby.command("script.said " .. colby.text("menu.play"))"#);
+	listen(&mut world);
+
+	let mut scripts = machine();
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("menu.play"),
+		"the same last resort the interface ends at, and never an empty string"
+	);
 }
 
 #[test]

@@ -316,6 +316,15 @@ where
 		Ok(Handle::from_bits(bits).map(|handle| handle.to_string()))
 	})?;
 
+	// the one lookup, in the table both kinds of program see rather than in a
+	// table of its own: a panel's program reaches it because it is building a
+	// string that a `set_text` cannot mark - "3 of 5 killed" is one sentence in
+	// English and a different shape in Russian - and a world program reaches it
+	// for the same reason. A string handed straight to `ui.set_text` needs
+	// none of this: `#` in front of it is the whole of that case.
+	let worded =
+		scope.create_function(move |_, key: String| Ok(world.borrow().text(&key).to_owned()))?;
+
 	// what a program asks before it makes or destroys anything. The answer is
 	// `true` for a process on its own, which is every screenshot, every
 	// recording and every window nobody has connected to - so a program that
@@ -377,6 +386,7 @@ where
 
 	tables.engine.set("command", command)?;
 	tables.engine.set("describe", describe)?;
+	tables.engine.set("text", worded)?;
 	tables.engine.set("is_host", is_host)?;
 	tables.engine.set("publish", publish)?;
 	tables.globals.set("print", print)?;

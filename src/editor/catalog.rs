@@ -75,6 +75,7 @@ pub(crate) const fn word(kind: Kind) -> &'static str {
 		| Kind::Skeleton => "skeleton",
 		| Kind::Clip => "clip",
 		| Kind::Script => "program",
+		| Kind::Translation => "translation",
 	}
 }
 
@@ -94,7 +95,10 @@ pub(crate) const fn word(kind: Kind) -> &'static str {
 /// kind says no, because the wrong answer for half of them is a screen of
 /// binary.
 pub(crate) const fn is_text(kind: Kind) -> bool {
-	matches!(kind, Kind::Mesh | Kind::Document | Kind::Material | Kind::Script)
+	matches!(
+		kind,
+		Kind::Mesh | Kind::Document | Kind::Material | Kind::Script | Kind::Translation
+	)
 }
 
 /// Every source under a project's asset tree, by name.
