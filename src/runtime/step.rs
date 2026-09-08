@@ -7,7 +7,7 @@
 //! definition of what a step does, and nothing in it depends on how much real
 //! time has gone by.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use colby_audio::Device;
 use colby_core::{
@@ -72,6 +72,14 @@ pub(crate) struct Parts<'a> {
 	/// of this and is unchanged by it, which is the property that keeps a
 	/// screenshot reproducible.
 	pub(crate) audio: Option<&'a mut Device>,
+
+	/// Where to leave how long the particles took.
+	///
+	/// A borrow rather than a return, because the caller keeps it across steps
+	/// for the profiler to read - which is `Simulation::spent`'s arrangement
+	/// with a different owner. The particles have no state of their own to
+	/// hang it off: the pool is in the world and the module is functions.
+	pub(crate) sparked: &'a mut Duration,
 }
 
 /// Advances the world by exactly one simulation step.
@@ -102,6 +110,7 @@ pub(crate) fn run(
 		simulation,
 		audio,
 		wire,
+		sparked,
 	} = parts;
 
 	// the present becomes the past before the game touches anything. What the
@@ -208,6 +217,18 @@ pub(crate) fn run(
 		}
 
 		simulation.step(world);
+
+		// and the particles immediately after the solver, inside the same
+		// guard and for the same reason: a cloud is a thing that *moves*, and
+		// a world being edited is one where the only thing that moves is what
+		// a person moves. After the solver rather than before it, so that a
+		// plume thrown by something the solver just pushed leaves from where
+		// the thing now is; before the game, so that `update` reads a cloud
+		// this step has finished writing. @ref `crate::sparks`.
+		let began = Instant::now();
+
+		crate::sparks::step(world);
+		*sparked = began.elapsed();
 
 		if let Some(game) = game {
 			game.update(world);
@@ -353,12 +374,14 @@ mod tests {
 
 	/// Runs one step of a client at a moment on the wire's clock.
 	fn stepped_at(net: &mut Net, world: &mut World, simulation: &mut Simulation, now: u64) {
+		let mut sparked = Duration::ZERO;
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
 			scripts: None,
 			simulation,
 			audio: None,
+			sparked: &mut sparked,
 			wire: Some(Wired { net, now: Duration::from_millis(now) }),
 		};
 
@@ -382,12 +405,14 @@ mod tests {
 	/// A step with nothing in it but a world, for the questions that are about
 	/// the step body rather than about the wire.
 	fn plain(world: &mut World, simulation: &mut Simulation, editing: bool) {
+		let mut sparked = Duration::ZERO;
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
 			scripts: None,
 			simulation,
 			audio: None,
+			sparked: &mut sparked,
 			wire: None,
 		};
 
@@ -628,12 +653,14 @@ mod tests {
 			let ended = u32::try_from(world.steps.saturating_add(1)).unwrap_or(u32::MAX);
 			let time = (colby_core::time::STEP * ended).as_secs_f32();
 
+			let mut sparked = Duration::ZERO;
 			let parts = Parts {
 				game: None,
 				interface: &mut interface,
 				scripts: None,
 				simulation,
 				audio: None,
+				sparked: &mut sparked,
 				wire: None,
 			};
 
@@ -680,12 +707,14 @@ mod tests {
 		// agree by accident.
 		let mut interface = Interface::new();
 		for _ in 0..20 {
+			let mut sparked = Duration::ZERO;
 			let parts = Parts {
 				game: None,
 				interface: &mut interface,
 				scripts: Some(&mut scripts),
 				simulation: &mut simulation,
 				audio: None,
+				sparked: &mut sparked,
 				wire: None,
 			};
 
@@ -808,12 +837,14 @@ mod tests {
 			let voice = world.audio.play(Voice::flat(sound));
 
 			for _ in 0..6 {
+				let mut sparked = Duration::ZERO;
 				let parts = Parts {
 					game: None,
 					interface: &mut interface,
 					scripts: None,
 					simulation: &mut simulation,
 					audio: None,
+					sparked: &mut sparked,
 					wire: None,
 				};
 
@@ -911,12 +942,14 @@ mod tests {
 	fn scripted(world: &mut World, simulation: &mut Simulation, editing: bool) {
 		let mut scripts =
 			Vm::new(colby_core::abi::console::defer).expect("the interpreter starts");
+		let mut sparked = Duration::ZERO;
 		let parts = Parts {
 			game: None,
 			interface: &mut Interface::new(),
 			scripts: Some(&mut scripts),
 			simulation,
 			audio: None,
+			sparked: &mut sparked,
 			wire: None,
 		};
 

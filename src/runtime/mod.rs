@@ -52,6 +52,7 @@ mod runtime;
 mod saves;
 mod screenshot;
 mod shot;
+mod sparks;
 mod step;
 #[cfg(feature = "hot_reload")]
 mod watch;

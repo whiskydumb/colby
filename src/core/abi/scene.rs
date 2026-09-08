@@ -68,9 +68,9 @@
 use crate::{
 	Result,
 	abi::{
-		Body, BodyId, BodyKind, Camera, EntityId, Entry, Joint, JointId, JointKind, Layers,
-		Light, MaterialId, MeshId, Pose, PoseId, Post, Registry, Renderable, Shape, ShapeKind,
-		Sky, Transform, Water, World,
+		Body, BodyId, BodyKind, Camera, Emitter, EntityId, Entry, Joint, JointId, JointKind,
+		Layers, Light, MaterialId, MeshId, Pose, PoseId, Post, Registry, Renderable, Shape,
+		ShapeKind, Sky, TextureId, Transform, Water, World,
 		field::{Field, field},
 		net::MAX_PEERS,
 		state::STATE_BYTES,
@@ -197,6 +197,22 @@ pub struct Thing {
 	/// `colby_asset::scene::Lit`.
 	pub light: Light,
 
+	/// What it throws off, or [`Emitter::NONE`] for an entity that throws
+	/// nothing.
+	///
+	/// Inline beside the light and for the light's reason: an emitter has no
+	/// existence apart from the entity carrying it. Its `texture` handle is
+	/// **not** meaningful here and is left at
+	/// [`TextureId::NONE`](crate::abi::TextureId::NONE) - a description names
+	/// assets rather than handling them, so the picture is
+	/// [`emitter_texture`](Self::emitter_texture) beside this, exactly as
+	/// [`mesh`](Self::mesh) and [`material`](Self::material) are the names of
+	/// a renderable's two handles.
+	pub emitter: Emitter,
+
+	/// The asset name of the emitter's picture, or empty for none.
+	pub emitter_texture: String,
+
 	/// Which entry of [`SceneData::posed`] moves it, or [`NO_INDEX`].
 	pub pose: u32,
 
@@ -223,6 +239,8 @@ impl Default for Thing {
 			material: String::new(),
 			color: Vec3::ZERO,
 			light: Light::NONE,
+			emitter: Emitter::NONE,
+			emitter_texture: String::new(),
 			pose: NO_INDEX,
 			parent: NO_INDEX,
 		}
@@ -1181,6 +1199,24 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 				.light(id)
 				.copied()
 				.unwrap_or(Light::NONE),
+			// the handle is dropped on the way out and the name is written
+			// instead, which is the rule every reference in this description
+			// follows. A live record holding a handle to a texture that has
+			// gone writes an empty name and comes back naming nothing.
+			emitter: Emitter {
+				texture: TextureId::NONE,
+				..world
+					.entities
+					.emitter(id)
+					.copied()
+					.unwrap_or(Emitter::NONE)
+			},
+			emitter_texture: world
+				.entities
+				.emitter(id)
+				.map(|emitter| emitter.texture)
+				.and_then(|handle| world.textures.get(handle))
+				.map_or_else(String::new, |entry| entry.name().to_owned()),
 			pose: pose_of
 				.get(renderable.pose.slot())
 				.copied()
@@ -1428,6 +1464,14 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	// that one it can be paid here, because the table is in `World`.
 	world.audio.stop_all();
 
+	// and nothing in the air survives either, for exactly that argument. A
+	// particle names the entity that threw it, the table about to be rebuilt
+	// is where that handle resolves, and a cloud left behind would be a cloud
+	// belonging to whoever happens to land in those slots. It is the same debt
+	// as the voices and it is paid in the same place, because the pool is in
+	// `World`. @ref `particles::Sparks`.
+	world.sparks.clear();
+
 	// before the entities, because a restored entity's renderable names a pose
 	// handle and the handles only exist once the table has been rebuilt.
 	let generations = slots(&scene.pose_generations, scene.posed.iter().map(Posed::key));
@@ -1455,6 +1499,9 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	for (id, thing) in things.iter().zip(&scene.things) {
 		world.entities.set_name(*id, &thing.name);
 		world.entities.set_light(*id, thing.light);
+		world
+			.entities
+			.set_emitter(*id, emitter(world, thing));
 	}
 
 	for (id, solid) in solids.iter().zip(&scene.solids) {
@@ -1633,6 +1680,9 @@ fn grafted_things(world: &mut World, piece: &SceneData) -> Vec<EntityId> {
 			// there because a refused slot hands back a null handle that
 			// `set_light` reads as nobody - which is the answer wanted.
 			world.entities.set_light(id, thing.light);
+			world
+				.entities
+				.set_emitter(id, emitter(world, thing));
 
 			id
 		})
@@ -1986,6 +2036,32 @@ fn hang(world: &mut World, landed: &[EntityId], standing: &[EntityId], things: &
 /// worth a line in the log, and an entity that simply never chose a material
 /// is not. Without the first branch every unnamed entity in a hand-written
 /// scene would warn, which is how a warning stops being read.
+/// One description's emitter, with its picture looked up by name.
+///
+/// The mirror of what [`things`] does on the way out, and the one place a
+/// `.cscene`'s emitter becomes a live one. A name nothing answers to is said
+/// once and then left as nothing: a plume drawn with the white texel is a
+/// plume somebody can see and fix, where refusing the file would lose the
+/// whole world over a missing sprite.
+///
+/// @param world - whose texture registry answers
+/// @param thing - the description
+fn emitter(world: &World, thing: &Thing) -> Emitter {
+	if thing.emitter_texture.is_empty() {
+		return Emitter {
+			texture: TextureId::NONE,
+			..thing.emitter
+		};
+	}
+
+	let found = world.textures.find(&thing.emitter_texture);
+	if !found.is_some() {
+		warn!(name = thing.emitter_texture, "a scene names a texture nothing answers to");
+	}
+
+	Emitter { texture: found, ..thing.emitter }
+}
+
 fn material(world: &World, name: &str) -> MaterialId {
 	if name.is_empty() {
 		return MaterialId::DEFAULT;
@@ -2242,6 +2318,9 @@ fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> 
 		pose,
 	});
 	world.entities.set_light(id, thing.light);
+	world
+		.entities
+		.set_emitter(id, emitter(world, thing));
 
 	id
 }

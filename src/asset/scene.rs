@@ -48,8 +48,8 @@ use std::path::Path;
 use colby_core::{
 	Result,
 	abi::{
-		BodyKind, Camera, JointKind, Layers, Light, LightKind, Post, ShapeKind, Sky, SkyKind,
-		ToneMap, Transform, Water, WaterKind,
+		BodyKind, Camera, Emitter, EmitterKind, JointKind, Layers, Light, LightKind, Post,
+		ShapeKind, Sky, SkyKind, SparkBlend, TextureId, ToneMap, Transform, Water, WaterKind,
 		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
@@ -70,14 +70,14 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// different number is refused with a message rather than read as if it
 /// agreed.
 ///
-/// Ten since a body record can say what fluid fills it.
-pub const FORMAT_VERSION: u32 = 10;
+/// Eleven since an entity record can say what it throws off.
+pub const FORMAT_VERSION: u32 = 11;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
 
 /// How big [`SceneHeader`] is, and where the first block starts.
-pub const HEADER_BYTES: usize = 176;
+pub const HEADER_BYTES: usize = 192;
 
 /// The bit in [`SceneHeader::flags`] that says the file carries a game's arena.
 ///
@@ -250,19 +250,36 @@ pub struct SceneHeader {
 	/// before this one wrote none at all.
 	pub wet_count: u32,
 
+	/// Bytes per emitter record. Must be `size_of::<Shed>()`.
+	pub shed_stride: u32,
+
+	/// Where the emitter block starts.
+	pub shed_offset: u32,
+
+	/// How many entities carried an emitter.
+	///
+	/// One record per emitter rather than a wider entity record, for the
+	/// light block's reason and with the same arithmetic behind it: throwing
+	/// particles is the rare thing an entity does, and every version before
+	/// this one wrote none at all.
+	pub shed_count: u32,
+
 	/// Nothing, and written as nothing.
 	///
-	/// Kept so the header stays a multiple of sixteen: the light block took
-	/// the last three spare words, so this block had to grow it by four. A
-	/// reader ignores it and a writer zeroes it, which is what makes it the
-	/// first word the next block added takes rather than a field anybody has
-	/// to think about.
-	pub spare: u32,
+	/// Two of them now. Kept so the header stays a multiple of sixteen: the
+	/// light block took the header's last three spare words, the water block
+	/// grew it by four and left one over, and this block took that one and
+	/// three more - which lands on a hundred and ninety-two with two to
+	/// spare. A reader ignores them and a writer zeroes them, which is what
+	/// makes them the first words the next block added takes rather than
+	/// fields anybody has to think about.
+	pub spare: [u32; 2],
 }
 
-// the light block took the header's last three spare words and this one grew
-// it by four, back to a multiple of sixteen with one word over. The next block
-// added takes that word and three more.
+// the light block took the header's last three spare words, the water block
+// grew it by four and left one over, and the emitter block took that one and
+// three more - a hundred and ninety-two bytes with two words to spare. The
+// next block added takes those two and two more.
 //
 // the blocks after the header inherit the buffer's alignment only because the
 // header is a multiple of it, and a field added without shrinking the spare
@@ -271,7 +288,7 @@ pub struct SceneHeader {
 // the first one whose length a game chooses. @ref `Places::of`.
 const _: () = assert!(
 	size_of::<SceneHeader>() == HEADER_BYTES,
-	"the header has to stay a hundred and seventy-six bytes"
+	"the header has to stay a hundred and ninety-two bytes"
 );
 
 /// The world's own settings: where it looks from, what lights it, how hard it
@@ -502,6 +519,82 @@ pub struct Wet {
 
 	/// Which way it runs, in units a second.
 	pub flow: [f32; 3],
+}
+
+/// One entity's emitter, as the file holds it.
+///
+/// Written only for an entity whose emitter is one of the throwing kinds, so
+/// the ordinary world carries none of these at all - which is the whole reason
+/// it is a block of its own rather than eighteen more words on every
+/// [`Stood`].
+///
+/// **The picture is a name and not a handle**, which is the one way this
+/// differs from [`Lit`]: a light holds only numbers and an emitter points at a
+/// texture, so the offset into the string blob is here beside the numbers,
+/// exactly as [`Stood::mesh`] and [`Stood::material`] are.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Shed {
+	/// Which entry of the entity block this belongs to.
+	pub thing: u32,
+
+	/// What shape it throws into, as
+	/// [`EmitterKind`](colby_core::abi::EmitterKind) in declaration order.
+	///
+	/// A record is only written for an emitter of one of the throwing kinds,
+	/// so nothing here should be the `none` word - but a reader that finds one
+	/// takes it, for the reason [`Lit::kind`] gives.
+	pub kind: u32,
+
+	/// How the cloud reaches the picture, as
+	/// [`SparkBlend`](colby_core::abi::SparkBlend) in declaration order.
+	pub blend: u32,
+
+	/// Offset into the string blob of the picture's asset name, or zero.
+	pub texture: u32,
+
+	/// How many particles a second it throws.
+	pub rate: f32,
+
+	/// The most it may have alive at once.
+	pub cap: u32,
+
+	/// How long a particle lives, in seconds.
+	pub life: f32,
+
+	/// How much of that is thrown away at random.
+	pub life_spread: f32,
+
+	/// How fast a particle leaves, in units a second.
+	pub speed: f32,
+
+	/// How much of that is thrown away at random.
+	pub speed_spread: f32,
+
+	/// The half-angle of a cone's mouth, in radians.
+	pub spread: f32,
+
+	/// How wide a particle is when it is thrown.
+	pub size: f32,
+
+	/// How wide it is when it dies.
+	pub size_end: f32,
+
+	/// The color it is thrown with, linear RGB.
+	pub color: [f32; 3],
+
+	/// The color it dies with, linear RGB.
+	pub color_end: [f32; 3],
+
+	/// How opaque a particle is at its brightest.
+	pub opacity: f32,
+
+	/// How much of the world's gravity a particle feels.
+	pub gravity: f32,
+
+	/// How much of its speed it loses a second, as a share.
+	pub drag: f32,
 }
 
 /// One posed skeleton, as the file holds it.
@@ -774,6 +867,10 @@ impl SceneFile {
 	#[must_use]
 	pub fn lit(&self) -> &[Lit] { self.block(self.header.lit_offset, self.header.lit_count) }
 
+	/// Every emitter record.
+	#[must_use]
+	pub fn shed(&self) -> &[Shed] { self.block(self.header.shed_offset, self.header.shed_count) }
+
 	/// The body block.
 	#[must_use]
 	pub fn bulk(&self) -> &[Bulk] { self.block(self.header.bulk_offset, self.header.bulk_count) }
@@ -921,6 +1018,21 @@ impl SceneFile {
 			}
 		}
 
+		// and the emitters the same way, and after the lights rather than
+		// before them for no reason but that the block is written in that
+		// order and a reader that walks the file in the file's own order is
+		// one fewer thing to hold in your head.
+		for record in self.shed() {
+			if let Some(thing) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+			{
+				thing.emitter = emitter_of(record);
+				self.name(record.texture)
+					.clone_into(&mut thing.emitter_texture);
+			}
+		}
+
 		// the bodies first and the water into them afterwards, for the reason
 		// the lights go onto the entities afterwards and by the same rule: a
 		// record naming a place the body block does not have is dropped rather
@@ -994,6 +1106,9 @@ impl SceneFile {
 			color: Vec3::from_array(stood.color),
 			// put on afterwards by the caller, out of the light block.
 			light: Light::NONE,
+			// and the same, out of the emitter block.
+			emitter: Emitter::NONE,
+			emitter_texture: String::new(),
 			pose: stood.pose,
 			parent: stood.parent,
 		}
@@ -1170,6 +1285,16 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		.filter(|(_, thing)| thing.light.kind.is_lit())
 		.map(|(index, thing)| lit_of(index, thing.light))
 		.collect::<Result<Vec<_>>>()?;
+	// one record per emitter, keyed the way a light is and for the light's
+	// reason: a piece grafted somewhere else keeps its entities' order and not
+	// their slots.
+	let shed: Vec<Shed> = data
+		.things
+		.iter()
+		.enumerate()
+		.filter(|(_, thing)| thing.emitter.kind.throws())
+		.map(|(index, thing)| shed_of(index, thing, &mut names))
+		.collect::<Result<Vec<_>>>()?;
 	let bulk: Vec<Bulk> = data
 		.solids
 		.iter()
@@ -1214,6 +1339,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	let blocks = Blocks {
 		stood: &stood,
 		lit: &lit,
+		shed: &shed,
 		bulk: &bulk,
 		wet: &wet,
 		tie: &tie,
@@ -1230,6 +1356,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::bytes_of(&setting_of(data.stage)));
 	out.extend_from_slice(bytemuck::cast_slice(&stood));
 	out.extend_from_slice(bytemuck::cast_slice(&lit));
+	out.extend_from_slice(bytemuck::cast_slice(&shed));
 	out.extend_from_slice(bytemuck::cast_slice(&bulk));
 	out.extend_from_slice(bytemuck::cast_slice(&wet));
 	out.extend_from_slice(bytemuck::cast_slice(&tie));
@@ -1252,6 +1379,7 @@ struct Places {
 	setting: usize,
 	stood: usize,
 	lit: usize,
+	shed: usize,
 	bulk: usize,
 	wet: usize,
 	tie: usize,
@@ -1270,6 +1398,7 @@ impl Places {
 		let Blocks {
 			stood,
 			lit,
+			shed,
 			bulk,
 			wet,
 			tie,
@@ -1284,7 +1413,10 @@ impl Places {
 		// the world reads in. Every offset is stored, so where a block lands is
 		// a matter of what is legible rather than of what a reader can find.
 		let lit_at = stood_at + size_of_val(stood);
-		let bulk_at = lit_at + size_of_val(lit);
+		// and the emitters beside the lights, for the same argument: both hang
+		// off an entity and both are read once the entity table is back.
+		let shed_at = lit_at + size_of_val(lit);
+		let bulk_at = shed_at + size_of_val(shed);
 		let wet_at = bulk_at + size_of_val(bulk);
 		let tie_at = wet_at + size_of_val(wet);
 		let bent_at = tie_at + size_of_val(tie);
@@ -1305,6 +1437,7 @@ impl Places {
 			setting,
 			stood: stood_at,
 			lit: lit_at,
+			shed: shed_at,
 			bulk: bulk_at,
 			wet: wet_at,
 			tie: tie_at,
@@ -1323,6 +1456,7 @@ impl Places {
 struct Blocks<'a> {
 	stood: &'a [Stood],
 	lit: &'a [Lit],
+	shed: &'a [Shed],
 	bulk: &'a [Bulk],
 	wet: &'a [Wet],
 	tie: &'a [Tie],
@@ -1342,6 +1476,7 @@ fn head(
 	let Blocks {
 		stood,
 		lit,
+		shed,
 		bulk,
 		wet,
 		tie,
@@ -1406,7 +1541,10 @@ fn head(
 		wet_stride: width::<Wet>("a scene's records")?,
 		wet_offset: count(places.wet, "a scene's records")?,
 		wet_count: count(wet.len(), "a scene's records")?,
-		spare: 0,
+		shed_stride: width::<Shed>("a scene's records")?,
+		shed_offset: count(places.shed, "a scene's records")?,
+		shed_count: count(shed.len(), "a scene's records")?,
+		spare: [0; 2],
 	})
 }
 
@@ -1632,6 +1770,63 @@ fn water_of(record: &Wet) -> Water {
 }
 
 /// One light, as the world holds it.
+/// One entity's emitter, as a record, with its picture put in the blob.
+///
+/// @param index - the entity's place in the entity block
+/// @param thing - the description it came off
+/// @param names - the blob the picture's name is appended to
+fn shed_of(index: usize, thing: &Thing, names: &mut Names) -> Result<Shed> {
+	let emitter = thing.emitter;
+
+	Ok(Shed {
+		thing: count(index, "a scene's records")?,
+		kind: emitter.kind.index(),
+		blend: emitter.blend.index(),
+		texture: names.put(&thing.emitter_texture),
+		rate: emitter.rate,
+		cap: emitter.cap,
+		life: emitter.life,
+		life_spread: emitter.life_spread,
+		speed: emitter.speed,
+		speed_spread: emitter.speed_spread,
+		spread: emitter.spread,
+		size: emitter.size,
+		size_end: emitter.size_end,
+		color: emitter.color.to_array(),
+		color_end: emitter.color_end.to_array(),
+		opacity: emitter.opacity,
+		gravity: emitter.gravity,
+		drag: emitter.drag,
+	})
+}
+
+/// One emitter record, as a description holds it.
+///
+/// The picture is left to the caller, which is the one thing here that needs
+/// the blob.
+fn emitter_of(record: &Shed) -> Emitter {
+	Emitter {
+		kind: EmitterKind::at(record.kind).unwrap_or(EmitterKind::None),
+		blend: SparkBlend::at(record.blend).unwrap_or_default(),
+		// a description never handles an asset; the name goes on beside it.
+		texture: TextureId::NONE,
+		rate: record.rate,
+		cap: record.cap,
+		life: record.life,
+		life_spread: record.life_spread,
+		speed: record.speed,
+		speed_spread: record.speed_spread,
+		spread: record.spread,
+		size: record.size,
+		size_end: record.size_end,
+		color: Vec3::from_array(record.color),
+		color_end: Vec3::from_array(record.color_end),
+		opacity: record.opacity,
+		gravity: record.gravity,
+		drag: record.drag,
+	}
+}
+
 fn light_of(record: &Lit) -> Light {
 	Light {
 		kind: LightKind::at(record.kind).unwrap_or(LightKind::None),
@@ -1833,6 +2028,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 		(header.setting_stride, size_of::<Setting>(), "settings"),
 		(header.stood_stride, size_of::<Stood>(), "entities"),
 		(header.lit_stride, size_of::<Lit>(), "lights"),
+		(header.shed_stride, size_of::<Shed>(), "emitters"),
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
 		(header.wet_stride, size_of::<Wet>(), "waters"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
@@ -1904,6 +2100,7 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 	fits::<Setting>(bytes, HEADER_BYTES, (header.setting_offset, 1), "settings")?;
 	fits::<Stood>(bytes, HEADER_BYTES, (header.stood_offset, header.stood_count), "entities")?;
 	fits::<Lit>(bytes, HEADER_BYTES, (header.lit_offset, header.lit_count), "lights")?;
+	fits::<Shed>(bytes, HEADER_BYTES, (header.shed_offset, header.shed_count), "emitters")?;
 	fits::<Bulk>(bytes, HEADER_BYTES, (header.bulk_offset, header.bulk_count), "bodies")?;
 	fits::<Wet>(bytes, HEADER_BYTES, (header.wet_offset, header.wet_count), "waters")?;
 	fits::<Tie>(bytes, HEADER_BYTES, (header.tie_offset, header.tie_count), "joints")?;
@@ -2012,6 +2209,8 @@ mod tests {
 				material: "brass".to_owned(),
 				color: Vec3::new(0.8, 0.7, 0.6),
 				light: Light::point(Vec3::new(1.0, 0.9, 0.7), 2.5, 12.0),
+				emitter: Emitter::NONE,
+				emitter_texture: String::new(),
 				pose: 0,
 				parent: scene::NO_INDEX,
 			},
@@ -2031,6 +2230,28 @@ mod tests {
 				// the block is 1, so a writer keying a light by slot rather
 				// than by index puts this record on nobody.
 				light: Light::spot(Vec3::new(0.2, 0.4, 1.0), 4.0, 30.0, 0.3, 0.6),
+				// on the second one for the light's reason, and with every
+				// number moved off its default so a round trip that dropped a
+				// field is a failing test rather than a coincidence
+				emitter: Emitter {
+					blend: SparkBlend::Alpha,
+					rate: 40.5,
+					cap: 96,
+					life: 2.25,
+					life_spread: 0.4,
+					speed: 3.5,
+					speed_spread: 0.6,
+					spread: 0.35,
+					size: 0.15,
+					size_end: 0.85,
+					color: Vec3::new(1.0, 0.5, 0.25),
+					color_end: Vec3::new(0.1, 0.1, 0.4),
+					opacity: 0.75,
+					gravity: 0.5,
+					drag: 0.2,
+					..Emitter::cone(40.5, 2.25, 0.35)
+				},
+				emitter_texture: "textures/smoke".to_owned(),
 				pose: scene::NO_INDEX,
 				// hanging off the first, so the field carries something a
 				// round trip could lose
@@ -2470,6 +2691,107 @@ mod tests {
 
 		assert_eq!(header.lit_count, 0, "nothing shines, so nothing is written down");
 		assert_eq!(round_trip(&data), data, "and it comes back the same way");
+	}
+
+	/// The sample written out, with one word of its first emitter record
+	/// overwritten.
+	///
+	/// @param at - the record's own field offset, in bytes
+	/// @param word - what to put there
+	fn shed_word_changed(at: usize, word: u32) -> SceneData {
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let first = usize::try_from(header.shed_offset).expect("it is an offset") + at;
+
+		assert_eq!(header.shed_count, 1, "the sample carries one emitter");
+		bytes[first..first + 4].copy_from_slice(&word.to_le_bytes());
+
+		SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a changed word is not a broken file")
+			.to_scene_data()
+	}
+
+	#[test]
+	fn an_emitter_is_written_against_its_place_in_the_entity_block_and_not_its_slot() {
+		// the sample's emitter is on the second entity, whose slot is 2 and
+		// whose place in the block is 1. A writer keying by slot puts the
+		// record on nobody; a reader keying by slot reads it onto nobody. The
+		// same trap the light block has.
+		let data = sample();
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+
+		assert_eq!(header.shed_count, 1, "one entity throws anything");
+		assert_eq!(file.shed()[0].thing, 1, "and it is the second entry, not slot two");
+		assert_eq!(
+			round_trip(&data).things[1].emitter,
+			data.things[1].emitter,
+			"and every number of it comes back"
+		);
+		assert_eq!(
+			round_trip(&data).things[1].emitter_texture,
+			"textures/smoke",
+			"picture and all"
+		);
+	}
+
+	#[test]
+	fn an_emitter_naming_an_entity_that_is_not_there_is_dropped() {
+		let read = shed_word_changed(offset_of!(Shed, thing), 99);
+
+		assert_eq!(read.things[1].emitter, Emitter::NONE, "the record went nowhere");
+		assert!(read.things[1].emitter_texture.is_empty(), "and neither did its picture");
+	}
+
+	#[test]
+	fn an_emitter_of_a_kind_this_build_does_not_know_reads_as_no_emitter() {
+		let read = shed_word_changed(offset_of!(Shed, kind), 9);
+
+		assert_eq!(
+			read.things[1].emitter.kind,
+			EmitterKind::None,
+			"a word off the end of the list is nothing rather than a refusal"
+		);
+		assert!(
+			(read.things[1].emitter.rate - sample_things()[1].emitter.rate).abs() < 1.0e-6,
+			"and the numbers beside it are still read"
+		);
+	}
+
+	#[test]
+	fn a_world_that_throws_nothing_writes_no_emitter_block() {
+		let mut data = sample();
+		for thing in &mut data.things {
+			thing.emitter = Emitter::NONE;
+			thing.emitter_texture = String::new();
+		}
+
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+
+		assert_eq!(header.shed_count, 0, "nothing throws, so nothing is written down");
+		assert_eq!(round_trip(&data), data, "and it comes back the same way");
+	}
+
+	#[test]
+	fn the_header_stays_a_multiple_of_sixteen_and_says_where_every_block_is() {
+		// the whole reason the spare words exist. A header that is not a
+		// multiple of sixteen moves every block after it by a byte or two and
+		// nothing notices until a cast fails on a machine that cares.
+		assert_eq!(HEADER_BYTES % 16, 0, "the blocks after it inherit its alignment");
+		assert_eq!(size_of::<SceneHeader>(), HEADER_BYTES);
+
+		let bytes = encode(&sample()).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+
+		assert_eq!(header.spare, [0; 2], "and a writer zeroes what it does not use");
+		assert!(
+			header.shed_offset > header.lit_offset,
+			"the emitters are written after the lights"
+		);
+		assert!(header.bulk_offset > header.shed_offset, "and the bodies after the emitters");
 	}
 
 	#[test]

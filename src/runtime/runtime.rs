@@ -142,6 +142,15 @@ pub struct Runtime {
 	/// is worth running, and the log says which half is missing.
 	pub(crate) audio: Option<Device>,
 
+	/// How long the last step's particles took.
+	///
+	/// Kept here rather than returned, because what reads it is the profiler
+	/// one layer up and it wants the number a whole frame later. The physics
+	/// keeps its own inside `Simulation`; the particles have no state to keep
+	/// theirs in, so it lives beside the thing that drives them. @ref
+	/// `crate::sparks`.
+	pub(crate) sparked: Duration,
+
 	/// The world as a snapshot describes it, taken down once a step rather
 	/// than allocated per snapshot. Empty off the wire.
 	records: Vec<Slot>,
@@ -265,6 +274,7 @@ impl Runtime {
 				// refuses a host anyway - so at that end this is which answer
 				// is given rather than whether one is.
 				wire: wired(self.net.as_mut(), moment),
+				sparked: &mut self.sparked,
 			},
 			input,
 			rate,
@@ -600,6 +610,7 @@ impl Opening {
 			console,
 			net,
 			audio,
+			sparked: Duration::ZERO,
 			records: Vec::new(),
 			started: Instant::now(),
 			project,
@@ -943,6 +954,7 @@ mod tests {
 				console: None,
 				net: None,
 				audio: None,
+				sparked: Duration::ZERO,
 				records: Vec::new(),
 				started: Instant::now(),
 				project: Project::parse(

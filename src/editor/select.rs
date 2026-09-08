@@ -742,6 +742,14 @@ fn copy_entities(world: &mut World, sources: &[EntityId]) -> Vec<(EntityId, Enti
 			world.entities.set_light(copy, light);
 		}
 
+		// and its emitter, beside the light and on the same terms. What it has
+		// already thrown is *not* copied: a cloud belongs to the emitter that
+		// threw it, and a duplicate that arrived with somebody else's smoke
+		// around it would be a copy of a moment rather than of a thing.
+		if let Some(emitter) = world.entities.emitter(source).copied() {
+			world.entities.set_emitter(copy, emitter);
+		}
+
 		let name = world.entities.name(source).to_owned();
 		world.entities.set_name(copy, &name);
 		copies.push((source, copy));

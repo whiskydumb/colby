@@ -31,6 +31,7 @@ use super::{
 	material::MaterialId,
 	mesh::MeshId,
 	names::Names,
+	particles::Emitter,
 	pose::PoseId,
 };
 use crate::{
@@ -365,6 +366,14 @@ pub struct Entities {
 	/// by index, and a side table would be a second lookup on the one path
 	/// the renderer walks every frame. @ref [`light`](super::light).
 	lights: Vec<Light>,
+	/// What each slot throws off, or [`Emitter::NONE`] for a slot that throws
+	/// nothing. The same slots again, and a light's argument word for word: an
+	/// emitter is rare where a transform is universal, and the step walks
+	/// every slot looking for one. What it throws is *not* here - the cloud is
+	/// [`World::sparks`](super::World::sparks), one pool for the world, and
+	/// this is only the description of it. @ref
+	/// [`particles`](super::particles).
+	emitters: Vec<Emitter>,
 	/// What each slot hangs off, or [`EntityId::NONE`] for a thing standing
 	/// on its own. The same slots again. A handle rather than a slot number,
 	/// so that a parent which died and whose slot something else took is a
@@ -397,6 +406,7 @@ impl Entities {
 			previous: Vec::new(),
 			renderables: Vec::new(),
 			lights: Vec::new(),
+			emitters: Vec::new(),
 			parents: Vec::new(),
 			names: Names::new(),
 			generations: Vec::new(),
@@ -438,6 +448,7 @@ impl Entities {
 		self.pending.push(slot);
 		self.renderables[slot] = Renderable::NOTHING;
 		self.lights[slot] = Light::NONE;
+		self.emitters[slot] = Emitter::NONE;
 		// and it hangs off nothing, whatever the previous occupant did.
 		self.parents[slot] = EntityId::NONE;
 		// whatever the previous occupant of this slot was called is not what
@@ -467,6 +478,7 @@ impl Entities {
 		self.previous[slot] = Transform::IDENTITY;
 		self.renderables[slot] = Renderable::NOTHING;
 		self.lights[slot] = Light::NONE;
+		self.emitters[slot] = Emitter::NONE;
 		self.parents[slot] = EntityId::NONE;
 		self.free.push(id.index);
 		self.live -= 1;
@@ -486,6 +498,7 @@ impl Entities {
 			self.previous[slot] = Transform::IDENTITY;
 			self.renderables[slot] = Renderable::NOTHING;
 			self.lights[slot] = Light::NONE;
+			self.emitters[slot] = Emitter::NONE;
 			self.parents[slot] = EntityId::NONE;
 			if let Ok(index) = u32::try_from(slot) {
 				self.free.push(index);
@@ -575,6 +588,46 @@ impl Entities {
 		};
 
 		self.lights[slot] = light;
+
+		true
+	}
+
+	/// What an entity throws off, or [`Emitter::NONE`] for one that throws
+	/// nothing.
+	///
+	/// Every living slot answers this and almost every answer is the nothing,
+	/// exactly as [`light`](Self::light) is. A caller walking the table asks
+	/// [`Emitter::throws`] rather than this. @ref
+	/// [`particles`](super::particles) for why the position and the direction
+	/// are not in the answer, and where what it has thrown lives.
+	#[must_use]
+	pub fn emitter(&self, id: EntityId) -> Option<&Emitter> {
+		self.slot(id).map(|slot| &self.emitters[slot])
+	}
+
+	/// What an entity throws off, to change.
+	pub fn emitter_mut(&mut self, id: EntityId) -> Option<&mut Emitter> {
+		self.slot(id).map(|slot| &mut self.emitters[slot])
+	}
+
+	/// Makes an entity throw particles, or stops it.
+	///
+	/// **The cloud it has already thrown is not touched**, which is the answer
+	/// with a reason: a fire that is turned off should burn out rather than
+	/// vanish, and the step sweeps what is left as each particle's own life
+	/// runs down. What does clear the cloud at once is the entity dying, and
+	/// that is [`Sparks::forget`](super::particles::Sparks::forget) from the
+	/// step rather than anything here - this table has no reach into the pool.
+	///
+	/// @param id - which entity
+	/// @param emitter - what it throws; [`Emitter::NONE`] stops it
+	/// @return `true` if the handle resolved
+	pub fn set_emitter(&mut self, id: EntityId, emitter: Emitter) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.emitters[slot] = emitter;
 
 		true
 	}
@@ -905,6 +958,8 @@ impl Entities {
 			.resize(slots, Renderable::NOTHING);
 		self.lights.clear();
 		self.lights.resize(slots, Light::NONE);
+		self.emitters.clear();
+		self.emitters.resize(slots, Emitter::NONE);
 		self.parents.clear();
 		self.parents.resize(slots, EntityId::NONE);
 		self.names.reset(slots);
@@ -963,6 +1018,7 @@ impl Entities {
 			self.previous.push(Transform::IDENTITY);
 			self.renderables.push(Renderable::NOTHING);
 			self.lights.push(Light::NONE);
+			self.emitters.push(Emitter::NONE);
 			self.parents.push(EntityId::NONE);
 			self.names.push();
 			self.generations.push(0);
@@ -1014,6 +1070,7 @@ impl Entities {
 		// the reason the parent below is left alone: a restore hands the table
 		// slots and plain records, and a light is set by handle afterwards.
 		self.lights[slot] = Light::NONE;
+		self.emitters[slot] = Emitter::NONE;
 		// off nothing until whoever put it back says otherwise, which a
 		// restore does once every record has landed. @ref `scene::restore`.
 		self.parents[slot] = EntityId::NONE;
@@ -1085,6 +1142,7 @@ impl Entities {
 		self.previous.push(Transform::IDENTITY);
 		self.renderables.push(Renderable::NOTHING);
 		self.lights.push(Light::NONE);
+		self.emitters.push(Emitter::NONE);
 		self.parents.push(EntityId::NONE);
 		self.names.push();
 		self.generations.push(0);

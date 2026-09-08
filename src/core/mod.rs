@@ -14,6 +14,7 @@
 pub mod abi;
 pub mod error;
 pub mod log;
+pub mod random;
 pub mod time;
 pub mod utils;
 

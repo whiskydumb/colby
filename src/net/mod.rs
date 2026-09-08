@@ -40,7 +40,10 @@
 //!   has;
 //! - [`ring`] - what a host remembers having told one peer, so the next telling
 //!   can be that difference;
-//! - [`random`] - a seeded shift register, so that a run can be repeated;
+//! - [`Random`](colby_core::random) - a seeded shift register, so that a run of
+//!   the wire below can be repeated. It lives in `colby_core` since shell step
+//!   5k, because a particle needs the same stream for the same reason a lying
+//!   link does, and is re-exported here so nothing that used it had to move;
 //! - [`link`] - a wire made as bad as somebody wants it, which is what there is
 //!   to point a change at when the change is about loss.
 //!
@@ -62,10 +65,11 @@ pub mod heard;
 pub mod link;
 pub mod packet;
 pub mod parcel;
-pub mod random;
 pub mod reliable;
 pub mod ring;
 pub mod snapshot;
+
+pub use colby_core::random::Random;
 
 pub use self::{
 	channel::{Channel, Delivery, HISTORY},
@@ -79,7 +83,6 @@ pub use self::{
 	parcel::{
 		AIM_BYTES, Kind, MAX_PARCEL, MAX_PIECE, MAX_PIECES, MAX_UNTIED, Parcel, Pieces, Untied,
 	},
-	random::Random,
 	reliable::{MAX_ITEM, MAX_ITEMS, Reliable},
 	ring::{DEPTH, Ring},
 	snapshot::{

@@ -48,7 +48,7 @@
 
 use std::time::Duration;
 
-use crate::random::{CERTAIN, Random, threshold};
+use colby_core::random::{CERTAIN, Random, threshold};
 
 /// The variable that sets how long a datagram is held.
 pub const LAG: &str = "net.lag";
@@ -183,7 +183,7 @@ impl Link {
 	/// A link that does nothing to what crosses it, ready to be told otherwise.
 	///
 	/// @param seed - what the chance in it starts from; @ref
-	/// [`Random::new`](crate::random::Random::new)
+	/// [`Random::new`](colby_core::random::Random::new)
 	#[must_use]
 	pub fn new(seed: u64) -> Self {
 		Self {

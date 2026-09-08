@@ -1,11 +1,19 @@
 //! Numbers that look random and are not.
 //!
-//! Twelve lines of shift and multiply, seeded by hand, because the whole point
-//! of the lying link above it is that a run of it can be repeated. Every
-//! networking library in this field reaches for a thread-local generator seeded
-//! from the operating system, and every one of them therefore cannot say what
-//! its own simulated link will do twice - which is fine for a demo and useless
-//! as a tool. A seed and a shift register cost nothing and buy a hash.
+//! Twelve lines of shift and multiply, seeded by hand, because two things in
+//! this engine want randomness and both of them want it to be repeatable. The
+//! lying link in `colby_net` is one: every networking library in this field
+//! reaches for a thread-local generator seeded from the operating system, and
+//! every one of them therefore cannot say what its own simulated link will do
+//! twice - which is fine for a demo and useless as a tool. Particles are the
+//! other, and their claim is stronger still: `--shot`, `--record` and `--link`
+//! are the same picture, the same sound and the same digest on every machine,
+//! and a plume of smoke drawn from the operating system's entropy would end
+//! all three.
+//!
+//! **It lives here rather than beside either of them**, and moved here at
+//! shell step 5k when the second caller arrived. A seed and a shift register
+//! cost nothing and buy a hash.
 //!
 //! **A probability crosses as a threshold rather than as a fraction.** The
 //! caller writes 0.02 and [`threshold`] turns it into the share of the draw

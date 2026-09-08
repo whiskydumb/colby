@@ -76,8 +76,8 @@
 use colby_core::{
 	Result,
 	abi::{
-		Body, BodyId, BodyKind, Camera, EntityId, Field, Joint, JointKind, Layers, Light, MeshId,
-		Post, Renderable, Shape, Sky, Transform,
+		Body, BodyId, BodyKind, Camera, Emitter, EntityId, Field, Joint, JointKind, Layers,
+		Light, MeshId, Post, Renderable, Shape, Sky, Transform,
 		field::{self, Kind},
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
@@ -264,7 +264,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 		check(
 			entry,
 			&[names(Transform::FIELDS, &[]), names(Renderable::FIELDS, &[])],
-			&["name", "parent", "light"],
+			&["name", "parent", "light", "emitter"],
 			"an entity",
 		)?;
 
@@ -302,6 +302,23 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			read(&mut lamp, shining, Light::FIELDS, "a light")?;
 		}
 
+		// and the emitter under a key of its own, for the light's reason and
+		// with one more of its own: an emitter has a `color` *and* a `size`
+		// and a `blend`, all three of which are words something else here
+		// already uses.
+		let mut emitter = Emitter::NONE;
+		let picture = if let Some(throwing) = entry.get("emitter") {
+			// `texture` by hand: it is a reference, so `read` steps over it
+			// and the name is taken beside the numbers - the same two calls a
+			// mesh and a material get.
+			check(throwing, &[names(Emitter::FIELDS, &[])], &["texture"], "an emitter")?;
+			read(&mut emitter, throwing, Emitter::FIELDS, "an emitter")?;
+
+			text(throwing.get("texture"))
+		} else {
+			String::new()
+		};
+
 		things.push(Thing {
 			name,
 			slot: count(index, "a scene's records")?,
@@ -311,6 +328,8 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			material: text(entry.get("material")),
 			color: look.color,
 			light: lamp,
+			emitter,
+			emitter_texture: picture,
 			pose,
 			parent: NO_INDEX,
 		});
@@ -1119,6 +1138,26 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> R
 		},
 		|_| None,
 	)?;
+	// and the emitter under its own key, on the same terms. The picture is
+	// written by hand because it is a reference - and it is written *only*
+	// when the entity throws something, so an emitter of no kind writes no
+	// object at all rather than an object holding one empty name.
+	put_all(
+		&mut rows,
+		&thing.emitter,
+		&Emitter::NONE,
+		Emitter::FIELDS,
+		&Writing {
+			prefix: "emitter.",
+			what: "an entity's emitter",
+			skipped: &[],
+		},
+		|field| match field {
+			| "texture" if thing.emitter.kind.throws() =>
+				named_row("texture", &thing.emitter_texture),
+			| _ => None,
+		},
+	)?;
 
 	Ok(rows.text())
 }
@@ -1526,7 +1565,8 @@ pub(crate) fn as_text(value: &str) -> String { json::quoted(value) }
 #[cfg(test)]
 mod tests {
 	use colby_core::abi::{
-		LightKind, ShapeKind, SkyKind, ToneMap, Water, WaterKind, scene::Form,
+		EmitterKind, LightKind, ShapeKind, SkyKind, SparkBlend, TextureId, ToneMap, Water,
+		WaterKind, scene::Form,
 	};
 
 	use super::*;
@@ -2664,6 +2704,85 @@ mod tests {
 
 		assert!(
 			format!("{refused}").contains("viscosity"),
+			"and the message says which word it was: {refused}"
+		);
+	}
+
+	#[test]
+	fn an_emitter_is_read_out_of_its_own_object_and_written_back_into_one() {
+		let scene = import(
+			r#"{ "entities": [
+				{ "name": "fire", "color": [1, 0, 0], "emitter": {
+					"kind": "cone", "blend": "alpha", "texture": "textures/smoke",
+					"rate": 40, "cap": 96, "life": 2, "spread": 0.35,
+					"size": 0.15, "size_end": 0.85, "color": [1, 0.5, 0.25],
+					"color_end": [0, 0, 0.5], "gravity": 0.25, "drag": 0.2 } },
+				{ "name": "crate", "mesh": "cube" }
+			] }"#,
+		)
+		.expect("it is a scene");
+
+		let fire = scene.things[0].emitter;
+
+		assert_eq!(fire.kind, EmitterKind::Cone, "the word is the kind");
+		assert_eq!(fire.blend, SparkBlend::Alpha, "and so is the way it reaches the picture");
+		assert_eq!(
+			scene.things[0].emitter_texture, "textures/smoke",
+			"and the picture is named rather than handled"
+		);
+		assert_eq!(
+			fire.texture,
+			TextureId::NONE,
+			"the handle beside it stays nothing: a description handles no asset"
+		);
+		assert_eq!(
+			fire.color,
+			Vec3::new(1.0, 0.5, 0.25),
+			"the emitter has its own color, which a flat namespace could not keep apart from 			 the entity's"
+		);
+		assert_eq!(
+			scene.things[0].color,
+			Vec3::new(1.0, 0.0, 0.0),
+			"and the entity's is its own"
+		);
+		assert!((fire.rate - 40.0).abs() < 1.0e-6 && (fire.life - 2.0).abs() < 1.0e-6);
+		assert_eq!(fire.cap, 96, "and a count comes through as a whole number");
+		assert_eq!(
+			scene.things[1].emitter,
+			Emitter::NONE,
+			"and an entity without one throws nothing"
+		);
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains("\"emitter\": {"), "the fire is written under its own key");
+		assert_eq!(
+			text.matches("\"emitter\": {").count(),
+			1,
+			"and the crate, whose emitter is the default, gets no key at all"
+		);
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn an_emitter_field_nobody_declared_is_refused_by_name() {
+		let refused = import(r#"{ "entities": [ { "name": "a", "emitter": { "swirl": 2 } } ] }"#)
+			.expect_err("an emitter has no swirl");
+
+		assert!(
+			format!("{refused}").contains("swirl"),
+			"and the message says which word it was: {refused}"
+		);
+	}
+
+	#[test]
+	fn an_emitter_with_a_negative_cap_is_refused_rather_than_read_as_none() {
+		let refused =
+			import(r#"{ "entities": [ { "emitter": { "kind": "point", "cap": -1 } } ] }"#)
+				.expect_err("a cap of minus one is not a cap");
+
+		assert!(
+			format!("{refused}").contains("cap"),
 			"and the message says which word it was: {refused}"
 		);
 	}

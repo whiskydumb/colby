@@ -21,8 +21,8 @@
 use colby_asset::Project;
 use colby_core::{
 	abi::{
-		Body, BodyId, EntityId, Field, Joint, JointId, Light, Material, MaterialId, ModelId,
-		Post, Renderable, Sky, TextureId, Transform, World,
+		Body, BodyId, Emitter, EntityId, Field, Joint, JointId, Light, Material, MaterialId,
+		ModelId, Post, Renderable, Sky, TextureId, Transform, World,
 		field::{Kind, Value},
 		scene::{self, Stage},
 	},
@@ -96,6 +96,7 @@ fn detail(
 			placing(ui, world, pick, history);
 			look(ui, world, id, history);
 			lamp(ui, world, id, history);
+			thrower(ui, world, id, history);
 		},
 		| Pick::Body(id) => {
 			naming(ui, world, pick, history, rename);
@@ -235,6 +236,23 @@ fn lamp(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 	if inspect(ui, "light", &mut light, Light::FIELDS) {
 		history.begin("light", world);
 		world.entities.set_light(id, light);
+	}
+}
+
+/// What an entity throws off, if anything.
+///
+/// Always drawn, for the light's reason and word for word: turning a crate
+/// into a fire is picking a word in a drop-down, and a section that appeared
+/// only for entities that were already emitters would leave nowhere to do it.
+/// @ref `colby_core::abi::particles`.
+fn thrower(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+	let Some(mut emitter) = world.entities.emitter(id).copied() else {
+		return;
+	};
+
+	if inspect(ui, "emitter", &mut emitter, Emitter::FIELDS) {
+		history.begin("emitter", world);
+		world.entities.set_emitter(id, emitter);
 	}
 }
 

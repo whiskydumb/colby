@@ -23,6 +23,7 @@ pub mod scene;
 pub mod shader;
 pub mod shadow;
 mod skin;
+mod sparks;
 pub mod timing;
 
 pub use ::wgpu;

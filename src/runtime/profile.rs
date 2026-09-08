@@ -86,8 +86,19 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Five spans of hardware, two of recording and five of simulation.
-const ROWS: usize = 12;
+/// Five spans of hardware, two of recording, five of simulation and one of
+/// particles.
+const ROWS: usize = 13;
+
+/// Which row of the table is the whole solver step.
+///
+/// Written out rather than "the last one", which is what it used to be and
+/// what stopped being true the moment a row was appended after it. A row added
+/// below has to leave these two alone or move them on purpose.
+const STEP_ROW: usize = 11;
+
+/// Which row is the particles.
+const SPARKS_ROW: usize = 12;
 
 /// How many frames the live table averages over.
 ///
@@ -177,7 +188,12 @@ impl Live {
 	///
 	/// @param record - what this thread spent, per [`Work`] in slot order
 	/// @param spent - what the last simulation step cost
-	pub(crate) fn walls(&mut self, record: [Option<Duration>; 2], spent: Spent) {
+	pub(crate) fn walls(
+		&mut self,
+		record: [Option<Duration>; 2],
+		spent: Spent,
+		sparked: Duration,
+	) {
 		for (at, took) in record.into_iter().enumerate() {
 			if let Some(took) = took {
 				self.add(Pass::ALL.len() + at, took);
@@ -186,9 +202,10 @@ impl Live {
 
 		let under = Pass::ALL.len() + Work::ALL.len();
 
-		for (at, took) in [spent.broad, spent.narrow, spent.buoyancy, spent.solve, spent.total]
-			.into_iter()
-			.enumerate()
+		for (at, took) in
+			[spent.broad, spent.narrow, spent.buoyancy, spent.solve, spent.total, sparked]
+				.into_iter()
+				.enumerate()
 		{
 			self.add(under + at, took);
 		}
@@ -314,6 +331,15 @@ struct Table {
 	/// One per name in [`NAMES`], in that order.
 	rows: [Row; ROWS],
 
+	/// The most particles any measured frame drew.
+	///
+	/// The most rather than the mean, because what somebody wants from it is
+	/// what the run was actually asked to draw: a cloud still filling up
+	/// during the warm-up would drag a mean below the number the project
+	/// really carries. The second stable number in this table - a time is a
+	/// fact about the afternoon, and this is a fact about the project.
+	sparks: usize,
+
 	/// How many render passes each frame recorded, and `None` before the first
 	/// one.
 	passes: Option<u32>,
@@ -332,7 +358,7 @@ struct Table {
 /// then what the step underneath cost - which is the order a frame actually
 /// happens in, read from the outside in.
 ///
-/// `pub(crate)` because the editor's pane shows the same twelve, and a panel
+/// `pub(crate)` because the editor's pane shows the same thirteen, and a panel
 /// with a list of its own would be a second place to add a row to.
 pub(crate) const NAMES: [&str; ROWS] = [
 	"gpu shadow",
@@ -347,6 +373,10 @@ pub(crate) const NAMES: [&str; ROWS] = [
 	"cpu buoyancy",
 	"cpu solve",
 	"cpu step",
+	// last, and outside the four above it rather than inside them: the
+	// particles are stepped beside the solver, not within it, so this is a
+	// part of `cpu step` and of nothing else. Added at shell step 5k.
+	"cpu sparks",
 ];
 
 impl Table {
@@ -358,6 +388,7 @@ impl Table {
 				worst: Duration::ZERO,
 				frames: 0,
 			}; ROWS],
+			sparks: 0,
 			passes: None,
 			steady: true,
 		}
@@ -367,7 +398,9 @@ impl Table {
 	///
 	/// @param frame - what the renderer measured
 	/// @param spent - what the last simulation step cost
-	fn fold(&mut self, frame: &Frame, spent: Spent) {
+	fn fold(&mut self, frame: &Frame, spent: Spent, sparked: Duration, sparks: usize) {
+		self.sparks = self.sparks.max(sparks);
+
 		for (at, pass) in Pass::ALL.into_iter().enumerate() {
 			if let (Some(row), Some(took)) = (self.rows.get_mut(at), frame.pass(pass)) {
 				row.add(took);
@@ -384,9 +417,10 @@ impl Table {
 
 		let under = Pass::ALL.len() + Work::ALL.len();
 
-		for (at, took) in [spent.broad, spent.narrow, spent.buoyancy, spent.solve, spent.total]
-			.into_iter()
-			.enumerate()
+		for (at, took) in
+			[spent.broad, spent.narrow, spent.buoyancy, spent.solve, spent.total, sparked]
+				.into_iter()
+				.enumerate()
 		{
 			if let Some(row) = self.rows.get_mut(under + at) {
 				row.add(took);
@@ -423,20 +457,25 @@ impl Table {
 			);
 		}
 
-		// the three numbers that add up to a frame, and they are three rather
-		// than two because the simulation's rows overlap: `cpu step` is the
-		// whole step and the four above it are parts of it - and `cpu broad` is
-		// in turn a part of `cpu narrow` - so adding every row would count the
-		// same microseconds twice over.
+		// the four numbers that add up to a frame, and they are four rather
+		// than thirteen because the simulation's rows overlap: `cpu step` is
+		// the whole solver step and the four above it are parts of it - and
+		// `cpu broad` is in turn a part of `cpu narrow` - so adding every row
+		// would count the same microseconds twice over. `cpu sparks` is the
+		// exception and is why this grew from three to four: the particles are
+		// stepped *beside* the solver, so their time is inside neither the
+		// solver's total nor anything else here.
 		info!(
 			frames,
 			passes = self.passes.unwrap_or_default(),
+			sparks = self.sparks,
 			steady = self.steady,
 			gpu_us = self.slice(0..Pass::ALL.len()).as_micros(),
 			cpu_us = self
 				.slice(Pass::ALL.len()..Pass::ALL.len() + Work::ALL.len())
 				.as_micros(),
-			step_us = self.slice(ROWS - 1..ROWS).as_micros(),
+			step_us = self.slice(STEP_ROW..STEP_ROW + 1).as_micros(),
+			sparks_us = self.slice(SPARKS_ROW..SPARKS_ROW + 1).as_micros(),
 			"a frame"
 		);
 
@@ -527,7 +566,12 @@ pub(crate) fn take(project: &Project, build: &Build, asked: &Asked, frames: u32)
 		let frame = capture.scene_mut().settle();
 
 		if number > WARMUP {
-			table.fold(&frame, runtime.simulation.spent());
+			table.fold(
+				&frame,
+				runtime.simulation.spent(),
+				runtime.sparked,
+				capture.scene_mut().sparks(),
+			);
 		}
 	}
 
@@ -597,7 +641,7 @@ mod tests {
 		// hardware every second or third, and neither waiting for the other
 		let mut live = Live::new();
 		// the recording span, which is the second of the two wall-clock ones
-		live.walls([None, Some(Duration::from_micros(300))], Spent::default());
+		live.walls([None, Some(Duration::from_micros(300))], Spent::default(), Duration::ZERO);
 
 		assert!(!live.profile().hardware, "nothing hardware has answered yet");
 		assert_eq!(
@@ -691,8 +735,13 @@ mod tests {
 		names.dedup();
 
 		assert_eq!(names.len(), ROWS, "two rows answer to one name");
+		assert_eq!(NAMES[STEP_ROW], "cpu step", "the summary's step row is the step");
+		assert_eq!(NAMES[SPARKS_ROW], "cpu sparks", "and its particle row is the particles");
+		assert!(SPARKS_ROW < ROWS, "both are rows this table has");
 		assert_eq!(
-			Pass::ALL.len() + Work::ALL.len() + 5,
+			// five of the solver's and one of the particles', which are
+			// stepped beside it rather than inside it
+			Pass::ALL.len() + Work::ALL.len() + 5 + 1,
 			ROWS,
 			"the table has a row for every span the renderer and the simulation report"
 		);
@@ -704,8 +753,8 @@ mod tests {
 		// worth comparing while it holds still for the whole of one.
 		let mut table = Table::new();
 
-		table.fold(&Frame::default(), Spent::default());
-		table.fold(&Frame::default(), Spent::default());
+		table.fold(&Frame::default(), Spent::default(), Duration::ZERO, 0);
+		table.fold(&Frame::default(), Spent::default(), Duration::ZERO, 0);
 
 		assert!(table.steady, "two frames that recorded the same passes");
 		assert_eq!(table.passes, Some(0));
@@ -722,7 +771,7 @@ mod tests {
 			total: Duration::from_micros(200),
 		};
 
-		table.fold(&Frame::default(), spent);
+		table.fold(&Frame::default(), spent, Duration::from_micros(31), 40);
 
 		let under = Pass::ALL.len() + Work::ALL.len();
 
@@ -731,6 +780,17 @@ mod tests {
 		assert_eq!(table.rows[under + 2].mean(), Duration::from_micros(7), "buoyancy");
 		assert_eq!(table.rows[under + 3].mean(), Duration::from_micros(90), "solve");
 		assert_eq!(table.rows[under + 4].mean(), Duration::from_micros(200), "the step");
+		assert_eq!(
+			table.rows[under + 5].mean(),
+			Duration::from_micros(31),
+			"and the particles, which are beside the solver rather than inside it"
+		);
+		assert_eq!(table.sparks, 40, "and the count is carried beside the times");
+		assert_eq!(
+			table.rows[under + 5].mean(),
+			Duration::from_micros(31),
+			"and the particles, which are beside the solver rather than inside it"
+		);
 	}
 
 	#[test]

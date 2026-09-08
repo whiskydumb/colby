@@ -39,6 +39,7 @@ pub mod mesh;
 pub mod model;
 pub mod names;
 pub mod net;
+pub mod particles;
 pub mod physics;
 pub mod pose;
 pub mod post;
@@ -78,6 +79,7 @@ pub use self::{
 	model::{Model, ModelData, ModelId, Models, Placement},
 	names::MAX_NAME,
 	net::{Aim, Command, Commands, PeerId, Role},
+	particles::{Emitter, EmitterKind, MAX_SPARKS, Spark, SparkBlend, Sparks},
 	physics::{
 		Bodies, Body, BodyId, BodyKind, Layers, MAX_BODIES, MAX_OVERLAPS, MAX_TOUCHES, Overlap,
 		Physics, Shape, ShapeKind, Touch, TouchKind, TraceFn, TraceInfo, TraceResult,
@@ -106,7 +108,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 58;
+pub const ABI_VERSION: u32 = 59;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -371,6 +373,17 @@ pub struct World {
 	/// [`render_transform`](Self::render_transform) where it is drawn.
 	pub entities: Entities,
 
+	/// Every particle alive in the world. Host-written.
+	///
+	/// The *cloud*, where [`Entities::emitter`] is the description that throws
+	/// it. One flat pool rather than a buffer per emitter, swept and moved by
+	/// the host inside the fixed step so that `--shot`, `--record` and
+	/// `--link` all see the same one; a game may read it and cannot push into
+	/// it. Not written down by a save, for the reason
+	/// [`editing`](Self::editing) is not: a fire re-lights itself. @ref
+	/// [`particles`](crate::abi::particles).
+	pub sparks: Sparks,
+
 	/// Every joint holding two bodies together, reached by handle.
 	///
 	/// Host-owned plain data beside the bodies, and for the same reasons. @ref
@@ -614,6 +627,7 @@ impl World {
 			owed_steps: 0,
 			contacts: 0,
 			entities: Entities::new(),
+			sparks: Sparks::new(),
 			bodies: Bodies::new(),
 			joints: Joints::new(),
 			meshes: Meshes::new(),

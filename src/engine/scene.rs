@@ -57,6 +57,7 @@ use crate::{
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, Maps},
 	skin::Joints,
+	sparks::Sparks,
 	timing::{Ends, Pass, Timings, Work},
 };
 
@@ -362,9 +363,9 @@ struct GpuMesh {
 }
 
 /// One texture, uploaded, with its whole mip chain.
-struct GpuTexture {
-	view: TextureView,
-	revision: u32,
+pub(crate) struct GpuTexture {
+	pub(crate) view: TextureView,
+	pub(crate) revision: u32,
 }
 
 /// Which texture a material's bind group is holding a view of.
@@ -583,6 +584,8 @@ pub struct Scene {
 	shadowing: bool,
 	/// The debug renderer, drawn into this scene's pass and its depth buffer.
 	lines: Lines,
+	/// The particle renderer, drawn into the same pass after everything else.
+	sparks: Sparks,
 	/// This frame's joint matrices, and where each pose's run is in them.
 	joints: Joints,
 	/// One per registry slot, in the same order, filled on demand.
@@ -699,6 +702,7 @@ impl Scene {
 		)?;
 		let depth = depth_view(&device, post::NO_SAMPLES, width, height);
 		let lines = Lines::new(&device, post::HDR_FORMAT, &globals_layout, post::NO_SAMPLES)?;
+		let sparks = Sparks::new(&device, post::HDR_FORMAT, post::NO_SAMPLES);
 		let post = post::Chain::new(&device, format, width, height)?;
 
 		let instances = device.create_buffer(&BufferDescriptor {
@@ -725,6 +729,7 @@ impl Scene {
 			cascades: Cascades::NONE,
 			shadowing: false,
 			lines,
+			sparks,
 			joints,
 			// nothing is uploaded until a frame says what the world holds: the
 			// registries belong to the host, and a scene built before the host
@@ -801,6 +806,13 @@ impl Scene {
 				) {
 					warn!(%complaint, "the debug lines kept the pipelines they had");
 				}
+
+				// and the particles, on the same terms and for the same
+				// reason: a pipeline built for another sample count is a
+				// validation error rather than a picture, and a cloud that
+				// kept the pair it had is the same "a picture with hard edges
+				// beats no picture" the table itself takes.
+				self.sparks.set_samples(post::HDR_FORMAT, asked);
 
 				self.depth = depth_view(&self.device, asked, self.size.0, self.size.1);
 				self.post.set_samples(&self.device, asked);
@@ -1000,6 +1012,20 @@ impl Scene {
 		// what makes a line seen through glass read as being behind it.
 		self.draw(&mut pass, &self.blended);
 
+		// and after even that. A particle writes no depth, so nothing it draws
+		// can hold anything else out, and it composites - which means every
+		// solid thing, every masked thing, every line and every pane of glass
+		// has to be in the target before it.
+		//
+		// **The cost, said out loud: a particle behind a pane of glass is
+		// drawn over the glass.** Two lists cannot interleave without being
+		// one list, and no engine read here makes them one - Fyrox and Godot
+		// sort their systems into the transparent queue as whole objects,
+		// which has the same failure at emitter granularity rather than at
+		// list granularity. It is `PT-1` on the audit list with a trigger
+		// rather than a thing to fix now.
+		self.sparks.draw(&mut pass, &self.bindings);
+
 		drop(pass);
 
 		// and last: the picture is measured, the eye moves, and the whole
@@ -1044,6 +1070,15 @@ impl Scene {
 	/// spans, ready the moment the frame has been recorded. The hardware half
 	/// arrives later through [`collect`](Self::collect).
 	pub fn spans(&self) -> crate::timing::Frame { self.timings.spans() }
+
+	/// How many particles the last frame drew.
+	///
+	/// A count rather than a duration, and the second stable number
+	/// `--profile` prints: a time is a fact about the afternoon, and how many
+	/// particles a project has in the air at a given step is a fact about the
+	/// project. A number that moved means somebody changed something.
+	#[must_use]
+	pub fn sparks(&self) -> usize { self.sparks.drawn() }
 
 	/// Whether anything is being measured.
 	pub const fn measuring(&self) -> bool { self.timings.timing() }
@@ -1255,6 +1290,16 @@ impl Scene {
 		self.sync_materials(world);
 		self.lines
 			.upload(&self.device, &self.queue, world);
+		// after `sync_textures`, which is what makes the picture a particle
+		// names one this frame can bind: the emitter holds a registry handle
+		// and the group it needs is over an uploaded view.
+		self.sparks.upload(
+			&self.device,
+			&self.queue,
+			world,
+			&self.textures,
+			&self.globals_layout,
+		);
 
 		// asked for once and used twice on purpose. This is where the frame
 		// stops being the simulation's and becomes the picture's: the camera

@@ -1006,10 +1006,14 @@ impl App {
 		}
 
 		let spent = self.runtime.simulation.spent();
+		let sparked = self.runtime.sparked;
 		let frame = renderer.scene_mut().spans();
 
-		self.live
-			.walls(colby_engine::timing::Work::ALL.map(|work| frame.work(work)), spent);
+		self.live.walls(
+			colby_engine::timing::Work::ALL.map(|work| frame.work(work)),
+			spent,
+			sparked,
+		);
 
 		if let Some(landed) = renderer.scene_mut().collect() {
 			self.live.hardware(
