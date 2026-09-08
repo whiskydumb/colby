@@ -38,7 +38,7 @@ use colby_asset::{
 	json::{self, Value},
 	project,
 };
-use colby_core::{Result, err};
+use colby_core::{Result, err, utils::path::lexical};
 
 /// The file's name, under the per-user directory.
 pub const FILE: &str = "projects.json";
@@ -448,8 +448,16 @@ fn order(shown: &mut [Shown], sort: Sort) {
 /// Through the filesystem when both resolve, so that a path typed with the
 /// other slash or through a link is the same project; by spelling when one
 /// does not, which is what a project on a drive that is not there comes to.
+///
+/// **Both are folded first**, and that is not a tidying step. `..` through a
+/// directory that is not there is a path `fs::canonicalize` refuses on unix
+/// and folds away on Windows, so without this a project added as
+/// `projects/other/../yard` is one entry on one platform and a second copy of
+/// an entry on the other. @ref [`lexical`].
 fn same_place(left: &Path, right: &Path) -> bool {
-	match (fs::canonicalize(left), fs::canonicalize(right)) {
+	let (left, right) = (lexical(left), lexical(right));
+
+	match (fs::canonicalize(&left), fs::canonicalize(&right)) {
 		| (Ok(left), Ok(right)) => left == right,
 		| _ => left == right,
 	}
@@ -680,6 +688,26 @@ mod tests {
 			.to_string();
 
 		assert!(text.contains("sideways"), "an order nobody knows: {text}");
+	}
+
+	#[test]
+	fn a_project_that_is_not_there_is_one_entry_too() {
+		// the spelling half of the rule below, and the half with teeth on both
+		// platforms. A step up through a directory nobody made is a path
+		// `fs::canonicalize` refuses outright on unix and folds away on
+		// Windows before it ever reaches the disk, so a list that compares
+		// what it was handed holds one project twice on one platform and once
+		// on the other. Folding first is what makes the two agree.
+		let root = fresh("missing");
+		let gone = root.join("gone");
+		let mut list = List::new(&root);
+
+		assert!(list.add(&gone), "added, whether or not the directory is there");
+		assert!(
+			!list.add(&root.join("other").join("..").join("gone")),
+			"and not a second time under another spelling"
+		);
+		assert_eq!(list.entries().len(), 1, "one project, one row");
 	}
 
 	#[test]

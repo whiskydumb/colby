@@ -1,6 +1,7 @@
 //! Small helpers with no better home.
 
 pub mod defer;
+pub mod path;
 
 /// Replaces the value behind a mutable reference and returns the old one.
 ///
