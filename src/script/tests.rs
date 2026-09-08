@@ -2901,3 +2901,66 @@ fn the_thruster_draws_itself_while_it_burns() {
 
 	assert!(!world.debug.lines().is_empty(), "and an arrow while it is on");
 }
+
+#[test]
+fn a_program_reads_an_action_rather_than_a_key() {
+	// **the whole of what the step is for, from the only caller that cannot
+	// declare an action itself.** A Lua program can register a command and
+	// nothing else, so it depends on somebody having declared `in.jump` - which
+	// is the argument for the engine shipping a default set at all.
+	let mut world = running(
+		r#"function tick(dt)
+			colby.command("script.said "
+				.. tostring(input.action("jump"))
+				.. tostring(input.action_pressed("jump"))
+				.. tostring(input.action("crouch"))
+				.. tostring(input.axis("left", "right"))
+				.. tostring(input.action("honk")))
+		end"#,
+	);
+	listen(&mut world);
+
+	for (action, key) in [("jump", "space"), ("crouch", "control"), ("left", "a"), ("right", "d")]
+	{
+		world.cvars.saved(
+			&format!("{}{action}", colby_core::abi::input::PREFIX),
+			Value::Text(key.to_owned()),
+			"",
+		);
+	}
+
+	world
+		.input
+		.set_key(colby_core::abi::Key::Space, true);
+	world.input.set_key(colby_core::abi::Key::D, true);
+
+	let mut scripts = machine();
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("truetruefalse1.0false"),
+		"held, its edge, one nobody pressed, an axis from two actions, and one nobody declared"
+	);
+}
+
+#[test]
+fn an_action_a_program_asks_about_is_never_an_error() {
+	// the one place this deliberately differs from `input.held`, which refuses
+	// a key nothing answers to. A key that does not exist is a typo in the
+	// program; an action that is not bound is an ordinary state of the world -
+	// a project that has not decided, or a person who cleared the row - and a
+	// program that had to guard every call is a program nobody writes right.
+	let mut world = running(
+		r#"function tick(dt)
+			local ok = pcall(function() return input.action("wander") end)
+			colby.command("script.said " .. tostring(ok) .. tostring(input.action("wander")))
+		end"#,
+	);
+	listen(&mut world);
+
+	let mut scripts = machine();
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("truefalse"), "it answered, and it answered no");
+}

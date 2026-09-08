@@ -1417,6 +1417,32 @@ where
 	tables.input.set("cursor", cursor)?;
 	tables.input.set("wheel", wheel)?;
 
+	// and the same three again over an *action* rather than a key. **An
+	// unknown name is not an error here, unlike a key's**: a key that does not
+	// exist is a typo in the program, but an action that is not bound is an
+	// ordinary state of the world - a project that has not got round to it, or
+	// a person who unbound it - and a program that had to guard every call
+	// would be a program nobody wrote correctly. @ref `World::action`.
+	for (name, ask) in [("action", 0_u8), ("action_pressed", 1), ("action_released", 2)] {
+		let asked = scope.create_function(move |_, action: String| {
+			let world = world.borrow();
+
+			Ok(match ask {
+				| 0 => world.action(&action),
+				| 1 => world.action_pressed(&action),
+				| _ => world.action_released(&action),
+			})
+		})?;
+
+		tables.input.set(name, asked)?;
+	}
+
+	let axis = scope.create_function(move |_, (negative, positive): (String, String)| {
+		Ok(world.borrow().action_axis(&negative, &positive))
+	})?;
+
+	tables.input.set("axis", axis)?;
+
 	Ok(())
 }
 

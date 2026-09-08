@@ -29,8 +29,8 @@ use std::{
 use colby_core::{
 	Error,
 	abi::{
-		Aim, Args, Asked, Cvars, Mix, NavSettings, PeerId, Scripts, Sound, Value, Voice, World,
-		console, cvar::Owner, navmesh,
+		Aim, Args, Asked, Bound, Cvars, Mix, NavSettings, PeerId, Scripts, Sound, Value, Voice,
+		World, console, cvar::Owner, input, navmesh,
 	},
 	error, info, warn,
 };
@@ -298,6 +298,7 @@ pub(crate) fn install(world: &mut World) {
 	);
 
 	install_render(world);
+	install_input(world);
 	install_nav(world);
 	install_scenes(world);
 	install_code(world);
@@ -306,6 +307,88 @@ pub(crate) fn install(world: &mut World) {
 	install_scripts(world);
 }
 
+/// What every project starts with bound, and to what.
+///
+/// **An engine that shipped no actions at all would make every project write
+/// these eight lines**, and one of them could not: a Lua program can register
+/// a *command* and nothing else, so a program under `assets/scripts/` that
+/// wanted an action would have had to ask somebody else to declare it. s&box
+/// ships a list for exactly this reason - "games that don't define any input
+/// actions will get a bunch of default actions given to them" - and Godot
+/// ships its `ui_*` set.
+///
+/// Eight rather than s&box's twenty: the movement four are in every reference
+/// there is, and jump, crouch, use and attack are the four after them. An
+/// inventory slot is a decision about a *game*.
+const ACTIONS: &[(&str, &str, &str)] = &[
+	("forward", "w", "walk forwards"),
+	("back", "s", "walk backwards"),
+	("left", "a", "step to the left"),
+	("right", "d", "step to the right"),
+	("jump", "space", "jump"),
+	("crouch", "control", "crouch"),
+	("use", "e", "use whatever is in front"),
+	("attack", "mouse1", "attack"),
+];
+
+/// The input map: one saved variable an action, and a command to read it back.
+///
+/// **Saved, like the tick rate and unlike the debug outlines.** Which key does
+/// what is the most personal setting a project has, and coming back to a world
+/// where it has been forgotten is the surprise. `reset in.jump` puts the
+/// default back, and `help in.` lists every action there is - which is the
+/// listing a `bind` command of its own would have had to grow.
+///
+/// @param world - the table to register into
+fn install_input(world: &mut World) {
+	for (action, key, help) in ACTIONS {
+		world.cvars.saved(
+			&format!("{}{action}", input::PREFIX),
+			Value::Text((*key).to_owned()),
+			help,
+		);
+	}
+
+	world
+		.cvars
+		.command("in.list", actions, "report every action and the key it answers to");
+}
+
+/// `in.list` - reports every action, its key, and whether it is down.
+///
+/// One line rather than one an action, because the answer to "why is my jump
+/// not working" is the whole table and not one row of it. **The state is in it
+/// too**: an action bound to a key nobody is pressing and an action bound to
+/// nothing look identical from outside, and this is the one place that can
+/// tell them apart.
+///
+/// # Safety
+///
+/// As [`help`].
+unsafe extern "C-unwind" fn actions(world: *mut World, _args: *const Args) {
+	// SAFETY: as help.
+	let world = unsafe { &mut *world };
+	// collected first, because the loop below reads the whole world through
+	// `bound` and cannot be holding a piece of it at the time.
+	let names = input::actions(&world.cvars)
+		.map(str::to_owned)
+		.collect::<Vec<_>>();
+	let mut bound = 0_usize;
+	let mut listed = Vec::with_capacity(names.len());
+
+	for action in &names {
+		let key = world.bound(action);
+		bound += usize::from(key.is_some());
+
+		listed.push(format!(
+			"{action}={}{}",
+			key.map_or("-", Bound::name),
+			if world.action(action) { "*" } else { "" }
+		));
+	}
+
+	info!(actions = names.len(), bound, map = listed.join(" "), "the input map");
+}
 /// The navmesh's variables: how big the thing that walks is, and one tool.
 ///
 /// **The four settings are saved and the drawing is not**, which is the split
@@ -1548,5 +1631,98 @@ r.backend auto
 		assert_eq!(world.audio.len(), 4);
 		console::run(&mut world, "snd.stop");
 		assert!(world.audio.is_empty(), "everything, not the first one");
+	}
+
+	#[test]
+	fn every_default_action_is_registered_and_bound_to_something() {
+		let world = engine();
+
+		for (action, key, _) in ACTIONS {
+			let name = format!("{}{action}", input::PREFIX);
+			let entry = world
+				.cvars
+				.get(&name)
+				.unwrap_or_else(|| panic!("{name} is not registered"));
+
+			assert!(entry.is_archived(), "{name} has to survive a restart");
+			assert_eq!(
+				world.bound(action).map(Bound::name),
+				Some(*key),
+				"{name} does not answer to the key it was registered with"
+			);
+		}
+	}
+
+	#[test]
+	fn the_listing_command_is_not_itself_an_action() {
+		// **a live run counted nine actions where there are eight**, because
+		// `in.list` is a command under the same prefix. `in.` is a namespace
+		// rather than a list - `sim.` holds a command and three variables - so
+		// what makes an entry an action is that it has a value.
+		let world = engine();
+		let named = input::actions(&world.cvars).collect::<Vec<_>>();
+
+		assert_eq!(named.len(), ACTIONS.len(), "{named:?}");
+		assert!(!named.contains(&"list"), "the command is not one of them: {named:?}");
+		assert_eq!(world.bound("list"), None);
+	}
+
+	#[test]
+	fn a_rebinding_survives_a_restart_and_a_reset_undoes_it() {
+		// the two halves of what makes this an input *map* rather than a
+		// constant: the file is where a person's choice lives, and `reset` is
+		// where the project's default lives.
+		let mut world = engine();
+
+		console::run(&mut world, &format!("{}jump q", input::PREFIX));
+
+		assert_eq!(world.bound("jump").map(Bound::name), Some("q"));
+
+		let name = format!("{}jump", input::PREFIX);
+
+		assert!(
+			world
+				.cvars
+				.iter()
+				.filter(|entry| entry.is_archived())
+				.any(|entry| entry.name() == name),
+			"and it is written into settings.cfg with the rest"
+		);
+
+		console::run(&mut world, &format!("reset {}jump", input::PREFIX));
+
+		assert_eq!(world.bound("jump").map(Bound::name), Some("space"), "back to the default");
+	}
+
+	#[test]
+	fn an_action_bound_to_a_word_that_is_not_a_key_is_quiet() {
+		// a console takes what it is typed, so `in.jump banana` is a thing a
+		// person can do. The answer is an action that answers to nothing, not
+		// a refused line and not a panic.
+		let mut world = engine();
+
+		console::run(&mut world, &format!("{}jump banana", input::PREFIX));
+
+		assert_eq!(world.bound("jump"), None, "nothing answers for it");
+		assert!(!world.action("jump"), "and it is never held");
+
+		console::run(&mut world, &format!("{}jump \"\"", input::PREFIX));
+
+		assert_eq!(world.bound("jump"), None, "and clearing it is the same answer");
+	}
+
+	#[test]
+	fn the_map_can_be_read_back_from_the_console() {
+		let mut world = engine();
+		world
+			.input
+			.set_key(colby_core::abi::Key::Space, true);
+
+		console::run(&mut world, "in.list");
+
+		// the command reports rather than returns, so what is asserted is that
+		// it ran against a world it could read and left it alone.
+		assert!(world.action("jump"), "space is down and jump is bound to it");
+		assert_eq!(world.bound("attack").map(Bound::name), Some("mouse1"));
 	}
 }

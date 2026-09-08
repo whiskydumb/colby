@@ -19,6 +19,8 @@
 //! that moved forty pixels moved forty pixels however many steps the frame
 //! happened to run.
 
+use super::cvar::{Cvars, Value};
+
 /// How many bytes of typed text one step can carry.
 ///
 /// Sixty-four, which is a sixtieth of a second of typing at any speed a person
@@ -274,6 +276,144 @@ impl Button {
 	#[must_use]
 	#[expect(clippy::as_conversions, reason = "as Key::index")]
 	pub const fn mask(self) -> u32 { 1 << (self as u32) }
+
+	/// Which button this is, counting from nil.
+	#[must_use]
+	#[expect(clippy::as_conversions, reason = "as Key::index")]
+	pub const fn index(self) -> usize { self as usize }
+
+	/// The button somebody means by that name.
+	///
+	/// @param name - what was typed, in any case
+	/// @return the button, or `None` if nothing answers to it
+	#[must_use]
+	pub fn named(name: &str) -> Option<Self> {
+		const ALL: [Button; Button::COUNT] =
+			[Button::Left, Button::Right, Button::Middle, Button::Back, Button::Forward];
+
+		let wanted = name.to_ascii_lowercase();
+
+		ALL.into_iter()
+			.find(|button| button.name() == wanted)
+	}
+
+	/// What this button is called. @ref [`BUTTONS`].
+	#[must_use]
+	pub fn name(self) -> &'static str { BUTTONS.get(self.index()).copied().unwrap_or("") }
+}
+
+/// What each button is called, in declaration order.
+///
+/// **`mouse1` rather than `left`, and that is forced rather than chosen**:
+/// `left` is already the name of [`Key::Left`], the arrow, and a binding
+/// string has to hold both kinds of thing in one namespace. Nothing else in
+/// the process is affected - the Lua `input.mouse_held("left")` names a button
+/// in a table where only buttons live, so there is no second spelling of one
+/// thing, only two things that had to be told apart.
+const BUTTONS: [&str; Button::COUNT] = ["mouse1", "mouse2", "mouse3", "mouse4", "mouse5"];
+
+/// What a binding says, once it has been read.
+///
+/// One key or one button, never several. **s&box's shape**: an `InputAction`
+/// there holds one `KeyboardCode` and one `GamepadCode`, which is one per
+/// device, and colby has one device. Godot allows a list because it is
+/// carrying keyboards, mice, joysticks and touch on one action; when colby
+/// grows a second device, the list arrives with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+	/// A key on the keyboard.
+	Key(Key),
+
+	/// A button on the mouse.
+	Button(Button),
+}
+
+impl Bound {
+	/// What a binding string means, if it means anything.
+	///
+	/// @param name - what the binding holds, in any case; surrounding space is
+	/// ignored, and an empty string is not bound to anything
+	/// @return the key or button, or `None`
+	#[must_use]
+	pub fn named(name: &str) -> Option<Self> {
+		let name = name.trim();
+
+		if name.is_empty() {
+			return None;
+		}
+
+		// keys first, because there are seventy-five of them and five buttons,
+		// and because a name that is both would be a bug in one of the two
+		// tables rather than a thing to resolve here.
+		Key::named(name)
+			.map(Self::Key)
+			.or_else(|| Button::named(name).map(Self::Button))
+	}
+
+	/// What this is called, which is what a binding holding it would say.
+	#[must_use]
+	pub fn name(self) -> &'static str {
+		match self {
+			| Self::Key(key) => key.name(),
+			| Self::Button(button) => button.name(),
+		}
+	}
+}
+
+/// What every binding's name begins with.
+///
+/// **A binding is a saved console variable**, and that is the whole of the
+/// storage: `in.jump "space"` in a project's `settings.cfg`. The alternative
+/// was a `bind` command with a table of its own, and it would have had to
+/// build its own saving, its own reset, its own listing and its own forgetting
+/// on a hot reload - all four of which [`Cvars`] already has and gets right.
+///
+/// It also lands on the split the field keeps: s&box declares its actions in
+/// the project's settings and keeps the player's rebindings in a config file;
+/// Godot puts the defaults in `ProjectSettings` and the overrides beside them.
+/// Here the *declaration* is the default a piece of code registers and the
+/// *rebinding* is the value in the file, which is one mechanism doing both
+/// jobs, and `reset in.jump` is what puts the first back.
+pub const PREFIX: &str = "in.";
+
+/// Every action there is, in the order they were registered.
+///
+/// **Variables only.** `in.` is a namespace rather than a list, exactly as
+/// `sim.` is - it holds `sim.rate` and `sim.step`, a variable and a command -
+/// so the actions in it are the entries that have a *value*. A live run
+/// counted nine actions where there are eight, because `in.list` is a command
+/// and looked like one.
+///
+/// @param cvars - the table the bindings are registered in
+pub fn actions(cvars: &Cvars) -> impl Iterator<Item = &str> {
+	cvars.iter().filter_map(|entry| {
+		entry
+			.value()
+			.and_then(|_| entry.name().strip_prefix(PREFIX))
+	})
+}
+
+/// What an action is bound to, if it is bound to anything.
+///
+/// Scanned rather than looked up by a built name, so that asking costs no
+/// allocation - the table is a few dozen entries and this is a handful of
+/// string comparisons a step.
+///
+/// @param cvars - the table the bindings are registered in
+/// @param action - the action's own name, without [`PREFIX`]
+/// @return the key or button, or `None` for an action nobody declared and one
+/// bound to nothing
+#[must_use]
+pub fn bound(cvars: &Cvars, action: &str) -> Option<Bound> {
+	let entry = cvars
+		.iter()
+		.filter(|entry| entry.value().is_some())
+		.find(|entry| entry.name().strip_prefix(PREFIX) == Some(action))?;
+
+	match entry.value()? {
+		| Value::Text(held) => Bound::named(held),
+		| _ => None,
+	}
 }
 
 /// One step's worth of input.
@@ -374,6 +514,37 @@ impl Input {
 		}
 
 		axis
+	}
+
+	/// Whether whatever an action is bound to is currently down.
+	///
+	/// The three below mirror the six above exactly, and are the whole of what
+	/// an action adds to a key: the naming is [`bound`]'s job and the state is
+	/// still this table's.
+	#[must_use]
+	pub fn bound_held(&self, bound: Bound) -> bool {
+		match bound {
+			| Bound::Key(key) => self.held(key),
+			| Bound::Button(button) => self.button_held(button),
+		}
+	}
+
+	/// Whether it went down during this step.
+	#[must_use]
+	pub fn bound_pressed(&self, bound: Bound) -> bool {
+		match bound {
+			| Bound::Key(key) => self.pressed(key),
+			| Bound::Button(button) => self.button_pressed(button),
+		}
+	}
+
+	/// Whether it came up during this step.
+	#[must_use]
+	pub fn bound_released(&self, bound: Bound) -> bool {
+		match bound {
+			| Bound::Key(key) => self.released(key),
+			| Bound::Button(button) => self.button_released(button),
+		}
 	}
 
 	/// Whether a mouse button is currently down.
@@ -808,5 +979,113 @@ mod tests {
 			(x - 1.0).abs() < f32::EPSILON && (y - 1.0).abs() < f32::EPSILON,
 			"top right is +1, +1: y is flipped from window coordinates"
 		);
+	}
+
+	/// A table with one action bound to whatever is named.
+	fn map(action: &str, to: &str) -> Cvars {
+		let mut cvars = Cvars::new();
+		cvars.saved(&format!("{PREFIX}{action}"), Value::Text(to.to_owned()), "");
+
+		cvars
+	}
+
+	#[test]
+	fn a_button_is_named_mouse_rather_than_left() {
+		// **the one place the two tables had to be told apart**: `left` is
+		// already the arrow key, and a binding string holds keys and buttons in
+		// one namespace. A button that answered to `left` would make
+		// `in.strafe "left"` mean two things.
+		assert_eq!(Button::Left.name(), "mouse1");
+		assert_eq!(Button::named("mouse1"), Some(Button::Left));
+		assert_eq!(Button::named("MOUSE5"), Some(Button::Forward), "and case does not matter");
+		assert_eq!(Button::named("left"), None, "which is the arrow key's name");
+		assert_eq!(Bound::named("left"), Some(Bound::Key(Key::Left)));
+		assert_eq!(Bound::named("mouse1"), Some(Bound::Button(Button::Left)));
+	}
+
+	#[test]
+	fn every_button_has_a_name_and_answers_to_it() {
+		for button in [Button::Left, Button::Right, Button::Middle, Button::Back, Button::Forward]
+		{
+			let name = button.name();
+
+			assert!(!name.is_empty(), "{button:?} has no name");
+			assert_eq!(Button::named(name), Some(button), "{name} does not come back");
+			assert_eq!(Bound::named(name).map(Bound::name), Some(name));
+		}
+	}
+
+	#[test]
+	fn a_binding_that_names_nothing_is_bound_to_nothing() {
+		assert_eq!(Bound::named(""), None, "an unbound action");
+		assert_eq!(Bound::named("   "), None, "and one that is only space");
+		assert_eq!(Bound::named("banana"), None, "and one that is a typo");
+		assert_eq!(Bound::named(" space "), Some(Bound::Key(Key::Space)), "but space is trimmed");
+	}
+
+	#[test]
+	fn an_action_reads_the_variable_it_is_named_after() {
+		let cvars = map("jump", "space");
+
+		assert_eq!(bound(&cvars, "jump"), Some(Bound::Key(Key::Space)));
+		assert_eq!(bound(&cvars, "crouch"), None, "an action nobody declared");
+		assert_eq!(bound(&cvars, "in.jump"), None, "the prefix is not part of the name");
+	}
+
+	#[test]
+	fn an_action_bound_to_nothing_reads_as_nothing_rather_than_failing() {
+		// the state a rebinding screen leaves behind when somebody clears a
+		// row, and the one a project leaves when it declares an action it has
+		// not decided about yet. Neither is an error.
+		let cleared = map("jump", "");
+
+		assert_eq!(bound(&cleared, "jump"), None);
+
+		let wrong = map("jump", "banana");
+
+		assert_eq!(bound(&wrong, "jump"), None);
+	}
+
+	#[test]
+	fn a_binding_that_is_not_text_is_not_a_binding() {
+		// `in.jump 4` typed at a console leaves an `Int` where a `Text` was,
+		// and the answer to that is "not bound" rather than a panic or a key
+		// picked by number.
+		let mut cvars = Cvars::new();
+		cvars.saved(&format!("{PREFIX}jump"), Value::Int(4), "");
+
+		assert_eq!(bound(&cvars, "jump"), None);
+	}
+
+	#[test]
+	fn the_three_readers_agree_with_the_key_they_are_named_for() {
+		let mut input = Input::default();
+
+		input.set_key(Key::Space, true);
+
+		let space = Bound::Key(Key::Space);
+
+		assert!(input.bound_held(space) && input.bound_pressed(space));
+		assert!(!input.bound_released(space));
+
+		input.end_step();
+
+		assert!(input.bound_held(space), "still down a step later");
+		assert!(!input.bound_pressed(space), "but no longer a fresh press");
+
+		input.set_key(Key::Space, false);
+
+		assert!(!input.bound_held(space) && input.bound_released(space));
+	}
+
+	#[test]
+	fn a_button_binding_reads_the_mouse_and_not_the_keyboard() {
+		let mut input = Input::default();
+
+		input.set_button(Button::Left, true);
+
+		assert!(input.bound_held(Bound::Button(Button::Left)));
+		assert!(input.bound_pressed(Bound::Button(Button::Left)));
+		assert!(!input.bound_held(Bound::Key(Key::Left)), "the arrow key is a different thing");
 	}
 }

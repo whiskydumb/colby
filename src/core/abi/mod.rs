@@ -73,7 +73,7 @@ pub use self::{
 	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
 	field::Field,
 	font::{Font, FontData, FontId, Fonts, Glyph},
-	input::{Button, Input, Key},
+	input::{Bound, Button, Input, Key},
 	joint::{Joint, JointId, JointKind, Joints, MAX_JOINTS},
 	light::{Light, LightKind, MAX_CONE, MIN_SPREAD},
 	material::{Material, MaterialId, Materials},
@@ -112,7 +112,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 61;
+pub const ABI_VERSION: u32 = 62;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -1116,6 +1116,78 @@ impl World {
 		})
 	}
 
+	/// What an action is bound to, if anything.
+	///
+	/// The one a rebinding screen and `in.<action>` itself both want: it says
+	/// *which* key answers for an action, where the three below only say
+	/// whether it is down.
+	///
+	/// @param action - the action's name, without
+	/// [`input::PREFIX`](input::PREFIX)
+	#[must_use]
+	pub fn bound(&self, action: &str) -> Option<Bound> { input::bound(&self.cvars, action) }
+
+	/// Whether an action's key is being held.
+	///
+	/// **The whole of what an input map is**, and it is three lines because
+	/// the naming is a console variable and the state is already
+	/// [`Input`]. An action nobody declared, and one bound to nothing, both
+	/// read as not held - which is what lets a game ask for an action a
+	/// project has not got round to binding without special-casing it.
+	///
+	/// @param action - the action's name
+	#[must_use]
+	pub fn action(&self, action: &str) -> bool {
+		self.bound(action)
+			.is_some_and(|bound| self.input.bound_held(bound))
+	}
+
+	/// Whether an action's key went down during this step.
+	///
+	/// @param action - the action's name
+	#[must_use]
+	pub fn action_pressed(&self, action: &str) -> bool {
+		self.bound(action)
+			.is_some_and(|bound| self.input.bound_pressed(bound))
+	}
+
+	/// Whether an action's key came up during this step.
+	///
+	/// @param action - the action's name
+	#[must_use]
+	pub fn action_released(&self, action: &str) -> bool {
+		self.bound(action)
+			.is_some_and(|bound| self.input.bound_released(bound))
+	}
+
+	/// Two actions read as one axis.
+	///
+	/// **This is where an axis lives, rather than in a type of its own.**
+	/// Godot's answer to the same question: an action is a boolean and
+	/// `get_axis(negative, positive)` composes two of them, with `get_vector`
+	/// composing four. Unreal is the one engine with typed actions, and it has
+	/// them because it hangs triggers and modifiers off each one. Here it is
+	/// also the smaller change: [`Input::axis`] already does exactly this for
+	/// two *keys*, and this is that function with the naming in front of it.
+	///
+	/// @param negative - the action that reads as `-1.0`
+	/// @param positive - the action that reads as `1.0`
+	/// @return `-1.0`, `0.0` or `1.0`; both held cancel out
+	#[must_use]
+	pub fn action_axis(&self, negative: &str, positive: &str) -> f32 {
+		let mut axis = 0.0;
+
+		if self.action(positive) {
+			axis += 1.0;
+		}
+
+		if self.action(negative) {
+			axis -= 1.0;
+		}
+
+		axis
+	}
+
 	/// Traces a ray through the world.
 	///
 	/// @param info - where from, where to, and what to be blind to
@@ -1983,5 +2055,111 @@ mod tests {
 			Some(&0),
 			"GetProcAddress takes a C string, not a Rust slice"
 		);
+	}
+
+	/// A world with two actions bound, and nothing pressed.
+	fn mapped() -> World {
+		let mut world = World::new();
+
+		for (action, key) in [("left", "a"), ("right", "d"), ("attack", "mouse1")] {
+			world.cvars.saved(
+				&format!("{}{action}", input::PREFIX),
+				Value::Text(key.to_owned()),
+				"",
+			);
+		}
+
+		world
+	}
+
+	#[test]
+	fn an_action_is_the_key_its_variable_names() {
+		let mut world = mapped();
+
+		assert!(!world.action("left"), "nothing is pressed yet");
+
+		world.input.set_key(Key::A, true);
+
+		assert!(world.action("left") && world.action_pressed("left"));
+		assert!(!world.action("right"), "and only the one that is bound to it");
+	}
+
+	#[test]
+	fn rebinding_an_action_moves_which_key_answers_for_it() {
+		// the whole point of the step, and the one thing a test can say that a
+		// picture cannot: the *same* line of game code follows the variable.
+		let mut world = mapped();
+		world.input.set_key(Key::Q, true);
+
+		assert!(!world.action("left"), "q is not bound to anything");
+
+		assert!(
+			world
+				.cvars
+				.set(&format!("{}left", input::PREFIX), "q"),
+			"the variable takes it"
+		);
+		assert!(world.action("left"), "and the action followed the binding");
+
+		world.input.set_key(Key::A, true);
+
+		assert!(world.action("left"), "still, because q is still down");
+
+		world.input.set_key(Key::Q, false);
+
+		assert!(!world.action("left"), "and a is no longer what it answers to");
+	}
+
+	#[test]
+	fn an_action_nobody_declared_is_quiet_rather_than_loud() {
+		let mut world = mapped();
+		world.input.set_key(Key::A, true);
+
+		assert!(!world.action("honk"), "no such action");
+		assert!(!world.action_pressed("honk"));
+		assert!(!world.action_released("honk"));
+		assert_eq!(world.bound("honk"), None);
+		assert!(world.action_axis("honk", "honk").abs() < f32::EPSILON);
+	}
+
+	#[test]
+	fn two_actions_read_as_one_axis() {
+		let mut world = mapped();
+
+		assert!(world.action_axis("left", "right").abs() < f32::EPSILON, "neither is down");
+
+		world.input.set_key(Key::D, true);
+
+		assert!((world.action_axis("left", "right") - 1.0).abs() < f32::EPSILON);
+
+		world.input.set_key(Key::A, true);
+
+		assert!(
+			world.action_axis("left", "right").abs() < f32::EPSILON,
+			"both down cancel, exactly as Input::axis does for two keys"
+		);
+
+		world.input.set_key(Key::D, false);
+
+		assert!((world.action_axis("left", "right") + 1.0).abs() < f32::EPSILON);
+	}
+
+	#[test]
+	fn an_action_may_be_bound_to_a_mouse_button() {
+		let mut world = mapped();
+
+		assert_eq!(world.bound("attack"), Some(Bound::Button(Button::Left)));
+
+		world.input.set_button(Button::Left, true);
+
+		assert!(world.action("attack") && world.action_pressed("attack"));
+
+		world.input.set_key(Key::Left, true);
+
+		assert!(world.action("attack"), "and the arrow key is a different thing entirely");
+
+		world.input.set_button(Button::Left, false);
+
+		assert!(!world.action("attack") && world.action_released("attack"));
 	}
 }
