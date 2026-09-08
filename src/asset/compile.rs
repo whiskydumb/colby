@@ -9,8 +9,13 @@
 //! directories may hold a `wall.obj` without one quietly winning.
 //!
 //! Compilation is incremental on modification time, the same rule the game
-//! module's watcher uses: an output newer than its input is left alone. That is
-//! what makes it cheap enough for the runner to call four times a second.
+//! module's watcher uses - and asked the same way, which is the half that is
+//! easy to get wrong. A pass writes down the time of every file it read, and
+//! the next pass leaves alone whatever still carries those times. It never
+//! asks whether an output is newer than its source: a filesystem whose clock
+//! is coarser than a compile hands both files one number, and a rule that
+//! reads that as stale rebuilds a tree nobody touched, four times a second,
+//! forever. @ref [`stamp`](crate::stamp).
 //!
 //! Modification time is not the only thing that makes an output stale. An
 //! output written by a different [`FORMAT_VERSION`](crate::FORMAT_VERSION) is
@@ -36,9 +41,9 @@
 //! the two cannot disagree about what a file compiles to.
 
 use std::{
+	collections::BTreeSet,
 	fs,
-	path::{Component, Path, PathBuf},
-	time::SystemTime,
+	path::{Path, PathBuf},
 };
 
 use colby_core::{
@@ -50,11 +55,14 @@ use colby_core::{
 	},
 	err,
 	glam::Vec3,
+	utils::path::lexical,
 };
 
 use crate::{
 	anim, document, font, format, gltf, html, import, jpeg, level, loc, lua, material, model,
-	obj, png, scene, script, skeleton, sound, texture, ttf, wav,
+	obj, png, scene, script, skeleton, sound,
+	stamp::{self, Input, Stamps},
+	texture, ttf, wav,
 };
 
 /// The directory under a workspace that holds editable sources.
@@ -513,33 +521,6 @@ pub(crate) fn within(path: &Path, root: &Path) -> Option<PathBuf> {
 	path.starts_with(lexical(root)).then_some(path)
 }
 
-/// Resolves `.` and `..` without touching the filesystem.
-///
-/// @ref [`within`] for why a step up over nothing stays a step up.
-fn lexical(path: &Path) -> PathBuf {
-	let mut out = PathBuf::new();
-
-	for part in path.components() {
-		match part {
-			| Component::CurDir => {},
-			| Component::ParentDir => step_up(&mut out),
-			| other => out.push(other),
-		}
-	}
-
-	out
-}
-
-/// A step up: over a name it takes the name away, over nothing or over another
-/// step up it stays a step up.
-fn step_up(path: &mut PathBuf) {
-	if matches!(path.components().next_back(), Some(Component::Normal(_))) {
-		path.pop();
-	} else {
-		path.push("..");
-	}
-}
-
 /// The name a source compiles to.
 ///
 /// @param root - the source tree the path is inside
@@ -931,7 +912,7 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 			.placements
 			.iter()
 			.map(|placement| placement.mesh.as_str())
-			.collect::<std::collections::BTreeSet<_>>()
+			.collect::<BTreeSet<_>>()
 			.len(),
 		skeletons: imported
 			.skins
@@ -1057,9 +1038,14 @@ fn picture_name(
 /// the run would mean a good edit to one mesh is held up by a bad edit to
 /// another.
 ///
+/// A pass writes one file of its own into the output tree - @ref
+/// [`stamp::FILE`] - holding what each output was built out of. That file is
+/// how the next pass knows what to leave alone, and losing it costs one
+/// rebuild of the tree and nothing else.
+///
 /// @param root - the source tree
 /// @param out - the output tree
-/// @param force - recompile even when the output is newer
+/// @param force - compile every source, whatever was written down about it
 /// @return what the run did
 pub fn compile_dir(root: &Path, out: &Path, force: bool) -> Result<Report> {
 	if !root.is_dir() {
@@ -1068,6 +1054,8 @@ pub fn compile_dir(root: &Path, out: &Path, force: bool) -> Result<Report> {
 
 	let mut report = Report::default();
 	let mut wanted = Vec::new();
+	let mut stamps = Stamps::read(out);
+	let mut filed = BTreeSet::new();
 
 	for source in sources(root)? {
 		let output = output_path(root, out, &source)?;
@@ -1089,21 +1077,49 @@ pub fn compile_dir(root: &Path, out: &Path, force: bool) -> Result<Report> {
 
 		wanted.push(output.clone());
 
-		if !force && !is_stale(&source, &output, root) {
+		let name = stamp::key(out, &output);
+
+		if !force && !is_stale(&source, &output, root, &stamps, &name) {
 			report.unchanged += 1;
+			filed.insert(name);
+
 			continue;
 		}
+
+		// read before the compiler opens a byte of any of them. A source
+		// edited while it is being compiled then carries a time that is not
+		// the one written down, and the next pass builds it again; taking the
+		// times afterwards would file the new time against the old contents.
+		let read = inputs(&source, root);
 
 		match compile_file(&source, &output, root) {
 			| Ok(mut compiled) => {
 				compiled.name = asset_name(root, &source)?;
 				report.compiled.push(compiled);
+				stamps.set(name.clone(), read);
+				filed.insert(name);
 			},
 			| Err(error) => report.failed.push(Failure { source, error }),
 		}
 	}
 
 	prune(out, &wanted, &mut report);
+	stamps.keep(&filed);
+
+	// a tree the compiler cannot write into is not a warning: every output of
+	// this pass went into the same directory, and one that took them and
+	// refused this would rebuild the whole tree on every pass afterwards.
+	if let Err(error) = stamps.write(out) {
+		let file = out.join(stamp::FILE);
+
+		report.failed.push(Failure {
+			error: err!(Asset(
+				"{}: this pass could not be written down: {error}",
+				file.display()
+			)),
+			source: file,
+		});
+	}
 
 	Ok(report)
 }
@@ -1155,18 +1171,27 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
 
 /// Whether an output needs rebuilding.
 ///
-/// A missing output, or one no newer than its source, is stale. A source whose
-/// time cannot be read is treated as stale too: recompiling costs a millisecond
-/// and skipping could mean never noticing an edit.
+/// A missing output is stale, and so is one whose inputs are no longer the
+/// files, at the times, that the pass which built it wrote down - @ref
+/// [`stamp`](crate::stamp). **Nothing here compares an output's time against a
+/// source's.** Two files written inside one tick of the filesystem's clock
+/// carry the same number, and a rule that reads that as stale rebuilds a tree
+/// nobody touched for as long as the runner is up.
 ///
-/// An output the engine could not read is stale whatever its timestamp says.
-/// That check reads twelve bytes per up-to-date output per pass, which is more
-/// than the `stat` it follows and still nothing next to being told to run the
-/// compiler by hand after every format change.
-fn is_stale(source: &Path, output: &Path, root: &Path) -> bool {
-	let Ok(built) = mtime(output) else {
+/// An output the engine could not read is stale whatever was written down
+/// about it. That check reads twelve bytes per up-to-date output per pass,
+/// which is more than the `stat` it follows and still nothing next to being
+/// told to run the compiler by hand after every format change.
+///
+/// @param source - the file it was compiled from
+/// @param output - what that compiled to
+/// @param root - the source tree
+/// @param stamps - what the pass that built it wrote down
+/// @param filed - the output's name in those stamps, from @ref [`stamp::key`]
+fn is_stale(source: &Path, output: &Path, root: &Path, stamps: &Stamps, filed: &str) -> bool {
+	if !output.is_file() {
 		return true;
-	};
+	}
 
 	let Some(kind) = Kind::of(source) else {
 		return false;
@@ -1184,24 +1209,32 @@ fn is_stale(source: &Path, output: &Path, root: &Path) -> bool {
 		return true;
 	}
 
-	if mtime(source)
-		.ok()
-		.is_none_or(|edited| edited >= built)
-	{
-		return true;
+	!stamps.matches(filed, &inputs(source, root))
+}
+
+/// Every file compiling one source reads.
+///
+/// The source itself, and then the files it was built out of - @ref
+/// [`extra_inputs`]. A document is compiled with its stylesheets folded into
+/// it, so editing a sheet three documents share has to rebuild all three;
+/// otherwise the picture only changes for whichever of them somebody happens
+/// to touch next.
+///
+/// @param source - the file to compile
+/// @param root - the source tree
+/// @return what to write down beside whatever it compiles to
+fn inputs(source: &Path, root: &Path) -> Vec<Input> {
+	let mut read = vec![Input::of(source, root)];
+
+	if let Some(kind) = Kind::of(source) {
+		read.extend(
+			extra_inputs(source, kind, root)
+				.iter()
+				.map(|path| Input::of(path, root)),
+		);
 	}
 
-	// and the files this one was built out of. A document is compiled with its
-	// stylesheets and its scripts folded into it, so editing a sheet three
-	// documents share has to rebuild all three - otherwise the picture only
-	// changes for whichever of them somebody happens to touch next.
-	extra_inputs(source, kind, root)
-		.iter()
-		.any(|path| {
-			mtime(path)
-				.ok()
-				.is_none_or(|edited| edited >= built)
-		})
+	read
 }
 
 /// Whether anything a model wrote beside its own file is in an old format.
@@ -1238,11 +1271,12 @@ fn beside_is_stale(output: &Path) -> bool {
 /// geometry kinds may have a sidecar beside it saying how to read the file -
 /// @ref [`import`].
 ///
-/// **A sidecar is listed only when it is there.** A path that does not exist
-/// has no time to read, and a caller reads that as stale - so naming one that
-/// is usually absent would rebuild every model on every pass, four times a
-/// second. What happens when one is *deleted* is a different question and is
-/// answered by a mark in the output; @ref [`is_stale`].
+/// **A sidecar is listed only when it is there.** A file that is not there has
+/// no time to read, and what a pass writes down about it is that it was
+/// absent - so a sidecar appearing beside a model is a list that changed, and
+/// a rebuild. What happens when one is *deleted* is answered twice over: the
+/// list changes here as well, and a mark in the output says so - @ref
+/// [`guide_changed`].
 fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
 	let mut found = match kind {
 		| Kind::Document => {
@@ -1361,9 +1395,6 @@ fn compile_material(source: &Path) -> Result<(Vec<u8>, Produced)> {
 	Ok((material::encode(&coat), Produced::Material { textures: named }))
 }
 
-/// A file's modification time.
-fn mtime(path: &Path) -> Result<SystemTime> { Ok(fs::metadata(path)?.modified()?) }
-
 /// Deletes outputs whose source is gone.
 ///
 /// Only colby's own compiled formats are considered, and only ones the run did
@@ -1401,7 +1432,10 @@ fn prune(out: &Path, wanted: &[PathBuf], report: &mut Report) {
 
 #[cfg(test)]
 mod tests {
-	use std::{thread::sleep, time::Duration};
+	use std::{
+		fs::File,
+		time::{Duration, SystemTime},
+	};
 
 	use super::*;
 	use crate::{document::DocumentFile, format::MeshFile, texture::TextureFile};
@@ -1535,6 +1569,14 @@ f 3 4 8 7
 f 4 1 5 8
 ";
 
+	/// One quad, which reads back as nothing like the cube above.
+	const QUAD_OBJ: &str = "v -1 0 -1
+v  1 0 -1
+v  1 0  1
+v -1 0  1
+f 1 2 3 4
+";
+
 	/// A directory nobody else is using, removed and recreated.
 	fn workspace(name: &str) -> PathBuf {
 		let dir = std::env::temp_dir()
@@ -1563,6 +1605,33 @@ f 4 1 5 8
 	fn run(workspace: &Path, force: bool) -> Report {
 		compile_dir(&source_root(workspace), &output_root(workspace), force)
 			.expect("the tree compiles")
+	}
+
+	/// Moves a file's modification time, either way.
+	///
+	/// **Nothing here sleeps waiting for a clock.** A filesystem moves its
+	/// timestamps in steps of its own choosing - a whole second on some - so a
+	/// test that waits for the step to pass is a test paced by the coarsest
+	/// filesystem anybody runs it on, and one that waits too little is a test
+	/// that fails there. Saying the time outright is exact and costs nothing.
+	///
+	/// @param path - the file to date
+	/// @param at - the modification time it takes
+	pub(super) fn dated(path: &Path, at: SystemTime) {
+		File::options()
+			.write(true)
+			.open(path)
+			.expect("the file opens")
+			.set_modified(at)
+			.expect("and takes a time");
+	}
+
+	/// When a file was last written.
+	pub(super) fn written(path: &Path) -> SystemTime {
+		fs::metadata(path)
+			.expect("the file is there")
+			.modified()
+			.expect("and has a time")
 	}
 
 	/// A scene source with an entity, a body under it and a rope holding it.
@@ -1911,15 +1980,87 @@ f 4 1 5 8
 		assert_eq!(second.unchanged, 1, "and says why");
 		assert!(second.is_quiet(), "so nothing on disk moved");
 
-		// mtime resolution is fine on NTFS, but the two writes are microseconds
-		// apart and the rule is `newer than`, so give the clock a moment.
-		sleep(Duration::from_millis(20));
-		put(&workspace, "meshes/box.obj", CUBE_OBJ);
+		let source = put(&workspace, "meshes/box.obj", CUBE_OBJ);
+
+		dated(&source, written(&source) + Duration::from_secs(1));
 
 		let third = run(&workspace, false);
 
 		assert_eq!(third.compiled.len(), 1, "an edited source is compiled again");
 		assert_eq!(third.unchanged, 0, "and nothing is skipped");
+	}
+
+	#[test]
+	fn an_output_as_old_as_its_source_is_left_alone() {
+		// what CI found, and the whole reason nothing here compares two files'
+		// times. A filesystem whose clock is coarser than one compile hands
+		// the source and the output the same number, and "no newer than its
+		// source" then says stale about a file that is perfectly current -
+		// every asset, every pass, four times a second, for as long as the
+		// runner is up. Measured on an ext4 whose inodes are too small to hold
+		// a nanosecond field; said outright here, so that this is a test
+		// rather than a filesystem.
+		let workspace = workspace("one-tick");
+		let source = put(&workspace, "meshes/box.obj", CUBE_OBJ);
+
+		assert_eq!(run(&workspace, false).compiled.len(), 1, "the first run compiles");
+
+		let output = output_root(&workspace)
+			.join("meshes")
+			.join("box.cmesh");
+
+		dated(&output, written(&source));
+
+		let second = run(&workspace, false);
+
+		assert!(
+			second.compiled.is_empty(),
+			"an output no newer than its source is still current"
+		);
+		assert_eq!(second.unchanged, 1, "and says why");
+	}
+
+	#[test]
+	fn a_source_put_back_older_than_its_output_is_compiled_again() {
+		// the half that comparing two times can never see. A file restored
+		// from a backup, or moved back into place, carries the time it had
+		// rather than the time it arrived - older than the output built from
+		// what used to be there - and every rule of the shape "is the source
+		// newer" leaves that output standing forever.
+		let workspace = workspace("restored");
+		let source = put(&workspace, "meshes/box.obj", CUBE_OBJ);
+
+		assert_eq!(run(&workspace, false).compiled.len(), 1, "the first run compiles");
+
+		let before = written(&source);
+
+		put(&workspace, "meshes/box.obj", QUAD_OBJ);
+		dated(&source, before - Duration::from_mins(1));
+
+		let report = run(&workspace, false);
+
+		assert_eq!(report.compiled.len(), 1, "a source that went backwards in time is a change");
+		assert!(
+			matches!(report.compiled[0].produced, Produced::Mesh { vertices: 4, .. }),
+			"and what stands on disk is the file that was put back: {:?}",
+			report.compiled[0].produced
+		);
+	}
+
+	#[test]
+	fn a_pass_writes_down_what_it_read_and_the_sweep_leaves_that_alone() {
+		let workspace = workspace("written-down");
+		put(&workspace, "meshes/box.obj", CUBE_OBJ);
+		run(&workspace, false);
+
+		let file = output_root(&workspace).join(stamp::FILE);
+
+		assert!(file.is_file(), "a pass that compiled something says what it was built from");
+
+		let second = run(&workspace, false);
+
+		assert!(second.removed.is_empty(), "the sweep does not take it for an orphan");
+		assert!(file.is_file(), "so the pass after it still has something to go on");
 	}
 
 	#[test]
@@ -1990,10 +2131,9 @@ f 4 1 5 8
 		assert_eq!(run(&workspace, false).compiled.len(), 2, "a document and a program");
 		assert_eq!(run(&workspace, false).unchanged, 2, "and the second run has nothing to do");
 
-		// as above: the rule is `newer than`, and two writes in the same
-		// microsecond are not.
-		sleep(Duration::from_millis(20));
-		put(&workspace, "ui/hud.lua", "local a = 2\n");
+		let program = put(&workspace, "ui/hud.lua", "local a = 2\n");
+
+		dated(&program, written(&program) + Duration::from_secs(1));
 
 		let report = run(&workspace, false);
 
@@ -2287,10 +2427,11 @@ f 4 1 5 8
 
 #[cfg(test)]
 mod model_tests {
-	use std::{thread::sleep, time::Duration};
+	use std::time::Duration;
 
 	use super::{
 		super::{format::MeshFile, model::ModelFile, texture::TextureFile},
+		tests::{dated, written},
 		*,
 	};
 
@@ -2607,8 +2748,8 @@ mod model_tests {
 		assert_eq!(run(&dir, false).compiled.len(), 3, "a model and its two pictures");
 		assert!(run(&dir, false).is_quiet(), "and nothing is stale a moment later");
 
-		sleep(Duration::from_millis(20));
 		fs::write(&bump, BUMP).expect("the picture is touched");
+		dated(&bump, written(&bump) + Duration::from_secs(1));
 
 		let report = run(&dir, false);
 		let mut names: Vec<String> = report
@@ -3024,8 +3165,9 @@ mod model_tests {
 
 		assert_eq!(run(&dir, false).compiled.len(), 0, "and settles");
 
-		sleep(Duration::from_millis(1100));
-		guide(&dir, "models/lamp.glb", r#"{ "scale": [4, 4, 4] }"#);
+		let sidecar = guide(&dir, "models/lamp.glb", r#"{ "scale": [4, 4, 4] }"#);
+
+		dated(&sidecar, written(&sidecar) + Duration::from_secs(1));
 
 		let report = run(&dir, false);
 

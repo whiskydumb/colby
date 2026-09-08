@@ -9,11 +9,11 @@
 //! decoding step in between.
 //!
 //! The compiler ([`compile`]) is the seam. It walks a source tree, skips
-//! anything whose output is newer than its input, and writes the results into a
-//! mirrored output tree. It is a library first and a command second: `just
-//! assets` runs it through `colby_assetc`, and the runner calls the same
-//! function in-process every quarter second so that editing a mesh reloads it
-//! without a restart.
+//! anything none of whose inputs have moved since it was last built - @ref
+//! [`stamp`] - and writes the results into a mirrored output tree. It is a
+//! library first and a command second: `just assets` runs it through
+//! `colby_assetc`, and the runner calls the same function in-process every
+//! quarter second so that editing a mesh reloads it without a restart.
 //!
 //! ```text
 //! assets/meshes/crystal.obj  --[obj::import]-->  MeshData
@@ -48,6 +48,7 @@ pub mod script;
 pub mod sdf;
 pub mod skeleton;
 pub mod sound;
+pub mod stamp;
 pub mod texture;
 pub mod ttf;
 pub mod wav;
