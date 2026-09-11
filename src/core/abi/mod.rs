@@ -32,6 +32,7 @@ pub mod decal;
 pub mod entity;
 pub mod field;
 pub mod font;
+pub mod ik;
 pub mod input;
 pub mod joint;
 pub mod light;
@@ -76,6 +77,7 @@ pub use self::{
 	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
 	field::Field,
 	font::{Font, FontData, FontId, Fonts, Glyph},
+	ik::Reach,
 	input::{Bound, Button, Input, Key},
 	joint::{Joint, JointId, JointKind, Joints, MAX_JOINTS},
 	light::{Light, LightKind, MAX_CONE, MIN_SPREAD},
@@ -116,7 +118,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 66;
+pub const ABI_VERSION: u32 = 67;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -925,6 +927,42 @@ impl World {
 		};
 
 		anim::travel(tree, &self.clips, self.skeletons.bones(posed.skeleton))
+	}
+
+	/// Bends a two-bone chain of a pose so that its end lands on a point.
+	///
+	/// [`ik::reach`] in the world's terms: the target and the pole are world
+	/// positions, carried into the pose's own space by where the character
+	/// stands, and the scratch is the one the ragdoll bridge already keeps.
+	/// Nothing else is written and nothing is kept between two calls, so a
+	/// prediction replaying a step bends the same way.
+	///
+	/// Its place in a step is after [`animate`](Self::animate) has written the
+	/// pose and after the character has been moved, because a foot is put on
+	/// the ground the character stands over now; and before
+	/// [`pull_ragdoll`](Self::pull_ragdoll), so that the bodies follow the bent
+	/// limb. Finding the ground is the game's: a
+	/// [`trace_ray`](Self::trace_ray) under each foot.
+	///
+	/// @param pose - the pose to bend
+	/// @param at - where the character stands, the transform its entities wear
+	/// @param wanted - the chain, and the world position its end is to reach
+	/// @return how far short of the target the end stops, in the pose's own
+	/// units (the ones a pelvis is lowered in) and nought when it gets there;
+	/// `None` for a stale pose or a chain that is not one
+	pub fn reach(&mut self, pose: PoseId, at: Transform, wanted: &Reach) -> Option<f32> {
+		let Self { poses, skeletons, rigging, .. } = self;
+		let posed = poses.get_mut(pose)?;
+		let inward = at.matrix().inverse();
+		let inside = Reach {
+			target: inward.transform_point3(wanted.target),
+			pole: wanted
+				.pole
+				.map(|pole| inward.transform_point3(pole)),
+			..*wanted
+		};
+
+		ik::reach(skeletons.bones(posed.skeleton), &mut posed.locals, &inside, rigging)
 	}
 
 	/// Puts a ragdoll's bodies where the pose says its bones are.

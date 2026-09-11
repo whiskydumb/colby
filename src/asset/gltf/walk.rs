@@ -23,6 +23,13 @@
 //! The last two are the negative controls, and they are why the first two mean
 //! anything: the same fixture measured the same way does slide, by the amount
 //! the other reader predicted, as soon as the travel is not what moves it.
+//!
+//! **The legs were bent by a two-bone solve the script worked out for
+//! itself**, every knee forwards, so the same file holds a second answer to
+//! what [`reach`] works out. A leg held crooked and bent back to its own ankle,
+//! the knee sent in front of the hip, puts the knee where that other solve did
+//! at every key of the lap, to within `4.8e-7`; sent behind the hip, the same
+//! knee lands well behind it, which is the control.
 
 use std::path::Path;
 
@@ -30,9 +37,10 @@ use colby_core::{
 	abi::{
 		ClipId, NO_BONE, Node, SkeletonId, Transform, Tree, World,
 		character::{Motion, move_and_slide},
+		ik::{Reach, reach},
 		pose::{Pose, PoseId},
 	},
-	glam::{Mat4, Quat, Vec3},
+	glam::{EulerRot, Mat4, Quat, Vec3},
 };
 
 use super::{Gltf, import};
@@ -340,4 +348,155 @@ fn played_in_place_on_a_walker_that_stays_put_the_walk_goes_nowhere_and_jumps_at
 		(largest - LAP).abs() < 1.0e-3,
 		"and the right foot, still on the ground, went back a whole lap at the seam: {largest}"
 	);
+}
+
+/// How far a knee bent back may land from where the walk had it, and a foot
+/// from the ankle it was bent to.
+///
+/// What the file's own rounding allows: the knees the script solved for went
+/// out through its exporter as single-precision turns and came back in
+/// through this crate's importer. Measured, the worst of the lap's hundred and
+/// twenty-two legs put a knee `4.8e-7` from the script's and a foot `4.0e-7`
+/// from its ankle; this is four times that, and still a hundred thousand times
+/// less than a knee bent the wrong way misses by.
+const BENT_WITHIN: f32 = 2.0e-6;
+
+/// Where every bone of the walker's pose is now, in the walker's own space.
+fn laid(world: &World, pose: PoseId, skeleton: SkeletonId, into: &mut Vec<Mat4>) -> Vec<Vec3> {
+	into.clear();
+	world
+		.poses
+		.model(pose, world.skeletons.bones(skeleton), 1.0, into);
+
+	into.iter()
+		.map(|model| model.w_axis.truncate())
+		.collect()
+}
+
+/// One leg at one frame: where the walk had the knee, where the leg held
+/// crooked had it, and where bending the crooked leg back put it.
+struct Knee {
+	/// Where the walk had it.
+	walked: Vec3,
+
+	/// Where the leg held crooked had it.
+	crooked: Vec3,
+
+	/// Where bending the crooked leg back to the walk's ankle put it.
+	bent: Vec3,
+
+	/// How far the foot landed from that ankle.
+	missed: f32,
+}
+
+/// Plays one frame of the walk, holds one leg crooked, and bends it back to
+/// the ankle the walk had, with the knee sent to one side of the hip.
+///
+/// Crooked rather than straight, because a straight leg is not always
+/// somewhere else: a foot trailing behind the hip bends the knee forwards until
+/// the thigh hangs very nearly plumb, which is where a straight leg has its
+/// knee too. Turned out to the side and twisted, the thigh and the calf put
+/// the knee out of the walk's plane at every moment of the lap.
+///
+/// @param foot - which foot's leg
+/// @param frame - which sixtieth of the lap
+/// @param toward - which way from the hip the knee is sent, in the walker's
+/// own space
+fn rebend(walker: &mut Walker, foot: usize, frame: u16, toward: Vec3) -> Knee {
+	let Walker { world, pose, clip, skeleton, .. } = walker;
+	let bones = world.skeletons.bones(*skeleton).to_vec();
+	let calf = usize::from(bones[foot].parent);
+	let thigh = usize::from(bones[calf].parent);
+	let mut matrices = Vec::new();
+
+	assert!(world.play(*pose, *clip, f32::from(frame) / 60.0, true), "the pose is there");
+
+	let walked = laid(world, *pose, *skeleton, &mut matrices);
+	let posed = world
+		.poses
+		.get_mut(*pose)
+		.expect("the pose is there");
+
+	posed.locals[thigh].rotation = Quat::from_euler(EulerRot::XYZ, 0.9, 0.2, 0.7);
+	posed.locals[calf].rotation = Quat::from_euler(EulerRot::XYZ, -0.8, 0.5, 0.1);
+
+	let crooked = laid(world, *pose, *skeleton, &mut matrices);
+	let end = u16::try_from(foot).expect("a bone index fits");
+	let wanted = Reach::new(end, walked[foot]).bending(walked[thigh] + toward);
+	let posed = world
+		.poses
+		.get_mut(*pose)
+		.expect("the pose is there");
+
+	assert_eq!(
+		reach(&bones, &mut posed.locals, &wanted, &mut matrices),
+		Some(0.0),
+		"an ankle the walk put somewhere is within its own leg's reach"
+	);
+
+	let bent = laid(world, *pose, *skeleton, &mut matrices);
+
+	Knee {
+		walked: walked[calf],
+		crooked: crooked[calf],
+		bent: bent[calf],
+		missed: bent[foot].distance(walked[foot]),
+	}
+}
+
+#[test]
+fn a_leg_held_crooked_and_bent_back_to_its_ankle_puts_the_knee_where_the_walk_had_it() {
+	// the walk was made by a two-bone solve the script worked out for itself,
+	// every knee bent forwards: so a leg held crooked and bent back to the
+	// ankle the file has, the knee sent in front of the hip, has to come back to
+	// where that other solve put it, at every one of the lap's sixty-one keys.
+	let mut walker = walker();
+	let feet = walker.feet;
+	let mut worst = (0.0_f32, 0.0_f32);
+
+	for frame in 0..=60 {
+		for foot in feet {
+			let knee = rebend(&mut walker, foot, frame, Vec3::Z);
+
+			assert!(
+				knee.crooked.distance(knee.walked) > 0.05,
+				"frame {frame}: the leg held crooked had its knee somewhere else to start from"
+			);
+
+			worst = (worst.0.max(knee.bent.distance(knee.walked)), worst.1.max(knee.missed));
+		}
+	}
+
+	assert!(
+		worst.0 < BENT_WITHIN && worst.1 < BENT_WITHIN,
+		"a knee came back {} from where the walk had it, and a foot landed {} from its ankle",
+		worst.0,
+		worst.1
+	);
+}
+
+#[test]
+fn sent_behind_the_hip_the_same_knee_bends_backwards_by_the_whole_bend() {
+	// the negative control: the same legs and the same ankles, the knee sent
+	// the other way, and it has to land well behind where the walk had it.
+	let mut walker = walker();
+	let feet = walker.feet;
+
+	for frame in [0_u16, 15, 30, 45] {
+		for foot in feet {
+			let knee = rebend(&mut walker, foot, frame, Vec3::NEG_Z);
+
+			assert!(
+				knee.missed < BENT_WITHIN,
+				"the foot still gets to its ankle, {} off",
+				knee.missed
+			);
+			assert!(
+				knee.bent.z < knee.walked.z - 0.05,
+				"frame {frame}: a knee sent backwards went to {} where the walk had it at {}",
+				knee.bent,
+				knee.walked
+			);
+		}
+	}
 }
