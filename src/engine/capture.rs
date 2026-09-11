@@ -2930,11 +2930,7 @@ f 1 4 5
 	fn a_decal_lays_the_roughness_and_the_metal_of_its_material_on_a_surface() {
 		// one decal over the whole floor at a time: of the floor's own
 		// material, which has to leave it as it was, then a smoother one and a
-		// metal one, each of which has to change what the light does there. The
-		// smoother one is not very smooth: below a roughness of about 0.27 the
-		// floor under `distribution_ggx`'s denominator flattens the highlight's
-		// peak, so a mirror-like decal would barely show where a middling one
-		// shows plainly
+		// metal one, each of which has to change what the light does there
 		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
 			return;
 		};
@@ -2967,6 +2963,146 @@ f 1 4 5
 		assert!(
 			brightness(metal).abs_diff(brightness(bare)) > 30,
 			"and a metal one takes the floor's diffuse away: {metal:?} against {bare:?}"
+		);
+	}
+
+	/// The floor of [`floor_under_the_light`] at a roughness of its own.
+	fn floor_of(roughness: f32) -> World {
+		let (mut world, dark) = floor_under_the_light();
+		world
+			.materials
+			.insert("test/dark", Material { roughness, ..dark });
+
+		world
+	}
+
+	#[test]
+	fn a_smoother_floor_shows_the_sun_back_brighter_where_it_mirrors_it() {
+		// the middle of the picture is where the floor mirrors the sun into the
+		// eye, so it is where the highlight peaks, and a smoother floor gathers
+		// the same light into a narrower and taller peak. Exposed at a two
+		// hundredth so that the smoothest of the three stays under white, where
+		// the arithmetic says 188, 51 and 15 on every channel; the floor the
+		// lobe's divisor used to have turned that order upside down, 6, 13, 15.
+		//
+		// The brightest pixel near the middle rather than the middle itself:
+		// the flat normal texel is 128 of 255, a hair past straight out, so an
+		// unmapped floor leans a third of a degree and at a tenth the highlight
+		// has moved its own half width, a few pixels, off the middle
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let middle = |capture: &mut Capture, roughness: f32| {
+			let mut world = floor_of(roughness);
+			world.post.exposure = 0.005;
+
+			let picture = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+			let near = SQUARE / 2 - 8..=SQUARE / 2 + 8;
+
+			near.clone()
+				.flat_map(|y| near.clone().map(move |x| (x, y)))
+				.map(|(x, y)| picture.pixel(x, y))
+				.max_by_key(|pixel| pixel[1])
+				.expect("a middle to look at")
+		};
+
+		let smooth = middle(&mut capture, 0.1);
+		let middling = middle(&mut capture, 0.2);
+		let rough = middle(&mut capture, 0.35);
+
+		assert!(
+			smooth[1] > middling[1] + 100 && middling[1] > rough[1] + 20,
+			"a smoother floor gives back more of the sun where it mirrors it: {smooth:?} at \
+			 0.1, {middling:?} at 0.2, {rough:?} at 0.35"
+		);
+	}
+
+	#[test]
+	fn a_floor_of_no_roughness_at_all_is_drawn_as_the_smoothest_the_shader_draws() {
+		// nought is under the floor the shader holds a roughness to, so the two
+		// pictures are one picture; and a tenth is a picture of its own, which
+		// is what says this capture can tell one roughness from the next at all
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let shoot = |capture: &mut Capture, roughness: f32| {
+			capture
+				.shoot(&mut floor_of(roughness))
+				.expect("the capture renders")
+		};
+
+		let nought = shoot(&mut capture, 0.0);
+		let smoothest = shoot(&mut capture, colby_core::abi::material::MIN_ROUGHNESS);
+		let tenth = shoot(&mut capture, 0.1);
+
+		assert!(
+			nought.pixels == smoothest.pixels,
+			"a surface that says nought is drawn as the smoothest one the shader draws"
+		);
+		assert!(tenth.pixels != smoothest.pixels, "and one at a tenth is not drawn as either");
+	}
+
+	/// A side with a pixel whose middle is the middle of the picture.
+	const ODD: u32 = 257;
+
+	#[test]
+	fn a_highlight_too_bright_for_the_target_is_written_at_the_ceiling() {
+		// a white metal as smooth as the shader draws, a lamp of a hundred one
+		// unit above it and the eye straight above both: where the floor mirrors
+		// the lamp into the eye it gives back some six million, far past the
+		// 65504 a half float holds. Exposed at two to the minus seventeenth the
+		// ceiling of two to the fifteenth is a quarter, which is 137 in sRGB.
+		// With nothing held, the same pixel reads 187 on a device that
+		// saturates a value it cannot store and 255 on one that stores an
+		// infinity; with the floor the lobe used to have it read nought
+		let Some(mut capture) = capture_of(ODD, ODD) else {
+			return;
+		};
+
+		// the sun traveling upwards, so the floor is lit by the lamp alone
+		let mut world = looking_world();
+		world.light = Vec3::Y;
+		world.ambient = Vec3::ZERO;
+		world.post.exposure = 2.0_f32.powi(-17);
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+		world
+			.cvars
+			.var(shadow::ENABLED, Value::Bool(false), "off for this picture");
+
+		let mirror = world.materials.insert("test/mirror", Material {
+			metallic: 1.0,
+			roughness: 0.0,
+			..Material::DEFAULT
+		});
+		let across = view_across(&world);
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(MeshId::QUAD, mirror, Vec3::ONE));
+
+		let lamp = world.entities.spawn_at(Transform::at(Vec3::Y));
+		assert!(
+			world
+				.entities
+				.set_light(lamp, colby_core::abi::Light::point(Vec3::ONE, 100.0, 5.0))
+		);
+
+		let pixel = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(ODD / 2, ODD / 2);
+
+		assert!(
+			[pixel[0], pixel[1], pixel[2]]
+				.iter()
+				.all(|channel| channel.abs_diff(137) <= 1),
+			"the highlight is written at the ceiling and no brighter: {pixel:?}"
 		);
 	}
 

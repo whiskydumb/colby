@@ -19,6 +19,8 @@ pub mod gpu;
 mod headless;
 pub mod image;
 mod lines;
+#[cfg(test)]
+mod lobe;
 pub mod overlay;
 mod post;
 pub mod renderer;

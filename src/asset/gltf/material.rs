@@ -90,7 +90,7 @@ pub struct Surface {
 	/// Zero for a dielectric, one for a metal.
 	pub metallic: f32,
 
-	/// Zero is a mirror, one is chalk.
+	/// Nought is as smooth as a surface is drawn, and one is chalk.
 	pub roughness: f32,
 
 	/// The color picture, if it has one.

@@ -239,6 +239,17 @@ pub const MASK_CUTOFF: f32 = 0.5;
 /// thing for a material nobody configured to be.
 pub const DEFAULT_ROUGHNESS: f32 = 0.8;
 
+/// The smoothest a surface is drawn, whatever its
+/// [`roughness`](Material::roughness) says.
+///
+/// **Written down twice and it has to stay one number**: here, and in the
+/// scene's shader, which holds every surface to at least this before it lights
+/// anything; a test compares the two. Not nought, because a mirror's highlight
+/// from a sun or a lamp is a point that no pixel can hold, and the shader's own
+/// note says why not less. A material may still say nought: the number is kept
+/// as it was written and drawn as this one.
+pub const MIN_ROUGHNESS: f32 = 0.045;
+
 /// What a surface is made of.
 ///
 /// Plain data with public fields: a game is expected to build one inline, and
@@ -254,7 +265,8 @@ pub struct Material {
 	/// blending across a texture, not for describing a real substance.
 	pub metallic: f32,
 
-	/// Zero is a mirror, one is chalk.
+	/// Nought is as smooth as a surface is drawn, which is [`MIN_ROUGHNESS`],
+	/// and one is chalk.
 	pub roughness: f32,
 
 	/// The albedo texture, or [`TextureId::NONE`] for a flat color.
@@ -338,7 +350,12 @@ impl Material {
 	pub const FIELDS: &[Field<Self>] = &[
 		field!(Color, "base_color", base_color, "the surface's own color, linear RGB"),
 		field!(Float, "metallic", metallic, "nought for a dielectric, one for a metal"),
-		field!(Float, "roughness", roughness, "nought is a mirror, one is chalk"),
+		field!(
+			Float,
+			"roughness",
+			roughness,
+			"nought is as smooth as a surface is drawn, one is chalk"
+		),
 		field!(Texture, "albedo", albedo, "the color picture, or none for a flat color"),
 		field!(Texture, "normal", normal, "the normal map, or none for a flat surface"),
 		field!(

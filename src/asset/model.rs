@@ -169,7 +169,7 @@ pub struct Coat {
 	/// Zero for a dielectric, one for a metal.
 	pub metallic: f32,
 
-	/// Zero is a mirror, one is chalk.
+	/// Nought is as smooth as a surface is drawn, and one is chalk.
 	pub roughness: f32,
 
 	/// How its alpha is read, as [`Blend::code`].
@@ -259,7 +259,7 @@ pub struct Material {
 	/// Zero for a dielectric, one for a metal.
 	pub metallic: f32,
 
-	/// Zero is a mirror, one is chalk.
+	/// Nought is as smooth as a surface is drawn, and one is chalk.
 	pub roughness: f32,
 
 	/// What happens past the edge of its pictures.

@@ -409,25 +409,78 @@ fn cascade_color(slice: i32) -> vec3<f32> {
     return vec3<f32>(1.0);
 }
 
+// The smoothest a surface is drawn, whatever its material says.
+//
+// Not nought: a mirror's highlight from a sun or a lamp is a point, and no
+// pixel can hold a point. And not less than this, for two reasons that come
+// out in the same place. Near its peak the divisor in `distribution_ggx` is the
+// roughness to the fourth plus one minus the square of a number near one, and
+// a float near one is only known to a step of about six hundred-millionths: at
+// this roughness the fourth power is some seventy of those steps and the
+// highlight keeps its shape, where at 0.02 it would be under three and the
+// highlight would be the rounding. And the sun is half a degree across, and a
+// highlight this smooth is already narrower than the sun's own reflection, so
+// nothing smoother would be any truer under it.
+//
+// Matched by `colby_core::abi::material::MIN_ROUGHNESS`, and a test says the
+// two agree.
+const MIN_ROUGHNESS: f32 = 0.045;
+
+// The brightest a surface comes out, in the target's own units.
+//
+// The target holds half floats, which stop at 65504, and a value past that can
+// arrive as an infinity: a curve then divides it by itself and leaves a black
+// dot in the middle of the highlight, and the meter reads the frame as so
+// bright that the exposure goes to its floor. Only a smooth surface gets near
+// it, under the sun at a grazing angle or under a lamp close by; at
+// `MIN_ROUGHNESS` the sun alone reaches hundreds of thousands. Two to the
+// fifteenth rather than all of the range, because the frame goes on blending
+// into the target after a surface is drawn, glass over it and sparks added
+// onto it, and what lands on top needs room. Past a few thousand everything is
+// white on the screen anyway, so the number shows only in how far a highlight
+// blooms.
+const HDR_CEILING: f32 = 32768.0;
+
 // How much of the surface's microfacets point along the half vector.
 // Trowbridge-Reitz, which everyone calls GGX.
+//
+// With `a` the roughness squared, written as
+// `(a / ((1 - n.h^2) + (n.h a)^2))^2 / pi` and not as the shorter
+// `a^2 / (pi (n.h^2 (a^2 - 1) + 1)^2)`, which is the same function. In the
+// shorter one `a^2 - 1` is a number near one, and adding the one back throws
+// away the low bits of the very `a^2` the peak is made of: at `MIN_ROUGHNESS`
+// its peak comes out six parts in a thousand low. This way round the peak is
+// `1 / (pi a^2)` to the last bit, and what rounding is left sits in
+// `1 - n.h^2` alone.
+//
+// **Nothing here is floored.** With the roughness held to `MIN_ROUGHNESS` and
+// `normal_dot_half` to no more than one, the divisor is never below `a^2`, four
+// millionths. A floor of a ten-thousandth under the old divisor flattened every
+// highlight smoother than a roughness of 0.27: at 0.1 the peak came out 1,
+// where it is 3183, and the lobe kept three and a half percent of its light.
 fn distribution_ggx(normal_dot_half: f32, roughness: f32) -> f32 {
     let a = roughness * roughness;
-    let a2 = a * a;
-    let d = normal_dot_half * normal_dot_half * (a2 - 1.0) + 1.0;
+    let aside = 1.0 - normal_dot_half * normal_dot_half;
+    let along = normal_dot_half * a;
+    let k = a / (aside + along * along);
 
-    return a2 / max(3.14159265 * d * d, 0.0001);
+    return k * k / 3.14159265;
 }
 
 // How much of them shadow each other, Smith's height-correlated form, already
 // divided by the 4 * n.l * n.v the specular term would otherwise need.
+//
+// Not floored either: `normal_dot_view` arrives at a ten-thousandth or more and
+// `a` at `MIN_ROUGHNESS` squared or more, so `light` alone is never below two
+// ten-millionths. The floor this used to have bit only where the sun and the
+// eye both graze the surface, and there it made a rim darker than it is.
 fn visibility_smith(normal_dot_view: f32, normal_dot_light: f32, roughness: f32) -> f32 {
     let a = roughness * roughness;
     let a2 = a * a;
     let view = normal_dot_light * sqrt(normal_dot_view * normal_dot_view * (1.0 - a2) + a2);
     let light = normal_dot_view * sqrt(normal_dot_light * normal_dot_light * (1.0 - a2) + a2);
 
-    return 0.5 / max(view + light, 0.0001);
+    return 0.5 / (view + light);
 }
 
 // How reflective the surface is at this angle. Schlick's approximation.
@@ -464,7 +517,9 @@ fn lit_by(
 ) -> vec3<f32> {
     let half_vector = normalize(towards_light + towards_eye);
     let normal_dot_light = max(dot(normal, towards_light), 0.0);
-    let normal_dot_half = max(dot(normal, half_vector), 0.0);
+    // no more than one: two unit vectors can dot to a hair past it, and with
+    // nothing floored in the distribution that hair would lift the peak.
+    let normal_dot_half = clamp(dot(normal, half_vector), 0.0, 1.0);
     let view_dot_half = max(dot(towards_eye, half_vector), 0.0);
 
     let fresnel = fresnel_schlick(view_dot_half, f0);
@@ -750,9 +805,10 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
     let base_color = surface.color;
 
     let metallic = clamp(surface.metallic, 0.0, 1.0);
-    // clamped away from zero: a perfect mirror makes the GGX denominator
-    // vanish, and the highlight becomes a single blinding pixel.
-    let roughness = clamp(surface.roughness, 0.045, 1.0);
+    // held here rather than where the material is read, so that what a person
+    // typed is what gets saved, and after the decals, which move it per pixel.
+    // @ref `MIN_ROUGHNESS` for how smooth that lets a surface be.
+    let roughness = clamp(surface.roughness, MIN_ROUGHNESS, 1.0);
 
     let normal = surface.normal;
     let towards_light = normalize(-globals.light.xyz);
@@ -803,7 +859,8 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
     // every renderer uses before it has one.
     let ambient_specular = fresnel_ambient(normal_dot_view, f0, roughness);
     let indirect = globals.ambient.rgb * (diffuse_color + ambient_specular);
-    let color = direct + indirect;
+    // @ref `HDR_CEILING`: past it a smooth highlight would not fit the target.
+    let color = min(direct + indirect, vec3<f32>(HDR_CEILING));
 
     if (globals.shadow.w > 0.5) {
         return color * cascade_color(slice);
