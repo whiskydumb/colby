@@ -747,6 +747,11 @@ impl App {
 				project: Some(&self.runtime.project),
 				gpu: self.gpu.as_ref(),
 				profile: self.live.profile(),
+				drawn: self
+					.renderer
+					.as_ref()
+					.map(|renderer| renderer.scene().drawn())
+					.unwrap_or_default(),
 			};
 			let frame = editor.run(&window, &mut self.runtime.world, &host);
 

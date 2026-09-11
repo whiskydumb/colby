@@ -46,6 +46,14 @@ impl Renderer {
 	/// what turns it on. @ref [`Scene::measure`].
 	pub fn scene_mut(&mut self) -> &mut Scene { &mut self.scene }
 
+	/// The scene it draws with, to read from.
+	///
+	/// What the last frame drew is a count on the scene, and a panel that shows
+	/// it has no business being able to change anything. @ref
+	/// [`Scene::drawn`].
+	#[must_use]
+	pub const fn scene(&self) -> &Scene { &self.scene }
+
 	/// Makes a surface for the window on the shared device, and a scene to
 	/// draw into it.
 	///

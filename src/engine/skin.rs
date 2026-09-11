@@ -186,6 +186,24 @@ impl Joints {
 		run
 	}
 
+	/// The matrices of one run [`take`](Self::take) handed out.
+	///
+	/// For what has to know where bones put a mesh before the GPU does, which
+	/// is whether any pass can see it at all. @ref `crate::cull::posed`.
+	///
+	/// @param run - `[offset, bones, 0, 0]`, as `take` returned it
+	/// @return those matrices, or none for [`NO_JOINTS`] and for anything else
+	/// that does not name a run this frame gathered
+	pub(crate) fn run(&self, run: [u32; 4]) -> &[Mat4] {
+		let (Ok(at), Ok(bones)) = (usize::try_from(run[0]), usize::try_from(run[1])) else {
+			return &[];
+		};
+
+		self.gathered
+			.get(at..at.saturating_add(bones))
+			.unwrap_or_default()
+	}
+
 	/// Writes what was gathered.
 	///
 	/// @param queue - the queue to write through

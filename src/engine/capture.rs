@@ -330,6 +330,7 @@ mod tests {
 
 	use super::*;
 	use crate::{
+		cull,
 		scene::MSAA,
 		shadow,
 		skin::{self, Joints},
@@ -2730,6 +2731,262 @@ f 1 4 5
 			"with the cascades off that spot is as lit as the floor beside it: {without} \
 			 against {lit}"
 		);
+	}
+
+	/// A world with a cube in the middle of the view and one in each of three
+	/// places the view does not reach: behind the eye, off to the left, and
+	/// past the far plane.
+	///
+	/// The one behind the eye also stands between the light and the one in the
+	/// middle, so its shadow is on the face the camera sees: the picture holds
+	/// something only a caster outside the view can put there.
+	fn surrounded() -> World {
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(0.3);
+
+		for (at, color) in [
+			(Vec3::ZERO, rgb(0.9, 0.1, 0.1)),
+			(Vec3::new(0.0, 0.0, 12.0), rgb(0.1, 0.9, 0.1)),
+			(Vec3::new(-30.0, 0.0, 0.0), rgb(0.1, 0.1, 0.9)),
+			(Vec3::new(0.0, 0.0, -300.0), rgb(0.9, 0.9, 0.1)),
+		] {
+			let id = world.entities.spawn_at(Transform::at(at));
+
+			world
+				.entities
+				.set_renderable(id, Renderable::new(MeshId::CUBE, color));
+		}
+
+		world
+	}
+
+	#[test]
+	fn what_the_camera_cannot_see_is_left_out_and_the_picture_does_not_change() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut world = surrounded();
+		let culled = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let kept = capture.scene_mut().drawn();
+
+		world
+			.cvars
+			.var(cull::ENABLED, Value::Bool(false), "off for this frame");
+
+		let whole = capture
+			.shoot(&mut world)
+			.expect("the second capture renders");
+		let everything = capture.scene_mut().drawn();
+
+		assert_eq!(kept.meshes, 4, "four entities have a mesh: {kept:?}");
+		assert_eq!(kept.seen, 1, "and only the one in front of the camera is drawn: {kept:?}");
+		assert_eq!(everything.seen, 4, "with the test off all four are: {everything:?}");
+		assert_eq!(
+			everything.cast,
+			shadow::CASCADES * 4,
+			"and every cascade draws every one of them: {everything:?}"
+		);
+		assert!(
+			kept.cast < everything.cast,
+			"while culling the cascades draw fewer: {kept:?} against {everything:?}"
+		);
+		assert_eq!(
+			dominant(culled.pixel(SIZE.0 / 2, SIZE.1 / 2)),
+			0,
+			"the one that is drawn is in the picture, so the pictures are of something"
+		);
+		assert!(
+			culled.pixels == whole.pixels,
+			"and the picture with three cubes left out is the picture with none left out"
+		);
+	}
+
+	#[test]
+	fn a_caster_outside_the_view_still_throws_its_shadow_into_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut world = shadowed_world();
+		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+		world.camera.target = Vec3::ZERO;
+
+		// twelve units off towards the side the light comes from and six up:
+		// out of the picture altogether, and its shadow lands six units in
+		let at = Vec3::new(-12.0, 6.0, 0.0);
+		let cube = world.entities.spawn_at(Transform {
+			position: at,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(1.4),
+		});
+		world
+			.entities
+			.set_renderable(cube, Renderable::new(MeshId::CUBE, Vec3::ONE));
+
+		let culled = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let drawn = capture.scene_mut().drawn();
+
+		let shaded = on_screen(&world, beneath(&world, at), SIZE);
+		let beside = on_screen(&world, beneath(&world, at) + Vec3::new(0.0, 0.0, 3.5), SIZE);
+		let dark = brightness(culled.pixel(shaded.0, shaded.1));
+		let lit = brightness(culled.pixel(beside.0, beside.1));
+
+		assert_eq!(drawn.seen, 1, "the picture draws the floor and not the cube: {drawn:?}");
+		assert!(
+			dark * 2 < lit,
+			"and the cube's shadow is on the floor at {shaded:?} all the same: {dark} against \
+			 {lit} beside it"
+		);
+
+		world
+			.cvars
+			.var(cull::ENABLED, Value::Bool(false), "off for this frame");
+
+		let whole = capture
+			.shoot(&mut world)
+			.expect("the second capture renders");
+
+		assert!(
+			culled.pixels == whole.pixels,
+			"and it is the same shadow the frame with nothing left out throws"
+		);
+	}
+
+	#[test]
+	fn a_cube_far_down_the_view_is_cast_into_some_cascades_and_not_all() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// forty units down the view and fifteen to the right: in the picture,
+		// and inside the last cascade's box, but beyond the far side of the
+		// nearer three, whose boxes stop well short of it. **The one thing a
+		// picture cannot say**: a cube drawn into a cascade that clips it away
+		// changes no pixel, so what a list that forgot which cascade it is for
+		// would cost shows up here and nowhere else.
+		let mut world = looking_world();
+		let cube = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(15.0, 0.0, -35.0)));
+		world
+			.entities
+			.set_renderable(cube, Renderable::new(MeshId::CUBE, rgb(0.9, 0.1, 0.1)));
+
+		capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let drawn = capture.scene_mut().drawn();
+
+		assert_eq!(drawn.seen, 1, "it is in the picture: {drawn:?}");
+		assert!(
+			(1..shadow::CASCADES).contains(&drawn.cast),
+			"and in some of the cascades' lists but not in every one: {drawn:?}"
+		);
+	}
+
+	/// The bar from [`armed`], standing somewhere of the caller's choosing.
+	fn armed_at(at: Vec3) -> (World, PoseId) {
+		let mut world = looking_world();
+		let mesh = world.meshes.insert(BAR, bar([0, 255, 0, 0]));
+		let skeleton = world.skeletons.insert("rig", elbow());
+		let pose = world
+			.poses
+			.spawn(Pose::resting(skeleton, world.skeletons.bones(skeleton)));
+		let id = world.entities.spawn_at(Transform::at(at));
+
+		world
+			.entities
+			.set_renderable(id, Renderable::new(mesh, rgb(0.9, 0.7, 0.2)).posed(pose));
+
+		(world, pose)
+	}
+
+	/// Carries a whole pose along `x` by moving its root bone, which is what a
+	/// ragdoll does to a character: the entity stays and the bones go.
+	fn carried(world: &mut World, pose: PoseId, along: f32) {
+		world.advance();
+		world
+			.poses
+			.get_mut(pose)
+			.expect("the pose is there")
+			.set(0, Transform::at(Vec3::X * along));
+		world.poses.snap_all();
+		world.settle();
+	}
+
+	#[test]
+	fn a_mesh_its_bones_carry_into_the_view_is_drawn_though_it_rests_outside_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// eleven units off to the left, where the camera cannot see the bar
+		// in the shape it was modeled in
+		let (mut world, pose) = armed_at(Vec3::new(-12.0, -0.5, 0.0));
+		let resting = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert_eq!(capture.scene_mut().drawn().seen, 0, "at rest it is out of the picture");
+		assert!(top_row(&resting, resting.pixel(1, 1)).is_none(), "and nothing is drawn");
+
+		// and its root carries it eleven back in
+		carried(&mut world, pose, 11.0);
+
+		let culled = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert_eq!(capture.scene_mut().drawn().seen, 1, "carried in, it is drawn");
+		assert!(
+			top_row(&culled, culled.pixel(1, 1)).is_some(),
+			"and it is in the picture, where its bones put it"
+		);
+
+		world
+			.cvars
+			.var(cull::ENABLED, Value::Bool(false), "off for this frame");
+
+		let whole = capture
+			.shoot(&mut world)
+			.expect("the second capture renders");
+
+		assert!(culled.pixels == whole.pixels, "the same picture as with nothing left out");
+	}
+
+	#[test]
+	fn a_mesh_its_bones_carry_out_of_the_view_is_left_out_though_it_rests_inside_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the other way round: in the middle of the picture at rest, and
+		// carried twenty units off to the right by its root
+		let (mut world, pose) = armed_at(Vec3::new(-1.0, -0.5, 0.0));
+
+		capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert_eq!(capture.scene_mut().drawn().seen, 1, "at rest it is drawn");
+
+		carried(&mut world, pose, 20.0);
+
+		let culled = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert_eq!(
+			capture.scene_mut().drawn().seen,
+			0,
+			"carried away it is not, though where it rests is in the middle of the view"
+		);
+		assert!(top_row(&culled, culled.pixel(1, 1)).is_none(), "and nothing is drawn");
 	}
 
 	/// How far above the floor the holed caster hangs, and how wide it is.

@@ -4,6 +4,7 @@
 //! state of its own, which is why it is a function rather than a type.
 
 use colby_core::{abi::World, time::Clock};
+use colby_engine::cull::Drawn;
 use egui::{Grid, ScrollArea, Ui};
 
 use crate::KEEP;
@@ -14,14 +15,15 @@ use crate::KEEP;
 /// @param world - the state to count
 /// @param clock - the pacing to report
 /// @param frames - how many frames have been drawn
-pub(crate) fn show(ui: &mut Ui, world: &World, clock: &Clock, frames: u64) {
+/// @param drawn - how much of the world the last frame drew
+pub(crate) fn show(ui: &mut Ui, world: &World, clock: &Clock, frames: u64, drawn: Drawn) {
 	ScrollArea::vertical()
 		.auto_shrink([false, false])
-		.show(ui, |ui| body(ui, world, clock, frames));
+		.show(ui, |ui| body(ui, world, clock, frames, drawn));
 }
 
 /// The numbers.
-fn body(ui: &mut Ui, world: &World, clock: &Clock, frames: u64) {
+fn body(ui: &mut Ui, world: &World, clock: &Clock, frames: u64, drawn: Drawn) {
 	// egui's own smoothed frame time rather than a mean kept here: it is
 	// measured over the same frames this is drawn in, and one number nobody
 	// has to maintain is worth more than a better one.
@@ -47,7 +49,7 @@ fn body(ui: &mut Ui, world: &World, clock: &Clock, frames: u64) {
 
 	Grid::new("numbers")
 		.num_columns(2)
-		.show(ui, |ui| numbers(ui, world, clock, frames));
+		.show(ui, |ui| numbers(ui, world, clock, frames, drawn));
 
 	if clock.speed() <= f32::EPSILON {
 		ui.separator();
@@ -56,7 +58,7 @@ fn body(ui: &mut Ui, world: &World, clock: &Clock, frames: u64) {
 }
 
 /// One row per number.
-fn numbers(ui: &mut Ui, world: &World, clock: &Clock, frames: u64) {
+fn numbers(ui: &mut Ui, world: &World, clock: &Clock, frames: u64, drawn: Drawn) {
 	row(ui, "frames drawn", &frames.to_string());
 	row(ui, "steps simulated", &world.steps.to_string());
 	row(ui, "simulated time", &format!("{:.1} s", world.time));
@@ -64,6 +66,7 @@ fn numbers(ui: &mut Ui, world: &World, clock: &Clock, frames: u64) {
 	row(ui, "speed", &format!("{:.2}x", clock.speed()));
 	row(ui, "stalls", &clock.stalls().to_string());
 	row(ui, "entities", &world.entities.len().to_string());
+	row(ui, "drawn", &seen(drawn));
 	row(
 		ui,
 		"bodies",
@@ -112,6 +115,19 @@ fn bounded(held: usize, refused: u32, what: &str) -> String {
 	}
 }
 
+/// How much of the world the last frame drew, as one line.
+///
+/// The one place a person can watch the frustum test work: turn the camera
+/// and the first number moves while the second stays where it is. @ref
+/// `colby_engine::cull`.
+///
+/// @param drawn - the last frame's counts
+/// @return the entities the picture drew out of those with a mesh, and how
+/// many times the shadow cascades drew one
+fn seen(drawn: Drawn) -> String {
+	format!("{} of {}, {} into the shadows", drawn.seen, drawn.meshes, drawn.cast)
+}
+
 /// One name and one value.
 fn row(ui: &mut Ui, name: &str, value: &str) {
 	ui.label(name);
@@ -122,6 +138,14 @@ fn row(ui: &mut Ui, name: &str, value: &str) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn what_a_frame_drew_reads_as_so_many_of_so_many() {
+		let drawn = Drawn { meshes: 1000, seen: 277, cast: 1303 };
+
+		assert_eq!(seen(drawn), "277 of 1000, 1303 into the shadows");
+		assert_eq!(seen(Drawn::default()), "0 of 0, 0 into the shadows");
+	}
 
 	#[test]
 	fn a_table_that_refused_nothing_reports_only_what_it_holds() {

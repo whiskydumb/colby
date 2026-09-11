@@ -52,7 +52,7 @@ use colby_core::{
 	time::Clock,
 	warn,
 };
-use colby_engine::{Gpu, Overlay, Viewport};
+use colby_engine::{Gpu, Overlay, Viewport, cull::Drawn};
 use egui::{Context, DragAndDrop, Key, Modifiers, Panel, Rect, Ui};
 use wgpu::{Device, Queue, TextureFormat, TextureView};
 use winit::{event::WindowEvent, window::Window};
@@ -162,6 +162,13 @@ pub struct Host<'a> {
 	/// apparatus and the simulation's are on the solver. What arrives here is
 	/// already averaged - @ref `Part`.
 	pub profile: Profile<'a>,
+
+	/// How much of the world the last frame drew.
+	///
+	/// Filled by the runner off the window's own scene, a frame behind the one
+	/// the panel is drawn in, which for a count of what a camera leaves out is
+	/// the same answer. @ref [`Drawn`].
+	pub drawn: Drawn,
 }
 
 /// What a frame is costing, as the panel shows it.
@@ -816,7 +823,7 @@ impl Panels {
 
 		match self.pane {
 			| Pane::Console => self.console.show(ui, world),
-			| Pane::Statistics => stats::show(ui, world, host.clock, host.frames),
+			| Pane::Statistics => stats::show(ui, world, host.clock, host.frames, host.drawn),
 			| Pane::Assets => self
 				.browser
 				.show(ui, host.project, host.gpu, changes),
@@ -1278,6 +1285,7 @@ mod tests {
 			project: None,
 			gpu: None,
 			profile: Profile::default(),
+			drawn: Drawn::default(),
 		};
 		let mut view = Rect::NOTHING;
 		let mut built = false;
@@ -1462,6 +1470,7 @@ mod tests {
 			project: None,
 			gpu: None,
 			profile: Profile::default(),
+			drawn: Drawn::default(),
 		};
 		let mut built = false;
 		let mut view = Rect::NOTHING;

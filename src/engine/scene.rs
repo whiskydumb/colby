@@ -23,7 +23,7 @@ use colby_core::{
 	Result,
 	abi::{
 		EntityId, Light, LightKind, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes,
-		SkinVertex, Texel, TextureData, TextureId, Textures, Transform, World,
+		Renderable, SkinVertex, Texel, TextureData, TextureId, Textures, Transform, World,
 		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
 	},
@@ -51,6 +51,7 @@ use wgpu::{
 };
 
 use crate::{
+	cull::{self, Bounds, Drawn, Frustum, Placed},
 	gpu::Gpu,
 	lines::Lines,
 	post,
@@ -348,18 +349,25 @@ struct GpuMesh {
 	index_count: u32,
 	revision: u32,
 
-	/// The middle of the mesh's bounds, in the shape it was modeled in.
+	/// The box around the mesh, in the shape it was modeled in.
 	///
 	/// Kept here rather than asked for per frame because
 	/// [`MeshData::bounds`](colby_core::abi::MeshData::bounds) walks every
-	/// vertex, and what wants it - sorting the blended half of a frame - would
-	/// ask once per entity per frame. It is worked out once per upload
-	/// instead, which is once per asset reload.
+	/// vertex, and what wants it - leaving out what a pass cannot see, and
+	/// sorting the blended half of a frame - asks once per entity per frame. It
+	/// is worked out once per upload instead, which is once per asset reload.
 	///
-	/// The middle rather than the origin, which is what the two engines that
-	/// publish their sort key both use: a floor slab modeled from a corner
-	/// would otherwise sort as though it were at that corner.
-	center: Vec3,
+	/// Its middle is what the blended half sorts on, rather than the origin,
+	/// which is what the two engines that publish their sort key both use: a
+	/// floor slab modeled from a corner would otherwise sort as though it were
+	/// at that corner.
+	bounds: Bounds,
+
+	/// Each bone's box, for a mesh bones move; empty for one they do not.
+	///
+	/// Worked out at upload beside [`bounds`](Self::bounds), for the same
+	/// reason and from the same walk over the vertices. @ref [`cull::bones`].
+	bones: Vec<Option<Bounds>>,
 }
 
 /// One texture, uploaded, with its whole mip chain.
@@ -402,6 +410,35 @@ struct GpuMaterial {
 /// [`Fyrox`]: https://fyrox.rs
 const DEPTH_GRAIN: f32 = 1000.0;
 
+/// How many lists one entity can be in: the picture's, and one per cascade.
+///
+/// Each list is a run of the instance buffer of its own, because a batch is a
+/// first and a count into it; so the buffer holds this many placements for
+/// every entity the world can hold. At a hundred and twenty-eight bytes a
+/// placement that is six hundred and forty kilobytes, beside sixteen megabytes
+/// of shadow maps.
+const LISTS: usize = 1 + CASCADES;
+
+/// What one frame can see, worked out once in [`Scene::upload`] and asked of
+/// everything that might be drawn.
+struct Sight {
+	/// Where the camera is.
+	eye: Vec3,
+
+	/// The way it looks, of unit length: what the blended half sorts along.
+	forward: Vec3,
+
+	/// What the picture is drawn through.
+	view: Frustum,
+
+	/// Each cascade's box, nearest first, or nothing in a frame with the
+	/// shadows off.
+	cascades: Option<[Frustum; CASCADES]>,
+
+	/// Whether to ask at all. @ref [`cull::ENABLED`].
+	culling: bool,
+}
+
 /// One entity, in the order it is going to be written into the frame.
 ///
 /// Sorted by everything in it, in this order, which is what makes one pass over
@@ -441,6 +478,17 @@ struct Sorted {
 	/// list an entity is in and the pipeline its batch is drawn with can never
 	/// be two different answers.
 	blend: Blend,
+
+	/// Where its placement is in [`Scene::staged`], which is worked out once
+	/// however many of the frame's lists the entity is in.
+	at: u32,
+
+	/// Which cascades can see it, one bit each and the nearest lowest.
+	///
+	/// Nought for everything blended, which casts nothing, and for everything
+	/// in a frame that is not culling, whose cascades draw the picture's solid
+	/// half instead of lists of their own.
+	casts: u8,
 }
 
 impl Sorted {
@@ -604,9 +652,30 @@ pub struct Scene {
 	/// sorted on different keys and only one of them casts - so a single list
 	/// would have to be split again at both of the places that walk it.
 	blended: Vec<Batch>,
-	/// Every drawn entity, sorted. Sorting twenty-byte keys and looking the
-	/// entities up again beats sorting the hundred-and-twelve-byte placements.
+	/// Every entity the picture draws, sorted. Sorting thirty-byte keys and
+	/// looking the placements up again beats sorting the hundred-and-twenty-
+	/// eight-byte placements.
 	order: Vec<Sorted>,
+	/// Every entity some pass draws this frame, flattened once.
+	///
+	/// An entity the picture and two cascades all draw is written into the
+	/// instance buffer three times, once into each list's run, and worked out
+	/// here once.
+	staged: Vec<Placement>,
+	/// The solid entities some cascade can see, sorted the way the picture's
+	/// solid half is, each carrying which cascades.
+	casters: Vec<Sorted>,
+	/// Each cascade's own batches, in a frame that is culling. @ref
+	/// [`culling`](Self::culling).
+	casting: [Vec<Batch>; CASCADES],
+	/// Whether this frame's cascades each draw a list of their own.
+	///
+	/// `false` is every frame before culling existed, kept exactly: all four
+	/// draw the picture's solid half, which with nothing left out of it is
+	/// every solid entity there is. @ref [`cull::ENABLED`].
+	culling: bool,
+	/// How much of the world the last frame drew.
+	drawn: Drawn,
 	/// Every lit entity with how far its reach is from the eye, kept so it
 	/// allocates once. @ref [`Scene::lamps`].
 	lit: Vec<(f32, Lamp)>,
@@ -707,7 +776,7 @@ impl Scene {
 
 		let instances = device.create_buffer(&BufferDescriptor {
 			label: Some("placements"),
-			size: size_bytes::<Placement>(MAX_ENTITIES)?,
+			size: size_bytes::<Placement>(MAX_ENTITIES * LISTS)?,
 			usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
 			mapped_at_creation: false,
 		});
@@ -738,10 +807,15 @@ impl Scene {
 			textures: Vec::new(),
 			materials: Vec::new(),
 			instances,
-			placements: Vec::with_capacity(MAX_ENTITIES),
+			placements: Vec::with_capacity(MAX_ENTITIES * LISTS),
 			batches: Vec::new(),
 			blended: Vec::new(),
 			order: Vec::with_capacity(MAX_ENTITIES),
+			staged: Vec::with_capacity(MAX_ENTITIES),
+			casters: Vec::with_capacity(MAX_ENTITIES),
+			casting: core::array::from_fn(|_| Vec::new()),
+			culling: false,
+			drawn: Drawn::default(),
 			lit: Vec::with_capacity(MAX_LAMPS),
 			sky: false,
 			post,
@@ -1080,6 +1154,14 @@ impl Scene {
 	#[must_use]
 	pub fn sparks(&self) -> usize { self.sparks.drawn() }
 
+	/// How much of the world the last frame drew, and how much it had.
+	///
+	/// Counts for a report, in the same spirit as [`sparks`](Self::sparks): a
+	/// number about the project at a given step, which a moved camera or a
+	/// switched-off test changes and nothing else does. @ref [`Drawn`].
+	#[must_use]
+	pub const fn drawn(&self) -> Drawn { self.drawn }
+
 	/// Whether the particle pipelines have been built.
 	///
 	/// The one table here built lazily, and the one whose failure to build is
@@ -1113,15 +1195,15 @@ impl Scene {
 	/// therefore testable.
 	///
 	/// @param world - the world being drawn
-	/// @param eye - where the camera is
+	/// @param sight - where the camera is, and what it can see
 	/// @return the array the uniform holds, and how many of it is real
-	fn lamps(&mut self, world: &World, eye: Vec3) -> ([Lamp; MAX_LAMPS], u32) {
+	fn lamps(&mut self, world: &World, sight: &Sight) -> ([Lamp; MAX_LAMPS], u32) {
 		let room = world
 			.cvars
 			.float(LAMPS)
 			.map_or(MAX_LAMPS, lamp_room);
 
-		chosen(world, eye, room, &mut self.lit)
+		chosen(world, sight.eye, sight.culling.then_some(&sight.view), room, &mut self.lit)
 	}
 
 	/// Records one list of batches into a pass that is already set up.
@@ -1187,13 +1269,19 @@ impl Scene {
 
 	/// Records one cascade's depth pass.
 	///
-	/// The same batches the scene draws, through a pipeline with no fragment
-	/// stage and no color target, so the whole pass is geometry against depth.
+	/// Everything solid this cascade's box can see, through a pipeline with no
+	/// fragment stage and no color target, so the whole pass is geometry
+	/// against depth. @ref [`casts_of`](Self::casts_of) for which batches.
 	///
-	/// Walks the solid half of the frame only. A blended surface writes no
-	/// depth and so has nothing to say about what a light can reach, which is
-	/// what every engine checked does with one; here it is not a rule anywhere
-	/// but a consequence of which list [`group`](Self::group) filed it in.
+	/// Solid only. A blended surface writes no depth and so has nothing to say
+	/// about what a light can reach, which is what every engine checked does
+	/// with one; here it is not a rule anywhere but a consequence of which
+	/// lists [`consider`](Self::consider) filed it in.
+	///
+	/// The pass is begun and its layer cleared whatever the list holds, empty
+	/// or not: a layer left alone holds last frame's depths, and a cascade
+	/// whose box sees nothing solid has to read as lit rather than as whatever
+	/// stood there a frame ago.
 	///
 	/// @param encoder - what to record into
 	/// @param slice - which cascade, nearest first
@@ -1235,7 +1323,7 @@ impl Scene {
 		// one attitude and be shadowed in another.
 		let mut bound = None;
 
-		for batch in &self.batches {
+		for batch in self.casts_of(slice) {
 			let (Some(mesh), Some(material)) =
 				(self.meshes.get(batch.mesh), self.materials.get(batch.material))
 			else {
@@ -1264,6 +1352,22 @@ impl Scene {
 			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
 			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
 			pass.draw_indexed(0..mesh.index_count, 0, batch.first..batch.first + batch.count);
+		}
+	}
+
+	/// The batches one cascade draws.
+	///
+	/// Its own list in a frame that is culling. In one that is not, the
+	/// picture's solid half - which, with nothing left out of the picture, is
+	/// every solid entity in the world, exactly what every frame drew into
+	/// every cascade before there was a test.
+	///
+	/// @param slice - which cascade, nearest first
+	fn casts_of(&self, slice: usize) -> &[Batch] {
+		if self.culling {
+			self.casting.get(slice).map_or(&[], Vec::as_slice)
+		} else {
+			&self.batches
 		}
 	}
 
@@ -1341,8 +1445,21 @@ impl Scene {
 			*slot = matrix.to_cols_array_2d();
 		}
 
-		let (lamps, count) = self.lamps(world, camera.position);
 		let projection = camera.view_projection(world.aspect);
+		// what everything below is asked against: the view the picture is
+		// drawn through and each cascade's box, out of the very matrices the
+		// passes use, so that what is left out and what the hardware would have
+		// clipped whole are one thing. @ref [`cull`].
+		let sight = Sight {
+			eye: camera.position,
+			forward: (camera.target - camera.position).normalize_or(Vec3::NEG_Z),
+			view: Frustum::of(projection),
+			cascades: self
+				.shadowing
+				.then(|| self.cascades.matrices.map(Frustum::of)),
+			culling: world.cvars.bool(cull::ENABLED).unwrap_or(true),
+		};
+		let (lamps, count) = self.lamps(world, &sight);
 		self.sky = world.sky.is_drawn();
 
 		self.queue.write_buffer(
@@ -1354,10 +1471,7 @@ impl Scene {
 				light: world.light.extend(0.0).to_array(),
 				ambient: world.ambient.extend(0.0).to_array(),
 				eye: camera.position.extend(1.0).to_array(),
-				forward: (camera.target - camera.position)
-					.normalize_or(Vec3::NEG_Z)
-					.extend(0.0)
-					.to_array(),
+				forward: sight.forward.extend(0.0).to_array(),
 				light_view_projection,
 				splits: self.cascades.splits,
 				cascade_texels: self.cascades.texels,
@@ -1392,7 +1506,7 @@ impl Scene {
 			self.shadows.upload(&self.queue, &self.cascades);
 		}
 
-		self.group(world);
+		self.group(world, &sight);
 
 		if self.placements.is_empty() {
 			return;
@@ -1541,130 +1655,215 @@ impl Scene {
 		})
 	}
 
-	/// Lays every entity out in the instance buffer, grouped by mesh and
-	/// material.
+	/// Lays everything some pass can see out in the instance buffer, grouped by
+	/// mesh and material, one run per list.
 	///
 	/// A sort rather than the counting pass this used to be. Counting works
 	/// while the key is one small index; the key is a pair now, and a counter
 	/// per combination would be a table of meshes times materials for the sake
 	/// of the handful of pairs a scene actually uses.
-	fn group(&mut self, world: &World) {
-		let (meshes, materials) = (world.meshes.len(), world.materials.len());
-		let camera = world.render_camera();
-		let forward = (camera.target - camera.position).normalize_or(Vec3::NEG_Z);
-
+	///
+	/// **Five lists, and the picture's is the one it always was.** It is sorted
+	/// and batched exactly as before, less what the view cannot see, so the
+	/// order anything is drawn in does not change and neither does the
+	/// picture. Each cascade gets a list of its own, out of one sort of
+	/// everything solid some cascade can see: the four boxes are four
+	/// different volumes, and a thing is usually inside one or two of them.
+	/// @ref [`cull`].
+	///
+	/// @param world - the world being drawn
+	/// @param sight - what this frame can see, and whether to ask
+	fn group(&mut self, world: &World, sight: &Sight) {
 		self.order.clear();
+		self.casters.clear();
+		self.staged.clear();
+		self.joints.begin(world);
+		self.culling = sight.culling;
+		self.drawn = Drawn::default();
+
 		for (id, _, renderable) in world.entities.iter() {
-			let mesh = renderable.mesh.slot();
-			if mesh == 0 || mesh >= meshes {
-				continue;
-			}
-
-			let material = renderable
-				.material
-				.slot()
-				.min(materials.saturating_sub(1));
-			let (Ok(mesh), Ok(material)) = (u32::try_from(mesh), u32::try_from(material)) else {
-				continue;
-			};
-
-			let blend = world
-				.materials
-				.get(renderable.material)
-				.map_or(Material::DEFAULT.blend, |surface| surface.blend);
-			let blended = blend == Blend::Alpha;
-
-			self.order.push(Sorted {
-				pass: u8::from(blended),
-				// worked out only for the half that is sorted on it. The solid
-				// half would pay a matrix multiply per entity per frame for a
-				// number nothing then reads.
-				depth: if blended {
-					-grain(self.view_depth(world, id, mesh, camera.position, forward))
-				} else {
-					0
-				},
-				mesh,
-				material,
-				entity: id,
-				blend,
-			});
+			self.consider(world, sight, id, renderable);
 		}
 
 		self.order.sort_unstable_by_key(Sorted::key);
+		self.casters.sort_unstable_by_key(Sorted::key);
 
 		self.placements.clear();
 		self.batches.clear();
 		self.blended.clear();
-		self.joints.begin(world);
 
 		for index in 0..self.order.len() {
-			self.place(world, index);
+			if let Some(entry) = self.order.get(index).copied() {
+				self.place(entry, None);
+			}
 		}
-	}
 
-	/// How far along the view a mesh's middle stands.
-	///
-	/// The same quantity the cascades are cut on and the shader picks a slice
-	/// with - a projection onto the direction the camera looks, rather than the
-	/// distance to it. Two panes side by side are then at one depth, which is
-	/// what somebody looking at them would say.
-	///
-	/// @param world - the transforms to draw with
-	/// @param id - the entity being measured
-	/// @param mesh - its uploaded geometry's slot
-	/// @param eye - where the camera is this frame
-	/// @param forward - the direction it looks, of unit length
-	/// @return how far in front of the eye the mesh's middle is
-	fn view_depth(
-		&self,
-		world: &World,
-		id: EntityId,
-		mesh: u32,
-		eye: Vec3,
-		forward: Vec3,
-	) -> f32 {
-		let Some(transform) = world.render_transform(id) else {
-			return 0.0;
+		for slice in 0..CASCADES {
+			self.place_casters(slice);
+		}
+
+		self.drawn.seen = self.order.len();
+		self.drawn.cast = if sight.cascades.is_none() {
+			0
+		} else if sight.culling {
+			self.casting
+				.iter()
+				.map(|list| instances(list))
+				.sum()
+		} else {
+			CASCADES * instances(&self.batches)
 		};
-
-		let center = usize::try_from(mesh)
-			.ok()
-			.and_then(|slot| self.meshes.get(slot))
-			.map_or(Vec3::ZERO, |uploaded| uploaded.center);
-
-		(transform.matrix().transform_point3(center) - eye).dot(forward)
 	}
 
-	/// Writes one entity of the sorted order into the instance buffer, opening
-	/// a new batch when its pair differs from the one before it.
-	fn place(&mut self, world: &World, index: usize) {
-		let Some(Sorted { mesh, material, entity: id, blend, .. }) =
-			self.order.get(index).copied()
-		else {
+	/// Decides which of the frame's lists one entity is in: the picture's,
+	/// some cascades', both, or none at all.
+	///
+	/// @param world - the world being drawn
+	/// @param sight - what this frame can see
+	/// @param id - the entity
+	/// @param renderable - what it draws
+	fn consider(&mut self, world: &World, sight: &Sight, id: EntityId, renderable: &Renderable) {
+		let mesh = renderable.mesh.slot();
+		if mesh == 0 || mesh >= world.meshes.len() {
+			return;
+		}
+
+		let material = renderable
+			.material
+			.slot()
+			.min(world.materials.len().saturating_sub(1));
+		let (Ok(mesh), Ok(material)) = (u32::try_from(mesh), u32::try_from(material)) else {
 			return;
 		};
 
 		// the transform to *draw* with, which is not the one the game wrote:
 		// it is somewhere between that one and the one before it. @ref
 		// [`World::render_transform`].
-		let (Some(transform), Some(renderable)) =
-			(world.render_transform(id), world.entities.renderable(id))
-		else {
+		let Some(transform) = world.render_transform(id) else {
 			return;
 		};
 
+		let blend = world
+			.materials
+			.get(renderable.material)
+			.map_or(Material::DEFAULT.blend, |surface| surface.blend);
+
+		self.drawn.meshes += 1;
+
+		let placed = self.reach(world, renderable, mesh, transform);
+		let seen = !sight.culling || sight.view.holds(&placed);
+		// a blended surface writes no depth and so casts nothing, and a frame
+		// that is not culling has no cascade lists to put anything into
+		let casts = sight
+			.cascades
+			.as_ref()
+			.filter(|_| sight.culling && blend != Blend::Alpha)
+			.map_or(0, |cascades| casts_into(cascades, &placed));
+
+		if !seen && casts == 0 {
+			return;
+		}
+
+		let Some(at) = self.stage(world, renderable, transform) else {
+			return;
+		};
+
+		let blended = blend == Blend::Alpha;
+		let entry = Sorted {
+			pass: u8::from(blended),
+			// worked out only for the half that is sorted on it, as how far
+			// along the view the middle of the entity's box stands: the same
+			// quantity the cascades are cut on and the shader picks a slice
+			// with, a projection onto the direction the camera looks rather
+			// than the distance to it, so two panes side by side are at one
+			// depth. The box is its bones' box for a mesh bones move, which
+			// sorts a character that fell over where it lies.
+			depth: if blended {
+				-grain((placed.center - sight.eye).dot(sight.forward))
+			} else {
+				0
+			},
+			mesh,
+			material,
+			entity: id,
+			blend,
+			at,
+			casts,
+		};
+
+		if seen {
+			self.order.push(entry);
+		}
+
+		if casts != 0 {
+			self.casters.push(entry);
+		}
+	}
+
+	/// The box an entity's geometry fills in the world this frame.
+	///
+	/// The mesh's own box carried by the entity's matrix, or, for a mesh bones
+	/// move, the box its bones have put it in, carried the same way. Asking
+	/// for a pose's matrices here gathers them a little before drawing would
+	/// have, and drawing then finds the same run. @ref [`cull::posed`].
+	///
+	/// @param world - the world being drawn, for the pose
+	/// @param renderable - what the entity draws
+	/// @param mesh - its uploaded geometry's slot
+	/// @param transform - where it is drawn this frame
+	/// @return the box, in the world
+	fn reach(
+		&mut self,
+		world: &World,
+		renderable: &Renderable,
+		mesh: u32,
+		transform: Transform,
+	) -> Placed {
+		let matrix = transform.matrix();
+		let Some(uploaded) = usize::try_from(mesh)
+			.ok()
+			.and_then(|slot| self.meshes.get(slot))
+		else {
+			// a slot the upload has not reached draws nothing either, and a
+			// point where the entity stands is as good an answer as any
+			return Bounds::default().carried(matrix);
+		};
+
+		if uploaded.bones.is_empty() {
+			return uploaded.bounds.carried(matrix);
+		}
+
+		let run = self.joints.take(world, renderable.pose);
+
+		cull::posed(&uploaded.bones, self.joints.run(run))
+			.unwrap_or(uploaded.bounds)
+			.carried(matrix)
+	}
+
+	/// Flattens one entity into what the vertex stage reads.
+	///
+	/// Once per frame however many lists the entity is in; each list copies
+	/// the result. @ref [`staged`](Self::staged).
+	///
+	/// @param world - the world being drawn, for the material and the pose
+	/// @param renderable - what the entity draws
+	/// @param transform - where it is drawn this frame
+	/// @return where in [`staged`](Self::staged) it went
+	fn stage(
+		&mut self,
+		world: &World,
+		renderable: &Renderable,
+		transform: Transform,
+	) -> Option<u32> {
 		let surface = world
 			.materials
 			.get(renderable.material)
 			.copied()
 			.unwrap_or(Material::DEFAULT);
 
-		let Ok(at) = u32::try_from(self.placements.len()) else {
-			return;
-		};
+		let at = u32::try_from(self.staged.len()).ok()?;
 
-		self.placements.push(Placement {
+		self.staged.push(Placement {
 			model: transform.matrix().to_cols_array_2d(),
 			// the fourth channel is the material's opacity, which only the
 			// blended pipeline's fragment stage reads. @ref
@@ -1686,8 +1885,51 @@ impl Scene {
 			skin: self.joints.take(world, renderable.pose),
 		});
 
-		let (mesh, material) =
-			(usize::try_from(mesh).unwrap_or(0), usize::try_from(material).unwrap_or(0));
+		Some(at)
+	}
+
+	/// Writes one cascade's list: everything solid its box can see, in the
+	/// order the casters were sorted in.
+	///
+	/// @param slice - which cascade, nearest first
+	fn place_casters(&mut self, slice: usize) {
+		if let Some(list) = self.casting.get_mut(slice) {
+			list.clear();
+		}
+
+		for index in 0..self.casters.len() {
+			let Some(entry) = self
+				.casters
+				.get(index)
+				.copied()
+				.filter(|entry| (entry.casts & (1 << slice)) != 0)
+			else {
+				continue;
+			};
+
+			self.place(entry, Some(slice));
+		}
+	}
+
+	/// Writes one sorted entry into the instance buffer, opening a new batch
+	/// when its pair differs from the one before it.
+	///
+	/// @param entry - what to write
+	/// @param into - which list: `None` for the picture's, a cascade's index
+	/// for one of theirs
+	fn place(&mut self, entry: Sorted, into: Option<usize>) {
+		let Some(placement) = usize::try_from(entry.at)
+			.ok()
+			.and_then(|at| self.staged.get(at))
+			.copied()
+		else {
+			return;
+		};
+
+		let (mesh, material) = (
+			usize::try_from(entry.mesh).unwrap_or(0),
+			usize::try_from(entry.material).unwrap_or(0),
+		);
 		// asked of the uploaded geometry rather than of the entity: what
 		// decides the pipeline is whether there are bones and weights to read,
 		// and an entity naming a pose over a mesh that has none is drawn as
@@ -1697,25 +1939,34 @@ impl Scene {
 			.get(mesh)
 			.is_some_and(|uploaded| uploaded.skin.is_some());
 
+		let Ok(first) = u32::try_from(self.placements.len()) else {
+			return;
+		};
+
 		// the list the sort already put this entity in. Reading the mode again
-		// here rather than taking the one `group` decided on would be two
+		// here rather than taking the one `consider` decided on would be two
 		// answers to one question, and the day they differed a batch would be
 		// drawn in a pass its neighbors are not in.
-		let batches = if blend == Blend::Alpha {
-			&mut self.blended
-		} else {
-			&mut self.batches
+		let batches = match into {
+			| Some(slice) => match self.casting.get_mut(slice) {
+				| Some(list) => list,
+				| None => return,
+			},
+			| None if entry.blend == Blend::Alpha => &mut self.blended,
+			| None => &mut self.batches,
 		};
+
+		self.placements.push(placement);
 
 		match batches.last_mut() {
 			| Some(batch) if batch.mesh == mesh && batch.material == material => batch.count += 1,
 			| _ => batches.push(Batch {
 				mesh,
 				material,
-				first: at,
+				first,
 				count: 1,
 				skinned,
-				blend,
+				blend: entry.blend,
 			}),
 		}
 	}
@@ -1842,11 +2093,8 @@ fn upload_mesh(device: &Device, queue: &Queue, data: &MeshData, revision: u32) -
 		}),
 		index_count: u32::try_from(data.indices.len()).unwrap_or(0),
 		revision,
-		center: {
-			let (low, high) = data.bounds();
-
-			(low + high) * 0.5
-		},
+		bounds: Bounds::of(data),
+		bones: cull::bones(data),
 	}
 }
 
@@ -2055,6 +2303,31 @@ fn grain(depth: f32) -> i32 {
 	scaled.clamp(f32::from(i16::MIN) * DEPTH_GRAIN, f32::from(i16::MAX) * DEPTH_GRAIN) as i32
 }
 
+/// Which cascades can see a box, as one bit each, the nearest lowest.
+///
+/// @param cascades - each cascade's box, nearest first
+/// @param placed - the entity's box, in the world
+fn casts_into(cascades: &[Frustum; CASCADES], placed: &Placed) -> u8 {
+	cascades
+		.iter()
+		.enumerate()
+		.fold(0, |mask, (slice, cascade)| {
+			if cascade.holds(placed) {
+				mask | (1 << slice)
+			} else {
+				mask
+			}
+		})
+}
+
+/// How many instances a list of batches draws.
+fn instances(batches: &[Batch]) -> usize {
+	batches
+		.iter()
+		.map(|batch| usize::try_from(batch.count).unwrap_or(0))
+		.sum()
+}
+
 /// Which lamps a frame carries, and in what order.
 ///
 /// **The nearest by the edge of their reach, not by their middle.** A lamp
@@ -2064,21 +2337,27 @@ fn grain(depth: f32) -> i32 {
 /// the origin would drop the huge lamp the room is lit by in favor of a small
 /// one behind the eye.
 ///
-/// There is no frustum test. A sphere behind the camera lights nothing, but
-/// working that out costs six plane tests per lamp per frame to save a slot in
-/// an array that is rarely full, and a lamp just off the edge of the screen
-/// still lights what is on it through a surface facing away from the eye. When
-/// a frame is measured to be spending real time in this loop the answer is a
-/// light grid rather than a better sort.
+/// **And only among the lamps whose reach touches the view.** A lamp whose
+/// whole sphere is outside the frustum cannot light a pixel of the picture,
+/// since nothing further from it than its range is lit by it at all, so it is
+/// not carried: a room lit from behind the camera no longer spends the budget
+/// on lights nobody sees. The test is the sphere and not the lamp's position,
+/// which is what keeps a lamp just off the edge of the screen: its reach
+/// crosses the edge, and what it lights on this side of it is lit. When a
+/// frame is measured to be spending real time in this loop the answer is
+/// still a light grid rather than a better sort.
 ///
 /// @param world - the world being drawn
 /// @param eye - where the camera is
+/// @param view - what the picture can see, or `None` to carry lamps wherever
+/// they are
 /// @param room - how many the frame may carry
 /// @param scratch - the caller's list, so this allocates nothing per frame
 /// @return the array the uniform holds, and how many of it is real
 fn chosen(
 	world: &World,
 	eye: Vec3,
+	view: Option<&Frustum>,
 	room: usize,
 	scratch: &mut Vec<(f32, Lamp)>,
 ) -> ([Lamp; MAX_LAMPS], u32) {
@@ -2097,6 +2376,10 @@ fn chosen(
 		let Some(at) = world.render_transform(id) else {
 			continue;
 		};
+
+		if view.is_some_and(|view| !view.holds_ball(at.position, light.range)) {
+			continue;
+		}
 
 		scratch.push(((at.position - eye).length() - light.range, Lamp::of(light, at)));
 	}
@@ -2584,6 +2867,8 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 
 #[cfg(test)]
 mod tests {
+	use colby_core::abi::Camera;
+
 	use super::*;
 
 	/// A short count as a distance, without an `as`.
@@ -2613,7 +2898,7 @@ mod tests {
 		// picture is inside the big one, so it is the one that matters.
 		let world = lit_world(&[(4.0, 1.0), (10.0, 20.0)]);
 		let mut scratch = Vec::new();
-		let (lamps, count) = chosen(&world, Vec3::ZERO, MAX_LAMPS, &mut scratch);
+		let (lamps, count) = chosen(&world, Vec3::ZERO, None, MAX_LAMPS, &mut scratch);
 
 		assert_eq!(count, 2, "both are carried");
 		assert!(
@@ -2630,7 +2915,7 @@ mod tests {
 			.collect();
 		let world = lit_world(&standing);
 		let mut scratch = Vec::new();
-		let (lamps, count) = chosen(&world, Vec3::ZERO, MAX_LAMPS, &mut scratch);
+		let (lamps, count) = chosen(&world, Vec3::ZERO, None, MAX_LAMPS, &mut scratch);
 
 		assert_eq!(usize::try_from(count), Ok(MAX_LAMPS), "the array fills and no further");
 		assert!(
@@ -2651,7 +2936,7 @@ mod tests {
 		let mut scratch = Vec::new();
 
 		for room in 0..=3 {
-			let (lamps, count) = chosen(&world, Vec3::ZERO, room, &mut scratch);
+			let (lamps, count) = chosen(&world, Vec3::ZERO, None, room, &mut scratch);
 
 			assert_eq!(usize::try_from(count), Ok(room), "asking for {room} carries {room}");
 
@@ -2680,9 +2965,80 @@ mod tests {
 			.set_light(off, Light::point(Vec3::ONE, 0.0, 5.0));
 
 		let mut scratch = Vec::new();
-		let (_, count) = chosen(&world, Vec3::ZERO, MAX_LAMPS, &mut scratch);
+		let (_, count) = chosen(&world, Vec3::ZERO, None, MAX_LAMPS, &mut scratch);
 
 		assert_eq!(count, 1, "one lamp among four entities");
+	}
+
+	/// A world with a lamp of each range standing at each point.
+	fn lamps_at(lamps: &[(Vec3, f32)]) -> World {
+		let mut world = World::new();
+
+		for &(at, range) in lamps {
+			let id = world.entities.spawn_at(Transform::at(at));
+
+			world
+				.entities
+				.set_light(id, Light::point(Vec3::ONE, 1.0, range));
+		}
+
+		world
+	}
+
+	/// What a camera at the origin looking down `-z` can see, square.
+	fn ahead() -> Frustum {
+		let camera = Camera {
+			position: Vec3::ZERO,
+			target: Vec3::NEG_Z,
+			..Camera::DEFAULT
+		};
+
+		Frustum::of(camera.view_projection(1.0))
+	}
+
+	#[test]
+	fn a_lamp_whose_reach_misses_the_view_gives_its_slot_to_one_that_reaches_it() {
+		// one three units behind the eye with a reach of one, which stops two
+		// short of the near plane, and one ten ahead: with room for one, the
+		// nearer wins while nothing asks what the picture can see, and the one
+		// the picture can see wins once something does
+		let world =
+			lamps_at(&[(Vec3::new(0.0, 0.0, 3.0), 1.0), (Vec3::new(0.0, 0.0, -10.0), 1.0)]);
+		let mut scratch = Vec::new();
+
+		let (blind, _) = chosen(&world, Vec3::ZERO, None, 1, &mut scratch);
+		let (seeing, count) = chosen(&world, Vec3::ZERO, Some(&ahead()), 1, &mut scratch);
+
+		assert!(
+			(blind[0].position_range[2] - 3.0).abs() < 1.0e-6,
+			"unasked, the nearer is carried: {:?}",
+			blind[0].position_range
+		);
+		assert_eq!(count, 1, "one is carried either way");
+		assert!(
+			(seeing[0].position_range[2] + 10.0).abs() < 1.0e-6,
+			"asked, the one ahead is: {:?}",
+			seeing[0].position_range
+		);
+	}
+
+	#[test]
+	fn a_lamp_off_the_edge_is_carried_while_its_reach_crosses_the_edge() {
+		// ten units ahead, the right-hand edge of a square view a radian across
+		// is 5.46 out. A lamp at eight lights across it with a reach of four and
+		// does not with a reach of one. **The case testing the lamp's position
+		// would get wrong**: its middle is outside the view either way.
+		let mut scratch = Vec::new();
+		let at = Vec3::new(8.0, 0.0, -10.0);
+		let view = ahead();
+
+		let (_, reaching) =
+			chosen(&lamps_at(&[(at, 4.0)]), Vec3::ZERO, Some(&view), MAX_LAMPS, &mut scratch);
+		let (_, short) =
+			chosen(&lamps_at(&[(at, 1.0)]), Vec3::ZERO, Some(&view), MAX_LAMPS, &mut scratch);
+
+		assert_eq!(reaching, 1, "a reach across the edge is carried");
+		assert_eq!(short, 0, "and one that stops short of it is not");
 	}
 
 	#[test]
@@ -2809,6 +3165,11 @@ mod tests {
 			size_bytes::<Placement>(MAX_ENTITIES).expect("the size fits"),
 			128 * BufferAddress::try_from(MAX_ENTITIES).expect("the count fits"),
 			"one placement per entity the world can hold"
+		);
+		assert_eq!(
+			size_bytes::<Placement>(MAX_ENTITIES * LISTS).expect("the size fits"),
+			128 * 5 * BufferAddress::try_from(MAX_ENTITIES).expect("the count fits"),
+			"and five of them for every one: the picture's list and each cascade's"
 		);
 		assert_eq!(
 			skin_stride(),

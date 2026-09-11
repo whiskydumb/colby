@@ -51,7 +51,9 @@ use colby_core::{
 #[cfg(feature = "editor")]
 use colby_editor::{Part, Profile};
 use colby_engine::{
-	Capture, Gpu, Overlay, gpu,
+	Capture, Gpu, Overlay,
+	cull::Drawn,
+	gpu,
 	timing::{Frame, Pass, Work},
 };
 use colby_physics::Spent;
@@ -361,6 +363,21 @@ struct Table {
 	/// about the world somebody thought it was.
 	walkable: u64,
 
+	/// The most entities with a mesh any measured frame had.
+	meshes: usize,
+
+	/// The most of them any measured frame's picture drew.
+	///
+	/// Beside `sparks` and for its reason: a count about the project rather
+	/// than about the afternoon. It says how much of a world the camera leaves
+	/// out, and `--set r.cull 0` puts all of it back, which is the same run
+	/// with this number at `meshes`. @ref `colby_engine::cull`.
+	drawn: usize,
+
+	/// The most times any measured frame's cascades drew an entity, the four
+	/// added together.
+	cast: usize,
+
 	/// How many render passes each frame recorded, and `None` before the first
 	/// one.
 	passes: Option<u32>,
@@ -412,6 +429,9 @@ impl Table {
 			sparks: 0,
 			ground: 0,
 			walkable: 0,
+			meshes: 0,
+			drawn: 0,
+			cast: 0,
 			passes: None,
 			steady: true,
 		}
@@ -428,6 +448,9 @@ impl Table {
 		self.sparks = self.sparks.max(counts.sparks);
 		self.ground = self.ground.max(counts.ground);
 		self.walkable = self.walkable.max(counts.walkable);
+		self.meshes = self.meshes.max(counts.drawn.meshes);
+		self.drawn = self.drawn.max(counts.drawn.seen);
+		self.cast = self.cast.max(counts.drawn.cast);
 
 		for (at, pass) in Pass::ALL.into_iter().enumerate() {
 			if let (Some(row), Some(took)) = (self.rows.get_mut(at), frame.pass(pass)) {
@@ -499,6 +522,9 @@ impl Table {
 			sparks = self.sparks,
 			ground = self.ground,
 			walkable = self.walkable,
+			meshes = self.meshes,
+			drawn = self.drawn,
+			cast = self.cast,
 			steady = self.steady,
 			gpu_us = self.slice(0..Pass::ALL.len()).as_micros(),
 			cpu_us = self
@@ -542,6 +568,9 @@ struct Counts {
 
 	/// How many cells of it a thing that walks may stand on.
 	walkable: u64,
+
+	/// How much of the world the frame drew, and how much there was to draw.
+	drawn: Drawn,
 }
 
 /// Runs the project for a while and prints what a frame of it costs.
@@ -620,6 +649,7 @@ pub(crate) fn take(project: &Project, build: &Build, asked: &Asked, frames: u32)
 				sparks: capture.scene_mut().sparks(),
 				ground: runtime.ground.triangles(),
 				walkable: runtime.paths.cells(),
+				drawn: capture.scene_mut().drawn(),
 			});
 		}
 	}
@@ -824,6 +854,7 @@ mod tests {
 			sparks: 40,
 			ground: 2048,
 			walkable: 900,
+			drawn: Drawn { meshes: 10, seen: 4, cast: 12 },
 		});
 
 		let under = Pass::ALL.len() + Work::ALL.len();
@@ -841,6 +872,11 @@ mod tests {
 		assert_eq!(table.sparks, 40, "and the count is carried beside the times");
 		assert_eq!(table.ground, 2048, "and so is the terrain's size");
 		assert_eq!(table.walkable, 900, "and how much of it can be walked on");
+		assert_eq!(
+			(table.meshes, table.drawn, table.cast),
+			(10, 4, 12),
+			"and how much of the world the frame drew"
+		);
 		assert_eq!(
 			table.rows[under + 5].mean(),
 			Duration::from_micros(31),

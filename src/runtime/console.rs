@@ -597,6 +597,15 @@ fn install_render(world: &mut World) {
 		Value::Bool(false),
 		"color every pixel by the shadow cascade it read",
 	);
+	// what a frame cannot see is left out of it: the view for the picture and
+	// each cascade's box for its shadows. On, and not saved, like the shadows:
+	// what the switch is for is measuring what the test saves, and showing
+	// that the picture does not depend on it.
+	world.cvars.var(
+		colby_engine::cull::ENABLED,
+		Value::Bool(true),
+		"leave out of a frame what its view and its shadows cannot reach",
+	);
 	// how many point and cone lights one frame may carry. A ceiling rather
 	// than a switch: the array is the frame's whole budget for them, so the
 	// number a machine can afford is the thing worth being able to say.
@@ -1355,6 +1364,7 @@ mod tests {
 		// `colby_engine::scene::Scene::upload`
 		(colby_engine::shadow::ENABLED, Value::Bool(true)),
 		(colby_engine::shadow::TINT, Value::Bool(false)),
+		(colby_engine::cull::ENABLED, Value::Bool(true)),
 		// `crate::console::volumes`, all four
 		(colby_audio::MASTER, Value::Float(1.0)),
 		(colby_audio::EFFECTS, Value::Float(1.0)),

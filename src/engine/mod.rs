@@ -13,6 +13,7 @@
 //! the contract rather than beside the thing it happens to pace.
 
 pub mod capture;
+pub mod cull;
 pub mod gpu;
 mod headless;
 pub mod image;
