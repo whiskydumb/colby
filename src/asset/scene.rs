@@ -9,10 +9,14 @@
 //! behind.
 //!
 //! ```text
-//!    0  SceneHeader                      160 bytes
-//!  160  Setting                          112 bytes, one of them
-//!    .  [Stood; stood_count]              76 bytes each
+//!    0  SceneHeader                      208 bytes
+//!  208  Setting                          208 bytes, one of them
+//!    .  [Stood; stood_count]              84 bytes each
+//!    .  [Lit;   lit_count]                36 bytes each
+//!    .  [Shed;  shed_count]               88 bytes each
+//!    .  [Sod;   sod_count]                44 bytes each
 //!    .  [Bulk;  bulk_count]              132 bytes each
+//!    .  [Wet;   wet_count]                36 bytes each
 //!    .  [Tie;   tie_count]               100 bytes each
 //!    .  [Bent;  bent_count]                24 bytes each
 //!    .  [Local; locals_count]              40 bytes each
@@ -71,8 +75,9 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// different number is refused with a message rather than read as if it
 /// agreed.
 ///
-/// Twelve since an entity record can say what ground it is.
-pub const FORMAT_VERSION: u32 = 12;
+/// Thirteen since an entity record carries a word of flags, the first of them
+/// saying that it is hidden.
+pub const FORMAT_VERSION: u32 = 13;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -418,6 +423,16 @@ const _: () = assert!(
 	"a settings record has to be a whole number of its own alignment"
 );
 
+/// The bit in [`Stood::flags`] that says the entity is hidden, and with it
+/// everything that hangs off it.
+///
+/// The bit means the unusual answer, the rule [`TIE_COLLIDE`] follows, so a
+/// record whose flags are zero is an entity that is drawn. A bit this build
+/// does not know is read as a property the record does not have, @ref
+/// `codes`, which is what lets the next one be added without moving
+/// [`FORMAT_VERSION`].
+pub const STOOD_HIDDEN: u32 = 1;
+
 /// One entity standing somewhere, looking like something.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -459,6 +474,9 @@ pub struct Stood {
 	/// own. Its position, rotation and scale are then its place inside that
 	/// entity.
 	pub parent: u32,
+
+	/// [`STOOD_HIDDEN`], and room for whatever comes after it.
+	pub flags: u32,
 }
 
 /// One entity's terrain, as the file holds it.
@@ -1206,6 +1224,7 @@ impl SceneFile {
 			terrain: Terrain::NONE,
 			pose: stood.pose,
 			parent: stood.parent,
+			hidden: stood.flags & STOOD_HIDDEN != 0,
 		}
 	}
 
@@ -1924,6 +1943,7 @@ fn stood_of(thing: &Thing, names: &mut Names) -> Stood {
 		color: thing.color.to_array(),
 		pose: thing.pose,
 		parent: thing.parent,
+		flags: if thing.hidden { STOOD_HIDDEN } else { 0 },
 	}
 }
 
@@ -2387,6 +2407,9 @@ mod tests {
 				terrain: Terrain::NONE,
 				pose: 0,
 				parent: scene::NO_INDEX,
+				// this one hidden and the second not, so a writer that put one
+				// answer on every record comes back unequal to the fixture
+				hidden: true,
 			},
 			Thing {
 				name: String::new(),
@@ -2444,6 +2467,7 @@ mod tests {
 				// hanging off the first, so the field carries something a
 				// round trip could lose
 				parent: 0,
+				hidden: false,
 			},
 		]
 	}
@@ -2751,6 +2775,58 @@ mod tests {
 		bytes[at..at + 4].copy_from_slice(&code.to_le_bytes());
 
 		bytes
+	}
+
+	#[test]
+	fn whether_an_entity_is_hidden_survives_both_ways() {
+		for hidden in [false, true] {
+			let mut data = sample();
+			data.things[1].hidden = hidden;
+
+			assert_eq!(
+				round_trip(&data).things[1].hidden,
+				hidden,
+				"an entity that says {hidden} comes back saying it"
+			);
+		}
+	}
+
+	#[test]
+	fn an_entity_that_is_drawn_is_what_a_record_of_no_flags_is() {
+		let bytes = encode(&sample()).expect("it fits");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+
+		assert_eq!(file.stood()[0].flags, STOOD_HIDDEN, "the hidden one sets the bit");
+		assert_eq!(file.stood()[1].flags, 0, "and the one that is drawn writes nothing");
+	}
+
+	/// The bytes of the sample with its first entity's flags overwritten.
+	fn stood_flags_of(word: u32) -> Vec<u8> {
+		let mut bytes = encode(&sample()).expect("it fits");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+		let at = usize::try_from(file.header().stood_offset).expect("an offset")
+			+ core::mem::offset_of!(Stood, flags);
+
+		bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+
+		bytes
+	}
+
+	#[test]
+	fn a_flag_this_build_does_not_know_is_a_property_the_entity_does_not_have() {
+		// the flag rule rather than the code rule, @ref `codes`: a bit from a
+		// later build is read, not refused, and it does not leak into the one
+		// this build knows
+		let hidden = |word: u32| {
+			SceneFile::from_bytes(AlignedBytes::from_slice(&stood_flags_of(word)))
+				.expect("a flag nothing answers to is read rather than refused")
+				.to_scene_data()
+				.things[0]
+				.hidden
+		};
+
+		assert!(!hidden(1 << 20), "a bit from a later build hides nothing");
+		assert!(hidden((1 << 20) | STOOD_HIDDEN), "and covers nothing the known bit says");
 	}
 
 	#[test]

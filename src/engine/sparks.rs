@@ -27,7 +27,7 @@
 
 use colby_core::{
 	Result,
-	abi::{SparkBlend, TextureId, World},
+	abi::{EntityId, SparkBlend, TextureId, World},
 	bytemuck::{self, Pod, Zeroable},
 	err,
 	glam::Vec3,
@@ -125,17 +125,9 @@ pub(crate) struct Sparks {
 	instances: Buffer,
 	capacity: u64,
 
-	/// The instance data this frame, sorted into runs.
-	///
-	/// A field rather than a local so that a frame with a cloud in it does not
-	/// allocate.
-	scratch: Vec<SparkInstance>,
-
-	/// Which run of `scratch` is drawn with which pipeline and which picture.
-	runs: Vec<Run>,
-
-	/// The sort key beside each instance, kept so the sort allocates once.
-	keys: Vec<(u32, u32)>,
+	/// This frame's cloud, laid out: what is written to the GPU and what it is
+	/// worked out in. @ref [`Cloud`].
+	cloud: Cloud,
 }
 
 impl Sparks {
@@ -160,9 +152,7 @@ impl Sparks {
 			groups: Vec::new(),
 			instances: buffer(device, INITIAL_INSTANCES),
 			capacity: INITIAL_INSTANCES,
-			scratch: Vec::new(),
-			runs: Vec::new(),
-			keys: Vec::new(),
+			cloud: Cloud::default(),
 		}
 	}
 
@@ -220,43 +210,9 @@ impl Sparks {
 		textures: &[GpuTexture],
 		globals: &BindGroupLayout,
 	) {
-		self.scratch.clear();
-		self.keys.clear();
-		self.runs.clear();
+		self.cloud.lay_out(world, textures.len());
 
-		for spark in world.sparks.iter() {
-			let Some(emitter) = world.entities.emitter(spark.owner) else {
-				continue;
-			};
-
-			let through = spark.through();
-			// the picture's slot, clamped into the table the way a
-			// renderable's material is: an emitter naming a texture that has
-			// gone is drawn with the white one rather than not at all.
-			let texture = if emitter.texture.slot() < textures.len() {
-				emitter.texture.slot()
-			} else {
-				TextureId::NONE.slot()
-			};
-
-			self.keys.push((
-				// the pipeline first and the picture second, which is what
-				// makes each run one `set_pipeline` and one `set_bind_group`.
-				// Nothing below it: the sort *within* a cloud is deliberately
-				// not done - @ref the module docs on `SparkBlend::Additive`.
-				u32::try_from(emitter.blend.row()).unwrap_or(0),
-				u32::try_from(texture).unwrap_or(0),
-			));
-			self.scratch.push(SparkInstance {
-				position: spark.position.to_array(),
-				size: mix(emitter.size, emitter.size_end, through).max(0.0),
-				color: mix3(emitter.color, emitter.color_end, through)
-					.extend(spark.fade() * emitter.opacity.clamp(0.0, 1.0))
-					.to_array(),
-			});
-		}
-
-		if self.scratch.is_empty() {
+		if self.cloud.sorted.is_empty() {
 			return;
 		}
 
@@ -264,46 +220,23 @@ impl Sparks {
 		// and a device that never sees one never builds them.
 		self.ensure(device, globals);
 
-		// the two are sorted together, which is why the key is beside the
-		// instance rather than in it: thirty-two bytes moved per swap instead
-		// of forty, and the key never reaches the GPU.
-		let mut order: Vec<u32> = (0..u32::try_from(self.scratch.len()).unwrap_or(0)).collect();
-
-		order.sort_unstable_by_key(|at| self.keys[usize::try_from(*at).unwrap_or(0)]);
-
-		let mut sorted = Vec::with_capacity(self.scratch.len());
-
-		for at in &order {
-			let at = usize::try_from(*at).unwrap_or(0);
-			let (blend, texture) = self.keys[at];
-			let blend = SparkBlend::at(blend).unwrap_or_default();
-			let texture = usize::try_from(texture).unwrap_or(0);
-			let first = u32::try_from(sorted.len()).unwrap_or(0);
-
-			sorted.push(self.scratch[at]);
-
-			match self.runs.last_mut() {
-				| Some(run) if run.blend == blend && run.texture == texture => run.count += 1,
-				| _ => self
-					.runs
-					.push(Run { blend, texture, first, count: 1 }),
-			}
-		}
-
-		self.scratch = sorted;
-
-		let wanted = u64::try_from(self.scratch.len()).unwrap_or(0);
+		let wanted = u64::try_from(self.cloud.sorted.len()).unwrap_or(0);
 		if wanted > self.capacity {
 			self.capacity = wanted.next_power_of_two();
 			self.instances = buffer(device, self.capacity);
 		}
 
-		queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.scratch));
+		queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.cloud.sorted));
 
 		// collected first, because binding takes `&mut self` and the runs are
 		// on it. A handful of pictures, so the allocation is nothing and the
 		// alternative is an index loop over a length that cannot change.
-		let pictures: Vec<usize> = self.runs.iter().map(|run| run.texture).collect();
+		let pictures: Vec<usize> = self
+			.cloud
+			.runs
+			.iter()
+			.map(|run| run.texture)
+			.collect();
 
 		for picture in pictures {
 			self.bind(device, textures, picture);
@@ -356,7 +289,7 @@ impl Sparks {
 	/// @param pass - the scene's pass, with its depth attachment
 	/// @param globals - the camera and the light
 	pub(crate) fn draw(&self, pass: &mut RenderPass<'_>, globals: &BindGroup) {
-		if self.runs.is_empty() {
+		if self.cloud.runs.is_empty() {
 			return;
 		}
 
@@ -368,7 +301,7 @@ impl Sparks {
 		};
 		let mut bound = None;
 
-		for run in &self.runs {
+		for run in &self.cloud.runs {
 			let Some(Some((group, _))) = self.groups.get(run.texture) else {
 				continue;
 			};
@@ -385,7 +318,7 @@ impl Sparks {
 	}
 
 	/// How many particles this frame drew, for a report.
-	pub(crate) fn drawn(&self) -> usize { self.scratch.len() }
+	pub(crate) fn drawn(&self) -> usize { self.cloud.sorted.len() }
 
 	/// Whether the two pipelines are there.
 	///
@@ -601,6 +534,130 @@ const INSTANCE_ATTRIBUTES: [VertexAttribute; 3] = [
 	},
 ];
 
+/// A frame's cloud, laid out as instances sorted into runs, with no device in
+/// it.
+///
+/// The half of [`Sparks::upload`] that has arithmetic in it, apart from the
+/// wgpu calls so that a test runs this very loop rather than a copy of it.
+/// Every list is kept between frames, which is what lets a frame with a cloud
+/// in it allocate nothing but the order it sorts.
+#[derive(Default)]
+struct Cloud {
+	/// The instances this frame, sorted into runs.
+	sorted: Vec<SparkInstance>,
+
+	/// Which run of `sorted` is drawn with which pipeline and which picture.
+	runs: Vec<Run>,
+
+	/// The instances in the order the pool holds them, before the sort.
+	unsorted: Vec<SparkInstance>,
+
+	/// The sort key beside each unsorted instance.
+	keys: Vec<(u32, u32)>,
+
+	/// Whether each slot's entity is drawn this frame: nought for not asked
+	/// yet, one for shown and two for hidden. @ref [`showing`].
+	shown: Vec<u8>,
+}
+
+impl Cloud {
+	/// Lays a world's cloud out.
+	///
+	/// @param world - whose pool and emitters are read
+	/// @param textures - how many pictures the scene has uploaded
+	fn lay_out(&mut self, world: &World, textures: usize) {
+		self.sorted.clear();
+		self.runs.clear();
+		self.unsorted.clear();
+		self.keys.clear();
+		self.shown.clear();
+		self.shown.resize(world.entities.slots(), 0);
+
+		for spark in world.sparks.iter() {
+			let Some(emitter) = world.entities.emitter(spark.owner) else {
+				continue;
+			};
+
+			// a hidden entity's cloud is not drawn, and it goes on being
+			// thrown: the step never asks. @ref `Entities::set_hidden`.
+			if !showing(&mut self.shown, world, spark.owner) {
+				continue;
+			}
+
+			let through = spark.through();
+			// the picture's slot, clamped into the table the way a
+			// renderable's material is: an emitter naming a texture that has
+			// gone is drawn with the white one rather than not at all.
+			let texture = if emitter.texture.slot() < textures {
+				emitter.texture.slot()
+			} else {
+				TextureId::NONE.slot()
+			};
+
+			self.keys.push((
+				// the pipeline first and the picture second, which is what
+				// makes each run one `set_pipeline` and one `set_bind_group`.
+				// Nothing below it: the sort *within* a cloud is deliberately
+				// not done - @ref the module docs on `SparkBlend::Additive`.
+				u32::try_from(emitter.blend.row()).unwrap_or(0),
+				u32::try_from(texture).unwrap_or(0),
+			));
+			self.unsorted.push(SparkInstance {
+				position: spark.position.to_array(),
+				size: mix(emitter.size, emitter.size_end, through).max(0.0),
+				color: mix3(emitter.color, emitter.color_end, through)
+					.extend(spark.fade() * emitter.opacity.clamp(0.0, 1.0))
+					.to_array(),
+			});
+		}
+
+		// the two are sorted together, which is why the key is beside the
+		// instance rather than in it: thirty-two bytes moved per swap instead
+		// of forty, and the key never reaches the GPU.
+		let mut order: Vec<u32> = (0..u32::try_from(self.unsorted.len()).unwrap_or(0)).collect();
+
+		order.sort_unstable_by_key(|at| self.keys[usize::try_from(*at).unwrap_or(0)]);
+
+		for at in &order {
+			let at = usize::try_from(*at).unwrap_or(0);
+			let (blend, texture) = self.keys[at];
+			let blend = SparkBlend::at(blend).unwrap_or_default();
+			let texture = usize::try_from(texture).unwrap_or(0);
+			let first = u32::try_from(self.sorted.len()).unwrap_or(0);
+
+			self.sorted.push(self.unsorted[at]);
+
+			match self.runs.last_mut() {
+				| Some(run) if run.blend == blend && run.texture == texture => run.count += 1,
+				| _ => self
+					.runs
+					.push(Run { blend, texture, first, count: 1 }),
+			}
+		}
+	}
+}
+
+/// Whether the entity that threw a particle is drawn, worked out once a frame
+/// for each entity rather than once for each particle.
+///
+/// Remembered by slot, which is sound only for an owner the emitter lookup has
+/// already found alive: for the length of a frame a slot has one occupant.
+///
+/// @param known - one word a slot, nought where nothing has been asked yet
+/// @param world - whose table answers
+/// @param owner - the entity that threw the particle
+fn showing(known: &mut [u8], world: &World, owner: EntityId) -> bool {
+	let Some(seen) = known.get_mut(owner.slot()) else {
+		return world.entities.shown(owner);
+	};
+
+	if *seen == 0 {
+		*seen = if world.entities.shown(owner) { 1 } else { 2 };
+	}
+
+	*seen == 1
+}
+
 /// The instance stride, asserted to match the attributes above.
 const fn stride() -> BufferAddress {
 	const {
@@ -613,67 +670,19 @@ const fn stride() -> BufferAddress {
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{Emitter, EmitterKind, EntityId, Spark, Textures};
+	use colby_core::abi::{Emitter, EmitterKind, Spark, Textures};
 
 	use super::*;
 
 	/// Lays a world's cloud out the way [`Sparks::upload`] does, without a
-	/// device.
-	///
-	/// The half of the upload that has arithmetic in it, lifted so a test can
-	/// reach it: the other half is three wgpu calls and a `write_buffer`.
+	/// device: [`Cloud::lay_out`] is that half of the upload, so this runs the
+	/// very loop a frame runs rather than a copy of it.
 	fn laid_out(world: &World, textures: usize) -> (Vec<SparkInstance>, Vec<Run>) {
-		let mut instances = Vec::new();
-		let mut keys = Vec::new();
+		let mut cloud = Cloud::default();
 
-		for spark in world.sparks.iter() {
-			let Some(emitter) = world.entities.emitter(spark.owner) else {
-				continue;
-			};
+		cloud.lay_out(world, textures);
 
-			let through = spark.through();
-			let texture = if emitter.texture.slot() < textures {
-				emitter.texture.slot()
-			} else {
-				TextureId::NONE.slot()
-			};
-
-			keys.push((
-				u32::try_from(emitter.blend.row()).unwrap_or(0),
-				u32::try_from(texture).unwrap_or(0),
-			));
-			instances.push(SparkInstance {
-				position: spark.position.to_array(),
-				size: mix(emitter.size, emitter.size_end, through).max(0.0),
-				color: mix3(emitter.color, emitter.color_end, through)
-					.extend(spark.fade() * emitter.opacity.clamp(0.0, 1.0))
-					.to_array(),
-			});
-		}
-
-		let mut order: Vec<u32> = (0..u32::try_from(instances.len()).unwrap_or(0)).collect();
-
-		order.sort_unstable_by_key(|at| keys[usize::try_from(*at).unwrap_or(0)]);
-
-		let mut sorted = Vec::new();
-		let mut runs: Vec<Run> = Vec::new();
-
-		for at in &order {
-			let at = usize::try_from(*at).unwrap_or(0);
-			let (blend, texture) = keys[at];
-			let blend = SparkBlend::at(blend).unwrap_or_default();
-			let texture = usize::try_from(texture).unwrap_or(0);
-			let first = u32::try_from(sorted.len()).unwrap_or(0);
-
-			sorted.push(instances[at]);
-
-			match runs.last_mut() {
-				| Some(run) if run.blend == blend && run.texture == texture => run.count += 1,
-				| _ => runs.push(Run { blend, texture, first, count: 1 }),
-			}
-		}
-
-		(sorted, runs)
+		(cloud.sorted, cloud.runs)
 	}
 
 	/// A world with one emitter and a cloud of `count` particles in it.
@@ -826,6 +835,86 @@ mod tests {
 
 		assert_eq!(instances.len(), 2, "the cloud is still there");
 		assert!(instances[0].color[3].abs() < 1e-6, "and every particle of it is invisible");
+	}
+
+	#[test]
+	fn a_cloud_whose_emitter_hangs_off_something_hidden_is_not_drawn_and_is_kept() {
+		let (mut world, id) = clouded(Emitter::point(10.0, 1.0), 4);
+		let torch = world.entities.spawn();
+		assert!(world.entities.set_parent(id, torch), "it hangs");
+		assert!(world.entities.set_hidden(torch, true), "the handle resolves");
+
+		let (instances, runs) = laid_out(&world, Textures::new().len());
+
+		assert!(instances.is_empty() && runs.is_empty(), "the frame draws none of it");
+		assert_eq!(world.sparks.len(), 4, "while the pool still holds all four");
+
+		assert!(world.entities.set_hidden(torch, false));
+
+		let (instances, _) = laid_out(&world, Textures::new().len());
+
+		assert_eq!(instances.len(), 4, "and shown again, the same four are drawn");
+	}
+
+	#[test]
+	fn two_clouds_in_one_pool_are_each_drawn_or_not_by_their_own_emitter() {
+		// what is asked is remembered a slot at a time, so particles of a hidden
+		// emitter and a shown one taking turns in the pool are what catches an
+		// answer remembered for the wrong slot, or for no slot at all
+		let mut world = World::new();
+		let shown = world.entities.spawn();
+		let hidden = world.entities.spawn();
+
+		for id in [shown, hidden] {
+			assert!(
+				world
+					.entities
+					.set_emitter(id, Emitter::point(10.0, 1.0))
+			);
+		}
+
+		assert!(world.entities.set_hidden(hidden, true));
+
+		for number in 0..6_u8 {
+			assert!(
+				world.sparks.push(Spark {
+					position: Vec3::new(f32::from(number), 0.0, 0.0),
+					velocity: Vec3::ZERO,
+					age: 0.5,
+					life: 1.0,
+					owner: if number.is_multiple_of(2) { hidden } else { shown },
+				}),
+				"there is room"
+			);
+		}
+
+		let (instances, _) = laid_out(&world, Textures::new().len());
+
+		assert_eq!(instances.len(), 3, "the shown one's three and none of the other's");
+		assert!(
+			instances.iter().all(|it| [1.0_f32, 3.0, 5.0]
+				.iter()
+				.any(|x| (it.position[0] - x).abs() < 1e-6)),
+			"and they are the shown one's"
+		);
+	}
+
+	#[test]
+	fn a_cloud_laid_out_again_asks_again_rather_than_remembering_the_last_frame() {
+		// the upload keeps one cloud for the life of the scene, so what it
+		// remembered about a slot has to be forgotten between two frames: a
+		// hide between them has to reach the second
+		let (mut world, id) = clouded(Emitter::point(10.0, 1.0), 4);
+		let mut cloud = Cloud::default();
+
+		cloud.lay_out(&world, Textures::new().len());
+
+		assert_eq!(cloud.sorted.len(), 4, "drawn to begin with");
+		assert!(world.entities.set_hidden(id, true));
+
+		cloud.lay_out(&world, Textures::new().len());
+
+		assert!(cloud.sorted.is_empty(), "and the next frame asks again");
 	}
 
 	#[test]

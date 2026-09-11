@@ -122,10 +122,17 @@ fn bounded(held: usize, refused: u32, what: &str) -> String {
 /// `colby_engine::cull`.
 ///
 /// @param drawn - the last frame's counts
-/// @return the entities the picture drew out of those with a mesh, and how
-/// many times the shadow cascades drew one
+/// @return the entities the picture drew out of those with a mesh, how many
+/// times the shadow cascades drew one, and how many were hidden when any were
 fn seen(drawn: Drawn) -> String {
-	format!("{} of {}, {} into the shadows", drawn.seen, drawn.meshes, drawn.cast)
+	let seen = format!("{} of {}, {} into the shadows", drawn.seen, drawn.meshes, drawn.cast);
+
+	// said only when there is something to say, the rule the two bounded
+	// rows keep: a project that hides nothing reads the way it always did
+	match drawn.hidden {
+		| 0 => seen,
+		| hidden => format!("{seen}, {hidden} hidden"),
+	}
 }
 
 /// One name and one value.
@@ -141,10 +148,20 @@ mod tests {
 
 	#[test]
 	fn what_a_frame_drew_reads_as_so_many_of_so_many() {
-		let drawn = Drawn { meshes: 1000, seen: 277, cast: 1303 };
+		let drawn = Drawn {
+			meshes: 1000,
+			seen: 277,
+			cast: 1303,
+			..Drawn::default()
+		};
 
 		assert_eq!(seen(drawn), "277 of 1000, 1303 into the shadows");
 		assert_eq!(seen(Drawn::default()), "0 of 0, 0 into the shadows");
+		assert_eq!(
+			seen(Drawn { hidden: 12, ..drawn }),
+			"277 of 1000, 1303 into the shadows, 12 hidden",
+			"and what was hidden, when anything was"
+		);
 	}
 
 	#[test]

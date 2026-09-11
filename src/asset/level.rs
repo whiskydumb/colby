@@ -264,7 +264,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 		check(
 			entry,
 			&[names(Transform::FIELDS, &[]), names(Renderable::FIELDS, &[])],
-			&["name", "parent", "light", "emitter", "terrain"],
+			&["name", "parent", "hidden", "light", "emitter", "terrain"],
 			"an entity",
 		)?;
 
@@ -284,6 +284,15 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 					})?,
 				"a scene's records",
 			)?
+		};
+
+		// by hand beside the name and the parent, for their reason: it is the
+		// entity's own, and no record's table has a row for it
+		let hidden = match entry.get("hidden") {
+			| None => false,
+			| Some(said) => said
+				.as_bool()
+				.ok_or_else(|| err!(Asset("an entity's hidden should be true or false")))?,
 		};
 
 		let mut transform = Transform::IDENTITY;
@@ -343,6 +352,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			terrain,
 			pose,
 			parent: NO_INDEX,
+			hidden,
 		});
 	}
 
@@ -1110,6 +1120,11 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> R
 
 	rows.put_text("name", name);
 	rows.put_text("parent", &at_index(things, thing.parent));
+	// only when it is, the rule every field here keeps: the usual answer is
+	// written as nothing at all
+	if thing.hidden {
+		rows.put("hidden", "true".to_owned());
+	}
 	put_place(&mut rows, &thing.transform, &Transform::IDENTITY, "an entity")?;
 
 	let look = Renderable {
@@ -1795,6 +1810,33 @@ mod tests {
 			.to_string();
 
 		assert!(error.contains("hangs off a chain that never ends"), "got {error}");
+	}
+
+	#[test]
+	fn a_hidden_entity_reads_hidden_and_writes_itself_back_the_same() {
+		let text = r#"{ "entities": [
+			{ "name": "car", "hidden": true },
+			{ "name": "wheel", "parent": "car" }
+		] }"#;
+		let scene = import(text).expect("it is a scene");
+
+		assert!(scene.things[0].hidden, "the car is hidden");
+		assert!(!scene.things[1].hidden, "and the wheel says nothing, so it is not");
+
+		let written = export(&scene).expect("it writes");
+
+		assert!(written.contains("\"hidden\": true"), "written when it is: {written}");
+		assert_eq!(written.matches("hidden").count(), 1, "and only then: {written}");
+		assert_eq!(import(&written).expect("it reads back"), scene);
+	}
+
+	#[test]
+	fn a_hidden_that_is_not_true_or_false_is_refused_naming_the_field() {
+		let refused = import(r#"{ "entities": [ { "hidden": "yes" } ] }"#)
+			.expect_err("a word is not a flag")
+			.to_string();
+
+		assert!(refused.contains("hidden") && refused.contains("true or false"), "got {refused}");
 	}
 
 	#[test]

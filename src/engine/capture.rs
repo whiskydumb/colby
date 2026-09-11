@@ -2857,6 +2857,162 @@ f 1 4 5
 		);
 	}
 
+	/// A cube a little bigger than the unit one, standing somewhere in a color.
+	fn cube_at(world: &mut World, at: Vec3, color: Vec3) -> colby_core::abi::EntityId {
+		let id = world.entities.spawn_at(Transform {
+			position: at,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(1.4),
+		});
+		world
+			.entities
+			.set_renderable(id, Renderable::new(MeshId::CUBE, color));
+
+		id
+	}
+
+	#[test]
+	fn hiding_a_parent_takes_what_hangs_off_it_out_of_the_picture_and_the_shadows() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the caster from the test above, out of the view with its shadow in
+		// it, and a red cube in the view, both hanging off one entity that
+		// draws nothing; and a green cube standing on its own, which is the
+		// part of the picture a hide has to leave alone
+		let mut world = shadowed_world();
+		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+		world.camera.target = Vec3::ZERO;
+
+		let group = world.entities.spawn();
+		let outside = Vec3::new(-12.0, 6.0, 0.0);
+		let inside = Vec3::new(3.0, 1.0, -2.0);
+		let alone = Vec3::new(0.0, 1.0, 3.0);
+		let caster = cube_at(&mut world, outside, Vec3::ONE);
+		let red = cube_at(&mut world, inside, rgb(0.9, 0.1, 0.1));
+		cube_at(&mut world, alone, rgb(0.1, 0.9, 0.1));
+		assert!(world.entities.set_parent(caster, group), "the caster hangs off the group");
+		assert!(world.entities.set_parent(red, group), "and so does the red cube");
+
+		let before = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let all = capture.scene_mut().drawn();
+		let shaded = on_screen(&world, beneath(&world, outside), SIZE);
+		let beside = on_screen(&world, beneath(&world, outside) + Vec3::new(0.0, 0.0, 3.5), SIZE);
+		let cube = on_screen(&world, inside, SIZE);
+		let lone = on_screen(&world, alone, SIZE);
+		let lit = brightness(before.pixel(beside.0, beside.1));
+
+		assert!(
+			brightness(before.pixel(shaded.0, shaded.1)) * 2 < lit,
+			"the caster's shadow is in the picture to begin with"
+		);
+		assert_eq!(dominant(before.pixel(cube.0, cube.1)), 0, "and so is the red cube");
+
+		assert!(world.entities.set_hidden(group, true), "the handle resolves");
+
+		let after = capture
+			.shoot(&mut world)
+			.expect("the second capture renders");
+		let left = capture.scene_mut().drawn();
+		let where_red_was = after.pixel(cube.0, cube.1);
+
+		assert_eq!(left.hidden, 2, "both of the group's cubes were left out: {left:?}");
+		assert_eq!(
+			left.meshes + left.hidden,
+			all.meshes,
+			"and they are the whole difference: {left:?} against {all:?}"
+		);
+		assert_eq!(left.seen + 1, all.seen, "the picture lost the red cube: {left:?}");
+		assert!(left.cast < all.cast, "and the cascades both: {left:?} against {all:?}");
+		assert!(
+			brightness(after.pixel(shaded.0, shaded.1)) * 10 > lit * 9,
+			"the shadow went with its caster"
+		);
+		assert!(
+			u32::from(where_red_was[0]) < u32::from(where_red_was[1]) + 30,
+			"the red cube is not drawn, got {where_red_was:?}"
+		);
+		assert_eq!(
+			after.pixel(lone.0, lone.1),
+			before.pixel(lone.0, lone.1),
+			"and the green one standing on its own is untouched"
+		);
+
+		assert!(world.entities.set_hidden(group, false));
+
+		let again = capture
+			.shoot(&mut world)
+			.expect("the third capture renders");
+
+		assert!(
+			again.pixels == before.pixels,
+			"shown again, the picture is the first one to the byte"
+		);
+		assert_eq!(capture.scene_mut().drawn(), all, "and so are the counts");
+	}
+
+	#[test]
+	fn a_lamp_hung_off_something_hidden_lights_nothing_until_it_is_shown() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the sun traveling a little upwards, so the floor facing up is lit
+		// by the lamp alone and the spot under the lamp is the lamp's
+		let mut world = shadowed_world();
+		world.light = Vec3::new(1.0, 0.3, 0.0).normalize();
+		world.ambient = Vec3::splat(0.05);
+		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+		world.camera.target = Vec3::ZERO;
+		world
+			.cvars
+			.var(shadow::ENABLED, Value::Bool(false), "off for these pictures");
+
+		let group = world.entities.spawn();
+		let lamp = world.entities.spawn_at(Transform::at(Vec3::Y));
+		assert!(
+			world
+				.entities
+				.set_light(lamp, colby_core::abi::Light::point(Vec3::ONE, 4.0, 6.0))
+		);
+		assert!(world.entities.set_parent(lamp, group));
+
+		let lit = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let under = on_screen(&world, Vec3::ZERO, SIZE);
+
+		assert_eq!(capture.scene_mut().drawn().lamps, 1, "the lamp is carried");
+
+		assert!(world.entities.set_hidden(group, true));
+
+		let dark = capture
+			.shoot(&mut world)
+			.expect("the second capture renders");
+
+		assert_eq!(
+			capture.scene_mut().drawn().lamps,
+			0,
+			"and hidden by what it hangs off, it is not"
+		);
+		assert!(
+			brightness(dark.pixel(under.0, under.1)) * 2
+				< brightness(lit.pixel(under.0, under.1)),
+			"so the spot under it goes dark"
+		);
+
+		assert!(world.entities.set_hidden(group, false));
+
+		let again = capture
+			.shoot(&mut world)
+			.expect("the third capture renders");
+
+		assert!(again.pixels == lit.pixels, "and shown again it lights the same picture");
+	}
+
 	#[test]
 	fn a_cube_far_down_the_view_is_cast_into_some_cascades_and_not_all() {
 		let Some(mut capture) = capture() else {

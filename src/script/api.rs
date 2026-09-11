@@ -673,8 +673,32 @@ where
 			Ok(true)
 		})?;
 
+	let hidden = scope.create_function(move |_, bits: Option<i64>| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(false);
+		};
+
+		Ok(world.borrow().entities.hidden(handle.entity()))
+	})?;
+
+	// not the authority's alone, unlike a spawn: hiding builds nothing and
+	// moves no slot, so a program that hides something at a client hides it
+	// on that screen, which is also all a tint set there does.
+	let set_hidden = scope.create_function(move |_, (bits, hidden): (Option<i64>, bool)| {
+		let Some(handle) = taken(bits, Kind::Entity)? else {
+			return Ok(false);
+		};
+
+		Ok(world
+			.borrow_mut()
+			.entities
+			.set_hidden(handle.entity(), hidden))
+	})?;
+
 	tables.entities.set("draw", draw)?;
 	tables.entities.set("set_color", set_color)?;
+	tables.entities.set("hidden", hidden)?;
+	tables.entities.set("set_hidden", set_hidden)?;
 	Ok(())
 }
 

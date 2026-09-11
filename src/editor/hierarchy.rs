@@ -29,8 +29,8 @@
 
 use colby_core::abi::{BodyId, EntityId, JointId, World};
 use egui::{
-	Align2, Button, DragAndDrop, Id, LayerId, Order, Response, ScrollArea, Sense, Stroke,
-	StrokeKind, TextStyle, Ui, vec2,
+	Align2, Button, DragAndDrop, Id, LayerId, Order, Response, RichText, ScrollArea, Sense,
+	Stroke, StrokeKind, TextStyle, Ui, vec2,
 };
 
 use crate::{
@@ -253,14 +253,25 @@ fn entity_row(
 ) {
 	let pick = Pick::Entity(id);
 	let label = select::entity_label(world, id);
+	// dim for a thing that is not drawn, whichever of the two hides it
+	let text = if world.entities.shown(id) {
+		RichText::new(label.as_str())
+	} else {
+		RichText::new(label.as_str()).weak()
+	};
 
-	// one widget that senses both a click and a drag, rather than a drag
-	// source wrapped around a clickable row: egui hands a click to the
-	// topmost widget that senses one, and a wrapper that senses only drags
-	// laid over a row that senses only clicks is a row nobody can click.
-	let response = ui.add(
-		Button::selectable(selection.is(pick), label.as_str()).sense(Sense::click_and_drag()),
-	);
+	let response = ui
+		.horizontal(|ui| {
+			eye(ui, world, changes, id);
+
+			// one widget that senses both a click and a drag, rather than a
+			// drag source wrapped around a clickable row: egui hands a click
+			// to the topmost widget that senses one, and a wrapper that senses
+			// only drags laid over a row that senses only clicks is a row
+			// nobody can click.
+			ui.add(Button::selectable(selection.is(pick), text).sense(Sense::click_and_drag()))
+		})
+		.inner;
 
 	// the payload is the handle: what is hung is looked up again when it
 	// lands, so a row that went away mid-drag hangs nothing.
@@ -293,6 +304,46 @@ fn entity_row(
 		.filter(|held| **held != id)
 	{
 		changes.push(Change::Hang { child: *child, parent: id });
+	}
+}
+
+/// What the eye in front of a row is drawn with.
+///
+/// The eye emoji, which egui's default fonts carry, written as an escape so
+/// that the source stays ASCII.
+const EYE: &str = "\u{1f441}";
+
+/// The eye in front of an entity's row, and what pressing it asks for.
+///
+/// Plain for a thing that is drawn, dim for one that is hidden, and struck
+/// through as well where the thing is hidden by its own word rather than by
+/// something it hangs off. Pressing it flips the entity's own word and nothing
+/// else: a child under something hidden is shown by showing what it hangs off,
+/// and a child hidden by its own word stays hidden when its parent is shown.
+///
+/// @param ui - where to draw it
+/// @param world - whose words are read
+/// @param changes - where a press is written down
+/// @param id - the entity
+fn eye(ui: &mut Ui, world: &World, changes: &mut Vec<Change>, id: EntityId) {
+	let own = world.entities.hidden(id);
+	let glyph = match (own, world.entities.shown(id)) {
+		| (true, _) => RichText::new(EYE).weak().strikethrough(),
+		| (false, false) => RichText::new(EYE).weak(),
+		| (false, true) => RichText::new(EYE),
+	};
+	let hint = if own {
+		"show it, and what hangs off it"
+	} else {
+		"hide it, and what hangs off it"
+	};
+
+	if ui
+		.add(Button::new(glyph).frame(false))
+		.on_hover_text(hint)
+		.clicked()
+	{
+		changes.push(Change::Hide { entity: id, hidden: !own });
 	}
 }
 
@@ -390,7 +441,7 @@ mod tests {
 		abi::{Body, Shape, Transform},
 		glam::Vec3,
 	};
-	use egui::{Context, Pos2, RawInput, Rect};
+	use egui::{Context, Modifiers, PointerButton, Pos2, RawInput, Rect};
 
 	use super::*;
 
@@ -478,5 +529,106 @@ mod tests {
 
 		assert!(changes.is_empty(), "nobody pressed anything");
 		assert_eq!(hierarchy.entities.len(), 2, "and the frame gathered the world");
+	}
+
+	/// The entity of the yard called something.
+	fn named(world: &World, name: &str) -> EntityId {
+		world
+			.entities
+			.iter()
+			.map(|(id, ..)| id)
+			.find(|&id| world.entities.name(id) == name)
+			.expect("the yard has one")
+	}
+
+	/// One press and one release, which is a click.
+	fn clicked(at: Pos2) -> Vec<egui::Event> {
+		let mut events = vec![egui::Event::PointerMoved(at)];
+
+		for pressed in [true, false] {
+			events.push(egui::Event::PointerButton {
+				pos: at,
+				button: PointerButton::Primary,
+				pressed,
+				modifiers: Modifiers::NONE,
+			});
+		}
+
+		events
+	}
+
+	/// One eye drawn on its own, and what pressing it asked for.
+	///
+	/// Twice over one context, the way a browser row is tested: egui answers
+	/// where a widget is only after it has drawn, so one frame finds it and
+	/// the next presses there. Once a frame whatever egui asks, because a
+	/// context may run the closure twice and an eye drawn twice would answer
+	/// a click twice.
+	fn eyed(
+		context: &Context,
+		world: &World,
+		id: EntityId,
+		events: Vec<egui::Event>,
+	) -> (Vec<Change>, Rect) {
+		let mut changes = Vec::new();
+		let mut drawn = Rect::NOTHING;
+		let mut once = false;
+
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(200.0, 40.0))),
+				events,
+				..Default::default()
+			},
+			|ui| {
+				if !once {
+					once = true;
+					eye(ui, world, &mut changes, id);
+					drawn = ui.min_rect();
+				}
+			},
+		);
+		output.textures_delta.clear();
+
+		(changes, drawn)
+	}
+
+	#[test]
+	fn the_eye_hides_a_thing_that_is_drawn_and_shows_one_that_is_hidden() {
+		let mut world = yard();
+		let car = named(&world, "car");
+		let context = Context::default();
+		let (_, drawn) = eyed(&context, &world, car, Vec::new());
+
+		let (changes, _) = eyed(&context, &world, car, clicked(drawn.center()));
+
+		assert_eq!(changes, vec![Change::Hide { entity: car, hidden: true }]);
+
+		assert!(world.entities.set_hidden(car, true));
+
+		let (changes, _) = eyed(&context, &world, car, clicked(drawn.center()));
+
+		assert_eq!(
+			changes,
+			vec![Change::Hide { entity: car, hidden: false }],
+			"and pressed again it shows it"
+		);
+	}
+
+	#[test]
+	fn the_eye_of_a_thing_its_parent_hides_sets_its_own_word() {
+		// the wheel is not drawn because the car is hidden, and its own word
+		// says it is not hidden: its eye flips that word and leaves the car's
+		// alone, so what it asks for is to be hidden itself
+		let mut world = yard();
+		let car = named(&world, "car");
+		let wheel = named(&world, "wheel");
+		assert!(world.entities.set_hidden(car, true));
+		let context = Context::default();
+		let (_, drawn) = eyed(&context, &world, wheel, Vec::new());
+
+		let (changes, _) = eyed(&context, &world, wheel, clicked(drawn.center()));
+
+		assert_eq!(changes, vec![Change::Hide { entity: wheel, hidden: true }]);
 	}
 }

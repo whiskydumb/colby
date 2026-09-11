@@ -24,6 +24,11 @@
 //! the chain when it is asked for rather than kept in a second array, and the
 //! renderer's is [`blended`](Entities::blended), which does the same between
 //! two steps.
+//!
+//! An entity may be hidden, @ref [`Entities::set_hidden`], and everything
+//! hanging off it is hidden with it. Whether a thing is drawn is worked out by
+//! the same walk up the chain, [`Entities::shown`], and only a picture asks:
+//! a hidden entity is still stepped, collided with and heard.
 
 use super::{
 	field::{Field, field},
@@ -390,6 +395,11 @@ pub struct Entities {
 	/// stale handle resolving to nobody, rather than a new parent nobody
 	/// asked for. @ref [`Entities::parent`].
 	parents: Vec<EntityId>,
+	/// Whether each slot is hidden, which hides everything hanging off it as
+	/// well. The same slots again, and each slot's own word only: whether a
+	/// thing is drawn is a walk up its parents, @ref [`Entities::shown`], and
+	/// never a second copy kept here.
+	hidden: Vec<bool>,
 	/// What each slot is called, or the empty string. The same slots again,
 	/// and the one array here that is not read by anything the engine does -
 	/// it exists for whoever has to point at a particular entity in words.
@@ -419,6 +429,7 @@ impl Entities {
 			emitters: Vec::new(),
 			terrains: Vec::new(),
 			parents: Vec::new(),
+			hidden: Vec::new(),
 			names: Names::new(),
 			generations: Vec::new(),
 			alive: Vec::new(),
@@ -463,6 +474,10 @@ impl Entities {
 		self.terrains[slot] = Terrain::NONE;
 		// and it hangs off nothing, whatever the previous occupant did.
 		self.parents[slot] = EntityId::NONE;
+		// and it is shown, whatever the previous occupant was. Cleared where a
+		// slot is handed out rather than where one is given back, the rule a
+		// name follows below: nothing reads a dead slot's word.
+		self.hidden[slot] = false;
 		// whatever the previous occupant of this slot was called is not what
 		// this is called. This is the only place a name is cleared, and it is
 		// here rather than at the despawn because a slot reaches the free list
@@ -837,6 +852,83 @@ impl Entities {
 		true
 	}
 
+	/// Whether an entity is hidden itself.
+	///
+	/// Its own word and nothing else: a child of something hidden answers
+	/// `false` here and is not drawn all the same. [`shown`](Self::shown) is
+	/// the question a picture asks.
+	///
+	/// @param id - the entity
+	/// @return its own word, or `false` for a stale handle
+	#[must_use]
+	pub fn hidden(&self, id: EntityId) -> bool {
+		self.slot(id)
+			.is_some_and(|slot| self.hidden[slot])
+	}
+
+	/// Hides an entity and everything hanging off it, or shows it again.
+	///
+	/// **Hidden is not switched off.** A hidden entity is stepped like any
+	/// other: its bodies collide and move it, its sounds play and its emitter
+	/// goes on throwing. What it loses is being drawn (its mesh, its shadow,
+	/// its lamp and its cloud) and being clicked on in the editor. Nothing but
+	/// a picture asks, which is also why nothing a simulation produces can
+	/// depend on it.
+	///
+	/// @param id - the entity
+	/// @param hidden - whether it is to be hidden
+	/// @return `true` if the handle resolved
+	pub fn set_hidden(&mut self, id: EntityId, hidden: bool) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.hidden[slot] = hidden;
+
+		true
+	}
+
+	/// Whether an entity is to be drawn: alive, not hidden, and hanging off
+	/// nothing that is.
+	///
+	/// Worked out when asked rather than kept, for the reason
+	/// [`placed`](Self::placed) is: a second copy of the answer is stale for
+	/// whoever reads it between a write and the pass that would refresh it, a
+	/// child hung under something hidden being the obvious case, and the walk
+	/// is the chain a drawn transform walks anyway. A hidden ancestor always
+	/// wins; nothing under one can ask to be drawn regardless.
+	///
+	/// @param id - the entity
+	/// @return `false` for a stale handle, a hidden entity, or one under a
+	/// hidden one
+	#[must_use]
+	pub fn shown(&self, id: EntityId) -> bool {
+		if self.slot(id).is_none() {
+			return false;
+		}
+
+		let mut at = id;
+
+		// bounded like the walk in `placed`, and for its reason: a loop cannot
+		// be made, and a walk that could not end anyway must.
+		for _ in 0..MAX_ENTITIES {
+			if !at.is_some() {
+				return true;
+			}
+
+			if self.hidden(at) {
+				return false;
+			}
+
+			at = self.parent(at);
+		}
+
+		// @note: not reachable, a chain being shorter than the table, and no
+		// test can see it. It errs towards drawing, the side on which a
+		// picture can be seen to be wrong.
+		true
+	}
+
 	/// Moves the present into the past, ready for another step.
 	///
 	/// The host calls this before every simulation step, and once more after a
@@ -1017,6 +1109,8 @@ impl Entities {
 		self.terrains.resize(slots, Terrain::NONE);
 		self.parents.clear();
 		self.parents.resize(slots, EntityId::NONE);
+		self.hidden.clear();
+		self.hidden.resize(slots, false);
 		self.names.reset(slots);
 		self.generations.clear();
 		self.generations
@@ -1077,6 +1171,7 @@ impl Entities {
 			self.terrains.push(Terrain::NONE);
 			self.terrains.push(Terrain::NONE);
 			self.parents.push(EntityId::NONE);
+			self.hidden.push(false);
 			self.names.push();
 			self.generations.push(0);
 			self.alive.push(false);
@@ -1132,6 +1227,9 @@ impl Entities {
 		// off nothing until whoever put it back says otherwise, which a
 		// restore does once every record has landed. @ref `scene::restore`.
 		self.parents[slot] = EntityId::NONE;
+		// and shown until whoever put it back says otherwise, for the light's
+		// reason: a table handed plain records has this set by handle after.
+		self.hidden[slot] = false;
 		self.generations[slot] = self.generations[slot].max(1);
 		self.live += 1;
 
@@ -1203,6 +1301,7 @@ impl Entities {
 		self.emitters.push(Emitter::NONE);
 		self.terrains.push(Terrain::NONE);
 		self.parents.push(EntityId::NONE);
+		self.hidden.push(false);
 		self.names.push();
 		self.generations.push(0);
 		self.alive.push(false);
@@ -1590,6 +1689,7 @@ mod tests {
 		assert_eq!(entities.generations.len(), length, "and the rest of the table agrees");
 		assert_eq!(entities.names.slots(), length, "and the rest of the table agrees");
 		assert_eq!(entities.parents.len(), length, "and the rest of the table agrees");
+		assert_eq!(entities.hidden.len(), length, "and the rest of the table agrees");
 	}
 
 	/// A parent that is turned, scaled and moved, so that every part of a
@@ -1757,6 +1857,100 @@ mod tests {
 			EntityId::NONE,
 			"and a reused slot hangs off nothing"
 		);
+	}
+
+	#[test]
+	fn hiding_something_hides_everything_under_it_and_nothing_beside_it() {
+		// three deep and two wide. Hiding the root is the case a walk that
+		// looked at the parent alone gets wrong, the grandchild's own parent
+		// not being hidden; hiding the middle is the case a walk that looked at
+		// the root alone gets wrong.
+		let mut entities = Entities::new();
+		let root = entities.spawn();
+		let middle = entities.spawn();
+		let beside = entities.spawn();
+		let under = entities.spawn();
+		assert!(entities.set_parent(middle, root));
+		assert!(entities.set_parent(beside, root));
+		assert!(entities.set_parent(under, middle));
+
+		assert!(entities.set_hidden(root, true), "the handle resolves");
+		assert!(!entities.shown(under), "the grandchild of something hidden is hidden");
+		assert!(
+			!entities.shown(middle) && !entities.shown(beside),
+			"and so is every child of it"
+		);
+		assert!(!entities.hidden(under), "by the root's word, not by one of its own");
+
+		assert!(entities.set_hidden(root, false));
+		assert!(entities.set_hidden(middle, true));
+		assert!(
+			entities.shown(root) && entities.shown(beside),
+			"above it and beside it are drawn"
+		);
+		assert!(
+			!entities.shown(middle) && !entities.shown(under),
+			"the middle and what hangs off it are not"
+		);
+	}
+
+	#[test]
+	fn hanging_something_under_a_hidden_thing_hides_it_and_taking_it_down_shows_it() {
+		// the case a kept answer goes stale on: nothing about the child changes,
+		// only what it hangs off
+		let mut entities = Entities::new();
+		let hidden = entities.spawn();
+		let child = entities.spawn();
+		assert!(entities.set_hidden(hidden, true));
+
+		assert!(entities.shown(child), "standing on its own it is drawn");
+		assert!(entities.set_parent(child, hidden));
+		assert!(!entities.shown(child), "hung under something hidden it is not");
+		assert!(entities.set_parent(child, EntityId::NONE));
+		assert!(entities.shown(child), "and taken down it is again");
+	}
+
+	#[test]
+	fn a_hidden_parent_that_died_hides_nothing_and_a_stale_handle_is_not_shown() {
+		let mut entities = Entities::new();
+		let parent = entities.spawn();
+		let child = entities.spawn();
+		assert!(entities.set_parent(child, parent));
+		assert!(entities.set_hidden(parent, true));
+		assert!(entities.despawn(parent));
+
+		assert!(entities.shown(child), "a dead parent is no parent, hidden or not");
+		assert!(!entities.shown(parent), "and a stale handle is drawn by nobody");
+		assert!(!entities.hidden(parent), "nor says it is hidden");
+		assert!(!entities.set_hidden(parent, true), "nor can be hidden");
+	}
+
+	#[test]
+	fn a_slot_handed_out_again_is_shown_however_it_is_handed_out() {
+		// the ways a slot comes back into use, each of which has to clear what
+		// the last occupant said, and each tried on a slot that was hidden
+		let mut entities = Entities::new();
+		let old = entities.spawn();
+		assert!(entities.set_hidden(old, true));
+		assert!(entities.despawn(old));
+
+		let spawned = entities.spawn();
+		assert_eq!(
+			spawned.slot(),
+			old.slot(),
+			"the fixture reuses the slot, or it proves nothing"
+		);
+		assert!(entities.shown(spawned), "spawned into it");
+
+		assert!(entities.set_hidden(spawned, true));
+		assert!(entities.despawn(spawned));
+		let grafted = entities.graft(old.slot(), 9, Transform::IDENTITY, Renderable::NOTHING);
+		assert!(grafted.is_some(), "the slot was free to graft into");
+		assert!(entities.shown(grafted), "grafted into it");
+
+		assert!(entities.set_hidden(grafted, true));
+		let put = entities.restore(&[4], &[(0, Transform::IDENTITY, Renderable::NOTHING)]);
+		assert!(entities.shown(put[0]), "restored into it");
 	}
 
 	#[test]

@@ -1599,6 +1599,75 @@ fn drawing_something_keeps_the_color_it_was_given() {
 }
 
 #[test]
+fn a_program_hides_a_parent_and_what_hangs_off_it_goes_with_it() {
+	let mut world = running(
+		r#"function tick(dt)
+			local car = entity.find("car")
+			entity.set_hidden(car, true)
+			colby.command("script.said " .. tostring(entity.hidden(car))
+				.. tostring(entity.hidden(entity.find("wheel"))))
+		end"#,
+	);
+	listen(&mut world);
+	let car = world.entities.spawn();
+	let wheel = world.entities.spawn();
+	world.entities.set_name(car, "car");
+	world.entities.set_name(wheel, "wheel");
+	assert!(world.entities.set_parent(wheel, car));
+	let mut scripts = machine();
+
+	stepped(&mut scripts, &mut world);
+
+	assert!(world.entities.hidden(car), "the program hid the car");
+	assert!(!world.entities.shown(wheel), "and the wheel went with it");
+	assert_eq!(
+		said(&world).as_deref(),
+		Some("truefalse"),
+		"and the program reads each one's own word back"
+	);
+}
+
+#[test]
+fn a_client_may_hide_what_it_may_not_build() {
+	// hiding builds nothing and moves no slot, so it is not refused where a
+	// spawn is: what a client hides, it hides on its own screen
+	let mut world =
+		running(r#"function tick(dt) entity.set_hidden(entity.find("car"), true) end"#);
+	let car = world.entities.spawn();
+	world.entities.set_name(car, "car");
+	joined(&mut world);
+	let mut scripts = machine();
+
+	stepped(&mut scripts, &mut world);
+
+	assert!(world.entities.hidden(car), "the client hid it");
+}
+
+#[test]
+fn a_program_shows_again_what_it_hid() {
+	// both directions in one tick, and in the order that can fail: hidden
+	// first and shown after, so a call that only ever hid leaves it hidden
+	let mut world = running(
+		r#"function tick(dt)
+			local car = entity.find("car")
+			entity.set_hidden(car, true)
+			local was = entity.hidden(car)
+			entity.set_hidden(car, false)
+			colby.command("script.said " .. tostring(was) .. tostring(entity.hidden(car)))
+		end"#,
+	);
+	listen(&mut world);
+	let car = world.entities.spawn();
+	world.entities.set_name(car, "car");
+	let mut scripts = machine();
+
+	stepped(&mut scripts, &mut world);
+
+	assert_eq!(said(&world).as_deref(), Some("truefalse"), "hidden, then shown again");
+	assert!(!world.entities.hidden(car), "and it is shown at the end of the tick");
+}
+
+#[test]
 fn a_program_makes_a_body_out_of_a_table_and_it_is_the_one_it_asked_for() {
 	let mut world = running(
 		r#"function tick(dt)

@@ -391,6 +391,39 @@ mod tests {
 	}
 
 	#[test]
+	fn a_hidden_emitter_throws_exactly_what_a_shown_one_throws() {
+		// hidden is a question only a picture asks, and this is the step's
+		// half of that rule: a fire that was hidden has to be burning when it
+		// is shown again, and burning the way it would have been
+		let ran = |hidden: bool| {
+			let (mut world, id) = thrower(Emitter {
+				speed_spread: 0.6,
+				life_spread: 0.5,
+				..Emitter::cone(120.0, 2.0, 0.6)
+			});
+
+			assert!(world.entities.set_hidden(id, hidden), "the handle resolves");
+			run(&mut world, 60);
+
+			world
+		};
+		let shown = ran(false);
+		let hidden = ran(true);
+
+		assert!(shown.sparks.len() > 10, "something was thrown");
+		assert_eq!(hidden.sparks.len(), shown.sparks.len(), "as much hidden as shown");
+		assert!(
+			hidden
+				.sparks
+				.iter()
+				.zip(shown.sparks.iter())
+				.all(|(one, other)| one.position.to_array().map(f32::to_bits)
+					== other.position.to_array().map(f32::to_bits)),
+			"and the same particles, to the bit"
+		);
+	}
+
+	#[test]
 	fn the_same_steps_throw_the_same_cloud_twice() {
 		let make = || {
 			let (mut world, _) = thrower(Emitter {

@@ -241,6 +241,13 @@ pub struct Thing {
 	/// in the file. `transform` is then the place inside that parent rather
 	/// than in the world.
 	pub parent: u32,
+
+	/// Whether it is hidden, which hides everything hanging off it as well.
+	///
+	/// Its own word and not the answer: a child of something hidden writes
+	/// `false` here, and is hidden by its parent's record rather than by one
+	/// of its own. @ref [`Entities::shown`](crate::abi::Entities::shown).
+	pub hidden: bool,
 }
 
 impl Default for Thing {
@@ -260,6 +267,7 @@ impl Default for Thing {
 			terrain: Terrain::NONE,
 			pose: NO_INDEX,
 			parent: NO_INDEX,
+			hidden: false,
 		}
 	}
 }
@@ -1245,6 +1253,7 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 				.filter(|_| world.poses.alive(renderable.pose))
 				.unwrap_or(NO_INDEX),
 			parent: parent_index(world, id, &index_of),
+			hidden: world.entities.hidden(id),
 			name: world.entities.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
@@ -1525,6 +1534,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 			.entities
 			.set_emitter(*id, emitter(world, thing));
 		world.entities.set_terrain(*id, thing.terrain);
+		world.entities.set_hidden(*id, thing.hidden);
 	}
 
 	for (id, solid) in solids.iter().zip(&scene.solids) {
@@ -1707,6 +1717,7 @@ fn grafted_things(world: &mut World, piece: &SceneData) -> Vec<EntityId> {
 				.entities
 				.set_emitter(id, emitter(world, thing));
 			world.entities.set_terrain(id, thing.terrain);
+			world.entities.set_hidden(id, thing.hidden);
 
 			id
 		})
@@ -2350,6 +2361,7 @@ fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> 
 	// on the next step and puts a mesh and a body under it, which is the same
 	// path a terrain somebody typed into an inspector takes.
 	world.entities.set_terrain(id, thing.terrain);
+	world.entities.set_hidden(id, thing.hidden);
 
 	id
 }
@@ -5295,6 +5307,68 @@ mod tests {
 
 		assert_eq!(put.things, 1, "the wheel landed and the car was already there");
 		assert_eq!(far.entities.parent(wheel), car, "hanging off the car in its slot");
+	}
+
+	#[test]
+	fn a_hidden_parent_is_written_down_with_its_own_word_and_its_child_without() {
+		let (mut world, car, _) = hung();
+		assert!(world.entities.set_hidden(car, true));
+
+		let scene = capture(&world);
+
+		assert!(scene.things[0].hidden, "the car says it is hidden");
+		assert!(!scene.things[1].hidden, "and the wheel does not: the car hides it");
+	}
+
+	#[test]
+	fn a_world_put_back_hides_what_it_hid() {
+		let (mut world, car, wheel) = hung();
+		assert!(world.entities.set_hidden(car, true));
+		let scene = capture(&world);
+
+		let mut again = World::new();
+		restore(&mut again, &scene).expect("nothing to disagree about");
+
+		assert!(again.entities.hidden(car), "the car comes back hidden");
+		assert!(!again.entities.shown(wheel), "and the wheel with it");
+		assert!(!again.entities.hidden(wheel), "by the car's word");
+	}
+
+	#[test]
+	fn a_copy_of_something_hidden_is_hidden_and_so_is_a_piece_that_crossed() {
+		// the wheel rather than the car, so that what a copy or a piece is
+		// checked for is its own word and not a parent's
+		let (mut world, _, wheel) = hung();
+		let body = world.attach_body(wheel, BodyKind::Dynamic, Shape::cuboid(Vec3::splat(0.5)));
+		assert!(world.entities.set_hidden(wheel, true));
+		let scene = capture(&world);
+
+		let mut pasted = World::new();
+		let put = instantiate(&mut pasted, &scene, Vec3::ZERO);
+
+		assert!(pasted.entities.hidden(put.entity_named("wheel")), "the copy is hidden");
+		assert!(!pasted.entities.hidden(put.entity_named("car")), "and only that one");
+
+		let piece = scene.piece(&records_of(&scene, body));
+		let mut far = World::new();
+		restore(&mut far, &scene).expect("agrees");
+		assert!(far.entities.despawn(wheel));
+		assert!(far.bodies.despawn(body));
+
+		assert_eq!(graft(&mut far, &piece).things, 1, "the wheel appeared");
+		assert!(far.entities.hidden(wheel), "and it arrived hidden");
+	}
+
+	#[test]
+	fn hiding_something_is_a_change_to_the_world() {
+		// what undo stands on: a gesture is kept when the world after it is not
+		// the world before, and a hide that compared equal would be a click
+		// nobody could take back
+		let (mut world, car, _) = hung();
+		let before = capture(&world);
+		assert!(world.entities.set_hidden(car, true));
+
+		assert!(!capture(&world).same_world(&before), "a hidden car is another world");
 	}
 
 	#[test]

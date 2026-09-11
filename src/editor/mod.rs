@@ -265,6 +265,15 @@ pub(crate) enum Change {
 		parent: EntityId,
 	},
 
+	/// Hide an entity and everything hanging off it, or show it again.
+	Hide {
+		/// Which.
+		entity: EntityId,
+
+		/// Whether it is to be hidden.
+		hidden: bool,
+	},
+
 	/// Switch the gizmo to one of its three things.
 	Tool(Tool),
 
@@ -893,6 +902,15 @@ impl Panels {
 					// other two are a race with the world. Worth a line, not
 					// a stop.
 					debug!(?child, ?parent, "nothing was hung");
+				}
+			},
+			| Change::Hide { entity, hidden } => {
+				// a gesture like a hang and undone like one: the word is in the
+				// world a record captures, so this is all a hide takes
+				self.tabs.history().begin("hide", world);
+
+				if !world.entities.set_hidden(entity, hidden) {
+					debug!(?entity, "nothing was hidden");
 				}
 			},
 			| Change::Tool(tool) => self.viewport.set_tool(tool),
@@ -1708,6 +1726,35 @@ mod tests {
 			Some("hang"),
 			"and the hang can be done again"
 		);
+	}
+
+	#[test]
+	fn a_hide_from_the_tree_is_one_step_and_is_undone_like_any_other() {
+		let mut world = World::new();
+		world.editing = true;
+		let car = world.entities.spawn_at(Transform::at(Vec3::X));
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::Z));
+		assert!(world.entities.set_parent(wheel, car));
+		let mut panels = Panels::default();
+
+		panels.apply(&mut world, Change::Hide { entity: car, hidden: true });
+
+		assert!(!world.entities.shown(wheel), "the car is hidden, and the wheel under it");
+		// two quiet frames: the one the hide was written in, and the one that
+		// closes the record
+		assert!(!panels.tabs.history().settle(&world));
+		assert!(panels.tabs.history().settle(&world), "the hide is a record");
+		assert_eq!(panels.tabs.history().undoable(), Some("hide"));
+
+		panels.apply(&mut world, Change::Undo);
+		let described = panels
+			.restore
+			.take()
+			.expect("a world to put back");
+		colby_core::abi::scene::restore(&mut world, &described).expect("the world takes it");
+
+		assert!(!world.entities.hidden(car), "one step back the car is drawn again");
+		assert!(world.entities.shown(wheel), "and the wheel with it");
 	}
 
 	#[test]

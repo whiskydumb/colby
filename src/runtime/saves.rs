@@ -956,6 +956,33 @@ mod tests {
 	}
 
 	#[test]
+	fn a_hidden_parent_saved_and_loaded_is_hidden_again_and_its_child_with_it() {
+		// through the real commands and a real file: a save that forgot the
+		// word, or a load that forgot to put it back, would show the car again
+		let project = project("hidden_round_trip");
+		let mut simulation = Box::new(Simulation::new());
+		let mut world = Box::new(console());
+
+		world.install_physics(simulation.table());
+
+		let car = world.entities.spawn();
+		let wheel = world.entities.spawn();
+		assert!(world.entities.set_parent(wheel, car));
+		assert!(world.entities.set_hidden(car, true));
+
+		colby_core::abi::console::run(&mut world, "scene.save hidden");
+		serve(&mut world, &mut simulation, &project);
+
+		assert!(world.entities.set_hidden(car, false), "shown again before the load");
+
+		colby_core::abi::console::run(&mut world, "scene.load hidden");
+		serve(&mut world, &mut simulation, &project);
+
+		assert!(world.entities.hidden(car), "the car came back hidden");
+		assert!(!world.entities.shown(wheel), "and the wheel with it, by the car's word");
+	}
+
+	#[test]
 	fn a_world_saved_with_its_ground_built_comes_back_with_one_terrain_and_one_body() {
 		// **the whole file path, which no unit test in `crate::terrain` reaches
 		// and no oracle here can see.** A `--shot` run serves console requests

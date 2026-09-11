@@ -1507,6 +1507,8 @@ impl Scene {
 		}
 
 		self.group(world, &sight);
+		// after the grouping, which starts every count over
+		self.drawn.lamps = usize::try_from(count).unwrap_or(0);
 
 		if self.placements.is_empty() {
 			return;
@@ -1735,6 +1737,17 @@ impl Scene {
 		let (Ok(mesh), Ok(material)) = (u32::try_from(mesh), u32::try_from(material)) else {
 			return;
 		};
+
+		// before anything else is asked of it, so a hidden entity costs the
+		// walk up its chain and nothing more: no transform, no bounds and no
+		// pose gathered. And before the count, so that `meshes` is what could
+		// be drawn and `hidden` is what the flag took out, the shadows along
+		// with the picture. @ref `Entities::shown`.
+		if !world.entities.shown(id) {
+			self.drawn.hidden += 1;
+
+			return;
+		}
 
 		// the transform to *draw* with, which is not the one the game wrote:
 		// it is somewhere between that one and the one before it. @ref
@@ -2373,6 +2386,12 @@ fn chosen(
 			continue;
 		};
 
+		// a hidden lamp is dark, and so is one under something hidden: a lamp
+		// is part of the picture, and the picture is what asks
+		if !world.entities.shown(id) {
+			continue;
+		}
+
 		let Some(at) = world.render_transform(id) else {
 			continue;
 		};
@@ -2968,6 +2987,28 @@ mod tests {
 		let (_, count) = chosen(&world, Vec3::ZERO, None, MAX_LAMPS, &mut scratch);
 
 		assert_eq!(count, 1, "one lamp among four entities");
+	}
+
+	#[test]
+	fn a_hidden_lamp_is_not_carried_and_nor_is_one_under_something_hidden() {
+		// three lamps: one hidden by its own word, one hung off something
+		// hidden, and the one in the middle that nothing hides
+		let mut world = lit_world(&[(2.0, 5.0), (4.0, 5.0), (6.0, 5.0)]);
+		let lamps: Vec<EntityId> = world.entities.iter().map(|(id, ..)| id).collect();
+		let group = world.entities.spawn();
+		assert!(world.entities.set_hidden(lamps[0], true));
+		assert!(world.entities.set_parent(lamps[2], group));
+		assert!(world.entities.set_hidden(group, true));
+
+		let mut scratch = Vec::new();
+		let (carried, count) = chosen(&world, Vec3::ZERO, None, MAX_LAMPS, &mut scratch);
+
+		assert_eq!(count, 1, "one lamp of the three is lit");
+		assert!(
+			(carried[0].position_range[0] - 4.0).abs() < 1.0e-6,
+			"and it is the one nothing hides: {:?}",
+			carried[0].position_range
+		);
 	}
 
 	/// A world with a lamp of each range standing at each point.

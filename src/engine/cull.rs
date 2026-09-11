@@ -365,7 +365,8 @@ pub fn posed(bones: &[Option<Bounds>], joints: &[Mat4]) -> Option<Bounds> {
 /// at a given step is a fact about the project.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Drawn {
-	/// Entities with a mesh to draw, whether or not anything drew them.
+	/// Entities with a mesh to draw that nothing hides, whether or not
+	/// anything drew them.
 	pub meshes: usize,
 
 	/// How many of them the picture drew.
@@ -376,6 +377,20 @@ pub struct Drawn {
 	/// With the test off every solid entity is drawn into all four, which is
 	/// four times what the picture's solid half holds.
 	pub cast: usize,
+
+	/// Entities with a mesh that are hidden, by their own word or by something
+	/// they hang off, and so were put in no list at all.
+	///
+	/// Beside [`meshes`](Self::meshes) rather than inside it: the two add up to
+	/// every entity with a mesh, and hiding a subtree moves this by the size of
+	/// it wherever the camera is. @ref
+	/// [`Entities::shown`](colby_core::abi::Entities::shown).
+	pub hidden: usize,
+
+	/// How many lamps the frame carried to the shader, after every rule that
+	/// decides it: the room a frame has, whether a lamp's reach touches the
+	/// view, and whether it is shown.
+	pub lamps: usize,
 }
 
 #[cfg(test)]

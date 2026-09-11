@@ -378,6 +378,13 @@ struct Table {
 	/// added together.
 	cast: usize,
 
+	/// The most entities with a mesh any measured frame left out for being
+	/// hidden. Beside `meshes`, and the two add up to every entity with one.
+	hidden: usize,
+
+	/// The most lamps any measured frame carried to the shader.
+	lamps: usize,
+
 	/// How many render passes each frame recorded, and `None` before the first
 	/// one.
 	passes: Option<u32>,
@@ -432,6 +439,8 @@ impl Table {
 			meshes: 0,
 			drawn: 0,
 			cast: 0,
+			hidden: 0,
+			lamps: 0,
 			passes: None,
 			steady: true,
 		}
@@ -451,6 +460,8 @@ impl Table {
 		self.meshes = self.meshes.max(counts.drawn.meshes);
 		self.drawn = self.drawn.max(counts.drawn.seen);
 		self.cast = self.cast.max(counts.drawn.cast);
+		self.hidden = self.hidden.max(counts.drawn.hidden);
+		self.lamps = self.lamps.max(counts.drawn.lamps);
 
 		for (at, pass) in Pass::ALL.into_iter().enumerate() {
 			if let (Some(row), Some(took)) = (self.rows.get_mut(at), frame.pass(pass)) {
@@ -525,6 +536,8 @@ impl Table {
 			meshes = self.meshes,
 			drawn = self.drawn,
 			cast = self.cast,
+			hidden = self.hidden,
+			lamps = self.lamps,
 			steady = self.steady,
 			gpu_us = self.slice(0..Pass::ALL.len()).as_micros(),
 			cpu_us = self
@@ -854,7 +867,13 @@ mod tests {
 			sparks: 40,
 			ground: 2048,
 			walkable: 900,
-			drawn: Drawn { meshes: 10, seen: 4, cast: 12 },
+			drawn: Drawn {
+				meshes: 10,
+				seen: 4,
+				cast: 12,
+				hidden: 3,
+				lamps: 2,
+			},
 		});
 
 		let under = Pass::ALL.len() + Work::ALL.len();
@@ -873,8 +892,8 @@ mod tests {
 		assert_eq!(table.ground, 2048, "and so is the terrain's size");
 		assert_eq!(table.walkable, 900, "and how much of it can be walked on");
 		assert_eq!(
-			(table.meshes, table.drawn, table.cast),
-			(10, 4, 12),
+			(table.meshes, table.drawn, table.cast, table.hidden, table.lamps),
+			(10, 4, 12, 3, 2),
 			"and how much of the world the frame drew"
 		);
 		assert_eq!(

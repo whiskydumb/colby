@@ -206,7 +206,8 @@ impl View {
 /// its own space rather than in the world's - which is what makes a rotated
 /// box pick as the box it looks like instead of as the larger box around it.
 /// An entity drawing nothing is not tested at all: there is nothing on screen
-/// to have been clicked.
+/// to have been clicked. Nor is a hidden one, for the same reason; it is picked
+/// from the hierarchy, where it can be seen.
 ///
 /// @param world - what to look through
 /// @param from - where the ray starts, in world space
@@ -220,6 +221,10 @@ pub(crate) fn under(world: &World, from: Vec3, along: Vec3) -> Pick {
 		let Some(mesh) = world.meshes.get(renderable.mesh) else {
 			continue;
 		};
+
+		if !world.entities.shown(id) {
+			continue;
+		}
 
 		// where it is in the world, whatever it hangs off: the ray is a
 		// world-space thing, and the bounds are tested in the entity's own.
@@ -538,6 +543,27 @@ mod tests {
 			under(&world, Vec3::Z * 10.0, Vec3::NEG_Z),
 			Pick::Nothing,
 			"so a ray through where it stands finds nothing"
+		);
+	}
+
+	#[test]
+	fn something_hidden_is_not_there_to_be_clicked_and_what_is_behind_it_is() {
+		let mut world = cubed();
+		let far = stood(&mut world, Transform::at(Vec3::ZERO));
+		let near = stood(&mut world, Transform::at(Vec3::Z * 4.0));
+		let Pick::Entity(id) = near else {
+			panic!("stood makes an entity");
+		};
+		// hidden by what it hangs off rather than by its own word, so what is
+		// asked is the whole chain
+		let group = world.entities.spawn();
+		assert!(world.entities.set_parent(id, group));
+		assert!(world.entities.set_hidden(group, true));
+
+		assert_eq!(
+			under(&world, Vec3::Z * 10.0, Vec3::NEG_Z),
+			far,
+			"the ray goes through where the hidden one stands and finds the one behind it"
 		);
 	}
 

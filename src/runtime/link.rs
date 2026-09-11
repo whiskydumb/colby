@@ -885,10 +885,14 @@ mod tests {
 		// asking for things, again when a console line grew the aim of whoever
 		// said it, and again at `NET-6` when both ends grew a real `World` and
 		// the number started covering where the client would *draw* things
-		// rather than the records it was holding.
+		// rather than the records it was holding. And once more when an entity
+		// record grew a word of flags: four bytes an entity in every
+		// appearance, which moves where the wire's losses fall. Taken back out,
+		// the old number came back exactly; the run said and heard sixteen,
+		// agreed, and took 210 snapshots and 2 baselines against 209 and 3.
 		let outcome = exchange(600, WIRE);
 
-		assert_eq!(outcome.digest, 0x15C8_8C05_3A94_AB91);
+		assert_eq!(outcome.digest, 0x1F54_7A69_F083_9F86);
 		// **and the half a digest cannot say.** A number that moved says only
 		// that something changed; this says that each of the sixteen lines
 		// arrived pointing where it was said from. The count is written down
