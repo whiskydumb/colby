@@ -35,7 +35,7 @@
 //! and Unreal one-poles every number in `stat unit`
 //! (`UnrealClient.cpp:381-400`).
 //!
-//! Nothing is read back off the GPU except the ten timestamps. A picture
+//! Nothing is read back off the GPU except the twelve timestamps. A picture
 //! copied to a mappable buffer is three and a half megabytes that no frame
 //! anybody plays ever pays, and it would be the largest row in the table.
 
@@ -88,19 +88,20 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Five spans of hardware, two of recording, five of simulation and one of
+/// Six spans of hardware, two of recording, five of simulation and one of
 /// particles.
-const ROWS: usize = 13;
+const ROWS: usize = 14;
 
 /// Which row of the table is the whole solver step.
 ///
 /// Written out rather than "the last one", which is what it used to be and
 /// what stopped being true the moment a row was appended after it. A row added
-/// below has to leave these two alone or move them on purpose.
-const STEP_ROW: usize = 11;
+/// below has to leave these two alone or move them on purpose; `gpu depth`
+/// went in above them and moved both.
+const STEP_ROW: usize = 12;
 
 /// Which row is the particles.
-const SPARKS_ROW: usize = 12;
+const SPARKS_ROW: usize = 13;
 
 /// How many frames the live table averages over.
 ///
@@ -220,7 +221,7 @@ impl Live {
 	/// @param passes - what the hardware spent, per [`Pass`] in slot order,
 	/// from a frame two or three behind the one this is called in
 	/// @param count - how many render passes that frame recorded
-	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 5], count: u32) {
+	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 6], count: u32) {
 		self.passes = Some(count);
 
 		for (at, took) in passes.into_iter().enumerate() {
@@ -402,15 +403,18 @@ struct Table {
 
 /// What each row is called, in the order they are reported.
 ///
-/// The five hardware spans first, then what this thread spent recording them,
+/// The six hardware spans first, then what this thread spent recording them,
 /// then what the step underneath cost - which is the order a frame actually
 /// happens in, read from the outside in.
 ///
-/// `pub(crate)` because the editor's pane shows the same thirteen, and a panel
+/// `pub(crate)` because the editor's pane shows the same fourteen, and a panel
 /// with a list of its own would be a second place to add a row to.
 pub(crate) const NAMES: [&str; ROWS] = [
 	"gpu shadow",
 	"gpu scene",
+	// the depth made readable, between the scene that wrote it and everything
+	// after that reads it. Added with parity card B1.
+	"gpu depth",
 	"gpu meter",
 	"gpu glow",
 	"gpu composite",
@@ -525,7 +529,7 @@ impl Table {
 		}
 
 		// the four numbers that add up to a frame, and they are four rather
-		// than thirteen because the simulation's rows overlap: `cpu step` is
+		// than fourteen because the simulation's rows overlap: `cpu step` is
 		// the whole solver step and the four above it are parts of it - and
 		// `cpu broad` is in turn a part of `cpu narrow` - so adding every row
 		// would count the same microseconds twice over. `cpu sparks` is the
@@ -614,7 +618,7 @@ pub(crate) fn take(project: &Project, build: &Build, asked: &Asked, frames: u32)
 
 	if !hardware {
 		warn!(
-			"this adapter has no timestamp queries, so the five hardware rows will be empty and \
+			"this adapter has no timestamp queries, so the six hardware rows will be empty and \
 			 only the wall clock is answering"
 		);
 	}
@@ -754,7 +758,7 @@ mod tests {
 		);
 		assert_eq!(live.profile().passes, None, "and no frame has been read back");
 
-		live.hardware([None, Some(Duration::from_micros(800)), None, None, None], 15);
+		live.hardware([None, Some(Duration::from_micros(800)), None, None, None, None], 15);
 
 		assert!(live.profile().hardware, "now it has");
 		assert_eq!(live.profile().parts[1].mean, Some(Duration::from_micros(800)));

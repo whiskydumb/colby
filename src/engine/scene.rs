@@ -22,7 +22,7 @@ use core::mem::offset_of;
 use colby_core::{
 	Result,
 	abi::{
-		EntityId, Light, LightKind, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes,
+		Camera, EntityId, Light, LightKind, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes,
 		Renderable, SkinVertex, Texel, TextureData, TextureId, Textures, Transform, World,
 		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
@@ -53,6 +53,7 @@ use wgpu::{
 use crate::{
 	cull::{self, Bounds, Drawn, Frustum, Placed},
 	decal::{self, Atlas, Chosen, DECALS, Key, MAX_DECALS, Paint},
+	depth::{self, Depth},
 	gpu::Gpu,
 	lines::Lines,
 	post,
@@ -637,7 +638,14 @@ pub struct Scene {
 	/// The target's size, which the depth buffer was built for and which a
 	/// viewport is cut down to.
 	size: (u32, u32),
-	depth: TextureView,
+	/// The depth buffer the scene's pass tests against, and the one a pass
+	/// after it reads. @ref [`depth`].
+	depth: Depth,
+	/// The depth drawn instead of the picture this frame, if somebody asked:
+	/// how far away white is, and the projection's two numbers a stored depth
+	/// is turned back into a distance with. Read in [`Scene::upload`], for the
+	/// reason [`sky`](Self::sky) is. @ref [`depth::VIEW`].
+	seeing: Option<(f32, [f32; 2])>,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
 	/// This frame's light matrices, fitted in `upload` and drawn in `render`.
@@ -771,7 +779,7 @@ impl Scene {
 			shader.source(),
 			post::NO_SAMPLES,
 		)?;
-		let depth = depth_view(&device, post::NO_SAMPLES, width, height);
+		let depth = Depth::new(&device, post::NO_SAMPLES, width, height)?;
 		let lines = Lines::new(&device, post::HDR_FORMAT, &globals_layout, post::NO_SAMPLES)?;
 		let sparks = Sparks::new(&device, post::HDR_FORMAT, post::NO_SAMPLES);
 		let post = post::Chain::new(&device, format, width, height)?;
@@ -798,6 +806,7 @@ impl Scene {
 			shader,
 			size: (width, height),
 			depth,
+			seeing: None,
 			shadows,
 			cascades: Cascades::NONE,
 			shadowing: false,
@@ -836,7 +845,7 @@ impl Scene {
 	/// Rebuilds the depth buffer for a new target size.
 	pub fn resize(&mut self, width: u32, height: u32) {
 		self.size = (width, height);
-		self.depth = depth_view(&self.device, self.pipelines.samples, width, height);
+		self.depth.resize(&self.device, width, height);
 		self.post.resize(&self.device, width, height);
 	}
 
@@ -894,7 +903,7 @@ impl Scene {
 				// beats no picture" the table itself takes.
 				self.sparks.set_samples(post::HDR_FORMAT, asked);
 
-				self.depth = depth_view(&self.device, asked, self.size.0, self.size.1);
+				self.depth.set_samples(&self.device, asked);
 				self.post.set_samples(&self.device, asked);
 
 				info!(samples = asked, "the scene is drawn with this many samples a pixel");
@@ -1006,7 +1015,7 @@ impl Scene {
 				},
 			})],
 			depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-				view: &self.depth,
+				view: self.depth.attachment(),
 				// cleared to the far plane, which is one under wgpu's
 				// zero-to-one depth range.
 				depth_ops: Some(Operations {
@@ -1032,17 +1041,7 @@ impl Scene {
 				// written by it and by nothing else, so returning here would
 				// leave the frame holding whatever was in it last.
 				drop(pass);
-				self.post.resolve(
-					&mut encoder,
-					&self.queue,
-					world.post,
-					seconds,
-					target,
-					&self.timings,
-				);
-				self.timings.resolve(&mut encoder);
-				self.timings.close(Work::Record);
-				self.queue.submit([encoder.finish()]);
+				self.finish(encoder, world, seconds, target);
 
 				return;
 			};
@@ -1112,15 +1111,65 @@ impl Scene {
 		// thing is squeezed onto the screen. Everything above this line drew
 		// into sixteen-bit floats, and nothing above it wrote a pixel of the
 		// frame that is about to be shown.
-		self.post
-			.resolve(&mut encoder, &self.queue, world.post, seconds, target, &self.timings);
+		self.finish(encoder, world, seconds, target);
+	}
 
-		// last of all, and into this frame's own encoder: the ten timestamps
-		// are copied out of the query set where the passes that wrote them can
-		// still be told apart. Nothing at all when nobody is measuring.
+	/// Everything after the scene's own pass: the depth made readable if
+	/// anything reads it, the post-processing, and the timestamps copied out.
+	///
+	/// A method of its own because a frame whose rectangle held nothing needs
+	/// all of it as well: what reaches the window is written by the last of
+	/// these passes and by nothing else.
+	///
+	/// @param encoder - the frame's, with the scene's pass in it
+	/// @param world - for what the post-processing is asked to do
+	/// @param seconds - how long the frame was, for the eye
+	/// @param target - what the last pass writes
+	fn finish(
+		&mut self,
+		mut encoder: CommandEncoder,
+		world: &World,
+		seconds: f32,
+		target: &TextureView,
+	) {
+		// between the scene that wrote the depth and everything after it that
+		// reads it, and only in a frame something does
+		self.depth.make_readable(
+			&self.device,
+			&mut encoder,
+			self.seeing.is_some(),
+			&self.timings,
+		);
+
+		let depth = self.seeing.and_then(|(white, lens)| {
+			self.depth
+				.readable()
+				.map(|view| post::Seen { view, white, lens })
+		});
+
+		self.post.resolve(
+			&mut encoder,
+			&self.queue,
+			world.post,
+			seconds,
+			post::Last { into: target, depth },
+			&self.timings,
+		);
+
+		// last of all, and into this frame's own encoder: the twelve
+		// timestamps are copied out of the query set where the passes that
+		// wrote them can still be told apart. Nothing at all when nobody is
+		// measuring.
 		self.timings.resolve(&mut encoder);
 		self.timings.close(Work::Record);
 		self.queue.submit([encoder.finish()]);
+	}
+
+	/// What a pass after the scene reads, one float a pixel, for a test.
+	/// @ref [`Depth::values`].
+	#[cfg(test)]
+	pub(crate) fn depth_values(&self) -> Option<Vec<f32>> {
+		self.depth.values(&self.device, &self.queue)
 	}
 
 	/// What this frame cost, for whoever asked to be told.
@@ -1541,6 +1590,7 @@ impl Scene {
 		let (lamps, count) = self.lamps(world, &sight);
 		let (decals, painted) = self.decals(world, &sight);
 		self.sky = world.sky.is_drawn();
+		self.seeing = seeing_of(world, &camera);
 
 		self.queue.write_buffer(
 			&self.globals,
@@ -2431,27 +2481,22 @@ const fn cascade(slice: usize) -> Ends {
 	}
 }
 
-/// Creates a depth buffer of a given size.
-fn depth_view(device: &Device, samples: u32, width: u32, height: u32) -> TextureView {
-	let texture = device.create_texture(&TextureDescriptor {
-		label: Some("depth"),
-		size: Extent3d {
-			width: width.max(1),
-			height: height.max(1),
-			depth_or_array_layers: 1,
-		},
-		mip_level_count: 1,
-		// and never resolved: a depth buffer is read by the pass that writes
-		// it and by nothing after it, which is why `Depth32Float` needing no
-		// `MULTISAMPLE_RESOLVE` costs nothing here.
-		sample_count: samples,
-		dimension: TextureDimension::D2,
-		format: DEPTH_FORMAT,
-		usage: TextureUsages::RENDER_ATTACHMENT,
-		view_formats: &[],
-	});
+/// What the depth view asks of this frame, if anything.
+///
+/// How far away white is, and the two numbers of the frame's own projection a
+/// stored depth is turned back into a distance with. A distance that is not
+/// one, nought or less or not a number at all, is the picture.
+///
+/// @param world - for the console variable and the aspect
+/// @param camera - the camera this frame is drawn from
+fn seeing_of(world: &World, camera: &Camera) -> Option<(f32, [f32; 2])> {
+	let lens = camera.projection(world.aspect);
 
-	texture.create_view(&TextureViewDescriptor::default())
+	world
+		.cvars
+		.float(depth::VIEW)
+		.filter(|white| white.is_finite() && *white > 0.0)
+		.map(|white| (white, [lens.z_axis.z, lens.w_axis.z]))
 }
 
 /// How many samples a console variable is asking for.
@@ -3088,8 +3133,6 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::Camera;
-
 	use super::*;
 
 	/// A short count as a distance, without an `as`.

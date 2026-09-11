@@ -31,7 +31,7 @@ mod tests {
 	};
 	use wgpu::TextureFormat;
 
-	use crate::{Capture, Gpu, scene};
+	use crate::{Capture, Gpu, depth, scene};
 
 	/// How big the target is. Small on purpose: nothing here reads it.
 	const SIZE: (u32, u32) = (16, 16);
@@ -188,6 +188,30 @@ mod tests {
 		window
 			.shoot(&mut world)
 			.expect("four samples in the window's format render");
+	}
+
+	#[test]
+	fn and_draws_the_depth_instead_at_one_sample_and_at_four() {
+		// the view's pipeline and its bind group, and at four samples the pass
+		// that resolves the depth, are only recorded in a frame that asks for
+		// the depth; the two tests above never do
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+
+		for samples in ["1", "4", "1"] {
+			tuned(&mut world, samples);
+			world
+				.cvars
+				.var(depth::VIEW, Value::Float(depth::NO_VIEW), "");
+			world.cvars.set(depth::VIEW, "10");
+
+			capture
+				.shoot(&mut world)
+				.expect("the depth drawn instead of the picture renders");
+		}
 	}
 
 	#[test]

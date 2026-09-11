@@ -59,8 +59,10 @@ pub(crate) const NO_SAMPLES: u32 = 1;
 /// at all (`wgpu-types/src/texture/format.rs:917`), and
 /// [`HDR_FORMAT`] is guaranteed `MULTISAMPLE_X4 | MULTISAMPLE_RESOLVE`
 /// (`:991`) while `Depth32Float` is guaranteed the first of the two (`:1000`),
-/// which is exactly what a multisampled scene needs, because a depth buffer is
-/// never resolved. Two and eight would each need
+/// which is exactly what a multisampled scene needs, because nothing resolves
+/// a depth buffer on the way out of a pass: when something reads the depth
+/// after the scene, a pass of its own does, @ref [`depth`](crate::depth). Two
+/// and eight would each need
 /// `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` asked for and then checked per
 /// format per adapter, which is three branches and three sets of pipelines to
 /// buy "slightly worse" and "slightly better".
@@ -128,6 +130,11 @@ struct Tuning {
 
 	/// `[how much is added back, the threshold, the knee under it, unused]`.
 	bloom: [f32; 4],
+
+	/// `[how far away white is, the projection's two numbers, whether the
+	/// target applies the sRGB curve]` while the depth is drawn instead of the
+	/// picture, and all nought otherwise. @ref [`Seen`].
+	depth: [f32; 4],
 }
 
 /// One rung of the ladder: a target, and the way to read it.
@@ -140,6 +147,31 @@ struct Rung {
 	/// [`Chain::measured`].
 	#[cfg(test)]
 	texture: Texture,
+}
+
+/// What the frame's last pass writes, and what it draws there.
+#[derive(Clone, Copy)]
+pub(crate) struct Last<'a> {
+	/// The window's or the capture's own view.
+	pub(crate) into: &'a TextureView,
+
+	/// The depth to draw instead of the picture, or nothing for the picture.
+	pub(crate) depth: Option<Seen<'a>>,
+}
+
+/// The depth as the last pass draws it, @ref
+/// [`depth::VIEW`](crate::depth::VIEW).
+#[derive(Clone, Copy)]
+pub(crate) struct Seen<'a> {
+	/// What a reader reads: one sample a pixel, whatever the scene drew with.
+	pub(crate) view: &'a TextureView,
+
+	/// How far along the view white is, in world units.
+	pub(crate) white: f32,
+
+	/// The projection's `z_axis.z` and `w_axis.z`, the two numbers a stored
+	/// depth is turned back into a distance with.
+	pub(crate) lens: [f32; 2],
 }
 
 /// The target the world is drawn into, and everything that reads it.
@@ -210,6 +242,23 @@ pub(crate) struct Chain {
 	down: RenderPipeline,
 	up: RenderPipeline,
 	composite: RenderPipeline,
+
+	/// What draws the depth instead of the picture. @ref
+	/// [`depth::VIEW`](crate::depth::VIEW).
+	seeing: RenderPipeline,
+
+	/// How it is handed the depth: one binding, the third of its group, where
+	/// every other pass here has the picture and its sampler.
+	depth_layout: BindGroupLayout,
+
+	/// Whether the target the last pass writes applies the sRGB curve on the
+	/// way out, which the depth view undoes so that a byte is a distance.
+	srgb: bool,
+
+	/// A share of the device, for the one bind group here made per frame: the
+	/// depth's, while the view is on. @ref [`Chain::see`].
+	device: Device,
+
 	size: (u32, u32),
 }
 
@@ -267,6 +316,16 @@ impl Chain {
 
 		let built =
 			pipelines(device, &module, format, [&numbers_layout, &texture_layout, &eye_layout]);
+		// beside the seven rather than among them: it reads the depth where
+		// they read the picture, so its second group is a layout of its own
+		let depth_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+			label: Some("post depth"),
+			entries: &[crate::depth::entry(2)],
+		});
+		let seeing = screen_pipeline(device, &module, "post depth", "fragment_depth", format, &[
+			Some(&numbers_layout),
+			Some(&depth_layout),
+		]);
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
 			return Err(err!(Graphics("the post-processing pipelines: {complaint}")));
@@ -310,6 +369,10 @@ impl Chain {
 			down: built.4,
 			up: built.5,
 			composite: built.6,
+			seeing,
+			depth_layout,
+			srgb: format.is_srgb(),
+			device: device.clone(),
 			size: (width, height),
 		})
 	}
@@ -387,7 +450,8 @@ impl Chain {
 	/// @param queue - where the tuning block is written
 	/// @param post - what the world asks for
 	/// @param seconds - how long this frame was, for the eye
-	/// @param out - the window's or the capture's own view
+	/// @param last - the window's or the capture's own view, and whether the
+	/// depth is drawn into it instead of the picture
 	/// @param timings - what to write this frame's marks into, which is
 	/// nothing at all until somebody has asked to be told
 	pub(crate) fn resolve(
@@ -396,16 +460,21 @@ impl Chain {
 		queue: &Queue,
 		post: Post,
 		seconds: f32,
-		out: &TextureView,
+		last: Last<'_>,
 		timings: &Timings,
 	) {
 		// the eye is measured first and read by the composite in the same
 		// encoder, so the tuning block has to describe the frame that is about
 		// to happen rather than the one that did.
 		let moving = if self.adapted { post.adapt(seconds) } else { 1.0 };
+		let depth = last.depth.map_or([0.0; 4], |seen| {
+			[seen.white, seen.lens[0], seen.lens[1], if self.srgb { 1.0 } else { 0.0 }]
+		});
 
-		queue.write_buffer(&self.tuning, 0, bytemuck::bytes_of(&tuning_of(post, moving)));
+		queue.write_buffer(&self.tuning, 0, bytemuck::bytes_of(&tuning_of(post, moving, depth)));
 
+		// both go on while the depth is looked at, so that the picture comes
+		// back as it was rather than through an eye that has to adapt again
 		if post.auto_exposure {
 			self.measure(encoder, timings);
 		}
@@ -415,10 +484,17 @@ impl Chain {
 		}
 
 		let composite = timings.writes(Pass::Composite, Ends::Both);
+
+		if let Some(seen) = last.depth {
+			self.see(encoder, last.into, seen, composite);
+
+			return;
+		}
+
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
 			label: Some("post composite"),
 			color_attachments: &[Some(RenderPassColorAttachment {
-				view: out,
+				view: last.into,
 				depth_slice: None,
 				resolve_target: None,
 				ops: Operations {
@@ -441,6 +517,40 @@ impl Chain {
 		pass.set_bind_group(2, &self.eyes[self.eye].read, &[]);
 		pass.set_bind_group(3, &self.glow_read, &[]);
 		pass.draw(0..3, 0..1);
+	}
+
+	/// The depth instead of the picture, as the frame's last pass.
+	///
+	/// @param encoder - the frame's encoder
+	/// @param into - the window's or the capture's own view
+	/// @param seen - what is drawn, and how far away white is
+	/// @param marks - the composite's span, which this pass stands in for
+	fn see(
+		&self,
+		encoder: &mut CommandEncoder,
+		into: &TextureView,
+		seen: Seen<'_>,
+		marks: Option<RenderPassTimestampWrites<'_>>,
+	) {
+		// made each frame the view is on rather than kept: it is a handful of
+		// descriptors, and keeping one would need the depth to say whenever its
+		// view is rebuilt, which a tool that is up for a moment does not earn
+		let read = self
+			.device
+			.create_bind_group(&BindGroupDescriptor {
+				label: Some("post depth"),
+				layout: &self.depth_layout,
+				entries: &[BindGroupEntry {
+					binding: 2,
+					resource: BindingResource::TextureView(seen.view),
+				}],
+			});
+
+		screen_pass(encoder, "post depth", into, marks, |pass| {
+			pass.set_pipeline(&self.seeing);
+			pass.set_bind_group(0, &self.numbers, &[]);
+			pass.set_bind_group(1, &read, &[]);
+		});
 	}
 
 	/// The bloom chain: what is bright, spread wide.
@@ -819,7 +929,10 @@ fn layouts(device: &Device) -> (BindGroupLayout, BindGroupLayout, BindGroupLayou
 }
 
 /// The tuning block for one frame.
-fn tuning_of(post: Post, moving: f32) -> Tuning {
+///
+/// @param depth - the depth view's four numbers, or nought while the picture
+/// is drawn. @ref [`Tuning::depth`].
+fn tuning_of(post: Post, moving: f32, depth: [f32; 4]) -> Tuning {
 	Tuning {
 		curve: [
 			// as a float because the whole block is floats and a word for
@@ -848,6 +961,7 @@ fn tuning_of(post: Post, moving: f32) -> Tuning {
 			post.bloom_threshold.max(0.0) * 0.5,
 			0.0,
 		],
+		depth,
 	}
 }
 
@@ -1409,7 +1523,14 @@ mod tests {
 						label: Some("post test meter"),
 					});
 
-			chain.resolve(&mut encoder, gpu.queue(), Post::DEFAULT, 1.0, out, &Timings::new(0.0));
+			chain.resolve(
+				&mut encoder,
+				gpu.queue(),
+				Post::DEFAULT,
+				1.0,
+				Last { into: out, depth: None },
+				&Timings::new(0.0),
+			);
 			gpu.queue().submit([encoder.finish()]);
 		}
 

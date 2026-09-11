@@ -189,7 +189,7 @@ pub struct Profile<'a> {
 
 	/// Whether the hardware side answered at all.
 	///
-	/// False on an adapter with no timestamp queries, where the five hardware
+	/// False on an adapter with no timestamp queries, where the six hardware
 	/// rows are empty and the wall clock is the whole answer.
 	pub hardware: bool,
 }

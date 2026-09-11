@@ -622,6 +622,15 @@ fn install_render(world: &mut World) {
 		Value::Float(colby_engine::decal::DEFAULT_DECALS),
 		"how many of the nearest decals a frame paints with",
 	);
+	// the depth drawn instead of the picture, as a distance: a tool, like the
+	// cascade tint, so off and not saved. What it is for is looking at what a
+	// pass after the scene reads.
+	world.cvars.var(
+		colby_engine::depth::VIEW,
+		Value::Float(colby_engine::depth::NO_VIEW),
+		"draw the depth instead of the picture: black at the eye, white this many units away; \
+		 nought is the picture",
+	);
 	// how many samples a pixel of the world is drawn with. **Saved**, unlike
 	// the two above and like `r.backend`: how much a machine can afford to
 	// spend on smooth edges is a property of the machine rather than of a
@@ -1373,6 +1382,7 @@ mod tests {
 		(colby_engine::shadow::ENABLED, Value::Bool(true)),
 		(colby_engine::shadow::TINT, Value::Bool(false)),
 		(colby_engine::cull::ENABLED, Value::Bool(true)),
+		(colby_engine::depth::VIEW, Value::Float(colby_engine::depth::NO_VIEW)),
 		// `crate::console::volumes`, all four
 		(colby_audio::MASTER, Value::Float(1.0)),
 		(colby_audio::EFFECTS, Value::Float(1.0)),

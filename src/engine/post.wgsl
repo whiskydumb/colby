@@ -20,10 +20,15 @@
 // for; w is how far towards a new measurement this frame moves the eye.
 // x is how much of the bright pass is added back; y is how bright a pixel has
 // to be to be in it; z is the width of the knee under that; w is unused.
+// x is how far away white is while the depth is drawn instead of the picture;
+// y and z are the two numbers of the projection a stored depth is turned back
+// into a distance with, its `z_axis.z` and its `w_axis.z`; w is whether the
+// target applies the sRGB curve on the way out. All nought otherwise.
 struct Tuning {
     curve: vec4<f32>,
     meter: vec4<f32>,
     bloom: vec4<f32>,
+    depth: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> tuning: Tuning;
@@ -412,4 +417,45 @@ fn fragment_composite(input: ScreenOutput) -> @location(0) vec4<f32> {
     // there was a curve at all. The exposure still applies, which is what
     // Godot's `LINEAR` means too.
     return vec4<f32>(clamp(exposed, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
+// The depth the scene wrote, one sample a pixel whatever it drew with: at four
+// samples it has been resolved to each pixel's nearest by now (`depth.wgsl`).
+// Bound by the view below and by nothing else, at the third binding of its
+// group because the first two are the picture and its sampler.
+@group(1) @binding(2) var depth: texture_depth_2d;
+
+// How far along the view a stored depth is.
+//
+// The projection stores `b / d - a` for a point `d` along the view, where `a`
+// and `b` are its `z_axis.z` and its `w_axis.z`. This is that line solved for
+// `d`, with the two numbers read off the very matrix the frame was drawn with.
+fn distance_of(stored: f32) -> f32 {
+    return tuning.depth.z / (stored + tuning.depth.y);
+}
+
+// A level from nought to one, as the linear value an sRGB target turns back
+// into that level on the way out: the curve's own inverse, so that the byte
+// that lands is the level times 255.
+fn undone(level: f32) -> f32 {
+    if (level <= 0.04045) {
+        return level / 12.92;
+    }
+
+    return pow((level + 0.055) / 1.055, 2.4);
+}
+
+// The depth instead of the picture: black at the eye, white `tuning.depth.x`
+// along the view from it, straight between, with no exposure and no curve.
+//
+// **A byte is a distance.** On an sRGB target the curve is undone first, so a
+// pixel a quarter of the way to white is 64 in the file, and a color picker
+// reads a distance off the picture with one multiplication.
+@fragment
+fn fragment_depth(input: ScreenOutput) -> @location(0) vec4<f32> {
+    let stored = textureLoad(depth, vec2<i32>(input.clip_position.xy), 0);
+    let level = clamp(distance_of(stored) / tuning.depth.x, 0.0, 1.0);
+    let shown = select(level, undone(level), tuning.depth.w > 0.5);
+
+    return vec4<f32>(shown, shown, shown, 1.0);
 }
