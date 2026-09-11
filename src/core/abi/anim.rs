@@ -32,6 +32,17 @@
 //! keys already say and the two would eventually disagree. It is a walk over
 //! the tracks rather than over the keys, and it is not on any path that runs
 //! per bone.
+//!
+//! **A tree can carry its character over the ground.** Root motion is the
+//! travel of one bone, the tree's [`Tree::motion`], taken out of the pose and
+//! handed back as a [`Travel`] for the game to move its character by. Nothing
+//! here writes anybody's transform: a character is moved by whatever moves it,
+//! which in this engine is a game calling a controller that knows about walls.
+//! [`travel`] works the answer out from the clip clock alone and keeps nothing
+//! between two calls, so a step replayed for a prediction, a world put back
+//! from a save and a clock run at another rate all get the same one; and
+//! [`evaluate`] pins the same bone where its rest stands, so that the pose and
+//! the travel together are the clip exactly as it was authored.
 
 use super::{
 	entity::Transform,
@@ -271,6 +282,9 @@ impl ClipData {
 /// nothing is the ordinary case rather than an error: a walk cycle authored on
 /// a rig with fingers, played on one without, has ten tracks that land here and
 /// is otherwise perfectly good.
+///
+/// Also what [`Tree::motion`] holds when nothing is to travel, which is what a
+/// tree holds unless it is told otherwise.
 pub const NO_BONE: u16 = u16::MAX;
 
 registry_handle! {
@@ -431,6 +445,118 @@ impl ClipData {
 			if let Some(local) = into.get_mut(usize::from(*bone)) {
 				track.apply(moment, local);
 			}
+		}
+	}
+
+	/// How far this clip carries a character between two moments.
+	///
+	/// Read off one bone, the one whose travel is the character's, and answered
+	/// as what that bone did over the ground with its height left out: the
+	/// ground it crossed and the turn about straight up it made, measured in
+	/// the frame the character stood in at `from`. That frame is what brings a
+	/// clip that turns as it walks out on a curve rather than a zigzag, once a
+	/// game turns its character by [`Travel::turned`] as it goes.
+	///
+	/// **A pure function of the two moments, and that is the whole design.**
+	/// Nothing is kept between two calls, so the travel over one step is the
+	/// same number whoever asks and however often: a prediction replaying its
+	/// commands, a world put back from a save, a host and its client. The seam
+	/// of a looping clip is worked out rather than remembered: a clock that
+	/// ran past the end has done a whole lap more, and a lap is the travel
+	/// from the clip's first moment to its last, so one step may cross any
+	/// number of seams, either way, and still land where an unbroken walk
+	/// would have. A clip that does not loop holds each of its ends, so a
+	/// character whose clip has finished stops.
+	///
+	/// @param bone - the name of the bone that carries the character
+	/// @param rest - that bone's rest, which is what its travel is measured
+	/// from @param from - where the caller's clock stood at the start, in
+	/// seconds @param to - where it stands now
+	/// @param looping - whether the clip starts again rather than holding its
+	/// end @return how far it carried the character; no travel at all for a
+	/// clip of no length, a bone with no name or a moment that is not a number
+	#[must_use]
+	pub fn travel(
+		&self,
+		bone: &str,
+		rest: Transform,
+		from: f32,
+		to: f32,
+		looping: bool,
+	) -> Travel {
+		let length = self.duration();
+
+		if bone.is_empty() || length <= 0.0 || !from.is_finite() || !to.is_finite() {
+			return Travel::NONE;
+		}
+
+		// a clip that does not loop wants no clamp here: sampling already holds
+		// each of its ends past it, which is the rule its pose is played by.
+		if !looping {
+			return self
+				.footprint(bone, rest, from)
+				.inverse()
+				.then(self.footprint(bone, rest, to));
+		}
+
+		let was = self.footprint(bone, rest, from.rem_euclid(length));
+		let now = self.footprint(bone, rest, to.rem_euclid(length));
+		let crossed = to.div_euclid(length) - from.div_euclid(length);
+
+		// the common case, a step inside one lap, is one difference and nothing
+		// composed around it, so it is exactly what a clip that does not loop
+		// would say about the same two moments.
+		//
+		// @note: no test can tell this from the composition below it, which
+		// comes back to the bit through the start and its inverse on every
+		// fixture tried. It is kept because it is the common case, and it saves
+		// the two footprints the start and the lap would cost every step.
+		if crossed == 0.0 {
+			return was.inverse().then(now);
+		}
+
+		let start = self.footprint(bone, rest, 0.0);
+		let lap = start
+			.inverse()
+			.then(self.footprint(bone, rest, length));
+
+		was.inverse()
+			.then(start)
+			.then(laps(lap, crossed))
+			.then(start.inverse())
+			.then(now)
+	}
+
+	/// Where one bone stands over the ground at a moment, against its rest.
+	///
+	/// The motion across the ground that carries the bone's rest to where the
+	/// clip has the bone: the turn about straight up, counted the whole way
+	/// round rather than folded into one turn, and the ground crossed. It is
+	/// the rest *turned by that much* that is carried onto the bone, which is
+	/// what makes a turn in place a turn about the bone rather than about the
+	/// middle of the character.
+	fn footprint(&self, bone: &str, rest: Transform, moment: f32) -> Travel {
+		let mut local = rest;
+
+		// every track naming the bone, in order, which is exactly what sampling
+		// does to it: a later track writing the same channel wins here as well.
+		for track in self
+			.tracks
+			.iter()
+			.filter(|track| track.bone == bone)
+		{
+			track.apply(moment, &mut local);
+		}
+
+		let turned = self
+			.tracks
+			.iter()
+			.rfind(|track| track.bone == bone && track.channel == Channel::Rotation)
+			.map_or(0.0, |track| heading_along(track, rest.rotation, moment));
+
+		Travel {
+			moved: flat(local.position) - Quat::from_rotation_y(turned) * flat(rest.position),
+			turned,
 		}
 	}
 }
@@ -666,6 +792,14 @@ pub enum Node {
 		/// Seconds on whatever clock the game keeps for it.
 		time: f32,
 
+		/// Where that clock stood one step ago.
+		///
+		/// Read by nothing but [`travel`], which is how far the clip carried
+		/// its character between the two, so a tree with no motion bone may
+		/// put anything here. A game advancing its clock by `dt` writes what it
+		/// held before adding it.
+		from: f32,
+
 		/// Whether it starts again rather than holding its last key.
 		looping: bool,
 	},
@@ -717,19 +851,47 @@ pub enum Node {
 /// whole tree evaluates in one forward pass with no recursion, a cycle cannot
 /// be built, and an index that passes the check is an index that exists. @ref
 /// [`Self::is_ordered`].
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tree {
 	/// Every step, children before the nodes that read them.
 	pub nodes: Vec<Node>,
 
 	/// Which of them is the answer.
 	pub root: u16,
+
+	/// The bone that carries the character, or [`NO_BONE`] for none.
+	///
+	/// Named on the tree rather than on a clip, because a clip names no
+	/// skeleton and whether a walk moves its character is a question about how
+	/// it is played: the same walk plays in place in a preview. One bone for
+	/// the whole tree, since a character goes one way at a time, and a clip in
+	/// the mix that stays where it is carries nothing on its own.
+	///
+	/// Set, it is taken out of the pose [`evaluate`] works out: held where its
+	/// rest stands over the ground and facing the way its rest faces, with its
+	/// height and every turn that is not about straight up left in the pose.
+	/// What it would have done is what [`travel`] hands back. An index like a
+	/// mask's branch, found once with
+	/// [`SkeletonData::find`](super::skeleton::SkeletonData::find).
+	pub motion: u16,
+}
+
+impl Default for Tree {
+	/// Written out rather than derived, because the derived one would name
+	/// bone nought as the bone that travels.
+	fn default() -> Self { Self::new() }
 }
 
 impl Tree {
-	/// A tree with nothing in it.
+	/// A tree with nothing in it, and nothing to travel.
 	#[must_use]
-	pub const fn new() -> Self { Self { nodes: Vec::new(), root: 0 } }
+	pub const fn new() -> Self {
+		Self {
+			nodes: Vec::new(),
+			root: 0,
+			motion: NO_BONE,
+		}
+	}
 
 	/// Adds a step, and makes it the answer.
 	///
@@ -889,7 +1051,7 @@ pub fn evaluate(
 		};
 
 		match *node {
-			| Node::Clip { clip, time, looping } => {
+			| Node::Clip { clip, time, looping, .. } => {
 				for (slot, bone) in here.iter_mut().zip(bones) {
 					*slot = bone.rest;
 				}
@@ -925,7 +1087,303 @@ pub fn evaluate(
 	out.clear();
 	out.extend_from_slice(pose);
 
+	// the bone that carries the character stays where its rest stands, and what
+	// it would have done is `travel`'s to hand back. A bone this skeleton has
+	// not got pins nothing.
+	if let (Some(bone), Some(local)) =
+		(bones.get(usize::from(tree.motion)), out.get_mut(usize::from(tree.motion)))
+	{
+		*local = pinned(*local, bone.rest);
+	}
+
 	true
+}
+
+/// The most laps of a looping clip one travel counts.
+///
+/// A step at sixty a second crosses the seam of a one-second walk at most once,
+/// and a clock that jumped further than this in one step was set rather than
+/// run: a game restarting its clock, not a character that walked sixty-four
+/// laps between two frames. Past it the travel stops counting, which is a bound
+/// on a loop rather than a promise about where such a character ends up.
+pub const MAX_LAPS: usize = 64;
+
+/// How far a character is carried over the ground, and how far it is turned.
+///
+/// What [`travel`] hands back, and the shape of a motion that stays on the
+/// ground: a distance across it and a turn about straight up, with the height
+/// left to whatever holds a character up. Measured in the character's own
+/// frame as it stood at the start, so the same travel is the same walk
+/// whichever way the character happens to face.
+///
+/// ```text
+///   let travel = world.travel(pose, &tree);
+///   world.animate(pose, &tree);
+///   let there = travel.applied(standing);
+///   let velocity = (there.position - standing.position) / world.dt;
+///   // move_and_slide with that velocity, then face there.rotation
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Travel {
+	/// The ground crossed, in the character's own frame at the start. Its `y`
+	/// is always nought.
+	pub moved: Vec3,
+
+	/// The turn about straight up, in radians, counterclockwise seen from
+	/// above.
+	pub turned: f32,
+}
+
+impl Travel {
+	/// Going nowhere and turning not at all.
+	pub const NONE: Self = Self { moved: Vec3::ZERO, turned: 0.0 };
+
+	/// This travel and then another, the second measured from where the first
+	/// ended.
+	///
+	/// @param next - the travel that follows, in the frame this one ends in
+	#[must_use]
+	pub fn then(self, next: Self) -> Self {
+		Self {
+			moved: self.moved + Quat::from_rotation_y(self.turned) * next.moved,
+			turned: self.turned + next.turned,
+		}
+	}
+
+	/// The travel that undoes this one.
+	#[must_use]
+	pub fn inverse(self) -> Self {
+		Self {
+			moved: -(Quat::from_rotation_y(-self.turned) * self.moved),
+			turned: -self.turned,
+		}
+	}
+
+	/// This travel part of the way towards another, which is what a blend of
+	/// two clips travels.
+	///
+	/// Both ends exact, as [`Transform::lerp`] has them and for its reason: a
+	/// weight of one is the second input, not something an ulp away from it.
+	///
+	/// @param other - the travel at the far end
+	/// @param t - zero for this one, one for the other
+	#[must_use]
+	pub fn lerp(self, other: Self, t: f32) -> Self {
+		if t <= 0.0 || self == other {
+			return self;
+		}
+
+		if t >= 1.0 {
+			return other;
+		}
+
+		Self {
+			moved: self.moved.lerp(other.moved, t),
+			turned: (other.turned - self.turned).mul_add(t, self.turned),
+		}
+	}
+
+	/// Where something standing at `at` is carried to.
+	///
+	/// The travel laid inside the transform, so it goes the way `at` faces and
+	/// as far as `at` is scaled: a character twice the size walks twice as far
+	/// on the same clip, which is what legs twice as long are for.
+	///
+	/// @param at - where it stands now
+	#[must_use]
+	pub fn applied(self, at: Transform) -> Transform {
+		at.then(Transform {
+			position: self.moved,
+			rotation: Quat::from_rotation_y(self.turned),
+			scale: Vec3::ONE,
+		})
+	}
+}
+
+/// How far a tree carries its character, by the travel of its motion bone.
+///
+/// The tree worked out the way [`evaluate`] works it out, one node at a time
+/// and children first, except that a node holds a travel rather than a pose: a
+/// clip's own ([`ClipData::travel`]), a blend's two inputs mixed by its weight,
+/// and a mask's layer only when the motion bone is inside its branch. The
+/// travel goes wherever the motion bone's own transform goes, which is what
+/// keeps it the travel of the pose that bone ends up in.
+///
+/// Nothing is written and nothing is kept, and no binding is needed: the
+/// motion bone's tracks are found by its name.
+///
+/// @param tree - the tree, with its motion bone
+/// @param clips - the registry its leaves name
+/// @param bones - the skeleton it is worked out over, parents first
+/// @return how far it carried the character; no travel at all for a tree with
+/// no motion bone, one that cannot be worked out, or a bone whose name an
+/// earlier bone already answers to
+#[must_use]
+pub fn travel(tree: &Tree, clips: &Clips, bones: &[Bone]) -> Travel {
+	let motion = usize::from(tree.motion);
+	let Some(bone) = bones.get(motion) else {
+		return Travel::NONE;
+	};
+
+	// a track names its bone the way a binding resolves it, by the first bone
+	// answering to the name, so a later bone sharing it is moved by no track at
+	// all. One with no name is moved by none either, which the clip's own
+	// travel answers for.
+	let named = bones
+		.iter()
+		.position(|each| each.name == bone.name);
+
+	if named != Some(motion) || tree.len() > MAX_NODES || !tree.is_ordered() {
+		return Travel::NONE;
+	}
+
+	let mut done = [Travel::NONE; MAX_NODES];
+
+	for (at, node) in tree.nodes.iter().enumerate() {
+		let here = match *node {
+			| Node::Clip { clip, time, from, looping } => clips
+				.data(clip)
+				.travel(&bone.name, bone.rest, from, time, looping),
+			| Node::Blend { first, second, weight } =>
+				carried(&done, first).lerp(carried(&done, second), weight),
+			| Node::Mask { first, second, branch, weight } => layered(
+				carried(&done, first),
+				carried(&done, second),
+				weight,
+				inside(bones, motion, branch),
+			),
+		};
+
+		if let Some(slot) = done.get_mut(at) {
+			*slot = here;
+		}
+	}
+
+	carried(&done, tree.root)
+}
+
+/// One already-worked travel out of the list, or none for an index past it.
+fn carried(done: &[Travel], index: u16) -> Travel {
+	done.get(usize::from(index))
+		.copied()
+		.unwrap_or(Travel::NONE)
+}
+
+/// The travel of a masked blend, which is the layer's only inside its branch.
+///
+/// [`masked`] for a travel: the motion bone is either inside the branch and
+/// moves towards the layer, or outside it and keeps the first input, and its
+/// travel does exactly what it does.
+fn layered(outside: Travel, within: Travel, weight: f32, within_branch: bool) -> Travel {
+	if within_branch {
+		outside.lerp(within, weight)
+	} else {
+		outside
+	}
+}
+
+/// The turn about straight up that a rotation holds, in radians.
+///
+/// The rotation taken apart as a turn about `y` after one about a level axis,
+/// and the first of those read as an angle: the part of a quaternion about `y`
+/// is its `y` and its `w` alone.
+///
+/// @note: what comes back is only ever used modulo a whole turn, as a
+/// difference [`wrapped`] into half a turn either side or as a rotation built
+/// from it. So neither sign of the quaternion is picked, and a half turn about
+/// a level axis, which faces no way at all, reads as some whole number of
+/// turns: both are the same answer to everything that asks.
+fn heading(turn: Quat) -> f32 { 2.0 * turn.y.atan2(turn.w) }
+
+/// An angle brought inside half a turn either side of nought.
+fn wrapped(angle: f32) -> f32 {
+	(angle + core::f32::consts::PI).rem_euclid(core::f32::consts::TAU) - core::f32::consts::PI
+}
+
+/// A point on the ground under another, its height taken away.
+const fn flat(point: Vec3) -> Vec3 { Vec3::new(point.x, 0.0, point.z) }
+
+/// How far a rotation track has turned its bone about straight up by a moment,
+/// counted the whole way round.
+///
+/// The turn is read at every key up to the moment and the steps between them
+/// added, each brought inside half a turn: two neighboring keys of a rotation
+/// are played the short way round, so no step between them turns half a
+/// circle. A clip that turns a whole circle therefore says a whole circle
+/// rather than nothing, which is what makes one lap of it turn its character
+/// all the way round.
+///
+/// @param track - a rotation track
+/// @param rest - the bone's rest rotation, which is the heading of nought
+/// @param moment - where in the clip
+fn heading_along(track: &Track, rest: Quat, moment: f32) -> f32 {
+	if track.times.is_empty() {
+		return 0.0;
+	}
+
+	let against = rest.inverse();
+	let mut last = heading(turn(track.key(0)) * against);
+	let mut total = last;
+
+	for (index, time) in track.times.iter().enumerate().skip(1) {
+		if *time > moment {
+			break;
+		}
+
+		let now = heading(turn(track.key(index)) * against);
+
+		total += wrapped(now - last);
+		last = now;
+	}
+
+	let mut at = Transform::IDENTITY;
+
+	track.apply(moment, &mut at);
+
+	total + wrapped(heading(at.rotation * against) - last)
+}
+
+/// One lap's travel taken a number of times, backwards for a negative number.
+///
+/// A loop rather than a formula, and bounded by [`MAX_LAPS`]: an honest step
+/// crosses one seam or none.
+///
+/// @param lap - one whole lap's travel
+/// @param count - how many, a whole number however it is stored
+fn laps(lap: Travel, count: f32) -> Travel {
+	let step = if count < 0.0 { lap.inverse() } else { lap };
+	let mut left = count.abs();
+	let mut out = Travel::NONE;
+
+	for _ in 0..MAX_LAPS {
+		if left < 0.5 {
+			break;
+		}
+
+		out = out.then(step);
+		left -= 1.0;
+	}
+
+	out
+}
+
+/// A motion bone with its travel over the ground taken out.
+///
+/// Where its rest stands over the ground and facing the way its rest faces,
+/// with its height, its scale and every turn that is not about straight up
+/// left as the pose had them: a hip that bobs and rocks as it walks still bobs
+/// and rocks. What was taken out is [`travel`]'s to hand back.
+///
+/// @param local - the bone as the tree left it, relative to its parent
+/// @param rest - the bone's rest
+fn pinned(local: Transform, rest: Transform) -> Transform {
+	let facing = Quat::from_rotation_y(heading(local.rotation * rest.rotation.inverse()));
+
+	Transform {
+		position: Vec3::new(rest.position.x, local.position.y, rest.position.z),
+		rotation: facing.inverse() * local.rotation,
+		scale: local.scale,
+	}
 }
 
 #[cfg(test)]
@@ -933,10 +1391,13 @@ mod tests {
 	use super::{
 		super::{
 			World,
+			character::{self, Motion},
+			net::Command,
 			pose::{Pose, PoseId},
 		},
 		*,
 	};
+	use crate::glam::Mat4;
 
 	/// A bone hanging off another, a stride along `x` from it.
 	fn bone(name: &str, parent: u16, along: f32) -> Bone {
@@ -1083,7 +1544,12 @@ mod tests {
 		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
 		let mut tree = Tree::new();
 
-		tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		tree.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		let out = worked(&tree, &clips, &skeletons, rig);
 
@@ -1106,8 +1572,18 @@ mod tests {
 
 		for (weight, want) in [(0.0, 4.0), (0.25, 5.0), (0.5, 6.0), (1.0, 8.0)] {
 			let mut tree = Tree::new();
-			let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
-			let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+			let one = tree.push(Node::Clip {
+				clip: first,
+				time: 0.0,
+				from: 0.0,
+				looping: false,
+			});
+			let two = tree.push(Node::Clip {
+				clip: second,
+				time: 0.0,
+				from: 0.0,
+				looping: false,
+			});
 
 			tree.push(Node::Blend { first: one, second: two, weight });
 
@@ -1127,7 +1603,12 @@ mod tests {
 	fn a_blend_of_a_clip_with_itself_is_the_clip_at_every_weight() {
 		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
 		let mut tree = Tree::new();
-		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		let one = tree.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		tree.push(Node::Blend { first: one, second: one, weight: 0.5 });
 
@@ -1149,8 +1630,18 @@ mod tests {
 		// it and wherever it happened to be last step.
 		let (clips, skeletons, rig, first, second) = stage(held(4.0), twisted());
 		let mut tree = Tree::new();
-		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
-		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+		let one = tree.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
+		let two = tree.push(Node::Clip {
+			clip: second,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		tree.push(Node::Blend { first: one, second: two, weight: 0.5 });
 
@@ -1175,8 +1666,18 @@ mod tests {
 	fn a_mask_moves_the_branch_and_leaves_the_rest_of_the_skeleton_alone() {
 		let (clips, skeletons, rig, first, second) = stage(held(4.0), twisted());
 		let mut tree = Tree::new();
-		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
-		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+		let one = tree.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
+		let two = tree.push(Node::Clip {
+			clip: second,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		// the branch starts at the elbow, so the elbow and the wrist are in it
 		// and the shoulder is not.
@@ -1212,8 +1713,18 @@ mod tests {
 	fn a_mask_at_half_weight_takes_the_branch_half_the_way() {
 		let (clips, skeletons, rig, first, second) = stage(held(4.0), twisted());
 		let mut tree = Tree::new();
-		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
-		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+		let one = tree.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
+		let two = tree.push(Node::Clip {
+			clip: second,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		tree.push(Node::Mask {
 			first: one,
@@ -1242,8 +1753,18 @@ mod tests {
 	fn a_mask_over_a_bone_the_rig_has_not_leaves_every_bone_as_the_first_input() {
 		let (clips, skeletons, rig, first, second) = stage(held(4.0), twisted());
 		let mut tree = Tree::new();
-		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
-		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+		let one = tree.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
+		let two = tree.push(Node::Clip {
+			clip: second,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		tree.push(Node::Mask {
 			first: one,
@@ -1275,9 +1796,11 @@ mod tests {
 			nodes: vec![Node::Blend { first: 1, second: 1, weight: 0.5 }, Node::Clip {
 				clip: first,
 				time: 0.0,
+				from: 0.0,
 				looping: false,
 			}],
 			root: 0,
+			motion: NO_BONE,
 		};
 
 		assert!(!backwards.is_ordered(), "the blend reads a node written after it");
@@ -1300,12 +1823,18 @@ mod tests {
 		// second input is a loop exactly as much as one reading itself through
 		// its first.
 		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
-		let leaf = Node::Clip { clip: first, time: 0.0, looping: false };
+		let leaf = Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		};
 
 		for (one, two) in [(1_u16, 0_u16), (0, 1)] {
 			let looping = Tree {
 				nodes: vec![leaf, Node::Blend { first: one, second: two, weight: 0.5 }],
 				root: 1,
+				motion: NO_BONE,
 			};
 
 			assert!(
@@ -1329,8 +1858,18 @@ mod tests {
 		// not the rule. A game that writes the field gets what it wrote.
 		let (clips, skeletons, rig, first, second) = stage(held(4.0), held(8.0));
 		let mut tree = Tree::new();
-		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
-		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+		let one = tree.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
+		let two = tree.push(Node::Clip {
+			clip: second,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		tree.push(Node::Blend { first: one, second: two, weight: 1.0 });
 		tree.root = one;
@@ -1352,8 +1891,14 @@ mod tests {
 		assert!(!Tree::new().is_ordered(), "nothing to work out");
 
 		let stray = Tree {
-			nodes: vec![Node::Clip { clip: first, time: 0.0, looping: false }],
+			nodes: vec![Node::Clip {
+				clip: first,
+				time: 0.0,
+				from: 0.0,
+				looping: false,
+			}],
 			root: 7,
+			motion: NO_BONE,
 		};
 
 		assert!(!stray.is_ordered(), "and an answer at a node that is not there");
@@ -1367,7 +1912,12 @@ mod tests {
 	#[test]
 	fn more_nodes_than_a_tree_may_hold_are_refused() {
 		let (clips, skeletons, rig, first, _) = stage(held(4.0), held(8.0));
-		let leaf = Node::Clip { clip: first, time: 0.0, looping: false };
+		let leaf = Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		};
 		let mut tree = Tree::new();
 
 		for _ in 0..=MAX_NODES {
@@ -1390,6 +1940,7 @@ mod tests {
 		let leaf = Node::Clip {
 			clip: ClipId::NONE,
 			time: 0.0,
+			from: 0.0,
 			looping: false,
 		};
 		let mut tree = Tree::new();
@@ -1410,15 +1961,30 @@ mod tests {
 		let mut scratch = Vec::new();
 		let mut out = Vec::new();
 		let mut big = Tree::new();
-		let one = big.push(Node::Clip { clip: first, time: 0.0, looping: false });
-		let two = big.push(Node::Clip { clip: second, time: 0.0, looping: false });
+		let one = big.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
+		let two = big.push(Node::Clip {
+			clip: second,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		big.push(Node::Blend { first: one, second: two, weight: 1.0 });
 
 		assert!(evaluate(&big, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out));
 
 		let mut small = Tree::new();
-		small.push(Node::Clip { clip: first, time: 0.0, looping: false });
+		small.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		assert!(evaluate(&small, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out));
 		assert!(
@@ -1439,8 +2005,18 @@ mod tests {
 			.poses
 			.spawn(Pose::resting(rig, world.skeletons.bones(rig)));
 		let mut tree = Tree::new();
-		let one = tree.push(Node::Clip { clip: first, time: 0.0, looping: false });
-		let two = tree.push(Node::Clip { clip: second, time: 0.0, looping: false });
+		let one = tree.push(Node::Clip {
+			clip: first,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
+		let two = tree.push(Node::Clip {
+			clip: second,
+			time: 0.0,
+			from: 0.0,
+			looping: false,
+		});
 
 		tree.push(Node::Blend { first: one, second: two, weight: 0.5 });
 
@@ -1469,6 +2045,7 @@ mod tests {
 		tree.push(Node::Clip {
 			clip: ClipId::NONE,
 			time: 0.0,
+			from: 0.0,
 			looping: false,
 		});
 		world.poses.despawn(pose);
@@ -2003,6 +2580,821 @@ mod tests {
 		assert!(
 			(clip.duration() - 0.0).abs() < f32::EPSILON,
 			"and a clip of nothing does not run backwards"
+		);
+	}
+
+	/// The walker: a root off the middle of the character, turned and tilted at
+	/// rest, with a foot hanging off it and a spine beside the foot.
+	///
+	/// Off the middle, so that a turn about the root and a turn about the
+	/// character's own origin are different answers; turned and tilted, so that
+	/// a heading read against the rest and one read against nothing are
+	/// different too.
+	fn walker() -> SkeletonData {
+		SkeletonData {
+			bones: vec![
+				Bone {
+					name: "root".to_owned(),
+					rest: Transform {
+						position: Vec3::new(0.25, 0.9, -0.5),
+						rotation: Quat::from_rotation_y(0.5) * Quat::from_rotation_x(0.3),
+						scale: Vec3::ONE,
+					},
+					..Bone::default()
+				},
+				bone("foot", 0, 0.1),
+				bone("spine", 0, -0.2),
+			],
+		}
+	}
+
+	/// The walker's root at rest.
+	fn rooted() -> Transform { walker().bones[0].rest }
+
+	/// The root's position at five moments along a path that is no straight
+	/// line: along `x` three times the square of the time, the height bobbing
+	/// and `z` wandering.
+	fn stride() -> Track {
+		Track {
+			bone: "root".to_owned(),
+			channel: Channel::Position,
+			interpolation: Interpolation::Linear,
+			times: vec![0.0, 0.25, 0.5, 0.75, 1.0],
+			values: vec![
+				0.0, 0.9, -0.5, 0.1875, 0.95, -0.42, 0.75, 0.88, -0.41, 1.6875, 0.93, -0.45, 3.0,
+				0.9, -0.4,
+			],
+		}
+	}
+
+	/// A clip of nothing but the stride.
+	fn striding() -> ClipData { ClipData { tracks: vec![stride()] } }
+
+	/// The root turned about straight up by so many degrees at each of so many
+	/// moments, over its tilted rest.
+	fn turning(times: &[f32], degrees: &[f32]) -> Track {
+		let rest = rooted().rotation;
+
+		Track {
+			bone: "root".to_owned(),
+			channel: Channel::Rotation,
+			interpolation: Interpolation::Linear,
+			times: times.to_vec(),
+			values: degrees
+				.iter()
+				.flat_map(|angle| (Quat::from_rotation_y(angle.to_radians()) * rest).to_array())
+				.collect(),
+		}
+	}
+
+	/// The root sliding along `x` by `far` over one second, and nothing else.
+	fn sliding(far: f32) -> ClipData {
+		ClipData {
+			tracks: vec![Track {
+				bone: "root".to_owned(),
+				channel: Channel::Position,
+				interpolation: Interpolation::Linear,
+				times: vec![0.0, 1.0],
+				values: vec![0.0, 0.9, -0.5, far, 0.9, -0.5],
+			}],
+		}
+	}
+
+	/// A root that walks a curve as it turns and rocks, keyed at nine moments
+	/// over the walker's rest, starting turned.
+	fn curving() -> ClipData {
+		let rest = rooted();
+		let times: Vec<f32> = (0..9_u8)
+			.map(|key| f32::from(key) / 8.0)
+			.collect();
+		let mut places = Vec::with_capacity(times.len() * 3);
+		let mut turns = Vec::with_capacity(times.len() * 4);
+
+		for time in &times {
+			let facing = 0.6_f32.mul_add(time * time, 1.2_f32.mul_add(*time, 0.4));
+			let rock = Quat::from_rotation_x(0.1 * (5.0 * time).sin());
+
+			places.extend_from_slice(&[
+				1.5_f32.mul_add(facing.sin(), rest.position.x),
+				0.05_f32.mul_add((6.0 * time).sin(), rest.position.y),
+				1.5_f32.mul_add(1.0 - facing.cos(), rest.position.z),
+			]);
+			turns.extend_from_slice(
+				&(Quat::from_rotation_y(facing) * rock * rest.rotation).to_array(),
+			);
+		}
+
+		ClipData {
+			tracks: vec![
+				Track {
+					bone: "root".to_owned(),
+					channel: Channel::Position,
+					interpolation: Interpolation::Linear,
+					times: times.clone(),
+					values: places,
+				},
+				Track {
+					bone: "root".to_owned(),
+					channel: Channel::Rotation,
+					interpolation: Interpolation::Linear,
+					times,
+					values: turns,
+				},
+			],
+		}
+	}
+
+	/// A registry of the walker and the clips handed in, every one of them
+	/// bound, the first called `clip0` and so on.
+	fn walking(taken: Vec<ClipData>) -> (Clips, Skeletons, SkeletonId) {
+		let mut clips = Clips::new();
+		let mut skeletons = Skeletons::new();
+		let rig = skeletons.insert("walker", walker());
+
+		for (index, data) in taken.into_iter().enumerate() {
+			let clip = clips.insert(&format!("clip{index}"), data);
+
+			clips.bind(clip, rig, &skeletons);
+		}
+
+		(clips, skeletons, rig)
+	}
+
+	/// A tree of one clip, carried by the walker's root.
+	fn carried_by_root(clip: ClipId, from: f32, time: f32, looping: bool) -> Tree {
+		let mut tree = Tree::new();
+
+		tree.push(Node::Clip { clip, time, from, looping });
+		tree.motion = 0;
+
+		tree
+	}
+
+	/// Where the walker's foot stands in its model, for the pose a tree works
+	/// out.
+	fn foot_at(tree: &Tree, clips: &Clips, rig: SkeletonId, bones: &[Bone]) -> Mat4 {
+		let (mut scratch, mut out) = (Vec::new(), Vec::new());
+
+		assert!(evaluate(tree, clips, rig, bones, &mut scratch, &mut out), "the tree works out");
+
+		out[0].matrix() * out[1].matrix()
+	}
+
+	/// A clip's travel taken one step at a time and added up.
+	fn stepwise(clip: &ClipData, rate: u16, steps: u16) -> Travel {
+		let mut went = Travel::NONE;
+
+		for step in 0..steps {
+			let from = f32::from(step) / f32::from(rate);
+			let to = f32::from(step + 1) / f32::from(rate);
+
+			went = went.then(clip.travel("root", rooted(), from, to, true));
+		}
+
+		went
+	}
+
+	#[test]
+	fn a_tree_names_no_bone_to_travel_unless_it_is_told_one() {
+		assert_eq!(Tree::new().motion, NO_BONE, "a new tree carries nothing");
+		assert_eq!(
+			Tree::default().motion,
+			NO_BONE,
+			"and neither does a default one, which a derived default would have given bone \
+			 nought"
+		);
+	}
+
+	#[test]
+	fn a_clip_carries_its_character_as_far_as_its_root_crosses_the_ground() {
+		let went = striding().travel("root", rooted(), 0.25, 0.75, false);
+
+		assert!(
+			went.moved
+				.abs_diff_eq(Vec3::new(1.5, 0.0, -0.03), 1.0e-5),
+			"from the second key to the fourth, with the height left out: {}",
+			went.moved
+		);
+		assert!(went.turned.abs() < 1.0e-6, "and a root that never turns turns nothing");
+	}
+
+	#[test]
+	fn a_step_across_the_seam_is_the_end_of_one_lap_and_the_start_of_the_next() {
+		let clip = striding();
+		let went = clip.travel("root", rooted(), 0.75, 1.25, true);
+
+		// the last quarter of one lap and the first quarter of the next: one and
+		// five sixteenths, and three sixteenths, along x, and along z what each
+		// of the two quarters wandered.
+		assert!(
+			went.moved
+				.abs_diff_eq(Vec3::new(1.5, 0.0, 0.13), 1.0e-5),
+			"{}",
+			went.moved
+		);
+
+		let back = clip.travel("root", rooted(), 1.25, 0.75, true);
+
+		assert!(
+			back.moved
+				.abs_diff_eq(Vec3::new(-1.5, 0.0, -0.13), 1.0e-5),
+			"and backwards across it is the same way back: {}",
+			back.moved
+		);
+	}
+
+	#[test]
+	fn a_step_over_several_seams_counts_every_lap_it_crossed() {
+		let went = striding().travel("root", rooted(), 0.25, 3.25, true);
+
+		assert!(
+			went.moved
+				.abs_diff_eq(Vec3::new(9.0, 0.0, 0.3), 1.0e-4),
+			"three whole laps of three along x and a tenth along z: {}",
+			went.moved
+		);
+	}
+
+	#[test]
+	fn a_clip_that_does_not_loop_stops_carrying_its_character_at_its_end() {
+		let clip = striding();
+
+		assert!(
+			clip.travel("root", rooted(), 0.75, 1.5, false)
+				.moved
+				.abs_diff_eq(Vec3::new(1.3125, 0.0, 0.05), 1.0e-5),
+			"the last quarter, and nothing past the end"
+		);
+		assert!(
+			clip.travel("root", rooted(), 1.2, 2.0, false)
+				.moved
+				.abs_diff_eq(Vec3::ZERO, 1.0e-6),
+			"and nothing at all once it has finished"
+		);
+	}
+
+	#[test]
+	fn inside_one_lap_a_looping_clip_says_exactly_what_one_that_does_not_would() {
+		let clip = ClipData {
+			tracks: vec![stride(), turning(&[0.0, 0.5, 1.0], &[20.0, 25.0, 40.0])],
+		};
+		let looping = clip.travel("root", rooted(), 0.3, 0.9, true);
+		let once = clip.travel("root", rooted(), 0.3, 0.9, false);
+
+		assert!(
+			looping.moved.abs_diff_eq(once.moved, 0.0)
+				&& (looping.turned - once.turned).abs() <= 0.0,
+			"the same arithmetic, not merely close: {looping:?} against {once:?}"
+		);
+	}
+
+	#[test]
+	fn the_steps_of_a_walk_add_up_to_the_walk_at_every_rate() {
+		// what taking the seam in closed form buys: two and a half laps are as
+		// far at thirty steps a second as at a hundred and forty-four.
+		let whole = striding().travel("root", rooted(), 0.0, 2.5, true);
+
+		assert!(
+			whole
+				.moved
+				.abs_diff_eq(Vec3::new(6.75, 0.0, 0.29), 1.0e-4),
+			"two laps and half of a third, in one go: {}",
+			whole.moved
+		);
+
+		for rate in [30_u16, 60, 144] {
+			let went = stepwise(&striding(), rate, rate * 5 / 2);
+
+			assert!(
+				went.moved.abs_diff_eq(whole.moved, 1.0e-4),
+				"at {rate} a second: {}",
+				went.moved
+			);
+		}
+	}
+
+	#[test]
+	fn a_turn_in_place_turns_the_character_about_its_root_and_not_its_middle() {
+		let clip = ClipData {
+			tracks: vec![turning(&[0.0, 0.5, 1.0], &[0.0, 30.0, 90.0])],
+		};
+		let went = clip.travel("root", rooted(), 0.0, 1.0, false);
+
+		assert!(
+			(went.turned - core::f32::consts::FRAC_PI_2).abs() < 1.0e-5,
+			"a quarter turn, read against the tilted rest: {}",
+			went.turned
+		);
+		// the root stands a quarter of a unit across and half a unit back from
+		// the character's own middle, so turning about it moves the middle.
+		assert!(
+			went.moved
+				.abs_diff_eq(Vec3::new(0.75, 0.0, -0.25), 1.0e-5),
+			"{}",
+			went.moved
+		);
+
+		let there = went.applied(Transform::IDENTITY);
+		let ground = there.rotation * flat(rooted().position) + there.position;
+
+		assert!(
+			ground.abs_diff_eq(flat(rooted().position), 1.0e-5),
+			"and where the root stands on the ground has not moved: {ground}"
+		);
+	}
+
+	#[test]
+	fn a_clip_that_turns_a_whole_circle_turns_its_character_a_whole_circle() {
+		// a quarter turn a key. The first key and the last face the same way, so
+		// a travel read off those two alone would turn nothing at all.
+		let clip = ClipData {
+			tracks: vec![turning(&[0.0, 0.25, 0.5, 0.75, 1.0], &[
+				0.0, 90.0, 180.0, 270.0, 360.0,
+			])],
+		};
+		let once = clip.travel("root", rooted(), 0.0, 1.0, false);
+		let twice = clip.travel("root", rooted(), 0.0, 2.0, true);
+
+		assert!(
+			(once.turned - core::f32::consts::TAU).abs() < 1.0e-4,
+			"once round: {}",
+			once.turned
+		);
+		assert!(
+			2.0_f32
+				.mul_add(-core::f32::consts::TAU, twice.turned)
+				.abs() < 1.0e-4,
+			"and twice round for two laps: {}",
+			twice.turned
+		);
+	}
+
+	#[test]
+	fn the_root_that_carries_the_character_is_pinned_over_its_rest_keeping_its_height_and_tilt() {
+		let tilt = Quat::from_rotation_z(0.2);
+		let rest = rooted();
+		let turn = Track {
+			bone: "root".to_owned(),
+			channel: Channel::Rotation,
+			interpolation: Interpolation::Linear,
+			times: vec![0.0],
+			values: (Quat::from_rotation_y(0.7) * tilt * rest.rotation)
+				.to_array()
+				.to_vec(),
+		};
+		let (clips, skeletons, rig) = walking(vec![ClipData { tracks: vec![stride(), turn] }]);
+		let tree = carried_by_root(clips.find("clip0"), 0.0, 0.5, false);
+		let (mut scratch, mut out) = (Vec::new(), Vec::new());
+
+		assert!(evaluate(&tree, &clips, rig, skeletons.bones(rig), &mut scratch, &mut out));
+		assert!(
+			out[0]
+				.position
+				.abs_diff_eq(Vec3::new(0.25, 0.88, -0.5), 1.0e-6),
+			"over its rest on the ground, at the height the clip gives it: {}",
+			out[0].position
+		);
+
+		let want = tilt * rest.rotation;
+
+		for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+			assert!(
+				(out[0].rotation * axis).abs_diff_eq(want * axis, 1.0e-5),
+				"the tilt stays and the turn goes, seen along {axis}"
+			);
+		}
+
+		assert!(
+			out[1]
+				.position
+				.abs_diff_eq(Vec3::new(0.1, 0.0, 0.0), 1.0e-6),
+			"and nothing below it is touched"
+		);
+	}
+
+	#[test]
+	fn a_tree_with_no_bone_to_travel_pins_nothing_and_carries_nothing() {
+		let (clips, skeletons, rig) = walking(vec![striding()]);
+		let bones = skeletons.bones(rig);
+
+		for motion in [NO_BONE, 40] {
+			let mut tree = carried_by_root(clips.find("clip0"), 0.0, 0.5, false);
+			let (mut scratch, mut out) = (Vec::new(), Vec::new());
+
+			tree.motion = motion;
+
+			assert!(evaluate(&tree, &clips, rig, bones, &mut scratch, &mut out));
+			assert!(
+				out[0]
+					.position
+					.abs_diff_eq(Vec3::new(0.75, 0.88, -0.41), 1.0e-6),
+				"motion {motion}: the root where the clip has it"
+			);
+			assert_eq!(travel(&tree, &clips, bones), Travel::NONE, "motion {motion}");
+		}
+	}
+
+	#[test]
+	fn a_bone_that_answers_to_a_name_an_earlier_bone_holds_carries_nothing() {
+		// a track names its bone by the first bone of that name, so a spine
+		// renamed to the root's name is moved by none of the root's tracks.
+		let mut skeleton = walker();
+		let mut clips = Clips::new();
+		let clip = clips.insert("stride", striding());
+		let mut tree = carried_by_root(clip, 0.25, 0.75, false);
+
+		skeleton.bones[2].name = "root".to_owned();
+		tree.motion = 2;
+
+		assert_eq!(travel(&tree, &clips, &skeleton.bones), Travel::NONE, "the spine is no root");
+
+		tree.motion = 0;
+
+		assert_ne!(
+			travel(&tree, &clips, &skeleton.bones),
+			Travel::NONE,
+			"the first of the two is"
+		);
+
+		// and with the first bone's name taken away, the tracks name the second.
+		skeleton.bones[0].name = String::new();
+
+		assert_eq!(
+			travel(&tree, &clips, &skeleton.bones),
+			Travel::NONE,
+			"a bone with no name carries nothing"
+		);
+
+		tree.motion = 2;
+
+		assert_ne!(
+			travel(&tree, &clips, &skeleton.bones),
+			Travel::NONE,
+			"and the spine answers now"
+		);
+	}
+
+	#[test]
+	fn a_blend_carries_its_character_between_its_two_clips_by_its_weight() {
+		let (clips, skeletons, rig) = walking(vec![striding(), sliding(6.0)]);
+		let mut tree = Tree::new();
+		let one = tree.push(Node::Clip {
+			clip: clips.find("clip0"),
+			time: 0.75,
+			from: 0.25,
+			looping: false,
+		});
+		let two = tree.push(Node::Clip {
+			clip: clips.find("clip1"),
+			time: 0.75,
+			from: 0.25,
+			looping: false,
+		});
+
+		tree.push(Node::Blend { first: one, second: two, weight: 0.25 });
+		tree.motion = 0;
+
+		let went = travel(&tree, &clips, skeletons.bones(rig));
+
+		assert!(
+			(went.moved.x - 1.875).abs() < 1.0e-5,
+			"a quarter of the way from the stride's one and a half to the slide's three: {}",
+			went.moved
+		);
+	}
+
+	#[test]
+	fn a_mask_carries_its_character_by_its_layer_only_when_the_root_is_inside_its_branch() {
+		let (clips, skeletons, rig) = walking(vec![striding(), sliding(6.0)]);
+
+		for (branch, want) in [(0_u16, 3.0), (2, 1.5)] {
+			let mut tree = Tree::new();
+			let one = tree.push(Node::Clip {
+				clip: clips.find("clip0"),
+				time: 0.75,
+				from: 0.25,
+				looping: false,
+			});
+			let two = tree.push(Node::Clip {
+				clip: clips.find("clip1"),
+				time: 0.75,
+				from: 0.25,
+				looping: false,
+			});
+
+			tree.push(Node::Mask {
+				first: one,
+				second: two,
+				branch,
+				weight: 1.0,
+			});
+			tree.motion = 0;
+
+			let went = travel(&tree, &clips, skeletons.bones(rig));
+
+			assert!(
+				(went.moved.x - want).abs() < 1.0e-5,
+				"a branch at bone {branch}: {}",
+				went.moved
+			);
+		}
+	}
+
+	#[test]
+	fn of_two_tracks_turning_the_root_the_later_one_turns_the_character() {
+		// the rule sampling has, and the travel has to keep it or the pose and
+		// the character would disagree about which way the walker faces.
+		let clip = ClipData {
+			tracks: vec![turning(&[0.0, 1.0], &[0.0, 30.0]), turning(&[0.0, 1.0], &[0.0, 60.0])],
+		};
+		let went = clip.travel("root", rooted(), 0.0, 1.0, false);
+
+		assert!(
+			(went.turned - 60.0_f32.to_radians()).abs() < 1.0e-5,
+			"the second track's sixty degrees: {}",
+			went.turned
+		);
+	}
+
+	#[test]
+	fn a_tree_that_cannot_be_worked_out_carries_nothing_as_it_poses_nothing() {
+		// working such a tree out leaves the pose at rest, so a travel out of it
+		// would carry a character the pose says is standing still.
+		let (clips, skeletons, rig) = walking(vec![striding()]);
+		let bones = skeletons.bones(rig);
+		let leaf = Node::Clip {
+			clip: clips.find("clip0"),
+			time: 0.75,
+			from: 0.25,
+			looping: false,
+		};
+		let mut crowded = Tree::new();
+
+		for _ in 0..=MAX_NODES {
+			crowded.push(leaf);
+		}
+
+		crowded.root = 0;
+		crowded.motion = 0;
+
+		assert_eq!(travel(&crowded, &clips, bones), Travel::NONE, "one node too many");
+
+		let backwards = Tree {
+			nodes: vec![Node::Blend { first: 1, second: 1, weight: 0.5 }, leaf],
+			root: 1,
+			motion: 0,
+		};
+
+		assert_eq!(
+			travel(&backwards, &clips, bones),
+			Travel::NONE,
+			"a node read before it is written"
+		);
+	}
+
+	#[test]
+	fn a_clock_that_is_no_number_carries_nothing() {
+		let clip = striding();
+
+		for (from, to) in [(f32::NAN, 0.5), (0.25, f32::INFINITY)] {
+			assert_eq!(
+				clip.travel("root", rooted(), from, to, true),
+				Travel::NONE,
+				"{from} to {to}"
+			);
+		}
+
+		// a bone with no name is moved by no track, not even one with no name
+		// either, because a binding finds no bone for an empty name.
+		let mut nameless = striding();
+
+		nameless.tracks[0].bone = String::new();
+
+		assert_eq!(
+			nameless.travel("", rooted(), 0.25, 0.75, true),
+			Travel::NONE,
+			"nor a bone with no name"
+		);
+		assert_eq!(
+			ClipData::default().travel("root", rooted(), 0.25, 0.75, true),
+			Travel::NONE,
+			"nor a clip of no length"
+		);
+	}
+
+	#[test]
+	fn a_clock_set_a_thousand_laps_on_counts_no_more_laps_than_the_bound() {
+		let went = striding().travel("root", rooted(), 0.25, 1000.25, true);
+		let bound = f32::from(u8::try_from(MAX_LAPS).expect("a small number"));
+
+		assert!(
+			went.moved
+				.abs_diff_eq(Vec3::new(3.0 * bound, 0.0, 0.1 * bound), 1.0e-2),
+			"{MAX_LAPS} laps' worth rather than a thousand, and an answer rather than a hang: {}",
+			went.moved
+		);
+	}
+
+	#[test]
+	fn travels_follow_one_another_undo_and_carry_what_they_are_laid_inside() {
+		let one = Travel {
+			moved: Vec3::new(1.0, 0.0, 2.0),
+			turned: 0.5,
+		};
+		let two = Travel {
+			moved: Vec3::new(-0.5, 0.0, 0.25),
+			turned: -1.25,
+		};
+		let both = one.then(two);
+		let want =
+			Vec3::new(1.0, 0.0, 2.0) + Quat::from_rotation_y(0.5) * Vec3::new(-0.5, 0.0, 0.25);
+
+		assert!(
+			both.moved.abs_diff_eq(want, 1.0e-6),
+			"the second turned by the first: {}",
+			both.moved
+		);
+		assert!((both.turned + 0.75).abs() < 1.0e-6, "and the turns added: {}", both.turned);
+
+		let undone = both.then(both.inverse());
+
+		assert!(
+			undone.moved.abs_diff_eq(Vec3::ZERO, 1.0e-6) && undone.turned.abs() < 1.0e-6,
+			"undone: {undone:?}"
+		);
+
+		let at = Transform {
+			position: Vec3::new(3.0, 1.0, -2.0),
+			rotation: Quat::from_rotation_y(1.0),
+			scale: Vec3::splat(2.0),
+		};
+		let there = one.applied(at);
+
+		assert!(
+			there
+				.position
+				.abs_diff_eq(at.position + at.rotation * Vec3::new(2.0, 0.0, 4.0), 1.0e-5),
+			"the way it faces and as far as it is scaled: {}",
+			there.position
+		);
+
+		for axis in [Vec3::X, Vec3::Z] {
+			assert!(
+				(there.rotation * axis).abs_diff_eq(Quat::from_rotation_y(1.5) * axis, 1.0e-5),
+				"turned on by half a radian"
+			);
+		}
+
+		assert_eq!(one.lerp(two, 0.0), one, "a blend at nought is the first, exactly");
+		assert_eq!(one.lerp(two, 1.0), two, "and at one the second");
+
+		// turns whose difference rounds, so a blend that worked the far end out
+		// rather than taking it would land an ulp away from it.
+		let (near, far) =
+			(Travel { moved: Vec3::X, turned: 0.2 }, Travel { moved: Vec3::Z, turned: -0.4 });
+
+		assert_eq!(near.lerp(far, 1.0), far, "the far end, not something next to it");
+		assert!((one.lerp(two, 0.5).turned + 0.375).abs() < 1.0e-6, "and halfway is halfway");
+	}
+
+	#[test]
+	fn a_character_carried_by_its_root_moves_exactly_as_the_clip_does_in_place() {
+		// the equality the whole of root motion rests on. The pose pinned and the
+		// character carried by its travel, against the same clip played in place
+		// on a character that never moves: at every step the one is the other
+		// moved by the same rigid motion, the one between them at the start. So
+		// nothing slides, nothing drifts and nothing turns wrong.
+		let (clips, skeletons, rig) = walking(vec![curving()]);
+		let bones = skeletons.bones(rig);
+		let clip = clips.find("clip0");
+		let mut standing = Transform::IDENTITY;
+		let mut first = None;
+
+		for step in 0..=60_u8 {
+			let from = f32::from(step.saturating_sub(1)) / 60.0;
+			let time = f32::from(step) / 60.0;
+			let pinning = carried_by_root(clip, from, time, false);
+			let mut in_place = pinning.clone();
+
+			in_place.motion = NO_BONE;
+			standing = travel(&pinning, &clips, bones).applied(standing);
+
+			let gap = standing.matrix()
+				* foot_at(&pinning, &clips, rig, bones)
+				* foot_at(&in_place, &clips, rig, bones).inverse();
+			let start = *first.get_or_insert(gap);
+
+			assert!(gap.abs_diff_eq(start, 1.0e-4), "step {step}: {gap:?} against {start:?}");
+		}
+
+		assert!(
+			standing.position.length() > 1.0,
+			"and it did go somewhere: {}",
+			standing.position
+		);
+	}
+
+	#[test]
+	fn a_world_says_how_far_a_tree_carries_a_pose_without_binding_anything() {
+		let mut world = World::new();
+		let rig = world.skeletons.insert("walker", walker());
+		let clip = world.clips.insert("stride", striding());
+		let pose = world
+			.poses
+			.spawn(Pose::resting(rig, world.skeletons.bones(rig)));
+		let tree = carried_by_root(clip, 0.25, 0.75, false);
+		let went = world.travel(pose, &tree);
+
+		assert!(
+			went.moved
+				.abs_diff_eq(Vec3::new(1.5, 0.0, -0.03), 1.0e-5),
+			"{}",
+			went.moved
+		);
+		assert_eq!(
+			world.clips.bindings(),
+			0,
+			"asked through a shared borrow, so nothing was bound and nothing had to be"
+		);
+		assert!(world.animate(pose, &tree), "the pose is there");
+
+		let root = world.poses.get(pose).expect("still there").locals[0];
+
+		assert!(
+			root.position
+				.abs_diff_eq(Vec3::new(0.25, 0.93, -0.5), 1.0e-6),
+			"and working the tree out into the pose pins the root over its rest: {}",
+			root.position
+		);
+
+		world.poses.despawn(pose);
+
+		assert_eq!(
+			world.travel(pose, &tree),
+			Travel::NONE,
+			"a pose that is gone is carried nowhere"
+		);
+	}
+
+	#[test]
+	fn a_prediction_replaying_its_commands_twice_is_carried_the_same_way_twice() {
+		// what a client does after a correction: run the commands the host has
+		// not confirmed again, from the same state. The travel is asked from
+		// inside the replay, which holds the world, and it keeps nothing between
+		// two calls, so the second run cannot tell it is the second. The run
+		// crosses the clip's seam on the way.
+		let mut world = World::new();
+		let rig = world.skeletons.insert("walker", walker());
+		let clip = world.clips.insert("curve", curving());
+		let pose = world
+			.poses
+			.spawn(Pose::resting(rig, world.skeletons.bones(rig)));
+		let commands: Vec<Command> = (0..48_u32)
+			.map(|number| Command {
+				step: 100 + u64::from(number) * 2,
+				number,
+				buttons: 0,
+				yaw: 0.0,
+				pitch: 0.0,
+			})
+			.collect();
+		let start =
+			Motion::new(Vec3::new(4.0, 0.0, -3.0), Vec3::ZERO, Vec3::splat(0.3), 1.0 / 60.0);
+		let facing = Quat::from_rotation_y(0.4);
+		let run = || {
+			let (mut clock, mut toward) = (0.1_f32, facing);
+			let moved =
+				character::replay(&world, &start, 98, &commands, |_command, _before, motion| {
+					let went = world
+						.travel(pose, &carried_by_root(clip, clock, clock + motion.dt, true));
+					let there =
+						went.applied(Transform { rotation: toward, ..Transform::IDENTITY });
+
+					motion.velocity = there.position / motion.dt;
+					toward = there.rotation;
+					clock += motion.dt;
+				});
+
+			(moved.position, toward, clock)
+		};
+		let (once, twice) = (run(), run());
+
+		assert!(once.0.abs_diff_eq(twice.0, 0.0), "to the bit: {} against {}", once.0, twice.0);
+		assert!(once.1.abs_diff_eq(twice.1, 0.0), "and facing the same way to the bit");
+		assert!(once.2 > 1.0, "the run crossed the seam, at {}", once.2);
+
+		let whole = world.travel(pose, &carried_by_root(clip, 0.1, once.2, true));
+		let there = whole.applied(Transform {
+			position: start.position,
+			rotation: facing,
+			scale: Vec3::ONE,
+		});
+
+		assert!(
+			once.0.abs_diff_eq(there.position, 1.0e-3),
+			"and it went where one travel over the whole run says: {} against {}",
+			once.0,
+			there.position
 		);
 	}
 }

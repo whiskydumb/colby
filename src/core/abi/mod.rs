@@ -60,8 +60,8 @@ pub mod water;
 
 pub use self::{
 	anim::{
-		Channel, Clip, ClipData, ClipId, Clips, Interpolation, MAX_KEYS, MAX_NODES, MAX_TRACKS,
-		NO_BONE, Node, Track, Tree,
+		Channel, Clip, ClipData, ClipId, Clips, Interpolation, MAX_KEYS, MAX_LAPS, MAX_NODES,
+		MAX_TRACKS, NO_BONE, Node, Track, Travel, Tree,
 	},
 	audio::{
 		Category, Listener, MAX_VOICES, Mix, Sound, SoundData, SoundId, Sounds, Voice, VoiceId,
@@ -116,7 +116,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 65;
+pub const ABI_VERSION: u32 = 66;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -902,6 +902,29 @@ impl World {
 			blending,
 			&mut posed.locals,
 		)
+	}
+
+	/// How far a blend tree carries its character this step.
+	///
+	/// The travel of the tree's [`Tree::motion`] bone over the ground, which
+	/// [`animate`](Self::animate) pins where its rest stands: the two together
+	/// are the clip as it was authored, and this half is for the game to move
+	/// its character by, through [`character::move_and_slide`] so that a wall
+	/// still stops it. Nothing is written and nothing is bound. The motion
+	/// bone's tracks are found by its name, so this takes `&self` and may be
+	/// asked from inside [`character::replay`], which holds the world while it
+	/// runs.
+	///
+	/// @param pose - the character's pose, for the skeleton it names
+	/// @param tree - the tree this step works out into that pose
+	/// @return how far it carried the character, or no travel for a stale pose
+	#[must_use]
+	pub fn travel(&self, pose: PoseId, tree: &Tree) -> Travel {
+		let Some(posed) = self.poses.get(pose) else {
+			return Travel::NONE;
+		};
+
+		anim::travel(tree, &self.clips, self.skeletons.bones(posed.skeleton))
 	}
 
 	/// Puts a ragdoll's bodies where the pose says its bones are.

@@ -49,6 +49,8 @@ mod clip;
 mod geometry;
 mod material;
 mod skin;
+#[cfg(test)]
+mod walk;
 
 pub use self::{
 	clip::{Clip, Clips},
