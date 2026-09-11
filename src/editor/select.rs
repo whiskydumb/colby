@@ -22,8 +22,8 @@
 use colby_asset::compile::Kind;
 use colby_core::{
 	abi::{
-		Body, BodyId, BodyKind, EntityId, JointId, MaterialId, MeshId, ModelId, Renderable,
-		Shape, Transform, Water, World, material, scene,
+		Body, BodyId, BodyKind, Decal, EntityId, JointId, MaterialId, MeshId, ModelId,
+		Renderable, Shape, Transform, Water, World, material, scene,
 	},
 	glam::Vec3,
 };
@@ -1036,6 +1036,37 @@ pub(crate) fn water(world: &mut World, at: Vec3) -> Vec<Pick> {
 	vec![Pick::Entity(entity)]
 }
 
+/// A decal, standing where the middle of the view meets the ground and turned
+/// to throw its picture straight down.
+///
+/// A unit across and a quarter deep, which puts the ground under the pointer in
+/// the middle of its box; no mesh, so nothing is drawn for it but what it
+/// paints; and the default material under a white tint, so what it paints is
+/// white until it is given a material of its own. @ref
+/// `colby_core::abi::decal`.
+///
+/// @param world - the world to put it in
+/// @param at - where the pointer is looking
+/// @return what was made, for the selection; empty when there was no room
+pub(crate) fn decal(world: &mut World, at: Vec3) -> Vec<Pick> {
+	let standing = Transform {
+		position: at,
+		// a quarter turn about x takes the box's -z, the way it throws, to -y
+		rotation: colby_core::glam::Quat::from_rotation_x(-core::f32::consts::FRAC_PI_2),
+		scale: Vec3::new(1.0, 1.0, 0.25),
+	};
+	let entity = world.entities.spawn_at(standing);
+
+	if !entity.is_some() {
+		return Vec::new();
+	}
+
+	world.entities.set_decal(entity, Decal::BOX);
+	world.entities.set_name(entity, "decal");
+
+	vec![Pick::Entity(entity)]
+}
+
 /// What a row of the asset browser becomes when it is dropped into the
 /// world: a scene laid down there, a mesh as an entity standing there, a
 /// model as an entity with a child per piece. Anything else - a texture, a
@@ -1246,6 +1277,40 @@ mod tests {
 			world.materials.find(material::WATER_NAME),
 			"in the one built-in material that is not solid"
 		);
+	}
+
+	#[test]
+	fn a_decal_is_a_box_turned_to_throw_straight_down_and_nothing_else() {
+		let mut world = World::new();
+		let Some(Pick::Entity(entity)) = decal(&mut world, Vec3::new(3.0, -1.0, 0.0))
+			.first()
+			.copied()
+		else {
+			panic!("a decal is picked by its entity");
+		};
+
+		assert_eq!(world.entities.decal(entity).copied(), Some(Decal::BOX), "it paints");
+
+		let at = world
+			.entities
+			.transform(entity)
+			.copied()
+			.expect("it stands somewhere");
+
+		assert!(
+			(at.rotation * Vec3::NEG_Z - Vec3::NEG_Y).length() < 1.0e-5,
+			"and throws its picture straight down"
+		);
+		assert_eq!(at.position, Vec3::new(3.0, -1.0, 0.0), "from where it was asked for");
+
+		let look = world
+			.entities
+			.renderable(entity)
+			.copied()
+			.expect("it has a look");
+
+		assert_eq!(look.mesh, MeshId::NONE, "with nothing drawn for it but what it paints");
+		assert_eq!(world.bodies.iter().count(), 0, "and no body");
 	}
 
 	#[test]

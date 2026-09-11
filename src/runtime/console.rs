@@ -614,6 +614,14 @@ fn install_render(world: &mut World) {
 		Value::Float(colby_engine::scene::DEFAULT_LAMPS),
 		"how many of the nearest point and cone lights a frame draws with",
 	);
+	// how many decals one frame may carry, on the lamps' terms: a ceiling on the
+	// array, not saved, and nought is the picture as it was before there were
+	// decals, which is what the variable is for.
+	world.cvars.var(
+		colby_engine::decal::DECALS,
+		Value::Float(colby_engine::decal::DEFAULT_DECALS),
+		"how many of the nearest decals a frame paints with",
+	);
 	// how many samples a pixel of the world is drawn with. **Saved**, unlike
 	// the two above and like `r.backend`: how much a machine can afford to
 	// spend on smooth edges is a property of the machine rather than of a

@@ -317,8 +317,8 @@ pub const fn rgb(red: f32, green: f32, blue: f32) -> Vec3 { Vec3::new(red, green
 mod tests {
 	use colby_core::{
 		abi::{
-			Material, MeshData, MeshId, Pose, PoseId, Post, Renderable, SkinVertex, Sky, SkyKind,
-			Texel, TextureData, ToneMap, Transform,
+			Decal, EntityId, Material, MeshData, MeshId, Pose, PoseId, Post, Renderable,
+			SkinVertex, Sky, SkyKind, Texel, TextureData, ToneMap, Transform,
 			cvar::Value,
 			material::{Blend, MaterialId},
 			mesh,
@@ -2454,6 +2454,556 @@ f 1 4 5
 		assert!(left < 60, "and the half it leans away is nearly out of the light: {left}");
 	}
 
+	/// How wide the view is at the floor, in world units.
+	fn view_across(world: &World) -> f32 { (world.camera.fov_y / 2.0).tan() * HEIGHT * 2.0 }
+
+	/// A green floor filling a square view from straight above, lit by the
+	/// ambient alone, so that what a pixel is is what the surface is.
+	fn floor_below() -> (World, EntityId) {
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(1.0);
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+
+		let across = view_across(&world);
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::new(MeshId::QUAD, rgb(0.1, 0.9, 0.1)));
+
+		(world, floor)
+	}
+
+	/// A decal of this material thrown straight down with its top towards `-z`,
+	/// its box this wide either way and a unit deep, its middle this far below
+	/// the floor.
+	fn thrown_down(
+		world: &mut World,
+		material: MaterialId,
+		order: i32,
+		side: f32,
+		below: f32,
+	) -> EntityId {
+		let decal = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, -below, 0.0),
+			rotation: Quat::from_rotation_x(-core::f32::consts::FRAC_PI_2),
+			scale: Vec3::new(side, side, 1.0),
+		});
+
+		world.entities.set_renderable(decal, Renderable {
+			material,
+			color: Vec3::ONE,
+			..Renderable::NOTHING
+		});
+		world
+			.entities
+			.set_decal(decal, Decal { order, ..Decal::BOX });
+
+		decal
+	}
+
+	/// A decal over the middle of the floor, half the view across and turned to
+	/// throw straight down: the square in the middle of the picture from a
+	/// quarter of the way across it to three quarters.
+	fn daubed(world: &mut World, material: MaterialId, order: i32) -> EntityId {
+		let half = view_across(world) * 0.5;
+
+		thrown_down(world, material, order, half, 0.0)
+	}
+
+	/// A decal over the whole of the floor the view holds.
+	fn covered(world: &mut World, material: MaterialId) -> EntityId {
+		let across = view_across(world);
+
+		thrown_down(world, material, 0, across, 0.0)
+	}
+
+	/// A flat red material, which is a decal throwing its tint alone.
+	fn red(world: &mut World) -> MaterialId {
+		world
+			.materials
+			.insert("test/red", Material::colored(rgb(1.0, 0.05, 0.05)))
+	}
+
+	#[test]
+	fn a_decal_paints_the_floor_inside_its_box_and_nothing_outside_it() {
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let (mut world, _) = floor_below();
+		let paint = red(&mut world);
+		daubed(&mut world, paint, 0);
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let (inside, outside) =
+			(image.pixel(SQUARE / 2, SQUARE / 2), image.pixel(SQUARE / 8, SQUARE / 2));
+
+		assert_eq!(dominant(inside), 0, "the middle of the floor is under the decal: {inside:?}");
+		assert_eq!(dominant(outside), 1, "and beside its box the floor is green: {outside:?}");
+		assert_eq!(capture.scene_mut().drawn().decals, 1, "and the frame says it carried one");
+	}
+
+	#[test]
+	fn a_frame_that_carries_no_decals_is_the_picture_there_would_be_without_any() {
+		// the negative control as a test: the budget at nought and the decal left
+		// out of the world are one picture to the byte
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let (mut bare, _) = floor_below();
+		let without = capture
+			.shoot(&mut bare)
+			.expect("the capture renders");
+
+		let (mut world, _) = floor_below();
+		let paint = red(&mut world);
+		daubed(&mut world, paint, 0);
+		world
+			.cvars
+			.var(crate::decal::DECALS, Value::Float(0.0), "");
+
+		let none = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert!(none.pixels == without.pixels, "a frame that carries none paints nothing");
+
+		world.cvars.set(crate::decal::DECALS, "1");
+		let one = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert!(
+			one.pixels != without.pixels,
+			"and one it carries is seen, which says the two above are not alike by accident"
+		);
+	}
+
+	#[test]
+	fn a_floor_that_takes_no_decals_and_a_hidden_decal_both_leave_the_floor_alone() {
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let (mut bare, _) = floor_below();
+		let without = capture
+			.shoot(&mut bare)
+			.expect("the capture renders");
+
+		let (mut refusing, floor) = floor_below();
+		let paint = red(&mut refusing);
+		daubed(&mut refusing, paint, 0);
+		assert!(refusing.entities.set_takes_decals(floor, false));
+
+		let refused = capture
+			.shoot(&mut refusing)
+			.expect("the capture renders");
+
+		assert!(refused.pixels == without.pixels, "a floor that takes no decals is the floor");
+
+		let (mut hiding, _) = floor_below();
+		let paint = red(&mut hiding);
+		let decal = daubed(&mut hiding, paint, 0);
+		assert!(hiding.entities.set_hidden(decal, true));
+
+		let hidden = capture
+			.shoot(&mut hiding)
+			.expect("the capture renders");
+
+		assert!(hidden.pixels == without.pixels, "and a hidden decal paints nothing at all");
+	}
+
+	#[test]
+	fn of_two_decals_over_one_point_the_one_of_the_higher_order_is_on_top() {
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let (mut world, _) = floor_below();
+		let paint = red(&mut world);
+		let blue = world
+			.materials
+			.insert("test/blue", Material::colored(rgb(0.05, 0.05, 1.0)));
+		let under = daubed(&mut world, paint, 0);
+		daubed(&mut world, blue, 1);
+
+		let first = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SQUARE / 2, SQUARE / 2);
+
+		assert_eq!(dominant(first), 2, "the blue one, of the higher order, is on top: {first:?}");
+
+		// the discriminating half: by slot alone the red one is always under
+		assert!(
+			world
+				.entities
+				.set_decal(under, Decal { order: 2, ..Decal::BOX })
+		);
+		let second = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SQUARE / 2, SQUARE / 2);
+
+		assert_eq!(
+			dominant(second),
+			0,
+			"and raising the red one's order puts it on top: {second:?}"
+		);
+	}
+
+	#[test]
+	fn a_decal_picture_lands_the_right_way_up_and_the_right_way_round() {
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let (mut world, _) = floor_below();
+		let picture = world
+			.textures
+			.insert("test/quadrants", quadrants());
+		let material = world
+			.materials
+			.insert("test/quadrants", Material::textured(picture));
+		daubed(&mut world, material, 0);
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		// the decal covers the middle half of the picture, so the middle of each
+		// quarter of it is three eighths or five eighths of the way across. Its
+		// top, +y, is thrown towards -z, which from above is the top of the
+		// screen, and its right edge is +x, which is the screen's right.
+		let (near, far) = (SQUARE * 3 / 8, SQUARE * 5 / 8);
+		let quarters = [
+			((near, near), 0, "the picture's first texel is at the top left"),
+			((far, near), 1, "the second is to the right of it"),
+			((near, far), 2, "the third is below the first"),
+		];
+
+		for ((x, y), channel, why) in quarters {
+			let pixel = image.pixel(x, y);
+
+			assert_eq!(dominant(pixel), channel, "{why}: {pixel:?}");
+		}
+
+		let white = image.pixel(far, far);
+
+		assert!(
+			white[0].abs_diff(white[1]) < 12 && white[1].abs_diff(white[2]) < 12,
+			"the fourth is white, so no channel wins: {white:?}"
+		);
+	}
+
+	#[test]
+	fn a_decal_normal_map_turns_the_light_the_floor_under_it_catches() {
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let (mut world, floor) = floor_below();
+		// down and towards -x, so a surface leaning into +x catches all of it and
+		// one leaning into -x catches none, the floor's own map test's light
+		world.light = Vec3::new(-1.0, -1.0, 0.0).normalize();
+		world.ambient = Vec3::ZERO;
+		world
+			.entities
+			.set_renderable(floor, Renderable::new(MeshId::QUAD, Vec3::ONE));
+
+		let normals = world
+			.textures
+			.insert("test/leaning", leaning_normals());
+		let material = world
+			.materials
+			.insert("test/leaning", Material::DEFAULT.bumped(normals));
+		daubed(&mut world, material, 0);
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let (left, right) = (
+			brightness(image.pixel(SQUARE * 3 / 8, SQUARE / 2)),
+			brightness(image.pixel(SQUARE * 5 / 8, SQUARE / 2)),
+		);
+
+		assert!(
+			right > left * 3,
+			"the half of the decal whose map leans into the light is much brighter: {right} \
+			 against {left}"
+		);
+	}
+
+	#[test]
+	fn a_decal_fades_on_a_face_edge_on_to_it_by_as_much_as_it_says() {
+		// a wall facing the camera, and a decal thrown straight down through it:
+		// the wall's face is edge on to the way the picture is thrown
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(1.0);
+
+		let wall = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(4.0, 4.0, 0.1),
+		});
+		world
+			.entities
+			.set_renderable(wall, Renderable::new(MeshId::CUBE, rgb(0.1, 0.9, 0.1)));
+
+		let paint = red(&mut world);
+		let decal = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::from_rotation_x(-core::f32::consts::FRAC_PI_2),
+			scale: Vec3::splat(2.0),
+		});
+		world
+			.entities
+			.set_renderable(decal, Renderable { material: paint, ..Renderable::NOTHING });
+		world.entities.set_decal(decal, Decal::BOX);
+
+		let faded = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert_eq!(dominant(faded), 1, "edge on, the default fade paints nothing: {faded:?}");
+
+		world
+			.entities
+			.set_decal(decal, Decal { fade: 0.0, ..Decal::BOX });
+		let painted = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert_eq!(dominant(painted), 0, "and a fade of nought paints it anyway: {painted:?}");
+	}
+
+	#[test]
+	fn a_decal_fades_towards_the_two_faces_its_picture_is_thrown_between() {
+		// the floor through the middle of the box, and then nine tenths of the
+		// way from the middle to the face above it: still painted there, and
+		// visibly less, so that a decal does not end in a hard line on
+		// something poking through one of those faces
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let shoot = |capture: &mut Capture, below: f32| {
+			let (mut world, _) = floor_below();
+			let paint = red(&mut world);
+			let half = view_across(&world) * 0.5;
+			thrown_down(&mut world, paint, 0, half, below);
+
+			capture
+				.shoot(&mut world)
+				.expect("the capture renders")
+				.pixel(SQUARE / 2, SQUARE / 2)
+		};
+
+		let middle = shoot(&mut capture, 0.0);
+		// the box is a unit deep, so a middle 0.45 below the floor leaves the
+		// floor 0.45 of the way from it to the face that looks up
+		let near_a_face = shoot(&mut capture, 0.45);
+
+		assert_eq!(dominant(middle), 0, "through the middle the decal paints: {middle:?}");
+		assert_eq!(dominant(near_a_face), 0, "and near a face it still does: {near_a_face:?}");
+		assert!(
+			near_a_face[1] > middle[1] + 40,
+			"but the floor's green comes back through it there: {near_a_face:?} against \
+			 {middle:?}"
+		);
+	}
+
+	/// A normal map every texel of which leans down the picture by forty-five
+	/// degrees: towards where `v` grows, on a face and in a decal's picture
+	/// alike.
+	fn leaning_down_the_picture() -> TextureData {
+		const SIDE: u32 = 4;
+		let mut base = Vec::new();
+		for _ in 0..SIDE * SIDE {
+			// 217 is +0.707 folded into a byte and 128 is zero, as in
+			// `leaning_normals`
+			base.extend_from_slice(&[128, 217, 217, 255]);
+		}
+
+		TextureData {
+			width: SIDE,
+			height: SIDE,
+			texel: Texel::Rgba8Unorm,
+			levels: colby_asset::texture::build_chain(SIDE, SIDE, base, Texel::Rgba8Unorm)
+				.expect("a chain of four texels a side builds"),
+		}
+	}
+
+	#[test]
+	fn a_map_thrown_by_a_decal_turns_a_floor_as_the_same_map_laid_on_it_does() {
+		// the quad's v grows towards +z, and so does the v of a picture thrown
+		// straight down with its top towards -z. A light falling towards -z
+		// catches a surface leaning into +z better than a flat one, so the map
+		// laid on the floor lights it more than no map does, and thrown onto a
+		// plain floor by a decal it has to light it the same
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let shoot = |capture: &mut Capture, laid: bool, thrown: bool| {
+			let mut world = looking_world();
+			world.light = Vec3::new(0.0, -1.0, -2.0).normalize();
+			world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+
+			let normals = world
+				.textures
+				.insert("test/down", leaning_down_the_picture());
+			let bumped = world
+				.materials
+				.insert("test/down", Material::DEFAULT.bumped(normals));
+
+			let across = view_across(&world);
+			let floor = world.entities.spawn_at(Transform {
+				position: Vec3::ZERO,
+				rotation: Quat::IDENTITY,
+				scale: Vec3::new(across, 1.0, across),
+			});
+			let look = if laid {
+				Renderable::of(MeshId::QUAD, bumped, Vec3::ONE)
+			} else {
+				Renderable::new(MeshId::QUAD, Vec3::ONE)
+			};
+			world.entities.set_renderable(floor, look);
+
+			if thrown {
+				covered(&mut world, bumped);
+			}
+
+			brightness(
+				capture
+					.shoot(&mut world)
+					.expect("the capture renders")
+					.pixel(SQUARE / 2, SQUARE / 2),
+			)
+		};
+
+		let flat = shoot(&mut capture, false, false);
+		let laid = shoot(&mut capture, true, false);
+		let thrown = shoot(&mut capture, false, true);
+
+		assert!(
+			laid > flat + 60,
+			"laid on the floor, the map leans it into the light: {laid} against {flat}"
+		);
+		assert!(
+			thrown.abs_diff(laid) <= 3,
+			"and thrown by a decal it leans it the same way by as much: {thrown} against {laid}"
+		);
+	}
+
+	/// A dark floor filling a square view from straight above, under a light
+	/// falling straight down: the middle of the picture is where a smooth
+	/// surface shows the light back to the eye.
+	///
+	/// @return the world, and the floor's own material
+	fn floor_under_the_light() -> (World, Material) {
+		let mut world = looking_world();
+		world.light = Vec3::NEG_Y;
+		world.ambient = Vec3::splat(0.1);
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+
+		let dark = Material::colored(Vec3::splat(0.3));
+		let material = world.materials.insert("test/dark", dark);
+		let across = view_across(&world);
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(MeshId::QUAD, material, Vec3::ONE));
+
+		(world, dark)
+	}
+
+	#[test]
+	fn a_decal_lays_the_roughness_and_the_metal_of_its_material_on_a_surface() {
+		// one decal over the whole floor at a time: of the floor's own
+		// material, which has to leave it as it was, then a smoother one and a
+		// metal one, each of which has to change what the light does there. The
+		// smoother one is not very smooth: below a roughness of about 0.27 the
+		// floor under `distribution_ggx`'s denominator flattens the highlight's
+		// peak, so a mirror-like decal would barely show where a middling one
+		// shows plainly
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let shoot = |capture: &mut Capture, surface: Option<fn(Material) -> Material>| {
+			let (mut world, dark) = floor_under_the_light();
+			if let Some(surface) = surface {
+				let material = world
+					.materials
+					.insert("test/surface", surface(dark));
+				covered(&mut world, material);
+			}
+
+			capture
+				.shoot(&mut world)
+				.expect("the capture renders")
+				.pixel(SQUARE / 2, SQUARE / 2)
+		};
+
+		let bare = shoot(&mut capture, None);
+		let same = shoot(&mut capture, Some(|dark| dark));
+		let smooth = shoot(&mut capture, Some(|dark| Material { roughness: 0.35, ..dark }));
+		let metal = shoot(&mut capture, Some(|dark| Material { metallic: 1.0, ..dark }));
+
+		assert_eq!(same, bare, "a decal of the floor's own material leaves it as it was");
+		assert!(
+			brightness(smooth).abs_diff(brightness(bare)) > 30,
+			"a smoother one shows the light back where the floor did not: {smooth:?} against \
+			 {bare:?}"
+		);
+		assert!(
+			brightness(metal).abs_diff(brightness(bare)) > 30,
+			"and a metal one takes the floor's diffuse away: {metal:?} against {bare:?}"
+		);
+	}
+
+	#[test]
+	fn a_decal_picture_wider_than_the_atlas_takes_whole_is_painted_from_a_smaller_level() {
+		// twice as wide as the widest picture the atlas takes whole, so it is
+		// packed from its second level on: what lands is the picture, or
+		// nothing at all if a level of it went where it does not fit
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let (mut world, _) = floor_below();
+		let (wide, tall) = (2048, 8);
+		let mut base = Vec::new();
+		for _ in 0..wide * tall {
+			base.extend_from_slice(&[0xFF, 0x10, 0x10, 0xFF]);
+		}
+		let picture = world.textures.insert("test/wide", TextureData {
+			width: wide,
+			height: tall,
+			texel: Texel::Rgba8Srgb,
+			levels: colby_asset::texture::build_chain(wide, tall, base, Texel::Rgba8Srgb)
+				.expect("a chain of a picture that size builds"),
+		});
+		let material = world
+			.materials
+			.insert("test/wide", Material::textured(picture));
+		daubed(&mut world, material, 0);
+
+		let middle = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SQUARE / 2, SQUARE / 2);
+
+		assert_eq!(dominant(middle), 0, "the picture's red lands on the green floor: {middle:?}");
+	}
+
 	/// Two texels side by side, red then blue, with no chain under them.
 	fn halves() -> TextureData {
 		TextureData {
@@ -2858,7 +3408,7 @@ f 1 4 5
 	}
 
 	/// A cube a little bigger than the unit one, standing somewhere in a color.
-	fn cube_at(world: &mut World, at: Vec3, color: Vec3) -> colby_core::abi::EntityId {
+	fn cube_at(world: &mut World, at: Vec3, color: Vec3) -> EntityId {
 		let id = world.entities.spawn_at(Transform {
 			position: at,
 			rotation: Quat::IDENTITY,

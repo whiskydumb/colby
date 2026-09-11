@@ -385,6 +385,9 @@ struct Table {
 	/// The most lamps any measured frame carried to the shader.
 	lamps: usize,
 
+	/// The most decals any measured frame carried to the shader.
+	decals: usize,
+
 	/// How many render passes each frame recorded, and `None` before the first
 	/// one.
 	passes: Option<u32>,
@@ -441,6 +444,7 @@ impl Table {
 			cast: 0,
 			hidden: 0,
 			lamps: 0,
+			decals: 0,
 			passes: None,
 			steady: true,
 		}
@@ -462,6 +466,7 @@ impl Table {
 		self.cast = self.cast.max(counts.drawn.cast);
 		self.hidden = self.hidden.max(counts.drawn.hidden);
 		self.lamps = self.lamps.max(counts.drawn.lamps);
+		self.decals = self.decals.max(counts.drawn.decals);
 
 		for (at, pass) in Pass::ALL.into_iter().enumerate() {
 			if let (Some(row), Some(took)) = (self.rows.get_mut(at), frame.pass(pass)) {
@@ -538,6 +543,7 @@ impl Table {
 			cast = self.cast,
 			hidden = self.hidden,
 			lamps = self.lamps,
+			decals = self.decals,
 			steady = self.steady,
 			gpu_us = self.slice(0..Pass::ALL.len()).as_micros(),
 			cpu_us = self
@@ -873,6 +879,7 @@ mod tests {
 				cast: 12,
 				hidden: 3,
 				lamps: 2,
+				decals: 5,
 			},
 		});
 
@@ -892,8 +899,8 @@ mod tests {
 		assert_eq!(table.ground, 2048, "and so is the terrain's size");
 		assert_eq!(table.walkable, 900, "and how much of it can be walked on");
 		assert_eq!(
-			(table.meshes, table.drawn, table.cast, table.hidden, table.lamps),
-			(10, 4, 12, 3, 2),
+			(table.meshes, table.drawn, table.cast, table.hidden, table.lamps, table.decals),
+			(10, 4, 12, 3, 2, 5),
 			"and how much of the world the frame drew"
 		);
 		assert_eq!(

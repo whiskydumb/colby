@@ -76,8 +76,8 @@
 use colby_core::{
 	Result,
 	abi::{
-		Body, BodyId, BodyKind, Camera, Emitter, EntityId, Field, Joint, JointKind, Layers,
-		Light, MeshId, Post, Renderable, Shape, Sky, Terrain, Transform,
+		Body, BodyId, BodyKind, Camera, Decal, Emitter, EntityId, Field, Joint, JointKind,
+		Layers, Light, MeshId, Post, Renderable, Shape, Sky, Terrain, Transform,
 		field::{self, Kind},
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
@@ -264,7 +264,16 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 		check(
 			entry,
 			&[names(Transform::FIELDS, &[]), names(Renderable::FIELDS, &[])],
-			&["name", "parent", "hidden", "light", "emitter", "terrain"],
+			&[
+				"name",
+				"parent",
+				"hidden",
+				"takes_decals",
+				"light",
+				"emitter",
+				"terrain",
+				"decal",
+			],
 			"an entity",
 		)?;
 
@@ -288,12 +297,10 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 
 		// by hand beside the name and the parent, for their reason: it is the
 		// entity's own, and no record's table has a row for it
-		let hidden = match entry.get("hidden") {
-			| None => false,
-			| Some(said) => said
-				.as_bool()
-				.ok_or_else(|| err!(Asset("an entity's hidden should be true or false")))?,
-		};
+		let hidden = said(entry, "hidden", false)?;
+		// and whether decals paint it, the same way and for the same reason,
+		// though it is the one whose usual answer is `true`
+		let takes_decals = said(entry, "takes_decals", true)?;
 
 		let mut transform = Transform::IDENTITY;
 		read(&mut transform, entry, Transform::FIELDS, "an entity")?;
@@ -338,6 +345,15 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			read(&mut terrain, ground, Terrain::FIELDS, "a terrain")?;
 		}
 
+		// and the decal under a key of its own, for the terrain's reason and
+		// with nothing by hand: a decal names no asset either, because what it
+		// throws is the entity's own material.
+		let mut decal = Decal::NONE;
+		if let Some(painting) = entry.get("decal") {
+			check(painting, &[names(Decal::FIELDS, &[])], &[], "a decal")?;
+			read(&mut decal, painting, Decal::FIELDS, "a decal")?;
+		}
+
 		things.push(Thing {
 			name,
 			slot: count(index, "a scene's records")?,
@@ -350,15 +366,35 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			emitter,
 			emitter_texture: picture,
 			terrain,
+			decal,
 			pose,
 			parent: NO_INDEX,
 			hidden,
+			takes_decals,
 		});
 	}
 
 	hang(&mut things, value)?;
 
 	Ok(things)
+}
+
+/// One of an entity's words that is true or false, or its usual answer
+/// when the source says nothing.
+///
+/// By hand beside the name and the parent, for their reason: each is the
+/// entity's own, and no record's table has a row for it.
+///
+/// @param entry - the entity's object
+/// @param key - which word
+/// @param usual - what an entity that says nothing is
+fn said(entry: &Value, key: &str, usual: bool) -> Result<bool> {
+	match entry.get(key) {
+		| None => Ok(usual),
+		| Some(said) => said
+			.as_bool()
+			.ok_or_else(|| err!(Asset("an entity's {key} should be true or false"))),
+	}
 }
 
 /// Resolves what every entity hangs off, once every name is known.
@@ -1125,6 +1161,11 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> R
 	if thing.hidden {
 		rows.put("hidden", "true".to_owned());
 	}
+	// and the word against decals on the same rule, whose usual answer is the
+	// other one, so what is written when it is said is `false`
+	if !thing.takes_decals {
+		rows.put("takes_decals", "false".to_owned());
+	}
 	put_place(&mut rows, &thing.transform, &Transform::IDENTITY, "an entity")?;
 
 	let look = Renderable {
@@ -1196,6 +1237,21 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> R
 		&Writing {
 			prefix: "terrain.",
 			what: "an entity's terrain",
+			skipped: &[],
+		},
+		|_| None,
+	)?;
+	// and the decal under its own key, on the ground's terms: nothing by hand,
+	// because a decal names no asset, and no object at all for an entity that
+	// paints nothing.
+	put_all(
+		&mut rows,
+		&thing.decal,
+		&Decal::NONE,
+		Decal::FIELDS,
+		&Writing {
+			prefix: "decal.",
+			what: "an entity's decal",
 			skipped: &[],
 		},
 		|_| None,
@@ -1607,8 +1663,8 @@ pub(crate) fn as_text(value: &str) -> String { json::quoted(value) }
 #[cfg(test)]
 mod tests {
 	use colby_core::abi::{
-		EmitterKind, LightKind, ShapeKind, SkyKind, SparkBlend, TerrainKind, TextureId, ToneMap,
-		Water, WaterKind, scene::Form,
+		DecalKind, EmitterKind, LightKind, ShapeKind, SkyKind, SparkBlend, TerrainKind,
+		TextureId, ToneMap, Water, WaterKind, scene::Form,
 	};
 
 	use super::*;
@@ -2870,6 +2926,68 @@ mod tests {
 	}
 
 	#[test]
+	fn a_decal_is_read_out_of_its_own_object_and_written_back_into_one() {
+		let scene = import(
+			r#"{ "entities": [
+				{ "name": "puddle", "material": "materials/puddle", "scale": [2, 2, 0.5],
+				  "decal": { "kind": "box", "fade": 0.25, "order": -3 } },
+				{ "name": "crate", "mesh": "cube", "takes_decals": false }
+			] }"#,
+		)
+		.expect("it is a scene");
+
+		let puddle = scene.things[0].decal;
+
+		assert_eq!(puddle.kind, DecalKind::Box, "the word is the kind");
+		assert!((puddle.fade - 0.25).abs() < 1.0e-6, "and the numbers beside it");
+		assert_eq!(puddle.order, -3, "an order below nought included");
+		assert_eq!(
+			scene.things[0].material, "materials/puddle",
+			"what it throws is the entity's own material, not a field of its own"
+		);
+		assert!(scene.things[0].takes_decals, "an entity that says nothing takes decals");
+		assert_eq!(scene.things[1].decal, Decal::NONE, "and a crate is not a decal");
+		assert!(!scene.things[1].takes_decals, "and says it takes none");
+
+		let text = export(&scene).expect("it writes back");
+
+		assert_eq!(
+			text.matches("\"decal\": {").count(),
+			1,
+			"the puddle alone gets the key: {text}"
+		);
+		assert_eq!(
+			text.matches("takes_decals").count(),
+			1,
+			"and the crate alone the word: {text}"
+		);
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_decal_field_nobody_declared_is_refused_by_name() {
+		let refused = import(r#"{ "entities": [ { "decal": { "splat": 2 } } ] }"#)
+			.expect_err("a decal has no splat");
+
+		assert!(
+			format!("{refused}").contains("splat"),
+			"and the message says which word it was: {refused}"
+		);
+	}
+
+	#[test]
+	fn a_takes_decals_that_is_not_true_or_false_is_refused_naming_the_field() {
+		let refused = import(r#"{ "entities": [ { "takes_decals": "no" } ] }"#)
+			.expect_err("a word is not a flag")
+			.to_string();
+
+		assert!(
+			refused.contains("takes_decals") && refused.contains("true or false"),
+			"got {refused}"
+		);
+	}
+
+	#[test]
 	fn a_terrain_field_nobody_declared_is_refused_by_name() {
 		let refused = import(r#"{ "entities": [ { "terrain": { "erosion": 2 } } ] }"#)
 			.expect_err("a terrain has no erosion");
@@ -2958,6 +3076,8 @@ mod tests {
 		fill(&mut look, Renderable::FIELDS, &[]);
 		let mut lamp = Light::NONE;
 		fill(&mut lamp, Light::FIELDS, &[]);
+		let mut decal = Decal::NONE;
+		fill(&mut decal, Decal::FIELDS, &[]);
 
 		let mut stage = Stage::DEFAULT;
 		fill(&mut stage, Stage::FIELDS, &[]);
@@ -2975,6 +3095,8 @@ mod tests {
 				material: "plastic".to_owned(),
 				color: look.color,
 				light: lamp,
+				decal,
+				takes_decals: false,
 				..Thing::default()
 			}],
 			solids: vec![Solid {

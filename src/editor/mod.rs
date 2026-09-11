@@ -341,6 +341,12 @@ pub(crate) enum Change {
 	/// reason: a cube is something the engine can make on its own.
 	Block,
 
+	/// Put a decal in the middle of what is being looked at, facing down.
+	///
+	/// The third press of its kind, for its reason: a decal is a box and a
+	/// material, and the engine can make both on its own.
+	Decal,
+
 	/// Turn the selected blocks into one mesh per material.
 	///
 	/// The name is the bar's write field, which already names what is being
@@ -936,6 +942,7 @@ impl Panels {
 			},
 			| Change::Water => self.water(world),
 			| Change::Block => self.block(world),
+			| Change::Decal => self.decal(world),
 			| Change::Bake(name) => self.bake(world, &name),
 			| Change::Drop { name, kind, at } => self.drop(world, &name, kind, at),
 		}
@@ -1056,9 +1063,7 @@ impl Panels {
 	/// origin while somebody is looking somewhere else is a block they have to
 	/// go and find.
 	fn block(&mut self, world: &mut World) {
-		let middle = Vec2::new(self.view.width() * 0.5, self.view.height() * 0.5);
-		let size = Vec2::new(self.view.width().max(1.0), self.view.height().max(1.0));
-		let at = aim::floor(&world.render_camera(), middle, size);
+		let at = self.looked_at(world);
 
 		self.tabs.history().begin("block", world);
 
@@ -1130,13 +1135,7 @@ impl Panels {
 	}
 
 	fn water(&mut self, world: &mut World) {
-		// where the middle of the picture meets the ground, which is where a
-		// drop with no pointer would land: a pool put down at the origin
-		// while somebody is looking somewhere else is a pool they have to go
-		// and find. @ref `aim::floor`.
-		let middle = Vec2::new(self.view.width() * 0.5, self.view.height() * 0.5);
-		let size = Vec2::new(self.view.width().max(1.0), self.view.height().max(1.0));
-		let at = aim::floor(&world.render_camera(), middle, size);
+		let at = self.looked_at(world);
 
 		self.tabs.history().begin("water", world);
 		let made = select::water(world, at);
@@ -1153,6 +1152,39 @@ impl Panels {
 		}
 
 		info!(?at, "a pool was put in the world");
+	}
+
+	/// Puts a decal where the middle of the picture meets the ground, turned to
+	/// throw straight down at it, and selects it.
+	fn decal(&mut self, world: &mut World) {
+		let at = self.looked_at(world);
+
+		self.tabs.history().begin("decal", world);
+		let made = select::decal(world, at);
+
+		if made.is_empty() {
+			warn!("there was no room in the world for a decal");
+
+			return;
+		}
+
+		self.selection.clear();
+		for pick in &made {
+			self.selection.toggle(world, *pick);
+		}
+
+		info!(?at, "a decal was put in the world");
+	}
+
+	/// Where the middle of the picture meets the ground, which is where a thing
+	/// made with no pointer lands: a pool put down at the origin while somebody
+	/// is looking somewhere else is a pool they have to go and find. @ref
+	/// `aim::floor`.
+	fn looked_at(&self, world: &World) -> Vec3 {
+		let middle = Vec2::new(self.view.width() * 0.5, self.view.height() * 0.5);
+		let size = Vec2::new(self.view.width().max(1.0), self.view.height().max(1.0));
+
+		aim::floor(&world.render_camera(), middle, size)
 	}
 
 	/// Puts an asset into the world where it was dropped, as one record, and

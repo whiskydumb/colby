@@ -28,6 +28,7 @@ pub mod character;
 pub mod console;
 pub mod cvar;
 pub mod debug;
+pub mod decal;
 pub mod entity;
 pub mod field;
 pub mod font;
@@ -71,6 +72,7 @@ pub use self::{
 	console::Asked,
 	cvar::{Args, ConsoleFn, Cvars, Value},
 	debug::{Debug, Label, Line, Pen},
+	decal::{DEFAULT_FADE, Decal, DecalKind, MAX_FADE},
 	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
 	field::Field,
 	font::{Font, FontData, FontId, Fonts, Glyph},
@@ -114,7 +116,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 64;
+pub const ABI_VERSION: u32 = 65;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";

@@ -391,6 +391,11 @@ pub struct Drawn {
 	/// decides it: the room a frame has, whether a lamp's reach touches the
 	/// view, and whether it is shown.
 	pub lamps: usize,
+
+	/// How many decals the frame carried to the shader, after every rule that
+	/// decides it: the room a frame has, whether a decal's box touches the
+	/// view, and whether it is shown.
+	pub decals: usize,
 }
 
 #[cfg(test)]

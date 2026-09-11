@@ -15,6 +15,7 @@
 //!    .  [Lit;   lit_count]                36 bytes each
 //!    .  [Shed;  shed_count]               88 bytes each
 //!    .  [Sod;   sod_count]                44 bytes each
+//!    .  [Daub;  daub_count]               16 bytes each
 //!    .  [Bulk;  bulk_count]              132 bytes each
 //!    .  [Wet;   wet_count]                36 bytes each
 //!    .  [Tie;   tie_count]               100 bytes each
@@ -52,9 +53,9 @@ use std::path::Path;
 use colby_core::{
 	Result,
 	abi::{
-		BodyKind, Camera, Emitter, EmitterKind, JointKind, Layers, Light, LightKind, Post,
-		ShapeKind, Sky, SkyKind, SparkBlend, Terrain, TerrainKind, TextureId, ToneMap, Transform,
-		Water, WaterKind,
+		BodyKind, Camera, Decal, DecalKind, Emitter, EmitterKind, JointKind, Layers, Light,
+		LightKind, Post, ShapeKind, Sky, SkyKind, SparkBlend, Terrain, TerrainKind, TextureId,
+		ToneMap, Transform, Water, WaterKind,
 		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
@@ -75,9 +76,9 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// different number is refused with a message rather than read as if it
 /// agreed.
 ///
-/// Thirteen since an entity record carries a word of flags, the first of them
-/// saying that it is hidden.
-pub const FORMAT_VERSION: u32 = 13;
+/// Fourteen since an entity may paint what is around it, which is a block of
+/// its own, and the entity record's word of flags grew its second bit.
+pub const FORMAT_VERSION: u32 = 14;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -284,24 +285,31 @@ pub struct SceneHeader {
 	/// every version before this one wrote none at all.
 	pub sod_count: u32,
 
-	/// Nothing, and written as nothing.
+	/// Bytes per decal record. Must be `size_of::<Daub>()`.
 	///
-	/// Three of them now. Kept so the header stays a multiple of sixteen: the
-	/// light block took the header's last three spare words, the water block
-	/// grew it by four and left one over, the emitter block took that one and
-	/// three more, and this block took the two those left and two more - which
-	/// lands on two hundred and eight with three to spare. A reader ignores
-	/// them and a writer zeroes them, which is what makes them the first words
-	/// the next block added takes rather than fields anybody has to think
-	/// about.
-	pub spare: [u32; 3],
+	/// This and the two after it are the three words the header kept spare,
+	/// which is exactly what a block costs, so the header is still two hundred
+	/// and eight bytes and a multiple of sixteen with nothing to spare. The
+	/// next block added grows it by four words and keeps one of them spare,
+	/// the way the water block did.
+	pub daub_stride: u32,
+
+	/// Where the decal block starts.
+	pub daub_offset: u32,
+
+	/// How many entities painted something.
+	///
+	/// One record per decal rather than a wider entity record, for the light
+	/// block's reason: painting is the rare thing an entity does, and every
+	/// version before this one wrote none at all.
+	pub daub_count: u32,
 }
 
 // the light block took the header's last three spare words, the water block
 // grew it by four and left one over, the emitter block took that one and three
-// more, and the terrain block took the two those left and two more - two
-// hundred and eight bytes with three words to spare. The next block added takes
-// those three and, if it needs a fourth, four more.
+// more, the terrain block took the two those left and two more, and the decal
+// block took the three that left - two hundred and eight bytes with nothing to
+// spare. The next block added grows it by four words and keeps one spare.
 //
 // the blocks after the header inherit the buffer's alignment only because the
 // header is a multiple of it, and a field added without shrinking the spare
@@ -310,7 +318,7 @@ pub struct SceneHeader {
 // the first one whose length a game chooses. @ref `Places::of`.
 const _: () = assert!(
 	size_of::<SceneHeader>() == HEADER_BYTES,
-	"the header has to stay a hundred and ninety-two bytes"
+	"the header has to stay two hundred and eight bytes"
 );
 
 /// The world's own settings: where it looks from, what lights it, how hard it
@@ -433,6 +441,14 @@ const _: () = assert!(
 /// [`FORMAT_VERSION`].
 pub const STOOD_HIDDEN: u32 = 1;
 
+/// The bit in [`Stood::flags`] that says decals leave the entity alone.
+///
+/// The second bit of the word, and the first to arrive the way
+/// [`STOOD_HIDDEN`] said the next one would: as a bit carrying the unusual
+/// answer, so a record of no flags is an entity decals paint. Unlike the
+/// first it is not handed down to what hangs off the entity.
+pub const STOOD_UNDECALED: u32 = 2;
+
 /// One entity standing somewhere, looking like something.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -475,7 +491,8 @@ pub struct Stood {
 	/// entity.
 	pub parent: u32,
 
-	/// [`STOOD_HIDDEN`], and room for whatever comes after it.
+	/// [`STOOD_HIDDEN`] and [`STOOD_UNDECALED`], and room for whatever comes
+	/// after them.
 	pub flags: u32,
 }
 
@@ -538,6 +555,35 @@ pub struct Sod {
 	/// hole waiting for a padding byte to be read as data. Anything but nought
 	/// is read as `true`, which is the rule a flag bit already keeps.
 	pub solid: u32,
+}
+
+/// One entity's decal, as the file holds it.
+///
+/// Written only for an entity that paints, keyed by its place in the entity
+/// block the way a [`Lit`] is. No blob and no picture: what a decal throws is
+/// the entity's own material, already named in its [`Stood`], and its box is
+/// the entity's own transform, already written there too. Which is why the
+/// whole record is four words.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Daub {
+	/// Which entry of the entity block this belongs to.
+	pub thing: u32,
+
+	/// What shape it paints into, as
+	/// [`DecalKind`](colby_core::abi::DecalKind) in declaration order.
+	///
+	/// A record is only written for a decal that paints, so nothing here
+	/// should be the `none` word - but a reader that finds one takes it, for
+	/// the reason [`Lit::kind`] gives.
+	pub kind: u32,
+
+	/// How much it fades on a surface turned away from it.
+	pub fade: f32,
+
+	/// Which of two decals painting one surface is on top: the higher.
+	pub order: i32,
 }
 
 /// One entity's light, as the file holds it.
@@ -971,6 +1017,10 @@ impl SceneFile {
 	#[must_use]
 	pub fn sod(&self) -> &[Sod] { self.block(self.header.sod_offset, self.header.sod_count) }
 
+	/// Every decal record.
+	#[must_use]
+	pub fn daub(&self) -> &[Daub] { self.block(self.header.daub_offset, self.header.daub_count) }
+
 	/// The body block.
 	#[must_use]
 	pub fn bulk(&self) -> &[Bulk] { self.block(self.header.bulk_offset, self.header.bulk_count) }
@@ -1097,52 +1147,7 @@ impl SceneFile {
 		let after_ties = stood.saturating_add(bulk).saturating_add(tie);
 		let after_poses = after_ties.saturating_add(bent);
 		let kept = usize::try_from(self.header.kept_slots).unwrap_or(0);
-		// the entities first and the lights onto them afterwards, because a
-		// light record names its entity by place in the block above. A record
-		// naming a place that is not there is dropped rather than refused: the
-		// block's length was checked against the file, so what is left is a
-		// record disagreeing with the entity block, and a world missing one
-		// lamp is a better answer than a load that did not happen. The same
-		// argument a pose's run of bones is read with.
-		let mut things: Vec<Thing> = self
-			.stood()
-			.iter()
-			.map(|it| self.thing(it))
-			.collect();
-		for record in self.lit() {
-			if let Some(thing) = usize::try_from(record.thing)
-				.ok()
-				.and_then(|index| things.get_mut(index))
-			{
-				thing.light = light_of(record);
-			}
-		}
-
-		// and the emitters the same way, and after the lights rather than
-		// before them for no reason but that the block is written in that
-		// order and a reader that walks the file in the file's own order is
-		// one fewer thing to hold in your head.
-		for record in self.shed() {
-			if let Some(thing) = usize::try_from(record.thing)
-				.ok()
-				.and_then(|index| things.get_mut(index))
-			{
-				thing.emitter = emitter_of(record);
-				self.name(record.texture)
-					.clone_into(&mut thing.emitter_texture);
-			}
-		}
-
-		// and the ground last of the three, in the file's own order again. It
-		// names no asset at all, so there is nothing beside it to look up.
-		for record in self.sod() {
-			if let Some(thing) = usize::try_from(record.thing)
-				.ok()
-				.and_then(|index| things.get_mut(index))
-			{
-				thing.terrain = terrain_of(record);
-			}
-		}
+		let things = self.things();
 
 		// the bodies first and the water into them afterwards, for the reason
 		// the lights go onto the entities afterwards and by the same rule: a
@@ -1205,6 +1210,72 @@ impl SceneFile {
 		}
 	}
 
+	/// Every entity record, with what the four blocks keyed by an entity put
+	/// onto it.
+	///
+	/// Lifted out of [`to_scene_data`](Self::to_scene_data), which counts its
+	/// lines. The entities first and the lights onto them afterwards, because a
+	/// light record names its entity by place in the block above. A record
+	/// naming a place that is not there is dropped rather than refused: the
+	/// block's length was checked against the file, so what is left is a record
+	/// disagreeing with the entity block, and a world missing one lamp is a
+	/// better answer than a load that did not happen. The same argument a
+	/// pose's run of bones is read with.
+	fn things(&self) -> Vec<Thing> {
+		let mut things: Vec<Thing> = self
+			.stood()
+			.iter()
+			.map(|it| self.thing(it))
+			.collect();
+		for record in self.lit() {
+			if let Some(thing) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+			{
+				thing.light = light_of(record);
+			}
+		}
+
+		// and the emitters the same way, and after the lights rather than
+		// before them for no reason but that the block is written in that
+		// order and a reader that walks the file in the file's own order is
+		// one fewer thing to hold in your head.
+		for record in self.shed() {
+			if let Some(thing) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+			{
+				thing.emitter = emitter_of(record);
+				self.name(record.texture)
+					.clone_into(&mut thing.emitter_texture);
+			}
+		}
+
+		// and the ground after the two, in the file's own order again. It
+		// names no asset at all, so there is nothing beside it to look up.
+		for record in self.sod() {
+			if let Some(thing) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+			{
+				thing.terrain = terrain_of(record);
+			}
+		}
+
+		// and the decals, in the file's own order a fourth time, naming nothing
+		// either: what a decal throws is the entity's own material.
+		for record in self.daub() {
+			if let Some(thing) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+			{
+				thing.decal = decal_of(record);
+			}
+		}
+
+		things
+	}
+
 	/// One entity record, with its names read out.
 	fn thing(&self, stood: &Stood) -> Thing {
 		Thing {
@@ -1222,9 +1293,12 @@ impl SceneFile {
 			emitter_texture: String::new(),
 			// and the same again, out of the terrain block.
 			terrain: Terrain::NONE,
+			// and the same a fourth time, out of the decal block.
+			decal: Decal::NONE,
 			pose: stood.pose,
 			parent: stood.parent,
 			hidden: stood.flags & STOOD_HIDDEN != 0,
+			takes_decals: stood.flags & STOOD_UNDECALED == 0,
 		}
 	}
 
@@ -1376,36 +1450,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		.iter()
 		.map(|thing| stood_of(thing, &mut names))
 		.collect();
-	// one record per lamp, and the index is the entity's place in the block
-	// above rather than its slot: a piece grafted somewhere else keeps its
-	// entities' order and not their slots, and a light has to follow the
-	// entity it is on. The same choice a body's `thing` makes.
-	let lit: Vec<Lit> = data
-		.things
-		.iter()
-		.enumerate()
-		.filter(|(_, thing)| thing.light.kind.is_lit())
-		.map(|(index, thing)| lit_of(index, thing.light))
-		.collect::<Result<Vec<_>>>()?;
-	// one record per emitter, keyed the way a light is and for the light's
-	// reason: a piece grafted somewhere else keeps its entities' order and not
-	// their slots.
-	let shed: Vec<Shed> = data
-		.things
-		.iter()
-		.enumerate()
-		.filter(|(_, thing)| thing.emitter.kind.throws())
-		.map(|(index, thing)| shed_of(index, thing, &mut names))
-		.collect::<Result<Vec<_>>>()?;
-	// and one per entity that is ground, keyed the same way and for the same
-	// reason.
-	let sod: Vec<Sod> = data
-		.things
-		.iter()
-		.enumerate()
-		.filter(|(_, thing)| thing.terrain.is_ground())
-		.map(|(index, thing)| sod_of(index, thing))
-		.collect::<Result<Vec<_>>>()?;
+	let carried = carried_of(data, &mut names)?;
 	let bulk: Vec<Bulk> = data
 		.solids
 		.iter()
@@ -1449,9 +1494,10 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 
 	let blocks = Blocks {
 		stood: &stood,
-		lit: &lit,
-		shed: &shed,
-		sod: &sod,
+		lit: &carried.lit,
+		shed: &carried.shed,
+		sod: &carried.sod,
+		daub: &carried.daub,
 		bulk: &bulk,
 		wet: &wet,
 		tie: &tie,
@@ -1467,9 +1513,10 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::bytes_of(&setting_of(data.stage)));
 	out.extend_from_slice(bytemuck::cast_slice(&stood));
-	out.extend_from_slice(bytemuck::cast_slice(&lit));
-	out.extend_from_slice(bytemuck::cast_slice(&shed));
-	out.extend_from_slice(bytemuck::cast_slice(&sod));
+	out.extend_from_slice(bytemuck::cast_slice(&carried.lit));
+	out.extend_from_slice(bytemuck::cast_slice(&carried.shed));
+	out.extend_from_slice(bytemuck::cast_slice(&carried.sod));
+	out.extend_from_slice(bytemuck::cast_slice(&carried.daub));
 	out.extend_from_slice(bytemuck::cast_slice(&bulk));
 	out.extend_from_slice(bytemuck::cast_slice(&wet));
 	out.extend_from_slice(bytemuck::cast_slice(&tie));
@@ -1486,6 +1533,49 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	Ok(out)
 }
 
+/// The four blocks keyed by an entity: what it shines, what it throws, what
+/// ground it is and what it paints.
+struct Carried {
+	lit: Vec<Lit>,
+	shed: Vec<Shed>,
+	sod: Vec<Sod>,
+	daub: Vec<Daub>,
+}
+
+/// The four blocks keyed by an entity, built.
+///
+/// Lifted out of [`encode`], which counts its lines. One record per entity
+/// that has the thing in question, and the index is the entity's place in the
+/// entity block rather than its slot: a piece grafted somewhere else keeps its
+/// entities' order and not their slots, and a record has to follow the entity
+/// it is on. The same choice a body's `thing` makes.
+///
+/// @param data - the description being written
+/// @param names - the blob an emitter's picture goes into, after every
+/// entity's own names, which is the order the blob has always been written in
+fn carried_of(data: &SceneData, names: &mut Names) -> Result<Carried> {
+	let keyed = || data.things.iter().enumerate();
+
+	Ok(Carried {
+		lit: keyed()
+			.filter(|(_, thing)| thing.light.kind.is_lit())
+			.map(|(index, thing)| lit_of(index, thing.light))
+			.collect::<Result<Vec<_>>>()?,
+		shed: keyed()
+			.filter(|(_, thing)| thing.emitter.kind.throws())
+			.map(|(index, thing)| shed_of(index, thing, names))
+			.collect::<Result<Vec<_>>>()?,
+		sod: keyed()
+			.filter(|(_, thing)| thing.terrain.is_ground())
+			.map(|(index, thing)| sod_of(index, thing))
+			.collect::<Result<Vec<_>>>()?,
+		daub: keyed()
+			.filter(|(_, thing)| thing.decal.paints())
+			.map(|(index, thing)| daub_of(index, thing.decal))
+			.collect::<Result<Vec<_>>>()?,
+	})
+}
+
 /// Where each block lands, worked out once so the header and the writing
 /// cannot disagree.
 struct Places {
@@ -1494,6 +1584,7 @@ struct Places {
 	lit: usize,
 	shed: usize,
 	sod: usize,
+	daub: usize,
 	bulk: usize,
 	wet: usize,
 	tie: usize,
@@ -1514,6 +1605,7 @@ impl Places {
 			lit,
 			shed,
 			sod,
+			daub,
 			bulk,
 			wet,
 			tie,
@@ -1533,7 +1625,9 @@ impl Places {
 		let shed_at = lit_at + size_of_val(lit);
 		// and the ground beside both, for the same argument a third time.
 		let sod_at = shed_at + size_of_val(shed);
-		let bulk_at = sod_at + size_of_val(sod);
+		// and the decals beside all three, for the same argument a fourth time.
+		let daub_at = sod_at + size_of_val(sod);
+		let bulk_at = daub_at + size_of_val(daub);
 		let wet_at = bulk_at + size_of_val(bulk);
 		let tie_at = wet_at + size_of_val(wet);
 		let bent_at = tie_at + size_of_val(tie);
@@ -1556,6 +1650,7 @@ impl Places {
 			lit: lit_at,
 			shed: shed_at,
 			sod: sod_at,
+			daub: daub_at,
 			bulk: bulk_at,
 			wet: wet_at,
 			tie: tie_at,
@@ -1576,6 +1671,7 @@ struct Blocks<'a> {
 	lit: &'a [Lit],
 	shed: &'a [Shed],
 	sod: &'a [Sod],
+	daub: &'a [Daub],
 	bulk: &'a [Bulk],
 	wet: &'a [Wet],
 	tie: &'a [Tie],
@@ -1597,6 +1693,7 @@ fn head(
 		lit,
 		shed,
 		sod,
+		daub,
 		bulk,
 		wet,
 		tie,
@@ -1667,7 +1764,9 @@ fn head(
 		sod_stride: width::<Sod>("a scene's records")?,
 		sod_offset: count(places.sod, "a scene's records")?,
 		sod_count: count(sod.len(), "a scene's records")?,
-		spare: [0; 3],
+		daub_stride: width::<Daub>("a scene's records")?,
+		daub_offset: count(places.daub, "a scene's records")?,
+		daub_count: count(daub.len(), "a scene's records")?,
 	})
 }
 
@@ -1943,8 +2042,21 @@ fn stood_of(thing: &Thing, names: &mut Names) -> Stood {
 		color: thing.color.to_array(),
 		pose: thing.pose,
 		parent: thing.parent,
-		flags: if thing.hidden { STOOD_HIDDEN } else { 0 },
+		flags: flags_of(thing),
 	}
+}
+
+/// The word of flags one entity's record carries.
+///
+/// Each bit is the unusual answer, so an entity that is drawn and takes decals
+/// writes nought.
+///
+/// @param thing - the description it came off
+fn flags_of(thing: &Thing) -> u32 {
+	let hidden = if thing.hidden { STOOD_HIDDEN } else { 0 };
+	let undecaled = if thing.takes_decals { 0 } else { STOOD_UNDECALED };
+
+	hidden | undecaled
 }
 
 /// One entity's terrain, as a record.
@@ -1989,6 +2101,30 @@ fn terrain_of(record: &Sod) -> Terrain {
 		// later version that means something more is still, today, a terrain
 		// somebody can stand on.
 		solid: record.solid != 0,
+	}
+}
+
+/// One entity's decal, as a record.
+///
+/// No blob at all, for the terrain's reason: a decal names no asset.
+///
+/// @param index - the entity's place in the entity block
+/// @param decal - what it paints
+fn daub_of(index: usize, decal: Decal) -> Result<Daub> {
+	Ok(Daub {
+		thing: count(index, "a scene's records")?,
+		kind: decal.kind.index(),
+		fade: decal.fade,
+		order: decal.order,
+	})
+}
+
+/// One decal record, as a description holds it.
+fn decal_of(record: &Daub) -> Decal {
+	Decal {
+		kind: DecalKind::at(record.kind).unwrap_or(DecalKind::None),
+		fade: record.fade,
+		order: record.order,
 	}
 }
 
@@ -2222,6 +2358,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 		(header.lit_stride, size_of::<Lit>(), "lights"),
 		(header.shed_stride, size_of::<Shed>(), "emitters"),
 		(header.sod_stride, size_of::<Sod>(), "terrains"),
+		(header.daub_stride, size_of::<Daub>(), "decals"),
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
 		(header.wet_stride, size_of::<Wet>(), "waters"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
@@ -2294,6 +2431,8 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 	fits::<Stood>(bytes, HEADER_BYTES, (header.stood_offset, header.stood_count), "entities")?;
 	fits::<Lit>(bytes, HEADER_BYTES, (header.lit_offset, header.lit_count), "lights")?;
 	fits::<Shed>(bytes, HEADER_BYTES, (header.shed_offset, header.shed_count), "emitters")?;
+	fits::<Sod>(bytes, HEADER_BYTES, (header.sod_offset, header.sod_count), "terrains")?;
+	fits::<Daub>(bytes, HEADER_BYTES, (header.daub_offset, header.daub_count), "decals")?;
 	fits::<Bulk>(bytes, HEADER_BYTES, (header.bulk_offset, header.bulk_count), "bodies")?;
 	fits::<Wet>(bytes, HEADER_BYTES, (header.wet_offset, header.wet_count), "waters")?;
 	fits::<Tie>(bytes, HEADER_BYTES, (header.tie_offset, header.tie_count), "joints")?;
@@ -2410,6 +2549,9 @@ mod tests {
 				// this one hidden and the second not, so a writer that put one
 				// answer on every record comes back unequal to the fixture
 				hidden: true,
+				// and refusing decals, so its word of flags carries both bits
+				takes_decals: false,
+				decal: Decal::NONE,
 			},
 			Thing {
 				name: String::new(),
@@ -2468,6 +2610,10 @@ mod tests {
 				// round trip could lose
 				parent: 0,
 				hidden: false,
+				takes_decals: true,
+				// on the second one for the light's reason, with both numbers off
+				// their defaults and the order below nought
+				decal: Decal { fade: 0.25, order: -7, ..Decal::BOX },
 			},
 		]
 	}
@@ -2796,7 +2942,11 @@ mod tests {
 		let bytes = encode(&sample()).expect("it fits");
 		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
 
-		assert_eq!(file.stood()[0].flags, STOOD_HIDDEN, "the hidden one sets the bit");
+		assert_eq!(
+			file.stood()[0].flags,
+			STOOD_HIDDEN | STOOD_UNDECALED,
+			"the hidden one that refuses decals sets both bits"
+		);
 		assert_eq!(file.stood()[1].flags, 0, "and the one that is drawn writes nothing");
 	}
 
@@ -3020,6 +3170,118 @@ mod tests {
 			.to_scene_data()
 	}
 
+	/// The sample written out, with one word of its first decal record
+	/// overwritten.
+	///
+	/// @param at - the record's own field offset, in bytes
+	/// @param word - what to put there
+	fn daub_word_changed(at: usize, word: u32) -> SceneData {
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let first = usize::try_from(header.daub_offset).expect("it is an offset") + at;
+
+		assert_eq!(header.daub_count, 1, "the sample carries one decal");
+		bytes[first..first + 4].copy_from_slice(&word.to_le_bytes());
+
+		SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a changed word is not a broken file")
+			.to_scene_data()
+	}
+
+	#[test]
+	fn a_decal_is_written_against_its_place_in_the_entity_block_and_not_its_slot() {
+		// the trap every block keyed by an entity has: the sample's decal is on
+		// the second entity, whose slot is two and whose place in the block is
+		// one
+		let data = sample();
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+
+		assert_eq!(header.daub_count, 1, "one entity paints");
+		assert_eq!(file.daub()[0].thing, 1, "and it is the second entry, not slot two");
+		assert_eq!(
+			round_trip(&data).things[1].decal,
+			data.things[1].decal,
+			"and every number of it comes back"
+		);
+	}
+
+	#[test]
+	fn a_world_that_paints_nothing_writes_no_decal_block_at_all() {
+		let mut data = sample();
+		for thing in &mut data.things {
+			thing.decal = Decal::NONE;
+		}
+
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+
+		assert_eq!(header.daub_count, 0, "nothing paints, so nothing is written down");
+		assert_eq!(round_trip(&data), data, "and it comes back the same way");
+	}
+
+	#[test]
+	fn a_decal_naming_an_entity_that_is_not_there_is_dropped() {
+		let read = daub_word_changed(offset_of!(Daub, thing), 99);
+
+		assert_eq!(read.things[1].decal, Decal::NONE, "the record went nowhere");
+	}
+
+	#[test]
+	fn a_decal_of_a_kind_this_build_does_not_know_reads_as_no_decal() {
+		let read = daub_word_changed(offset_of!(Daub, kind), 9);
+
+		assert_eq!(
+			read.things[1].decal.kind,
+			DecalKind::None,
+			"a word this build has no spelling for paints nothing"
+		);
+		assert_eq!(
+			read.things[1].decal.order, -7,
+			"and the numbers beside it are still read, the way a light's are"
+		);
+	}
+
+	#[test]
+	fn whether_an_entity_takes_decals_survives_both_ways() {
+		for takes in [false, true] {
+			let mut data = sample();
+			data.things[1].takes_decals = takes;
+
+			assert_eq!(
+				round_trip(&data).things[1].takes_decals,
+				takes,
+				"an entity that says {takes} comes back saying it"
+			);
+		}
+	}
+
+	#[test]
+	fn the_word_against_decals_is_a_bit_of_its_own_and_neither_bit_leaks_into_the_other() {
+		let read = |word: u32| {
+			let first = SceneFile::from_bytes(AlignedBytes::from_slice(&stood_flags_of(word)))
+				.expect("a flag nothing answers to is read rather than refused")
+				.to_scene_data()
+				.things
+				.into_iter()
+				.next()
+				.expect("the sample stands two");
+
+			(first.hidden, first.takes_decals)
+		};
+
+		assert_eq!(read(0), (false, true), "no flags: drawn, and painted by decals");
+		assert_eq!(read(STOOD_HIDDEN), (true, true), "hidden says nothing about decals");
+		assert_eq!(
+			read(STOOD_UNDECALED),
+			(false, false),
+			"and the word against them hides nothing"
+		);
+		assert_eq!(read(1 << 20), (false, true), "and a bit from a later build is neither");
+	}
+
 	#[test]
 	fn a_terrain_is_written_against_its_place_in_the_entity_block_and_not_its_slot() {
 		// the same trap the light and the emitter blocks both have: the
@@ -3147,7 +3409,8 @@ mod tests {
 		let bytes = encode(&sample()).expect("it fits in one file");
 		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
 
-		assert_eq!(header.spare, [0; 3], "and a writer zeroes what it does not use");
+		assert!(header.daub_offset > header.sod_offset, "the decals after the ground");
+		assert!(header.bulk_offset > header.daub_offset, "and the bodies after the decals");
 		assert!(
 			header.shed_offset > header.lit_offset,
 			"the emitters are written after the lights"
@@ -3604,7 +3867,12 @@ mod tests {
 		let blocks = [
 			(offset_of!(SceneHeader, setting_offset), "settings"),
 			(offset_of!(SceneHeader, stood_offset), "entities"),
+			(offset_of!(SceneHeader, lit_offset), "lights"),
+			(offset_of!(SceneHeader, shed_offset), "emitters"),
+			(offset_of!(SceneHeader, sod_offset), "terrains"),
+			(offset_of!(SceneHeader, daub_offset), "decals"),
 			(offset_of!(SceneHeader, bulk_offset), "bodies"),
+			(offset_of!(SceneHeader, wet_offset), "waters"),
 			(offset_of!(SceneHeader, tie_offset), "joints"),
 			(offset_of!(SceneHeader, bent_offset), "poses"),
 			(offset_of!(SceneHeader, locals_offset), "bones"),

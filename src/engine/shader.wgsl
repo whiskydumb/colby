@@ -21,6 +21,11 @@
 // a console variable. A cell of a light grid is the next step and it is not
 // this one.
 //
+// The decals are a flat array too, walked by every fragment the same way and
+// for the same reason, and before anything is lit: a fragment inside a
+// decal's box takes the decal's picture into its own color, normal,
+// roughness and how metal it is, and is then lit as whatever it has become.
+//
 // The normal a pixel is shaded with is the geometry's, turned by whatever the
 // normal map says. The frame that turn happens in is built per vertex from the
 // normal and the tangent the mesh carries, and its third axis is the cross of
@@ -59,11 +64,15 @@ struct Globals {
     sky_horizon: vec4<f32>,
     // rgb is the color straight down; w is unused.
     sky_ground: vec4<f32>,
-    // x is how many of the lamps below are real; the rest is unused.
+    // x is how many of the lamps below are real and y how many of the decals;
+    // the rest is unused.
     counts: vec4<u32>,
     // The local lights, nearest first. Everything from `counts.x` up is
     // whatever was in the buffer last frame and is never read.
     lamps: array<Lamp, MAX_LAMPS>,
+    // The decals, in the order they are painted. Everything from `counts.y`
+    // up is never read.
+    decals: array<Paint, MAX_DECALS>,
 };
 
 // How many local lights one frame may carry.
@@ -88,7 +97,39 @@ struct Lamp {
     direction: vec4<f32>,
 };
 
+// How many decals one frame may carry.
+//
+// Matched by `colby_engine::decal::MAX_DECALS`, and the two have to agree for
+// the lamps' reason: this sizes the uniform and that fills it.
+const MAX_DECALS: u32 = 32u;
+
+// The bit in an instance's flags that says decals leave it alone.
+const UNDECALED: u32 = 1u;
+
+// One decal, packed into seven vectors.
+struct Paint {
+    // The world into the box's own space, a row an axis: a point's place
+    // along one is the dot of xyz with it plus w, and the box is where all
+    // three places are within a half of nought.
+    rows: array<vec4<f32>, 3>,
+    // Where the color picture is in the atlas, as u, v, width and height,
+    // or all nought for a decal that throws its tint alone.
+    color: vec4<f32>,
+    // Where the normal map is, the same way, or all nought for none.
+    normal: vec4<f32>,
+    // rgb is the color; a is the opacity.
+    tint: vec4<f32>,
+    // x is metallic, y roughness, z how much it fades on a turned surface.
+    surface: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> globals: Globals;
+
+// Every picture a decal throws, in one texture read two ways: as colors,
+// through a view that decodes sRGB, and as numbers for the normal maps.
+@group(0) @binding(1) var decal_colors: texture_2d<f32>;
+@group(0) @binding(2) var decal_numbers: texture_2d<f32>;
+@group(0) @binding(3) var decal_sampler: sampler;
 
 @group(1) @binding(0) var albedo: texture_2d<f32>;
 @group(1) @binding(1) var surface_sampler: sampler;
@@ -130,7 +171,8 @@ struct InstanceInput {
     @location(10) normal_scale: vec4<f32>,
     // x is where this instance's joint matrices start in the buffer below and
     // y is how many there are. Zero and zero is a thing bones do not move; the
-    // static entry point never reads it.
+    // static entry point never reads those two. z is the entity's own flags,
+    // which both entry points hand on to the fragment stage.
     @location(11) skin: vec4<u32>,
 };
 
@@ -191,6 +233,8 @@ struct VertexOutput {
     @location(4) surface: vec2<f32>,
     // xyz is the tangent in world space; w carries the sign through unchanged.
     @location(5) tangent: vec4<f32>,
+    // The entity's own flags, the same across a whole triangle.
+    @location(6) @interpolate(flat) flags: u32,
 };
 
 @vertex
@@ -245,6 +289,7 @@ fn place(vertex: VertexInput, instance: InstanceInput, model: mat4x4<f32>) -> Ve
     output.uv = vertex.uv * instance.surface.zw;
     output.world_position = world_position.xyz;
     output.surface = instance.surface.xy;
+    output.flags = instance.skin.z;
 
     return output;
 }
@@ -551,19 +596,165 @@ fn fragment_blended(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(shade(input, sampled), sampled.a * input.tint.a);
 }
 
+// What one point of a surface is made of, before it is lit: what its own
+// material says, and then whatever the decals over it painted.
+struct Surface {
+    color: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
+    normal: vec3<f32>,
+};
+
+// A surface with every decal over this point painted onto it, in the order the
+// frame carries them, so that a later decal covers an earlier one.
+//
+// The whole list is walked, the lamps' way, and a point outside a decal's box
+// leaves at the first test. That branch is coherent for the lamps' reason:
+// neighboring fragments are inside or outside the same box together.
+fn painted(
+    start: Surface,
+    world_position: vec3<f32>,
+    facing: vec3<f32>,
+    across: vec3<f32>,
+    down: vec3<f32>,
+) -> Surface {
+    var surface = start;
+    let count = min(globals.counts.y, MAX_DECALS);
+
+    for (var index = 0u; index < count; index++) {
+        let decal = globals.decals[index];
+        let local = vec3<f32>(
+            dot(decal.rows[0].xyz, world_position) + decal.rows[0].w,
+            dot(decal.rows[1].xyz, world_position) + decal.rows[1].w,
+            dot(decal.rows[2].xyz, world_position) + decal.rows[2].w,
+        );
+
+        if (any(abs(local) > vec3<f32>(0.5))) {
+            continue;
+        }
+
+        surface = painted_by(surface, decal, local, facing, across, down);
+    }
+
+    return surface;
+}
+
+// One decal painted onto a surface, at a point inside its box.
+//
+// How much lands is the picture's own alpha times the material's opacity,
+// faded towards the two faces of the box the picture is thrown between, so it
+// does not end in a hard line on something that pokes through one, and faded
+// on a surface turned away from the way it is thrown. What lands takes the
+// color, how metal it is and the roughness towards the decal's own, and turns
+// the normal by the decal's map if it has one.
+fn painted_by(
+    start: Surface,
+    decal: Paint,
+    local: vec3<f32>,
+    facing: vec3<f32>,
+    across: vec3<f32>,
+    down: vec3<f32>,
+) -> Surface {
+    var surface = start;
+
+    // the picture's own place: +x is its right edge and +y its top, and a
+    // texture counts v downwards from its top
+    let uv = vec2<f32>(local.x + 0.5, 0.5 - local.y);
+    // how fast that place moves from one pixel to the next, which is what
+    // picks a level: the point's own movement, carried into the box
+    let along_x = vec2<f32>(dot(decal.rows[0].xyz, across), -dot(decal.rows[1].xyz, across));
+    let along_y = vec2<f32>(dot(decal.rows[0].xyz, down), -dot(decal.rows[1].xyz, down));
+
+    var picture = decal.tint;
+    if (any(decal.color.xy > vec2<f32>(0.0))) {
+        picture *= textureSampleGrad(
+            decal_colors,
+            decal_sampler,
+            decal.color.xy + uv * decal.color.zw,
+            along_x * decal.color.zw,
+            along_y * decal.color.zw,
+        );
+    }
+
+    let depth = abs(local.z) * 2.0;
+    let square = depth * depth;
+    let edge = 1.0 - square * square * square * square;
+    let turned = dot(facing, normalize(decal.rows[2].xyz)) * 0.5 + 0.5;
+    let fade = decal.surface.z;
+    let facing_fade = select(1.0, smoothstep(fade, 1.0, turned), fade > 0.0);
+    let amount = clamp(picture.a * edge * facing_fade, 0.0, 1.0);
+
+    surface.color = mix(surface.color, picture.rgb, amount);
+    surface.metallic = mix(surface.metallic, decal.surface.x, amount);
+    surface.roughness = mix(surface.roughness, decal.surface.y, amount);
+
+    if (any(decal.normal.xy > vec2<f32>(0.0))) {
+        let numbers = textureSampleGrad(
+            decal_numbers,
+            decal_sampler,
+            decal.normal.xy + uv * decal.normal.zw,
+            along_x * decal.normal.zw,
+            along_y * decal.normal.zw,
+        ).xyz * 2.0 - 1.0;
+        let right = normalize(decal.rows[0].xyz);
+
+        surface.normal = normalize(mix(surface.normal, bent(surface.normal, right, numbers), amount));
+    }
+
+    return surface;
+}
+
+// A normal map's direction, laid on a surface along a decal's own axes.
+//
+// The picture's right edge is the box's x pressed flat into the surface, and
+// down the picture is the way v grows: the frame a cube's face gives its own
+// map, so a map that reads right on a cube reads right thrown.
+fn bent(normal: vec3<f32>, right: vec3<f32>, numbers: vec3<f32>) -> vec3<f32> {
+    let flat = right - normal * dot(normal, right);
+
+    // a surface the box's x points straight into has no right edge to lay the
+    // map along. The guard `shading_normal` keeps, for a surface the decal is
+    // edge on to, which a fade leaves nearly unpainted anyway.
+    if (dot(flat, flat) < 1.0e-12) {
+        return normal;
+    }
+
+    let along_u = normalize(flat);
+    let along_v = -cross(normal, along_u);
+
+    return normalize(along_u * numbers.x + along_v * numbers.y + normal * numbers.z);
+}
+
 // Everything all three entry points do once the albedo has been sampled.
 //
 // Returns the color alone. What goes in the alpha channel is the one thing the
 // three disagree about, so it is theirs rather than this function's.
 fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
-    let base_color = input.tint.rgb * sampled.rgb;
+    // how far the point moves from one pixel to the next, asked here and not
+    // among the decals: a derivative wants every pixel of a quad asking it
+    // together, and whether the decals are asked at all is up to the entity.
+    let across = dpdx(input.world_position);
+    let down = dpdy(input.world_position);
 
-    let metallic = clamp(input.surface.x, 0.0, 1.0);
+    var surface = Surface(
+        input.tint.rgb * sampled.rgb,
+        input.surface.x,
+        input.surface.y,
+        shading_normal(input),
+    );
+
+    if ((input.flags & UNDECALED) == 0u) {
+        surface = painted(surface, input.world_position, normalize(input.normal), across, down);
+    }
+
+    let base_color = surface.color;
+
+    let metallic = clamp(surface.metallic, 0.0, 1.0);
     // clamped away from zero: a perfect mirror makes the GGX denominator
     // vanish, and the highlight becomes a single blinding pixel.
-    let roughness = clamp(input.surface.y, 0.045, 1.0);
+    let roughness = clamp(surface.roughness, 0.045, 1.0);
 
-    let normal = shading_normal(input);
+    let normal = surface.normal;
     let towards_light = normalize(-globals.light.xyz);
     let towards_eye = normalize(globals.eye.xyz - input.world_position);
 

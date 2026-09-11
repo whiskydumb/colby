@@ -68,9 +68,9 @@
 use crate::{
 	Result,
 	abi::{
-		Body, BodyId, BodyKind, Camera, Emitter, EntityId, Entry, Joint, JointId, JointKind,
-		Layers, Light, MaterialId, MeshId, Pose, PoseId, Post, Registry, Renderable, Shape,
-		ShapeKind, Sky, Terrain, TextureId, Transform, Water, World,
+		Body, BodyId, BodyKind, Camera, Decal, Emitter, EntityId, Entry, Joint, JointId,
+		JointKind, Layers, Light, MaterialId, MeshId, Pose, PoseId, Post, Registry, Renderable,
+		Shape, ShapeKind, Sky, Terrain, TextureId, Transform, Water, World,
 		field::{Field, field},
 		net::MAX_PEERS,
 		state::STATE_BYTES,
@@ -229,6 +229,14 @@ pub struct Thing {
 	/// megabytes. @ref `colby_runtime::terrain`.
 	pub terrain: Terrain,
 
+	/// What it paints, or [`Decal::NONE`] for an entity that paints nothing.
+	///
+	/// Inline beside the light, for its reason: a decal has no existence
+	/// apart from the entity carrying it. It names no asset either, like the
+	/// ground: the picture it throws is [`material`](Self::material), which
+	/// every entity has anyway.
+	pub decal: Decal,
+
 	/// Which entry of [`SceneData::posed`] moves it, or [`NO_INDEX`].
 	pub pose: u32,
 
@@ -248,6 +256,13 @@ pub struct Thing {
 	/// `false` here, and is hidden by its parent's record rather than by one
 	/// of its own. @ref [`Entities::shown`](crate::abi::Entities::shown).
 	pub hidden: bool,
+
+	/// Whether decals may paint it.
+	///
+	/// Its own word, and not handed down: a child of something decals
+	/// leave alone is painted unless it says otherwise. @ref
+	/// [`Entities::takes_decals`](crate::abi::Entities::takes_decals).
+	pub takes_decals: bool,
 }
 
 impl Default for Thing {
@@ -265,9 +280,11 @@ impl Default for Thing {
 			emitter: Emitter::NONE,
 			emitter_texture: String::new(),
 			terrain: Terrain::NONE,
+			decal: Decal::NONE,
 			pose: NO_INDEX,
 			parent: NO_INDEX,
 			hidden: false,
+			takes_decals: true,
 		}
 	}
 }
@@ -1254,6 +1271,12 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 				.unwrap_or(NO_INDEX),
 			parent: parent_index(world, id, &index_of),
 			hidden: world.entities.hidden(id),
+			decal: world
+				.entities
+				.decal(id)
+				.copied()
+				.unwrap_or(Decal::NONE),
+			takes_decals: world.entities.takes_decals(id),
 			name: world.entities.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
@@ -1535,6 +1558,10 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 			.set_emitter(*id, emitter(world, thing));
 		world.entities.set_terrain(*id, thing.terrain);
 		world.entities.set_hidden(*id, thing.hidden);
+		world.entities.set_decal(*id, thing.decal);
+		world
+			.entities
+			.set_takes_decals(*id, thing.takes_decals);
 	}
 
 	for (id, solid) in solids.iter().zip(&scene.solids) {
@@ -1718,6 +1745,10 @@ fn grafted_things(world: &mut World, piece: &SceneData) -> Vec<EntityId> {
 				.set_emitter(id, emitter(world, thing));
 			world.entities.set_terrain(id, thing.terrain);
 			world.entities.set_hidden(id, thing.hidden);
+			world.entities.set_decal(id, thing.decal);
+			world
+				.entities
+				.set_takes_decals(id, thing.takes_decals);
 
 			id
 		})
@@ -2362,6 +2393,10 @@ fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> 
 	// path a terrain somebody typed into an inspector takes.
 	world.entities.set_terrain(id, thing.terrain);
 	world.entities.set_hidden(id, thing.hidden);
+	world.entities.set_decal(id, thing.decal);
+	world
+		.entities
+		.set_takes_decals(id, thing.takes_decals);
 
 	id
 }
@@ -5369,6 +5404,68 @@ mod tests {
 		assert!(world.entities.set_hidden(car, true));
 
 		assert!(!capture(&world).same_world(&before), "a hidden car is another world");
+	}
+
+	#[test]
+	fn a_decal_and_the_word_against_them_are_written_down_and_put_back() {
+		let (mut world, car, wheel) = hung();
+		let painted = Decal { fade: 0.25, order: -2, ..Decal::BOX };
+		assert!(world.entities.set_decal(wheel, painted));
+		assert!(world.entities.set_takes_decals(car, false));
+
+		let scene = capture(&world);
+
+		assert_eq!(scene.things[1].decal, painted, "the wheel's decal is written down");
+		assert!(!scene.things[0].takes_decals, "and the car's word against them");
+		assert!(scene.things[1].takes_decals, "which the wheel does not inherit");
+
+		let mut again = World::new();
+		restore(&mut again, &scene).expect("nothing to disagree about");
+
+		assert_eq!(again.entities.decal(wheel).copied(), Some(painted), "it comes back");
+		assert!(!again.entities.takes_decals(car), "and so does the word");
+		assert!(again.entities.takes_decals(wheel), "on the one that said it and no other");
+	}
+
+	#[test]
+	fn a_copy_of_a_decal_paints_and_so_does_a_piece_that_crossed() {
+		let (mut world, _, wheel) = hung();
+		let body = world.attach_body(wheel, BodyKind::Dynamic, Shape::cuboid(Vec3::splat(0.5)));
+		assert!(world.entities.set_decal(wheel, Decal::BOX));
+		assert!(world.entities.set_takes_decals(wheel, false));
+		let scene = capture(&world);
+
+		let mut pasted = World::new();
+		let put = instantiate(&mut pasted, &scene, Vec3::ZERO);
+		let copy = put.entity_named("wheel");
+
+		assert_eq!(pasted.entities.decal(copy).copied(), Some(Decal::BOX), "the copy paints");
+		assert!(!pasted.entities.takes_decals(copy), "and refuses what it refused");
+
+		let piece = scene.piece(&records_of(&scene, body));
+		let mut far = World::new();
+		restore(&mut far, &scene).expect("agrees");
+		assert!(far.entities.despawn(wheel));
+		assert!(far.bodies.despawn(body));
+
+		assert_eq!(graft(&mut far, &piece).things, 1, "the wheel appeared");
+		assert_eq!(far.entities.decal(wheel).copied(), Some(Decal::BOX), "painting");
+		assert!(!far.entities.takes_decals(wheel), "and refusing");
+	}
+
+	#[test]
+	fn a_decal_or_a_word_against_them_is_a_change_to_the_world() {
+		// what undo stands on, the hidden word's test again
+		let (mut world, car, _) = hung();
+		let before = capture(&world);
+		assert!(world.entities.set_decal(car, Decal::BOX));
+
+		assert!(!capture(&world).same_world(&before), "a car that paints is another world");
+
+		let (mut world, car, _) = hung();
+		assert!(world.entities.set_takes_decals(car, false));
+
+		assert!(!capture(&world).same_world(&before), "and so is one that takes none");
 	}
 
 	#[test]

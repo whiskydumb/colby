@@ -52,6 +52,7 @@ use wgpu::{
 
 use crate::{
 	cull::{self, Bounds, Drawn, Frustum, Placed},
+	decal::{self, Atlas, Chosen, DECALS, Key, MAX_DECALS, Paint},
 	gpu::Gpu,
 	lines::Lines,
 	post,
@@ -286,11 +287,15 @@ struct Globals {
 	/// `[r, g, b, unused]` straight down.
 	sky_ground: [f32; 4],
 
-	/// `[how many lamps are real, unused, unused, unused]`.
+	/// `[how many lamps are real, how many decals are, unused, unused]`.
 	counts: [u32; 4],
 
 	/// The local lights, nearest first; the rest is [`Lamp::DARK`].
 	lamps: [Lamp; MAX_LAMPS],
+
+	/// The decals, in the order they are painted; the rest is
+	/// [`Paint::NOTHING`]. @ref [`decal`].
+	decals: [Paint; MAX_DECALS],
 }
 
 /// One entity, flattened into what the vertex stage reads.
@@ -326,7 +331,12 @@ struct Placement {
 	/// infinities.
 	normal_scale: [f32; 4],
 
-	/// `[where this instance's joint matrices start, how many, 0, 0]`.
+	/// `[where this instance's joint matrices start, how many, flags, 0]`.
+	///
+	/// The flags are the entity's own, and the one bit there is says decals
+	/// leave it alone - @ref
+	/// [`Entities::takes_decals`](colby_core::abi::Entities::takes_decals).
+	/// Here rather than in an attribute of its own because this word was spare.
 	///
 	/// Read by the skinned pipeline and by nothing else; the static one
 	/// declares the attribute and never looks at it, which a pipeline allows.
@@ -609,6 +619,10 @@ pub struct Scene {
 	material_layout: BindGroupLayout,
 	/// One per [`Wrap`], in its discriminant order.
 	samplers: [Sampler; 2],
+	/// Every picture the world's decals throw. @ref [`decal`].
+	atlas: Atlas,
+	/// What reads the atlas. @ref [`decal_sampler`].
+	decal_sampler: Sampler,
 	shader: Shader,
 
 	/// The WGSL the table in hand was built from.
@@ -679,6 +693,11 @@ pub struct Scene {
 	/// Every lit entity with how far its reach is from the eye, kept so it
 	/// allocates once. @ref [`Scene::lamps`].
 	lit: Vec<(f32, Lamp)>,
+	/// The decals this frame carries, kept so it allocates once. @ref
+	/// [`Scene::decals`].
+	painted: Vec<Chosen>,
+	/// Every picture the world's decals throw, as the atlas knows them.
+	pictures: Vec<Key>,
 	/// The float target the world is drawn into, and everything that squeezes
 	/// it back down. @ref [`post`](crate::post).
 	post: post::Chain,
@@ -714,30 +733,13 @@ impl Scene {
 			mapped_at_creation: false,
 		});
 
-		let globals_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-			label: Some("globals"),
-			entries: &[BindGroupLayoutEntry {
-				binding: 0,
-				visibility: ShaderStages::VERTEX_FRAGMENT,
-				ty: BindingType::Buffer {
-					ty: BufferBindingType::Uniform,
-					has_dynamic_offset: false,
-					min_binding_size: None,
-				},
-				count: None,
-			}],
-		});
-
+		let globals_layout = frame_layout(&device);
 		let material_layout = material_layout(&device);
-
-		let bindings = device.create_bind_group(&BindGroupDescriptor {
-			label: Some("globals"),
-			layout: &globals_layout,
-			entries: &[BindGroupEntry {
-				binding: 0,
-				resource: globals.as_entire_binding(),
-			}],
-		});
+		// empty until a decal exists, and whole all the same: the group it is
+		// bound in has to be, for every pipeline that reads group nought.
+		let atlas = Atlas::new(&device);
+		let decal_sampler = decal_sampler(&device);
+		let bindings = frame_bindings(&device, &globals_layout, &globals, &atlas, &decal_sampler);
 
 		// one per wrap mode rather than one per material: a sampler is a small
 		// piece of fixed-function state with two settings anybody actually
@@ -791,6 +793,8 @@ impl Scene {
 			globals_layout,
 			material_layout,
 			samplers,
+			atlas,
+			decal_sampler,
 			shader,
 			size: (width, height),
 			depth,
@@ -817,6 +821,8 @@ impl Scene {
 			culling: false,
 			drawn: Drawn::default(),
 			lit: Vec::with_capacity(MAX_LAMPS),
+			painted: Vec::with_capacity(MAX_DECALS),
+			pictures: Vec::new(),
 			sky: false,
 			post,
 			// the period is a property of the queue and never changes, so it
@@ -1206,6 +1212,79 @@ impl Scene {
 		chosen(world, sight.eye, sight.culling.then_some(&sight.view), room, &mut self.lit)
 	}
 
+	/// Which decals this frame carries, packed for the shader, with the atlas
+	/// brought level with every picture the world's decals throw first.
+	///
+	/// A decal whose picture the atlas should hold and does not is left out
+	/// rather than drawn as its tint alone: the atlas gives up only when the
+	/// pictures do not fit it at all, and it says so when it does.
+	///
+	/// @param world - the world being drawn
+	/// @param sight - where the camera is, and what it can see
+	/// @return the array the uniform holds, and how many of it is real
+	fn decals(&mut self, world: &World, sight: &Sight) -> ([Paint; MAX_DECALS], u32) {
+		decal::pictures(world, &mut self.pictures);
+
+		if self
+			.atlas
+			.ensure(&self.device, &self.queue, &world.textures, &self.pictures)
+		{
+			self.bindings = frame_bindings(
+				&self.device,
+				&self.globals_layout,
+				&self.globals,
+				&self.atlas,
+				&self.decal_sampler,
+			);
+		}
+
+		let room = world
+			.cvars
+			.float(DECALS)
+			.map_or(MAX_DECALS, decal::room);
+
+		decal::chosen(
+			world,
+			sight.eye,
+			sight.culling.then_some(&sight.view),
+			room,
+			&mut self.painted,
+		);
+
+		let mut paints = [Paint::NOTHING; MAX_DECALS];
+		let mut count = 0;
+
+		for chosen in &self.painted {
+			let [color, normal] = chosen.pictures();
+			let (Some(color), Some(normal)) =
+				(self.placed(&world.textures, color), self.placed(&world.textures, normal))
+			else {
+				continue;
+			};
+
+			if let (Some(paint), Some(slot)) =
+				(Paint::of(chosen, color, normal), paints.get_mut(count))
+			{
+				*slot = paint;
+				count += 1;
+			}
+		}
+
+		(paints, u32::try_from(count).unwrap_or(0))
+	}
+
+	/// Where one picture a decal throws is in the atlas.
+	///
+	/// @param textures - the world's registry
+	/// @param picture - the picture, or nothing for a decal throwing none
+	/// @return where it is, [`NO_PICTURE`](decal::NO_PICTURE) for no picture
+	/// at all, and nothing for a picture the atlas does not hold
+	fn placed(&self, textures: &Textures, picture: Option<TextureId>) -> Option<[f32; 4]> {
+		picture.map_or(Some(decal::NO_PICTURE), |id| {
+			decal::key(textures, id).and_then(|key| self.atlas.rect(key))
+		})
+	}
+
 	/// Records one list of batches into a pass that is already set up.
 	///
 	/// Both halves of a frame go through this: what differs between them is the
@@ -1460,6 +1539,7 @@ impl Scene {
 			culling: world.cvars.bool(cull::ENABLED).unwrap_or(true),
 		};
 		let (lamps, count) = self.lamps(world, &sight);
+		let (decals, painted) = self.decals(world, &sight);
 		self.sky = world.sky.is_drawn();
 
 		self.queue.write_buffer(
@@ -1497,8 +1577,9 @@ impl Scene {
 					.to_array(),
 				sky_horizon: world.sky.horizon.extend(0.0).to_array(),
 				sky_ground: world.sky.ground.extend(0.0).to_array(),
-				counts: [count, 0, 0, 0],
+				counts: [count, painted, 0, 0],
 				lamps,
+				decals,
 			}),
 		);
 
@@ -1509,6 +1590,7 @@ impl Scene {
 		self.group(world, &sight);
 		// after the grouping, which starts every count over
 		self.drawn.lamps = usize::try_from(count).unwrap_or(0);
+		self.drawn.decals = usize::try_from(painted).unwrap_or(0);
 
 		if self.placements.is_empty() {
 			return;
@@ -1777,7 +1859,7 @@ impl Scene {
 			return;
 		}
 
-		let Some(at) = self.stage(world, renderable, transform) else {
+		let Some(at) = self.stage(world, id, renderable, transform) else {
 			return;
 		};
 
@@ -1859,12 +1941,14 @@ impl Scene {
 	/// the result. @ref [`staged`](Self::staged).
 	///
 	/// @param world - the world being drawn, for the material and the pose
+	/// @param id - the entity, for its own flags
 	/// @param renderable - what the entity draws
 	/// @param transform - where it is drawn this frame
 	/// @return where in [`staged`](Self::staged) it went
 	fn stage(
 		&mut self,
 		world: &World,
+		id: EntityId,
 		renderable: &Renderable,
 		transform: Transform,
 	) -> Option<u32> {
@@ -1875,6 +1959,11 @@ impl Scene {
 			.unwrap_or(Material::DEFAULT);
 
 		let at = u32::try_from(self.staged.len()).ok()?;
+		// the first entity of the frame to name a pose is what gathers it;
+		// the second finds the same run rather than a second copy of it. The
+		// third word is the entity's own flags, which the joints leave alone.
+		let mut skin = self.joints.take(world, renderable.pose);
+		skin[2] = u32::from(!world.entities.takes_decals(id));
 
 		self.staged.push(Placement {
 			model: transform.matrix().to_cols_array_2d(),
@@ -1893,9 +1982,7 @@ impl Scene {
 			normal_scale: normal_scale(transform.scale)
 				.extend(0.0)
 				.to_array(),
-			// the first entity of the frame to name a pose is what gathers it;
-			// the second finds the same run rather than a second copy of it.
-			skin: self.joints.take(world, renderable.pose),
+			skin,
 		});
 
 		Some(at)
@@ -1983,6 +2070,115 @@ impl Scene {
 			}),
 		}
 	}
+}
+
+/// The layout of group nought: the frame's uniform, and the decals' atlas read
+/// two ways with the sampler that reads it.
+///
+/// **One group for both**, rather than a fifth for the atlas: a device need
+/// only allow four, and all four are spoken for. The atlas belongs with the
+/// uniform anyway, because both are the frame's and neither is a material's.
+/// Every pipeline built against this - the sky, the debug lines, the
+/// particles - declares the three it does not read, which a layout allows.
+///
+/// @param device - the device to build against
+fn frame_layout(device: &Device) -> BindGroupLayout {
+	let picture = |binding| BindGroupLayoutEntry {
+		binding,
+		visibility: ShaderStages::FRAGMENT,
+		ty: BindingType::Texture {
+			sample_type: TextureSampleType::Float { filterable: true },
+			view_dimension: TextureViewDimension::D2,
+			multisampled: false,
+		},
+		count: None,
+	};
+
+	device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+		label: Some("globals"),
+		entries: &[
+			BindGroupLayoutEntry {
+				binding: 0,
+				visibility: ShaderStages::VERTEX_FRAGMENT,
+				ty: BindingType::Buffer {
+					ty: BufferBindingType::Uniform,
+					has_dynamic_offset: false,
+					min_binding_size: None,
+				},
+				count: None,
+			},
+			picture(1),
+			picture(2),
+			BindGroupLayoutEntry {
+				binding: 3,
+				visibility: ShaderStages::FRAGMENT,
+				ty: BindingType::Sampler(SamplerBindingType::Filtering),
+				count: None,
+			},
+		],
+	})
+}
+
+/// Group nought, over this frame's uniform and the atlas as it stands.
+///
+/// Rebuilt whenever the atlas is, because a group holds a view of one texture
+/// and a rebuilt atlas is a new one.
+///
+/// @param device - the device to build against
+/// @param layout - [`frame_layout`]
+/// @param globals - the uniform
+/// @param atlas - the decals' pictures
+/// @param sampler - what reads them
+fn frame_bindings(
+	device: &Device,
+	layout: &BindGroupLayout,
+	globals: &Buffer,
+	atlas: &Atlas,
+	sampler: &Sampler,
+) -> BindGroup {
+	device.create_bind_group(&BindGroupDescriptor {
+		label: Some("globals"),
+		layout,
+		entries: &[
+			BindGroupEntry {
+				binding: 0,
+				resource: globals.as_entire_binding(),
+			},
+			BindGroupEntry {
+				binding: 1,
+				resource: BindingResource::TextureView(atlas.colors()),
+			},
+			BindGroupEntry {
+				binding: 2,
+				resource: BindingResource::TextureView(atlas.numbers()),
+			},
+			BindGroupEntry {
+				binding: 3,
+				resource: BindingResource::Sampler(sampler),
+			},
+		],
+	})
+}
+
+/// The sampler every decal's picture is read through.
+///
+/// Clamped, and the one sampler here without anisotropy, on purpose: in an
+/// atlas a sample stretched along a grazing angle reaches further than the gap
+/// between two pictures, and a smear of the neighbor is worse than a little
+/// blur on a decal seen edge on.
+///
+/// @param device - the device to build against
+fn decal_sampler(device: &Device) -> Sampler {
+	device.create_sampler(&SamplerDescriptor {
+		label: Some("decal"),
+		address_mode_u: AddressMode::ClampToEdge,
+		address_mode_v: AddressMode::ClampToEdge,
+		address_mode_w: AddressMode::ClampToEdge,
+		mag_filter: FilterMode::Linear,
+		min_filter: FilterMode::Linear,
+		mipmap_filter: MipmapFilterMode::Linear,
+		..SamplerDescriptor::default()
+	})
 }
 
 /// The layout every material's group is built against.
@@ -2867,10 +3063,16 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 		// vectors rather than a struct of named floats.
 		assert!(size_of::<Lamp>().is_multiple_of(16), "and a uniform array's stride is not it");
 		assert!(
-			size_of::<Globals>() == 576 + size_of::<Lamp>() * MAX_LAMPS,
+			size_of::<Globals>()
+				== 576 + size_of::<Lamp>() * MAX_LAMPS + size_of::<Paint>() * MAX_DECALS,
 			"the two camera matrices, the light, the cascades, the fog, the sky, the counts and 			 the lamps"
 		);
 		assert!(size_of::<Globals>().is_multiple_of(16), "and a uniform struct has to be");
+		assert!(size_of::<Paint>() == 112, "a decal is no longer seven vec4s");
+		assert!(
+			size_of::<Paint>().is_multiple_of(16),
+			"and its array's stride in a uniform would not be it"
+		);
 		// lines.wgsl declares only the first field of this struct and reads
 		// only that, which a uniform binding allows: what it needs is for the
 		// field to stay first, and this is where that is checked.

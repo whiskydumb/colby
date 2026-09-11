@@ -67,6 +67,34 @@ const LIT: Color32 = Color32::from_rgb(255, 235, 120);
 /// asking to be grabbed.
 const LAMP: Color32 = Color32::from_rgb(190, 170, 70);
 
+/// The eight corners of the unit cube a decal's box is, in its own space.
+const BOX_CORNERS: [Vec3; 8] = [
+	Vec3::new(-0.5, -0.5, -0.5),
+	Vec3::new(0.5, -0.5, -0.5),
+	Vec3::new(0.5, 0.5, -0.5),
+	Vec3::new(-0.5, 0.5, -0.5),
+	Vec3::new(-0.5, -0.5, 0.5),
+	Vec3::new(0.5, -0.5, 0.5),
+	Vec3::new(0.5, 0.5, 0.5),
+	Vec3::new(-0.5, 0.5, 0.5),
+];
+
+/// Which pairs of [`BOX_CORNERS`] are the box's twelve edges.
+const BOX_EDGES: [(usize, usize); 12] = [
+	(0, 1),
+	(1, 2),
+	(2, 3),
+	(3, 0),
+	(4, 5),
+	(5, 6),
+	(6, 7),
+	(7, 4),
+	(0, 4),
+	(1, 5),
+	(2, 6),
+	(3, 7),
+];
+
 /// What the pointer does outside every window.
 #[derive(Debug, Default)]
 pub(crate) struct Viewport {
@@ -291,6 +319,7 @@ impl Viewport {
 		}
 
 		lamps(context, world, selection, &camera, viewport, view);
+		decals(context, world, selection, &camera, viewport, view);
 		handles.paint(
 			context,
 			self.grab
@@ -458,6 +487,56 @@ fn lamps(
 				corner,
 				stroke,
 			);
+		}
+	}
+}
+
+/// Every selected decal's box, drawn over the world.
+///
+/// The lamps' reason a second time: a decal has no geometry of its own, and
+/// the box it paints inside is what a person stretches when they scale one, so
+/// without this the only evidence of where it reaches is whatever it happens
+/// to have painted.
+fn decals(
+	context: &Context,
+	world: &World,
+	selection: &Selection,
+	camera: &Camera,
+	viewport: Vec2,
+	view: Rect,
+) {
+	let painter = context
+		.layer_painter(LayerId::background())
+		.with_clip_rect(view);
+	let corner = Vec2::new(view.min.x, view.min.y);
+	let stroke = Stroke::new(INK.0, LAMP);
+	let view_projection = camera.view_projection(viewport.x / viewport.y.max(1.0));
+
+	for pick in selection.picks() {
+		let Pick::Entity(id) = pick else {
+			continue;
+		};
+
+		if !world
+			.entities
+			.decal(id)
+			.is_some_and(|it| it.paints())
+		{
+			continue;
+		}
+
+		let matrix = world
+			.entities
+			.placed(id)
+			.unwrap_or_default()
+			.matrix();
+		let ends = BOX_CORNERS
+			.map(|at| gizmo::project(view_projection, matrix.transform_point3(at), viewport));
+
+		for (from, to) in BOX_EDGES {
+			if let (Some(start), Some(end)) = (ends[from], ends[to]) {
+				painter.line_segment([spot(start + corner), spot(end + corner)], stroke);
+			}
 		}
 	}
 }

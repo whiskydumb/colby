@@ -29,8 +29,15 @@
 //! hanging off it is hidden with it. Whether a thing is drawn is worked out by
 //! the same walk up the chain, [`Entities::shown`], and only a picture asks:
 //! a hidden entity is still stepped, collided with and heard.
+//!
+//! An entity may refuse decals, @ref [`Entities::set_takes_decals`]: whatever
+//! a decal throws lands on every surface inside its box except those of an
+//! entity that said so. Unlike being hidden this is the entity's own word and
+//! nothing hanging off it inherits it, because what it is about is a surface,
+//! and a child's surface is its own.
 
 use super::{
+	decal::Decal,
 	field::{Field, field},
 	light::Light,
 	material::MaterialId,
@@ -389,6 +396,13 @@ pub struct Entities {
 	/// indistinguishable from a hill somebody modeled. @ref
 	/// [`terrain`](super::terrain).
 	terrains: Vec<Terrain>,
+	/// What each slot paints, or [`Decal::NONE`] for a slot that paints
+	/// nothing. The same slots again, and the light's argument a fourth time:
+	/// a decal is rare where a transform is universal, and the renderer walks
+	/// every slot looking for one. **Where it paints is not here**: the box
+	/// is the slot's own transform and the picture its own material. @ref
+	/// [`decal`](super::decal).
+	decals: Vec<Decal>,
 	/// What each slot hangs off, or [`EntityId::NONE`] for a thing standing
 	/// on its own. The same slots again. A handle rather than a slot number,
 	/// so that a parent which died and whose slot something else took is a
@@ -400,6 +414,11 @@ pub struct Entities {
 	/// thing is drawn is a walk up its parents, @ref [`Entities::shown`], and
 	/// never a second copy kept here.
 	hidden: Vec<bool>,
+	/// Whether each slot refuses decals, so that nothing a decal throws lands
+	/// on it. The same slots again, and each slot's own word: unlike being
+	/// hidden it is not handed down to what hangs off the slot. @ref
+	/// [`Entities::takes_decals`].
+	undecaled: Vec<bool>,
 	/// What each slot is called, or the empty string. The same slots again,
 	/// and the one array here that is not read by anything the engine does -
 	/// it exists for whoever has to point at a particular entity in words.
@@ -428,8 +447,10 @@ impl Entities {
 			lights: Vec::new(),
 			emitters: Vec::new(),
 			terrains: Vec::new(),
+			decals: Vec::new(),
 			parents: Vec::new(),
 			hidden: Vec::new(),
+			undecaled: Vec::new(),
 			names: Names::new(),
 			generations: Vec::new(),
 			alive: Vec::new(),
@@ -472,12 +493,18 @@ impl Entities {
 		self.lights[slot] = Light::NONE;
 		self.emitters[slot] = Emitter::NONE;
 		self.terrains[slot] = Terrain::NONE;
+		// and it paints nothing, cleared here and not where the slot is given
+		// back, by the rule the hidden word below keeps: each way a slot is
+		// handed out clears it once, and nothing reads a dead slot.
+		self.decals[slot] = Decal::NONE;
 		// and it hangs off nothing, whatever the previous occupant did.
 		self.parents[slot] = EntityId::NONE;
 		// and it is shown, whatever the previous occupant was. Cleared where a
 		// slot is handed out rather than where one is given back, the rule a
 		// name follows below: nothing reads a dead slot's word.
 		self.hidden[slot] = false;
+		// and it takes decals, by the same rule and for the same reason.
+		self.undecaled[slot] = false;
 		// whatever the previous occupant of this slot was called is not what
 		// this is called. This is the only place a name is cleared, and it is
 		// here rather than at the despawn because a slot reaches the free list
@@ -527,7 +554,6 @@ impl Entities {
 			self.renderables[slot] = Renderable::NOTHING;
 			self.lights[slot] = Light::NONE;
 			self.emitters[slot] = Emitter::NONE;
-			self.terrains[slot] = Terrain::NONE;
 			self.terrains[slot] = Terrain::NONE;
 			self.parents[slot] = EntityId::NONE;
 			if let Ok(index) = u32::try_from(slot) {
@@ -696,6 +722,37 @@ impl Entities {
 		};
 
 		self.terrains[slot] = terrain;
+
+		true
+	}
+
+	/// What an entity paints, or [`Decal::NONE`] for one that paints nothing.
+	///
+	/// Every living slot answers this and almost every answer is the nothing,
+	/// exactly as [`light`](Self::light) is. A caller walking the table asks
+	/// [`Decal::paints`] rather than this. @ref [`decal`](super::decal) for why
+	/// the box and the picture are not in the answer.
+	#[must_use]
+	pub fn decal(&self, id: EntityId) -> Option<&Decal> {
+		self.slot(id).map(|slot| &self.decals[slot])
+	}
+
+	/// What an entity paints, to change.
+	pub fn decal_mut(&mut self, id: EntityId) -> Option<&mut Decal> {
+		self.slot(id).map(|slot| &mut self.decals[slot])
+	}
+
+	/// Makes an entity a decal, or stops it being one.
+	///
+	/// @param id - which entity
+	/// @param decal - what it paints; [`Decal::NONE`] paints nothing
+	/// @return `true` if the handle resolved
+	pub fn set_decal(&mut self, id: EntityId, decal: Decal) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.decals[slot] = decal;
 
 		true
 	}
@@ -929,6 +986,42 @@ impl Entities {
 		true
 	}
 
+	/// Whether decals paint an entity's surfaces.
+	///
+	/// Its own word and nothing else: unlike [`shown`](Self::shown) this is not
+	/// a walk up the parents, because what it says is about a surface and a
+	/// child's surface is its own. The renderer asks it once for every entity
+	/// it draws.
+	///
+	/// @param id - the entity
+	/// @return `true` unless the entity said otherwise, and `false` for a stale
+	/// handle, which has no surface to paint
+	#[must_use]
+	pub fn takes_decals(&self, id: EntityId) -> bool {
+		self.slot(id)
+			.is_some_and(|slot| !self.undecaled[slot])
+	}
+
+	/// Says whether decals may paint an entity's surfaces.
+	///
+	/// For something that moves through a world full of them: a character
+	/// walking through a puddle's box would otherwise have the puddle painted
+	/// up its legs. What it changes is only what is drawn, the way hiding
+	/// does, and nothing a step produces can depend on it.
+	///
+	/// @param id - the entity
+	/// @param takes - whether decals paint it
+	/// @return `true` if the handle resolved
+	pub fn set_takes_decals(&mut self, id: EntityId, takes: bool) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.undecaled[slot] = !takes;
+
+		true
+	}
+
 	/// Moves the present into the past, ready for another step.
 	///
 	/// The host calls this before every simulation step, and once more after a
@@ -1111,6 +1204,10 @@ impl Entities {
 		self.parents.resize(slots, EntityId::NONE);
 		self.hidden.clear();
 		self.hidden.resize(slots, false);
+		self.decals.clear();
+		self.decals.resize(slots, Decal::NONE);
+		self.undecaled.clear();
+		self.undecaled.resize(slots, false);
 		self.names.reset(slots);
 		self.generations.clear();
 		self.generations
@@ -1169,9 +1266,10 @@ impl Entities {
 			self.lights.push(Light::NONE);
 			self.emitters.push(Emitter::NONE);
 			self.terrains.push(Terrain::NONE);
-			self.terrains.push(Terrain::NONE);
+			self.decals.push(Decal::NONE);
 			self.parents.push(EntityId::NONE);
 			self.hidden.push(false);
+			self.undecaled.push(false);
 			self.names.push();
 			self.generations.push(0);
 			self.alive.push(false);
@@ -1224,12 +1322,14 @@ impl Entities {
 		self.lights[slot] = Light::NONE;
 		self.emitters[slot] = Emitter::NONE;
 		self.terrains[slot] = Terrain::NONE;
+		self.decals[slot] = Decal::NONE;
 		// off nothing until whoever put it back says otherwise, which a
 		// restore does once every record has landed. @ref `scene::restore`.
 		self.parents[slot] = EntityId::NONE;
 		// and shown until whoever put it back says otherwise, for the light's
 		// reason: a table handed plain records has this set by handle after.
 		self.hidden[slot] = false;
+		self.undecaled[slot] = false;
 		self.generations[slot] = self.generations[slot].max(1);
 		self.live += 1;
 
@@ -1300,8 +1400,10 @@ impl Entities {
 		self.lights.push(Light::NONE);
 		self.emitters.push(Emitter::NONE);
 		self.terrains.push(Terrain::NONE);
+		self.decals.push(Decal::NONE);
 		self.parents.push(EntityId::NONE);
 		self.hidden.push(false);
+		self.undecaled.push(false);
 		self.names.push();
 		self.generations.push(0);
 		self.alive.push(false);
@@ -1690,6 +1792,8 @@ mod tests {
 		assert_eq!(entities.names.slots(), length, "and the rest of the table agrees");
 		assert_eq!(entities.parents.len(), length, "and the rest of the table agrees");
 		assert_eq!(entities.hidden.len(), length, "and the rest of the table agrees");
+		assert_eq!(entities.decals.len(), length, "and the rest of the table agrees");
+		assert_eq!(entities.undecaled.len(), length, "and the rest of the table agrees");
 	}
 
 	/// A parent that is turned, scaled and moved, so that every part of a
@@ -1951,6 +2055,91 @@ mod tests {
 		assert!(entities.set_hidden(grafted, true));
 		let put = entities.restore(&[4], &[(0, Transform::IDENTITY, Renderable::NOTHING)]);
 		assert!(entities.shown(put[0]), "restored into it");
+	}
+
+	#[test]
+	fn a_graft_that_grows_the_table_grows_every_array_by_one_a_slot() {
+		// the path the length test above does not take: a piece arriving into a
+		// slot past the end of a table that has never been that long
+		let mut entities = Entities::new();
+		let grafted = entities.graft(5, 3, Transform::IDENTITY, Renderable::NOTHING);
+
+		assert!(grafted.is_some(), "the slot was free to graft into");
+		assert_eq!(entities.alive.len(), 6, "slots nought to five");
+		assert_eq!(entities.terrains.len(), 6, "and the ground agrees");
+		assert_eq!(entities.decals.len(), 6, "and so do the decals");
+		assert_eq!(entities.undecaled.len(), 6, "and whether each takes one");
+		assert_eq!(entities.hidden.len(), 6, "and the rest of the table");
+	}
+
+	#[test]
+	fn a_decal_belongs_to_its_entity_and_a_stale_handle_has_none() {
+		let mut entities = Entities::new();
+		let wall = entities.spawn();
+		let puddle = entities.spawn();
+		let painted = Decal { order: 4, ..Decal::BOX };
+
+		assert!(entities.set_decal(puddle, painted), "the handle resolves");
+		assert_eq!(entities.decal(puddle).copied(), Some(painted), "and hands it back");
+		assert_eq!(entities.decal(wall).copied(), Some(Decal::NONE), "and nobody else has it");
+
+		assert!(entities.despawn(puddle));
+		assert!(entities.decal(puddle).is_none(), "a stale handle has none");
+		assert!(!entities.set_decal(puddle, painted), "and cannot be given one");
+	}
+
+	#[test]
+	fn taking_decals_is_a_word_of_the_entity_itself_and_its_children_keep_theirs() {
+		let mut entities = Entities::new();
+		let parent = entities.spawn();
+		let child = entities.spawn();
+		assert!(entities.set_parent(child, parent));
+
+		assert!(entities.takes_decals(parent), "an entity takes decals until it says not");
+		assert!(entities.set_takes_decals(parent, false), "the handle resolves");
+		assert!(!entities.takes_decals(parent), "and then it takes none");
+		assert!(entities.takes_decals(child), "while what hangs off it keeps its own word");
+
+		assert!(entities.despawn(child));
+		assert!(!entities.takes_decals(child), "and a stale handle has no surface to paint");
+		assert!(!entities.set_takes_decals(child, true), "nor can be told to");
+	}
+
+	#[test]
+	fn a_slot_handed_out_again_paints_nothing_and_takes_decals_however_it_is_handed_out() {
+		// the hidden word's test, for the two words this card added: each way a
+		// slot comes back into use, tried on a slot that was a decal refusing
+		// decals, which nothing clears on the way out
+		let mut entities = Entities::new();
+		let old = entities.spawn();
+		let mark = |entities: &mut Entities, id: EntityId| {
+			assert!(entities.set_decal(id, Decal::BOX));
+			assert!(entities.set_takes_decals(id, false));
+		};
+
+		mark(&mut entities, old);
+		assert!(entities.despawn(old));
+
+		let spawned = entities.spawn();
+		assert_eq!(
+			spawned.slot(),
+			old.slot(),
+			"the fixture reuses the slot, or it proves nothing"
+		);
+		assert_eq!(entities.decal(spawned).copied(), Some(Decal::NONE), "spawned into it");
+		assert!(entities.takes_decals(spawned), "and takes decals");
+
+		mark(&mut entities, spawned);
+		assert!(entities.despawn(spawned));
+		let grafted = entities.graft(old.slot(), 9, Transform::IDENTITY, Renderable::NOTHING);
+		assert!(grafted.is_some(), "the slot was free to graft into");
+		assert_eq!(entities.decal(grafted).copied(), Some(Decal::NONE), "grafted into it");
+		assert!(entities.takes_decals(grafted), "and takes decals");
+
+		mark(&mut entities, grafted);
+		let put = entities.restore(&[4], &[(0, Transform::IDENTITY, Renderable::NOTHING)]);
+		assert_eq!(entities.decal(put[0]).copied(), Some(Decal::NONE), "restored into it");
+		assert!(entities.takes_decals(put[0]), "and takes decals");
 	}
 
 	#[test]

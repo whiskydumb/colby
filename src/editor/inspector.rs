@@ -21,8 +21,8 @@
 use colby_asset::Project;
 use colby_core::{
 	abi::{
-		Body, BodyId, Emitter, EntityId, Field, Joint, JointId, Light, Material, MaterialId,
-		ModelId, Post, Renderable, Sky, Terrain, TextureId, Transform, World,
+		Body, BodyId, Decal, Emitter, EntityId, Field, Joint, JointId, Light, Material,
+		MaterialId, ModelId, Post, Renderable, Sky, Terrain, TextureId, Transform, World,
 		field::{Kind, Value},
 		scene::{self, Stage},
 	},
@@ -98,6 +98,7 @@ fn detail(
 			lamp(ui, world, id, history);
 			thrower(ui, world, id, history);
 			land(ui, world, id, history);
+			paint(ui, world, id, history);
 		},
 		| Pick::Body(id) => {
 			naming(ui, world, pick, history, rename);
@@ -273,6 +274,31 @@ fn land(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 	if inspect(ui, "terrain", &mut terrain, Terrain::FIELDS) {
 		history.begin("terrain", world);
 		world.entities.set_terrain(id, terrain);
+	}
+}
+
+/// What an entity paints, if anything, and whether it is painted itself.
+///
+/// Always drawn, for the light's reason: turning a block into a decal is
+/// picking a word in a drop-down. The word against decals sits under it,
+/// because it is the other half of the same question and nothing else on the
+/// panel is about paint. @ref `colby_core::abi::decal`.
+fn paint(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+	if let Some(mut decal) = world.entities.decal(id).copied()
+		&& inspect(ui, "decal", &mut decal, Decal::FIELDS)
+	{
+		history.begin("decal", world);
+		world.entities.set_decal(id, decal);
+	}
+
+	let mut takes = world.entities.takes_decals(id);
+
+	if ui
+		.checkbox(&mut takes, "decals paint it")
+		.changed()
+	{
+		history.begin("decals paint it", world);
+		world.entities.set_takes_decals(id, takes);
 	}
 }
 
@@ -896,6 +922,10 @@ mod tests {
 		assert!(
 			!untouched(&Light::spot(Vec3::new(1.0, 0.9, 0.7), 3.0, 8.0, 0.2, 0.5), Light::FIELDS),
 			"and a lamp, its word and its two angles included"
+		);
+		assert!(
+			!untouched(&Decal { fade: 0.25, order: -2, ..Decal::BOX }, Decal::FIELDS),
+			"and a decal, its word and its whole number included"
 		);
 		assert!(
 			!untouched(

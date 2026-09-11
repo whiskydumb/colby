@@ -21,8 +21,8 @@
 mod tests {
 	use colby_core::{
 		abi::{
-			Emitter, MeshId, Renderable, Spark, SparkBlend, TextureId, ToneMap, Transform, Value,
-			World,
+			Decal, Emitter, MeshId, Renderable, Spark, SparkBlend, Texel, TextureData, TextureId,
+			ToneMap, Transform, Value, World,
 			cvar::Cvars,
 			debug,
 			material::{Blend, Material},
@@ -76,6 +76,42 @@ mod tests {
 			world
 				.entities
 				.set_renderable(id, Renderable::of(MeshId::CUBE, material, Vec3::splat(0.5)));
+		}
+
+		// a decal over the first of them, throwing a picture and a normal map, so
+		// the atlas is built, written and bound through both of its views; and
+		// the second of them refusing decals, so the flag reaches the shader
+		let picture = world.textures.insert("test/splash", TextureData {
+			width: 4,
+			height: 4,
+			texel: Texel::Rgba8Srgb,
+			levels: vec![vec![0xFF; 64]],
+		});
+		let bumps = world
+			.textures
+			.insert("test/splash_normal", TextureData {
+				width: 4,
+				height: 4,
+				texel: Texel::Rgba8Unorm,
+				levels: vec![[128, 128, 255, 255].repeat(16)],
+			});
+		let splash = world
+			.materials
+			.insert("test/splash", Material::textured(picture).bumped(bumps));
+		let decal = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(2.0),
+		});
+
+		world
+			.entities
+			.set_renderable(decal, Renderable { material: splash, ..Renderable::NOTHING });
+		world.entities.set_decal(decal, Decal::BOX);
+
+		let second = world.entities.iter().nth(1).map(|(id, ..)| id);
+		if let Some(second) = second {
+			world.entities.set_takes_decals(second, false);
 		}
 
 		for blend in [SparkBlend::Alpha, SparkBlend::Additive] {

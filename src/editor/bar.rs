@@ -166,9 +166,9 @@ fn tools(ui: &mut Ui, tool: Tool, changes: &mut Vec<Change>) {
 
 /// What the engine can put in the world without an asset behind it.
 ///
-/// Two buttons, and they are here rather than in the asset browser for the
+/// Three buttons, and they are here rather than in the asset browser for the
 /// reason the first one was: the browser is a view of what is under `assets/`,
-/// and neither a body of water nor a block is under anything.
+/// and none of a body of water, a block and a decal is under anything.
 ///
 /// @return where the water button landed, so that something other than a hand
 /// can find it and press it
@@ -187,6 +187,14 @@ fn adding(ui: &mut Ui, filed: &str, changes: &mut Vec<Change>) -> Rect {
 		.clicked()
 	{
 		changes.push(Change::Block);
+	}
+
+	if ui
+		.button("+ decal")
+		.on_hover_text("a box of paint in the middle of the view, thrown straight down")
+		.clicked()
+	{
+		changes.push(Change::Decal);
 	}
 
 	if ui
