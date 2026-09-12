@@ -54,6 +54,8 @@ struct Globals {
     // x is one texel in map coordinates, y is unused, z is whether shadows are
     // on at all, w is whether to color every pixel by the cascade it read.
     shadow: vec4<f32>,
+    // Where each cascade's map sits in the atlas, nearest slice first.
+    cascade_tiles: array<Tile, 4>,
     // rgb is the color a distant surface fades towards; w is how quickly it
     // does, per unit of distance. A w of nought is no fog, and the arithmetic
     // below says so without a branch.
@@ -73,6 +75,19 @@ struct Globals {
     // The decals, in the order they are painted. Everything from `counts.y`
     // up is never read.
     decals: array<Paint, MAX_DECALS>,
+};
+
+// Where one shadow map sits in the atlas.
+//
+// Matched by `colby_engine::shadow::Tile`. A cascade's tile is a whole layer -
+// origin nought, scale one, bounds nought to one - which makes the arithmetic
+// below the identity for it, and that is why the atlas cost the sun's shadows
+// no pixel at all.
+struct Tile {
+    // The rectangle a tap is held inside: min u, min v, max u, max v.
+    bounds: vec4<f32>,
+    // Where it starts, how much of a layer's side it covers, and which layer.
+    place: vec4<f32>,
 };
 
 // How many local lights one frame may carry.
@@ -380,19 +395,43 @@ fn shadowing(world_position: vec3<f32>, normal: vec3<f32>, lean: f32, slice: i32
 
     // clip space counts y upwards and a texture counts it down.
     let at = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+
+    return gather(globals.cascade_tiles[slice], at, ndc.z);
+}
+
+// How much of one map's light reaches a point already projected into it.
+//
+// Nine taps, and the tile is what turns them into places in the atlas: a tap
+// sits at `origin + at * scale`, moved by a whole atlas texel each way, and is
+// then held inside the tile's own bounds so it cannot wander into the map next
+// door. One texel of the atlas is one texel of every tile in it, whatever the
+// tile's size, which is why there is one step here and not one per tile.
+//
+// **For a cascade this is `at + offset` and nothing else.** The origin is
+// nought, the scale is one and the bounds are the layer's own, so the multiply
+// and the add are exact whether or not they are folded together, and clamping
+// to nought and one in front of a sampler that already clamps to the edge
+// changes no tap. That is the whole reason the cascades could move into an
+// atlas without a picture moving with them.
+//
+// @param tile - where the map sits
+// @param at - where the point landed in it, nought to one
+// @param depth - how far the point is, in the map's own depth range
+fn gather(tile: Tile, at: vec2<f32>, depth: f32) -> f32 {
     let step = globals.shadow.x;
+    let layer = i32(tile.place.w);
 
     var lit = 0.0;
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
             let offset = vec2<f32>(f32(x), f32(y)) * step;
-            lit += textureSampleCompareLevel(
-                shadow_maps,
-                shadow_sampler,
-                at + offset,
-                slice,
-                ndc.z,
+            let uv = clamp(
+                tile.place.xy + at * tile.place.z + offset,
+                tile.bounds.xy,
+                tile.bounds.zw,
             );
+
+            lit += textureSampleCompareLevel(shadow_maps, shadow_sampler, uv, layer, depth);
         }
     }
 

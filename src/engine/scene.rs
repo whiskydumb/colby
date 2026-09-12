@@ -59,7 +59,7 @@ use crate::{
 	lines::Lines,
 	post,
 	shader::Shader,
-	shadow::{self, CASCADES, Cascades, Maps},
+	shadow::{self, CASCADES, Cascades, Maps, Tile},
 	shaft::{self, Asking, Shaft},
 	skin::Joints,
 	sparks::Sparks,
@@ -277,6 +277,12 @@ struct Globals {
 	cascade_texels: [f32; CASCADES],
 	/// `[one texel in map coordinates, unused, shadows on, tint by cascade]`.
 	shadow: [f32; 4],
+
+	/// Where each cascade's map sits in the atlas, nearest slice first.
+	///
+	/// A whole layer each, which is why the atlas cost the cascades nothing.
+	/// @ref [`Tile::layer`].
+	cascade_tiles: [Tile; CASCADES],
 
 	/// `[r, g, b, how quickly a surface fades with distance]`.
 	fog: [f32; 4],
@@ -1656,6 +1662,7 @@ impl Scene {
 				light_view_projection,
 				splits: self.cascades.splits,
 				cascade_texels: self.cascades.texels,
+				cascade_tiles: shadow::cascade_tiles(),
 				shadow: [
 					1.0 / shadow::resolution(),
 					0.0,
@@ -3152,6 +3159,7 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 			"Placement is no longer a mat4, three vec4s and four words"
 		);
 		assert!(align_of::<Placement>() == 4, "Placement gained padding");
+		assert!(size_of::<Tile>() == 32, "a Tile is no longer two vec4s");
 		assert!(size_of::<Lamp>() == 48, "a Lamp is no longer three vec4s");
 		// a uniform array's stride is its element rounded up to sixteen, so an
 		// element that is already a multiple of it is laid out here exactly as
@@ -3160,8 +3168,12 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 		assert!(size_of::<Lamp>().is_multiple_of(16), "and a uniform array's stride is not it");
 		assert!(
 			size_of::<Globals>()
-				== 576 + size_of::<Lamp>() * MAX_LAMPS + size_of::<Paint>() * MAX_DECALS,
-			"the two camera matrices, the light, the cascades, the fog, the sky, the counts and 			 the lamps"
+				== 576
+					+ size_of::<Tile>() * CASCADES
+					+ size_of::<Lamp>() * MAX_LAMPS
+					+ size_of::<Paint>() * MAX_DECALS,
+			"the two camera matrices, the light, the cascades and their tiles, the fog, the \
+			 sky, 			 the counts and the lamps"
 		);
 		assert!(size_of::<Globals>().is_multiple_of(16), "and a uniform struct has to be");
 		assert!(size_of::<Paint>() == 112, "a decal is no longer seven vec4s");

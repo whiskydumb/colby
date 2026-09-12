@@ -21,6 +21,13 @@
 //! turns. The sphere depends only on the near and far distances, the field of
 //! view and the aspect - none of which move when the camera does.
 //!
+//! **The maps all live in one atlas**, a depth array of [`LAYERS`] layers a
+//! thousand and twenty-four texels square. A cascade takes a whole layer and a
+//! local light's map takes a [`LOCAL`]-texel [`Tile`] of the layer past them,
+//! sixteen to the layer. One texture is one binding, one sampler and one
+//! budget; and because a whole-layer tile's arithmetic is the identity, the
+//! cascades moved into it without a pixel of any picture moving.
+//!
 //! **And the whole grid is then snapped to whole texels.** Even with a sphere,
 //! the light's box slides continuously as the camera walks, so a shadow edge
 //! shimmers between one texel and the next. Rounding the position of a fixed
@@ -31,7 +38,8 @@
 use colby_core::{
 	Result,
 	abi::Camera,
-	bytemuck, err,
+	bytemuck::{self, Pod, Zeroable},
+	err,
 	glam::{
 		Mat4, Vec3,
 		camera::rh::{proj::directx::orthographic, view::look_at_mat4},
@@ -57,12 +65,51 @@ use crate::scene::{
 /// How many slices the shadow distance is cut into.
 ///
 /// Four is what the resolution is worth: at [`RESOLUTION`] each map costs four
-/// megabytes, so the set is sixteen, which a machine running twenty pixel tests
-/// side by side can afford and sixty-four is not.
+/// megabytes, so the set is sixteen and the whole atlas twenty, which a machine
+/// running twenty pixel tests side by side can afford and sixty-four is not.
 pub const CASCADES: usize = 4;
 
-/// How many texels one cascade's map is on a side.
+/// How many texels one layer of the atlas is on a side.
+///
+/// A cascade takes a whole layer, so this is also a cascade's own resolution
+/// and the name it kept from before there was an atlas.
 pub const RESOLUTION: u32 = 1024;
+
+/// How many texels one local light's map is on a side.
+///
+/// A quarter of a layer's side, so sixteen of them tile one layer. The number
+/// is the field's for exactly this map: the engine nearest colby in shape
+/// keeps a 2D map at a thousand and twenty-four and a cube face at two hundred
+/// and fifty-six, and the one with the largest renderer halves its object
+/// resolution for a cube before quantizing it further, saying out loud that a
+/// cube costs a lot of memory. Six faces here are a megabyte and a half, a
+/// tenth of what the sun already spends.
+pub const LOCAL: u32 = 256;
+
+/// How many local tiles fit across one layer.
+const LOCAL_ROW: usize = 4;
+
+/// How many local maps the atlas holds at once.
+///
+/// One layer of them, [`LOCAL_ROW`] squared. A cone takes one and a point
+/// takes six, so the frame can carry two points and four cones, or sixteen
+/// cones, and what does not fit throws no shadow. @ref [`Slots`].
+pub const LOCAL_TILES: usize = 16;
+
+/// How many layers the atlas has: one per cascade, and one of local tiles.
+pub const LAYERS: usize = CASCADES + 1;
+
+/// [`LOCAL`] as a float, for the tile arithmetic below.
+const LOCAL_F: f32 = 256.0;
+
+const _: () = {
+	assert!(RESOLUTION == LOCAL * 4, "a layer no longer holds four local tiles across");
+	assert!(
+		LOCAL_TILES == LOCAL_ROW * LOCAL_ROW,
+		"and LOCAL_TILES is no longer that squared"
+	);
+	assert!(LOCAL == 256, "LOCAL and LOCAL_F disagree");
+};
 
 /// How far from the camera anything is shadowed at all, in world units.
 ///
@@ -154,6 +201,179 @@ impl Cascades {
 		splits: [0.0; CASCADES],
 		texels: [0.0; CASCADES],
 	};
+}
+
+/// Where one shadow map sits in the atlas.
+///
+/// Two vectors, the way a lamp is three: a fragment reading a map has to know
+/// where its rectangle starts, how much of a layer it covers, which layer it
+/// is on, and how far a tap may wander before it leaves the rectangle and
+/// begins reading somebody else's map.
+///
+/// **The last of those is the one thing an atlas has to say that a stack of
+/// separate maps does not**, and it is why the bounds are carried rather than
+/// worked out where they are read: a tile that is a whole layer is bounded by
+/// the layer itself, which is exactly what the sampler's clamp already does,
+/// and a tile inside a layer has to stop half a texel short of its own edge
+/// instead. The two rules are different, so the answer is settled here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Tile {
+	/// The rectangle a tap is held inside, as `[min u, min v, max u, max v]`.
+	pub bounds: [f32; 4],
+
+	/// `[origin u, origin v, how much of a layer's side it covers, its layer]`.
+	pub place: [f32; 4],
+}
+
+impl Tile {
+	/// The whole of one layer, which is what a cascade takes.
+	///
+	/// **Its arithmetic is the identity, and that is not a coincidence.** The
+	/// scale is one, the origin is nought and the bounds are the layer's own,
+	/// so a lookup that used to be `at + offset` still is - exactly, in
+	/// floating point, whether or not the compiler folds the multiply and the
+	/// add together - and clamping to nought and one before a sampler that
+	/// clamps to the edge changes nothing. That is what let the cascades move
+	/// into an atlas without a pixel of any picture moving with them.
+	///
+	/// @param layer - which layer, nearest cascade first
+	#[must_use]
+	pub fn layer(layer: usize) -> Self {
+		Self {
+			bounds: [0.0, 0.0, 1.0, 1.0],
+			place: [0.0, 0.0, 1.0, whole(layer)],
+		}
+	}
+
+	/// One local map's tile, by its place in the local layer.
+	///
+	/// Sixteen of them, four across, on the layer past the last cascade.
+	///
+	/// @param slot - which tile, along the top row first
+	#[must_use]
+	pub fn local(slot: usize) -> Self {
+		let across = whole(slot % LOCAL_ROW);
+		let down = whole(slot / LOCAL_ROW % LOCAL_ROW);
+		let side = LOCAL_F / RESOLUTION_F;
+		let (origin_u, origin_v) = (across * side, down * side);
+
+		// half a texel in from every edge. A tap that wandered past it would
+		// read the neighboring map rather than the edge of its own, which is
+		// the one way an atlas can be wrong that a stack of maps cannot.
+		let inset = 0.5 / RESOLUTION_F;
+
+		Self {
+			bounds: [
+				origin_u + inset,
+				origin_v + inset,
+				origin_u + side - inset,
+				origin_v + side - inset,
+			],
+			place: [origin_u, origin_v, side, whole(CASCADES)],
+		}
+	}
+
+	/// Which layer of the atlas it is on.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_possible_truncation,
+		clippy::cast_sign_loss,
+		reason = "written by `whole` out of a layer index, so it is a small whole number"
+	)]
+	pub fn layer_index(self) -> usize { self.place[3].max(0.0) as usize }
+
+	/// The rectangle it covers in its layer, in texels: `[x, y, side]`.
+	///
+	/// What a pass sets its viewport and its scissor to before drawing into
+	/// it. A cascade's is the whole layer, which is what a pass does anyway.
+	#[must_use]
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_possible_truncation,
+		clippy::cast_sign_loss,
+		reason = "a fraction of a layer times its side, so a texel count under RESOLUTION"
+	)]
+	pub fn viewport(self) -> [u32; 3] {
+		let side = (self.place[2] * RESOLUTION_F).round().max(1.0);
+
+		[
+			(self.place[0] * RESOLUTION_F).round() as u32,
+			(self.place[1] * RESOLUTION_F).round() as u32,
+			side as u32,
+		]
+	}
+}
+
+/// Where each cascade's map sits in the atlas, nearest slice first.
+///
+/// Fixed for the life of the process - the cascades take the first [`CASCADES`]
+/// layers whole - so this is a constant written as a function rather than
+/// anything a frame decides.
+#[must_use]
+pub fn cascade_tiles() -> [Tile; CASCADES] { std::array::from_fn(Tile::layer) }
+
+/// A small whole number as a float, without a cast anybody has to justify.
+fn whole(value: usize) -> f32 { f32::from(u8::try_from(value).unwrap_or(0)) }
+
+/// How one frame's local tiles are handed out.
+///
+/// A bump index and a ceiling, and that is the whole allocator - because
+/// nothing here is kept between frames. Every shadow map colby draws is drawn
+/// again every frame, so a lamp that lands in a different tile than it had
+/// last time reads exactly the same depths out of it; the thing an atlas that
+/// *caches* has to do - hold a tile to its light, and evict by least recently
+/// used when it cannot - is work colby does not have to do. One engine in the
+/// field caches and keeps a five-hundred-millisecond tolerance to stop tiles
+/// thrashing; the one that redraws every frame repacks from nothing every
+/// frame, which is this.
+///
+/// **A lamp that does not fit is skipped rather than stopping the walk.** The
+/// lamps arrive nearest first, so the rule is mostly "the far ones go dark" -
+/// but a cone wanting one tile behind a point that wanted six and did not get
+/// them still gets its tile, and that is strictly better than stopping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slots {
+	/// How many tiles have been handed out.
+	used: usize,
+
+	/// How many there are to hand out at all.
+	room: usize,
+}
+
+impl Slots {
+	/// A frame's worth, holding at most so many tiles.
+	///
+	/// @param room - the ceiling, held inside what the atlas has
+	#[must_use]
+	pub const fn with_room(room: usize) -> Self {
+		Self {
+			used: 0,
+			room: if room > LOCAL_TILES { LOCAL_TILES } else { room },
+		}
+	}
+
+	/// Takes a run of tiles, if there is one.
+	///
+	/// @param wanted - how many in a row: one for a cone, six for a point
+	/// @return the first one's place in the local layer, or nothing
+	pub fn take(&mut self, wanted: usize) -> Option<usize> {
+		let after = self.used.checked_add(wanted)?;
+		if wanted == 0 || after > self.room {
+			return None;
+		}
+
+		let first = self.used;
+		self.used = after;
+
+		Some(first)
+	}
+
+	/// How many tiles the frame has handed out.
+	#[must_use]
+	pub const fn used(self) -> usize { self.used }
 }
 
 /// Fits one set of cascades to a camera and a light.
@@ -295,9 +515,9 @@ fn snap(matrix: Mat4) -> Mat4 {
 /// is sixty-four bytes and the rest of each slot is nothing anybody reads.
 const SLOT: u64 = 256;
 
-/// The depth array, the depth-only pipeline, and the groups both ends bind.
+/// The atlas, the depth-only pipeline, and the groups both ends bind.
 pub(crate) struct Maps {
-	/// One view per cascade, each one layer of the array, drawn into.
+	/// One view per layer of the atlas, drawn into.
 	layers: Vec<TextureView>,
 
 	/// The matrix each pass reads, one [`SLOT`] per cascade.
@@ -322,7 +542,7 @@ pub(crate) struct Maps {
 }
 
 impl Maps {
-	/// Builds the array, all four pipelines and every group.
+	/// Builds the atlas, all four pipelines and every group.
 	///
 	/// @param device - the device to build against
 	/// @param joints - the layout of the frame's joint matrices, which the
@@ -338,11 +558,11 @@ impl Maps {
 		let cascade_layout = cascade_layout(device);
 		let sample_layout = sample_layout(device);
 		let texture = device.create_texture(&TextureDescriptor {
-			label: Some("shadow maps"),
+			label: Some("shadow atlas"),
 			size: Extent3d {
 				width: RESOLUTION,
 				height: RESOLUTION,
-				depth_or_array_layers: u32::try_from(CASCADES).unwrap_or(1),
+				depth_or_array_layers: u32::try_from(LAYERS).unwrap_or(1),
 			},
 			mip_level_count: 1,
 			sample_count: 1,
@@ -352,12 +572,12 @@ impl Maps {
 			view_formats: &[],
 		});
 
-		let layers = (0..CASCADES)
-			.map(|slice| {
+		let layers = (0..LAYERS)
+			.map(|layer| {
 				texture.create_view(&TextureViewDescriptor {
-					label: Some("shadow cascade"),
+					label: Some("shadow layer"),
 					dimension: Some(TextureViewDimension::D2),
-					base_array_layer: u32::try_from(slice).unwrap_or(0),
+					base_array_layer: u32::try_from(layer).unwrap_or(0),
 					array_layer_count: Some(1),
 					aspect: TextureAspect::DepthOnly,
 					..TextureViewDescriptor::default()
@@ -433,8 +653,8 @@ impl Maps {
 		&self.pipelines[usize::from(masked) * 2 + usize::from(skinned)]
 	}
 
-	/// One cascade's layer, to draw into.
-	pub(crate) fn layer(&self, slice: usize) -> Option<&TextureView> { self.layers.get(slice) }
+	/// One layer of the atlas, to draw into.
+	pub(crate) fn layer(&self, layer: usize) -> Option<&TextureView> { self.layers.get(layer) }
 
 	/// One cascade's group, holding its matrix.
 	pub(crate) fn slot(&self, slice: usize) -> Option<&BindGroup> { self.slots.get(slice) }
@@ -473,10 +693,10 @@ fn cascade_layout(device: &Device) -> BindGroupLayout {
 ///
 /// @param device - the device to build against
 /// @param layout - the layout the group is built against
-/// @param maps - the depth array every cascade is one layer of
+/// @param maps - the atlas every map is a rectangle of
 fn sample_group(device: &Device, layout: &BindGroupLayout, maps: &Texture) -> BindGroup {
 	let map = maps.create_view(&TextureViewDescriptor {
-		label: Some("shadow maps"),
+		label: Some("shadow atlas"),
 		dimension: Some(TextureViewDimension::D2Array),
 		aspect: TextureAspect::DepthOnly,
 		..TextureViewDescriptor::default()
@@ -715,6 +935,109 @@ mod tests {
 		}
 
 		out
+	}
+
+	#[test]
+	fn a_cascade_takes_a_whole_layer_and_its_arithmetic_is_the_identity() {
+		for slice in 0..CASCADES {
+			let tile = Tile::layer(slice);
+
+			// compared by their bits, because "exactly" is the claim: an
+			// origin of nearly nought and a scale of nearly one would move
+			// every cascade sample by a fraction of a texel.
+			let bits = |values: [f32; 4]| values.map(f32::to_bits);
+
+			assert_eq!(
+				bits(tile.bounds),
+				bits([0.0, 0.0, 1.0, 1.0]),
+				"slice {slice} is bounded by the layer"
+			);
+			assert_eq!(
+				bits(tile.place),
+				bits([0.0, 0.0, 1.0, whole(slice)]),
+				"and starts at nought, at scale one, on its own layer"
+			);
+			assert_eq!(tile.layer_index(), slice, "which is the one it says");
+			assert_eq!(tile.viewport(), [0, 0, RESOLUTION], "and its pass covers all of it");
+		}
+
+		// what the identity means where it is read: `origin + at * scale` has
+		// to hand back `at` bit for bit, for every value a projection can
+		// produce, or the atlas moved a picture.
+		let tile = Tile::layer(0);
+		for step in 0..=1024_u32 {
+			let at = f32::from(u16::try_from(step).expect("a thousand")) / RESOLUTION_F;
+			let landed = tile.place[2].mul_add(at, tile.place[0]);
+
+			assert!(landed.to_bits() == at.to_bits(), "{at} came back as {landed}");
+		}
+	}
+
+	#[test]
+	fn the_local_tiles_cover_their_layer_without_touching_each_other() {
+		let side = LOCAL_F / RESOLUTION_F;
+		let mut seen = Vec::with_capacity(LOCAL_TILES);
+
+		for slot in 0..LOCAL_TILES {
+			let tile = Tile::local(slot);
+
+			assert_eq!(tile.layer_index(), CASCADES, "tile {slot} is past the last cascade");
+			assert!(
+				(tile.place[2] - side).abs() < 1.0e-7,
+				"tile {slot} covers {} of a layer rather than {side}",
+				tile.place[2]
+			);
+
+			let [x, y, extent] = tile.viewport();
+			assert_eq!(extent, LOCAL, "tile {slot} is not a local map wide");
+			assert!(
+				x + extent <= RESOLUTION && y + extent <= RESOLUTION,
+				"tile {slot} hangs off"
+			);
+
+			// the bounds sit strictly inside the rectangle, by half a texel,
+			// which is what stops a tap reading the map next door.
+			let inset = 0.5 / RESOLUTION_F;
+			assert!(
+				(tile.bounds[0] - (tile.place[0] + inset)).abs() < 1.0e-7
+					&& (tile.bounds[2] - (tile.place[0] + side - inset)).abs() < 1.0e-7,
+				"tile {slot} is bounded at {:?} rather than half a texel inside itself",
+				tile.bounds
+			);
+
+			for (other, seen_x, seen_y) in &seen {
+				assert!(
+					x + extent <= *seen_x
+						|| *seen_x + extent <= x
+						|| y + extent <= *seen_y
+						|| *seen_y + extent <= y,
+					"tiles {slot} and {other} overlap"
+				);
+			}
+
+			seen.push((slot, x, y));
+		}
+	}
+
+	#[test]
+	fn the_atlas_hands_out_runs_until_it_runs_out_and_then_keeps_going() {
+		let mut slots = Slots::with_room(LOCAL_TILES);
+
+		assert_eq!(slots.take(6), Some(0), "the first point takes the first six");
+		assert_eq!(slots.take(6), Some(6), "the second takes the next six");
+		assert_eq!(slots.take(6), None, "the third does not fit");
+		assert_eq!(slots.take(1), Some(12), "but a cone behind it still gets a tile");
+		assert_eq!(slots.used(), 13, "and the count is what was handed out");
+
+		assert_eq!(slots.take(0), None, "nobody may ask for nothing");
+		assert_eq!(slots.used(), 13, "and asking for nothing takes nothing");
+
+		let mut none = Slots::with_room(0);
+		assert_eq!(none.take(1), None, "a frame told to hand out nothing hands out nothing");
+
+		let mut over = Slots::with_room(LOCAL_TILES + 100);
+		assert_eq!(over.take(LOCAL_TILES), Some(0), "a ceiling past the atlas is the atlas");
+		assert_eq!(over.take(1), None, "and it stops there");
 	}
 
 	#[test]
