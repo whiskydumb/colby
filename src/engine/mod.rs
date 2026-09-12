@@ -12,6 +12,7 @@
 //! reads, so the loop's clock lives in [`colby_core::time`] with the rest of
 //! the contract rather than beside the thing it happens to pace.
 
+mod brdf;
 pub mod capture;
 pub mod cull;
 pub mod decal;

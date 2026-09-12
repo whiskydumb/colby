@@ -173,6 +173,19 @@ struct Paint {
 @group(0) @binding(4) var environment: texture_cube<f32>;
 @group(0) @binding(5) var environment_sampler: sampler;
 
+// What fraction of whatever it reflects a surface actually sends back: the
+// lobe above, integrated over a whole hemisphere, as a table of two numbers
+// over n.v and roughness. Beside the environment because the frame reads it and
+// no draw changes it, and bound whether there is an environment or not - a flat
+// ambient color goes through the same table a sky does.
+@group(0) @binding(6) var split_sum: texture_2d<f32>;
+@group(0) @binding(7) var split_sampler: sampler;
+
+// How many texels the table above is on a side. Matched by
+// `colby_engine::brdf::SIDE`, and a test says the two agree - a shader cannot
+// ask a texture how big it is without giving up the level argument.
+const SPLIT_SIDE: f32 = 64.0;
+
 @group(1) @binding(0) var albedo: texture_2d<f32>;
 @group(1) @binding(1) var surface_sampler: sampler;
 // Sampled as numbers rather than as a color: the compiler stores it in a linear
@@ -572,13 +585,77 @@ fn reflected_radiance(way: vec3<f32>, roughness: f32) -> vec3<f32> {
     ).rgb;
 }
 
-// The same, for a whole hemisphere of incoming light rather than one direction.
-// A rough surface cannot reflect a sharp rim, so the term it grows towards is
-// held down by the roughness instead of going all the way to white.
-fn fresnel_ambient(normal_dot_view: f32, f0: vec3<f32>, roughness: f32) -> vec3<f32> {
-    let ceiling = max(vec3<f32>(1.0 - roughness), f0);
+// What the environment sends a surface from every direction at once.
+//
+// The last level of the roughness chain, read along the normal: at a roughness
+// of one the filter above is the widest the cube holds, so what comes back is
+// the hemisphere around that direction averaged rather than anything sharp.
+// That is the stand-in for an irradiance map, and it costs one tap of a texture
+// already bound rather than a second cube, a second binding and a second half
+// of the compiler.
+//
+// It is an average radiance and not an irradiance - the filter divides by the
+// weights it summed - which is the same quantity `globals.ambient.rgb` is, so
+// the two sides of the branch below multiply the diffuse color by the same kind
+// of number.
+fn ambient_radiance(way: vec3<f32>) -> vec3<f32> {
+    return reflected_radiance(way, 1.0);
+}
 
-    return f0 + (ceiling - f0) * pow(clamp(1.0 - normal_dot_view, 0.0, 1.0), 5.0);
+// The same, for a whole hemisphere of incoming light rather than one direction.
+//
+// **This is the lobe above integrated, not a curve that looks like it.** What
+// the table holds is `f0 * A + B`, the two halves of the split-sum: the
+// reflectance is linear in `f0`, so the part that multiplies it and the part
+// that does not are summed separately once, offline, and every material picks
+// its own colors out of the same two numbers. The f90 the bias is multiplied by
+// is one, which is what @ref `fresnel_schlick` uses a direction at a time.
+//
+// **And then what a single bounce loses is put back.** The integral above is
+// one reflection off one microfacet, and a rough surface's facets bounce light
+// off each other: at a roughness of one the single bounce keeps thirty-one
+// percent of what arrives and the rest is simply gone, so a rough metal comes
+// out two thirds too dark rather than the too bright it used to be. The
+// compensation is the standard one - scale by `1 + f0 (1/(A+B) - 1)`, which is
+// exactly enough to send a white surface's whole hemisphere back - and three of
+// the six engines in the field apply it. It cannot exceed one for an `f0` that
+// does not, because `(f0 A + B) / (A + B)` is at most one when `f0` is.
+//
+// The reason the table is read rather than a published two-term fit evaluated:
+// the fit is of somebody else's shadowing term, and against a real table it is
+// out by six hundredths on average and by a fifth at a middling roughness head
+// on. @ref `colby_engine::brdf` for where these numbers come from.
+fn ambient_brdf(normal_dot_view: f32, f0: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let asked = vec2<f32>(clamp(normal_dot_view, 0.0, 1.0), clamp(roughness, 0.0, 1.0));
+    // the table's first texel holds the value at nought and its last the value
+    // at one, so a coordinate has to be squeezed into the strip between their
+    // middles. Without this the outer half texel of each axis is flat, and the
+    // two places it is flattest - the eye square to the surface, and a
+    // roughness of one - are the two this term is read at most.
+    let place = (asked * (SPLIT_SIDE - 1.0) + 0.5) / SPLIT_SIDE;
+    let table = textureSampleLevel(split_sum, split_sampler, place, 0.0).rg;
+    let once = f0 * table.x + vec3<f32>(table.y);
+    // what one bounce keeps, which is what the compensation divides by
+    let kept = max(table.x + table.y, 1.0e-4);
+
+    return once * (vec3<f32>(1.0) + f0 * (1.0 / kept - 1.0));
+}
+
+// What the body of a material gets, once the reflection off its face has taken
+// its share.
+//
+// A surface cannot send back more than reaches it. Whatever fraction the
+// ambient reflection carries away never reaches the pigment underneath, so what
+// is left for the diffuse term is one minus it - the same division @ref
+// `lit_by` has made a direction at a time since before any of this existed,
+// now made for the hemisphere as well.
+//
+// The max is not for that arithmetic, which cannot exceed one for an `f0` that
+// does not. It is for a material whose color is above one, which nothing stops
+// a person naming: without it such a surface would come back with a *negative*
+// diffuse term and a black ring where it turns away.
+fn ambient_diffuse(diffuse_color: vec3<f32>, reflected: vec3<f32>) -> vec3<f32> {
+    return diffuse_color * max(vec3<f32>(0.0), vec3<f32>(1.0) - reflected);
 }
 
 // What one light of any kind does to a surface, before its own color and
@@ -1012,37 +1089,40 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
     // diffuse term at all, so without this a gold cube under one light is black
     // everywhere the highlight is not - physically right, and it reads as a bug.
     //
-    // **Two lines rather than one, and the branch is the point.** When a world
-    // names an environment the specular half is multiplied by what the surface
-    // actually reflects; when it does not, the line is the one this shader had
-    // before there were environments at all - character for character. Folding
-    // the two together by multiplying the color by a white cube would not do:
-    // `a * (b + c)` and `a * b + a * c` are not the same float, and a world with
-    // no sky has to draw what it drew.
+    // **Two lines rather than one, and the branch is still the point.** Folding
+    // them together by multiplying by a white cube would not do: `a * (b + c)`
+    // and `a * b + a * c` are not the same float, and a world with no sky has
+    // no environment to read a level of.
     //
-    // @note: it is the same expression and it is not quite the same picture.
-    // Measured against a build from before this line existed, over a fixture of
-    // four metal balls and a floor: **one channel of 2,764,800 comes back a byte
-    // different**, and the cause is this branch rather than anything it guards -
-    // the same build with the bindings added and the branch left out is byte for
-    // byte. A branch here reorganizes how the whole function is scheduled, and a
-    // rounding somewhere else in it lands the other way.
+    // **Both halves are lit by the same thing.** When a world names an
+    // environment, the specular half reads the level its roughness names along
+    // the reflected direction and the diffuse half reads the roughest level
+    // along the normal; when it does not, both read the one ambient color. What
+    // `globals.ambient.rgb` means is therefore "the sky, for a world that has
+    // none" - the same meaning it has had for the specular half since the cube
+    // arrived, now taken to its conclusion.
     //
-    // The *diffuse* half stays the ambient color whatever the sky is, which is
-    // deliberate rather than unfinished. One engine in the field offers a flat
-    // color for the diffuse ambient and refuses to offer one for the specular,
-    // on the grounds that a mirror reflecting a constant is a flat grey object;
-    // this is that split taken at its word.
-    let ambient_specular = fresnel_ambient(normal_dot_view, f0, roughness);
+    // **And the diffuse half is what the specular one did not take.** A surface
+    // cannot send back more than reaches it: whatever fraction the reflection
+    // above carries away is gone before anything reaches the body of the
+    // material underneath, so the diffuse term is multiplied by one minus it.
+    // Three of the six engines in the field do this, one does it behind a
+    // switch that is off for its older materials, and one refuses - but the
+    // argument that settles it here is closer to home: `lit_by` has divided the
+    // direct diffuse by the same Fresnel since before any of this existed, and
+    // an ambient term that did not was the odd one out in this file.
+    //
+    let ambient_specular = ambient_brdf(normal_dot_view, f0, roughness);
+    let indirect_diffuse = ambient_diffuse(diffuse_color, ambient_specular);
     var indirect: vec3<f32>;
 
     if (globals.sky_horizon.w > 0.5) {
         let reflected = reflect(-towards_eye, normal);
 
-        indirect = globals.ambient.rgb * diffuse_color
+        indirect = ambient_radiance(normal) * indirect_diffuse
             + reflected_radiance(reflected, roughness) * ambient_specular;
     } else {
-        indirect = globals.ambient.rgb * (diffuse_color + ambient_specular);
+        indirect = globals.ambient.rgb * (indirect_diffuse + ambient_specular);
     }
     // @ref `HDR_CEILING`: past it a smooth highlight would not fit the target.
     let color = min(direct + indirect, vec3<f32>(HDR_CEILING));

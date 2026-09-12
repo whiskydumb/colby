@@ -18,6 +18,7 @@
 //! states. That is the whole of the renderer's part in the fixed timestep.
 
 use core::mem::offset_of;
+use std::sync::Arc;
 
 use colby_core::{
 	Result,
@@ -51,6 +52,7 @@ use wgpu::{
 };
 
 use crate::{
+	brdf::{self, Split},
 	cull::{self, Bounds, Drawn, Frustum, Placed},
 	decal::{self, Atlas, Chosen, DECALS, Key, MAX_DECALS, Paint},
 	depth::{self, Depth},
@@ -728,6 +730,8 @@ pub struct Scene {
 	shadows: Maps,
 	/// The cube a surface's reflections are read out of. @ref [`env`].
 	environment: Environment,
+	/// How much of whatever it reflects a surface sends back. @ref [`brdf`].
+	split: Arc<Split>,
 	/// This frame's light matrices, fitted in `upload` and drawn in `render`.
 	cascades: Cascades,
 	/// Whether the console left the shadow passes switched on this frame.
@@ -840,9 +844,14 @@ impl Scene {
 		// before group nought, because the cube is one of its entries: there is
 		// no fifth group to put it in. @ref [`env`].
 		let environment = Environment::new(&device, &queue)?;
+		// and beside it, taken from the device rather than built here: the
+		// table is the same one for every scene this device draws. @ref
+		// [`Gpu::split`].
+		let split = Arc::clone(gpu.split());
 		let bindings = frame_bindings(&device, &globals_layout, &globals, &atlas, &Held {
 			decals: &decal_sampler,
 			environment: &environment,
+			split: &split,
 		});
 
 		// one per wrap mode rather than one per material: a sampler is a small
@@ -911,6 +920,7 @@ impl Scene {
 			focusing: None,
 			shadows,
 			environment,
+			split,
 			cascades: Cascades::NONE,
 			shadowing: false,
 			lines,
@@ -1790,6 +1800,7 @@ impl Scene {
 		frame_bindings(&self.device, &self.globals_layout, &self.globals, &self.atlas, &Held {
 			decals: &self.decal_sampler,
 			environment: &self.environment,
+			split: &self.split,
 		})
 	}
 
@@ -2474,6 +2485,7 @@ impl Scene {
 /// @param device - the device to build against
 fn frame_layout(device: &Device) -> BindGroupLayout {
 	let environment = env::layout_entries(ENVIRONMENT_TEXTURE, ENVIRONMENT_SAMPLER);
+	let split = brdf::layout_entries(SPLIT_TEXTURE, SPLIT_SAMPLER);
 	let picture = |binding| BindGroupLayoutEntry {
 		binding,
 		visibility: ShaderStages::FRAGMENT,
@@ -2508,6 +2520,8 @@ fn frame_layout(device: &Device) -> BindGroupLayout {
 			},
 			environment[0],
 			environment[1],
+			split[0],
+			split[1],
 		],
 	})
 }
@@ -2525,6 +2539,17 @@ const ENVIRONMENT_TEXTURE: u32 = 4;
 
 /// Which binding its sampler takes.
 const ENVIRONMENT_SAMPLER: u32 = 5;
+
+/// Which binding the split-sum table takes.
+///
+/// Beside the environment and for the same reason - the frame reads it and no
+/// draw changes it - but it is here whether there is an environment or not: the
+/// ambient reflection of a flat color goes through the same table the
+/// reflection of a sky does. @ref [`brdf`](crate::brdf).
+const SPLIT_TEXTURE: u32 = 6;
+
+/// Which binding its sampler takes.
+const SPLIT_SAMPLER: u32 = 7;
 
 /// Group nought, over this frame's uniform and the atlas as it stands.
 ///
@@ -2571,6 +2596,14 @@ fn frame_bindings(
 				binding: ENVIRONMENT_SAMPLER,
 				resource: BindingResource::Sampler(held.environment.sampler()),
 			},
+			BindGroupEntry {
+				binding: SPLIT_TEXTURE,
+				resource: BindingResource::TextureView(held.split.view()),
+			},
+			BindGroupEntry {
+				binding: SPLIT_SAMPLER,
+				resource: BindingResource::Sampler(held.split.sampler()),
+			},
 		],
 	})
 }
@@ -2585,6 +2618,9 @@ struct Held<'a> {
 
 	/// The cube every reflection and a cubemap sky are read out of.
 	environment: &'a Environment,
+
+	/// The table that says how much of either one a surface sends back.
+	split: &'a Split,
 }
 
 /// The sampler every decal's picture is read through.

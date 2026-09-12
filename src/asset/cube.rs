@@ -38,6 +38,7 @@ use colby_core::{
 	Result,
 	abi::texture::{CUBE_FACES, Texel, TextureData},
 	err,
+	utils::half::half,
 };
 
 use crate::radiance::Radiance;
@@ -425,65 +426,6 @@ fn cross(first: [f32; 3], second: [f32; 3]) -> [f32; 3] {
 	})
 }
 
-/// One value as the sixteen bits the format stores.
-///
-/// Rust has no half-precision type that is stable, so the bits are assembled:
-/// the sign, the exponent held inside what the format reaches, and the top ten
-/// bits of the mantissa, rounded to nearest with ties going to even - which is
-/// what every other encoder of this format does, and therefore what a second
-/// answer will agree with.
-fn half(value: f32) -> u16 {
-	let bits = value.to_bits();
-	let sign = u16::try_from(bits >> 31).unwrap_or(0) << 15;
-	let exponent = i32::try_from((bits >> 23) & 0xFF).unwrap_or(0) - 127;
-	let mantissa = bits & 0x007F_FFFF;
-
-	// a value that is not a number at all, or one past what the format reaches,
-	// both come back as the largest finite value of their sign: a sky with an
-	// infinity in it is a sky nobody can filter, and clipping it is better than
-	// a texel the GPU reads as not-a-number and spreads over the picture.
-	if exponent == 128 {
-		return sign | 0x7BFF;
-	}
-
-	if exponent > 15 {
-		return sign | 0x7BFF;
-	}
-
-	// below what the format holds with a full mantissa, the value is stored
-	// with a smaller one and an exponent of nought
-	if exponent < -14 {
-		let shift = u32::try_from(-14 - exponent).unwrap_or(32);
-
-		if shift > 24 {
-			return sign;
-		}
-
-		let widened = (mantissa | 0x0080_0000) >> shift;
-
-		return sign | u16::try_from(rounded(widened) & 0x03FF).unwrap_or(0);
-	}
-
-	let stored = u32::try_from(exponent + 15).unwrap_or(0) << 10;
-	let rounded = rounded(mantissa);
-
-	// rounding the mantissa up can carry into the exponent, and adding the two
-	// together is what makes that carry land where it should
-	sign | u16::try_from((stored + rounded).min(0x7BFF)).unwrap_or(0x7BFF)
-}
-
-/// A twenty-three bit mantissa rounded down to ten, ties to even.
-fn rounded(mantissa: u32) -> u32 {
-	let kept = mantissa >> 13;
-	let dropped = mantissa & 0x1FFF;
-
-	if dropped > 0x1000 || (dropped == 0x1000 && kept & 1 == 1) {
-		kept + 1
-	} else {
-		kept
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -558,8 +500,8 @@ mod tests {
 	/// One of the format's sixteen-bit values back as a float.
 	///
 	/// Written out rather than taken from a crate, because the point of the
-	/// tests below is that the encoder above agrees with the format and not
-	/// that it agrees with itself.
+	/// tests below is that what @ref `colby_core::utils::half` wrote agrees
+	/// with the format and not that it agrees with itself.
 	fn widened(bits: u16) -> f32 {
 		let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
 		let exponent = i32::from((bits >> 10) & 0x1F);
@@ -570,25 +512,6 @@ mod tests {
 		}
 
 		sign * (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent - 15)
-	}
-
-	#[test]
-	fn half_precision_round_trips_the_values_that_fit_in_it() {
-		for value in [0.0_f32, 1.0, 0.5, 2.0, 0.25, 1024.0, 65504.0, -1.0, -0.5] {
-			assert!(
-				(widened(half(value)) - value).abs() <= value.abs() * 1.0e-3,
-				"{value} came back as {}",
-				widened(half(value))
-			);
-		}
-	}
-
-	#[test]
-	fn a_value_past_what_the_format_reaches_clips_rather_than_becoming_an_infinity() {
-		assert_eq!(half(1.0e30), 0x7BFF, "the largest finite value");
-		assert_eq!(half(-1.0e30), 0xFBFF, "and its negative");
-		assert_eq!(half(f32::INFINITY), 0x7BFF, "an infinity clips as well");
-		assert_eq!(half(f32::NAN), 0x7BFF, "and so does a value that is not a number");
 	}
 
 	#[test]

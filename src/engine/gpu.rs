@@ -16,7 +16,7 @@
 //! read over it for one run, and everything built on the device lives with the
 //! answer. @ref [`backends`], which is the whole of that rule.
 
-use std::env;
+use std::{env, sync::Arc};
 
 use colby_core::{Result, debug, err, info, warn};
 use wgpu::{
@@ -25,6 +25,8 @@ use wgpu::{
 	Queue, RequestAdapterOptions, Trace,
 };
 use winit::window::Window;
+
+use crate::brdf::Split;
 
 /// The APIs considered when nobody says otherwise.
 ///
@@ -252,6 +254,15 @@ pub struct Gpu {
 	adapter: Adapter,
 	device: Device,
 	queue: Queue,
+
+	/// The split-sum table of the shading lobe, baked once for this device.
+	///
+	/// **Here rather than on the scene that reads it, and the reason is
+	/// measured.** The table is the same one for every scene a device draws,
+	/// so a copy per scene is waste - and on this machine it is worse than
+	/// waste: one more texture per scene, with a second device alive beside
+	/// this one, faults the process. @ref [`brdf`](crate::brdf).
+	split: Arc<Split>,
 }
 
 impl Gpu {
@@ -297,6 +308,9 @@ impl Gpu {
 	/// The queue every upload and every frame's work is submitted on.
 	#[must_use]
 	pub const fn queue(&self) -> &Queue { &self.queue }
+
+	/// The split-sum table this device's scenes read their ambient term out of.
+	pub(crate) fn split(&self) -> &Arc<Split> { &self.split }
 
 	/// The adapter the device was made on, for configuring a surface against.
 	pub(crate) const fn adapter(&self) -> &Adapter { &self.adapter }
@@ -381,7 +395,9 @@ impl Gpu {
 			.await
 			.map_err(|error| err!(Graphics("requesting a device: {error}")))?;
 
-		Ok(Some(Self { instance, adapter, device, queue }))
+		let split = Arc::new(Split::new(&device, &queue)?);
+
+		Ok(Some(Self { instance, adapter, device, queue, split }))
 	}
 }
 
