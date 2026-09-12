@@ -54,6 +54,7 @@ use crate::{
 	cull::{self, Bounds, Drawn, Frustum, Placed},
 	decal::{self, Atlas, Chosen, DECALS, Key, MAX_DECALS, Paint},
 	depth::{self, Depth},
+	env::{self, Environment},
 	focus::{self, Focus},
 	gpu::Gpu,
 	lines::Lines,
@@ -725,6 +726,8 @@ pub struct Scene {
 	focusing: Option<focus::Asking>,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
+	/// The cube a surface's reflections are read out of. @ref [`env`].
+	environment: Environment,
 	/// This frame's light matrices, fitted in `upload` and drawn in `render`.
 	cascades: Cascades,
 	/// Whether the console left the shadow passes switched on this frame.
@@ -834,7 +837,13 @@ impl Scene {
 		// bound in has to be, for every pipeline that reads group nought.
 		let atlas = Atlas::new(&device);
 		let decal_sampler = decal_sampler(&device);
-		let bindings = frame_bindings(&device, &globals_layout, &globals, &atlas, &decal_sampler);
+		// before group nought, because the cube is one of its entries: there is
+		// no fifth group to put it in. @ref [`env`].
+		let environment = Environment::new(&device, &queue)?;
+		let bindings = frame_bindings(&device, &globals_layout, &globals, &atlas, &Held {
+			decals: &decal_sampler,
+			environment: &environment,
+		});
 
 		// one per wrap mode rather than one per material: a sampler is a small
 		// piece of fixed-function state with two settings anybody actually
@@ -901,6 +910,7 @@ impl Scene {
 			focus,
 			focusing: None,
 			shadows,
+			environment,
 			cascades: Cascades::NONE,
 			shadowing: false,
 			lines,
@@ -1435,13 +1445,7 @@ impl Scene {
 			.atlas
 			.ensure(&self.device, &self.queue, &world.textures, &self.pictures)
 		{
-			self.bindings = frame_bindings(
-				&self.device,
-				&self.globals_layout,
-				&self.globals,
-				&self.atlas,
-				&self.decal_sampler,
-			);
+			self.bindings = self.frame_group();
 		}
 
 		let room = world
@@ -1723,7 +1727,31 @@ impl Scene {
 	}
 
 	/// Writes this frame's resources, globals and entity instances to the GPU.
-	fn upload(&mut self, world: &World) {
+	/// Puts the world's environment on the device, and rebuilds group nought
+	/// when it moved.
+	///
+	/// A texture rather than a matrix, so it is done here rather than in the
+	/// uniform the rest of the frame is written into. A frame whose sky did not
+	/// change does nothing at all.
+	fn sync_environment(&mut self, world: &World) {
+		let wanted = world.cvars.bool(env::ENABLED).unwrap_or(true);
+
+		if self
+			.environment
+			.update(&self.device, &self.queue, world, wanted)
+		{
+			self.bindings = self.frame_group();
+		}
+	}
+
+	/// Everything the frame reads that lives in a registry rather than in the
+	/// uniform.
+	///
+	/// Geometry, pictures, materials, the debug pen's lines, the particles'
+	/// groups and the environment: all of them are "what is on the device
+	/// matching what the world holds", and none of them depends on where the
+	/// camera is this frame.
+	fn sync_tables(&mut self, world: &World) {
 		self.sync_meshes(&world.meshes);
 		self.sync_textures(&world.textures);
 		self.sync_materials(world);
@@ -1739,6 +1767,34 @@ impl Scene {
 			&self.textures,
 			&self.globals_layout,
 		);
+		self.sync_environment(world);
+	}
+
+	/// How many roughness levels the bound environment has, nought for none.
+	///
+	/// **The word the shader branches on.** Nought says there is no environment
+	/// and the shading takes the line it took before there were any, which is
+	/// what makes a world with no sky draw what it drew. It rides on the sky's
+	/// own vector rather than in a word of its own, because a number about the
+	/// sky belongs beside the sky's colors.
+	fn roughness_levels(&self) -> f32 {
+		f32::from(u16::try_from(self.environment.levels()).unwrap_or(0))
+	}
+
+	/// Group nought, rebuilt around whatever the atlas and the environment are
+	/// now.
+	///
+	/// Two things make it stale and both are rare: the decals' atlas growing,
+	/// and the world naming a different environment. @ref [`frame_bindings`].
+	fn frame_group(&self) -> BindGroup {
+		frame_bindings(&self.device, &self.globals_layout, &self.globals, &self.atlas, &Held {
+			decals: &self.decal_sampler,
+			environment: &self.environment,
+		})
+	}
+
+	fn upload(&mut self, world: &World) {
+		self.sync_tables(world);
 
 		// asked for once and used twice on purpose. This is where the frame
 		// stops being the simulation's and becomes the picture's: the camera
@@ -1825,7 +1881,11 @@ impl Scene {
 					.zenith
 					.extend(if self.sky { 1.0 } else { 0.0 })
 					.to_array(),
-				sky_horizon: world.sky.horizon.extend(0.0).to_array(),
+				sky_horizon: world
+					.sky
+					.horizon
+					.extend(self.roughness_levels())
+					.to_array(),
 				sky_ground: world.sky.ground.extend(0.0).to_array(),
 				counts: [count, painted, 0, 0],
 				lamps,
@@ -1939,8 +1999,20 @@ impl Scene {
 				continue;
 			}
 
-			let uploaded =
-				upload_texture(&self.device, &self.queue, texture.value(), texture.revision());
+			// an environment is in the same registry as every picture, because
+			// it is compiled by the same compiler into the same format - but
+			// nothing here can sample one. A material's group binds a flat
+			// picture and there is no arithmetic in the shader that would know
+			// which of six faces to read. So the slot gets the white texel and
+			// the cube is put on the device by @ref [`env`] instead, once, for
+			// the whole frame rather than per material.
+			let flat = &TextureData::white();
+			let value = if texture.value().is_cube() {
+				flat
+			} else {
+				texture.value()
+			};
+			let uploaded = upload_texture(&self.device, &self.queue, value, texture.revision());
 			match self.textures.get_mut(slot) {
 				| Some(existing) => *existing = uploaded,
 				| None => self.textures.push(uploaded),
@@ -2401,6 +2473,7 @@ impl Scene {
 ///
 /// @param device - the device to build against
 fn frame_layout(device: &Device) -> BindGroupLayout {
+	let environment = env::layout_entries(ENVIRONMENT_TEXTURE, ENVIRONMENT_SAMPLER);
 	let picture = |binding| BindGroupLayoutEntry {
 		binding,
 		visibility: ShaderStages::FRAGMENT,
@@ -2433,9 +2506,25 @@ fn frame_layout(device: &Device) -> BindGroupLayout {
 				ty: BindingType::Sampler(SamplerBindingType::Filtering),
 				count: None,
 			},
+			environment[0],
+			environment[1],
 		],
 	})
 }
+
+/// Which binding of group nought the environment's cube takes.
+///
+/// **In the frame's own group rather than in one of its own.** There is no
+/// fifth group - the scene binds four and four is the floor a device has to
+/// offer - and of the four this is the one every pass binds and no draw
+/// changes. It also has to be this one rather than the shadow atlas's: the sky
+/// is drawn by a pipeline whose layout declares group nought and nothing else,
+/// and a pipeline layout that skipped a group would make the shader's own group
+/// numbers resolve somewhere else. @ref [`env`](crate::env).
+const ENVIRONMENT_TEXTURE: u32 = 4;
+
+/// Which binding its sampler takes.
+const ENVIRONMENT_SAMPLER: u32 = 5;
 
 /// Group nought, over this frame's uniform and the atlas as it stands.
 ///
@@ -2452,7 +2541,7 @@ fn frame_bindings(
 	layout: &BindGroupLayout,
 	globals: &Buffer,
 	atlas: &Atlas,
-	sampler: &Sampler,
+	held: &Held<'_>,
 ) -> BindGroup {
 	device.create_bind_group(&BindGroupDescriptor {
 		label: Some("globals"),
@@ -2472,10 +2561,30 @@ fn frame_bindings(
 			},
 			BindGroupEntry {
 				binding: 3,
-				resource: BindingResource::Sampler(sampler),
+				resource: BindingResource::Sampler(held.decals),
+			},
+			BindGroupEntry {
+				binding: ENVIRONMENT_TEXTURE,
+				resource: BindingResource::TextureView(held.environment.view()),
+			},
+			BindGroupEntry {
+				binding: ENVIRONMENT_SAMPLER,
+				resource: BindingResource::Sampler(held.environment.sampler()),
 			},
 		],
 	})
+}
+
+/// What group nought holds besides the uniform and the decals' atlas.
+///
+/// A struct rather than two more arguments, because the builder is already at
+/// the count the lints allow and the two are read together.
+struct Held<'a> {
+	/// What the decals' pictures are read through.
+	decals: &'a Sampler,
+
+	/// The cube every reflection and a cubemap sky are read out of.
+	environment: &'a Environment,
 }
 
 /// The sampler every decal's picture is read through.
@@ -3160,6 +3269,14 @@ fn compile_sky(
 /// bound - and group one is bound per batch, so an empty world would refuse the
 /// draw. That is a wgpu validation error rather than a black screen, and the
 /// rendered test found it.
+///
+/// **It is also why the environment is in group nought.** A cubemap sky is
+/// drawn out of the environment, so this pipeline has to be able to read it;
+/// putting it in a later group would mean either declaring that group here -
+/// which needs the ones before it, which is the paragraph above - or leaving a
+/// hole, which makes the shader's own group numbers resolve to a different
+/// group entirely. That one is not a validation error at all: the sky comes
+/// back one flat color and nothing anywhere says why.
 fn build_sky(
 	device: &Device,
 	format: TextureFormat,

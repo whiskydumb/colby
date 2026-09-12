@@ -68,7 +68,8 @@ struct Globals {
     fog: vec4<f32>,
     // rgb is the color straight up; w is whether a sky is drawn at all.
     sky_zenith: vec4<f32>,
-    // rgb is the color at eye level; w is unused.
+    // rgb is the color at eye level; w is how many roughness levels the
+    // environment holds, nought for a world that has none.
     sky_horizon: vec4<f32>,
     // rgb is the color straight down; w is unused.
     sky_ground: vec4<f32>,
@@ -162,6 +163,15 @@ struct Paint {
 @group(0) @binding(1) var decal_colors: texture_2d<f32>;
 @group(0) @binding(2) var decal_numbers: texture_2d<f32>;
 @group(0) @binding(3) var decal_sampler: sampler;
+
+// The environment, in the frame's own group because there is no fifth group -
+// the scene binds four and four is the floor a device has to offer - and
+// because the sky is drawn by a pipeline whose layout declares this group and
+// no other. Its mip chain is a roughness chain rather than a size chain, so
+// level nought is the picture the sky is drawn out of and a rough surface reads
+// further down it.
+@group(0) @binding(4) var environment: texture_cube<f32>;
+@group(0) @binding(5) var environment_sampler: sampler;
 
 @group(1) @binding(0) var albedo: texture_2d<f32>;
 @group(1) @binding(1) var surface_sampler: sampler;
@@ -542,6 +552,24 @@ fn visibility_smith(normal_dot_view: f32, normal_dot_light: f32, roughness: f32)
 // How reflective the surface is at this angle. Schlick's approximation.
 fn fresnel_schlick(view_dot_half: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - view_dot_half, 0.0, 1.0), 5.0);
+}
+
+// What the environment sends back along one direction, at one roughness.
+//
+// The level is the roughness, because the file's mip chain was built that way:
+// nought is the picture itself and the last level is the whole hemisphere
+// averaged. Multiplying by `levels - 1` is the whole mapping, and the sampler
+// filters between two levels as well as inside them - without that a ball whose
+// roughness changes smoothly over it shows a band wherever the level steps.
+fn reflected_radiance(way: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let last = max(globals.sky_horizon.w - 1.0, 0.0);
+
+    return textureSampleLevel(
+        environment,
+        environment_sampler,
+        way,
+        clamp(roughness, 0.0, 1.0) * last,
+    ).rgb;
 }
 
 // The same, for a whole hemisphere of incoming light rather than one direction.
@@ -978,16 +1006,44 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
             normal_dot_view,
         );
 
-    // everything this renderer does not simulate, in one term, standing in for
-    // an environment there is no map of.
+    // everything this renderer does not simulate, in one term.
     //
     // @note: the specular half of it matters more than it looks. A metal has no
     // diffuse term at all, so without this a gold cube under one light is black
     // everywhere the highlight is not - physically right, and it reads as a bug.
-    // A prefiltered environment is the real answer; this is the placeholder
-    // every renderer uses before it has one.
+    //
+    // **Two lines rather than one, and the branch is the point.** When a world
+    // names an environment the specular half is multiplied by what the surface
+    // actually reflects; when it does not, the line is the one this shader had
+    // before there were environments at all - character for character. Folding
+    // the two together by multiplying the color by a white cube would not do:
+    // `a * (b + c)` and `a * b + a * c` are not the same float, and a world with
+    // no sky has to draw what it drew.
+    //
+    // @note: it is the same expression and it is not quite the same picture.
+    // Measured against a build from before this line existed, over a fixture of
+    // four metal balls and a floor: **one channel of 2,764,800 comes back a byte
+    // different**, and the cause is this branch rather than anything it guards -
+    // the same build with the bindings added and the branch left out is byte for
+    // byte. A branch here reorganizes how the whole function is scheduled, and a
+    // rounding somewhere else in it lands the other way.
+    //
+    // The *diffuse* half stays the ambient color whatever the sky is, which is
+    // deliberate rather than unfinished. One engine in the field offers a flat
+    // color for the diffuse ambient and refuses to offer one for the specular,
+    // on the grounds that a mirror reflecting a constant is a flat grey object;
+    // this is that split taken at its word.
     let ambient_specular = fresnel_ambient(normal_dot_view, f0, roughness);
-    let indirect = globals.ambient.rgb * (diffuse_color + ambient_specular);
+    var indirect: vec3<f32>;
+
+    if (globals.sky_horizon.w > 0.5) {
+        let reflected = reflect(-towards_eye, normal);
+
+        indirect = globals.ambient.rgb * diffuse_color
+            + reflected_radiance(reflected, roughness) * ambient_specular;
+    } else {
+        indirect = globals.ambient.rgb * (diffuse_color + ambient_specular);
+    }
     // @ref `HDR_CEILING`: past it a smooth highlight would not fit the target.
     let color = min(direct + indirect, vec3<f32>(HDR_CEILING));
 
@@ -1065,6 +1121,13 @@ fn fragment_sky(input: SkyOutput) -> @location(0) vec4<f32> {
     let near = globals.inverse_view_projection * vec4<f32>(input.ndc, 0.0, 1.0);
     let far = globals.inverse_view_projection * vec4<f32>(input.ndc, 1.0, 1.0);
     let way = normalize(far.xyz / far.w - near.xyz / near.w);
+
+    // one texture, two jobs: the picture is level nought of the same chain a
+    // reflection reads further down. There is no second binding and no second
+    // file, because level nought is what the filter leaves alone.
+    if (globals.sky_horizon.w > 0.5) {
+        return vec4<f32>(reflected_radiance(way, 0.0), 1.0);
+    }
 
     return vec4<f32>(sky_color(way), 1.0);
 }

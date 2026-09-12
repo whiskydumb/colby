@@ -318,7 +318,7 @@ mod tests {
 	use colby_core::{
 		abi::{
 			Decal, EntityId, Material, MeshData, MeshId, Pose, PoseId, Post, Renderable,
-			SkinVertex, Sky, SkyKind, Texel, TextureData, ToneMap, Transform,
+			SkinVertex, Sky, SkyKind, Texel, TextureData, TextureId, ToneMap, Transform,
 			cvar::Value,
 			material::{Blend, MaterialId},
 			mesh,
@@ -330,7 +330,7 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		cull,
+		cull, env,
 		scene::MSAA,
 		shadow,
 		skin::{self, Joints},
@@ -3286,11 +3286,30 @@ f 1 4 5
 	/// here at all: what this test is about is two backends, and the shared
 	/// device is whichever of them wgpu ranked first. Asking for each by name
 	/// is the only way to know which two were compared.
-	fn on(api: Backends) -> Option<Gpu> {
-		match Gpu::open(api, None) {
-			| Ok(gpu) => gpu,
-			| Err(error) => panic!("opening a {api:?} device failed: {error}"),
+	fn on(api: Backends) -> Option<&'static Gpu> {
+		static SECOND: std::sync::OnceLock<Option<Gpu>> = std::sync::OnceLock::new();
+
+		// **The shared device for whichever API it is already on, and one more
+		// held for the life of the process for the other.** Every other test in
+		// this binary draws on [`crate::gpu::shared`], and the reason is
+		// measured rather than tidy: a suite that opens a device per test has a
+		// dozen alive at once and the driver falls over - an access violation
+		// with no panic and no failing test, the harness simply stopping
+		// mid-list. This test is the one that cannot use the shared device for
+		// *both* of its devices, because its whole point is two different APIs.
+		// So it uses it for one of them and opens the other once, which leaves
+		// the process with two devices rather than four.
+		let shared = crate::gpu::shared()?;
+		if Backends::from(shared.adapter().get_info().backend) == api {
+			return Some(shared);
 		}
+
+		SECOND
+			.get_or_init(|| match Gpu::open(api, None) {
+				| Ok(gpu) => gpu,
+				| Err(error) => panic!("opening a {api:?} device failed: {error}"),
+			})
+			.as_ref()
 	}
 
 	#[test]
@@ -4510,6 +4529,310 @@ f 1 4 5
 			towards_the_rim * 10 > center * 7,
 			"and so is two thirds of the way out, because a flattened sphere's normals still \
 			 face the camera: {towards_the_rim} against {center}"
+		);
+	}
+	/// A cube of one color a face, in the order the file writes them, with a
+	/// chain whose every level is that same color.
+	///
+	/// Six colors rather than one, because what almost everything about a cube
+	/// gets wrong is *which face*, and a cube of one color cannot tell.
+	fn six_colors(side: u32) -> TextureData {
+		const COLORS: [[f32; 3]; 6] = [
+			[1.0, 0.0, 0.0],
+			[0.0, 1.0, 0.0],
+			[0.0, 0.0, 1.0],
+			[1.0, 1.0, 0.0],
+			[0.0, 1.0, 1.0],
+			[1.0, 0.0, 1.0],
+		];
+
+		let count = TextureData::full_chain(side, side);
+		let levels = (0..count)
+			.map(|level| {
+				let across = usize::try_from((side >> level.min(31)).max(1)).unwrap_or(1);
+
+				COLORS
+					.into_iter()
+					.flat_map(|color| one_face(color, across * across))
+					.collect()
+			})
+			.collect();
+
+		TextureData {
+			width: side,
+			height: side,
+			faces: 6,
+			texel: Texel::Rgba16Float,
+			levels,
+		}
+	}
+
+	/// A cube whose every level is a different grey, brightest last.
+	///
+	/// What the six-colored one cannot show: which *level* a roughness reads.
+	/// There the answer is the same color at every level, so a wrong level and
+	/// a right one look alike.
+	fn brightening(side: u32) -> TextureData {
+		let count = TextureData::full_chain(side, side);
+		let levels = (0..count)
+			.map(|level| {
+				let across = usize::try_from((side >> level.min(31)).max(1)).unwrap_or(1);
+				let step = f32::from(u16::try_from(level).unwrap_or(0) + 1)
+					/ f32::from(u16::try_from(count).unwrap_or(1));
+				let texel: Vec<u8> = [step, step, step, 1.0]
+					.into_iter()
+					.flat_map(|value| eighth(value).to_le_bytes())
+					.collect();
+
+				texel.repeat(across * across * 6)
+			})
+			.collect();
+
+		TextureData {
+			width: side,
+			height: side,
+			faces: 6,
+			texel: Texel::Rgba16Float,
+			levels,
+		}
+	}
+
+	/// A value in `0 ..= 1` as the sixteen bits the environment format holds.
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_possible_truncation,
+		clippy::cast_sign_loss,
+		reason = "held inside nought and one by the callers, and assembled bit by bit rather 		          than converted"
+	)]
+	fn eighth(value: f32) -> u16 {
+		if value <= 0.0 {
+			return 0;
+		}
+
+		let exponent = value.log2().floor().clamp(-14.0, 15.0);
+		let mantissa = ((value / exponent.exp2() - 1.0) * 1024.0)
+			.round()
+			.clamp(0.0, 1023.0);
+
+		(((exponent as i32 + 15) as u16) << 10) | mantissa as u16
+	}
+
+	/// One face's worth of one color, opaque.
+	fn one_face(color: [f32; 3], texels: usize) -> Vec<u8> {
+		let texel: Vec<u8> = [color[0], color[1], color[2], 1.0]
+			.into_iter()
+			.flat_map(|value| half_bits(value).to_le_bytes())
+			.collect();
+
+		texel.repeat(texels)
+	}
+
+	/// Nought or one as the sixteen bits the environment format holds.
+	fn half_bits(value: f32) -> u16 { if value > 0.5 { 0x3C00 } else { 0 } }
+
+	/// A world looking straight down at a mirror-flat floor, nothing else lit.
+	///
+	/// The sun travels upwards and the ambient is black, so every pixel of the
+	/// floor is the ambient specular term and nothing else - which is the term
+	/// whose radiance an environment replaces. Looking straight down means what
+	/// the floor reflects is straight up, which is one named face of the cube
+	/// rather than a blend of several.
+	fn mirror_world() -> World {
+		let mut world = looking_world();
+		world.light = Vec3::Y;
+		world.ambient = Vec3::ZERO;
+		world.post.tonemap = ToneMap::None;
+		world.post.auto_exposure = false;
+		world.post.exposure = 1.0;
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+		world.camera.target = Vec3::ZERO;
+		world
+			.cvars
+			.var(shadow::ENABLED, Value::Bool(false), "off for these pictures");
+
+		let mirror = world.materials.insert("test/mirror", Material {
+			metallic: 1.0,
+			roughness: 0.0,
+			..Material::DEFAULT
+		});
+		let across = view_across(&world);
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(MeshId::QUAD, mirror, Vec3::ONE));
+
+		world
+	}
+
+	#[test]
+	fn a_mirror_under_no_light_at_all_reflects_the_environment_rather_than_black() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut world = mirror_world();
+		let before = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let dark = brightness(before.pixel(SIZE.0 / 2, SIZE.1 / 2));
+
+		let sky = world.textures.insert("test/sky", six_colors(4));
+		world.sky = Sky::environment(sky);
+
+		let after = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let lit = after.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert!(
+			dark < 8,
+			"with no environment and no light a metal is black but for its highlight, which is \
+			 the thing this card exists to stop: {dark}"
+		);
+		// the camera looks straight down at a floor facing up, so what the
+		// middle of it reflects is +y, which is the third face and blue
+		assert!(
+			lit[2] > 180 && lit[0] < 40 && lit[1] < 40,
+			"and with one it reflects the face the direction lands on, which is blue: {lit:?}"
+		);
+	}
+
+	#[test]
+	fn a_rough_metal_reads_further_down_the_chain_than_a_smooth_one() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut world = mirror_world();
+		let sky = world.textures.insert("test/sky", brightening(8));
+		world.sky = Sky::environment(sky);
+
+		let smooth = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		// the same world with the floor roughened all the way. Each level of
+		// this cube is a brighter grey than the one above it, so what the
+		// picture says is *which level was read* - the one thing a cube of six
+		// flat colors cannot tell, because there a wrong level and a right one
+		// look alike.
+		world.materials.insert("test/mirror", Material {
+			metallic: 1.0,
+			roughness: 1.0,
+			..Material::DEFAULT
+		});
+
+		let rough = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert!(
+			u32::from(rough[1]) > u32::from(smooth[1]) + 40,
+			"a roughness of one reads the far end of the chain and a smooth surface reads the 			 near one: {rough:?} against {smooth:?}"
+		);
+	}
+
+	#[test]
+	fn a_world_whose_switch_is_off_draws_what_it_drew_before_there_were_any() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut world = mirror_world();
+		// a cubemap sky naming nothing, which is the world this one is claimed
+		// to draw: the switch turns off the *reflections*, and what is drawn
+		// behind the world is the sky's own word either way
+		world.sky = Sky::environment(TextureId::NONE);
+
+		let before = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		let sky = world.textures.insert("test/sky", six_colors(4));
+		world.sky = Sky::environment(sky);
+		world
+			.cvars
+			.var(env::ENABLED, Value::Bool(false), "off for this picture");
+
+		let after = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert_eq!(
+			before.pixels, after.pixels,
+			"the switch is the whole of what it says: a world naming an environment with it off \
+			 draws the world that names none"
+		);
+	}
+
+	#[test]
+	fn a_cubemap_sky_is_drawn_behind_the_world_as_well_as_reflected_in_it() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// nothing standing in it, so every pixel of it is the sky
+		let mut world = looking_world();
+		world.clear = Vec3::ZERO;
+		let sky = world.textures.insert("test/sky", six_colors(4));
+		world.sky = Sky::environment(sky);
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		// the camera looks along -z, which is the sixth face and magenta
+		let middle = image.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert!(
+			middle[0] > 180 && middle[1] < 40 && middle[2] > 180,
+			"the middle of the picture looks along -z, and that face is magenta: {middle:?}"
+		);
+
+		world.sky = Sky::NONE;
+
+		let none = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert_ne!(middle, none, "and turning the sky off is a different picture");
+	}
+
+	#[test]
+	fn a_cubemap_sky_naming_nothing_falls_back_to_the_three_colors() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		let mut world = looking_world();
+		world.clear = Vec3::ZERO;
+		world.sky = Sky {
+			kind: SkyKind::Cubemap,
+			..Sky::gradient(Vec3::Z, Vec3::Y, Vec3::X)
+		};
+
+		let asked = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		world.sky = Sky::gradient(Vec3::Z, Vec3::Y, Vec3::X);
+
+		let gradient = capture
+			.shoot(&mut world)
+			.expect("the capture renders")
+			.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert_eq!(
+			asked, gradient,
+			"a word asking for a cubemap with none to show draws the gradient, because a black \
+			 dome is nobody's idea of a sky"
 		);
 	}
 }

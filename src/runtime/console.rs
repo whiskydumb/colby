@@ -608,6 +608,16 @@ fn install_render(world: &mut World) {
 		Value::Float(colby_engine::shadow::DEFAULT_LOCAL_LAMPS),
 		"how many tiles of the shadow atlas the point and cone lights may have",
 	);
+	// whether a surface's reflections come out of the world's environment or
+	// out of its one ambient color. On, like the shadows and for the same
+	// reason: what the switch is for is measuring the feature and taking the
+	// picture a build from before it would have taken, which is how the
+	// environment's negative control is shot.
+	world.cvars.var(
+		colby_engine::env::ENABLED,
+		Value::Bool(true),
+		"reflect the world's environment map, when its sky names one",
+	);
 	// what a frame cannot see is left out of it: the view for the picture and
 	// each cascade's box for its shadows. On, and not saved, like the shadows:
 	// what the switch is for is measuring what the test saves, and showing
