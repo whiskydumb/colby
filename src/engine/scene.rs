@@ -54,6 +54,7 @@ use crate::{
 	cull::{self, Bounds, Drawn, Frustum, Placed},
 	decal::{self, Atlas, Chosen, DECALS, Key, MAX_DECALS, Paint},
 	depth::{self, Depth},
+	focus::{self, Focus},
 	gpu::Gpu,
 	lines::Lines,
 	post,
@@ -652,6 +653,12 @@ pub struct Scene {
 	/// What those passes are asked for this frame, or nothing. Read in
 	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
 	shafting: Option<Asking>,
+	/// The three passes that blur what the lens is not focused on. @ref
+	/// [`focus`].
+	focus: Focus,
+	/// What those passes are asked for this frame, or nothing. Read in
+	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
+	focusing: Option<focus::Asking>,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
 	/// This frame's light matrices, fitted in `upload` and drawn in `render`.
@@ -790,6 +797,7 @@ impl Scene {
 		let sparks = Sparks::new(&device, post::HDR_FORMAT, post::NO_SAMPLES);
 		let post = post::Chain::new(&device, format, width, height)?;
 		let shaft = Shaft::new(&device, width, height)?;
+		let focus = Focus::new(&device, width, height)?;
 
 		let instances = device.create_buffer(&BufferDescriptor {
 			label: Some("placements"),
@@ -816,6 +824,8 @@ impl Scene {
 			seeing: None,
 			shaft,
 			shafting: None,
+			focus,
+			focusing: None,
 			shadows,
 			cascades: Cascades::NONE,
 			shadowing: false,
@@ -857,6 +867,7 @@ impl Scene {
 		self.depth.resize(&self.device, width, height);
 		self.post.resize(&self.device, width, height);
 		self.shaft.resize(width, height);
+		self.focus.resize(width, height);
 	}
 
 	/// Rebuilds everything that has to agree about how many samples a pixel is.
@@ -1144,13 +1155,13 @@ impl Scene {
 	) {
 		// between the scene that wrote the depth and everything after it that
 		// reads it, and only in a frame something does. **Anything**: the view
-		// that draws the depth was the first reader and the smear around the
-		// sun is the second, so the question is whether one of them asked
-		// rather than whether that one did.
+		// that draws the depth was the first reader, the smear around the sun
+		// is the second and the lens is the third, so the question is whether
+		// one of them asked rather than whether that one did.
 		self.depth.make_readable(
 			&self.device,
 			&mut encoder,
-			self.seeing.is_some() || self.shafting.is_some(),
+			self.seeing.is_some() || self.shafting.is_some() || self.focusing.is_some(),
 			&self.timings,
 		);
 
@@ -1160,6 +1171,21 @@ impl Scene {
 			&mut encoder,
 			&self.queue,
 			self.shafting,
+			self.post.picture(),
+			&self.depth,
+			&self.timings,
+		);
+
+		// and after it, because light the air caught is in the picture and a
+		// lens is out of focus about the whole picture. Three of the four
+		// engines with this effect put it before the bloom and the meter, as
+		// this does, and all four put it before the curve: a blur is an
+		// average of light, and an average taken after a curve is an average
+		// of the wrong numbers.
+		self.focus.render(
+			&mut encoder,
+			&self.queue,
+			self.focusing,
 			self.post.picture(),
 			&self.depth,
 			&self.timings,
@@ -1615,6 +1641,7 @@ impl Scene {
 		self.sky = world.sky.is_drawn();
 		self.seeing = seeing_of(world, &camera);
 		self.shafting = shaft::asking_of(world, &camera);
+		self.focusing = focus::asking_of(world, &camera);
 
 		self.queue.write_buffer(
 			&self.globals,

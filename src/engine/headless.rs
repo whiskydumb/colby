@@ -240,6 +240,31 @@ mod tests {
 	}
 
 	#[test]
+	fn and_blurs_what_the_lens_is_not_focused_on_at_one_sample_and_at_four() {
+		// the three lens passes are only recorded in a frame whose camera
+		// focuses on something, and two of them read the depth - so this is
+		// the third reader of that buffer, built and validated here on a
+		// device that draws nothing. The last of the three blends into the
+		// picture, which is a pipeline state the two above do not have.
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+
+		world.camera.focus = 4.0;
+		world.camera.focus_range = 6.0;
+		world.camera.blur = 12.0;
+
+		for samples in ["1", "4", "1"] {
+			tuned(&mut world, samples);
+			capture
+				.shoot(&mut world)
+				.expect("the blur renders at either sample count");
+		}
+	}
+
+	#[test]
 	fn a_shader_that_does_not_compile_is_refused_here_the_way_a_card_refuses_it() {
 		// what says the two above have teeth. Nothing is drawn on this device,
 		// so "the frame rendered" could mean the pipelines were never built -

@@ -16,6 +16,7 @@ pub mod capture;
 pub mod cull;
 pub mod decal;
 pub mod depth;
+mod focus;
 pub mod gpu;
 mod headless;
 pub mod image;

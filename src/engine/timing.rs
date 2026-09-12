@@ -99,6 +99,12 @@ pub enum Pass {
 	/// camera. @ref [`shaft`](crate::shaft).
 	Shaft,
 
+	/// The lens out of focus: two blurs at half the picture on each axis, and
+	/// one pass blending the result back over it by how far off the plane in
+	/// focus each pixel is. None at all while the camera focuses on nothing.
+	/// @ref [`focus`](crate::focus).
+	Focus,
+
 	/// The bloom chain, down and back up: eleven passes at a window's size,
 	/// and none at all in a frame that does not bloom.
 	Glow,
@@ -111,11 +117,12 @@ pub enum Pass {
 
 impl Pass {
 	/// Every span, in the order a frame runs them.
-	pub const ALL: [Self; 7] = [
+	pub const ALL: [Self; 8] = [
 		Self::Shadow,
 		Self::Scene,
 		Self::Depth,
 		Self::Shaft,
+		Self::Focus,
 		Self::Meter,
 		Self::Glow,
 		Self::Composite,
@@ -129,6 +136,7 @@ impl Pass {
 			| Self::Scene => "scene",
 			| Self::Depth => "depth",
 			| Self::Shaft => "shaft",
+			| Self::Focus => "focus",
 			| Self::Meter => "meter",
 			| Self::Glow => "glow",
 			| Self::Composite => "composite",
@@ -142,9 +150,10 @@ impl Pass {
 			| Self::Scene => 1,
 			| Self::Depth => 2,
 			| Self::Shaft => 3,
-			| Self::Meter => 4,
-			| Self::Glow => 5,
-			| Self::Composite => 6,
+			| Self::Focus => 4,
+			| Self::Meter => 5,
+			| Self::Glow => 6,
+			| Self::Composite => 7,
 		}
 	}
 
@@ -160,9 +169,10 @@ impl Pass {
 			| Self::Scene => 2,
 			| Self::Depth => 4,
 			| Self::Shaft => 6,
-			| Self::Meter => 8,
-			| Self::Glow => 10,
-			| Self::Composite => 12,
+			| Self::Focus => 8,
+			| Self::Meter => 10,
+			| Self::Glow => 12,
+			| Self::Composite => 14,
 		}
 	}
 }
@@ -238,7 +248,7 @@ pub(crate) enum Ends {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
 	/// What the hardware spent, per [`Pass`], in its `slot` order.
-	passes: [Option<Duration>; 7],
+	passes: [Option<Duration>; 8],
 
 	/// What this thread spent, per [`Work`], in its `slot` order.
 	work: [Option<Duration>; 2],
@@ -365,9 +375,9 @@ pub struct Timings {
 
 impl Timings {
 	/// How many timestamps the set holds: two per span.
-	const QUERIES: u32 = 14;
+	const QUERIES: u32 = 16;
 	/// The same number where a length is wanted. @ref [`Pass::query`].
-	const TICKS: usize = 14;
+	const TICKS: usize = 16;
 
 	/// An apparatus that measures nothing.
 	///
@@ -696,7 +706,7 @@ impl Timings {
 		// read into a table of its own and then written over the frame in one
 		// go: `span` reads the mask off `self` and the frame is a field of
 		// the same `self`, so the two cannot be borrowed at once.
-		let mut spans = [None; 7];
+		let mut spans = [None; 8];
 
 		for pass in Pass::ALL {
 			if let Some(held) = spans.get_mut(pass.slot()) {

@@ -88,20 +88,21 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Seven spans of hardware, two of recording, five of simulation and one of
+/// Eight spans of hardware, two of recording, five of simulation and one of
 /// particles.
-const ROWS: usize = 15;
+const ROWS: usize = 16;
 
 /// Which row of the table is the whole solver step.
 ///
 /// Written out rather than "the last one", which is what it used to be and
 /// what stopped being true the moment a row was appended after it. A row added
 /// below has to leave these two alone or move them on purpose; `gpu depth`
-/// went in above them and moved both, and `gpu shaft` did it again.
-const STEP_ROW: usize = 13;
+/// went in above them and moved both, `gpu shaft` did it again and `gpu focus`
+/// a third time.
+const STEP_ROW: usize = 14;
 
 /// Which row is the particles.
-const SPARKS_ROW: usize = 14;
+const SPARKS_ROW: usize = 15;
 
 /// How many frames the live table averages over.
 ///
@@ -221,7 +222,7 @@ impl Live {
 	/// @param passes - what the hardware spent, per [`Pass`] in slot order,
 	/// from a frame two or three behind the one this is called in
 	/// @param count - how many render passes that frame recorded
-	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 7], count: u32) {
+	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 8], count: u32) {
 		self.passes = Some(count);
 
 		for (at, took) in passes.into_iter().enumerate() {
@@ -419,6 +420,10 @@ pub(crate) const NAMES: [&str; ROWS] = [
 	// writes into the picture before either of the two below it read it.
 	// Added with parity card B2.
 	"gpu shaft",
+	// the lens out of focus, which reads that depth as well and blurs the
+	// picture the two below it then measure and gather. Added with parity
+	// card B3.
+	"gpu focus",
 	"gpu meter",
 	"gpu glow",
 	"gpu composite",
@@ -762,7 +767,10 @@ mod tests {
 		);
 		assert_eq!(live.profile().passes, None, "and no frame has been read back");
 
-		live.hardware([None, Some(Duration::from_micros(800)), None, None, None, None, None], 15);
+		live.hardware(
+			[None, Some(Duration::from_micros(800)), None, None, None, None, None, None],
+			15,
+		);
 
 		assert!(live.profile().hardware, "now it has");
 		assert_eq!(live.profile().parts[1].mean, Some(Duration::from_micros(800)));
