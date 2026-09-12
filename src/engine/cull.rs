@@ -421,6 +421,7 @@ mod tests {
 			fov_y: FRAC_PI_2,
 			near: 0.1,
 			far: 100.0,
+			..Camera::DEFAULT
 		};
 
 		Frustum::of(camera.view_projection(1.0))

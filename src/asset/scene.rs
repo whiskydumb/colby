@@ -76,9 +76,10 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// different number is refused with a message rather than read as if it
 /// agreed.
 ///
-/// Fourteen since an entity may paint what is around it, which is a block of
-/// its own, and the entity record's word of flags grew its second bit.
-pub const FORMAT_VERSION: u32 = 14;
+/// Fifteen since a camera carries a lens as well as a pose: three words on the
+/// settings record, which is the first growth that record has had to pay for
+/// since it was given a spare word to spend.
+pub const FORMAT_VERSION: u32 = 15;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -432,6 +433,27 @@ pub struct Setting {
 	///
 	/// The next field to arrive pays for two: itself and a new spare.
 	pub shafts: f32,
+
+	/// How far away the lens is focused; nought is a lens that holds
+	/// everything sharp.
+	pub focus: f32,
+
+	/// How far off that a surface is blurred all the way.
+	pub focus_range: f32,
+
+	/// How wide the blur gets there, as a radius in pixels.
+	pub blur: f32,
+
+	/// The record's spare word, remade.
+	///
+	/// **This is the bill the field above's note said would come.** Three
+	/// words of lens arrived at once and the eight-byte `steps` at the top
+	/// keeps the record eight-aligned, so the three cost four - and, unlike
+	/// `shafts`, they cost [`FORMAT_VERSION`] as well, because a record that
+	/// grows is a record an older build reads the wrong length of. Having paid
+	/// the version anyway, the fourth word is spent now rather than later: the
+	/// next single field to arrive takes this and moves nothing.
+	pub reserved: u32,
 }
 
 // a record with padding in it is not `Pod`, so this would already have failed
@@ -1448,6 +1470,10 @@ const EMPTY_SETTING: Setting = Setting {
 	fog: [0.0; 3],
 	fog_density: 0.0,
 	shafts: 0.0,
+	focus: 0.0,
+	focus_range: 0.0,
+	blur: 0.0,
+	reserved: 0,
 };
 
 /// Writes a world out as a `.cscene`.
@@ -1937,6 +1963,10 @@ fn setting_of(stage: Stage) -> Setting {
 		fog: stage.post.fog.to_array(),
 		fog_density: stage.post.fog_density,
 		shafts: stage.post.shafts,
+		focus: stage.camera.focus,
+		focus_range: stage.camera.focus_range,
+		blur: stage.camera.blur,
+		reserved: 0,
 	}
 }
 
@@ -1950,6 +1980,9 @@ fn stage_of(setting: Setting) -> Stage {
 			fov_y: setting.fov_y,
 			near: setting.near,
 			far: setting.far,
+			focus: setting.focus,
+			focus_range: setting.focus_range,
+			blur: setting.blur,
 		},
 		clear: Vec3::from_array(setting.clear),
 		// a kind this build does not know reads as no sky, for the reason a
@@ -2726,6 +2759,9 @@ mod tests {
 					fov_y: 1.1,
 					near: 0.2,
 					far: 300.0,
+					focus: 7.5,
+					focus_range: 22.0,
+					blur: 11.0,
 				},
 				clear: Vec3::new(0.1, 0.2, 0.3),
 				// drawn, and three colors none of which is a default, so the
@@ -3080,32 +3116,33 @@ mod tests {
 	}
 
 	#[test]
-	fn a_settings_record_whose_last_word_is_spare_reads_as_a_world_with_no_shafts() {
-		// the whole of why that field cost no [`FORMAT_VERSION`]: a build that
-		// did not know the word wrote nought into it, and nought there is the
-		// world nobody asked for shafts in. Everything before it is at the
-		// offset it always was, which is the other half of the claim.
+	fn the_settings_record_ends_in_a_word_nothing_reads() {
+		// what the next single field on this record will take, and the claim
+		// that makes that free: whatever is in the spare, the world that comes
+		// back is the same world, and the field before it is where it was.
+		// @ref [`Setting::reserved`] for why there is one at all.
 		let data = sample();
 		let mut bytes = encode(&data).expect("it fits in one file");
 		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
 		let at = usize::try_from(header.setting_offset).expect("it is an offset")
-			+ offset_of!(Setting, shafts);
+			+ offset_of!(Setting, reserved);
 
-		assert!(data.stage.post.shafts > 0.0, "the sample asks for some, so a zero means this");
+		assert_eq!(
+			at + 4,
+			usize::try_from(header.setting_offset).expect("it is an offset")
+				+ size_of::<Setting>(),
+			"the spare is the last word of the record, which is what makes it the spare"
+		);
 
-		bytes[at..at + 4].copy_from_slice(&0_u32.to_le_bytes());
+		bytes[at..at + 4].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
 
 		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
-			.expect("a spare word is not a broken file")
+			.expect("a word nothing reads is not a broken file")
 			.to_scene_data();
 
+		assert_eq!(read.stage, data.stage, "a word nothing reads changes no part of the world");
 		assert!(
-			read.stage.post.shafts.abs() < f32::EPSILON,
-			"a spare word is no shafts, not a smear of {}",
-			read.stage.post.shafts
-		);
-		assert!(
-			(read.stage.post.fog_density - data.stage.post.fog_density).abs() < 1.0e-9,
+			(read.stage.camera.blur - data.stage.camera.blur).abs() < 1.0e-9,
 			"and the field before it is still where it was"
 		);
 	}

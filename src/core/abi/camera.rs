@@ -4,6 +4,15 @@
 //! what an orbit control wants, and an orbit control is what there is. A camera
 //! carrying its own rotation is the better shape for a first-person controller
 //! and can be added when one exists - the renderer only ever asks for a matrix.
+//!
+//! **And the lens, which is why three of the fields below are not about where
+//! the camera is.** Depth of field is a property of the glass rather than of
+//! the world: it moves when a person pulls focus and not when the weather
+//! changes, so it sits here beside the field of view rather than on the post
+//! record where the tonemap, the bloom and the fog are. That split is the
+//! field's: every engine here that has the effect keeps its focus distance on
+//! the camera, including the one whose record is the post settings, which
+//! files them under a heading of their own all the same.
 
 use super::field::{Field, field};
 use crate::glam::{
@@ -37,6 +46,31 @@ pub struct Camera {
 
 	/// Nothing further than this is drawn.
 	pub far: f32,
+
+	/// How far away the lens is focused, in world units.
+	///
+	/// Nought is a lens that holds everything sharp, which is where a fresh
+	/// camera sits and where every engine that has this at all starts: two of
+	/// them use this very number as the switch, and the largest of the family
+	/// says so in a comment beside its own nought. A world that wants a
+	/// shallow picture sets this to the distance of whatever it is looking at.
+	pub focus: f32,
+
+	/// How much nearer or further than [`focus`](Self::focus) a surface has to
+	/// be to be blurred all the way.
+	///
+	/// The same number on both sides of the plane in focus, and the fall
+	/// between them is straight: a surface half this far off the plane is
+	/// blurred half as wide. Ignored while `focus` is nought.
+	pub focus_range: f32,
+
+	/// How wide the blur gets at that distance, as a radius in pixels.
+	///
+	/// In pixels rather than in millimeters of a sensor this camera does not
+	/// have, and it is the number that bounds what the passes cost: a pixel of
+	/// radius is a tap. Zero is no blur, and no work either - the passes are
+	/// skipped rather than run with a radius of nothing.
+	pub blur: f32,
 }
 
 impl Camera {
@@ -48,6 +82,9 @@ impl Camera {
 		fov_y: 1.0,
 		near: 0.1,
 		far: 200.0,
+		focus: 0.0,
+		focus_range: 10.0,
+		blur: 16.0,
 	};
 	/// Its fields, for an inspector, a reader and a writer. @ref
 	/// [`field`](super::field).
@@ -58,6 +95,14 @@ impl Camera {
 		field!(Float, "fov_y", fov_y, "the vertical field of view, in radians"),
 		field!(Float, "near", near, "nothing closer than this is drawn"),
 		field!(Float, "far", far, "nothing further than this is drawn"),
+		field!(Float, "focus", focus, "how far away the lens is focused; nought is everything"),
+		field!(
+			Float,
+			"focus_range",
+			focus_range,
+			"how far off that a surface is blurred all the way"
+		),
+		field!(Float, "blur", blur, "how wide the blur gets there, as a radius in pixels"),
 	];
 
 	/// The view matrix: world space into camera space.
@@ -86,6 +131,14 @@ impl Camera {
 	/// Both of the above, in the order the shader multiplies them.
 	#[must_use]
 	pub fn view_projection(&self, aspect: f32) -> Mat4 { self.projection(aspect) * self.view() }
+
+	/// Whether anything in the picture is out of focus.
+	///
+	/// Both numbers have to mean something: a lens focused nowhere holds
+	/// everything sharp, and one whose blur is nothing wide blurs nothing
+	/// however far off the plane a surface is. Either way no pass is recorded.
+	#[must_use]
+	pub fn is_focusing(&self) -> bool { self.focus > 0.0 && self.blur > 0.0 }
 
 	/// Which way the world lies through a point on the near plane.
 	///
@@ -148,11 +201,18 @@ impl Camera {
 
 	/// This camera part of the way towards another one.
 	///
-	/// Position, target and field of view blend. `up`, `near` and `far` are
-	/// taken from the far end rather than blended: two `up` vectors that are
-	/// not parallel pass through zero somewhere between them, and
-	/// `look_at_mat4` of a zero up vector is not a matrix. None of the three
-	/// is a thing that changes often enough to be worth that.
+	/// Position, target, field of view and the three lens numbers blend. `up`,
+	/// `near` and `far` are taken from the far end rather than blended: two
+	/// `up` vectors that are not parallel pass through zero somewhere between
+	/// them, and `look_at_mat4` of a zero up vector is not a matrix. None of
+	/// the three is a thing that changes often enough to be worth that.
+	///
+	/// **The lens numbers are on the blended side for the reason `target`
+	/// is.** A focus pull is a thing a game moves every step, and a camera
+	/// whose focus jumps at the step rate judders exactly as badly as one
+	/// whose target does. `focus` blending through nought would flicker the
+	/// passes on and off, so a pull that starts or ends at nought is a pull
+	/// the game writes as a real distance at both ends.
 	///
 	/// @note: an orbiting camera interpolated this way travels the chord
 	/// rather than the arc, so its distance from the target dips by
@@ -177,6 +237,9 @@ impl Camera {
 			position: self.position.lerp(other.position, t),
 			target: self.target.lerp(other.target, t),
 			fov_y: (other.fov_y - self.fov_y).mul_add(t, self.fov_y),
+			focus: (other.focus - self.focus).mul_add(t, self.focus),
+			focus_range: (other.focus_range - self.focus_range).mul_add(t, self.focus_range),
+			blur: (other.blur - self.blur).mul_add(t, self.blur),
 			..other
 		}
 	}
@@ -257,6 +320,58 @@ mod tests {
 			(seen.fov_y - 0.9).abs() < 1.0e-5,
 			"and halfway through the zoom, got {}",
 			seen.fov_y
+		);
+	}
+
+	#[test]
+	fn a_fresh_camera_holds_everything_sharp() {
+		assert!(
+			!Camera::DEFAULT.is_focusing(),
+			"a lens focused nowhere blurs nothing, which is where the whole field starts"
+		);
+
+		let focused = Camera { focus: 8.0, ..Camera::DEFAULT };
+
+		assert!(focused.is_focusing(), "and a distance is what turns it on");
+
+		// what decides whether three passes are recorded at all, so a number
+		// somebody typed backwards has to read as off rather than as a radius
+		// multiplied by a negative
+		for asked in [0.0, -0.0, -1.0, f32::NEG_INFINITY] {
+			assert!(
+				!Camera { focus: asked, ..focused }.is_focusing(),
+				"a focus of {asked} is no blur"
+			);
+			assert!(
+				!Camera { blur: asked, ..focused }.is_focusing(),
+				"and a radius of {asked} is no blur either"
+			);
+		}
+	}
+
+	#[test]
+	fn a_focus_pull_is_interpolated_the_way_the_pose_is() {
+		let was = Camera { focus: 4.0, blur: 8.0, ..Camera::DEFAULT };
+		let is = Camera {
+			focus: 20.0,
+			blur: 24.0,
+			focus_range: 30.0,
+			..was
+		};
+
+		let seen = was.lerp(is, 0.5);
+
+		assert!(
+			(seen.focus - 12.0).abs() < 1.0e-5,
+			"halfway through the step is halfway through the pull, got {}",
+			seen.focus
+		);
+		assert!(
+			(seen.blur - 16.0).abs() < 1.0e-5 && (seen.focus_range - 20.0).abs() < 1.0e-5,
+			"and so are the other two: a lens number that jumps at the step rate judders as \
+			 badly as a target that does, got {} and {}",
+			seen.blur,
+			seen.focus_range
 		);
 	}
 
