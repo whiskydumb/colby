@@ -63,6 +63,7 @@ pub fn import(bytes: &[u8], texel: Texel) -> Result<TextureData> {
 	Ok(TextureData {
 		width,
 		height,
+		faces: 1,
 		texel,
 		levels: build_chain(width, height, rgba, texel)?,
 	})

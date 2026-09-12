@@ -1507,6 +1507,7 @@ f 1 4 5
 		TextureData {
 			width: SIDE,
 			height: SIDE,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: colby_asset::texture::build_chain(SIDE, SIDE, base, Texel::Rgba8Srgb)
 				.expect("the chain builds"),
@@ -1612,6 +1613,7 @@ f 1 4 5
 		TextureData {
 			width: 2,
 			height: 2,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: colby_asset::texture::build_chain(2, 2, base, Texel::Rgba8Srgb)
 				.expect("the chain builds"),
@@ -2398,6 +2400,7 @@ f 1 4 5
 		TextureData {
 			width: 8,
 			height: 1,
+			faces: 1,
 			texel: Texel::Rgba8Unorm,
 			levels: vec![base],
 		}
@@ -2833,6 +2836,7 @@ f 1 4 5
 		TextureData {
 			width: SIDE,
 			height: SIDE,
+			faces: 1,
 			texel: Texel::Rgba8Unorm,
 			levels: colby_asset::texture::build_chain(SIDE, SIDE, base, Texel::Rgba8Unorm)
 				.expect("a chain of four texels a side builds"),
@@ -3123,6 +3127,7 @@ f 1 4 5
 		let picture = world.textures.insert("test/wide", TextureData {
 			width: wide,
 			height: tall,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: colby_asset::texture::build_chain(wide, tall, base, Texel::Rgba8Srgb)
 				.expect("a chain of a picture that size builds"),
@@ -3145,6 +3150,7 @@ f 1 4 5
 		TextureData {
 			width: 2,
 			height: 1,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: vec![vec![0xFF, 0, 0, 0xFF, 0, 0, 0xFF, 0xFF]],
 		}

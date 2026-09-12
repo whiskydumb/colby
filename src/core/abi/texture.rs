@@ -18,13 +18,21 @@ pub const WHITE_NAME: &str = "white";
 /// The name the always-present flat normal map is registered under.
 pub const FLAT_NORMAL_NAME: &str = "flat_normal";
 
+/// How many faces a cube has.
+///
+/// A named constant because it is both a dimension of a texture and the length
+/// of the renderer's list of directions, and the two have to be the same six.
+pub const CUBE_FACES: u32 = 6;
+
 /// How a texel is laid out.
 ///
-/// Two variants, and the difference between them is not the bytes but what the
-/// bytes mean. It is an enum rather than an assumption because the asset format
-/// stores it, and the day block compression arrives the reader has to be able
-/// to say "this build does not know that layout" instead of reading four bytes
-/// per texel from a file that has one.
+/// Three variants, and what separates the first two is not the bytes but what
+/// the bytes mean. It is an enum rather than an assumption because the asset
+/// format stores it, and the day block compression arrives the reader has to be
+/// able to say "this build does not know that layout" instead of reading four
+/// bytes per texel from a file that has one - which is exactly what the third
+/// variant needed it for, since eight bytes per texel read as four is a file
+/// the length check would not even catch.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Texel {
@@ -46,6 +54,21 @@ pub enum Texel {
 	/// `colby_asset::texture::build_chain`. Averaging colors means averaging
 	/// the light they stand for; averaging numbers means averaging the numbers.
 	Rgba8Unorm = 1,
+
+	/// Sixteen bits per channel, four channels, half-precision floats, linear.
+	///
+	/// **The layout an environment needs and the eight-bit ones cannot give.**
+	/// A sky holds a sun in it, and a sun is not a number between nought and
+	/// one: an eight-bit image clips it to white and every reflection of it
+	/// comes back the same grey as the cloud beside it. Half-precision reaches
+	/// 65504, which is the same ceiling the renderer's own target has, so a
+	/// value that survives this layout survives the frame.
+	///
+	/// Linear like [`Rgba8Unorm`](Self::Rgba8Unorm) and for a different reason:
+	/// that one is linear because its channels are not light, and this one
+	/// because a float does not need a curve to spend its bits where the eye
+	/// is. There is no sixteen-bit sRGB format on any device.
+	Rgba16Float = 2,
 }
 
 impl Texel {
@@ -54,6 +77,7 @@ impl Texel {
 	pub const fn bytes(self) -> usize {
 		match self {
 			| Self::Rgba8Srgb | Self::Rgba8Unorm => 4,
+			| Self::Rgba16Float => 8,
 		}
 	}
 
@@ -80,6 +104,7 @@ impl Texel {
 		match code {
 			| 0 => Some(Self::Rgba8Srgb),
 			| 1 => Some(Self::Rgba8Unorm),
+			| 2 => Some(Self::Rgba16Float),
 			| _ => None,
 		}
 	}
@@ -93,6 +118,19 @@ pub struct TextureData {
 
 	/// Height of the largest level, in texels.
 	pub height: u32,
+
+	/// How many faces each level holds: one for a picture, six for a cube.
+	///
+	/// **A count rather than a flag**, because every arithmetic that touches
+	/// it multiplies by it - @ref [`level_bytes`](Self::level_bytes) - and a
+	/// bool would put the six somewhere else than the thing it describes. Six
+	/// is the only other value there is, and
+	/// [`is_consistent`](Self::is_consistent) says so.
+	///
+	/// The faces of one level lie back to back in that level's bytes, in the
+	/// order `+x -x +y -y +z -z`, which is the order the renderer's own cube
+	/// arithmetic already uses.
+	pub faces: u32,
 
 	/// How its texels are laid out.
 	pub texel: Texel,
@@ -115,8 +153,30 @@ impl TextureData {
 		Self {
 			width: 1,
 			height: 1,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: vec![vec![0xFF; 4]],
+		}
+	}
+
+	/// A cube of one white texel a face, which is what no environment means.
+	///
+	/// The white texel's trick in a second shape, and for the third time: a
+	/// binding cannot be left empty, so the renderer always has a cube bound
+	/// and this is the one it binds when a world names none. Sampling it
+	/// answers one in every direction at every level, so anything that
+	/// multiplies by it is unchanged - though what actually keeps the picture
+	/// unchanged is the branch that does not multiply at all, because
+	/// `a * (b + c)` and `a * b + a * c` are not the same float.
+	#[must_use]
+	pub fn white_cube() -> Self {
+		Self {
+			width: 1,
+			height: 1,
+			faces: CUBE_FACES,
+			texel: Texel::Rgba16Float,
+			// one, as a half-precision float, four channels, six faces
+			levels: vec![[0x00, 0x3C].repeat(4 * 6)],
 		}
 	}
 
@@ -137,6 +197,7 @@ impl TextureData {
 		Self {
 			width: 1,
 			height: 1,
+			faces: 1,
 			texel: Texel::Rgba8Unorm,
 			levels: vec![vec![128, 128, 255, 255]],
 		}
@@ -172,16 +233,21 @@ impl TextureData {
 		(if width > 0 { width } else { 1 }, if height > 0 { height } else { 1 })
 	}
 
-	/// How many bytes one mip level should hold.
+	/// How many bytes one mip level should hold, every face of it together.
 	#[must_use]
 	pub fn level_bytes(&self, level: u32) -> usize {
 		let (width, height) = self.level_size(level);
 		let area = usize::try_from(width)
 			.unwrap_or(0)
-			.saturating_mul(usize::try_from(height).unwrap_or(0));
+			.saturating_mul(usize::try_from(height).unwrap_or(0))
+			.saturating_mul(usize::try_from(self.faces).unwrap_or(1));
 
 		area.saturating_mul(self.texel.bytes())
 	}
+
+	/// Whether this is a cube rather than a picture.
+	#[must_use]
+	pub const fn is_cube(&self) -> bool { self.faces == CUBE_FACES }
 
 	/// How many bytes the whole chain holds.
 	#[must_use]
@@ -194,6 +260,13 @@ impl TextureData {
 	#[must_use]
 	pub fn is_consistent(&self) -> bool {
 		if self.width == 0 || self.height == 0 || self.levels.is_empty() {
+			return false;
+		}
+
+		// one face or six, and a cube's faces are square: a direction picks a
+		// face and then two coordinates inside it, and that arithmetic has no
+		// answer for a face that is wider than it is tall.
+		if self.faces != 1 && (self.faces != CUBE_FACES || self.width != self.height) {
 			return false;
 		}
 
@@ -303,6 +376,7 @@ mod tests {
 		let mut data = TextureData {
 			width,
 			height,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: Vec::new(),
 		};
@@ -320,6 +394,74 @@ mod tests {
 		assert_eq!(Texel::Rgba8Srgb.code(), 0, "and the number the format writes");
 		assert_eq!(Texel::from_code(0), Some(Texel::Rgba8Srgb), "which reads back");
 		assert_eq!(Texel::from_code(7), None, "and an unknown one is refused, not guessed");
+	}
+
+	#[test]
+	fn a_high_range_layout_is_eight_bytes_and_is_not_a_color() {
+		assert_eq!(Texel::Rgba16Float.bytes(), 8, "four channels of sixteen bits");
+		assert_eq!(Texel::Rgba16Float.code(), 2, "the number the format writes");
+		assert_eq!(Texel::from_code(2), Some(Texel::Rgba16Float), "which reads back");
+		assert!(
+			!Texel::Rgba16Float.is_color(),
+			"a float needs no curve, so nothing runs one over it on the way in or out"
+		);
+	}
+
+	#[test]
+	fn a_cube_is_six_faces_of_bytes_a_level_and_a_picture_is_one() {
+		let picture = chained(8, 8);
+		let cube = TextureData { faces: CUBE_FACES, ..chained(8, 8) };
+
+		assert!(!picture.is_cube(), "one face is a picture");
+		assert!(cube.is_cube(), "and six are a cube");
+		assert_eq!(
+			cube.level_bytes(0),
+			picture.level_bytes(0) * 6,
+			"which is six times the bytes at every level"
+		);
+		assert_eq!(cube.level_bytes(2), picture.level_bytes(2) * 6, "the small ones too");
+		assert_eq!(cube.level_size(1), picture.level_size(1), "the size is one face's");
+	}
+
+	#[test]
+	fn a_face_count_that_is_neither_one_nor_six_is_not_consistent() {
+		for faces in [0, 2, 3, 5, 7, 12] {
+			let odd = TextureData { faces, ..chained(4, 4) };
+
+			assert!(!odd.is_consistent(), "{faces} faces is not a shape anything reads");
+		}
+	}
+
+	#[test]
+	fn a_cube_whose_faces_are_not_square_is_not_consistent() {
+		let oblong = TextureData { faces: CUBE_FACES, ..chained(8, 4) };
+
+		assert!(
+			!oblong.is_consistent(),
+			"a direction picks a face and then two coordinates inside a square one"
+		);
+	}
+
+	#[test]
+	fn the_white_cube_answers_one_in_every_direction() {
+		let cube = TextureData::white_cube();
+
+		assert!(cube.is_cube(), "six faces");
+		assert_eq!((cube.width, cube.height), (1, 1), "of one texel each");
+		assert_eq!(cube.texel, Texel::Rgba16Float, "in the layout an environment is in");
+		assert_eq!(cube.levels.len(), 1, "and one level, because one texel is its whole chain");
+		assert!(cube.is_consistent(), "which adds up");
+		assert_eq!(
+			cube.levels.first().map(Vec::len),
+			Some(6 * 4 * 2),
+			"six faces of four channels of two bytes"
+		);
+		assert!(
+			cube.levels.first().is_some_and(|level| level
+				.chunks_exact(2)
+				.all(|pair| pair == [0x00, 0x3C])),
+			"every one of them the sixteen bits that stand for one"
+		);
 	}
 
 	#[test]
@@ -371,6 +513,7 @@ mod tests {
 		let empty = TextureData {
 			width: 0,
 			height: 4,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: vec![Vec::new()],
 		};

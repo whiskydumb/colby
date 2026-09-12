@@ -10,7 +10,7 @@
 //!
 //! ```text
 //!    0  SceneHeader                      208 bytes
-//!  208  Setting                          208 bytes, one of them
+//!  208  Setting                          224 bytes, one of them
 //!    .  [Stood; stood_count]              84 bytes each
 //!    .  [Lit;   lit_count]                36 bytes each
 //!    .  [Shed;  shed_count]               88 bytes each
@@ -448,16 +448,23 @@ pub struct Setting {
 	/// How wide the blur gets there, as a radius in pixels.
 	pub blur: f32,
 
-	/// The record's spare word, remade.
+	/// Offset into the blob of the sky's environment name, or zero for none.
 	///
-	/// **This is the bill the field above's note said would come.** Three
-	/// words of lens arrived at once and the eight-byte `steps` at the top
-	/// keeps the record eight-aligned, so the three cost four - and, unlike
-	/// `shafts`, they cost [`FORMAT_VERSION`] as well, because a record that
-	/// grows is a record an older build reads the wrong length of. Having paid
-	/// the version anyway, the fourth word is spent now rather than later: the
-	/// next single field to arrive takes this and moves nothing.
-	pub reserved: u32,
+	/// **This is the spare the lens paid for, spent, and it moved no
+	/// [`FORMAT_VERSION`].** The record is the length it was, so a build that
+	/// does not know this word reads every field before it correctly and reads
+	/// this one as nought - which is the empty string, because offset nought is
+	/// where the blob's empty name lives. What such a build does with the rest
+	/// of a cubemap sky is refuse the *kind*: `sky_kind` is read as an index
+	/// into a list of words and an index past the end of it reads as no sky at
+	/// all, @ref [`stage_of`]. So an older build opens a newer file and shows a
+	/// world with the clear color behind it, which is the graceful answer
+	/// rather than the wrong one.
+	///
+	/// **There is no spare after this one.** The record is eight-aligned by the
+	/// `steps` at the top, so the next field to arrive costs four bytes of
+	/// itself, four of a new spare, and the version.
+	pub sky_cubemap: u32,
 }
 
 // a record with padding in it is not `Pod`, so this would already have failed
@@ -1219,6 +1226,7 @@ impl SceneFile {
 
 		SceneData {
 			stage: stage_of(self.setting()),
+			sky_cubemap: self.name(self.setting().sky_cubemap).to_owned(),
 			things,
 			solids,
 			links: self
@@ -1490,7 +1498,7 @@ const EMPTY_SETTING: Setting = Setting {
 	focus: 0.0,
 	focus_range: 0.0,
 	blur: 0.0,
-	reserved: 0,
+	sky_cubemap: 0,
 };
 
 /// Writes a world out as a `.cscene`.
@@ -1533,6 +1541,10 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		.map(|posed| bent_of(posed, &mut names, &mut locals))
 		.collect();
 
+	// last of the records to be made, because the blob has to be finished
+	// before its length goes into the header and this puts one name in it
+	let setting = setting_of(data.stage, &data.sky_cubemap, &mut names);
+
 	let mut generations = data.thing_generations.clone();
 	generations.extend_from_slice(&data.solid_generations);
 	generations.extend_from_slice(&data.link_generations);
@@ -1565,7 +1577,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 
 	let mut out = Vec::with_capacity(places.names + names.blob().len());
 	out.extend_from_slice(bytemuck::bytes_of(&header));
-	out.extend_from_slice(bytemuck::bytes_of(&setting_of(data.stage)));
+	out.extend_from_slice(bytemuck::bytes_of(&setting));
 	out.extend_from_slice(bytemuck::cast_slice(&stood));
 	out.extend_from_slice(bytemuck::cast_slice(&carried.lit));
 	out.extend_from_slice(bytemuck::cast_slice(&carried.shed));
@@ -1949,8 +1961,9 @@ fn tie_of(link: &Link, names: &mut Names) -> Tie {
 	}
 }
 
-/// The settings record, from the description.
-fn setting_of(stage: Stage) -> Setting {
+/// The settings record, from the description, with its one name put in the
+/// blob.
+fn setting_of(stage: Stage, cubemap: &str, names: &mut Names) -> Setting {
 	Setting {
 		steps: stage.steps,
 		camera_position: stage.camera.position.to_array(),
@@ -1984,7 +1997,7 @@ fn setting_of(stage: Stage) -> Setting {
 		focus: stage.camera.focus,
 		focus_range: stage.camera.focus_range,
 		blur: stage.camera.blur,
-		reserved: 0,
+		sky_cubemap: names.put(cubemap),
 	}
 }
 
@@ -2010,6 +2023,10 @@ fn stage_of(setting: Setting) -> Stage {
 			zenith: Vec3::from_array(setting.sky_zenith),
 			horizon: Vec3::from_array(setting.sky_horizon),
 			ground: Vec3::from_array(setting.sky_ground),
+			// named rather than numbered, so the handle is resolved by whoever
+			// has a registry to resolve it against. @ref
+			// `SceneData::sky_cubemap`.
+			cubemap: TextureId::NONE,
 		},
 		// a curve this build does not know reads as none, the same way an
 		// unknown light or sky kind does. @ref `light_of`.
@@ -2755,6 +2772,7 @@ mod tests {
 		SceneData {
 			things: sample_things(),
 			solids: sample_solids(),
+			sky_cubemap: String::new(),
 			posed: vec![Posed {
 				name: "hero".to_owned(),
 				slot: 1,
@@ -3135,34 +3153,67 @@ mod tests {
 	}
 
 	#[test]
-	fn the_settings_record_ends_in_a_word_nothing_reads() {
-		// what the next single field on this record will take, and the claim
-		// that makes that free: whatever is in the spare, the world that comes
-		// back is the same world, and the field before it is where it was.
-		// @ref [`Setting::reserved`] for why there is one at all.
-		let data = sample();
-		let mut bytes = encode(&data).expect("it fits in one file");
+	fn the_settings_record_ends_in_the_name_that_spent_its_spare() {
+		// the claim the spare was kept for, collected: the word at the end of
+		// the record is now a name offset, the record is the length it was, and
+		// the field before it is where it was. @ref [`Setting::sky_cubemap`].
+		let data = SceneData {
+			sky_cubemap: "skies/dusk".to_owned(),
+			stage: Stage {
+				sky: Sky::environment(TextureId::NONE),
+				..sample().stage
+			},
+			..sample()
+		};
+		let bytes = encode(&data).expect("it fits in one file");
 		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
 		let at = usize::try_from(header.setting_offset).expect("it is an offset")
-			+ offset_of!(Setting, reserved);
+			+ offset_of!(Setting, sky_cubemap);
 
 		assert_eq!(
 			at + 4,
 			usize::try_from(header.setting_offset).expect("it is an offset")
 				+ size_of::<Setting>(),
-			"the spare is the last word of the record, which is what makes it the spare"
+			"it is the last word of the record, which is the spare it took"
+		);
+		assert_eq!(
+			size_of::<Setting>(),
+			224,
+			"and the record is the length it already was, which is what makes the word free"
 		);
 
-		bytes[at..at + 4].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
-
 		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
-			.expect("a word nothing reads is not a broken file")
+			.expect("a scene naming a sky")
 			.to_scene_data();
 
-		assert_eq!(read.stage, data.stage, "a word nothing reads changes no part of the world");
+		assert_eq!(read.sky_cubemap, "skies/dusk", "the name came back");
+		assert_eq!(read.stage.sky.kind, SkyKind::Cubemap, "and so did the word beside it");
 		assert!(
 			(read.stage.camera.blur - data.stage.camera.blur).abs() < 1.0e-9,
 			"and the field before it is still where it was"
+		);
+	}
+
+	#[test]
+	fn a_scene_that_names_no_sky_puts_nought_in_the_word_an_older_build_ignores() {
+		// the other half of the claim: a file from before this word meant
+		// anything holds nought there, and nought is the empty name.
+		let bytes = encode(&sample()).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let at = usize::try_from(header.setting_offset).expect("it is an offset")
+			+ offset_of!(Setting, sky_cubemap);
+		let word = u32::from_le_bytes(
+			<[u8; 4]>::try_from(&bytes[at..at + 4]).expect("four bytes of a word"),
+		);
+
+		assert_eq!(word, 0, "which is where the blob's empty name lives");
+		assert_eq!(
+			SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+				.expect("a scene naming no sky")
+				.to_scene_data()
+				.sky_cubemap,
+			"",
+			"and it reads back as no name"
 		);
 	}
 

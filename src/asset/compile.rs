@@ -59,8 +59,8 @@ use colby_core::{
 };
 
 use crate::{
-	anim, document, font, format, gltf, html, import, jpeg, level, loc, lua, material, model,
-	obj, png, scene, script, skeleton, sound,
+	anim, cube, document, font, format, gltf, html, import, jpeg, level, loc, lua, material,
+	model, obj, png, radiance, scene, script, skeleton, sound,
 	stamp::{self, Input, Stamps},
 	texture, ttf, wav,
 };
@@ -88,6 +88,7 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
 	png::EXTENSION,
 	jpeg::EXTENSION,
 	jpeg::LONG_EXTENSION,
+	radiance::EXTENSION,
 	ttf::EXTENSION,
 	html::EXTENSION,
 	gltf::EXTENSION,
@@ -211,7 +212,8 @@ impl Kind {
 
 		match extension.as_str() {
 			| obj::EXTENSION => Some(Self::Mesh),
-			| png::EXTENSION | jpeg::EXTENSION | jpeg::LONG_EXTENSION => Some(Self::Texture),
+			| png::EXTENSION | jpeg::EXTENSION | jpeg::LONG_EXTENSION | radiance::EXTENSION =>
+				Some(Self::Texture),
 			| ttf::EXTENSION => Some(Self::Font),
 			| wav::EXTENSION => Some(Self::Sound),
 			| html::EXTENSION => Some(Self::Document),
@@ -333,6 +335,9 @@ pub enum Produced {
 
 		/// Its height.
 		height: u32,
+
+		/// How many faces each level holds: one, or six for an environment.
+		faces: u32,
 
 		/// How many mip levels were built.
 		levels: usize,
@@ -631,7 +636,14 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 	let (bytes, produced) = match kind {
 		| Kind::Mesh => compile_mesh(source)?,
 		| Kind::Texture => {
-			let data = if has_extension(source, &[png::EXTENSION]) {
+			let data = if has_extension(source, &[radiance::EXTENSION]) {
+				// the one import that does not hand its pixels over as they
+				// were: a sky arrives as one wide picture and leaves as six
+				// faces whose levels are a roughness rather than a size. @ref
+				// [`cube`](crate::cube).
+				cube::build(&radiance::import_file(source)?)
+					.map_err(|error| err!(Asset("{}: {error}", source.display())))?
+			} else if has_extension(source, &[png::EXTENSION]) {
 				png::import_file(source, texel_of(source))?
 			} else {
 				jpeg::import_file(source, texel_of(source))?
@@ -641,6 +653,7 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 			let produced = Produced::Texture {
 				width: data.width,
 				height: data.height,
+				faces: data.faces,
 				levels: data.levels.len(),
 			};
 
@@ -1953,7 +1966,7 @@ f 1 2 3 4
 
 		assert_eq!(
 			image.produced,
-			Produced::Texture { width: 2, height: 2, levels: 2 },
+			Produced::Texture { width: 2, height: 2, faces: 1, levels: 2 },
 			"two by two, with the level below it"
 		);
 		assert_eq!(
@@ -1965,6 +1978,62 @@ f 1 2 3 4
 		let file = TextureFile::open(&image.output).expect("the output is a texture");
 
 		assert_eq!(file.header().levels, 2, "and holds what the report claimed");
+	}
+
+	#[test]
+	fn a_radiance_file_compiles_to_a_cube_of_six_prefiltered_faces() {
+		let workspace = workspace("skies");
+		fs::create_dir_all(source_root(&workspace).join("skies")).expect("the directory");
+
+		// four across and two down, the top row bright and the bottom row dark
+		let mut hdr = b"#?RADIANCE
+FORMAT=32-bit_rle_rgbe
+
+-Y 2 +X 4
+"
+		.to_vec();
+		for _ in 0..4 {
+			hdr.extend_from_slice(&[128, 128, 128, 133]);
+		}
+		for _ in 0..4 {
+			hdr.extend_from_slice(&[128, 128, 128, 129]);
+		}
+		fs::write(source_root(&workspace).join("skies/dusk.hdr"), &hdr).expect("it is written");
+
+		let report = run(&workspace, false);
+
+		assert!(report.failed.is_empty(), "the sky compiles: {:?}", report.failed);
+		assert_eq!(report.compiled.len(), 1, "one file in, one file out");
+
+		let sky = report
+			.compiled
+			.first()
+			.expect("the sky is in the report");
+
+		assert_eq!(
+			sky.produced,
+			Produced::Texture {
+				width: cube::FACE_SIDE,
+				height: cube::FACE_SIDE,
+				faces: 6,
+				levels: 8,
+			},
+			"six faces of a hundred and twenty-eight, eight roughness levels"
+		);
+		assert_eq!(
+			sky.output.extension().and_then(|e| e.to_str()),
+			Some("ctex"),
+			"and it is a texture, not a kind of its own: what changed is what is in one"
+		);
+
+		let file = TextureFile::open(&sky.output).expect("the output is a texture");
+
+		assert_eq!(file.header().faces(), 6, "the flag came through the file");
+		assert_eq!(
+			file.header().texel,
+			Texel::Rgba16Float.code(),
+			"and so did the layout that holds a sun"
+		);
 	}
 
 	#[test]

@@ -21,7 +21,7 @@ use std::path::Path;
 
 use colby_core::{
 	Result,
-	abi::texture::{Texel, TextureData},
+	abi::texture::{CUBE_FACES, Texel, TextureData},
 	bytemuck::{self, Pod, Zeroable},
 	err,
 };
@@ -39,6 +39,21 @@ pub const EXTENSION: &str = "ctex";
 
 /// How big [`TextureHeader`] is, and where the first level starts.
 pub const HEADER_BYTES: usize = 64;
+
+/// The bit in [`TextureHeader::flags`] that says the levels hold six faces.
+///
+/// **A flag rather than a count, and it costs no [`FORMAT_VERSION`].** The
+/// reader already refuses a flag it does not know - @ref [`check`] - so a build
+/// written before this bit existed says "sets flag bits this build does not
+/// know about" and stops, which is the only correct answer available: six faces
+/// is six times the bytes, and a reader that ignored the bit would hand the GPU
+/// one face and five faces of somebody else's memory. That is the mirror of the
+/// trick a spare *bit in a validated word* cannot play: there, being refused is
+/// the problem; here, being refused is the whole point.
+pub const FLAG_CUBE: u32 = 1;
+
+/// Every flag this build knows about.
+pub const KNOWN_FLAGS: u32 = FLAG_CUBE;
 
 /// The largest image the compiler will accept, on either side.
 ///
@@ -82,6 +97,12 @@ pub struct TextureHeader {
 
 	/// Padding to a multiple of the buffer alignment. Always zero.
 	pub reserved: [u32; 6],
+}
+
+impl TextureHeader {
+	/// How many faces each level holds: one, or six for a cube.
+	#[must_use]
+	pub const fn faces(&self) -> u32 { if self.flags & FLAG_CUBE == 0 { 1 } else { CUBE_FACES } }
 }
 
 /// A `.ctex` held in memory, checked, and ready to be read in place.
@@ -142,6 +163,7 @@ impl TextureFile {
 		TextureData {
 			width: self.header.width,
 			height: self.header.height,
+			faces: self.header.faces(),
 			texel,
 			levels,
 		}
@@ -157,7 +179,13 @@ impl TextureFile {
 		let mut at = usize::try_from(self.header.data_offset).ok()?;
 
 		for index in 0..=level {
-			let bytes = level_bytes(self.header.width, self.header.height, index, texel)?;
+			let bytes = level_bytes(
+				self.header.width,
+				self.header.height,
+				self.header.faces(),
+				index,
+				texel,
+			)?;
 			if index == level {
 				return Some(at..at.checked_add(bytes)?);
 			}
@@ -193,7 +221,7 @@ pub fn encode(data: &TextureData) -> Result<Vec<u8>> {
 	let header = TextureHeader {
 		magic: MAGIC,
 		version: FORMAT_VERSION,
-		flags: 0,
+		flags: if data.is_cube() { FLAG_CUBE } else { 0 },
 		texel: data.texel.code(),
 		width: data.width,
 		height: data.height,
@@ -257,7 +285,7 @@ pub fn version_of(path: &Path) -> Option<u32> {
 /// @param texel - which layout those bytes are in
 /// @return every level, largest first
 pub fn build_chain(width: u32, height: u32, base: Vec<u8>, texel: Texel) -> Result<Vec<Vec<u8>>> {
-	let expected = level_bytes(width, height, 0, texel)
+	let expected = level_bytes(width, height, 1, 0, texel)
 		.ok_or_else(|| err!(Asset("a texture of {width}x{height} does not fit in memory")))?;
 
 	if base.len() != expected {
@@ -405,13 +433,14 @@ const fn size_at(width: u32, height: u32, level: u32) -> (u32, u32) {
 	(if width > 0 { width } else { 1 }, if height > 0 { height } else { 1 })
 }
 
-/// How many bytes one level of an image takes.
-fn level_bytes(width: u32, height: u32, level: u32, texel: Texel) -> Option<usize> {
+/// How many bytes one level of an image takes, every face of it together.
+fn level_bytes(width: u32, height: u32, faces: u32, level: u32, texel: Texel) -> Option<usize> {
 	let (width, height) = size_at(width, height, level);
 
 	usize::try_from(width)
 		.ok()?
 		.checked_mul(usize::try_from(height).ok()?)?
+		.checked_mul(usize::try_from(faces).ok()?)?
 		.checked_mul(texel.bytes())
 }
 
@@ -448,10 +477,10 @@ fn check(bytes: &[u8]) -> std::result::Result<TextureHeader, String> {
 		));
 	}
 
-	if header.flags != 0 {
+	if header.flags & !KNOWN_FLAGS != 0 {
 		return Err(format!(
 			"sets flag bits {:#010X} that this build does not know about",
-			header.flags
+			header.flags & !KNOWN_FLAGS
 		));
 	}
 
@@ -482,6 +511,14 @@ fn check_size(header: &TextureHeader) -> std::result::Result<(), String> {
 		return Err("has no mip levels at all".to_owned());
 	}
 
+	if header.faces() != 1 && header.width != header.height {
+		return Err(format!(
+			"is a cube whose faces are {}x{}, and a direction picks a face and then two 			 \
+			 coordinates inside a square one",
+			header.width, header.height
+		));
+	}
+
 	let full = TextureData::full_chain(header.width, header.height);
 	if header.levels > full {
 		return Err(format!(
@@ -501,7 +538,7 @@ fn check_levels(
 ) -> std::result::Result<(), String> {
 	let mut total: usize = 0;
 	for level in 0..header.levels {
-		let bytes = level_bytes(header.width, header.height, level, texel)
+		let bytes = level_bytes(header.width, header.height, header.faces(), level, texel)
 			.ok_or_else(|| format!("has a level {level} whose size overflows"))?;
 
 		total = total
@@ -511,8 +548,12 @@ fn check_levels(
 
 	if usize::try_from(header.data_bytes).unwrap_or(usize::MAX) != total {
 		return Err(format!(
-			"says its levels are {} bytes, and {} levels of {}x{} are {total}",
-			header.data_bytes, header.levels, header.width, header.height
+			"says its levels are {} bytes, and {} levels of {}x{} in {} face(s) are {total}",
+			header.data_bytes,
+			header.levels,
+			header.width,
+			header.height,
+			header.faces()
 		));
 	}
 
@@ -530,6 +571,8 @@ fn check_levels(
 
 #[cfg(test)]
 mod tests {
+	use std::mem::offset_of;
+
 	use super::*;
 
 	/// An image of a size, filled with one color.
@@ -549,6 +592,7 @@ mod tests {
 		TextureData {
 			width,
 			height,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: build_chain(width, height, filled(width, height, color), Texel::Rgba8Srgb)
 				.expect("the chain builds"),
@@ -602,6 +646,100 @@ mod tests {
 		);
 		assert_eq!(file.level(0).len(), 8 * 8 * 4, "at the length it should be");
 		assert!(file.level(99).is_empty(), "and a level past the end is nothing");
+	}
+
+	/// A cube of a side, every texel the same two bytes, a full chain.
+	fn cube(side: u32) -> TextureData {
+		let count = TextureData::full_chain(side, side);
+		let levels = (0..count)
+			.map(|level| {
+				let across = usize::try_from((side >> level.min(31)).max(1)).unwrap_or(1);
+
+				vec![0x11; across * across * 6 * 8]
+			})
+			.collect();
+
+		TextureData {
+			width: side,
+			height: side,
+			faces: CUBE_FACES,
+			texel: Texel::Rgba16Float,
+			levels,
+		}
+	}
+
+	#[test]
+	fn a_cube_round_trips_through_the_file_with_its_faces_and_its_layout() {
+		let data = cube(8);
+		let bytes = encode(&data).expect("it fits");
+		let file = TextureFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("it reads");
+
+		assert_eq!(file.header().flags, FLAG_CUBE, "the flag says six faces");
+		assert_eq!(file.header().faces(), 6, "and the header hands that back as a count");
+		assert_eq!(file.header().texel, Texel::Rgba16Float.code(), "in the high-range layout");
+		assert_eq!(file.level(0).len(), 8 * 8 * 6 * 8, "a level is six faces of eight bytes");
+		assert_eq!(file.level(1).len(), 4 * 4 * 6 * 8, "and so is the one below it");
+		assert_eq!(file.to_texture_data(), data, "and the whole thing comes back as it went in");
+	}
+
+	#[test]
+	fn a_picture_carries_no_flag_at_all_so_nothing_before_this_build_is_stale() {
+		let bytes = encode(&chained(4, 4, [1, 2, 3, 4])).expect("it fits");
+		let file = TextureFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("it reads");
+
+		assert_eq!(file.header().flags, 0, "which is what every file written so far holds");
+		assert_eq!(file.header().faces(), 1, "and one face");
+	}
+
+	#[test]
+	fn a_flag_this_build_does_not_know_is_still_refused() {
+		// the property the cube flag leans on: the word is validated, so the
+		// *next* bit is refused rather than ignored - which is the only correct
+		// answer when a bit changes how many bytes a level holds.
+		let mut bytes = encode(&cube(4)).expect("it fits");
+		let at = offset_of!(TextureHeader, flags);
+		bytes[at..at + 4].copy_from_slice(&(FLAG_CUBE | 0x8000_0000).to_le_bytes());
+
+		let refused = TextureFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("a bit from the future");
+
+		assert!(
+			refused.to_string().contains("0x80000000"),
+			"and it names the bit rather than the whole word: {refused}"
+		);
+	}
+
+	#[test]
+	fn a_cube_whose_faces_are_not_square_is_refused_by_the_reader_as_well() {
+		let mut bytes = encode(&cube(4)).expect("it fits");
+		let at = offset_of!(TextureHeader, height);
+		bytes[at..at + 4].copy_from_slice(&2_u32.to_le_bytes());
+
+		let refused = TextureFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("a cube of oblong faces");
+
+		assert!(
+			refused.to_string().contains("square"),
+			"with the reason in the message: {refused}"
+		);
+	}
+
+	#[test]
+	fn a_cube_read_as_a_picture_does_not_add_up_which_is_how_an_older_build_finds_out() {
+		// what a build that did not know the flag would see if it ignored it
+		// rather than refusing: five faces of somebody else's memory, caught by
+		// the length check before anything is handed to a device.
+		let mut bytes = encode(&cube(4)).expect("it fits");
+		let at = offset_of!(TextureHeader, flags);
+		bytes[at..at + 4].copy_from_slice(&0_u32.to_le_bytes());
+
+		let refused = TextureFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("six faces read as one");
+
+		assert!(
+			refused.to_string().contains("face(s)"),
+			"and the message says how many faces it counted: {refused}"
+		);
 	}
 
 	#[test]

@@ -551,12 +551,21 @@ fn shrink(output: &Path) -> Result<Image> {
 }
 
 /// The same, given the texels.
+///
+/// **A cube shows its first face, and a value above one is held down to it.**
+/// The browser wants a square of eight-bit color, and an environment is six
+/// faces whose channels go up to the tens of thousands, so something has to be
+/// chosen rather than read. What is chosen is the face a direction of `+x`
+/// lands on, exposed by nothing at all: a sky's own numbers, clipped, which is
+/// the same picture a camera pointing that way with the exposure at one would
+/// take.
 pub(crate) fn shrunk(data: &TextureData) -> Result<Image> {
 	let Some(level) = data.levels.first() else {
 		return Err!(Asset("a texture with no levels"));
 	};
 	let (width, height) = (data.width.max(1), data.height.max(1));
-	let stride = usize::try_from(width).unwrap_or(1) * 4;
+	let bytes = data.texel.bytes();
+	let stride = usize::try_from(width).unwrap_or(1) * bytes;
 
 	if level.len() < stride * usize::try_from(height).unwrap_or(1) {
 		return Err!(Asset("a texture shorter than its size says"));
@@ -568,13 +577,64 @@ pub(crate) fn shrunk(data: &TextureData) -> Result<Image> {
 		let row = usize::try_from(y * height / SIZE).unwrap_or(0) * stride;
 
 		for x in 0..SIZE {
-			let at = row + usize::try_from(x * width / SIZE).unwrap_or(0) * 4;
+			let at = row + usize::try_from(x * width / SIZE).unwrap_or(0) * bytes;
+			let texel = level.get(at..at + bytes).unwrap_or_default();
 
-			pixels.extend_from_slice(level.get(at..at + 4).unwrap_or(&[0, 0, 0, 255]));
+			pixels.extend_from_slice(&flatten(texel, data.texel));
 		}
 	}
 
 	Ok(Image { width: SIZE, height: SIZE, pixels })
+}
+
+/// One texel of any layout as four eight-bit channels.
+fn flatten(texel: &[u8], layout: Texel) -> [u8; 4] {
+	if layout != Texel::Rgba16Float {
+		return <[u8; 4]>::try_from(texel).unwrap_or([0, 0, 0, 255]);
+	}
+
+	let mut out = [0, 0, 0, 255];
+	for (channel, slot) in out.iter_mut().enumerate() {
+		let pair = texel
+			.get(channel * 2..channel * 2 + 2)
+			.and_then(|slice| <[u8; 2]>::try_from(slice).ok())
+			.unwrap_or([0, 0]);
+
+		*slot = encoded(widened(u16::from_le_bytes(pair)));
+	}
+
+	out
+}
+
+/// One of the sixteen-bit values a high-range texture holds, as a float.
+fn widened(bits: u16) -> f32 {
+	let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+	let exponent = i32::from((bits >> 10) & 0x1F);
+	let mantissa = f32::from(bits & 0x03FF);
+
+	if exponent == 0 {
+		return sign * mantissa * 2.0_f32.powi(-24);
+	}
+
+	sign * (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent - 15)
+}
+
+/// A linear value as the sRGB byte a browser shows.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "held inside nought and two hundred and fifty-five on the line above the cast"
+)]
+fn encoded(value: f32) -> u8 {
+	let held = value.clamp(0.0, 1.0);
+	let curved = if held <= 0.003_130_8 {
+		held * 12.92
+	} else {
+		1.055_f32.mul_add(held.powf(1.0 / 2.4), -0.055)
+	};
+
+	(curved * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// Whether a picture on disk is newer than the compiled file it is of.
@@ -663,6 +723,7 @@ mod tests {
 		let data = TextureData {
 			width: 2,
 			height: 2,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: vec![vec![
 				255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,

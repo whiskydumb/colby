@@ -221,8 +221,10 @@ fn describe(produced: Produced) -> String {
 			)
 		},
 		| Produced::Material { textures } => format!("{textures:>6} pictures named"),
-		| Produced::Texture { width, height, levels } =>
+		| Produced::Texture { width, height, faces: 1, levels } =>
 			format!("{width:>6} x {height:<6} {levels} mip levels"),
+		| Produced::Texture { width, height, faces, levels } =>
+			format!("{width:>6} x {height:<6} {faces} faces, {levels} roughness levels"),
 		| Produced::Sound { frames, rate, channels } => format!(
 			"{frames:>6} frames at {rate} a second, {}",
 			if channels == 1 { "mono" } else { "stereo" }

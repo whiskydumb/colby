@@ -896,6 +896,7 @@ mod tests {
 		let mut data = TextureData {
 			width,
 			height,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: Vec::new(),
 		};
@@ -994,6 +995,7 @@ mod tests {
 		let alone = TextureData {
 			width: 2048,
 			height: 512,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: vec![Vec::new()],
 		};
@@ -1013,6 +1015,7 @@ mod tests {
 		let big = TextureData {
 			width: 1024,
 			height: 1024,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: vec![Vec::new(); 11],
 		};

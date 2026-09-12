@@ -3,25 +3,37 @@
 //! Three colors and a word: the top of the sky, the band at eye level and what
 //! is under it. That is Wicked's `horizon` and `zenith` sitting on the same
 //! record as its sun and its gravity, and Godot's `ProceduralSkyMaterial`,
-//! which is what a new world there gets by default. A cubemap is the other
-//! shape the field ships and it needs a texture that has six faces, which this
-//! engine's `.ctex` has no spelling for yet.
+//! which is what a new world there gets by default. The other shape the field
+//! ships is a cubemap, and that is the third word: a texture with six faces,
+//! which this engine's `.ctex` now has a spelling for.
 //!
-//! **This is the sky that is drawn, not the sky that lights.** Unreal splits
-//! them into two components for a reason worth copying: `USkyAtmosphere` is
-//! the picture and `USkyLightComponent` is the light, and the second is a
-//! *convolution* of an environment rather than a color anybody types. colby's
-//! stand-in for the second is [`Stage::ambient`](super::scene::Stage::ambient)
-//! and it stays exactly where it is - turning the sky on changes what is
-//! behind the world and nothing about what is lit by it. The day there is an
-//! environment probe, that is what feeds the ambient.
+//! **The drawn sky and the sky that lights are one record here and two in the
+//! largest engine in the field**, and the split is worth understanding before
+//! reading either. There `USkyAtmosphere` is the picture and
+//! `USkyLightComponent` is the light, and the second is a *convolution* of an
+//! environment rather than a color anybody types. Here one word answers both,
+//! which is what two of the three smaller engines do: naming a cubemap draws it
+//! behind the world and lights the world's reflections out of it, because the
+//! file holding it holds the convolution as well - its mip chain is a roughness
+//! chain rather than a size chain.
+//!
+//! **Only the reflections, though.** The half of the ambient term that stands
+//! for light arriving diffusely is still
+//! [`Stage::ambient`](super::scene::Stage::ambient), one color, whatever the
+//! sky is. That is not an omission: one engine in the field offers a flat color
+//! for the diffuse ambient and *refuses* to offer one for the specular, on the
+//! grounds that a mirror reflecting a constant is a flat grey object - and a
+//! flat color remains a defensible stand-in for the half it does offer it for.
 //!
 //! **It costs a fragment nothing where geometry stands.** The sky is drawn
 //! after everything opaque, at the far plane, with the depth test on and the
 //! depth write off - so every pixel a wall covered is thrown away before it is
 //! shaded. @ref `colby_engine`.
 
-use super::field::{Field, field, word};
+use super::{
+	field::{Field, field, word},
+	texture::TextureId,
+};
 use crate::glam::Vec3;
 
 /// What is drawn behind the world.
@@ -34,14 +46,21 @@ pub enum SkyKind {
 
 	/// A gradient from the ground, through the horizon, to the zenith.
 	Gradient,
+
+	/// A picture with six faces, drawn behind the world and reflected in it.
+	///
+	/// The one kind that names something: [`Sky::cubemap`]. A sky of this kind
+	/// whose texture is nothing falls back to the gradient the three colors
+	/// describe, because the three colors are always there and a black dome is
+	/// nobody's idea of a sky.
+	Cubemap,
 }
 
 impl SkyKind {
 	/// The word each kind is written as, in declaration order.
 	///
-	/// A file's vocabulary and an inspector's drop-down. A cubemap is the
-	/// third word when there is a texture with six faces to name.
-	pub const WORDS: &[&str] = &["none", "gradient"];
+	/// A file's vocabulary and an inspector's drop-down.
+	pub const WORDS: &[&str] = &["none", "gradient", "cubemap"];
 
 	/// The kind at a place in [`WORDS`](Self::WORDS), if there is one.
 	///
@@ -51,6 +70,7 @@ impl SkyKind {
 		match index {
 			| 0 => Some(Self::None),
 			| 1 => Some(Self::Gradient),
+			| 2 => Some(Self::Cubemap),
 			| _ => None,
 		}
 	}
@@ -92,9 +112,22 @@ pub struct Sky {
 	/// Straight down.
 	///
 	/// A color of its own rather than a mirror of the zenith, because the half
-	/// under the horizon is the ground rather than more sky. Unreal keeps the
-	/// same distinction on the light half of it, as `LowerHemisphereColor`.
+	/// under the horizon is the ground rather than more sky. The largest engine
+	/// in the field keeps the same distinction on the light half of it.
 	pub ground: Vec3,
+
+	/// The environment, or [`TextureId::NONE`] for the three colors alone.
+	///
+	/// A cube of six faces whose mip chain is a *roughness* chain, so that
+	/// level nought is the picture the sky is drawn out of and the level a
+	/// surface's own roughness names is what it reflects. @ref
+	/// `colby_asset::cube` for what builds one.
+	///
+	/// Read whatever the kind says, and meaningful only when the kind is
+	/// [`SkyKind::Cubemap`] - which is the pairing an inspector shows and a
+	/// file writes, so that turning the word away from `cubemap` and back does
+	/// not lose the name somebody typed.
+	pub cubemap: TextureId,
 }
 
 impl Sky {
@@ -112,6 +145,7 @@ impl Sky {
 		field!(Color, "zenith", zenith, "the color straight up"),
 		field!(Color, "horizon", horizon, "the color at eye level"),
 		field!(Color, "ground", ground, "the color straight down"),
+		field!(Texture, "cubemap", cubemap, "the environment, when the kind is a cubemap"),
 	];
 	/// No sky at all: the clear color, and nothing over it.
 	///
@@ -123,6 +157,7 @@ impl Sky {
 		zenith: Vec3::new(0.12, 0.24, 0.52),
 		horizon: Vec3::new(0.55, 0.66, 0.82),
 		ground: Vec3::new(0.10, 0.09, 0.08),
+		cubemap: TextureId::NONE,
 	};
 
 	/// A gradient of three colors.
@@ -137,7 +172,35 @@ impl Sky {
 			zenith,
 			horizon,
 			ground,
+			cubemap: TextureId::NONE,
 		}
+	}
+
+	/// An environment, drawn behind the world and reflected in it.
+	///
+	/// The three colors come along as the fallback: a build or a project that
+	/// cannot answer to the name still has a sky.
+	///
+	/// @param cubemap - the six-faced texture
+	#[must_use]
+	pub const fn environment(cubemap: TextureId) -> Self {
+		Self {
+			kind: SkyKind::Cubemap,
+			cubemap,
+			..Self::NONE
+		}
+	}
+
+	/// Whether anything is reflected out of this sky rather than out of the
+	/// ambient color.
+	///
+	/// Both halves of the answer: the word has to say cubemap *and* there has
+	/// to be a texture. A world where one of those is missing lights exactly as
+	/// it did before there were cubemaps, which is what the renderer's own
+	/// switch turns on and off.
+	#[must_use]
+	pub fn lights(self) -> bool {
+		matches!(self.kind, SkyKind::Cubemap) && self.cubemap.is_some()
 	}
 
 	/// The three colors a world starts with, drawn.
@@ -197,6 +260,7 @@ mod tests {
 				| Kind::Word(words) =>
 					Value::Word(u32::try_from(words.len()).expect("a short list") - 1),
 				| Kind::Color => Value::Color(Vec3::new(0.25, 0.5, 0.75)),
+				| Kind::Texture => Value::Texture(TextureId::new(9)),
 				| kind => panic!("a sky has no field of {kind:?}"),
 			};
 
@@ -204,6 +268,7 @@ mod tests {
 			assert_eq!(entry.get(&sky), written, "{} hands back what it took", entry.name);
 		}
 
-		assert_eq!(sky.kind, SkyKind::Gradient, "the last word is the last kind");
+		assert_eq!(sky.kind, SkyKind::Cubemap, "the last word is the last kind");
+		assert!(sky.lights(), "and a cubemap with a texture is a sky that lights");
 	}
 }

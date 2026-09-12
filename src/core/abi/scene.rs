@@ -665,6 +665,17 @@ pub struct SceneData {
 	/// The world's own settings.
 	pub stage: Stage,
 
+	/// The asset name of the sky's environment, or empty for none.
+	///
+	/// **Here rather than on [`Stage`] for the reason a mesh's name is on
+	/// [`Thing`] rather than on [`Renderable`]**: a live record holds handles,
+	/// because a handle is what the renderer reads, and a described one holds
+	/// names, because where a texture landed this run says nothing about where
+	/// it lands the next one. Keeping the name out of `Stage` also keeps
+	/// `Stage` a `Copy` record, which every caller that passes settings around
+	/// by value relies on.
+	pub sky_cubemap: String,
+
 	/// Every entity that was alive.
 	pub things: Vec<Thing>,
 
@@ -959,6 +970,7 @@ impl SceneData {
 
 		Self {
 			stage: self.stage,
+			sky_cubemap: self.sky_cubemap.clone(),
 			thing_generations: vec![1; things.len()],
 			solid_generations: vec![1; kept.len()],
 			link_generations: vec![1; links.len()],
@@ -1137,6 +1149,12 @@ pub fn capture(world: &World) -> SceneData {
 
 	SceneData {
 		stage: settings(world),
+		// the name back out of the registry, the way an emitter's sprite is
+		// named back. @ref `emitter`.
+		sky_cubemap: world
+			.textures
+			.get(world.sky.cubemap)
+			.map_or_else(String::new, |entry| entry.name().to_owned()),
 		links: links(world, &solid_of),
 		posed,
 		pose_generations: (0..world.poses.slots())
@@ -1445,6 +1463,7 @@ impl Default for Scenes {
 /// What an unknown handle reads as.
 static EMPTY: SceneData = SceneData {
 	stage: Stage::DEFAULT,
+	sky_cubemap: String::new(),
 	things: Vec::new(),
 	solids: Vec::new(),
 	links: Vec::new(),
@@ -1596,7 +1615,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	// that have only just been rebuilt.
 	restore_players(world, scene);
 
-	stage_world(world, scene.stage);
+	stage_world(world, scene.stage, &scene.sky_cubemap);
 
 	Ok(Restored {
 		things: things.iter().filter(|id| id.is_some()).count(),
@@ -2128,6 +2147,28 @@ fn emitter(world: &World, thing: &Thing) -> Emitter {
 	Emitter { texture: found, ..thing.emitter }
 }
 
+/// The sky, with its environment resolved out of the registry.
+///
+/// A name nothing answers to is a warning and a sky that lights out of its
+/// ambient color, which is the rule an emitter's missing sprite follows: losing
+/// the whole world over a missing picture is worse than losing the picture.
+///
+/// @param world - whose texture registry answers
+/// @param sky - the sky the description carried
+/// @param name - the environment's asset name, or empty
+fn sky(world: &World, sky: Sky, name: &str) -> Sky {
+	if name.is_empty() {
+		return Sky { cubemap: TextureId::NONE, ..sky };
+	}
+
+	let found = world.textures.find(name);
+	if !found.is_some() {
+		warn!(name, "a scene names an environment nothing answers to");
+	}
+
+	Sky { cubemap: found, ..sky }
+}
+
 fn material(world: &World, name: &str) -> MaterialId {
 	if name.is_empty() {
 		return MaterialId::DEFAULT;
@@ -2148,10 +2189,10 @@ fn material(world: &World, name: &str) -> MaterialId {
 /// A load is the largest discontinuity there is, so nothing is drawn
 /// traveling from where it used to be: every transform's past was written to
 /// match its present by the table restores, and the camera says so here.
-fn stage_world(world: &mut World, stage: Stage) {
+fn stage_world(world: &mut World, stage: Stage, cubemap: &str) {
 	world.camera = stage.camera;
 	world.clear = stage.clear;
-	world.sky = stage.sky;
+	world.sky = sky(world, stage.sky, cubemap);
 	world.post = stage.post;
 	world.light = stage.light;
 	world.ambient = stage.ambient;
@@ -2467,7 +2508,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		abi::{
-			Command, MAX_ENTITIES, Material, MeshData, PeerId, Role, mesh,
+			Command, MAX_ENTITIES, Material, MeshData, PeerId, Role, SkyKind, TextureData, mesh,
 			skeleton::{Bone, SkeletonData, SkeletonId},
 		},
 		glam::Vec2,
@@ -5671,5 +5712,51 @@ mod tests {
 		assert!(copied_joint.is_some(), "and a joint");
 		assert_ne!(copied_joint, joint, "which is its own joint");
 		assert_eq!(world.joints.name(copied_joint), "rope");
+	}
+
+	#[test]
+	fn the_sky_names_its_environment_and_a_load_turns_that_into_a_handle() {
+		let mut world = World::new();
+		let sky = world
+			.textures
+			.insert("skies/dusk", TextureData::white_cube());
+		let described = SceneData {
+			stage: Stage {
+				sky: Sky::environment(TextureId::NONE),
+				..Stage::DEFAULT
+			},
+			sky_cubemap: "skies/dusk".to_owned(),
+			..SceneData::default()
+		};
+
+		restore(&mut world, &described).expect("a world with a sky in it");
+
+		assert_eq!(world.sky.cubemap, sky, "the name was resolved against the registry");
+		assert!(world.sky.lights(), "so the sky lights what it is behind");
+
+		// and back out again: the capture names what the handle points at
+		assert_eq!(capture(&world).sky_cubemap, "skies/dusk", "the name comes back");
+	}
+
+	#[test]
+	fn a_sky_naming_an_environment_nothing_answers_to_lights_out_of_the_ambient() {
+		let mut world = World::new();
+		let described = SceneData {
+			stage: Stage {
+				sky: Sky::environment(TextureId::new(7)),
+				..Stage::DEFAULT
+			},
+			sky_cubemap: "skies/absent".to_owned(),
+			..SceneData::default()
+		};
+
+		restore(&mut world, &described).expect("a world is not lost over a missing picture");
+
+		assert!(!world.sky.cubemap.is_some(), "the handle the file carried is not trusted");
+		assert!(
+			!world.sky.lights(),
+			"and a cubemap sky with no cubemap lights exactly as a world did before there were 			 any"
+		);
+		assert_eq!(world.sky.kind, SkyKind::Cubemap, "the word it asked for is kept, though");
 	}
 }

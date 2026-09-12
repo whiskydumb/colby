@@ -387,9 +387,17 @@ impl Painter {
 		};
 
 		let bytes = u32::try_from(data.texel.bytes()).unwrap_or(4);
+		// a document draws a flat picture, and an environment is neither flat
+		// nor a picture: nothing here would know which of six faces to show or
+		// what to do with a value above one. Skipped rather than guessed at.
 		let format = match data.texel {
-			| Texel::Rgba8Srgb => TextureFormat::Rgba8UnormSrgb,
-			| Texel::Rgba8Unorm => TextureFormat::Rgba8Unorm,
+			| Texel::Rgba8Srgb if !data.is_cube() => TextureFormat::Rgba8UnormSrgb,
+			| Texel::Rgba8Unorm if !data.is_cube() => TextureFormat::Rgba8Unorm,
+			| _ => {
+				debug!(slot = id.index(), "a document names a texture it cannot draw");
+
+				return;
+			},
 		};
 
 		let group = self.make_texture(

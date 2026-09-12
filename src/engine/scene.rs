@@ -2697,6 +2697,7 @@ const fn texel_format(texel: Texel) -> TextureFormat {
 	match texel {
 		| Texel::Rgba8Srgb => TextureFormat::Rgba8UnormSrgb,
 		| Texel::Rgba8Unorm => TextureFormat::Rgba8Unorm,
+		| Texel::Rgba16Float => TextureFormat::Rgba16Float,
 	}
 }
 

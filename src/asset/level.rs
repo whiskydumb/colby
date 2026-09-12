@@ -154,8 +154,11 @@ pub fn import(text: &str) -> Result<SceneData> {
 	let solids = bodies(root.get("bodies"), &things)?;
 	let links = joints(root.get("joints"), &solids)?;
 
+	let (stage, sky_cubemap) = stage(root.get("stage"))?;
+
 	Ok(SceneData {
-		stage: stage(root.get("stage"))?,
+		stage,
+		sky_cubemap,
 		thing_generations: vec![1; things.len()],
 		solid_generations: vec![1; solids.len()],
 		link_generations: vec![1; links.len()],
@@ -194,9 +197,13 @@ pub(crate) fn fields(value: &Value, known: &[&str], what: &str) -> Result<()> {
 }
 
 /// The world's own settings, or the ones a world starts with.
-fn stage(value: Option<&Value>) -> Result<Stage> {
+///
+/// @return the settings and the sky's environment name, which is a *name* and
+/// therefore beside the table rather than in it - the same arrangement a
+/// material's two pictures have. @ref [`REFERENCES`].
+fn stage(value: Option<&Value>) -> Result<(Stage, String)> {
 	let Some(value) = value else {
-		return Ok(Stage::DEFAULT);
+		return Ok((Stage::DEFAULT, String::new()));
 	};
 
 	check(value, &[names(Stage::FIELDS, &[])], &["camera", "sky", "post"], "a stage")?;
@@ -213,18 +220,30 @@ fn stage(value: Option<&Value>) -> Result<Stage> {
 	// a sky has a `ground` and a `horizon`, and a flat namespace shared with
 	// `clear`, `light` and `ambient` reads as four colors nobody can tell
 	// apart. It is also a record of its own in the world.
-	if let Some(above) = value.get("sky") {
-		check(above, &[names(Sky::FIELDS, &[])], &[], "a sky")?;
-		read(&mut stage.sky, above, Sky::FIELDS, "a sky")?;
-	}
+	let cubemap = match value.get("sky") {
+		| Some(above) => {
+			check(above, &[names(Sky::FIELDS, &REFERENCES)], &REFERENCES, "a sky")?;
+			read(&mut stage.sky, above, Sky::FIELDS, "a sky")?;
+
+			text(above.get("cubemap"))
+		},
+		| None => String::new(),
+	};
 
 	if let Some(after) = value.get("post") {
 		check(after, &[names(Post::FIELDS, &[])], &[], "the post-processing")?;
 		read(&mut stage.post, after, Post::FIELDS, "the post-processing")?;
 	}
 
-	Ok(stage)
+	Ok((stage, cubemap))
 }
+
+/// The sky's fields that are read by hand because they are names.
+///
+/// One of them, and it is a texture: [`Kind::Texture`](Field) is a handle, and
+/// a file cannot hold a handle - so the row is a string here and the registry
+/// turns it into a handle when a world is built out of this.
+const REFERENCES: [&str; 1] = ["cubemap"];
 
 /// Every pose the source declares.
 ///
@@ -1030,7 +1049,7 @@ pub fn export(scene: &SceneData) -> Result<String> {
 	// written by whatever knows there is a next one. A trailing one is the
 	// single thing JSON refuses that is easy to write by accident.
 	let parts: Vec<String> = [
-		stage_of(&scene.stage)?,
+		stage_of(&scene.stage, &scene.sky_cubemap)?,
 		block("entities", &things),
 		block("bodies", &solids),
 		block("joints", &links),
@@ -1091,7 +1110,7 @@ fn named<T>(
 
 /// The world's own settings, or nothing if they are the ones a world starts
 /// with.
-fn stage_of(stage: &Stage) -> Result<Option<String>> {
+fn stage_of(stage: &Stage, cubemap: &str) -> Result<Option<String>> {
 	let mut rows = Rows::default();
 
 	put_all(
@@ -1126,10 +1145,13 @@ fn stage_of(stage: &Stage) -> Result<Option<String>> {
 		&Writing {
 			prefix: "sky.",
 			what: "the sky",
-			skipped: &[],
+			skipped: &REFERENCES,
 		},
 		|_| None,
 	)?;
+	if let Some((name, written)) = named_row("sky.cubemap", cubemap) {
+		rows.put(name, written);
+	}
 	put_all(
 		&mut rows,
 		&stage.post,
@@ -2723,6 +2745,36 @@ mod tests {
 
 		assert!(text.contains("\"sky\": {"), "the sky is written under its own key");
 		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_sky_names_its_environment_and_the_name_survives_a_round_trip() {
+		let scene =
+			import(r#"{ "stage": { "sky": { "kind": "cubemap", "cubemap": "skies/dusk" } } }"#)
+				.expect("it is a scene");
+
+		assert_eq!(scene.stage.sky.kind, SkyKind::Cubemap, "the third word");
+		assert_eq!(scene.sky_cubemap, "skies/dusk", "and the name beside the table");
+		assert_eq!(
+			scene.stage.sky.cubemap,
+			TextureId::NONE,
+			"the handle is nothing here, because a file holds names and a registry holds handles"
+		);
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains(r#""cubemap": "skies/dusk""#), "the name is written: {text}");
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_sky_that_names_no_environment_writes_no_row_for_one() {
+		let scene =
+			import(r#"{ "stage": { "sky": { "kind": "gradient" } } }"#).expect("it is a scene");
+		let text = export(&scene).expect("it writes back");
+
+		assert_eq!(scene.sky_cubemap, "", "nothing was named");
+		assert!(!text.contains("cubemap"), "so no row is written: {text}");
 	}
 
 	#[test]

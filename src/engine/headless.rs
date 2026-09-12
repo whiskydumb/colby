@@ -84,6 +84,7 @@ mod tests {
 		let picture = world.textures.insert("test/splash", TextureData {
 			width: 4,
 			height: 4,
+			faces: 1,
 			texel: Texel::Rgba8Srgb,
 			levels: vec![vec![0xFF; 64]],
 		});
@@ -92,6 +93,7 @@ mod tests {
 			.insert("test/splash_normal", TextureData {
 				width: 4,
 				height: 4,
+				faces: 1,
 				texel: Texel::Rgba8Unorm,
 				levels: vec![[128, 128, 255, 255].repeat(16)],
 			});
