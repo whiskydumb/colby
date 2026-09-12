@@ -29,7 +29,7 @@ use colby_core::{
 	},
 	bytemuck::{self, Pod, Zeroable},
 	err, error,
-	glam::Vec3,
+	glam::{Mat4, Vec3},
 	info, warn,
 };
 use wgpu::{
@@ -59,7 +59,7 @@ use crate::{
 	lines::Lines,
 	post,
 	shader::Shader,
-	shadow::{self, CASCADES, Cascades, Maps, Tile},
+	shadow::{self, CASCADES, Cascades, LOCAL_TILES, Maps, Slots, Tile},
 	shaft::{self, Asking, Shaft},
 	skin::Joints,
 	sparks::Sparks,
@@ -189,6 +189,27 @@ pub const MSAA: &str = "r.msaa";
 /// a renderer whose passes nobody has yet measured.
 pub const DEFAULT_MSAA: f32 = 4.0;
 
+/// One lamp a frame carries, with what deciding its shadow needs.
+///
+/// The packed [`Lamp`] is what the shader reads and holds no kind, no cone
+/// angle and no rotation - a cone's falloff is two numbers by then. Working
+/// out where a shadow map looks from needs all three back, so they ride along
+/// here rather than being unpicked from the packing.
+struct Shining {
+	/// How far the near edge of its reach is from the eye, which is the order
+	/// [`chosen`] sorts on.
+	near: f32,
+
+	/// What the shader reads.
+	lamp: Lamp,
+
+	/// What it shines, as the world holds it.
+	light: Light,
+
+	/// Where it stands and which way it is turned.
+	at: Transform,
+}
+
 /// One local light, as the shader reads it.
 ///
 /// Three vectors, and the kind is not one of them: a cone is
@@ -206,6 +227,13 @@ struct Lamp {
 
 	/// `[x, y, z, cone offset]`, the way a cone points.
 	direction: [f32; 4],
+
+	/// `[the first atlas tile, how many, one texel per unit of distance, 0]`.
+	///
+	/// A count of nought is a lamp that throws no shadow: it was told not to,
+	/// or the atlas was full when its turn came. @ref
+	/// [`shadow::Slots`](crate::shadow::Slots).
+	shadow: [f32; 4],
 }
 
 impl Lamp {
@@ -214,6 +242,7 @@ impl Lamp {
 		position_range: [0.0; 4],
 		color: [0.0; 4],
 		direction: [0.0, 0.0, -1.0, 1.0],
+		shadow: [0.0; 4],
 	};
 
 	/// One light in the world, packed.
@@ -230,6 +259,7 @@ impl Lamp {
 				.normalize_or(Vec3::NEG_Z)
 				.extend(1.0)
 				.to_array(),
+			shadow: [0.0; 4],
 		};
 
 		if light.kind == LightKind::Spot {
@@ -283,6 +313,13 @@ struct Globals {
 	/// A whole layer each, which is why the atlas cost the cascades nothing.
 	/// @ref [`Tile::layer`].
 	cascade_tiles: [Tile; CASCADES],
+
+	/// Where each local map sits in the atlas, in the order they were handed
+	/// out: a cone takes one and a point takes six in a row.
+	lamp_tiles: [Tile; LOCAL_TILES],
+
+	/// World space into each local map's clip space, one per tile above.
+	lamp_views: [[[f32; 4]; 4]; LOCAL_TILES],
 
 	/// `[r, g, b, how quickly a surface fades with distance]`.
 	fog: [f32; 4],
@@ -429,14 +466,22 @@ struct GpuMaterial {
 /// [`Fyrox`]: https://fyrox.rs
 const DEPTH_GRAIN: f32 = 1000.0;
 
-/// How many lists one entity can be in: the picture's, and one per cascade.
+/// How many lists one entity can be in: the picture's, one per cascade, and one
+/// per tile of the atlas a lamp may take.
 ///
 /// Each list is a run of the instance buffer of its own, because a batch is a
 /// first and a count into it; so the buffer holds this many placements for
 /// every entity the world can hold. At a hundred and twenty-eight bytes a
-/// placement that is six hundred and forty kilobytes, beside sixteen megabytes
-/// of shadow maps.
-const LISTS: usize = 1 + CASCADES;
+/// placement that is two and three quarter megabytes, beside twenty of atlas -
+/// and the great majority of the runs are empty in any real world, because a
+/// lamp's map only sees what is inside its reach.
+const LISTS: usize = 1 + MAPS;
+
+/// How many shadow maps one frame can draw: the cascades and the atlas's tiles.
+///
+/// A list index past the picture's is one of these, in the same order the
+/// atlas's slots are: the cascades first, the lamps' tiles after them.
+const MAPS: usize = CASCADES + LOCAL_TILES;
 
 /// What one frame can see, worked out once in [`Scene::upload`] and asked of
 /// everything that might be drawn.
@@ -453,6 +498,18 @@ struct Sight {
 	/// Each cascade's box, nearest first, or nothing in a frame with the
 	/// shadows off.
 	cascades: Option<[Frustum; CASCADES]>,
+
+	/// What each local map this frame draws can see.
+	///
+	/// A face of a point light is a right-angled perspective and a cone is one
+	/// as wide as it opens, and both are volumes six planes hold - so the same
+	/// test that leaves geometry out of a cascade leaves it out of these,
+	/// unchanged, and no second mechanism had to be written. @ref
+	/// [`Frustum::of`]. Only the first [`maps`](Self::maps) are real.
+	faces: [Frustum; LOCAL_TILES],
+
+	/// How many of [`faces`](Self::faces) the frame handed out.
+	maps: usize,
 
 	/// Whether to ask at all. @ref [`cull::ENABLED`].
 	culling: bool,
@@ -502,12 +559,13 @@ struct Sorted {
 	/// however many of the frame's lists the entity is in.
 	at: u32,
 
-	/// Which cascades can see it, one bit each and the nearest lowest.
+	/// Which maps can see it, one bit each: the cascades lowest, then the
+	/// lamps' tiles in the order they were handed out.
 	///
 	/// Nought for everything blended, which casts nothing, and for everything
 	/// in a frame that is not culling, whose cascades draw the picture's solid
 	/// half instead of lists of their own.
-	casts: u8,
+	casts: u32,
 }
 
 impl Sorted {
@@ -706,9 +764,19 @@ pub struct Scene {
 	/// The solid entities some cascade can see, sorted the way the picture's
 	/// solid half is, each carrying which cascades.
 	casters: Vec<Sorted>,
-	/// Each cascade's own batches, in a frame that is culling. @ref
-	/// [`culling`](Self::culling).
-	casting: [Vec<Batch>; CASCADES],
+	/// Each shadow map's own batches, in a frame that is culling: the cascades
+	/// first, the lamps' tiles after them. @ref [`culling`](Self::culling).
+	casting: [Vec<Batch>; MAPS],
+
+	/// Where each local map this frame draws sits in the atlas.
+	lamp_tiles: [Tile; LOCAL_TILES],
+
+	/// World space into each of their clip spaces.
+	lamp_views: [[[f32; 4]; 4]; LOCAL_TILES],
+
+	/// How many tiles the frame handed out, which is how many of the two
+	/// arrays above are real and how many passes the local layer records.
+	lamp_maps: usize,
 	/// Whether this frame's cascades each draw a list of their own.
 	///
 	/// `false` is every frame before culling existed, kept exactly: all four
@@ -719,7 +787,7 @@ pub struct Scene {
 	drawn: Drawn,
 	/// Every lit entity with how far its reach is from the eye, kept so it
 	/// allocates once. @ref [`Scene::lamps`].
-	lit: Vec<(f32, Lamp)>,
+	lit: Vec<Shining>,
 	/// The decals this frame carries, kept so it allocates once. @ref
 	/// [`Scene::decals`].
 	painted: Vec<Chosen>,
@@ -852,6 +920,9 @@ impl Scene {
 			staged: Vec::with_capacity(MAX_ENTITIES),
 			casters: Vec::with_capacity(MAX_ENTITIES),
 			casting: core::array::from_fn(|_| Vec::new()),
+			lamp_tiles: [Tile::local(0); LOCAL_TILES],
+			lamp_views: [[[0.0; 4]; 4]; LOCAL_TILES],
+			lamp_maps: 0,
 			culling: false,
 			drawn: Drawn::default(),
 			lit: Vec::with_capacity(MAX_LAMPS),
@@ -1013,6 +1084,15 @@ impl Scene {
 				// feature and one console variable, and what anybody wants to
 				// know is what shadows cost.
 				self.cast(&mut encoder, slice, self.timings.writes(Pass::Shadow, cascade(slice)));
+			}
+
+			// and one more over the atlas's last layer, for every lamp that
+			// asked for a tile. A span of its own rather than four more of the
+			// one above, because what it costs is a different question: the
+			// cascades are the sun and are always four, and this is however
+			// many lamps the frame is standing near.
+			if self.lamp_maps > 0 {
+				self.cast_lamps(&mut encoder, self.timings.writes(Pass::Lamps, Ends::Both));
 			}
 		}
 
@@ -1304,6 +1384,10 @@ impl Scene {
 	/// `Scene`; the rule itself is [`chosen`], which needs no device and is
 	/// therefore testable.
 	///
+	/// The tiles of the atlas are handed out here too, because which lamps
+	/// throw a shadow is decided by the order this picked them in. @ref
+	/// [`allocate`].
+	///
 	/// @param world - the world being drawn
 	/// @param sight - where the camera is, and what it can see
 	/// @return the array the uniform holds, and how many of it is real
@@ -1313,7 +1397,25 @@ impl Scene {
 			.float(LAMPS)
 			.map_or(MAX_LAMPS, lamp_room);
 
-		chosen(world, sight.eye, sight.culling.then_some(&sight.view), room, &mut self.lit)
+		let (mut lamps, count) =
+			chosen(world, sight.eye, sight.culling.then_some(&sight.view), room, &mut self.lit);
+
+		// the cascades are off means every shadow is off: `r.shadows` is the
+		// feature's switch and a lamp's map is part of the feature.
+		let tiles = if self.shadowing {
+			world
+				.cvars
+				.float(shadow::LOCAL_LAMPS)
+				.map_or(LOCAL_TILES, lamp_room)
+				.min(LOCAL_TILES)
+		} else {
+			0
+		};
+
+		self.lamp_maps =
+			allocate(&self.lit, &mut lamps, tiles, &mut self.lamp_tiles, &mut self.lamp_views);
+
+		(lamps, count)
 	}
 
 	/// Which decals this frame carries, packed for the shader, with the atlas
@@ -1429,14 +1531,17 @@ impl Scene {
 		}
 	}
 
-	/// Which one draws a batch into a cascade.
+	/// Which one draws a batch into a shadow map.
 	///
 	/// A match rather than a lookup, so that a mode nobody has thought about
 	/// yet is a compile error here on the day it is added rather than a
 	/// fence-shaped hole in the light.
 	///
+	/// @param local - whether the map is a lamp's rather than a cascade's
+	/// @param blend - how the surface reads its picture's alpha
+	/// @param skinned - whether bones move it
 	/// @return the pipeline, or nothing for a surface that does not cast
-	fn casting(&self, blend: Blend, skinned: bool) -> Option<&RenderPipeline> {
+	fn casting(&self, local: bool, blend: Blend, skinned: bool) -> Option<&RenderPipeline> {
 		let masked = match blend {
 			| Blend::Opaque => false,
 			| Blend::Mask => true,
@@ -1447,7 +1552,7 @@ impl Scene {
 			| Blend::Alpha => return None,
 		};
 
-		Some(self.shadows.casting(masked, skinned))
+		Some(self.shadows.casting(local, masked, skinned))
 	}
 
 	/// Records one cascade's depth pass.
@@ -1476,44 +1581,82 @@ impl Scene {
 		slice: usize,
 		marks: Option<RenderPassTimestampWrites<'_>>,
 	) {
-		let (Some(layer), Some(slot)) = (self.shadows.layer(slice), self.shadows.slot(slice))
-		else {
+		let Some(layer) = self.shadows.layer(slice) else {
 			return;
 		};
 
-		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-			label: Some("shadow"),
-			color_attachments: &[],
-			depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-				view: layer,
-				depth_ops: Some(Operations {
-					load: LoadOp::Clear(1.0),
-					store: StoreOp::Store,
-				}),
-				stencil_ops: None,
-			}),
-			timestamp_writes: marks,
-			occlusion_query_set: None,
-			multiview_mask: None,
-		});
-
-		pass.set_bind_group(0, slot, &[]);
+		let mut pass = shadow_pass(encoder, layer, marks);
 		pass.set_bind_group(1, self.joints.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
+
+		self.draw_map(&mut pass, slice, false);
+	}
+
+	/// Records every local light's map, in one pass over the atlas's last
+	/// layer.
+	///
+	/// **One pass, not one per tile.** The layer is cleared once, and each map
+	/// is then drawn through a viewport and a scissor cut to its own
+	/// rectangle, which is what an atlas is for and what keeps sixteen shadow
+	/// maps costing the frame one pass rather than sixteen. A clear cannot be
+	/// cut to a rectangle, so the order has to be that way round.
+	///
+	/// The pass is begun and the layer cleared whether or not any lamp asked
+	/// for a tile, for the reason a cascade's is: a layer left alone holds last
+	/// frame's depths.
+	///
+	/// @param encoder - what to record into
+	/// @param marks - the span, and `None` in a frame nobody is measuring
+	fn cast_lamps(
+		&self,
+		encoder: &mut CommandEncoder,
+		marks: Option<RenderPassTimestampWrites<'_>>,
+	) {
+		let Some(layer) = self.shadows.layer(CASCADES) else {
+			return;
+		};
+
+		let mut pass = shadow_pass(encoder, layer, marks);
+		pass.set_bind_group(1, self.joints.bindings(), &[]);
+		pass.set_vertex_buffer(1, self.instances.slice(..));
+
+		for tile in 0..self.lamp_maps.min(LOCAL_TILES) {
+			let [x, y, side] = Tile::local(tile).viewport();
+			let (at_x, at_y, extent) = (texels(x), texels(y), texels(side));
+
+			pass.set_viewport(at_x, at_y, extent, extent, 0.0, 1.0);
+			pass.set_scissor_rect(x, y, side, side);
+
+			self.draw_map(&mut pass, CASCADES.saturating_add(tile), true);
+		}
+	}
+
+	/// Draws one shadow map's list into a pass already begun.
+	///
+	/// @param pass - the pass, with its joints and instances already bound
+	/// @param map - which of the frame's maps: a cascade, then a lamp's tile
+	/// @param local - whether it is a lamp's, which picks the unbiased
+	/// pipelines
+	fn draw_map(&self, pass: &mut RenderPass<'_>, map: usize, local: bool) {
+		let Some(slot) = self.shadows.slot(map) else {
+			return;
+		};
+
+		pass.set_bind_group(0, slot, &[]);
 
 		// the same swap the scene pass makes, and it has to be made here too:
 		// a character whose shadow were cast from its bind pose would stand in
 		// one attitude and be shadowed in another.
 		let mut bound = None;
 
-		for batch in self.casts_of(slice) {
+		for batch in self.casts_of(map) {
 			let (Some(mesh), Some(material)) =
 				(self.meshes.get(batch.mesh), self.materials.get(batch.material))
 			else {
 				continue;
 			};
 
-			let Some(pipeline) = self.casting(batch.blend, batch.skinned) else {
+			let Some(pipeline) = self.casting(local, batch.blend, batch.skinned) else {
 				continue;
 			};
 
@@ -1545,10 +1688,10 @@ impl Scene {
 	/// every solid entity in the world, exactly what every frame drew into
 	/// every cascade before there was a test.
 	///
-	/// @param slice - which cascade, nearest first
-	fn casts_of(&self, slice: usize) -> &[Batch] {
+	/// @param map - which of the frame's maps: a cascade, then a lamp's tile
+	fn casts_of(&self, map: usize) -> &[Batch] {
 		if self.culling {
-			self.casting.get(slice).map_or(&[], Vec::as_slice)
+			self.casting.get(map).map_or(&[], Vec::as_slice)
 		} else {
 			&self.batches
 		}
@@ -1609,25 +1752,12 @@ impl Scene {
 		// fitted to a pose the frame does not use. Off is off all the way to
 		// the shader: nothing is drawn into the maps and nothing samples them.
 		self.shadowing = world.cvars.bool(shadow::ENABLED).unwrap_or(true);
-		self.cascades = if self.shadowing {
-			let distance = world
-				.cvars
-				.float(shadow::DISTANCE)
-				.unwrap_or(shadow::DEFAULT_DISTANCE);
+		self.cascades = self.fitted(world, &camera);
 
-			shadow::fit(&camera, world.aspect, world.light, distance)
-		} else {
-			Cascades::NONE
-		};
-
-		let mut light_view_projection = [[[0.0; 4]; 4]; CASCADES];
-		for (slot, matrix) in light_view_projection
-			.iter_mut()
-			.zip(self.cascades.matrices)
-		{
-			*slot = matrix.to_cols_array_2d();
-		}
-
+		let light_view_projection = self
+			.cascades
+			.matrices
+			.map(|it| it.to_cols_array_2d());
 		let projection = camera.view_projection(world.aspect);
 		// what everything below is asked against: the view the picture is
 		// drawn through and each cascade's box, out of the very matrices the
@@ -1640,9 +1770,19 @@ impl Scene {
 			cascades: self
 				.shadowing
 				.then(|| self.cascades.matrices.map(Frustum::of)),
+			// filled in below, once the lamps have been picked and their tiles
+			// handed out: a face's volume is the very matrix its pass draws
+			// through, which does not exist until then.
+			faces: [Frustum::of(Mat4::IDENTITY); LOCAL_TILES],
+			maps: 0,
 			culling: world.cvars.bool(cull::ENABLED).unwrap_or(true),
 		};
 		let (lamps, count) = self.lamps(world, &sight);
+		let sight = Sight {
+			faces: self.lamp_volumes(),
+			maps: self.lamp_maps,
+			..sight
+		};
 		let (decals, painted) = self.decals(world, &sight);
 		self.sky = world.sky.is_drawn();
 		self.seeing = seeing_of(world, &camera);
@@ -1663,6 +1803,8 @@ impl Scene {
 				splits: self.cascades.splits,
 				cascade_texels: self.cascades.texels,
 				cascade_tiles: shadow::cascade_tiles(),
+				lamp_tiles: self.lamp_tiles,
+				lamp_views: self.lamp_views,
 				shadow: [
 					1.0 / shadow::resolution(),
 					0.0,
@@ -1693,6 +1835,7 @@ impl Scene {
 
 		if self.shadowing {
 			self.shadows.upload(&self.queue, &self.cascades);
+			self.upload_lamp_views();
 		}
 
 		self.group(world, &sight);
@@ -1707,6 +1850,58 @@ impl Scene {
 		self.queue
 			.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.placements));
 		self.joints.upload(&self.queue);
+	}
+
+	/// This frame's cascades, or none at all with the shadows switched off.
+	///
+	/// @param world - the world being drawn, for the console
+	/// @param camera - the camera the *picture* is drawn from, which is the
+	/// one the slices have to be cut along
+	fn fitted(&self, world: &World, camera: &Camera) -> Cascades {
+		if !self.shadowing {
+			return Cascades::NONE;
+		}
+
+		let distance = world
+			.cvars
+			.float(shadow::DISTANCE)
+			.unwrap_or(shadow::DEFAULT_DISTANCE);
+
+		shadow::fit(camera, world.aspect, world.light, distance)
+	}
+
+	/// What each local map this frame draws can see.
+	///
+	/// One volume per tile, out of the very matrix that tile's pass draws
+	/// through - the same rule the cascades' boxes follow, so that what a map
+	/// leaves out and what the hardware would have clipped whole are one
+	/// thing. Only the first [`lamp_maps`](Self::lamp_maps) are real.
+	fn lamp_volumes(&self) -> [Frustum; LOCAL_TILES] {
+		core::array::from_fn(|tile| {
+			let view = self
+				.lamp_views
+				.get(tile)
+				.copied()
+				.unwrap_or_else(|| Mat4::IDENTITY.to_cols_array_2d());
+
+			Frustum::of(Mat4::from_cols_array_2d(&view))
+		})
+	}
+
+	/// Writes each local map's matrix into the slot its pass reads.
+	///
+	/// Beside [`Maps::upload`], which does the same for the cascades; apart
+	/// from it because a frame has four of those and however many of these the
+	/// atlas had room for.
+	fn upload_lamp_views(&self) {
+		for tile in 0..self.lamp_maps.min(LOCAL_TILES) {
+			let Some(view) = self.lamp_views.get(tile) else {
+				continue;
+			};
+
+			self.shadows
+				.upload_local(&self.queue, tile, Mat4::from_cols_array_2d(view));
+		}
 	}
 
 	/// Brings the uploaded meshes level with the world's registry.
@@ -1890,8 +2085,8 @@ impl Scene {
 			}
 		}
 
-		for slice in 0..CASCADES {
-			self.place_casters(slice);
+		for map in 0..MAPS {
+			self.place_casters(map);
 		}
 
 		self.drawn.seen = self.order.len();
@@ -1900,10 +2095,21 @@ impl Scene {
 		} else if sight.culling {
 			self.casting
 				.iter()
+				.take(CASCADES)
 				.map(|list| instances(list))
 				.sum()
 		} else {
 			CASCADES * instances(&self.batches)
+		};
+		self.drawn.lamp_casts = if sight.culling {
+			self.casting
+				.iter()
+				.skip(CASCADES)
+				.take(self.lamp_maps)
+				.map(|list| instances(list))
+				.sum()
+		} else {
+			self.lamp_maps * instances(&self.batches)
 		};
 	}
 
@@ -1956,12 +2162,16 @@ impl Scene {
 		let placed = self.reach(world, renderable, mesh, transform);
 		let seen = !sight.culling || sight.view.holds(&placed);
 		// a blended surface writes no depth and so casts nothing, and a frame
-		// that is not culling has no cascade lists to put anything into
+		// that is not culling has no shadow lists to put anything into. The
+		// lamps' maps are the same rule with the same test over a different
+		// set of volumes, and their bits sit past the cascades'.
+		let casting = sight.culling && blend != Blend::Alpha;
 		let casts = sight
 			.cascades
 			.as_ref()
-			.filter(|_| sight.culling && blend != Blend::Alpha)
-			.map_or(0, |cascades| casts_into(cascades, &placed));
+			.filter(|_| casting)
+			.map_or(0, |cascades| casts_into(cascades, &placed))
+			| if casting { throws_into(sight, &placed) } else { 0 };
 
 		if !seen && casts == 0 {
 			return;
@@ -2100,8 +2310,8 @@ impl Scene {
 	/// order the casters were sorted in.
 	///
 	/// @param slice - which cascade, nearest first
-	fn place_casters(&mut self, slice: usize) {
-		if let Some(list) = self.casting.get_mut(slice) {
+	fn place_casters(&mut self, map: usize) {
+		if let Some(list) = self.casting.get_mut(map) {
 			list.clear();
 		}
 
@@ -2110,12 +2320,12 @@ impl Scene {
 				.casters
 				.get(index)
 				.copied()
-				.filter(|entry| (entry.casts & (1 << slice)) != 0)
+				.filter(|entry| (entry.casts & (1 << map)) != 0)
 			else {
 				continue;
 			};
 
-			self.place(entry, Some(slice));
+			self.place(entry, Some(map));
 		}
 	}
 
@@ -2530,6 +2740,36 @@ fn create_buffer(
 ///
 /// @param slice - which cascade, nearest first
 /// @return what this cascade's pass writes
+/// Begins one shadow pass over one layer of the atlas, cleared.
+///
+/// @param encoder - what to record into
+/// @param layer - the layer to draw into
+/// @param marks - the span this pass carries an end of, if any
+fn shadow_pass<'pass>(
+	encoder: &'pass mut CommandEncoder,
+	layer: &'pass TextureView,
+	marks: Option<RenderPassTimestampWrites<'pass>>,
+) -> RenderPass<'pass> {
+	encoder.begin_render_pass(&RenderPassDescriptor {
+		label: Some("shadow"),
+		color_attachments: &[],
+		depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+			view: layer,
+			depth_ops: Some(Operations {
+				load: LoadOp::Clear(1.0),
+				store: StoreOp::Store,
+			}),
+			stencil_ops: None,
+		}),
+		timestamp_writes: marks,
+		occlusion_query_set: None,
+		multiview_mask: None,
+	})
+}
+
+/// A count of texels as a float, for a viewport.
+fn texels(count: u32) -> f32 { f32::from(u16::try_from(count).unwrap_or(0)) }
+
 const fn cascade(slice: usize) -> Ends {
 	match (slice, CASCADES) {
 		| (0, 1) => Ends::Both,
@@ -2619,17 +2859,27 @@ fn grain(depth: f32) -> i32 {
 ///
 /// @param cascades - each cascade's box, nearest first
 /// @param placed - the entity's box, in the world
-fn casts_into(cascades: &[Frustum; CASCADES], placed: &Placed) -> u8 {
-	cascades
-		.iter()
-		.enumerate()
-		.fold(0, |mask, (slice, cascade)| {
-			if cascade.holds(placed) {
-				mask | (1 << slice)
-			} else {
-				mask
-			}
-		})
+fn casts_into(cascades: &[Frustum; CASCADES], placed: &Placed) -> u32 {
+	volumes(cascades.iter(), placed, 0)
+}
+
+/// Which of a frame's local maps can see a box, as bits past the cascades'.
+///
+/// @param sight - what this frame can see, for its faces and how many are real
+/// @param placed - the box, in the world
+fn throws_into(sight: &Sight, placed: &Placed) -> u32 {
+	volumes(sight.faces.iter().take(sight.maps), placed, CASCADES)
+}
+
+/// Which of a run of volumes hold a box, as bits from a given place.
+fn volumes<'a>(over: impl Iterator<Item = &'a Frustum>, placed: &Placed, from: usize) -> u32 {
+	over.enumerate().fold(0, |mask, (index, volume)| {
+		if volume.holds(placed) {
+			mask | (1 << (index + from))
+		} else {
+			mask
+		}
+	})
 }
 
 /// How many instances a list of batches draws.
@@ -2671,7 +2921,7 @@ fn chosen(
 	eye: Vec3,
 	view: Option<&Frustum>,
 	room: usize,
-	scratch: &mut Vec<(f32, Lamp)>,
+	scratch: &mut Vec<Shining>,
 ) -> ([Lamp; MAX_LAMPS], u32) {
 	scratch.clear();
 
@@ -2699,27 +2949,114 @@ fn chosen(
 			continue;
 		}
 
-		scratch.push(((at.position - eye).length() - light.range, Lamp::of(light, at)));
+		scratch.push(Shining {
+			near: (at.position - eye).length() - light.range,
+			lamp: Lamp::of(light, at),
+			light,
+			at,
+		});
 	}
 
 	// `total_cmp` rather than a partial compare: a lamp at a nan distance is a
 	// world that has blown up, and it should sort somewhere definite rather
 	// than making the order depend on which pairs were compared.
-	scratch.sort_by(|(near, _), (other, _)| near.total_cmp(other));
+	scratch.sort_by(|one, other| one.near.total_cmp(&other.near));
+	scratch.truncate(room.min(MAX_LAMPS));
 
 	let mut lamps = [Lamp::DARK; MAX_LAMPS];
 	let mut count = 0;
 
-	for (slot, (_, lamp)) in lamps
-		.iter_mut()
-		.zip(scratch.iter().take(room.min(MAX_LAMPS)))
-	{
-		*slot = *lamp;
+	for (slot, shining) in lamps.iter_mut().zip(scratch.iter()) {
+		*slot = shining.lamp;
 		count += 1;
 	}
 
 	(lamps, u32::try_from(count).unwrap_or(0))
 }
+
+/// Hands the frame's atlas tiles to the lamps that asked for one, nearest
+/// first, and works out where each of their maps looks from.
+///
+/// **The order is the one [`chosen`] already sorted**, which is the same
+/// quantity the field measures for this: one engine scales a map by the reach
+/// over the distance to the eye, another by how much of the screen the light
+/// covers, and the nearest edge of a lamp's reach is that answer already
+/// computed. Nothing new is measured here.
+///
+/// **A lamp that does not fit is skipped rather than stopping the walk.** Six
+/// tiles is a point and one is a cone, so a cone behind a point that filled
+/// the atlas still gets its map - which is strictly better than the far ones
+/// simply going dark in order.
+///
+/// @param shining - the lamps the frame carries, nearest first
+/// @param lamps - their packed forms, written with where their maps landed
+/// @param room - how many tiles the console left the frame
+/// @param tiles - written with where each map sits in the atlas
+/// @param views - written with world space into each map's clip space
+/// @return how many tiles were handed out
+fn allocate(
+	shining: &[Shining],
+	lamps: &mut [Lamp; MAX_LAMPS],
+	room: usize,
+	tiles: &mut [Tile; LOCAL_TILES],
+	views: &mut [[[f32; 4]; 4]; LOCAL_TILES],
+) -> usize {
+	// every tile is put back to something finite first: a view left over from
+	// last frame would be read as a volume by the culler, and a zero matrix
+	// would be read as nothing at all.
+	*tiles = [Tile::local(0); LOCAL_TILES];
+	*views = [Mat4::IDENTITY.to_cols_array_2d(); LOCAL_TILES];
+
+	let mut slots = Slots::with_room(room);
+
+	for (index, lit) in shining.iter().enumerate() {
+		let wanted = match lit.light.kind {
+			| LightKind::Point => 6,
+			| LightKind::Spot => 1,
+			| LightKind::None => continue,
+		};
+
+		if !lit.light.shadow {
+			continue;
+		}
+
+		let (Some(first), Some(lamp)) = (slots.take(wanted), lamps.get_mut(index)) else {
+			continue;
+		};
+
+		let spread = if wanted == 6 {
+			shadow::point_spread()
+		} else {
+			shadow::cone_spread(lit.light.cone().1)
+		};
+
+		lamp.shadow = [whole(first), whole(wanted), spread, 0.0];
+
+		for face in 0..wanted {
+			let matrix = if wanted == 6 {
+				shadow::faces(lit.at.position, lit.light.range)[face]
+			} else {
+				shadow::cone(
+					lit.at.position,
+					lit.at.rotation * Vec3::NEG_Z,
+					lit.light.range,
+					lit.light.cone().1,
+				)
+			};
+
+			let at = first + face;
+			if let (Some(tile), Some(view)) = (tiles.get_mut(at), views.get_mut(at)) {
+				*tile = Tile::local(at);
+				*view = matrix.to_cols_array_2d();
+			}
+		}
+	}
+
+	slots.used()
+}
+
+/// A small whole number as a float, the way the tiles are written.
+fn whole(value: usize) -> f32 { f32::from(u8::try_from(value).unwrap_or(0)) }
 
 /// How many lamps a console variable is asking for.
 ///
@@ -3160,20 +3497,20 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 		);
 		assert!(align_of::<Placement>() == 4, "Placement gained padding");
 		assert!(size_of::<Tile>() == 32, "a Tile is no longer two vec4s");
-		assert!(size_of::<Lamp>() == 48, "a Lamp is no longer three vec4s");
+		assert!(size_of::<Lamp>() == 64, "a Lamp is no longer four vec4s");
 		// a uniform array's stride is its element rounded up to sixteen, so an
 		// element that is already a multiple of it is laid out here exactly as
-		// the shader reads it - which is the whole reason a lamp is three
+		// the shader reads it - which is the whole reason a lamp is four
 		// vectors rather than a struct of named floats.
 		assert!(size_of::<Lamp>().is_multiple_of(16), "and a uniform array's stride is not it");
 		assert!(
 			size_of::<Globals>()
 				== 576
 					+ size_of::<Tile>() * CASCADES
+					+ (size_of::<Tile>() + 64) * LOCAL_TILES
 					+ size_of::<Lamp>() * MAX_LAMPS
 					+ size_of::<Paint>() * MAX_DECALS,
-			"the two camera matrices, the light, the cascades and their tiles, the fog, the \
-			 sky, 			 the counts and the lamps"
+			"the camera, the cascades and their tiles, the lamps' tiles and views, the sky and 			 the lamps"
 		);
 		assert!(size_of::<Globals>().is_multiple_of(16), "and a uniform struct has to be");
 		assert!(size_of::<Paint>() == 112, "a decal is no longer seven vec4s");
@@ -3517,8 +3854,8 @@ mod tests {
 		);
 		assert_eq!(
 			size_bytes::<Placement>(MAX_ENTITIES * LISTS).expect("the size fits"),
-			128 * 5 * BufferAddress::try_from(MAX_ENTITIES).expect("the count fits"),
-			"and five of them for every one: the picture's list and each cascade's"
+			128 * 21 * BufferAddress::try_from(MAX_ENTITIES).expect("the count fits"),
+			"and twenty-one of them for every one: the picture's list, each cascade's, and one 			 per tile of the shadow atlas"
 		);
 		assert_eq!(
 			skin_stride(),

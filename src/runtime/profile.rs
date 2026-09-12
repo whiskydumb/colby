@@ -88,21 +88,21 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Eight spans of hardware, two of recording, five of simulation and one of
+/// Nine spans of hardware, two of recording, five of simulation and one of
 /// particles.
-const ROWS: usize = 16;
+const ROWS: usize = 17;
 
 /// Which row of the table is the whole solver step.
 ///
 /// Written out rather than "the last one", which is what it used to be and
 /// what stopped being true the moment a row was appended after it. A row added
 /// below has to leave these two alone or move them on purpose; `gpu depth`
-/// went in above them and moved both, `gpu shaft` did it again and `gpu focus`
-/// a third time.
-const STEP_ROW: usize = 14;
+/// went in above them and moved both, `gpu shaft` did it again, `gpu focus` a
+/// third time and `gpu lamps` a fourth.
+const STEP_ROW: usize = 15;
 
 /// Which row is the particles.
-const SPARKS_ROW: usize = 15;
+const SPARKS_ROW: usize = 16;
 
 /// How many frames the live table averages over.
 ///
@@ -222,7 +222,7 @@ impl Live {
 	/// @param passes - what the hardware spent, per [`Pass`] in slot order,
 	/// from a frame two or three behind the one this is called in
 	/// @param count - how many render passes that frame recorded
-	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 8], count: u32) {
+	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 9], count: u32) {
 		self.passes = Some(count);
 
 		for (at, took) in passes.into_iter().enumerate() {
@@ -380,6 +380,10 @@ struct Table {
 	/// added together.
 	cast: usize,
 
+	/// The most times any measured frame's local lights drew one, every tile
+	/// of the shadow atlas added together.
+	lamp_cast: usize,
+
 	/// The most entities with a mesh any measured frame left out for being
 	/// hidden. Beside `meshes`, and the two add up to every entity with one.
 	hidden: usize,
@@ -412,6 +416,9 @@ struct Table {
 /// with a list of its own would be a second place to add a row to.
 pub(crate) const NAMES: [&str; ROWS] = [
 	"gpu shadow",
+	// every local light's map, in one pass over the atlas's last layer. Added
+	// with parity card B5, on the atlas card B4 laid down.
+	"gpu lamps",
 	"gpu scene",
 	// the depth made readable, between the scene that wrote it and everything
 	// after that reads it. Added with parity card B1.
@@ -455,6 +462,7 @@ impl Table {
 			meshes: 0,
 			drawn: 0,
 			cast: 0,
+			lamp_cast: 0,
 			hidden: 0,
 			lamps: 0,
 			decals: 0,
@@ -477,6 +485,7 @@ impl Table {
 		self.meshes = self.meshes.max(counts.drawn.meshes);
 		self.drawn = self.drawn.max(counts.drawn.seen);
 		self.cast = self.cast.max(counts.drawn.cast);
+		self.lamp_cast = self.lamp_cast.max(counts.drawn.lamp_casts);
 		self.hidden = self.hidden.max(counts.drawn.hidden);
 		self.lamps = self.lamps.max(counts.drawn.lamps);
 		self.decals = self.decals.max(counts.drawn.decals);
@@ -554,6 +563,7 @@ impl Table {
 			meshes = self.meshes,
 			drawn = self.drawn,
 			cast = self.cast,
+			lamp_cast = self.lamp_cast,
 			hidden = self.hidden,
 			lamps = self.lamps,
 			decals = self.decals,
@@ -768,13 +778,13 @@ mod tests {
 		assert_eq!(live.profile().passes, None, "and no frame has been read back");
 
 		live.hardware(
-			[None, Some(Duration::from_micros(800)), None, None, None, None, None, None],
+			[None, None, Some(Duration::from_micros(800)), None, None, None, None, None, None],
 			15,
 		);
 
 		assert!(live.profile().hardware, "now it has");
-		assert_eq!(live.profile().parts[1].mean, Some(Duration::from_micros(800)));
-		assert_eq!(live.profile().parts[1].name, "gpu scene", "in the second row");
+		assert_eq!(live.profile().parts[2].mean, Some(Duration::from_micros(800)));
+		assert_eq!(live.profile().parts[2].name, "gpu scene", "in the third row");
 		assert_eq!(live.profile().passes, Some(15), "and the count came with it");
 	}
 
@@ -893,6 +903,7 @@ mod tests {
 				meshes: 10,
 				seen: 4,
 				cast: 12,
+				lamp_casts: 7,
 				hidden: 3,
 				lamps: 2,
 				decals: 5,

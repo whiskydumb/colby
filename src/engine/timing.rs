@@ -80,6 +80,11 @@ pub enum Pass {
 	/// Every shadow cascade, as one span: four passes that are one feature.
 	Shadow,
 
+	/// Every local light's shadow map, as one span: one pass over the atlas's
+	/// last layer, with a viewport per tile. None at all in a frame where no
+	/// lamp asked for one. @ref [`shadow`](crate::shadow).
+	Lamps,
+
 	/// The world itself - the geometry, the sky, the debug lines and the
 	/// blended half. Where the lights and the samples are paid for.
 	Scene,
@@ -117,8 +122,9 @@ pub enum Pass {
 
 impl Pass {
 	/// Every span, in the order a frame runs them.
-	pub const ALL: [Self; 8] = [
+	pub const ALL: [Self; 9] = [
 		Self::Shadow,
+		Self::Lamps,
 		Self::Scene,
 		Self::Depth,
 		Self::Shaft,
@@ -133,6 +139,7 @@ impl Pass {
 	pub const fn name(self) -> &'static str {
 		match self {
 			| Self::Shadow => "shadow",
+			| Self::Lamps => "lamps",
 			| Self::Scene => "scene",
 			| Self::Depth => "depth",
 			| Self::Shaft => "shaft",
@@ -147,13 +154,14 @@ impl Pass {
 	const fn slot(self) -> usize {
 		match self {
 			| Self::Shadow => 0,
-			| Self::Scene => 1,
-			| Self::Depth => 2,
-			| Self::Shaft => 3,
-			| Self::Focus => 4,
-			| Self::Meter => 5,
-			| Self::Glow => 6,
-			| Self::Composite => 7,
+			| Self::Lamps => 1,
+			| Self::Scene => 2,
+			| Self::Depth => 3,
+			| Self::Shaft => 4,
+			| Self::Focus => 5,
+			| Self::Meter => 6,
+			| Self::Glow => 7,
+			| Self::Composite => 8,
 		}
 	}
 
@@ -166,13 +174,14 @@ impl Pass {
 	const fn query(self) -> u32 {
 		match self {
 			| Self::Shadow => 0,
-			| Self::Scene => 2,
-			| Self::Depth => 4,
-			| Self::Shaft => 6,
-			| Self::Focus => 8,
-			| Self::Meter => 10,
-			| Self::Glow => 12,
-			| Self::Composite => 14,
+			| Self::Lamps => 2,
+			| Self::Scene => 4,
+			| Self::Depth => 6,
+			| Self::Shaft => 8,
+			| Self::Focus => 10,
+			| Self::Meter => 12,
+			| Self::Glow => 14,
+			| Self::Composite => 16,
 		}
 	}
 }
@@ -248,7 +257,7 @@ pub(crate) enum Ends {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
 	/// What the hardware spent, per [`Pass`], in its `slot` order.
-	passes: [Option<Duration>; 8],
+	passes: [Option<Duration>; 9],
 
 	/// What this thread spent, per [`Work`], in its `slot` order.
 	work: [Option<Duration>; 2],
@@ -375,9 +384,9 @@ pub struct Timings {
 
 impl Timings {
 	/// How many timestamps the set holds: two per span.
-	const QUERIES: u32 = 16;
+	const QUERIES: u32 = 18;
 	/// The same number where a length is wanted. @ref [`Pass::query`].
-	const TICKS: usize = 16;
+	const TICKS: usize = 18;
 
 	/// An apparatus that measures nothing.
 	///
@@ -706,7 +715,7 @@ impl Timings {
 		// read into a table of its own and then written over the frame in one
 		// go: `span` reads the mask off `self` and the frame is a field of
 		// the same `self`, so the two cannot be borrowed at once.
-		let mut spans = [None; 8];
+		let mut spans = [None; 9];
 
 		for pass in Pass::ALL {
 			if let Some(held) = spans.get_mut(pass.slot()) {

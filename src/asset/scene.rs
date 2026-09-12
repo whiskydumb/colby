@@ -76,10 +76,14 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// different number is refused with a message rather than read as if it
 /// agreed.
 ///
-/// Fifteen since a camera carries a lens as well as a pose: three words on the
-/// settings record, which is the first growth that record has had to pay for
-/// since it was given a spare word to spend.
-pub const FORMAT_VERSION: u32 = 15;
+/// Sixteen since a light says whether it throws a shadow: one word on the light
+/// record, which had no spare to take it. The word before it is a *kind*, read
+/// as an index into a list of words and refused when it is not one of them, so
+/// the trick that costs nothing - @ref [`BULK_WEIGHTLESS`], a bit in a word
+/// that already exists - was not available: a build that did not know the bit
+/// would refuse the file rather than ignore it. So the record grew, and what
+/// grew is a flags word, which the *next* bit will be free to join.
+pub const FORMAT_VERSION: u32 = 16;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -623,9 +627,9 @@ pub struct Daub {
 ///
 /// Keyed by the entity the way a [`Bulk`] is, rather than folded into
 /// [`Stood`]: nearly every entity in a world carries no light, and a wider
-/// entity record would spend thirty-six bytes on each of them to say so. Both
+/// entity record would spend forty bytes on each of them to say so. Both
 /// shapes bump [`FORMAT_VERSION`] once and only once; this one costs a world
-/// of a thousand crates and two lamps seventy-two bytes instead of thirty-six
+/// of a thousand crates and two lamps eighty bytes instead of forty
 /// thousand.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -658,7 +662,20 @@ pub struct Lit {
 
 	/// The half-angle of a cone's edge, in radians.
 	pub outer: f32,
+
+	/// What is unusual about it, as bits. @ref [`LIT_UNSHADOWED`].
+	pub flags: u32,
 }
+
+/// The bit in [`Lit::flags`] that says nothing it lights throws a shadow.
+///
+/// **The unusual answer, the way [`STOOD_UNDECALED`] is**, because a lamp casts
+/// by default: a record of no flags is a lamp that throws a shadow, which is
+/// what a light placed by hand means. A bit this build does not know is read as
+/// a property the record does not have, which is what lets the next one arrive
+/// without moving [`FORMAT_VERSION`] again - and this word is here so that
+/// there is a next one to arrive into.
+pub const LIT_UNSHADOWED: u32 = 1;
 
 /// One body's fluid, as the file holds it.
 ///
@@ -1869,6 +1886,7 @@ fn lit_of(index: usize, light: Light) -> Result<Lit> {
 		range: light.range,
 		inner: light.inner,
 		outer: light.outer,
+		flags: if light.shadow { 0 } else { LIT_UNSHADOWED },
 	})
 }
 
@@ -2208,6 +2226,7 @@ fn light_of(record: &Lit) -> Light {
 		range: record.range,
 		inner: record.inner,
 		outer: record.outer,
+		shadow: (record.flags & LIT_UNSHADOWED) == 0,
 	}
 }
 

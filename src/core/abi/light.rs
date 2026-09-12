@@ -144,6 +144,23 @@ pub struct Light {
 	/// Between [`inner`](Self::inner) and this the light falls off to nothing.
 	/// Ignored by a point.
 	pub outer: f32,
+
+	/// Whether what it lights throws a shadow.
+	///
+	/// **On, and the field it was decided against is split exactly three to
+	/// three.** Three engines have it on and three off, and the reason the
+	/// three have it off is the same in all three: the number of lights is
+	/// unbounded, so a scene with fifty lamps would want fifty shadow maps and
+	/// the cost has to be the user's to accept. colby's is bounded by
+	/// construction - sixteen tiles of an atlas, and lamps past them throw
+	/// nothing - so the case they are guarding against cannot arise here.
+	///
+	/// What settles it beyond that is the engine's own consistency: the sun
+	/// casts by default, and a lamp that does not while the sun does is a lamp
+	/// whose light goes through walls in a picture nobody asked a question
+	/// about. Every other switch of this family is a *look* a world opts into
+	/// with a number; this one is whether the picture is right.
+	pub shadow: bool,
 }
 
 impl Light {
@@ -166,6 +183,7 @@ impl Light {
 		field!(Float, "range", range, "how far its contribution reaches"),
 		field!(Float, "inner", inner, "the half-angle of a cone's bright middle, in radians"),
 		field!(Float, "outer", outer, "the half-angle of a cone's edge, in radians"),
+		field!(Bool, "shadow", shadow, "whether what it lights throws a shadow"),
 	];
 	/// No light at all.
 	///
@@ -184,9 +202,12 @@ impl Light {
 		// stamped in it.
 		inner: 0.0,
 		outer: std::f32::consts::FRAC_PI_4,
+		shadow: true,
 	};
 
 	/// A point of a color, reaching so far.
+	///
+	/// It throws a shadow, which is what [`NONE`](Self::NONE) says.
 	///
 	/// @param color - linear RGB
 	/// @param intensity - the multiplier on it
@@ -204,6 +225,8 @@ impl Light {
 
 	/// A cone of a color, reaching so far and opening so wide.
 	///
+	/// It throws a shadow, which is what [`NONE`](Self::NONE) says.
+	///
 	/// @param color - linear RGB
 	/// @param intensity - the multiplier on it
 	/// @param range - how far it reaches
@@ -218,6 +241,7 @@ impl Light {
 			range,
 			inner,
 			outer,
+			shadow: Self::NONE.shadow,
 		}
 	}
 
@@ -328,6 +352,7 @@ mod tests {
 					Value::Word(u32::try_from(words.len()).expect("a short list") - 1),
 				| Kind::Color => Value::Color(Vec3::new(0.25, 0.5, 0.75)),
 				| Kind::Float => Value::Float(1.5),
+				| Kind::Bool => Value::Bool(false),
 				| kind => panic!("a light has no field of {kind:?}"),
 			};
 

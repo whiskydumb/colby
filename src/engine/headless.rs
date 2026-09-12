@@ -21,8 +21,8 @@
 mod tests {
 	use colby_core::{
 		abi::{
-			Decal, Emitter, MeshId, Renderable, Spark, SparkBlend, Texel, TextureData, TextureId,
-			ToneMap, Transform, Value, World,
+			Decal, Emitter, Light, MeshId, Renderable, Spark, SparkBlend, Texel, TextureData,
+			TextureId, ToneMap, Transform, Value, World,
 			cvar::Cvars,
 			debug,
 			material::{Blend, Material},
@@ -31,7 +31,7 @@ mod tests {
 	};
 	use wgpu::TextureFormat;
 
-	use crate::{Capture, Gpu, depth, scene};
+	use crate::{Capture, Gpu, depth, scene, shadow};
 
 	/// How big the target is. Small on purpose: nothing here reads it.
 	const SIZE: (u32, u32) = (16, 16);
@@ -131,6 +131,23 @@ mod tests {
 			});
 		}
 
+		// a point and a cone, both casting, so the atlas's local layer is
+		// drawn into and both the six-tile shape and the one-tile shape are
+		// recorded. @ref [`shadow`](crate::shadow).
+		let point = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(0.0, 2.0, 1.0)));
+		world
+			.entities
+			.set_light(point, Light::point(Vec3::ONE, 8.0, 12.0));
+
+		let spot = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(2.0, 2.0, 1.0)));
+		world
+			.entities
+			.set_light(spot, Light::spot(Vec3::ONE, 8.0, 12.0, 0.2, 0.6));
+
 		world
 			.debug
 			.line(Vec3::ZERO, Vec3::X, debug::WHITE);
@@ -143,6 +160,7 @@ mod tests {
 		let mut cvars = Cvars::new();
 
 		cvars.var(scene::MSAA, Value::Float(1.0), "");
+		cvars.var(shadow::LOCAL_LAMPS, Value::Float(shadow::DEFAULT_LOCAL_LAMPS), "");
 		cvars.set(scene::MSAA, samples);
 		world.cvars = cvars;
 	}

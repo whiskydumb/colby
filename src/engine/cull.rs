@@ -378,6 +378,16 @@ pub struct Drawn {
 	/// four times what the picture's solid half holds.
 	pub cast: usize,
 
+	/// How many times a lamp's map drew one, every tile of the atlas added
+	/// together.
+	///
+	/// Beside [`cast`](Self::cast) rather than inside it: the sun's four boxes
+	/// cover the view and a lamp's six cover a sphere around the lamp, so the
+	/// two answer different questions about the same frame. A point light with
+	/// nothing near it is six maps drawing nothing, and this is where that
+	/// shows.
+	pub lamp_casts: usize,
+
 	/// Entities with a mesh that are hidden, by their own word or by something
 	/// they hang off, and so were put in no list at all.
 	///

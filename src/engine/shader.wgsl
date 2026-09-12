@@ -11,9 +11,10 @@
 //
 // Shading is metallic-roughness: Cook-Torrance specular with GGX, Smith
 // visibility and Schlick's Fresnel, over a Lambert diffuse. One directional
-// light with cascaded shadows, up to MAX_LAMPS local ones with none, and no
-// image-based lighting - the ambient term stands in for everything the scene
-// does not simulate, which is why it is a color and not a number.
+// light with cascaded shadows, up to MAX_LAMPS local ones whose maps are tiles
+// of the same atlas, and no image-based lighting - the ambient term stands in
+// for everything the scene does not simulate, which is why it is a color and
+// not a number.
 //
 // The local lights are a flat array walked by every fragment: no tiles, no
 // clusters, no per-object list. What keeps that affordable is that the CPU
@@ -56,6 +57,11 @@ struct Globals {
     shadow: vec4<f32>,
     // Where each cascade's map sits in the atlas, nearest slice first.
     cascade_tiles: array<Tile, 4>,
+    // Where each local light's map sits, in the order the tiles were handed
+    // out: a cone takes one and a point takes six in a row.
+    lamp_tiles: array<Tile, MAX_LOCAL_TILES>,
+    // World space into each of their clip spaces.
+    lamp_views: array<mat4x4<f32>, MAX_LOCAL_TILES>,
     // rgb is the color a distant surface fades towards; w is how quickly it
     // does, per unit of distance. A w of nought is no fog, and the arithmetic
     // below says so without a branch.
@@ -110,7 +116,18 @@ struct Lamp {
     // xyz is the way a cone points, which is the entity's own -z; w is the
     // cone's offset.
     direction: vec4<f32>,
+    // x is the first atlas tile its map is in, y is how many tiles it has, z
+    // is how much of the world one texel of that map covers per unit of
+    // distance, and w is unused. A count of nought is a lamp that throws no
+    // shadow, which is the only thing the loop below has to test.
+    shadow: vec4<f32>,
 };
+
+// How many local shadow maps the atlas holds.
+//
+// Matched by `colby_engine::shadow::LOCAL_TILES`, for the reason MAX_LAMPS is
+// matched: this sizes the uniform and that fills it.
+const MAX_LOCAL_TILES: u32 = 16u;
 
 // How many decals one frame may carry.
 //
@@ -619,6 +636,7 @@ fn lamps_at(
         // is one for it whatever the angle is. @ref `Lamp`.
         let along = dot(-lamp.direction.xyz, towards_light);
         let cone = clamp(along * lamp.color.w + lamp.direction.w, 0.0, 1.0);
+        let lean = 1.0 - clamp(dot(normal, towards_light), 0.0, 1.0);
 
         total += lit_by(
             normal,
@@ -632,10 +650,81 @@ fn lamps_at(
             * lamp.color.rgb
             * lamp_falloff(distance_square, range_square)
             * cone
-            * cone;
+            * cone
+            * lamp_shadowing(lamp, world_position, normal, lean);
     }
 
     return total;
+}
+
+// How much of one lamp's light reaches a point: one is lit, zero is in shadow.
+//
+// **A point light is six flat views and a cone is one**, which is why the only
+// thing this has to decide is which of them a point fell into: the largest
+// component of the direction from the lamp picks the face, in the order the
+// matrices were written - `+x -x +y -y +z -z`. A cone has one map and skips
+// the pick entirely.
+//
+// The sample is pushed along the surface's own normal first, for the reason a
+// cascade's is, and by the same two-to-four texels - except that a texel of a
+// perspective map grows with distance, so the size of it is worked out here
+// from the distance to the lamp rather than read out of a table.
+//
+// **The face is picked from the pushed point, not the plain one.** A point
+// near a face's edge can be pushed across it, and picking the face first would
+// then project it through the wrong matrix and read the wrong map.
+//
+// @param lamp - the light, which carries where its maps are
+// @param world_position - the point being lit
+// @param normal - the surface's normal there
+// @param lean - how far the surface is turned away from the lamp, nought
+// facing it and one edge on
+fn lamp_shadowing(lamp: Lamp, world_position: vec3<f32>, normal: vec3<f32>, lean: f32) -> f32 {
+    let count = u32(max(lamp.shadow.y, 0.0));
+    if (globals.shadow.z < 0.5 || count == 0u) {
+        return 1.0;
+    }
+
+    let first = u32(max(lamp.shadow.x, 0.0));
+    let reach = length(world_position - lamp.position_range.xyz);
+    let push = lamp.shadow.z * reach * mix(2.0, 4.0, clamp(lean, 0.0, 1.0));
+    let at = world_position + normal * push;
+
+    var face = 0u;
+    if (count > 1u) {
+        let away = at - lamp.position_range.xyz;
+        let size = abs(away);
+
+        if (size.x >= size.y && size.x >= size.z) {
+            face = select(1u, 0u, away.x > 0.0);
+        } else if (size.y >= size.z) {
+            face = select(3u, 2u, away.y > 0.0);
+        } else {
+            face = select(5u, 4u, away.z > 0.0);
+        }
+    }
+
+    let index = min(first + face, MAX_LOCAL_TILES - 1u);
+    let clip = globals.lamp_views[index] * vec4<f32>(at, 1.0);
+
+    // behind the map's own eye, which a push across a face edge can just about
+    // manage at grazing angles. Nothing there is in this map's shadow.
+    if (clip.w <= 0.0) {
+        return 1.0;
+    }
+
+    let ndc = clip.xyz / clip.w;
+
+    // in front of the near plane or past the far one. The far one is the
+    // lamp's own reach, so a point past it was already outside the falloff.
+    if (ndc.z <= 0.0 || ndc.z >= 1.0) {
+        return 1.0;
+    }
+
+    // clip space counts y upwards and a texture counts it down.
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+
+    return gather(globals.lamp_tiles[index], uv, ndc.z);
 }
 
 // How much alpha a texel needs before a masked surface draws it at all.
@@ -863,8 +952,9 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
 
     // how much of the *sun* this point can see. It multiplies the sun's term
     // and nothing else: what a shadow takes away is that light's own
-    // contribution, the lamps below cast none at all, and the ambient stands in
-    // for everything that reaches a surface by some other route.
+    // contribution, each lamp below asks its own maps for its own answer, and
+    // the ambient stands in for everything that reaches a surface by some
+    // other route.
     let view_depth = dot(input.world_position - globals.eye.xyz, globals.forward.xyz);
     let slice = cascade_of(view_depth);
     let reaching = shadowing(input.world_position, normal, 1.0 - normal_dot_light, slice);

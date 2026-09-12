@@ -597,6 +597,17 @@ fn install_render(world: &mut World) {
 		Value::Bool(false),
 		"color every pixel by the shadow cascade it read",
 	);
+	// how many tiles of the shadow atlas the local lights may have between
+	// them: a point takes six and a cone one, and what does not fit throws no
+	// shadow. A ceiling rather than a switch, for the reason the lamp count
+	// below is one - except that nought here is also how a picture is taken
+	// with the lamps casting nothing, which is what a screenshot from before
+	// the atlas is compared against.
+	world.cvars.var(
+		colby_engine::shadow::LOCAL_LAMPS,
+		Value::Float(colby_engine::shadow::DEFAULT_LOCAL_LAMPS),
+		"how many tiles of the shadow atlas the point and cone lights may have",
+	);
 	// what a frame cannot see is left out of it: the view for the picture and
 	// each cascade's box for its shadows. On, and not saved, like the shadows:
 	// what the switch is for is measuring what the test saves, and showing
@@ -1381,6 +1392,10 @@ mod tests {
 		// `colby_engine::scene::Scene::upload`
 		(colby_engine::shadow::ENABLED, Value::Bool(true)),
 		(colby_engine::shadow::TINT, Value::Bool(false)),
+		(
+			colby_engine::shadow::LOCAL_LAMPS,
+			Value::Float(colby_engine::shadow::DEFAULT_LOCAL_LAMPS),
+		),
 		(colby_engine::cull::ENABLED, Value::Bool(true)),
 		(colby_engine::depth::VIEW, Value::Float(colby_engine::depth::NO_VIEW)),
 		// `crate::console::volumes`, all four

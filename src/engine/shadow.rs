@@ -42,7 +42,10 @@ use colby_core::{
 	err,
 	glam::{
 		Mat4, Vec3,
-		camera::rh::{proj::directx::orthographic, view::look_at_mat4},
+		camera::rh::{
+			proj::directx::{orthographic, perspective},
+			view::look_at_mat4,
+		},
 	},
 };
 use wgpu::{
@@ -130,6 +133,21 @@ pub const ENABLED: &str = "r.shadows";
 
 /// The console variable that says how far out anything is shadowed.
 pub const DISTANCE: &str = "r.shadow_distance";
+
+/// The console variable that says how many atlas tiles the lamps may have.
+///
+/// A ceiling on the ceiling, the way [`LAMPS`](crate::scene::LAMPS) is one on
+/// how many lamps a frame carries at all. Nought turns every local shadow off
+/// without turning a lamp off, which is what a picture measured against the
+/// build before this one is shot with.
+pub const LOCAL_LAMPS: &str = "r.shadow_lamps";
+
+/// What [`LOCAL_LAMPS`] holds until somebody sets it: the whole atlas.
+pub const DEFAULT_LOCAL_LAMPS: f32 = 16.0;
+
+const _: () = {
+	assert!(LOCAL_TILES == 16, "LOCAL_TILES and DEFAULT_LOCAL_LAMPS disagree");
+};
 
 /// The console variable that colors every pixel by the cascade it read.
 ///
@@ -305,6 +323,110 @@ impl Tile {
 			side as u32,
 		]
 	}
+}
+
+/// The widest a cone's shadow may be drawn, in radians.
+///
+/// A cone may open to nearly a hemisphere - `Light::MAX_CONE` is 88.9 degrees
+/// of half-angle - and
+/// a perspective projection at a hundred and seventy-eight degrees across
+/// spends nearly all of its texels on the four corners of a square that the
+/// cone does not reach. A hundred and fifty is where that stops being worth
+/// drawing; past it the shadow is drawn at this width and the edge of a wider
+/// cone falls outside its own map, which reads as lit. A limit, and written
+/// down as one.
+const CONE_CEILING: f32 = 2.617_993_9;
+
+/// How near a local light's map starts, as a fraction of how far it reaches.
+///
+/// A hundredth, held at a centimeter, which puts a lamp of the usual few units
+/// of reach at about a twentieth. Every texel of depth precision behind the
+/// near plane is spent on nothing, and a light with something touching it is
+/// the case that decides the number.
+const LOCAL_NEAR: f32 = 0.01;
+
+/// The six views a point light's shadow is drawn from.
+///
+/// **Six faces rather than two.** Four of the five engines read draw a point
+/// light's shadow as six square views - three as a cube texture and one as six
+/// rectangles of an atlas, which is this. The fifth warps the sphere onto two
+/// paraboloids, and the reason not to follow it is that a paraboloid is not a
+/// projection: it is right at every vertex and wrong everywhere between them,
+/// so a wall crossing one bulges unless it is cut into pieces small enough to
+/// hide it. The engine that does it compensates in its vertex stage; six flat
+/// views need no compensating at all.
+///
+/// The axis order is `+x -x +y -y +z -z`, which the shader picks a face out of
+/// by the largest component of the direction. The up vectors are colby's own:
+/// nothing outside this file and its reader sees them, so the only rule they
+/// have to keep is not lying along their own axis.
+///
+/// @param position - where the lamp stands
+/// @param range - how far it reaches, which is the far plane
+/// @return one matrix per face, world space into that face's clip space
+#[must_use]
+pub fn faces(position: Vec3, range: f32) -> [Mat4; 6] {
+	let axes = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+	let ups = [Vec3::Y, Vec3::Y, Vec3::Z, Vec3::NEG_Z, Vec3::Y, Vec3::Y];
+	let projection = local_projection(std::f32::consts::FRAC_PI_2, range);
+
+	std::array::from_fn(|face| {
+		let (axis, up) = (axes[face], ups[face]);
+
+		projection * look_at_mat4(position, position + axis, up)
+	})
+}
+
+/// The one view a cone's shadow is drawn from.
+///
+/// A single perspective as wide as the cone is, so the cone is the circle
+/// inscribed in the square the map covers: everything the cone lights at all is
+/// inside it, and the corners it wastes are the corners the falloff has already
+/// taken to nothing.
+///
+/// @param position - where the lamp stands
+/// @param direction - the way it points, of any length
+/// @param range - how far it reaches
+/// @param outer - the half-angle of its edge, in radians
+/// @return world space into the cone's clip space
+#[must_use]
+pub fn cone(position: Vec3, direction: Vec3, range: f32, outer: f32) -> Mat4 {
+	let along = direction.normalize_or(Vec3::NEG_Z);
+	let up = if along.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+
+	local_projection(cone_fov(outer), range) * look_at_mat4(position, position + along, up)
+}
+
+/// How wide a cone's map is drawn, held inside what a projection can do.
+fn cone_fov(outer: f32) -> f32 { (outer * 2.0).clamp(0.01, CONE_CEILING) }
+
+/// How much of the world one texel of a local map covers, per unit of distance.
+///
+/// What the shader multiplies by the distance to the lamp to get the size of
+/// the texel a point landed in, which is what its normal offset is measured in
+/// which is the same quantity [`Cascades::texels`] holds for a cascade, except
+/// that a perspective map's texel grows with distance and so cannot be one
+/// number.
+///
+/// @param fov - how wide the view is, in radians: a right angle for a face of
+/// a point light, the cone's own width for a cone
+#[must_use]
+pub fn spread(fov: f32) -> f32 { 2.0 * (fov * 0.5).tan() / LOCAL_F }
+
+/// [`spread`] for one face of a point light.
+#[must_use]
+pub fn point_spread() -> f32 { spread(std::f32::consts::FRAC_PI_2) }
+
+/// [`spread`] for a cone of a given edge.
+#[must_use]
+pub fn cone_spread(outer: f32) -> f32 { spread(cone_fov(outer)) }
+
+/// The projection every local map is drawn through.
+fn local_projection(fov: f32, range: f32) -> Mat4 {
+	let far = range.max(0.02);
+	let near = (far * LOCAL_NEAR).clamp(0.01, far * 0.5);
+
+	perspective(fov, 1.0, near, far)
 }
 
 /// Where each cascade's map sits in the atlas, nearest slice first.
@@ -509,6 +631,10 @@ fn snap(matrix: Mat4) -> Mat4 {
 	snapped
 }
 
+/// How many maps the atlas can be drawn into, and so how many slots the
+/// uniform holds: one per cascade and one per local tile.
+const SLOTS: usize = CASCADES + LOCAL_TILES;
+
 /// How far the uniform slots of one buffer have to be apart.
 ///
 /// wgpu's floor for a uniform binding's offset, and every backend's. One matrix
@@ -532,13 +658,24 @@ pub(crate) struct Maps {
 	/// Kept so the scene's pipeline can be built again when its shader is.
 	sample_layout: BindGroupLayout,
 
-	/// One per (whether the picture has to be sampled, whether bones move it).
+	/// One per (a local map or a cascade, the picture is sampled, bones move
+	/// it).
 	///
-	/// Two axes and four entries, the same shape the scene's table has - but
-	/// keyed on a *bool* rather than on `Blend`, because what a cascade wants
-	/// to know is only whether the surface can have holes in it. A mode that
-	/// does not cast at all has no row here rather than an unused one.
-	pipelines: [RenderPipeline; 4],
+	/// Three axes and eight entries. The last two are the same shape the
+	/// scene's table has - keyed on a *bool* rather than on `Blend`, because
+	/// what a shadow pass wants to know is only whether the surface can have
+	/// holes in it, and a mode that does not cast has no row here rather than
+	/// an unused one.
+	///
+	/// **The first axis exists for one reason: the depth bias.** A cascade is
+	/// drawn with a slope-scaled bias in the pipeline; a local map is drawn
+	/// with none at all, and leans entirely on the normal offset the scene's
+	/// shader applies. That is a deliberate choice and its reason is not
+	/// graphical - a slope-scaled bias on a floating-point depth is scaled by
+	/// a value the specification leaves to the implementation, so a second
+	/// answer worked out away from the device cannot predict it, and a shadow
+	/// nobody can predict is a shadow nobody can check.
+	pipelines: [RenderPipeline; 8],
 }
 
 impl Maps {
@@ -588,22 +725,22 @@ impl Maps {
 		let sampled = sample_group(device, &sample_layout, &texture);
 
 		let uniforms = device.create_buffer(&BufferDescriptor {
-			label: Some("cascades"),
-			size: SLOT * u64::try_from(CASCADES).unwrap_or(1),
+			label: Some("shadow views"),
+			size: SLOT * u64::try_from(SLOTS).unwrap_or(1),
 			usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
 			mapped_at_creation: false,
 		});
 
-		let slots = (0..CASCADES)
-			.map(|slice| {
+		let slots = (0..SLOTS)
+			.map(|slot| {
 				device.create_bind_group(&BindGroupDescriptor {
-					label: Some("cascade"),
+					label: Some("shadow view"),
 					layout: &cascade_layout,
 					entries: &[BindGroupEntry {
 						binding: 0,
 						resource: BindingResource::Buffer(BufferBinding {
 							buffer: &uniforms,
-							offset: SLOT * u64::try_from(slice).unwrap_or(0),
+							offset: SLOT * u64::try_from(slot).unwrap_or(0),
 							size: None,
 						}),
 					}],
@@ -617,12 +754,13 @@ impl Maps {
 			joints,
 			material,
 		};
-		let pipelines = [
-			build_pipeline(device, &groups, false, false),
-			build_pipeline(device, &groups, false, true),
-			build_pipeline(device, &groups, true, false),
-			build_pipeline(device, &groups, true, true),
-		];
+		let pipelines = std::array::from_fn(|index| {
+			build_pipeline(device, &groups, Wanted {
+				local: index >= 4,
+				masked: index % 4 >= 2,
+				skinned: index % 2 == 1,
+			})
+		});
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
 			return Err(err!(Graphics("the shadow pipeline: {complaint}")));
@@ -644,27 +782,49 @@ impl Maps {
 	/// The group the scene binds to read every map.
 	pub(crate) const fn bindings(&self) -> &BindGroup { &self.sampled }
 
-	/// The pipeline a cascade's pass runs for one batch.
+	/// The pipeline a shadow pass runs for one batch.
 	///
+	/// @param local - whether this is a lamp's map rather than a cascade
 	/// @param masked - whether the surface's picture has to be sampled before
 	/// its depth is allowed to be written
 	/// @param skinned - whether bones move the geometry
-	pub(crate) fn casting(&self, masked: bool, skinned: bool) -> &RenderPipeline {
-		&self.pipelines[usize::from(masked) * 2 + usize::from(skinned)]
+	pub(crate) fn casting(&self, local: bool, masked: bool, skinned: bool) -> &RenderPipeline {
+		&self.pipelines[usize::from(local) * 4 + usize::from(masked) * 2 + usize::from(skinned)]
 	}
 
 	/// One layer of the atlas, to draw into.
 	pub(crate) fn layer(&self, layer: usize) -> Option<&TextureView> { self.layers.get(layer) }
 
-	/// One cascade's group, holding its matrix.
-	pub(crate) fn slot(&self, slice: usize) -> Option<&BindGroup> { self.slots.get(slice) }
+	/// One map's group, holding the matrix its pass draws through.
+	///
+	/// The cascades take the first [`CASCADES`] and the local tiles the rest,
+	/// in the order [`Slots`] handed them out.
+	pub(crate) fn slot(&self, slot: usize) -> Option<&BindGroup> { self.slots.get(slot) }
 
-	/// Writes this frame's matrices, one per slot.
+	/// Writes this frame's cascade matrices, one per slot.
 	pub(crate) fn upload(&self, queue: &Queue, cascades: &Cascades) {
 		for (slice, matrix) in cascades.matrices.iter().enumerate() {
-			let at = SLOT * u64::try_from(slice).unwrap_or(0);
-			queue.write_buffer(&self.uniforms, at, bytemuck::bytes_of(&matrix.to_cols_array()));
+			self.write(queue, slice, *matrix);
 		}
+	}
+
+	/// Writes one local map's matrix, by its tile.
+	///
+	/// @param queue - what to write through
+	/// @param tile - which local tile, as [`Slots`] handed it out
+	/// @param matrix - world space into that map's clip space
+	pub(crate) fn upload_local(&self, queue: &Queue, tile: usize, matrix: Mat4) {
+		self.write(queue, CASCADES.saturating_add(tile), matrix);
+	}
+
+	/// Writes one matrix into one slot of the uniform.
+	fn write(&self, queue: &Queue, slot: usize, matrix: Mat4) {
+		if slot >= SLOTS {
+			return;
+		}
+
+		let at = SLOT * u64::try_from(slot).unwrap_or(0);
+		queue.write_buffer(&self.uniforms, at, bytemuck::bytes_of(&matrix.to_cols_array()));
 	}
 }
 
@@ -777,6 +937,24 @@ struct Groups<'a> {
 	material: &'a BindGroupLayout,
 }
 
+/// Which of the eight depth pipelines to build.
+///
+/// A struct rather than three flags, for the reason [`Groups`] is one: it is
+/// what the caller varies, and three bools in a row at a call site say nothing
+/// about which is which.
+#[derive(Clone, Copy, Debug)]
+struct Wanted {
+	/// Whether it draws a lamp's map, which is the variant with no bias.
+	local: bool,
+
+	/// Whether the surface's picture has to be sampled before its depth is
+	/// allowed to be written.
+	masked: bool,
+
+	/// Whether bones move the geometry.
+	skinned: bool,
+}
+
 /// Builds one depth pipeline.
 ///
 /// Over the same two vertex buffers the scene draws from: the shader reads the
@@ -785,15 +963,10 @@ struct Groups<'a> {
 ///
 /// @param device - the device to build against
 /// @param groups - the bind group layouts, in group order
-/// @param masked - whether to build the variant that samples the picture and
-/// discards, rather than the one with no fragment stage at all
-/// @param skinned - whether to build the variant that reads bones
-fn build_pipeline(
-	device: &Device,
-	groups: &Groups<'_>,
-	masked: bool,
-	skinned: bool,
-) -> RenderPipeline {
+/// @param wanted - which of the eight
+fn build_pipeline(device: &Device, groups: &Groups<'_>, wanted: Wanted) -> RenderPipeline {
+	let Wanted { local, masked, skinned } = wanted;
+
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
 		label: Some("shadow"),
 		source: ShaderSource::Wgsl(include_str!("shadow.wgsl").into()),
@@ -831,7 +1004,7 @@ fn build_pipeline(
 	};
 
 	device.create_render_pipeline(&RenderPipelineDescriptor {
-		label: Some(label_of(masked, skinned)),
+		label: Some(label_of(wanted)),
 		layout: Some(&pipeline_layout),
 		vertex: VertexState {
 			module: &shader,
@@ -868,10 +1041,19 @@ fn build_pipeline(
 			// against a thirty-two-bit float depth, where the constant term is
 			// scaled by a value nobody can predict; the normal offset in the
 			// scene's shader is the half that does the work.
-			bias: DepthBiasState {
-				constant: 4,
-				slope_scale: 2.5,
-				clamp: 0.0,
+			//
+			// **And a local map takes none of it**, for that same sentence
+			// read the other way: what nobody can predict, no second answer
+			// can check. A lamp's map leans on the normal offset alone, which
+			// is arithmetic anybody can repeat.
+			bias: if local {
+				DepthBiasState::default()
+			} else {
+				DepthBiasState {
+					constant: 4,
+					slope_scale: 2.5,
+					clamp: 0.0,
+				}
 			},
 		}),
 		multisample: MultisampleState::default(),
@@ -889,21 +1071,134 @@ fn build_pipeline(
 	})
 }
 
-/// What one of the four is called in a graphics debugger.
-const fn label_of(masked: bool, skinned: bool) -> &'static str {
-	match (masked, skinned) {
-		| (false, false) => "shadow",
-		| (false, true) => "shadow skinned",
-		| (true, false) => "shadow masked",
-		| (true, true) => "shadow masked skinned",
+/// What one of the eight is called in a graphics debugger.
+const fn label_of(wanted: Wanted) -> &'static str {
+	match (wanted.local, wanted.masked, wanted.skinned) {
+		| (false, false, false) => "shadow",
+		| (false, false, true) => "shadow skinned",
+		| (false, true, false) => "shadow masked",
+		| (false, true, true) => "shadow masked skinned",
+		| (true, false, false) => "lamp shadow",
+		| (true, false, true) => "lamp shadow skinned",
+		| (true, true, false) => "lamp shadow masked",
+		| (true, true, true) => "lamp shadow masked skinned",
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use colby_core::glam::Vec4Swizzles;
+	use colby_core::{
+		abi::{
+			Light, MeshId, Post, Renderable, Sky, ToneMap, Transform, Value, World,
+			material::{Blend, Material},
+		},
+		glam::{Quat, Vec4Swizzles},
+	};
 
 	use super::*;
+	use crate::{
+		Capture, Image,
+		capture::rgb,
+		scene::{LAMPS, MSAA},
+	};
+
+	/// How big every picture here is.
+	const PICTURE: (u32, u32) = (240, 180);
+
+	/// A capture on the binary's one device, or `None` with no GPU.
+	fn capture() -> Option<Capture> {
+		let gpu = crate::gpu::shared()?;
+
+		match Capture::new(gpu, PICTURE.0, PICTURE.1) {
+			| Ok(capture) => Some(capture),
+			| Err(error) => panic!("building the capture failed: {error}"),
+		}
+	}
+
+	/// A shut room with one lamp in it, looked at from inside.
+	///
+	/// The sun travels straight *up*, so every surface the camera can see has
+	/// the sun's whole term multiplied by nought and the lamp is the only
+	/// thing lighting the picture. No curve and no eye, for the reason every
+	/// pixel test here has: what is measured is a difference between two
+	/// pictures, and an eye that adapted to one of them would move all of it.
+	fn room() -> World {
+		let mut world = World::new();
+
+		world.post = Post {
+			tonemap: ToneMap::None,
+			auto_exposure: false,
+			exposure: 1.0,
+			..Post::DEFAULT
+		};
+		world.ambient = Vec3::splat(0.02);
+		world.sky = Sky::NONE;
+		world.clear = Vec3::ZERO;
+		world.aspect = f32::from(u16::try_from(PICTURE.0).unwrap_or(u16::MAX))
+			/ f32::from(u16::try_from(PICTURE.1).unwrap_or(u16::MAX));
+		// high enough that the near floor - which is where a shadow thrown
+		// towards the camera lands - fills the bottom of the frame
+		world.camera.position = Vec3::new(0.0, 4.0, 6.0);
+		world.camera.target = Vec3::new(0.0, 0.0, -2.0);
+		// traveling up, so nothing the camera sees is lit by it
+		world.light = Vec3::Y;
+		world.cvars.var(MSAA, Value::Float(1.0), "");
+		world.cvars.var(LAMPS, Value::Float(32.0), "");
+		world
+			.cvars
+			.var(LOCAL_LAMPS, Value::Float(DEFAULT_LOCAL_LAMPS), "");
+
+		// the floor
+		block(&mut world, Vec3::new(0.0, -0.5, 0.0), Vec3::new(24.0, 1.0, 24.0));
+		// the back of the room, which the lamp lights and the pillar shades
+		block(&mut world, Vec3::new(0.0, 3.0, -7.0), Vec3::new(24.0, 6.0, 1.0));
+
+		world
+	}
+
+	/// A grey box in a world.
+	fn block(world: &mut World, position: Vec3, scale: Vec3) -> colby_core::abi::EntityId {
+		let id = world.entities.spawn_at(Transform {
+			position,
+			rotation: Quat::IDENTITY,
+			scale,
+		});
+
+		world
+			.entities
+			.set_renderable(id, Renderable::new(MeshId::CUBE, rgb(0.6, 0.6, 0.6)));
+
+		id
+	}
+
+	/// A lamp standing somewhere, throwing a shadow or not.
+	fn lamp(world: &mut World, position: Vec3, light: Light) -> colby_core::abi::EntityId {
+		let id = world.entities.spawn_at(Transform {
+			position,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::ONE,
+		});
+
+		world.entities.set_light(id, light);
+
+		id
+	}
+
+	/// A point lamp of the brightness these tests use, throwing a shadow.
+	fn bright() -> Light { Light::point(Vec3::ONE, 12.0, 14.0) }
+
+	/// The same lamp told not to throw one.
+	fn quiet() -> Light { Light { shadow: false, ..bright() } }
+
+	/// How bright one pixel of a picture is, in the red channel.
+	fn level(picture: &Image, column: u32, row: u32) -> i32 {
+		i32::from(picture.pixel(column, row)[0])
+	}
+
+	/// The picture a world draws.
+	fn shot(capture: &mut Capture, world: &mut World) -> Image {
+		capture.shoot(world).expect("the capture renders")
+	}
 
 	/// A camera a test can reason about: at the origin, looking down `-z`.
 	fn camera() -> Camera {
@@ -1038,6 +1333,367 @@ mod tests {
 		let mut over = Slots::with_room(LOCAL_TILES + 100);
 		assert_eq!(over.take(LOCAL_TILES), Some(0), "a ceiling past the atlas is the atlas");
 		assert_eq!(over.take(1), None, "and it stops there");
+	}
+
+	#[test]
+	fn the_six_faces_of_a_point_cover_every_direction_once() {
+		let (at, reach) = (Vec3::new(1.0, 2.0, -3.0), 10.0);
+		let views = faces(at, reach);
+		let mut used = [0_u32; 6];
+
+		// a spiral rather than a grid, so no sample lands on an axis where two
+		// faces are equally good and the pick is a tie
+		for step in 0..600 {
+			let turn = f32::from(u16::try_from(step).expect("six hundred"));
+			let around = turn * 2.399_963_2;
+			let up = 1.0 - (turn + 0.5) / 300.0;
+			let radius = (1.0 - up * up).max(0.0).sqrt();
+			let way = Vec3::new(radius * around.cos(), up, radius * around.sin());
+			let point = at + way * (reach * 0.5);
+
+			// the shader's rule, written out again
+			let size = way.abs();
+			let face = if size.x >= size.y && size.x >= size.z {
+				usize::from(way.x <= 0.0)
+			} else if size.y >= size.z {
+				2 + usize::from(way.y <= 0.0)
+			} else {
+				4 + usize::from(way.z <= 0.0)
+			};
+
+			let clip = views[face] * point.extend(1.0);
+			let ndc = clip.xyz() / clip.w;
+
+			assert!(clip.w > 0.0, "{way} is behind the face the rule picked");
+			assert!(
+				ndc.truncate().abs().max_element() <= 1.0 + 1.0e-4,
+				"{way} falls outside face {face} at {ndc}"
+			);
+			assert!((0.0..=1.0).contains(&ndc.z), "and outside its depth range at {}", ndc.z);
+			used[face] += 1;
+		}
+
+		assert!(used.iter().all(|count| *count > 50), "some face was never used: {used:?}");
+	}
+
+	#[test]
+	fn a_cone_holds_what_it_lights_and_is_held_back_when_it_opens_too_wide() {
+		let (at, reach, outer) = (Vec3::new(0.0, 4.0, 0.0), 12.0, 0.6_f32);
+		let view = cone(at, Vec3::NEG_Y, reach, outer);
+
+		// the edge of the cone lands on the edge of the map, which is what
+		// makes the map exactly as wide as the light and no wider
+		let edge = at + Vec3::new(outer.tan() * 5.0, -5.0, 0.0);
+		let clip = view * edge.extend(1.0);
+		let ndc = clip.xyz() / clip.w;
+
+		assert!((ndc.x.abs() - 1.0).abs() < 1.0e-3, "the cone's edge is at {}", ndc.x);
+
+		let inside = at + Vec3::new(outer.tan() * 2.5, -5.0, 0.0);
+		let clip = view * inside.extend(1.0);
+
+		assert!(
+			(clip.xyz() / clip.w)
+				.truncate()
+				.abs()
+				.max_element()
+				< 1.0,
+			"and everything the cone lights is inside it"
+		);
+
+		// a cone may open to nearly a hemisphere and a projection may not
+		assert!(
+			(cone_fov(1.55) - CONE_CEILING).abs() < 1.0e-6,
+			"a cone past the ceiling is drawn at the ceiling"
+		);
+		assert!((cone_fov(0.4) - 0.8).abs() < 1.0e-6, "and a narrow one at twice its own edge");
+	}
+
+	#[test]
+	fn a_local_map_starts_a_hundredth_of_the_way_in_and_ends_at_the_reach() {
+		for reach in [0.5_f32, 4.0, 16.0, 200.0] {
+			let view = cone(Vec3::ZERO, Vec3::NEG_Z, reach, 0.5);
+			let near = (reach * LOCAL_NEAR).clamp(0.01, reach * 0.5);
+
+			let at_near = view * Vec3::new(0.0, 0.0, -near).extend(1.0);
+			let at_far = view * Vec3::new(0.0, 0.0, -reach).extend(1.0);
+
+			assert!(
+				(at_near.z / at_near.w).abs() < 1.0e-4,
+				"a reach of {reach} does not start at nought"
+			);
+			assert!((at_far.z / at_far.w - 1.0).abs() < 1.0e-4, "and does not end at one");
+		}
+	}
+
+	#[test]
+	fn the_offset_a_sample_is_pushed_by_is_a_texel_of_its_own_map() {
+		// two units of world for every unit of distance across a right angle,
+		// divided by the map's side - so a point ten away sits in a texel this
+		// wide, and the shader pushes by two to four of them.
+		let spread = point_spread();
+
+		assert!(spread.mul_add(10.0, -(20.0 / LOCAL_F)).abs() < 1.0e-7, "a face's texel is not");
+		assert!(cone_spread(0.5) < spread, "a cone narrower than a right angle has a finer one");
+		assert!(cone_spread(1.2) > spread, "and a wider one a coarser");
+	}
+
+	#[test]
+	fn the_atlas_runs_out_and_a_cone_behind_a_point_still_gets_a_tile() {
+		// six tiles a point and one a cone, sixteen in all: two points fill
+		// twelve, a third does not fit, and the rule is that the walk carries
+		// on rather than stopping - so what is behind it is still drawn.
+		let mut slots = Slots::with_room(LOCAL_TILES);
+		let given: Vec<Option<usize>> = [6, 6, 6, 1, 1, 1, 1, 1]
+			.into_iter()
+			.map(|wanted| slots.take(wanted))
+			.collect();
+
+		assert_eq!(
+			given,
+			vec![Some(0), Some(6), None, Some(12), Some(13), Some(14), Some(15), None],
+			"two points, then whatever fits behind them"
+		);
+	}
+
+	#[test]
+	fn a_lamp_behind_a_wall_does_not_light_what_the_wall_hides() {
+		// the whole card in one measurement: two places on the floor the same
+		// distance from the lamp, one of them with a pillar in the way. Told
+		// not to cast, they are lit alike; told to, they are not.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room();
+
+		// the lamp behind the pillar, so what it hides is the near floor and
+		// the near floor is the bottom of the picture
+		block(&mut world, Vec3::new(0.0, 1.0, -1.0), Vec3::new(1.2, 2.0, 0.6));
+		let id = lamp(&mut world, Vec3::new(0.0, 2.4, -4.0), quiet());
+
+		let (shaded, beside) = (PICTURE.0 / 2, PICTURE.0 / 8);
+		let row = PICTURE.1 * 3 / 4;
+
+		let plain = shot(&mut capture, &mut world);
+		let (was_shaded, was_beside) = (level(&plain, shaded, row), level(&plain, beside, row));
+
+		world.entities.set_light(id, bright());
+
+		let cast = shot(&mut capture, &mut world);
+		let (now_shaded, now_beside) = (level(&cast, shaded, row), level(&cast, beside, row));
+
+		assert!(
+			now_shaded < was_shaded - 20,
+			"what the pillar hides goes dark: {was_shaded} to {now_shaded}"
+		);
+		assert!(
+			(now_beside - was_beside).abs() <= 1,
+			"and what it does not hide is left alone: {was_beside} to {now_beside}"
+		);
+	}
+
+	#[test]
+	fn a_lamp_told_not_to_cast_draws_what_the_console_drew_with_no_atlas() {
+		// two ways of saying no, and they have to be the same picture: the
+		// field on the light, and the ceiling on how many tiles a frame may
+		// hand out. The second is what a screenshot from the build before this
+		// card is compared against.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room();
+
+		block(&mut world, Vec3::new(0.0, 1.0, -1.0), Vec3::new(1.2, 2.0, 0.6));
+		let id = lamp(&mut world, Vec3::new(0.0, 2.4, -4.0), quiet());
+
+		let by_field = shot(&mut capture, &mut world);
+
+		world.entities.set_light(id, bright());
+		world.cvars.set(LOCAL_LAMPS, "0");
+
+		let by_console = shot(&mut capture, &mut world);
+
+		assert!(
+			by_field.pixels == by_console.pixels,
+			"a light that will not cast and an atlas with no room are one picture"
+		);
+
+		world.cvars.set(LOCAL_LAMPS, "16");
+		let casting = shot(&mut capture, &mut world);
+
+		assert!(by_field.pixels != casting.pixels, "and giving it room is a different one");
+	}
+
+	#[test]
+	fn a_cone_casts_from_the_one_face_it_has() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room();
+
+		block(&mut world, Vec3::new(0.0, 1.0, -1.0), Vec3::new(1.2, 2.0, 0.6));
+
+		// where the point lamp stood, pointing back at the camera and down, so
+		// the pillar stands between it and the near floor
+		let at = Vec3::new(0.0, 2.8, -4.0);
+		let id = world.entities.spawn_at(Transform {
+			position: at,
+			rotation: Quat::from_rotation_arc(Vec3::NEG_Z, Vec3::new(0.0, -0.3, 1.0).normalize()),
+			scale: Vec3::ONE,
+		});
+		let shape = Light::spot(Vec3::ONE, 60.0, 16.0, 0.15, 0.7);
+		world
+			.entities
+			.set_light(id, Light { shadow: false, ..shape });
+
+		let plain = shot(&mut capture, &mut world);
+
+		world.entities.set_light(id, shape);
+
+		let cast = shot(&mut capture, &mut world);
+
+		assert!(plain.pixels != cast.pixels, "a cone that casts draws a different picture");
+
+		let (middle, row) = (PICTURE.0 / 2, PICTURE.1 * 3 / 4);
+
+		assert!(
+			level(&cast, middle, row) < level(&plain, middle, row) - 10,
+			"and what the pillar hides from it is darker"
+		);
+	}
+
+	#[test]
+	fn a_hidden_lamp_and_a_blended_caster_are_both_left_out() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room();
+
+		let pillar = block(&mut world, Vec3::new(0.0, 1.0, -1.0), Vec3::new(1.2, 2.0, 0.6));
+		let id = lamp(&mut world, Vec3::new(0.0, 2.4, -4.0), bright());
+
+		let casting = shot(&mut capture, &mut world);
+
+		world.entities.set_hidden(id, true);
+
+		assert!(
+			shot(&mut capture, &mut world).pixels != casting.pixels,
+			"a hidden lamp lights nothing at all"
+		);
+
+		world.entities.set_hidden(id, false);
+		// a surface what is behind shows through writes no depth, so it says
+		// nothing about what a light can reach - the same rule the cascades
+		// have, and it is which list `consider` filed it in rather than a test
+		// of its own
+		let glass = world.materials.insert("test/glass", Material {
+			blend: Blend::Alpha,
+			opacity: 0.5,
+			..Material::DEFAULT
+		});
+		world
+			.entities
+			.set_renderable(pillar, Renderable::of(MeshId::CUBE, glass, rgb(0.6, 0.6, 0.6)));
+
+		// **one pixel rather than the whole picture**, because a glass pillar
+		// changes every pixel it covers whether or not it casts. The place
+		// read is the floor the pillar hid a moment ago: with the pillar solid
+		// it is dark, and with it glass it has to read the same as it does
+		// with the atlas taken away altogether.
+		let (probe, row) = (PICTURE.0 / 2, PICTURE.1 * 3 / 4);
+		let through = shot(&mut capture, &mut world);
+
+		world.cvars.set(LOCAL_LAMPS, "0");
+		let nothing = shot(&mut capture, &mut world);
+
+		assert!(
+			level(&casting, probe, row) < level(&through, probe, row) - 20,
+			"a solid pillar throws a shadow there"
+		);
+		assert!(
+			(level(&through, probe, row) - level(&nothing, probe, row)).abs() <= 1,
+			"and a glass one throws none: {} against {}",
+			level(&through, probe, row),
+			level(&nothing, probe, row)
+		);
+	}
+
+	#[test]
+	fn a_lamp_shadows_sideways_as_well_as_ahead() {
+		// **the test that says the shader picks the right face of the six.**
+		// Everything else here is shadowed through the face pointing away from
+		// the camera, so a shader that read the same face whichever way a
+		// point lay would pass all of it. These two places lie to either side
+		// of the lamp, the same distance out, one of them behind a pillar -
+		// and the face each reads is the one pointing its own way.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room();
+
+		let at = Vec3::new(0.0, 2.4, -4.0);
+		block(&mut world, at + Vec3::new(2.0, -1.4, 0.0), Vec3::new(1.2, 2.0, 0.6));
+		let id = lamp(&mut world, at, quiet());
+
+		// where the floor four units back and three and a half out lands, out
+		// of the same projection the camera has. The right-hand one is behind
+		// the pillar and the left-hand one is not.
+		let (blocked, clear, row) = (173, 66, 76);
+
+		let plain = shot(&mut capture, &mut world);
+		let (was_blocked, was_clear) = (level(&plain, blocked, row), level(&plain, clear, row));
+
+		assert!(
+			(was_blocked - was_clear).abs() < 6,
+			"the two sides are lit alike before anything casts: {was_blocked} and {was_clear}"
+		);
+
+		world.entities.set_light(id, bright());
+
+		let cast = shot(&mut capture, &mut world);
+		let (now_blocked, now_clear) = (level(&cast, blocked, row), level(&cast, clear, row));
+
+		assert!(
+			now_blocked < was_blocked - 20,
+			"the side with the pillar goes dark: {was_blocked} to {now_blocked}"
+		);
+		assert!(
+			(now_clear - was_clear).abs() <= 1,
+			"and the side without it does not: {was_clear} to {now_clear}"
+		);
+	}
+
+	#[test]
+	fn the_lamps_cost_one_pass_however_many_of_them_there_are() {
+		// the whole point of an atlas: sixteen maps in one layer, and a layer
+		// is a pass. A map each would have been sixteen.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room();
+
+		block(&mut world, Vec3::new(0.0, 1.0, -1.0), Vec3::new(1.2, 2.0, 0.6));
+
+		let mut frame = |world: &mut World| {
+			capture.draw(world, &mut []);
+
+			capture.scene_mut().spans().passes()
+		};
+
+		let none = frame(&mut world);
+		let first = lamp(&mut world, Vec3::new(0.0, 2.4, -4.0), bright());
+		let casting = frame(&mut world);
+
+		assert_eq!(casting, none + 1, "every lamp's map is one pass over one layer");
+
+		let second = lamp(&mut world, Vec3::new(-2.0, 2.4, -3.0), bright());
+
+		assert_eq!(frame(&mut world), casting, "and a second lamp is still that one pass");
+
+		world.entities.set_light(first, quiet());
+		world.entities.set_light(second, quiet());
+
+		assert_eq!(frame(&mut world), none, "and no lamp asking is no pass at all");
 	}
 
 	#[test]
