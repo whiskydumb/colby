@@ -417,10 +417,21 @@ pub struct Setting {
 	/// How quickly it fades, per unit of distance.
 	pub fog_density: f32,
 
-	/// Spare, and the reason this record has no padding in it: the eight-byte
-	/// `steps` at the top makes the record eight-aligned, so its length has to
-	/// be a multiple of eight and the fields before this add up to four short.
-	pub reserved: u32,
+	/// How much light the air catches around the sun.
+	///
+	/// **This field took the record's spare word and did not move
+	/// [`FORMAT_VERSION`], which is the second kind of field that does not have
+	/// to.** The first is a bit in a word that already exists, @ref
+	/// [`BULK_WEIGHTLESS`]; this is the word itself. The spare was there
+	/// because the eight-byte `steps` at the top makes the record
+	/// eight-aligned, so its length has to be a multiple of eight and the
+	/// fields before it add up to four short - and a file written before this
+	/// word meant anything holds nought there, which reads as the world with
+	/// no shafts in it. So an asset compiled by the previous build is still
+	/// correct and is not rebuilt, and a save taken by it still loads.
+	///
+	/// The next field to arrive pays for two: itself and a new spare.
+	pub shafts: f32,
 }
 
 // a record with padding in it is not `Pod`, so this would already have failed
@@ -1436,7 +1447,7 @@ const EMPTY_SETTING: Setting = Setting {
 	bloom_threshold: 1.0,
 	fog: [0.0; 3],
 	fog_density: 0.0,
-	reserved: 0,
+	shafts: 0.0,
 };
 
 /// Writes a world out as a `.cscene`.
@@ -1925,7 +1936,7 @@ fn setting_of(stage: Stage) -> Setting {
 		bloom_threshold: stage.post.bloom_threshold,
 		fog: stage.post.fog.to_array(),
 		fog_density: stage.post.fog_density,
-		reserved: 0,
+		shafts: stage.post.shafts,
 	}
 }
 
@@ -1964,6 +1975,7 @@ fn stage_of(setting: Setting) -> Stage {
 			bloom_threshold: setting.bloom_threshold,
 			fog: Vec3::from_array(setting.fog),
 			fog_density: setting.fog_density,
+			shafts: setting.shafts,
 		},
 		light: Vec3::from_array(setting.light),
 		ambient: Vec3::from_array(setting.ambient),
@@ -2739,6 +2751,7 @@ mod tests {
 					bloom_threshold: 1.6,
 					fog: Vec3::new(0.31, 0.42, 0.53),
 					fog_density: 0.02,
+					shafts: 0.7,
 				},
 				light: Vec3::new(-0.4, -1.0, -0.3),
 				ambient: Vec3::splat(0.25),
@@ -3063,6 +3076,37 @@ mod tests {
 		assert_eq!(
 			read.stage.sky.zenith, data.stage.sky.zenith,
 			"and the colors beside it are still read"
+		);
+	}
+
+	#[test]
+	fn a_settings_record_whose_last_word_is_spare_reads_as_a_world_with_no_shafts() {
+		// the whole of why that field cost no [`FORMAT_VERSION`]: a build that
+		// did not know the word wrote nought into it, and nought there is the
+		// world nobody asked for shafts in. Everything before it is at the
+		// offset it always was, which is the other half of the claim.
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let at = usize::try_from(header.setting_offset).expect("it is an offset")
+			+ offset_of!(Setting, shafts);
+
+		assert!(data.stage.post.shafts > 0.0, "the sample asks for some, so a zero means this");
+
+		bytes[at..at + 4].copy_from_slice(&0_u32.to_le_bytes());
+
+		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a spare word is not a broken file")
+			.to_scene_data();
+
+		assert!(
+			read.stage.post.shafts.abs() < f32::EPSILON,
+			"a spare word is no shafts, not a smear of {}",
+			read.stage.post.shafts
+		);
+		assert!(
+			(read.stage.post.fog_density - data.stage.post.fog_density).abs() < 1.0e-9,
+			"and the field before it is still where it was"
 		);
 	}
 

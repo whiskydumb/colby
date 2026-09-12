@@ -171,6 +171,26 @@ pub struct Post {
 	/// what is near untouched and closes over the far distance rather than
 	/// greying everything evenly.
 	pub fog_density: f32,
+
+	/// How much light the air catches around the sun.
+	///
+	/// Zero is none, and no work either: the passes are skipped rather than
+	/// run and multiplied by nothing, the way [`bloom`](Self::bloom) is. The
+	/// light it smears is whatever the picture holds past the middle of the
+	/// view - the sky, in a world that has one - so it needs no color of its
+	/// own.
+	///
+	/// **One number, and the rest are constants.** The shape of the smear has
+	/// four more: how far along the way to the sun it reaches, how much each
+	/// tap adds, how fast a tap fades with distance, and how wide of the sun
+	/// anything happens at all. Every one of them is a look rather than a
+	/// choice a world makes, and the field ships them fixed; the one engine
+	/// here that has this effect and a knob for it exposes exactly this
+	/// number.
+	///
+	/// Off in a fresh world, which is where both engines that have it start.
+	/// @ref [`colby_engine`] for the passes.
+	pub shafts: f32,
 }
 
 impl Post {
@@ -195,6 +215,7 @@ impl Post {
 		bloom_threshold: 1.0,
 		fog: Vec3::new(0.55, 0.60, 0.68),
 		fog_density: 0.0,
+		shafts: 0.0,
 	};
 	/// Its fields, for an inspector, a reader and a writer. @ref
 	/// [`field`](super::field).
@@ -223,6 +244,7 @@ impl Post {
 		),
 		field!(Color, "fog", fog, "the color a distant surface fades towards"),
 		field!(Float, "fog_density", fog_density, "how quickly it fades, per unit of distance"),
+		field!(Float, "shafts", shafts, "how much light the air catches around the sun"),
 	];
 
 	/// The exposure a measured average asks for, before the clamp.
@@ -260,6 +282,10 @@ impl Post {
 	/// Whether distance takes anything away from a surface.
 	#[must_use]
 	pub fn is_foggy(self) -> bool { self.fog_density > 0.0 }
+
+	/// Whether the air catches anything around the sun.
+	#[must_use]
+	pub fn is_shafting(self) -> bool { self.shafts > 0.0 }
 }
 
 impl Default for Post {
@@ -291,10 +317,29 @@ mod tests {
 	}
 
 	#[test]
-	fn a_world_starts_with_a_curve_and_without_bloom_or_fog() {
+	fn a_world_starts_with_a_curve_and_without_bloom_fog_or_shafts() {
 		assert!(Post::DEFAULT.auto_exposure, "the eye adapts");
 		assert!(!Post::DEFAULT.is_blooming(), "nothing is added back");
-		assert!(!Post::DEFAULT.is_foggy(), "and distance takes nothing away");
+		assert!(!Post::DEFAULT.is_foggy(), "distance takes nothing away");
+		assert!(!Post::DEFAULT.is_shafting(), "and the air catches nothing");
+	}
+
+	#[test]
+	fn the_air_catches_light_only_at_a_strength_above_nothing() {
+		// what decides whether three passes are recorded at all, so a number
+		// somebody typed backwards has to read as off rather than as a smear
+		// multiplied by a negative
+		for asked in [0.0, -0.0, -1.0, f32::NEG_INFINITY] {
+			assert!(
+				!Post { shafts: asked, ..Post::DEFAULT }.is_shafting(),
+				"a strength of {asked} is no shafts"
+			);
+		}
+
+		assert!(
+			Post { shafts: 1.0e-6, ..Post::DEFAULT }.is_shafting(),
+			"and anything above nothing is some"
+		);
 	}
 
 	#[test]
