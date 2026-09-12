@@ -59,6 +59,7 @@ use crate::{
 	post,
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, Maps},
+	shaft::{self, Asking, Shaft},
 	skin::Joints,
 	sparks::Sparks,
 	timing::{Ends, Pass, Timings, Work},
@@ -646,6 +647,11 @@ pub struct Scene {
 	/// is turned back into a distance with. Read in [`Scene::upload`], for the
 	/// reason [`sky`](Self::sky) is. @ref [`depth::VIEW`].
 	seeing: Option<(f32, [f32; 2])>,
+	/// The three passes that smear the sky around the sun. @ref [`shaft`].
+	shaft: Shaft,
+	/// What those passes are asked for this frame, or nothing. Read in
+	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
+	shafting: Option<Asking>,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
 	/// This frame's light matrices, fitted in `upload` and drawn in `render`.
@@ -783,6 +789,7 @@ impl Scene {
 		let lines = Lines::new(&device, post::HDR_FORMAT, &globals_layout, post::NO_SAMPLES)?;
 		let sparks = Sparks::new(&device, post::HDR_FORMAT, post::NO_SAMPLES);
 		let post = post::Chain::new(&device, format, width, height)?;
+		let shaft = Shaft::new(&device, width, height)?;
 
 		let instances = device.create_buffer(&BufferDescriptor {
 			label: Some("placements"),
@@ -807,6 +814,8 @@ impl Scene {
 			size: (width, height),
 			depth,
 			seeing: None,
+			shaft,
+			shafting: None,
 			shadows,
 			cascades: Cascades::NONE,
 			shadowing: false,
@@ -847,6 +856,7 @@ impl Scene {
 		self.size = (width, height);
 		self.depth.resize(&self.device, width, height);
 		self.post.resize(&self.device, width, height);
+		self.shaft.resize(width, height);
 	}
 
 	/// Rebuilds everything that has to agree about how many samples a pixel is.
@@ -1133,11 +1143,25 @@ impl Scene {
 		target: &TextureView,
 	) {
 		// between the scene that wrote the depth and everything after it that
-		// reads it, and only in a frame something does
+		// reads it, and only in a frame something does. **Anything**: the view
+		// that draws the depth was the first reader and the smear around the
+		// sun is the second, so the question is whether one of them asked
+		// rather than whether that one did.
 		self.depth.make_readable(
 			&self.device,
 			&mut encoder,
-			self.seeing.is_some(),
+			self.seeing.is_some() || self.shafting.is_some(),
+			&self.timings,
+		);
+
+		// before the eye is measured and before the bloom is gathered, so
+		// that light the air caught is part of the picture both of them read
+		self.shaft.render(
+			&mut encoder,
+			&self.queue,
+			self.shafting,
+			self.post.picture(),
+			&self.depth,
 			&self.timings,
 		);
 
@@ -1156,10 +1180,9 @@ impl Scene {
 			&self.timings,
 		);
 
-		// last of all, and into this frame's own encoder: the twelve
-		// timestamps are copied out of the query set where the passes that
-		// wrote them can still be told apart. Nothing at all when nobody is
-		// measuring.
+		// last of all, and into this frame's own encoder: the timestamps are
+		// copied out of the query set where the passes that wrote them can
+		// still be told apart. Nothing at all when nobody is measuring.
 		self.timings.resolve(&mut encoder);
 		self.timings.close(Work::Record);
 		self.queue.submit([encoder.finish()]);
@@ -1591,6 +1614,7 @@ impl Scene {
 		let (decals, painted) = self.decals(world, &sight);
 		self.sky = world.sky.is_drawn();
 		self.seeing = seeing_of(world, &camera);
+		self.shafting = shaft::asking_of(world, &camera);
 
 		self.queue.write_buffer(
 			&self.globals,

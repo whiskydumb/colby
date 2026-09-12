@@ -77,6 +77,16 @@ pub(crate) struct Depth {
 	/// What [`multi`](Self::multi) is laid out as.
 	layout: BindGroupLayout,
 
+	/// Which rebuild of [`readable`](Self::readable)'s view this is.
+	///
+	/// A pass after the scene that reads the depth every frame wants its bind
+	/// group kept rather than made, and a bind group may only be kept as long
+	/// as the view in it is the one that exists. This is what a reader keeps
+	/// beside its group and compares: the number moves whenever the buffer is
+	/// rebuilt for a size or a sample count, and whenever the resolved one is
+	/// made or let go. It never comes back to a value it has had.
+	epoch: u64,
+
 	/// The pass that fills [`single`](Self::single).
 	resolve: RenderPipeline,
 }
@@ -107,6 +117,7 @@ impl Depth {
 			multi,
 			single: None,
 			layout,
+			epoch: 0,
 			resolve,
 		})
 	}
@@ -134,6 +145,7 @@ impl Depth {
 		self.buffer = buffer(device, samples, size.0, size.1);
 		self.multi = read_multi(device, &self.layout, samples, &self.buffer);
 		self.single = None;
+		self.epoch = self.epoch.wrapping_add(1);
 	}
 
 	/// What the scene's pass writes and tests against.
@@ -158,13 +170,16 @@ impl Depth {
 		timings: &Timings,
 	) {
 		if !asked {
-			self.single = None;
+			if self.single.take().is_some() {
+				self.epoch = self.epoch.wrapping_add(1);
+			}
 
 			return;
 		}
 
 		if self.multi.is_some() && self.single.is_none() {
 			self.single = Some(one_sample(device, self.size));
+			self.epoch = self.epoch.wrapping_add(1);
 		}
 
 		let (Some(multi), Some(single)) = (self.multi.as_ref(), self.single.as_ref()) else {
@@ -193,6 +208,14 @@ impl Depth {
 		pass.set_bind_group(0, multi, &[]);
 		pass.draw(0..3, 0..1);
 	}
+
+	/// Which rebuild of [`readable`](Self::readable)'s view this is.
+	///
+	/// A reader that runs every frame keeps this beside the bind group it made
+	/// and rebuilds the group when the two disagree, which is the whole of how
+	/// a group is kept safely: the view inside one has to be the view that
+	/// exists. The field it returns says when it moves.
+	pub(crate) const fn epoch(&self) -> u64 { self.epoch }
 
 	/// What a reader binds this frame: one sample a pixel, whatever the scene
 	/// drew with.

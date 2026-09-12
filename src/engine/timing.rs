@@ -93,6 +93,12 @@ pub enum Pass {
 	/// The eye's ladder and the one texel it settles into: nine passes.
 	Meter,
 
+	/// The light the air catches around the sun: a mask and a smear at a
+	/// quarter of the picture, and one pass putting the smear back over it.
+	/// None at all while a world asks for no shafts or the sun is behind the
+	/// camera. @ref [`shaft`](crate::shaft).
+	Shaft,
+
 	/// The bloom chain, down and back up: eleven passes at a window's size,
 	/// and none at all in a frame that does not bloom.
 	Glow,
@@ -105,8 +111,15 @@ pub enum Pass {
 
 impl Pass {
 	/// Every span, in the order a frame runs them.
-	pub const ALL: [Self; 6] =
-		[Self::Shadow, Self::Scene, Self::Depth, Self::Meter, Self::Glow, Self::Composite];
+	pub const ALL: [Self; 7] = [
+		Self::Shadow,
+		Self::Scene,
+		Self::Depth,
+		Self::Shaft,
+		Self::Meter,
+		Self::Glow,
+		Self::Composite,
+	];
 
 	/// The word for it in a report.
 	#[must_use]
@@ -115,6 +128,7 @@ impl Pass {
 			| Self::Shadow => "shadow",
 			| Self::Scene => "scene",
 			| Self::Depth => "depth",
+			| Self::Shaft => "shaft",
 			| Self::Meter => "meter",
 			| Self::Glow => "glow",
 			| Self::Composite => "composite",
@@ -127,9 +141,10 @@ impl Pass {
 			| Self::Shadow => 0,
 			| Self::Scene => 1,
 			| Self::Depth => 2,
-			| Self::Meter => 3,
-			| Self::Glow => 4,
-			| Self::Composite => 5,
+			| Self::Shaft => 3,
+			| Self::Meter => 4,
+			| Self::Glow => 5,
+			| Self::Composite => 6,
 		}
 	}
 
@@ -144,9 +159,10 @@ impl Pass {
 			| Self::Shadow => 0,
 			| Self::Scene => 2,
 			| Self::Depth => 4,
-			| Self::Meter => 6,
-			| Self::Glow => 8,
-			| Self::Composite => 10,
+			| Self::Shaft => 6,
+			| Self::Meter => 8,
+			| Self::Glow => 10,
+			| Self::Composite => 12,
 		}
 	}
 }
@@ -222,7 +238,7 @@ pub(crate) enum Ends {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
 	/// What the hardware spent, per [`Pass`], in its `slot` order.
-	passes: [Option<Duration>; 6],
+	passes: [Option<Duration>; 7],
 
 	/// What this thread spent, per [`Work`], in its `slot` order.
 	work: [Option<Duration>; 2],
@@ -283,8 +299,8 @@ fn unpack(view: &[u8]) -> [u64; Timings::TICKS] {
 /// it got before this module existed.
 #[derive(Debug)]
 pub struct Timings {
-	/// The twelve slots, two per [`Pass`], or `None` while nobody is measuring
-	/// and on an adapter that cannot.
+	/// Two slots per [`Pass`], or `None` while nobody is measuring and on an
+	/// adapter that cannot.
 	set: Option<QuerySet>,
 
 	/// Where `resolve_query_set` writes, and what is copied out of.
@@ -349,9 +365,9 @@ pub struct Timings {
 
 impl Timings {
 	/// How many timestamps the set holds: two per span.
-	const QUERIES: u32 = 12;
+	const QUERIES: u32 = 14;
 	/// The same number where a length is wanted. @ref [`Pass::query`].
-	const TICKS: usize = 12;
+	const TICKS: usize = 14;
 
 	/// An apparatus that measures nothing.
 	///
@@ -680,7 +696,7 @@ impl Timings {
 		// read into a table of its own and then written over the frame in one
 		// go: `span` reads the mask off `self` and the frame is a field of
 		// the same `self`, so the two cannot be borrowed at once.
-		let mut spans = [None; 6];
+		let mut spans = [None; 7];
 
 		for pass in Pass::ALL {
 			if let Some(held) = spans.get_mut(pass.slot()) {
@@ -693,7 +709,7 @@ impl Timings {
 		self.last
 	}
 
-	/// Waits for the queue and maps the twelve numbers out of the read buffer.
+	/// Waits for the queue and maps the set's numbers out of the read buffer.
 	///
 	/// Split off the caller so that the borrow of the buffer ends before the
 	/// frame is written into: they are two fields of one struct, and one is
@@ -863,7 +879,7 @@ mod tests {
 			"the set holds a beginning and an end for every span and nothing else"
 		);
 		assert_eq!(
-			usize::try_from(Timings::QUERIES).expect("twelve fits"),
+			usize::try_from(Timings::QUERIES).expect("a small count fits"),
 			Timings::TICKS,
 			"the count the set is made with and the array it is read into"
 		);

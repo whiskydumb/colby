@@ -215,6 +215,31 @@ mod tests {
 	}
 
 	#[test]
+	fn and_smears_the_sky_around_the_sun_at_one_sample_and_at_four() {
+		// the three shaft passes are only recorded in a frame that asks for
+		// them, and the mask reads the depth the way the view above does - so
+		// this is the second reader of that buffer, built and validated here
+		// on a device that draws nothing
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+
+		// the camera looks down -z from +z, and light traveling +z comes from
+		// -z, so this is the sun in front of it
+		world.light = Vec3::Z;
+		world.post.shafts = 0.8;
+
+		for samples in ["1", "4", "1"] {
+			tuned(&mut world, samples);
+			capture
+				.shoot(&mut world)
+				.expect("the smear renders at either sample count");
+		}
+	}
+
+	#[test]
 	fn a_shader_that_does_not_compile_is_refused_here_the_way_a_card_refuses_it() {
 		// what says the two above have teeth. Nothing is drawn on this device,
 		// so "the frame rendered" could mean the pipelines were never built -

@@ -28,6 +28,7 @@ pub mod renderer;
 pub mod scene;
 pub mod shader;
 pub mod shadow;
+mod shaft;
 mod skin;
 mod sparks;
 pub mod timing;

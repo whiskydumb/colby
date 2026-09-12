@@ -391,6 +391,16 @@ impl Chain {
 		}
 	}
 
+	/// The picture itself: what the world ends up in whatever it was drawn
+	/// with, and what everything after the scene reads and writes.
+	///
+	/// **Not [`target`](Self::target)**, and the difference is the whole of why
+	/// this exists: that one is what the scene's pass draws into, which is the
+	/// multisampled buffer when there is one. This is where that resolves to,
+	/// so a pass after the scene can read it and add to it. @ref
+	/// [`shaft`](crate::shaft), which does both.
+	pub(crate) const fn picture(&self) -> &TextureView { &self.target }
+
 	/// Where the scene's pass resolves to, or nothing when it is not
 	/// multisampled.
 	pub(crate) const fn resolve_into(&self) -> Option<&TextureView> {
@@ -956,8 +966,8 @@ fn tuning_of(post: Post, moving: f32, depth: [f32; 4]) -> Tuning {
 			post.bloom.max(0.0),
 			post.bloom_threshold.max(0.0),
 			// half the threshold, which is the band the soft edge spans. A
-			// number of its own would be a thirteenth field on a record that
-			// already has twelve, for a knob nobody has asked to turn.
+			// number of its own would be one more field on a record that
+			// already has thirteen, for a knob nobody has asked to turn.
 			post.bloom_threshold.max(0.0) * 0.5,
 			0.0,
 		],
