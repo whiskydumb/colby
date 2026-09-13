@@ -241,60 +241,91 @@ impl Depth {
 	#[cfg(test)]
 	pub(crate) fn values(&self, device: &Device, queue: &wgpu::Queue) -> Option<Vec<f32>> {
 		let texture = self.readable()?.texture();
-		let (width, height) = (texture.width(), texture.height());
-		let row = width * 4;
-		let padded =
-			row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-		let staging = device.create_buffer(&wgpu::BufferDescriptor {
-			label: Some("depth readback"),
-			size: u64::from(padded) * u64::from(height),
-			usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-			mapped_at_creation: false,
-		});
-		let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-			label: Some("depth readback"),
-		});
 
-		encoder.copy_texture_to_buffer(
-			wgpu::TexelCopyTextureInfo {
-				texture,
-				mip_level: 0,
-				origin: wgpu::Origin3d::ZERO,
-				aspect: wgpu::TextureAspect::DepthOnly,
-			},
-			wgpu::TexelCopyBufferInfo {
-				buffer: &staging,
-				layout: wgpu::TexelCopyBufferLayout {
-					offset: 0,
-					bytes_per_row: Some(padded),
-					rows_per_image: Some(height),
-				},
-			},
-			Extent3d { width, height, depth_or_array_layers: 1 },
-		);
-		queue.submit([encoder.finish()]);
-
-		let slice = staging.slice(..);
-		slice.map_async(wgpu::MapMode::Read, |_| {});
-		device
-			.poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-			.ok()?;
-
-		let mapped = slice.get_mapped_range().ok()?;
-		let stride = usize::try_from(row).ok()?;
-		let mut values = Vec::with_capacity(stride / 4 * usize::try_from(height).ok()?);
-
-		for line in mapped.chunks(usize::try_from(padded).ok()?) {
-			for four in line.get(..stride)?.chunks_exact(4) {
-				values.push(f32::from_le_bytes(four.try_into().ok()?));
-			}
-		}
-
-		drop(mapped);
-		staging.unmap();
-
-		Some(values)
+		floats(&copied_out(device, queue, texture, wgpu::TextureAspect::DepthOnly, 4)?)
 	}
+}
+
+/// A texture's texels copied out to the processor, top row first, with the
+/// padding every row of a copy is rounded up to taken off again.
+///
+/// A test's, and only a test's: how a buffer nothing ever puts on a screen is
+/// read back and held against arithmetic. The texture has to carry the copy
+/// bit, which every buffer here carries in a test build and in no other.
+///
+/// @param device - to build the staging buffer on
+/// @param queue - to submit the copy on
+/// @param texture - what to copy, one sample a pixel
+/// @param aspect - the depth of a depth texture, or all of a color one
+/// @param stride - how many bytes one texel of it is
+#[cfg(test)]
+pub(crate) fn copied_out(
+	device: &Device,
+	queue: &wgpu::Queue,
+	texture: &wgpu::Texture,
+	aspect: wgpu::TextureAspect,
+	stride: u32,
+) -> Option<Vec<u8>> {
+	let (width, height) = (texture.width(), texture.height());
+	let row = width * stride;
+	let padded =
+		row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+	let staging = device.create_buffer(&wgpu::BufferDescriptor {
+		label: Some("readback"),
+		size: u64::from(padded) * u64::from(height),
+		usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+		mapped_at_creation: false,
+	});
+	let mut encoder = device
+		.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+
+	encoder.copy_texture_to_buffer(
+		wgpu::TexelCopyTextureInfo {
+			texture,
+			mip_level: 0,
+			origin: wgpu::Origin3d::ZERO,
+			aspect,
+		},
+		wgpu::TexelCopyBufferInfo {
+			buffer: &staging,
+			layout: wgpu::TexelCopyBufferLayout {
+				offset: 0,
+				bytes_per_row: Some(padded),
+				rows_per_image: Some(height),
+			},
+		},
+		Extent3d { width, height, depth_or_array_layers: 1 },
+	);
+	queue.submit([encoder.finish()]);
+
+	let slice = staging.slice(..);
+	slice.map_async(wgpu::MapMode::Read, |_| {});
+	device
+		.poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+		.ok()?;
+
+	let mapped = slice.get_mapped_range().ok()?;
+	let wide = usize::try_from(row).ok()?;
+	let mut bytes = Vec::with_capacity(wide * usize::try_from(height).ok()?);
+
+	for line in mapped.chunks(usize::try_from(padded).ok()?) {
+		bytes.extend_from_slice(line.get(..wide)?);
+	}
+
+	drop(mapped);
+	staging.unmap();
+
+	Some(bytes)
+}
+
+/// Four bytes at a time as the little-endian floats they are. A tail shorter
+/// than four is not a float and is left off.
+#[cfg(test)]
+pub(crate) fn floats(bytes: &[u8]) -> Option<Vec<f32>> {
+	bytes
+		.chunks_exact(4)
+		.map(|four| four.try_into().ok().map(f32::from_le_bytes))
+		.collect()
 }
 
 /// How a reader binds [`Depth::readable`]: a depth texture of one sample, read

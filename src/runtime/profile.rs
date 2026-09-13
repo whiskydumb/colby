@@ -88,9 +88,9 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Nine spans of hardware, two of recording, five of simulation and one of
+/// Ten spans of hardware, two of recording, five of simulation and one of
 /// particles.
-const ROWS: usize = 17;
+const ROWS: usize = 18;
 
 /// Which row of the table is the whole solver step.
 ///
@@ -98,11 +98,11 @@ const ROWS: usize = 17;
 /// what stopped being true the moment a row was appended after it. A row added
 /// below has to leave these two alone or move them on purpose; `gpu depth`
 /// went in above them and moved both, `gpu shaft` did it again, `gpu focus` a
-/// third time and `gpu lamps` a fourth.
-const STEP_ROW: usize = 15;
+/// third time, `gpu lamps` a fourth and `gpu prepass` a fifth.
+const STEP_ROW: usize = 16;
 
 /// Which row is the particles.
-const SPARKS_ROW: usize = 16;
+const SPARKS_ROW: usize = 17;
 
 /// How many frames the live table averages over.
 ///
@@ -222,7 +222,7 @@ impl Live {
 	/// @param passes - what the hardware spent, per [`Pass`] in slot order,
 	/// from a frame two or three behind the one this is called in
 	/// @param count - how many render passes that frame recorded
-	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 9], count: u32) {
+	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 10], count: u32) {
 		self.passes = Some(count);
 
 		for (at, took) in passes.into_iter().enumerate() {
@@ -419,6 +419,9 @@ pub(crate) const NAMES: [&str; ROWS] = [
 	// every local light's map, in one pass over the atlas's last layer. Added
 	// with parity card B5, on the atlas card B4 laid down.
 	"gpu lamps",
+	// every solid thing in view drawn once more before the scene, writing its
+	// depth, its normal and its roughness. Added with parity card C1.
+	"gpu prepass",
 	"gpu scene",
 	// the depth made readable, between the scene that wrote it and everything
 	// after that reads it. Added with parity card B1.
@@ -778,13 +781,24 @@ mod tests {
 		assert_eq!(live.profile().passes, None, "and no frame has been read back");
 
 		live.hardware(
-			[None, None, Some(Duration::from_micros(800)), None, None, None, None, None, None],
+			[
+				None,
+				None,
+				None,
+				Some(Duration::from_micros(800)),
+				None,
+				None,
+				None,
+				None,
+				None,
+				None,
+			],
 			15,
 		);
 
 		assert!(live.profile().hardware, "now it has");
-		assert_eq!(live.profile().parts[2].mean, Some(Duration::from_micros(800)));
-		assert_eq!(live.profile().parts[2].name, "gpu scene", "in the third row");
+		assert_eq!(live.profile().parts[3].mean, Some(Duration::from_micros(800)));
+		assert_eq!(live.profile().parts[3].name, "gpu scene", "in the fourth row");
 		assert_eq!(live.profile().passes, Some(15), "and the count came with it");
 	}
 

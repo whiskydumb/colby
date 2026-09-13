@@ -61,6 +61,7 @@ use crate::{
 	gpu::Gpu,
 	lines::Lines,
 	post,
+	prepass::{self, Prepass},
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, LOCAL_TILES, Maps, Slots, Tile},
 	shaft::{self, Asking, Shaft},
@@ -726,6 +727,19 @@ pub struct Scene {
 	/// What those passes are asked for this frame, or nothing. Read in
 	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
 	focusing: Option<focus::Asking>,
+	/// The pass before the scene, which writes every pixel's depth, normal and
+	/// roughness for whatever reads them before anything is lit. @ref
+	/// [`prepass`].
+	prepass: Prepass,
+	/// What that pass wrote, drawn instead of the picture this frame, if
+	/// somebody asked. Read in [`Scene::upload`], for the reason
+	/// [`seeing`](Self::seeing) is. @ref [`prepass::VIEW`].
+	showing: Option<prepass::Showing>,
+	/// Whether a test asked for the pass before the scene with nothing to read
+	/// it, which is how a test shows that the pass moves no pixel of the
+	/// picture. @ref [`prepare_anyway`](Self::prepare_anyway).
+	#[cfg(test)]
+	anyway: bool,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
 	/// The cube a surface's reflections are read out of. @ref [`env`].
@@ -918,6 +932,10 @@ impl Scene {
 			shafting: None,
 			focus,
 			focusing: None,
+			prepass: Prepass::new(width, height),
+			showing: None,
+			#[cfg(test)]
+			anyway: false,
 			shadows,
 			environment,
 			split,
@@ -965,6 +983,7 @@ impl Scene {
 		self.post.resize(&self.device, width, height);
 		self.shaft.resize(width, height);
 		self.focus.resize(width, height);
+		self.prepass.resize(width, height);
 	}
 
 	/// Rebuilds everything that has to agree about how many samples a pixel is.
@@ -1056,8 +1075,16 @@ impl Scene {
 		// the whole table, and none of it is assigned until all of it has
 		// compiled: half a reload is a world where the crates moved and the
 		// characters did not.
-		self.pipelines =
-			Pipelines::build(&self.device, post::HDR_FORMAT, &groups, source, samples)?;
+		let table = Pipelines::build(&self.device, post::HDR_FORMAT, &groups, source, samples)?;
+		// and the pass before the scene with it, if that was ever built, for the
+		// same reason: a normal written by one shader and lit by another is two
+		// answers to one question.
+		let prepass = self
+			.prepass
+			.rebuilt(&self.device, &groups, source)?;
+
+		self.pipelines = table;
+		self.prepass.replace(prepass);
 		source.clone_into(&mut self.built);
 
 		Ok(())
@@ -1116,6 +1143,11 @@ impl Scene {
 			}
 		}
 
+		// after the shadows and before the scene's own pass, because what reads
+		// a surface before it is lit has to find it written already. @ref
+		// [`prepass`].
+		self.prepare(&mut encoder, view);
+
 		let scene_marks = self.timings.writes(Pass::Scene, Ends::Both);
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
 			label: Some("scene"),
@@ -1173,20 +1205,7 @@ impl Scene {
 				return;
 			};
 
-			#[expect(
-				clippy::as_conversions,
-				clippy::cast_precision_loss,
-				reason = "pixel counts, nowhere near where f32 stops holding integers"
-			)]
-			pass.set_viewport(
-				view.x as f32,
-				view.y as f32,
-				view.width as f32,
-				view.height as f32,
-				0.0,
-				1.0,
-			);
-			pass.set_scissor_rect(view.x, view.y, view.width, view.height);
+			cut(&mut pass, view);
 		}
 
 		pass.set_bind_group(0, &self.bindings, &[]);
@@ -1302,13 +1321,18 @@ impl Scene {
 				.readable()
 				.map(|view| post::Seen { view, white, lens })
 		});
+		let surfaces = self.showing.and_then(|showing| {
+			self.prepass
+				.surfaces()
+				.map(|view| post::Prepared { view, showing })
+		});
 
 		self.post.resolve(
 			&mut encoder,
 			&self.queue,
 			world.post,
 			seconds,
-			post::Last { into: target, depth },
+			post::Last { into: target, depth, surfaces },
 			&self.timings,
 		);
 
@@ -1326,6 +1350,30 @@ impl Scene {
 	pub(crate) fn depth_values(&self) -> Option<Vec<f32>> {
 		self.depth.values(&self.device, &self.queue)
 	}
+
+	/// What the pass before the scene wrote for each pixel's surface, for a
+	/// test. @ref [`Prepass::surface_values`].
+	#[cfg(test)]
+	pub(crate) fn surface_values(&self) -> Option<Vec<[f32; 4]>> {
+		self.prepass
+			.surface_values(&self.device, &self.queue)
+	}
+
+	/// What the pass before the scene wrote for each pixel's depth, for a test.
+	#[cfg(test)]
+	pub(crate) fn prepass_depth_values(&self) -> Option<Vec<f32>> {
+		self.prepass
+			.depth_values(&self.device, &self.queue)
+	}
+
+	/// Asks for the pass before the scene whether or not anything reads it,
+	/// for a test.
+	///
+	/// **The one way to have the pass and the picture in the same frame**
+	/// before anything that reads the buffer draws the picture as well: the
+	/// view that does read it draws the buffer in the picture's place.
+	#[cfg(test)]
+	pub(crate) const fn prepare_anyway(&mut self, asked: bool) { self.anyway = asked; }
 
 	/// What this frame cost, for whoever asked to be told.
 	///
@@ -1515,6 +1563,27 @@ impl Scene {
 	/// already bound
 	/// @param batches - the runs to draw, in order
 	fn draw(&self, pass: &mut RenderPass<'_>, batches: &[Batch]) {
+		self.draw_through(pass, batches, |blend, skinned| {
+			Some(self.pipelines.get(blend, skinned))
+		});
+	}
+
+	/// The same, through whichever pipeline `pick` names for each batch.
+	///
+	/// The scene's table picks for the picture and the pass before the scene
+	/// picks its own; everything else about drawing a batch - its geometry, its
+	/// skin, its material's group and its run of instances - is the same in
+	/// both, which is what keeps the two passes drawing the same triangles.
+	///
+	/// @param pass - the pass to record into, with groups nought, two and three
+	/// already bound
+	/// @param batches - the runs to draw, in order
+	/// @param pick - the pipeline for a blend and whether bones move the mesh,
+	/// or nothing for a batch this pass does not draw
+	fn draw_through<'a, F>(&'a self, pass: &mut RenderPass<'_>, batches: &[Batch], pick: F)
+	where
+		F: Fn(Blend, bool) -> Option<&'a RenderPipeline>,
+	{
 		// swapped when a batch wants another one rather than once per batch.
 		// The solid half is ordered by mesh and material, so a world of crates
 		// with one character in it changes pipeline twice however many crates
@@ -1522,15 +1591,17 @@ impl Scene {
 		let mut bound = None;
 
 		for batch in batches {
-			let (Some(mesh), Some(material)) =
-				(self.meshes.get(batch.mesh), self.materials.get(batch.material))
-			else {
+			let (Some(mesh), Some(material), Some(pipeline)) = (
+				self.meshes.get(batch.mesh),
+				self.materials.get(batch.material),
+				pick(batch.blend, batch.skinned),
+			) else {
 				continue;
 			};
 
 			let wanted = (batch.blend, batch.skinned);
 			if bound != Some(wanted) {
-				pass.set_pipeline(self.pipelines.get(batch.blend, batch.skinned));
+				pass.set_pipeline(pipeline);
 				bound = Some(wanted);
 			}
 
@@ -1544,6 +1615,84 @@ impl Scene {
 			pass.draw_indexed(0..mesh.index_count, 0, batch.first..batch.first + batch.count);
 		}
 	}
+
+	/// Records the pass before the scene, or lets what it writes into go.
+	///
+	/// The solid half of the picture's own list, through the rectangle the
+	/// picture is drawn into: what the view leaves out and what is hidden are
+	/// left out of this as well, so a surface is written for exactly the pixels
+	/// the scene's pass is about to light. @ref [`prepass`].
+	///
+	/// @param encoder - the frame's, with the shadows already in it
+	/// @param view - the part of the target the picture is drawn into, or the
+	/// whole of it
+	fn prepare(&mut self, encoder: &mut CommandEncoder, view: Option<Viewport>) {
+		if !self.preparing() {
+			self.prepass.release();
+
+			return;
+		}
+
+		let groups = [
+			&self.globals_layout,
+			&self.material_layout,
+			self.shadows.sample_layout(),
+			self.joints.layout(),
+		];
+
+		if !self
+			.prepass
+			.ensure(&self.device, &groups, &self.built)
+		{
+			return;
+		}
+
+		let Some(mut pass) = self
+			.prepass
+			.begin(encoder, self.timings.writes(Pass::Prepass, Ends::Both))
+		else {
+			return;
+		};
+
+		// the rectangle the picture is cut to, and one with nothing inside the
+		// target leaves the pass cleared and nothing else, as the picture is
+		if let Some(asked) = view {
+			let Some(inside) = asked.within(self.size.0, self.size.1) else {
+				return;
+			};
+
+			cut(&mut pass, inside);
+		}
+
+		pass.set_bind_group(0, &self.bindings, &[]);
+		pass.set_bind_group(2, self.shadows.bindings(), &[]);
+		pass.set_bind_group(3, self.joints.bindings(), &[]);
+		pass.set_vertex_buffer(1, self.instances.slice(..));
+
+		self.draw_through(&mut pass, &self.batches, |blend, skinned| {
+			self.prepass.pipeline(blend, skinned)
+		});
+	}
+
+	/// Whether anything reads what the pass before the scene writes, this
+	/// frame.
+	///
+	/// The view that draws it is the only reader so far. A test can ask for it
+	/// with nothing reading it at all, @ref
+	/// [`prepare_anyway`](Self::prepare_anyway).
+	fn preparing(&self) -> bool { self.showing.is_some() || self.asked_anyway() }
+
+	/// Whether a test asked for the pass with nothing to read it.
+	#[cfg(test)]
+	const fn asked_anyway(&self) -> bool { self.anyway }
+
+	/// Nothing outside a test asks for a pass nobody reads.
+	#[cfg(not(test))]
+	#[expect(
+		clippy::unused_self,
+		reason = "the test build's twin reads a field this build does not have"
+	)]
+	const fn asked_anyway(&self) -> bool { false }
 
 	/// Which one draws a batch into a shadow map.
 	///
@@ -1853,6 +2002,9 @@ impl Scene {
 		let (decals, painted) = self.decals(world, &sight);
 		self.sky = world.sky.is_drawn();
 		self.seeing = seeing_of(world, &camera);
+		// the depth view wins when both are asked for, and a view nobody sees
+		// asks for no pass
+		self.showing = prepass::showing_of(world).filter(|_| self.seeing.is_none());
 		self.shafting = shaft::asking_of(world, &camera);
 		self.focusing = focus::asking_of(world, &camera);
 
@@ -3423,31 +3575,7 @@ fn build_pipeline(
 		immediate_size: 0,
 	});
 
-	let (vertex_stride, instance_stride) = strides();
-
-	let vertices = VertexBufferLayout {
-		array_stride: vertex_stride,
-		step_mode: VertexStepMode::Vertex,
-		attributes: &VERTEX_ATTRIBUTES,
-	};
-
-	let instances = VertexBufferLayout {
-		array_stride: instance_stride,
-		step_mode: VertexStepMode::Instance,
-		attributes: &INSTANCE_ATTRIBUTES,
-	};
-	let skin = VertexBufferLayout {
-		array_stride: skin_stride(),
-		step_mode: VertexStepMode::Vertex,
-		attributes: &SKIN_ATTRIBUTES,
-	};
-	// the third buffer only where it is read. Declaring it on both would mean
-	// binding one for every crate in the world, and there is nothing to bind.
-	let buffers: &[Option<VertexBufferLayout<'_>>] = if skinned {
-		&[Some(vertices), Some(instances), Some(skin)]
-	} else {
-		&[Some(vertices), Some(instances)]
-	};
+	let buffers = vertex_buffers(skinned);
 
 	device.create_render_pipeline(&RenderPipelineDescriptor {
 		label: Some(label_of(blend, skinned)),
@@ -3456,7 +3584,7 @@ fn build_pipeline(
 			module: &shader,
 			entry_point: Some(if skinned { "vertex_skinned" } else { "vertex_main" }),
 			compilation_options: PipelineCompilationOptions::default(),
-			buffers,
+			buffers: &buffers,
 		},
 		primitive: PrimitiveState {
 			topology: PrimitiveTopology::TriangleList,
@@ -3522,6 +3650,64 @@ fn build_pipeline(
 		multiview_mask: None,
 		cache: None,
 	})
+}
+
+/// The vertex buffers a pipeline that draws a batch reads: the geometry and the
+/// placements always, and the skin for a mesh bones move.
+///
+/// The third buffer only where it is read. Declaring it on the static pipelines
+/// would mean binding one for every crate in the world, and there is nothing to
+/// bind. Shared by the scene's table, the shadows' and the pass before the
+/// scene, which all draw the same batches out of the same buffers and have to
+/// agree about how.
+///
+/// @param skinned - whether the pipeline reads bones
+pub(crate) fn vertex_buffers(skinned: bool) -> Vec<Option<VertexBufferLayout<'static>>> {
+	let (vertex_stride, instance_stride) = strides();
+	let mut buffers = vec![
+		Some(VertexBufferLayout {
+			array_stride: vertex_stride,
+			step_mode: VertexStepMode::Vertex,
+			attributes: &VERTEX_ATTRIBUTES,
+		}),
+		Some(VertexBufferLayout {
+			array_stride: instance_stride,
+			step_mode: VertexStepMode::Instance,
+			attributes: &INSTANCE_ATTRIBUTES,
+		}),
+	];
+
+	if skinned {
+		buffers.push(Some(VertexBufferLayout {
+			array_stride: skin_stride(),
+			step_mode: VertexStepMode::Vertex,
+			attributes: &SKIN_ATTRIBUTES,
+		}));
+	}
+
+	buffers
+}
+
+/// Holds a pass to a rectangle of its target, by its viewport and its scissor
+/// alike.
+///
+/// @param pass - the pass, already begun
+/// @param view - the rectangle, already cut down to what lies inside the target
+fn cut(pass: &mut RenderPass<'_>, view: Viewport) {
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_precision_loss,
+		reason = "pixel counts, nowhere near where f32 stops holding integers"
+	)]
+	pass.set_viewport(
+		view.x as f32,
+		view.y as f32,
+		view.width as f32,
+		view.height as f32,
+		0.0,
+		1.0,
+	);
+	pass.set_scissor_rect(view.x, view.y, view.width, view.height);
 }
 
 /// What one [`MeshVertex`] hands the vertex stage.

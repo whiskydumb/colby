@@ -31,7 +31,7 @@ mod tests {
 	};
 	use wgpu::TextureFormat;
 
-	use crate::{Capture, Gpu, depth, scene, shadow};
+	use crate::{Capture, Gpu, depth, prepass, scene, shadow};
 
 	/// How big the target is. Small on purpose: nothing here reads it.
 	const SIZE: (u32, u32) = (16, 16);
@@ -231,6 +231,31 @@ mod tests {
 			capture
 				.shoot(&mut world)
 				.expect("the depth drawn instead of the picture renders");
+		}
+	}
+
+	#[test]
+	fn and_writes_every_surface_before_the_scene_at_one_sample_and_at_four() {
+		// the pass before the scene, its four pipelines and the view that draws
+		// its buffer, all of them only recorded in a frame that asks - so the
+		// three tests above never build any of them. Both of the view's two
+		// answers, across both sample counts, and back.
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+
+		for (samples, showing) in [("1", "1"), ("4", "2"), ("1", "2"), ("4", "1")] {
+			tuned(&mut world, samples);
+			world
+				.cvars
+				.var(prepass::VIEW, Value::Float(prepass::NO_VIEW), "");
+			world.cvars.set(prepass::VIEW, showing);
+
+			capture
+				.shoot(&mut world)
+				.expect("what every surface is, drawn instead of the picture, renders");
 		}
 	}
 

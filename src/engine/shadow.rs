@@ -58,12 +58,10 @@ use wgpu::{
 	RenderPipeline, RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor,
 	ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, Texture, TextureAspect,
 	TextureDescriptor, TextureDimension, TextureSampleType, TextureUsages, TextureView,
-	TextureViewDescriptor, TextureViewDimension, VertexBufferLayout, VertexState, VertexStepMode,
+	TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
-use crate::scene::{
-	DEPTH_FORMAT, INSTANCE_ATTRIBUTES, SKIN_ATTRIBUTES, VERTEX_ATTRIBUTES, skin_stride, strides,
-};
+use crate::scene::{DEPTH_FORMAT, vertex_buffers};
 
 /// How many slices the shadow distance is cut into.
 ///
@@ -981,27 +979,7 @@ fn build_pipeline(device: &Device, groups: &Groups<'_>, wanted: Wanted) -> Rende
 		immediate_size: 0,
 	});
 
-	let (vertex_stride, instance_stride) = strides();
-	let vertices = VertexBufferLayout {
-		array_stride: vertex_stride,
-		step_mode: VertexStepMode::Vertex,
-		attributes: &VERTEX_ATTRIBUTES,
-	};
-	let instances = VertexBufferLayout {
-		array_stride: instance_stride,
-		step_mode: VertexStepMode::Instance,
-		attributes: &INSTANCE_ATTRIBUTES,
-	};
-	let skin = VertexBufferLayout {
-		array_stride: skin_stride(),
-		step_mode: VertexStepMode::Vertex,
-		attributes: &SKIN_ATTRIBUTES,
-	};
-	let buffers: &[Option<VertexBufferLayout<'_>>] = if skinned {
-		&[Some(vertices), Some(instances), Some(skin)]
-	} else {
-		&[Some(vertices), Some(instances)]
-	};
+	let buffers = vertex_buffers(skinned);
 
 	device.create_render_pipeline(&RenderPipelineDescriptor {
 		label: Some(label_of(wanted)),
@@ -1015,7 +993,7 @@ fn build_pipeline(device: &Device, groups: &Groups<'_>, wanted: Wanted) -> Rende
 				| (true, true) => "vertex_masked_skinned",
 			}),
 			compilation_options: PipelineCompilationOptions::default(),
-			buffers,
+			buffers: &buffers,
 		},
 		primitive: PrimitiveState {
 			topology: PrimitiveTopology::TriangleList,

@@ -39,7 +39,10 @@ use wgpu::{
 	TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
-use crate::timing::{Ends, Pass, Timings};
+use crate::{
+	prepass::Showing,
+	timing::{Ends, Pass, Timings},
+};
 
 /// The format the world is drawn into.
 ///
@@ -133,7 +136,9 @@ struct Tuning {
 
 	/// `[how far away white is, the projection's two numbers, whether the
 	/// target applies the sRGB curve]` while the depth is drawn instead of the
-	/// picture, and all nought otherwise. @ref [`Seen`].
+	/// picture; `[one for the normal or two for the roughness, nought, nought,
+	/// the same curve]` while what the pass before the scene wrote is; and all
+	/// nought otherwise. @ref [`Seen`] and [`Prepared`].
 	depth: [f32; 4],
 }
 
@@ -157,6 +162,10 @@ pub(crate) struct Last<'a> {
 
 	/// The depth to draw instead of the picture, or nothing for the picture.
 	pub(crate) depth: Option<Seen<'a>>,
+
+	/// What the pass before the scene wrote, to draw instead of the picture,
+	/// or nothing. The depth wins when both are asked for.
+	pub(crate) surfaces: Option<Prepared<'a>>,
 }
 
 /// The depth as the last pass draws it, @ref
@@ -172,6 +181,28 @@ pub(crate) struct Seen<'a> {
 	/// The projection's `z_axis.z` and `w_axis.z`, the two numbers a stored
 	/// depth is turned back into a distance with.
 	pub(crate) lens: [f32; 2],
+}
+
+/// What the pass before the scene wrote, as the last pass draws it, @ref
+/// [`prepass::VIEW`](crate::prepass::VIEW).
+#[derive(Clone, Copy)]
+pub(crate) struct Prepared<'a> {
+	/// The surfaces, one sample a pixel whatever the scene drew with.
+	pub(crate) view: &'a TextureView,
+
+	/// Which of the two numbers a texel holds is drawn.
+	pub(crate) showing: Showing,
+}
+
+/// One pass drawn in the picture's place: a pipeline, how it is handed its
+/// texture, and the texture.
+#[derive(Clone, Copy)]
+struct Instead<'a> {
+	label: &'a str,
+	pipeline: &'a RenderPipeline,
+	layout: &'a BindGroupLayout,
+	binding: u32,
+	view: &'a TextureView,
 }
 
 /// The target the world is drawn into, and everything that reads it.
@@ -251,6 +282,14 @@ pub(crate) struct Chain {
 	/// every other pass here has the picture and its sampler.
 	depth_layout: BindGroupLayout,
 
+	/// What draws the pass before the scene's buffer instead of the picture.
+	/// @ref [`prepass::VIEW`](crate::prepass::VIEW).
+	surfacing: RenderPipeline,
+
+	/// How it is handed that buffer: one binding, the fourth of its group, so
+	/// that it and the depth above are never two names for one slot.
+	surfaces_layout: BindGroupLayout,
+
 	/// Whether the target the last pass writes applies the sRGB curve on the
 	/// way out, which the depth view undoes so that a byte is a distance.
 	srgb: bool,
@@ -326,6 +365,17 @@ impl Chain {
 			Some(&numbers_layout),
 			Some(&depth_layout),
 		]);
+		// and beside that one for the same reason, reading what the pass before
+		// the scene wrote
+		let surfaces_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+			label: Some("post surfaces"),
+			entries: &[crate::prepass::entry(3)],
+		});
+		let surfacing =
+			screen_pipeline(device, &module, "post surfaces", "fragment_surfaces", format, &[
+				Some(&numbers_layout),
+				Some(&surfaces_layout),
+			]);
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
 			return Err(err!(Graphics("the post-processing pipelines: {complaint}")));
@@ -371,6 +421,8 @@ impl Chain {
 			composite: built.6,
 			seeing,
 			depth_layout,
+			surfacing,
+			surfaces_layout,
 			srgb: format.is_srgb(),
 			device: device.clone(),
 			size: (width, height),
@@ -477,9 +529,12 @@ impl Chain {
 		// encoder, so the tuning block has to describe the frame that is about
 		// to happen rather than the one that did.
 		let moving = if self.adapted { post.adapt(seconds) } else { 1.0 };
-		let depth = last.depth.map_or([0.0; 4], |seen| {
-			[seen.white, seen.lens[0], seen.lens[1], if self.srgb { 1.0 } else { 0.0 }]
-		});
+		let curve = if self.srgb { 1.0 } else { 0.0 };
+		let depth = match (last.depth, last.surfaces) {
+			| (Some(seen), _) => [seen.white, seen.lens[0], seen.lens[1], curve],
+			| (None, Some(prepared)) => [number_of(prepared.showing), 0.0, 0.0, curve],
+			| (None, None) => [0.0; 4],
+		};
 
 		queue.write_buffer(&self.tuning, 0, bytemuck::bytes_of(&tuning_of(post, moving, depth)));
 
@@ -496,7 +551,35 @@ impl Chain {
 		let composite = timings.writes(Pass::Composite, Ends::Both);
 
 		if let Some(seen) = last.depth {
-			self.see(encoder, last.into, seen, composite);
+			self.instead(
+				encoder,
+				last.into,
+				Instead {
+					label: "post depth",
+					pipeline: &self.seeing,
+					layout: &self.depth_layout,
+					binding: 2,
+					view: seen.view,
+				},
+				composite,
+			);
+
+			return;
+		}
+
+		if let Some(prepared) = last.surfaces {
+			self.instead(
+				encoder,
+				last.into,
+				Instead {
+					label: "post surfaces",
+					pipeline: &self.surfacing,
+					layout: &self.surfaces_layout,
+					binding: 3,
+					view: prepared.view,
+				},
+				composite,
+			);
 
 			return;
 		}
@@ -529,35 +612,36 @@ impl Chain {
 		pass.draw(0..3, 0..1);
 	}
 
-	/// The depth instead of the picture, as the frame's last pass.
+	/// A buffer drawn instead of the picture, as the frame's last pass: the
+	/// depth, or what the pass before the scene wrote.
 	///
 	/// @param encoder - the frame's encoder
 	/// @param into - the window's or the capture's own view
-	/// @param seen - what is drawn, and how far away white is
+	/// @param instead - which pass, and the texture it reads
 	/// @param marks - the composite's span, which this pass stands in for
-	fn see(
+	fn instead(
 		&self,
 		encoder: &mut CommandEncoder,
 		into: &TextureView,
-		seen: Seen<'_>,
+		instead: Instead<'_>,
 		marks: Option<RenderPassTimestampWrites<'_>>,
 	) {
 		// made each frame the view is on rather than kept: it is a handful of
-		// descriptors, and keeping one would need the depth to say whenever its
+		// descriptors, and keeping one would need the buffer to say whenever its
 		// view is rebuilt, which a tool that is up for a moment does not earn
 		let read = self
 			.device
 			.create_bind_group(&BindGroupDescriptor {
-				label: Some("post depth"),
-				layout: &self.depth_layout,
+				label: Some(instead.label),
+				layout: instead.layout,
 				entries: &[BindGroupEntry {
-					binding: 2,
-					resource: BindingResource::TextureView(seen.view),
+					binding: instead.binding,
+					resource: BindingResource::TextureView(instead.view),
 				}],
 			});
 
-		screen_pass(encoder, "post depth", into, marks, |pass| {
-			pass.set_pipeline(&self.seeing);
+		screen_pass(encoder, instead.label, into, marks, |pass| {
+			pass.set_pipeline(instead.pipeline);
 			pass.set_bind_group(0, &self.numbers, &[]);
 			pass.set_bind_group(1, &read, &[]);
 		});
@@ -800,7 +884,7 @@ fn half_from(value: f32) -> u16 {
 
 /// The other way: sixteen bits back into a float.
 #[cfg(test)]
-fn half_into(bits: u16) -> f32 {
+pub(crate) fn half_into(bits: u16) -> f32 {
 	let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
 	let exponent = i32::from((bits >> 10) & 0x1F);
 	let mantissa = f32::from(bits & 0x03FF);
@@ -972,6 +1056,15 @@ fn tuning_of(post: Post, moving: f32, depth: [f32; 4]) -> Tuning {
 			0.0,
 		],
 		depth,
+	}
+}
+
+/// Which of the pass before the scene's two numbers a view draws, as the float
+/// the tuning block holds it in.
+const fn number_of(showing: Showing) -> f32 {
+	match showing {
+		| Showing::Normal => 1.0,
+		| Showing::Roughness => 2.0,
 	}
 }
 
@@ -1538,7 +1631,7 @@ mod tests {
 				gpu.queue(),
 				Post::DEFAULT,
 				1.0,
-				Last { into: out, depth: None },
+				Last { into: out, depth: None, surfaces: None },
 				&Timings::new(0.0),
 			);
 			gpu.queue().submit([encoder.finish()]);
@@ -1658,6 +1751,8 @@ mod tests {
 			"fragment_down",
 			"fragment_up",
 			"fragment_composite",
+			"fragment_depth",
+			"fragment_surfaces",
 		] {
 			assert!(source.contains(&format!("fn {entry}(")), "{entry} is not in post.wgsl");
 		}

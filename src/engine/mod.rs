@@ -27,6 +27,7 @@ mod lines;
 mod lobe;
 pub mod overlay;
 mod post;
+pub mod prepass;
 pub mod renderer;
 pub mod scene;
 pub mod shader;

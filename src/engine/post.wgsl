@@ -23,7 +23,9 @@
 // x is how far away white is while the depth is drawn instead of the picture;
 // y and z are the two numbers of the projection a stored depth is turned back
 // into a distance with, its `z_axis.z` and its `w_axis.z`; w is whether the
-// target applies the sRGB curve on the way out. All nought otherwise.
+// target applies the sRGB curve on the way out. While what the pass before the
+// scene wrote is drawn instead, x is one for the normal and two for the
+// roughness and w is the same curve. All nought otherwise.
 struct Tuning {
     curve: vec4<f32>,
     meter: vec4<f32>,
@@ -458,4 +460,39 @@ fn fragment_depth(input: ScreenOutput) -> @location(0) vec4<f32> {
     let shown = select(level, undone(level), tuning.depth.w > 0.5);
 
     return vec4<f32>(shown, shown, shown, 1.0);
+}
+
+// What the pass before the scene wrote: xyz a normal in the world, w how rough
+// the surface is, and nought in all four wherever nothing was drawn. Bound by
+// the view below and by nothing else, at a binding of its own so that it and
+// the depth above are never two names for one slot.
+@group(1) @binding(3) var surfaces: texture_2d<f32>;
+
+// That buffer instead of the picture: at one the normal as a color, each axis
+// from minus one to one laid over nought to one, and at two the roughness as a
+// grey. Black wherever nothing was drawn, which no normal comes out as - all
+// three of its axes would have to be minus one.
+//
+// **A byte is a number**, the depth view's rule: on an sRGB target the curve is
+// undone first, so an axis of one is 255 in the file and a roughness of a half
+// is half of it.
+@fragment
+fn fragment_surfaces(input: ScreenOutput) -> @location(0) vec4<f32> {
+    let held = textureLoad(surfaces, vec2<i32>(input.clip_position.xy), 0);
+
+    if (held.w <= 0.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
+    var level = clamp(held.xyz * 0.5 + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    if (tuning.depth.x > 1.5) {
+        level = vec3<f32>(clamp(held.w, 0.0, 1.0));
+    }
+
+    if (tuning.depth.w > 0.5) {
+        level = vec3<f32>(undone(level.x), undone(level.y), undone(level.z));
+    }
+
+    return vec4<f32>(level, 1.0);
 }

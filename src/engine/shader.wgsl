@@ -9,6 +9,13 @@
 // built, so none of the three can be a branch. Six pipelines come out of the
 // six pairs.
 //
+// Two more fragment entry points draw nothing anybody sees. The pass before the
+// scene runs the same two vertex entry points into a target of its own and
+// writes down, for every pixel of the solid and the masked half, the normal the
+// picture is about to be lit with and how rough the surface is there - four
+// more pipelines, and no second copy of any of the arithmetic below. @ref
+// `colby_engine::prepass`.
+//
 // Shading is metallic-roughness: Cook-Torrance specular with GGX, Smith
 // visibility and Schlick's Fresnel, over a Lambert diffuse. One directional
 // light with cascaded shadows, up to MAX_LAMPS local ones whose maps are tiles
@@ -884,6 +891,50 @@ fn fragment_blended(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(shade(input, sampled), sampled.a * input.tint.a);
 }
 
+// What the pass before the scene writes for a solid surface: the normal it is
+// about to be lit with, and how rough it is where the lobe reads it.
+//
+// **The surface `shade` lights, not a cheaper cousin of it.** The normal map and
+// every decal have turned the normal by the time it is written, because this
+// asks the same function `shade` asks.
+//
+// The albedo is not sampled. Its color is the one thing about a surface this
+// pass does not write, and a solid surface keeps its whole face whatever the
+// picture says, so a white texel stands in and is multiplied into a color
+// nobody reads.
+@fragment
+fn fragment_prepass(input: VertexOutput) -> @location(0) vec4<f32> {
+    return prepared(surface_at(input, vec4<f32>(1.0)));
+}
+
+// The same for a surface whose picture has holes in it, which leaves a hole in
+// the buffer wherever it leaves one in the picture.
+//
+// **One cutoff and no coverage.** The pass is one sample a pixel whatever the
+// picture is drawn with, so the alpha to coverage the picture's own pipeline
+// turns on at four samples has nothing to spread across here: a leaf's edge is
+// hard in the buffer where it is soft in the picture.
+@fragment
+fn fragment_prepass_masked(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+    if (sampled.a < MASK_CUTOFF) {
+        discard;
+    }
+
+    return prepared(surface_at(input, sampled));
+}
+
+// A surface as the pass before the scene stores it: xyz the normal, in the
+// world and of unit length, and w the roughness the lobe reads.
+//
+// **The roughness is held above `MIN_ROUGHNESS` here as `shade` holds it**,
+// which is what the lobe is evaluated at, and it is also what makes nought in
+// that channel mean that nothing was drawn: the pass clears the target to
+// nought, and no surface is ever smoother than that.
+fn prepared(surface: Surface) -> vec4<f32> {
+    return vec4<f32>(surface.normal, clamp(surface.roughness, MIN_ROUGHNESS, 1.0));
+}
+
 // What one point of a surface is made of, before it is lit: what its own
 // material says, and then whatever the decals over it painted.
 struct Surface {
@@ -1013,11 +1064,15 @@ fn bent(normal: vec3<f32>, right: vec3<f32>, numbers: vec3<f32>) -> vec3<f32> {
     return normalize(along_u * numbers.x + along_v * numbers.y + normal * numbers.z);
 }
 
-// Everything all three entry points do once the albedo has been sampled.
+// What one point of a surface is once its own picture and every decal over it
+// have had their say: the half of `shade` that comes before any light.
 //
-// Returns the color alone. What goes in the alpha channel is the one thing the
-// three disagree about, so it is theirs rather than this function's.
-fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
+// **A function of its own because two passes ask it.** The scene lights what
+// this returns, and the pass before the scene writes down its normal and its
+// roughness for whatever reads them before anything is lit - and a normal read
+// in place of the one the picture is shaded with has to be this arithmetic
+// rather than a copy of it that the next decal change leaves behind.
+fn surface_at(input: VertexOutput, sampled: vec4<f32>) -> Surface {
     // how far the point moves from one pixel to the next, asked here and not
     // among the decals: a derivative wants every pixel of a quad asking it
     // together, and whether the decals are asked at all is up to the entity.
@@ -1035,6 +1090,15 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
         surface = painted(surface, input.world_position, normalize(input.normal), across, down);
     }
 
+    return surface;
+}
+
+// Everything all three entry points do once the albedo has been sampled.
+//
+// Returns the color alone. What goes in the alpha channel is the one thing the
+// three disagree about, so it is theirs rather than this function's.
+fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
+    let surface = surface_at(input, sampled);
     let base_color = surface.color;
 
     let metallic = clamp(surface.metallic, 0.0, 1.0);

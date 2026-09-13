@@ -652,6 +652,15 @@ fn install_render(world: &mut World) {
 		"draw the depth instead of the picture: black at the eye, white this many units away; \
 		 nought is the picture",
 	);
+	// what the pass before the scene wrote, drawn instead of the picture: the
+	// depth view's twin, off and not saved for its reasons. What it is for is
+	// looking at what a pass before the scene reads.
+	world.cvars.var(
+		colby_engine::prepass::VIEW,
+		Value::Float(colby_engine::prepass::NO_VIEW),
+		"draw what every surface is instead of the picture: 1 its normal, 2 its roughness; \
+		 nought is the picture",
+	);
 	// how many samples a pixel of the world is drawn with. **Saved**, unlike
 	// the two above and like `r.backend`: how much a machine can afford to
 	// spend on smooth edges is a property of the machine rather than of a
@@ -1408,6 +1417,7 @@ mod tests {
 		),
 		(colby_engine::cull::ENABLED, Value::Bool(true)),
 		(colby_engine::depth::VIEW, Value::Float(colby_engine::depth::NO_VIEW)),
+		(colby_engine::prepass::VIEW, Value::Float(colby_engine::prepass::NO_VIEW)),
 		// `crate::console::volumes`, all four
 		(colby_audio::MASTER, Value::Float(1.0)),
 		(colby_audio::EFFECTS, Value::Float(1.0)),

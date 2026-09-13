@@ -159,6 +159,23 @@ impl Capture {
 		}
 	}
 
+	/// Draws a frame into one rectangle of the target, the way a window with
+	/// tools around its picture draws the world into the middle. A test's.
+	///
+	/// @param world - the state to draw; its `aspect` is overwritten to match
+	/// the rectangle
+	/// @param view - the rectangle
+	#[cfg(test)]
+	pub(crate) fn draw_within(&mut self, world: &mut World, view: crate::Viewport) {
+		world.aspect = view.aspect();
+
+		let target = self
+			.color
+			.create_view(&TextureViewDescriptor::default());
+
+		self.scene.render(&target, world, Some(view), 0.0);
+	}
+
 	/// The device this capture draws with.
 	///
 	/// For an [`Overlay`], which builds its pipelines against the same device
