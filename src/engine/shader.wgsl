@@ -19,9 +19,10 @@
 // Shading is metallic-roughness: Cook-Torrance specular with GGX, Smith
 // visibility and Schlick's Fresnel, over a Lambert diffuse. One directional
 // light with cascaded shadows, up to MAX_LAMPS local ones whose maps are tiles
-// of the same atlas, and no image-based lighting - the ambient term stands in
-// for everything the scene does not simulate, which is why it is a color and
-// not a number.
+// of the same atlas, and one term for everything the scene does not simulate:
+// the world's environment when its sky names one and its one ambient color
+// when it does not, both through the same split-sum table, and both multiplied
+// by how much of the sky the surface can see - which nothing a light sends is.
 //
 // The local lights are a flat array walked by every fragment: no tiles, no
 // clusters, no per-object list. What keeps that affordable is that the CPU
@@ -192,6 +193,13 @@ struct Paint {
 // `colby_engine::brdf::SIDE`, and a test says the two agree - a shader cannot
 // ask a texture how big it is without giving up the level argument.
 const SPLIT_SIDE: f32 = 64.0;
+
+// How much of the sky each pixel sees, worked out before this pass from the
+// pass before the scene: half the picture on each axis, r the share and g how
+// far along the view it was worked out, or one texel that says all of the sky
+// in a frame nobody asked for it in. Beside the table for the table's reason.
+// @ref `colby_engine::occlusion`, and `occlusion_at` for how it is read.
+@group(0) @binding(8) var occlusion: texture_2d<f32>;
 
 @group(1) @binding(0) var albedo: texture_2d<f32>;
 @group(1) @binding(1) var surface_sampler: sampler;
@@ -855,7 +863,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // One, not the tint's own alpha: a surface this pipeline draws is solid
     // whatever the material says, which is what every renderer with an alpha
     // mode does with the number in its other modes.
-    return vec4<f32>(shade(input, textureSample(albedo, surface_sampler, input.uv)), 1.0);
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+
+    return vec4<f32>(shade(input, sampled, seen(input)), 1.0);
 }
 
 // The same, for a surface whose picture has holes in it.
@@ -869,11 +879,14 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
     let sampled = textureSample(albedo, surface_sampler, input.uv);
+    // before anything decides to throw the fragment away, for the sample's
+    // reason: @ref `seen`
+    let lit = seen(input);
     if (sampled.a < MASK_CUTOFF) {
         discard;
     }
 
-    return vec4<f32>(shade(input, sampled), 1.0);
+    return vec4<f32>(shade(input, sampled, lit), 1.0);
 }
 
 // And for a surface what is behind still shows through.
@@ -884,11 +897,104 @@ fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
 // what is already there; the depth buffer is read and not written, and the pass
 // this runs in is sorted far to near, both of which are the pipeline's doing
 // rather than anything this file can see.
+//
+// **All of the sky, whatever is around it.** Nothing that blends is in the
+// buffer the share was worked out from, so what the buffer holds at a pane's
+// pixels is the share of whatever is behind the pane, and darkening the glass
+// by it would be lighting one surface with another's corners.
 @fragment
 fn fragment_blended(input: VertexOutput) -> @location(0) vec4<f32> {
     let sampled = textureSample(albedo, surface_sampler, input.uv);
 
-    return vec4<f32>(shade(input, sampled), sampled.a * input.tint.a);
+    return vec4<f32>(shade(input, sampled, 1.0), sampled.a * input.tint.a);
+}
+
+// How much of the sky the point a fragment of the solid or the masked half is
+// shading can see.
+//
+// A function of its own because both of those ask it before anything else, and
+// the masked one before it decides to throw the fragment away: how fast the
+// distance changes from one pixel to the next is a derivative, and a
+// derivative wants every pixel of a quad asking it together.
+//
+// **The distance is the w the view's own matrix gives the point, and not the
+// eye and the forward direction that `shade` finds its cascade with.** The two
+// are the same number. Written the same way, one channel of one pixel of a
+// fixture moved by a level at a strength of nought, with nothing hidden
+// anywhere - what a compiler sharing the two and rounding them another way
+// would do, and what reading the texel alone did not. Written this way the
+// picture at nought is the picture from before this was read, to the bit.
+fn seen(input: VertexOutput) -> f32 {
+    let along_view = (globals.view_projection * vec4<f32>(input.world_position, 1.0)).w;
+
+    return occlusion_at(input.clip_position.xy, along_view, fwidth(along_view));
+}
+
+// How much of the sky a pixel's surface sees, read out of the half-sized buffer.
+//
+// **Four texels, blended by where the pixel lies between them.** A texel stands
+// for the pixel at twice its place, so a pixel at an even place on both axes
+// reads its own texel and nothing else, and one at an odd place the mean of the
+// two or four around it. Written `a + (b - a) * t` rather than as a mix, so that
+// four texels of one come back one to the last bit: an open surface multiplies
+// its light by exactly one.
+//
+// **A texel that is not on this surface is not read.** One whose distance
+// along the view is further from the fragment's than the surface's own slope
+// allows is read as whichever of the four is nearest the fragment's distance
+// instead. Without that, a thing standing in front of a crease carries the
+// crease's darkness round its edge; and at four samples a pixel, a fragment on
+// an edge is shaded at the middle of a pixel where the buffer may hold
+// whatever is behind it. A slope rather than a share of the distance: on a
+// floor seen at a slant, two pixels next to each other legitimately differ by
+// more than a hundredth of how far away they are.
+//
+// **Every coordinate is held inside what is bound**, because a texel read past
+// the end of a texture comes back nought, and nought is the whole sky hidden.
+// The one texel a frame that asked for nothing binds answers one for every
+// pixel of the picture that way.
+//
+// @param pixel - the fragment's place on the picture, in pixels
+// @param along_view - how far along the view the fragment is
+// @param slope - how much that changes from one pixel to the next
+fn occlusion_at(pixel: vec2<f32>, along_view: f32, slope: f32) -> f32 {
+    let last = vec2<i32>(textureDimensions(occlusion)) - vec2<i32>(1);
+    let at = vec2<i32>(pixel);
+    let base = at / 2;
+    let t = vec2<f32>(at - base * 2) * 0.5;
+
+    var texels = array<vec4<f32>, 4>(
+        textureLoad(occlusion, min(base, last), 0),
+        textureLoad(occlusion, min(base + vec2<i32>(1, 0), last), 0),
+        textureLoad(occlusion, min(base + vec2<i32>(0, 1), last), 0),
+        textureLoad(occlusion, min(base + vec2<i32>(1, 1), last), 0),
+    );
+    let within = slope * 1.5 + along_view * 1.0e-3;
+
+    var nearest = texels[0].r;
+    var closest = abs(texels[0].g - along_view);
+
+    for (var index = 1u; index < 4u; index++) {
+        let off = abs(texels[index].g - along_view);
+
+        if (off < closest) {
+            closest = off;
+            nearest = texels[index].r;
+        }
+    }
+
+    var shares = array<f32, 4>();
+
+    for (var index = 0u; index < 4u; index++) {
+        let own = abs(texels[index].g - along_view) <= within;
+
+        shares[index] = select(nearest, texels[index].r, own);
+    }
+
+    let upper = shares[0] + (shares[1] - shares[0]) * t.x;
+    let lower = shares[2] + (shares[3] - shares[2]) * t.x;
+
+    return upper + (lower - upper) * t.y;
 }
 
 // What the pass before the scene writes for a solid surface: the normal it is
@@ -1097,7 +1203,10 @@ fn surface_at(input: VertexOutput, sampled: vec4<f32>) -> Surface {
 //
 // Returns the color alone. What goes in the alpha channel is the one thing the
 // three disagree about, so it is theirs rather than this function's.
-fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
+//
+// @param lit - how much of the sky the point sees, which the entry point asks
+// for because the masked one has to ask before its discard: @ref `seen`
+fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32) -> vec3<f32> {
     let surface = surface_at(input, sampled);
     let base_color = surface.color;
 
@@ -1188,6 +1297,17 @@ fn shade(input: VertexOutput, sampled: vec4<f32>) -> vec3<f32> {
     } else {
         indirect = globals.ambient.rgb * (indirect_diffuse + ambient_specular);
     }
+
+    // how much of the sky this point can see, and it multiplies this term and
+    // nothing else, for the shadows' reason turned round: a sun or a lamp is
+    // taken away by its own shadow, and what stands in for the light arriving
+    // from everywhere is taken away by whatever is near enough to be in the
+    // way of everywhere. Both halves by the one number, because the buffer
+    // holds one: every second factor in the field is a fit to something it
+    // does not hold. After the branch rather than inside each side of it, so
+    // that both are multiplied by the same thing the same way.
+    indirect *= lit;
+
     // @ref `HDR_CEILING`: past it a smooth highlight would not fit the target.
     let color = min(direct + indirect, vec3<f32>(HDR_CEILING));
 

@@ -40,6 +40,14 @@
 //! thing is taken for solid, and a pole darkens the floor behind it as if it
 //! were a wall. Glass, particles and the debug lines are not in the buffers it
 //! reads, so they hide nothing.
+//!
+//! **What it multiplies is the light that arrives by other routes, and nothing
+//! a light sends.** The scene reads the buffer in the fragment stage of its
+//! solid and its masked half and multiplies the one term that stands in for
+//! everything the renderer does not simulate; a sun or a lamp is taken away by
+//! its own shadow, and a pane of glass is not in the buffer, so it reads one. A
+//! frame nobody asks for the estimate in binds one texel that says all of the
+//! sky, which multiplies by exactly one.
 
 use colby_core::{
 	Result,
@@ -51,12 +59,13 @@ use wgpu::{
 	BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
 	BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
 	BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder, Device,
-	ErrorFilter, Extent3d, FragmentState, LoadOp, MultisampleState, Operations,
+	ErrorFilter, Extent3d, FragmentState, LoadOp, MultisampleState, Operations, Origin3d,
 	PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, Queue, RenderPass,
 	RenderPassColorAttachment, RenderPassDescriptor, RenderPassTimestampWrites, RenderPipeline,
 	RenderPipelineDescriptor, ShaderModule, ShaderModuleDescriptor, ShaderSource, ShaderStages,
-	StoreOp, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
-	TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
+	StoreOp, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
+	TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+	TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
 use crate::{
@@ -65,6 +74,21 @@ use crate::{
 	shader::Shader,
 	timing::{Ends, Pass, Timings},
 };
+
+/// The console variable that says how much of what the estimate finds hidden
+/// the picture takes away.
+///
+/// **A strength, on, and not saved.** One takes away all of it and nought none
+/// of it; a frame at nought records no pass and multiplies by one texel that
+/// says all of the sky, so nought is the picture exactly as it was before any
+/// of this existed, which is what the variable is for beside turning the cost
+/// off. On for the shadows' reason: what it corrects is the light itself, the
+/// ambient term reaching into corners it cannot reach, and what a machine that
+/// cannot afford the correction needs is somewhere to say so.
+pub const STRENGTH: &str = "r.occlusion";
+
+/// What [`STRENGTH`] holds until somebody sets it: all of it.
+pub const DEFAULT_STRENGTH: f32 = 1.0;
 
 /// How far away something may be and still hide the sky from a surface, in
 /// world units.
@@ -123,9 +147,13 @@ pub(crate) struct Asking {
 
 /// What this frame asks for, if anything.
 ///
-/// The view that draws the buffer is the only thing that asks so far.
+/// The picture asks at the strength [`STRENGTH`] says, and not at all at
+/// nought. The view that draws the buffer asks whatever that says and at the
+/// whole strength, because what it draws is how much of the sky a surface sees
+/// rather than how much of it the picture takes away - and the picture is not
+/// on the screen while it is.
 ///
-/// @param world - for the aspect
+/// @param world - for the aspect and the console variable
 /// @param camera - the camera this frame is drawn from
 /// @param showing - what the view is asked to draw, if anything
 #[must_use]
@@ -134,7 +162,13 @@ pub(crate) fn asking_of(
 	camera: &Camera,
 	showing: Option<Showing>,
 ) -> Option<Asking> {
-	if showing != Some(Showing::Occlusion) {
+	let strength = if showing == Some(Showing::Occlusion) {
+		1.0
+	} else {
+		strength_of(world)
+	};
+
+	if strength <= 0.0 {
 		return None;
 	}
 
@@ -144,8 +178,34 @@ pub(crate) fn asking_of(
 	Some(Asking {
 		view: [0, 1, 2].map(|axis| view.row(axis).to_array()),
 		lens: [lens.x_axis.x, lens.y_axis.y, lens.z_axis.z, lens.w_axis.z],
-		strength: 1.0,
+		strength,
 	})
+}
+
+/// How much of what is hidden the picture asks to take away.
+///
+/// @param world - for the console variable
+fn strength_of(world: &World) -> f32 {
+	held(
+		world
+			.cvars
+			.float(STRENGTH)
+			.unwrap_or(DEFAULT_STRENGTH),
+	)
+}
+
+/// A strength as somebody asked for it, held inside nought and one.
+///
+/// A nan is the whole strength rather than none, the lamps' rule: a variable
+/// nobody meant to set should not quietly change the light.
+///
+/// @param asked - what the variable holds
+fn held(asked: f32) -> f32 {
+	if asked.is_nan() {
+		return DEFAULT_STRENGTH;
+	}
+
+	asked.clamp(0.0, 1.0)
 }
 
 /// The two half-sized buffers, and the way the second pass reads the first.
@@ -172,6 +232,20 @@ pub(crate) struct Occlusion {
 	/// frame nothing does, the way the pass before the scene's are.
 	buffers: Option<Buffers>,
 
+	/// Which making of [`buffers`](Self::buffers) a reader is looking at.
+	///
+	/// **Moved when they are made as well as when they are let go**, where the
+	/// pass before the scene's moves only when its targets go: that pass's one
+	/// reader makes its group only while there are targets, and the scene's
+	/// frame group is made whether there are buffers or not - over
+	/// [`none`](Self::none) when there are not - so a pair of buffers arriving
+	/// is a change that group has to hear about too.
+	epoch: u64,
+
+	/// One texel that says a surface sees all of the sky, which is what a
+	/// reader binds in a frame nobody asked for the estimate in.
+	none: TextureView,
+
 	/// How both passes read what the pass before the scene wrote, and which of
 	/// that pass's buffers the group is for. @ref [`Prepass::epoch`].
 	reading: Option<(u64, BindGroup)>,
@@ -186,14 +260,16 @@ pub(crate) struct Occlusion {
 }
 
 impl Occlusion {
-	/// Builds both pipelines and the block they read their numbers from.
+	/// Builds both pipelines, the block they read their numbers from and the
+	/// texel a frame that asks for nothing binds.
 	///
 	/// No buffer yet: a frame that asks for nothing never makes one.
 	///
 	/// @param device - the device to build against
+	/// @param queue - where the texel that says all of the sky is written
 	/// @param width - the picture's width in pixels
 	/// @param height - its height
-	pub(crate) fn new(device: &Device, width: u32, height: u32) -> Result<Self> {
+	pub(crate) fn new(device: &Device, queue: &Queue, width: u32, height: u32) -> Result<Self> {
 		let numbers_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
 			label: Some("occlusion numbers"),
 			entries: &[BindGroupLayoutEntry {
@@ -258,6 +334,8 @@ impl Occlusion {
 		Ok(Self {
 			size: (width, height),
 			buffers: None,
+			epoch: 0,
+			none: whole_sky(device, queue),
 			reading: None,
 			tuning,
 			numbers,
@@ -279,7 +357,14 @@ impl Occlusion {
 		}
 
 		self.size = (width, height);
-		self.buffers = None;
+		self.let_go();
+	}
+
+	/// Lets both buffers go, and says so to whoever holds a group over them.
+	fn let_go(&mut self) {
+		if self.buffers.take().is_some() {
+			self.epoch = self.epoch.wrapping_add(1);
+		}
 	}
 
 	/// Records both passes, or lets the buffers go.
@@ -305,7 +390,7 @@ impl Occlusion {
 		else {
 			// the group too: it holds the pass before the scene's buffers, which
 			// that pass lets go in the same frame
-			self.buffers = None;
+			self.let_go();
 			self.reading = None;
 
 			return;
@@ -322,12 +407,15 @@ impl Occlusion {
 				view_y,
 				view_z,
 				lens: asked.lens,
-				size: [pixels(width), pixels(height), RADIUS, asked.strength.clamp(0.0, 1.0)],
+				// held inside nought and one already, by the one place that makes
+				// an asking
+				size: [pixels(width), pixels(height), RADIUS, asked.strength],
 			}),
 		);
 
 		if self.buffers.is_none() {
 			self.buffers = Some(buffers(&self.device, &self.raw_layout, self.size));
+			self.epoch = self.epoch.wrapping_add(1);
 		}
 
 		// kept rather than made each frame, for the reason the smear keeps its
@@ -405,6 +493,14 @@ impl Occlusion {
 		self.buffers.as_ref().map(|buffers| &buffers.done)
 	}
 
+	/// What the scene binds for the share of the sky: [`done`](Self::done), or
+	/// one texel that says all of it in a frame that did not ask.
+	pub(crate) fn bound(&self) -> &TextureView { self.done().unwrap_or(&self.none) }
+
+	/// Which making of the buffers [`bound`](Self::bound) hands back. @ref
+	/// [`epoch`](Self::epoch)'s field for when it moves.
+	pub(crate) const fn epoch(&self) -> u64 { self.epoch }
+
 	/// What the last frame wrote, two floats a texel, top row first. A test's.
 	///
 	/// @param device - to build the staging buffer on
@@ -412,8 +508,7 @@ impl Occlusion {
 	#[cfg(test)]
 	pub(crate) fn values(&self, device: &Device, queue: &Queue) -> Option<Vec<[f32; 2]>> {
 		let texture = self.done()?.texture();
-		let bytes =
-			crate::depth::copied_out(device, queue, texture, wgpu::TextureAspect::All, 8)?;
+		let bytes = crate::depth::copied_out(device, queue, texture, TextureAspect::All, 8)?;
 
 		Some(
 			bytes
@@ -446,6 +541,57 @@ pub(crate) const fn entry(binding: u32) -> BindGroupLayoutEntry {
 		},
 		count: None,
 	}
+}
+
+/// One texel of the buffers' format that says a surface sees all of the sky
+/// and nothing was drawn there.
+///
+/// **One, and read with its coordinate held inside it.** A texel read past the
+/// end of a texture comes back nought, and nought is the whole sky hidden, so
+/// the scene holds every coordinate it reads to the size of what is bound
+/// rather than trusting a one-by-one texture to answer for a whole picture.
+/// Multiplying by it is multiplying by one, which leaves every bit where it
+/// was.
+///
+/// @param device - the device to build against
+/// @param queue - where the texel is written
+fn whole_sky(device: &Device, queue: &Queue) -> TextureView {
+	let texture = device.create_texture(&TextureDescriptor {
+		label: Some("occlusion none"),
+		size: Extent3d {
+			width: 1,
+			height: 1,
+			depth_or_array_layers: 1,
+		},
+		mip_level_count: 1,
+		sample_count: 1,
+		dimension: TextureDimension::D2,
+		format: FORMAT,
+		usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+		view_formats: &[],
+	});
+
+	queue.write_texture(
+		TexelCopyTextureInfo {
+			texture: &texture,
+			mip_level: 0,
+			origin: Origin3d::ZERO,
+			aspect: TextureAspect::All,
+		},
+		bytemuck::cast_slice(&[1.0_f32, 0.0]),
+		TexelCopyBufferLayout {
+			offset: 0,
+			bytes_per_row: Some(8),
+			rows_per_image: Some(1),
+		},
+		Extent3d {
+			width: 1,
+			height: 1,
+			depth_or_array_layers: 1,
+		},
+	);
+
+	texture.create_view(&TextureViewDescriptor::default())
 }
 
 /// A count of pixels as the float the shader reads it as.
@@ -620,12 +766,16 @@ fn pipeline(
 #[cfg(test)]
 mod tests {
 	use colby_core::{
-		abi::{EntityId, MaterialId, MeshId, Renderable, Transform, Value},
+		abi::{
+			EntityId, Light, MaterialId, MeshId, Post, Renderable, Sky, ToneMap, Transform,
+			Value,
+			material::{Blend, Material},
+		},
 		glam::{Quat, Vec2, Vec3},
 	};
 
 	use super::*;
-	use crate::{Capture, prepass, scene::MSAA};
+	use crate::{Capture, Image, prepass, scene::MSAA};
 
 	/// How big every capture here is.
 	const SIZE: (u32, u32) = (320, 240);
@@ -686,6 +836,29 @@ mod tests {
 	/// is some forty pixels across on the screen here, twenty texels.
 	const MARGIN: u32 = 24;
 
+	/// How far a byte of the picture at one may be from the picture at nought
+	/// times the share, worked out in linear light and put back through the
+	/// curve.
+	///
+	/// **Measured at 0.70 and set at twice it.** What is left is two roundings
+	/// to a byte, the one the picture at nought was read back through and the
+	/// one the picture at one is written with. Reading the nearest texel rather
+	/// than blending four is some three bytes out across the crease, and a
+	/// share multiplied in twice or by the wrong strength a great deal more.
+	const PICTURE_WITHIN: f32 = 1.4;
+
+	/// How many pixels of a box's edge in front of a dark crease may still pick
+	/// the crease up at four samples a pixel, out of some eighty that do when
+	/// the distance is not matched at all.
+	///
+	/// **Measured at 13 and set at twice it; at one sample it is nought.** At
+	/// four, a fragment on an edge is shaded at the middle of a pixel the pass
+	/// before the scene saw the crease at, and when none of the four texels
+	/// around that pixel is the box there is nothing of the box's own to read.
+	/// The one sample a pixel that pass draws with, `C1-4`, is where that comes
+	/// from.
+	const EDGE_AT_FOUR: usize = 26;
+
 	/// A capture on the binary's one device, or `None` with no GPU.
 	fn capture() -> Option<Capture> {
 		let gpu = crate::gpu::shared()?;
@@ -706,8 +879,47 @@ mod tests {
 		world.cvars.set(prepass::VIEW, showing);
 	}
 
+	/// How much of what is hidden the picture takes away.
+	fn strength(world: &mut World, asked: &str) {
+		world
+			.cvars
+			.var(STRENGTH, Value::Float(DEFAULT_STRENGTH), "");
+		world.cvars.set(STRENGTH, asked);
+	}
+
+	/// The picture's own look out of the way, and the light arriving from
+	/// everywhere the only light: no curve, an exposure of one, no sky, and a
+	/// sun that travels straight up and so lights nothing the camera sees.
+	fn flat(world: &mut World, ambient: f32) {
+		world.post = Post {
+			tonemap: ToneMap::None,
+			auto_exposure: false,
+			exposure: 1.0,
+			..Post::DEFAULT
+		};
+		world.sky = Sky::NONE;
+		world.clear = Vec3::ZERO;
+		world.light = Vec3::Y;
+		world.ambient = Vec3::splat(ambient);
+	}
+
+	/// The scene's own shader with one piece of it replaced, which has to be in
+	/// it exactly once.
+	fn variant(find: &str, replace: &str) -> String {
+		let source = include_str!("shader.wgsl");
+
+		assert_eq!(source.matches(find).count(), 1, "`{find}` is in the shader exactly once");
+
+		source.replace(find, replace)
+	}
+
 	/// A box of the default material standing somewhere.
 	fn slab(world: &mut World, position: Vec3, scale: Vec3) -> EntityId {
+		tinted(world, position, scale, Vec3::ONE)
+	}
+
+	/// The same in a color of its own.
+	fn tinted(world: &mut World, position: Vec3, scale: Vec3, tint: Vec3) -> EntityId {
 		let id = world.entities.spawn_at(Transform {
 			position,
 			rotation: Quat::IDENTITY,
@@ -716,9 +928,35 @@ mod tests {
 
 		world
 			.entities
-			.set_renderable(id, Renderable::of(MeshId::CUBE, MaterialId::DEFAULT, Vec3::ONE));
+			.set_renderable(id, Renderable::of(MeshId::CUBE, MaterialId::DEFAULT, tint));
 
 		id
+	}
+
+	/// How many pixels of two pictures differ, and how many of those are darker
+	/// in the first.
+	fn darker(one: &Image, other: &Image) -> (usize, usize) {
+		let pairs: Vec<(&[u8], &[u8])> = one
+			.pixels
+			.chunks_exact(4)
+			.zip(other.pixels.chunks_exact(4))
+			.filter(|(a, b)| a != b)
+			.collect();
+		let dimmer = pairs
+			.iter()
+			.filter(|(a, b)| {
+				a.iter()
+					.take(3)
+					.map(|v| u32::from(*v))
+					.sum::<u32>() < b
+					.iter()
+					.take(3)
+					.map(|v| u32::from(*v))
+					.sum::<u32>()
+			})
+			.count();
+
+		(pairs.len(), dimmer)
 	}
 
 	/// A floor whose top is at nought and a wall whose face is at `wall`, seen
@@ -1022,7 +1260,47 @@ mod tests {
 	}
 
 	#[test]
-	fn the_pass_runs_only_while_something_asks_and_leaves_the_picture_as_it_was() {
+	fn a_strength_nobody_could_mean_lands_somewhere_definite() {
+		// no device: what a frame asks for is worked out before anything is drawn.
+		// Compared as bits, and written out as literals rather than read off the
+		// constants they check
+		let mut world = World::new();
+		let camera = world.render_camera();
+		let asked = |world: &World, showing| {
+			asking_of(world, &camera, showing).map(|asking| asking.strength.to_bits())
+		};
+		let whole = Some(1.0_f32.to_bits());
+
+		assert_eq!(asked(&world, None), whole, "a world that never said is taken at all of it");
+
+		for (typed, wanted) in
+			[("0.25", Some(0.25_f32.to_bits())), ("0", None), ("-1", None), ("3", whole)]
+		{
+			strength(&mut world, typed);
+
+			assert_eq!(asked(&world, None), wanted, "a strength of {typed}");
+		}
+
+		// the console refuses a nan typed at it, and a game setting the variable
+		// does not have to
+		assert_eq!(held(f32::NAN).to_bits(), 1.0_f32.to_bits(), "a nan is all of it");
+
+		strength(&mut world, "0");
+
+		assert_eq!(
+			asked(&world, Some(Showing::Occlusion)),
+			whole,
+			"and the view asks at the whole of it whatever the strength says"
+		);
+		assert_eq!(
+			asked(&world, Some(Showing::Normal)),
+			None,
+			"while a view of something else asks for nothing"
+		);
+	}
+
+	#[test]
+	fn the_passes_run_while_the_picture_or_the_view_asks_and_not_at_all_at_nought() {
 		let Some(mut capture) = capture() else {
 			return;
 		};
@@ -1030,36 +1308,613 @@ mod tests {
 
 		for samples in ["4", "1"] {
 			asking(&mut world, samples, "0");
+			strength(&mut world, "0");
 
 			let before = capture
 				.shoot(&mut world)
 				.expect("the capture renders");
 			let quiet = capture.scene_mut().spans().passes();
+			let held_quiet = capture.scene_mut().occlusion_values().is_some();
 
+			// the view asks whatever the strength says
 			asking(&mut world, samples, "3");
 			capture.draw(&mut world, &mut []);
 
-			let asked = capture.scene_mut().spans().passes();
+			let viewed = capture.scene_mut().spans().passes();
+
+			// and the picture asks at any strength above nought
+			asking(&mut world, samples, "0");
+			strength(&mut world, "0.25");
+			capture.draw(&mut world, &mut []);
+
+			let pictured = capture.scene_mut().spans().passes();
 			let held = capture.scene_mut().occlusion_values().is_some();
 
-			asking(&mut world, samples, "0");
+			strength(&mut world, "0");
 
 			let after = capture
 				.shoot(&mut world)
 				.expect("the capture renders");
 
 			assert_eq!(
-				asked,
+				viewed,
 				quiet + 3,
-				"at {samples} samples the pass before the scene, the estimate and the average"
+				"at {samples} samples the view asks for the pass before the scene, the estimate \
+				 and the average"
 			);
-			assert_eq!(capture.scene_mut().spans().passes(), quiet, "and none of them after");
-			assert!(held, "the buffers are there while asked");
+			assert_eq!(
+				pictured,
+				quiet + 3,
+				"and so does the picture at a quarter of the strength"
+			);
+			assert_eq!(capture.scene_mut().spans().passes(), quiet, "and at nought none of them");
+			assert!(!held_quiet && held, "the buffers are there only while asked");
 			assert!(
 				capture.scene_mut().occlusion_values().is_none(),
 				"and let go when nothing asks"
 			);
-			assert!(before.pixels == after.pixels, "and the picture is the one it was");
+			assert!(before.pixels == after.pixels, "and the picture at nought is the one it was");
+		}
+	}
+
+	#[test]
+	fn group_nought_is_made_again_only_when_the_buffers_are_made_or_let_go() {
+		// kept rather than made each frame: a frame that asks what the last one
+		// asked binds the group it already has, and nothing a picture shows
+		// would say otherwise
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = crease();
+
+		asking(&mut world, "1", "0");
+		strength(&mut world, "1");
+		capture.draw(&mut world, &mut []);
+
+		let first = capture.scene_mut().rebinds();
+
+		for _ in 0..4 {
+			capture.draw(&mut world, &mut []);
+		}
+
+		assert!(
+			first >= 1,
+			"the first frame that asks makes the buffers and the group over them"
+		);
+		assert_eq!(
+			capture.scene_mut().rebinds(),
+			first,
+			"four frames that ask the same make no group"
+		);
+
+		strength(&mut world, "0");
+		capture.draw(&mut world, &mut []);
+		capture.draw(&mut world, &mut []);
+
+		assert_eq!(capture.scene_mut().rebinds(), first + 1, "the buffers let go is one group");
+
+		strength(&mut world, "0.5");
+		capture.draw(&mut world, &mut []);
+		capture.draw(&mut world, &mut []);
+
+		assert_eq!(capture.scene_mut().rebinds(), first + 2, "and made again is one more");
+	}
+
+	#[test]
+	fn at_nought_the_picture_is_the_one_a_shader_that_multiplies_nothing_draws() {
+		// the texel a frame at nought binds says all of the sky, and multiplying
+		// by it has to leave every bit where it was. The second answer is the
+		// shader with the multiply taken out, which draws the same picture at any
+		// strength. The frame at one comes first, so the frame at nought after it
+		// has let its buffers go and has to have made group nought again rather
+		// than reading them stale.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		// a sun and a lamp too, so that a multiply that reached either would be
+		// in the picture as well
+		let mut world = lit_corner(0.6);
+		let unmultiplied = variant("indirect *= lit;", "");
+
+		for samples in ["1", "4"] {
+			asking(&mut world, samples, "0");
+			capture
+				.scene_mut()
+				.set_shader(include_str!("shader.wgsl"))
+				.expect("the scene's own shader builds");
+			strength(&mut world, "1");
+
+			let occluded = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			strength(&mut world, "0");
+
+			let plain = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			capture
+				.scene_mut()
+				.set_shader(&unmultiplied)
+				.expect("the shader without the multiply builds");
+			strength(&mut world, "1");
+
+			let passes_asked = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			strength(&mut world, "0");
+
+			let nothing = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+			let (moved, dimmer) = darker(&occluded, &plain);
+
+			assert!(
+				plain.pixels == nothing.pixels,
+				"at {samples} samples nought draws what a shader that multiplies nothing draws"
+			);
+			assert!(
+				passes_asked.pixels == nothing.pixels,
+				"and asking for the passes without the multiply changes no pixel either"
+			);
+			assert!(
+				moved > 1000 && dimmer == moved,
+				"while at one the corner is darker, and nothing is lighter: {dimmer} of {moved} \
+				 pixels"
+			);
+		}
+	}
+
+	#[test]
+	fn with_nothing_arriving_from_everywhere_the_picture_at_one_is_the_picture_at_nought() {
+		// what a light sends is never multiplied: with the ambient term at nought
+		// the sun on the floor and the wall and a lamp in the corner are the
+		// whole picture, and it has to come out the same to the bit however much
+		// of the sky the corner sees. The same world with an ambient term is what
+		// says the corner is in reach of something at all.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut moved_by = |samples: &str, ambient: f32| {
+			let mut world = lit_corner(ambient);
+
+			asking(&mut world, samples, "0");
+			strength(&mut world, "1");
+
+			let occluded = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			strength(&mut world, "0");
+
+			let plain = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			darker(&occluded, &plain).0
+		};
+
+		for samples in ["1", "4"] {
+			let lights_alone = moved_by(samples, 0.0);
+			let with_ambient = moved_by(samples, 0.5);
+
+			assert_eq!(
+				lights_alone, 0,
+				"at {samples} samples the sun and the lamp are not multiplied: {lights_alone} \
+				 pixels moved"
+			);
+			assert!(
+				with_ambient > 1000,
+				"while an ambient term in the same corner is darkened: {with_ambient} pixels"
+			);
+		}
+	}
+
+	/// The crease with a box on the floor near the wall, lit by a sun that
+	/// reaches the floor and the wall and by a lamp in the corner, and by an
+	/// ambient term of the level asked.
+	fn lit_corner(ambient: f32) -> World {
+		let mut world = crease();
+
+		flat(&mut world, ambient);
+		world.light = Vec3::new(0.3, -1.0, -0.6);
+		slab(&mut world, Vec3::new(0.6, 0.5, WALL + 0.9), Vec3::ONE);
+
+		let lamp = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(-0.8, 0.6, WALL + 0.6)));
+
+		world
+			.entities
+			.set_light(lamp, Light::point(Vec3::new(1.0, 0.8, 0.6), 3.0, 4.0));
+
+		world
+	}
+
+	#[test]
+	fn half_the_strength_takes_away_half_of_what_is_hidden() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = crease();
+
+		asking(&mut world, "1", "0");
+		strength(&mut world, "1");
+
+		let whole = written(&mut capture, &mut world);
+
+		strength(&mut world, "0.5");
+
+		let half = written(&mut capture, &mut world);
+		let drawn = whole
+			.iter()
+			.zip(&half)
+			.filter(|(one, _)| one[1] > 0.0);
+		let mut hidden = 0;
+
+		for (one, other) in drawn {
+			hidden += u32::from(one[0] < 0.9);
+
+			assert_eq!(one[1].to_bits(), other[1].to_bits(), "the distance is the same number");
+			assert!(
+				0.5_f32
+					.mul_add(1.0 - one[0], other[0] - 1.0)
+					.abs() <= 1.0e-6,
+				"a texel that sees {} at the whole strength sees {} at half",
+				one[0],
+				other[0]
+			);
+
+			if one[0].to_bits() == 1.0_f32.to_bits() {
+				assert_eq!(
+					other[0].to_bits(),
+					1.0_f32.to_bits(),
+					"and all of it stays all of it"
+				);
+			}
+		}
+
+		assert!(hidden > 1000, "and the crease is in it: {hidden} texels under nine tenths");
+	}
+
+	/// A byte of an sRGB picture as the linear level it encodes.
+	fn linear(byte: u8) -> f32 {
+		let level = f32::from(byte) / 255.0;
+
+		if level <= 0.040_45 {
+			level / 12.92
+		} else {
+			((level + 0.055) / 1.055).powf(2.4)
+		}
+	}
+
+	/// A linear level as the byte an sRGB target stores it as, before rounding.
+	fn encoded(level: f32) -> f32 {
+		let curved = if level <= 0.003_130_8 {
+			level * 12.92
+		} else {
+			1.055_f32.mul_add(level.powf(1.0 / 2.4), -0.055)
+		};
+
+		curved * 255.0
+	}
+
+	/// What the scene reads for a pixel of the picture out of the half-sized
+	/// buffer, worked out here rather than in the shader: the four texels
+	/// around it blended by where it lies between them.
+	///
+	/// `None` for a pixel whose four texels do not all lie on its own surface,
+	/// where the scene's match on distance takes over, and for one where
+	/// nothing was drawn. **On its own surface is decided by the normal as
+	/// well as the distance**: where a floor meets a wall the distance runs on
+	/// without a step, and the scene still turns the floor's texel away from
+	/// the wall's fragment, because the floor's distance changes faster than
+	/// the wall's own slope allows.
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_precision_loss,
+		reason = "a remainder of two, which is nought or one"
+	)]
+	fn upsampled(
+		values: &[[f32; 2]],
+		surfaces: &[[f32; 4]],
+		(column, row): (u32, u32),
+	) -> Option<f32> {
+		let (left, top) = (column / 2, row / 2);
+		let (right, bottom) = ((left + 1).min(HALF.0 - 1), (top + 1).min(HALF.1 - 1));
+		let places = [(left, top), (right, top), (left, bottom), (right, bottom)];
+		let four = places.map(|place| at(values, place));
+		let normal_at = |(across, down): (u32, u32)| {
+			surfaces
+				.get(usize::try_from(down * SIZE.0 + across).unwrap_or(usize::MAX))
+				.map(|texel| Vec3::new(texel[0], texel[1], texel[2]))
+		};
+		let own = normal_at((column, row))?;
+		let flat = places.iter().all(|&(across, down)| {
+			normal_at((across * 2, down * 2))
+				.is_some_and(|normal| normal.abs_diff_eq(own, 1.0e-3))
+		});
+		let near = four
+			.iter()
+			.map(|texel| texel[1])
+			.fold(f32::MAX, f32::min);
+		let far = four
+			.iter()
+			.map(|texel| texel[1])
+			.fold(0.0, f32::max);
+		// a plane's distance changes evenly across two texels; two parallel
+		// surfaces one behind the other do not
+		let bent = (four[0][1] + four[3][1] - four[1][1] - four[2][1]).abs();
+
+		if !flat
+			|| own == Vec3::ZERO
+			|| near <= 0.0
+			|| far - near > 0.02 * near
+			|| bent > 1.0e-3 * near
+		{
+			return None;
+		}
+
+		let (across, down) = ((column % 2) as f32 * 0.5, (row % 2) as f32 * 0.5);
+		let upper = (four[1][0] - four[0][0]).mul_add(across, four[0][0]);
+		let lower = (four[3][0] - four[2][0]).mul_add(across, four[2][0]);
+
+		Some((lower - upper).mul_add(down, upper))
+	}
+
+	#[test]
+	fn the_picture_at_one_is_the_picture_at_nought_times_the_share_the_buffer_holds() {
+		// three pictures of a room lit by nothing but the ambient term: at nought,
+		// at one, and with the term itself at nought, which is black. If the share
+		// multiplies exactly that term, the picture at one is the picture at
+		// nought times the share, read out of the half-sized buffer the way the
+		// scene reads it - which is worked out here from the buffer, for every
+		// pixel whose four texels lie on one surface. The box on the floor is
+		// drawn by the masked entry point, with nothing in its picture to cut
+		// away, so the entry point that has to ask before its discard is in the
+		// room too.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = crease();
+		let cutout = world
+			.materials
+			.insert("test/cutout", Material { blend: Blend::Mask, ..Material::DEFAULT });
+		let standing = slab(&mut world, Vec3::new(0.6, 0.5, WALL + 0.9), Vec3::ONE);
+
+		world
+			.entities
+			.set_renderable(standing, Renderable::of(MeshId::CUBE, cutout, Vec3::ONE));
+		asking(&mut world, "1", "0");
+		strength(&mut world, "1");
+		flat(&mut world, 0.0);
+
+		let dark = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		flat(&mut world, 0.8);
+
+		let occluded = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let shares = capture
+			.scene_mut()
+			.occlusion_values()
+			.expect("asked for, so written");
+		let surfaces = capture
+			.scene_mut()
+			.surface_values()
+			.expect("asked for, so written");
+
+		strength(&mut world, "0");
+
+		let plain = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let mut read = 0;
+		let mut hidden = 0;
+		let mut worst = 0.0_f32;
+
+		assert!(
+			dark.pixels
+				.chunks_exact(4)
+				.all(|pixel| pixel.iter().take(3).all(|channel| *channel == 0)),
+			"with nothing arriving from everywhere the room is black"
+		);
+
+		for (column, row) in
+			(0..SIZE.1).flat_map(|row| (0..SIZE.0).map(move |column| (column, row)))
+		{
+			let Some(share) = upsampled(&shares, &surfaces, (column, row)) else {
+				continue;
+			};
+			let before = plain.pixel(column, row);
+			let after = occluded.pixel(column, row);
+
+			read += 1;
+			hidden += u32::from(share < 0.9);
+
+			for channel in 0..3 {
+				let wanted = encoded(linear(before[channel]) * share);
+
+				worst = worst.max((f32::from(after[channel]) - wanted).abs());
+			}
+		}
+
+		assert!(read > 40_000 && hidden > 1000, "the room and its corners: {read} and {hidden}");
+		assert!(
+			worst <= PICTURE_WITHIN,
+			"the picture at one is the share of the one at nought, and it is out by {worst} of \
+			 a byte over {read} pixels"
+		);
+	}
+
+	#[test]
+	fn a_pane_of_glass_takes_nothing_away_from_itself() {
+		// nothing that blends is in the buffer, so at a pane's pixels it holds the
+		// share of whatever is behind the pane, and the pane is lit with all of the
+		// sky whatever that says. A pane opaque enough to hide what is behind it is
+		// what makes that a comparison of its own pixels: at one and at nought they
+		// are the same to the bit, while the same pane reading the buffer the way a
+		// solid surface does is darker.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let reading = variant(
+			"shade(input, sampled, 1.0), sampled.a * input.tint.a",
+			"shade(input, sampled, seen(input)), sampled.a * input.tint.a",
+		);
+
+		for samples in ["1", "4"] {
+			let mut world = crease();
+
+			flat(&mut world, 0.8);
+			asking(&mut world, samples, "0");
+			strength(&mut world, "0");
+			capture
+				.scene_mut()
+				.set_shader(include_str!("shader.wgsl"))
+				.expect("the scene's own shader builds");
+
+			let bare = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+			let glass = world.materials.insert("test/glass", Material {
+				blend: Blend::Alpha,
+				opacity: 1.0,
+				..Material::colored(Vec3::new(0.2, 0.5, 0.9))
+			});
+			let pane = world.entities.spawn_at(Transform {
+				position: Vec3::new(0.0, 0.4, WALL + 0.3),
+				rotation: Quat::IDENTITY,
+				scale: Vec3::new(1.6, 0.8, 0.05),
+			});
+
+			world
+				.entities
+				.set_renderable(pane, Renderable::of(MeshId::CUBE, glass, Vec3::ONE));
+
+			let plain = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			strength(&mut world, "1");
+
+			let occluded = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			capture
+				.scene_mut()
+				.set_shader(&reading)
+				.expect("the shader whose glass reads the buffer builds");
+
+			let wrong = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+			// the pane's own pixels, well inside it: covered, and so is every
+			// pixel around them, so that no sample of what is behind is in them
+			let covered =
+				|column: u32, row: u32| plain.pixel(column, row) != bare.pixel(column, row);
+			let inside: Vec<(u32, u32)> = (1..SIZE.1 - 1)
+				.flat_map(|row| (1..SIZE.0 - 1).map(move |column| (column, row)))
+				.filter(|&(column, row)| {
+					covered(column, row)
+						&& covered(column - 1, row)
+						&& covered(column + 1, row)
+						&& covered(column, row - 1)
+						&& covered(column, row + 1)
+				})
+				.collect();
+			let same = inside
+				.iter()
+				.filter(|&&(column, row)| occluded.pixel(column, row) == plain.pixel(column, row))
+				.count();
+			let darkened = inside
+				.iter()
+				.filter(|&&(column, row)| wrong.pixel(column, row) != occluded.pixel(column, row))
+				.count();
+
+			assert!(inside.len() > 2000, "the pane is in the picture: {} pixels", inside.len());
+			assert_eq!(same, inside.len(), "at {samples} samples the pane is not darkened");
+			assert!(darkened > 500, "and glass that read the buffer would be: {darkened} pixels");
+		}
+	}
+
+	#[test]
+	fn the_edge_of_a_box_in_front_of_a_crease_does_not_carry_the_crease_round_it() {
+		// a white box hanging in front of a black crease, further from both of its
+		// planes than the reach, so every texel of the box sees all of the sky and
+		// the crease behind its lower edge sees little of it. Drawn through a
+		// shader that paints each surface's own color times the share it reads,
+		// the box has to come out as it does through one that paints its color
+		// alone: a texel of the crease beside the edge is not the box's surface
+		// and is not read. The black crease paints nought either way, which is
+		// what leaves the box's own samples as the whole difference at four.
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let anchor = "return vec4<f32>(shade(input, sampled, seen(input)), 1.0);";
+		let painted = variant(anchor, "return vec4<f32>(input.tint.rgb * seen(input), 1.0);");
+		let whole = variant(anchor, "return vec4<f32>(input.tint.rgb, 1.0);");
+		let matching = "let own = abs(texels[index].g - along_view) <= within;";
+
+		assert_eq!(painted.matches(matching).count(), 1, "the match is in the shader once");
+
+		let unmatched = painted.replace(matching, "let own = true;");
+		let mut world = World::new();
+
+		world.camera.position = Vec3::new(0.0, 2.5, 1.0);
+		world.camera.target = Vec3::new(0.0, 0.0, WALL);
+		flat(&mut world, 0.8);
+		tinted(&mut world, Vec3::new(0.0, -0.5, 0.0), Vec3::new(40.0, 1.0, 40.0), Vec3::ZERO);
+		tinted(
+			&mut world,
+			Vec3::new(0.0, 5.0, WALL - 0.5),
+			Vec3::new(40.0, 10.0, 1.0),
+			Vec3::ZERO,
+		);
+		tinted(&mut world, Vec3::new(0.0, 0.9, WALL + 0.8), Vec3::splat(0.5), Vec3::ONE);
+		strength(&mut world, "1");
+
+		for samples in ["1", "4"] {
+			asking(&mut world, samples, "0");
+
+			let mut through = |source: &str| {
+				capture
+					.scene_mut()
+					.set_shader(source)
+					.expect("the variant builds");
+				capture
+					.shoot(&mut world)
+					.expect("the capture renders")
+			};
+			let alone = through(&whole);
+			let read = through(&painted);
+			let careless = through(&unmatched);
+			let lit = alone
+				.pixels
+				.chunks_exact(4)
+				.filter(|pixel| pixel[0] > 0)
+				.count();
+			let (halo, _) = darker(&read, &alone);
+			let (picked_up, dimmer) = darker(&careless, &alone);
+
+			let allowed = if samples == "1" { 0 } else { EDGE_AT_FOUR };
+
+			assert!(lit > 1000, "the box is in the picture: {lit} pixels");
+			assert!(
+				picked_up > 20 && dimmer == picked_up,
+				"at {samples} samples an edge that read whatever texel is nearest picks the \
+				 crease up: {dimmer} of {picked_up} pixels darker"
+			);
+			assert!(
+				halo <= allowed && halo * 3 <= picked_up,
+				"and one that matches the distance does not: {halo} pixels against {picked_up}"
+			);
 		}
 	}
 
@@ -1129,6 +1984,17 @@ mod tests {
 		}
 
 		assert!(darker > 500, "and the crease is in it: {darker} texels under nine tenths");
+
+		// and the view draws the share whatever the picture's strength says: what
+		// it is for is looking at the estimate, and the picture is not on the
+		// screen while it is
+		strength(&mut world, "0");
+
+		let at_nought = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert!(image.pixels == at_nought.pixels, "at nought the view is the same picture");
 	}
 
 	#[test]

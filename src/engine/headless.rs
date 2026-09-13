@@ -31,7 +31,7 @@ mod tests {
 	};
 	use wgpu::TextureFormat;
 
-	use crate::{Capture, Gpu, depth, prepass, scene, shadow};
+	use crate::{Capture, Gpu, depth, occlusion, prepass, scene, shadow};
 
 	/// How big the target is. Small on purpose: nothing here reads it.
 	const SIZE: (u32, u32) = (16, 16);
@@ -281,6 +281,32 @@ mod tests {
 			capture.shoot(&mut world).expect(
 				"how much of the sky each pixel sees, drawn instead of the picture, renders",
 			);
+		}
+	}
+
+	#[test]
+	fn and_multiplies_the_share_into_the_picture_and_binds_one_texel_when_nothing_asks() {
+		// the picture asking on its own, with no view: group nought made over the
+		// half-sized buffer, then over the one texel that says all of the sky when
+		// the strength goes to nought, and back - across both sample counts, so
+		// that every one of the scene's pipelines is bound against both
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+
+		for (samples, strength) in [("1", "1"), ("4", "0"), ("4", "1"), ("1", "0"), ("1", "0.5")]
+		{
+			tuned(&mut world, samples);
+			world
+				.cvars
+				.var(occlusion::STRENGTH, Value::Float(occlusion::DEFAULT_STRENGTH), "");
+			world.cvars.set(occlusion::STRENGTH, strength);
+
+			capture
+				.shoot(&mut world)
+				.expect("a picture that takes the share of the sky away renders");
 		}
 	}
 

@@ -742,6 +742,13 @@ pub struct Scene {
 	/// What that is asked for this frame, or nothing. Read in
 	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
 	occluding: Option<occlusion::Asking>,
+	/// Which making of that share group nought was made over. @ref
+	/// [`Occlusion::epoch`].
+	occluded: u64,
+	/// How many times group nought has been made again, which is how a test
+	/// shows a kept group is kept. @ref [`rebinds`](Self::rebinds).
+	#[cfg(test)]
+	rebound: u32,
 	/// Whether a test asked for the pass before the scene with nothing to read
 	/// it, which is how a test shows that the pass moves no pixel of the
 	/// picture. @ref [`prepare_anyway`](Self::prepare_anyway).
@@ -849,13 +856,7 @@ impl Scene {
 		let device = gpu.device().clone();
 		let queue = gpu.queue().clone();
 
-		let globals = device.create_buffer(&BufferDescriptor {
-			label: Some("globals"),
-			size: size_bytes::<Globals>(1)?,
-			usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-			mapped_at_creation: false,
-		});
-
+		let globals = globals_uniform(&device)?;
 		let globals_layout = frame_layout(&device);
 		let material_layout = material_layout(&device);
 		// empty until a decal exists, and whole all the same: the group it is
@@ -869,18 +870,18 @@ impl Scene {
 		// table is the same one for every scene this device draws. @ref
 		// [`Gpu::split`].
 		let split = Arc::clone(gpu.split());
+		// and before group nought too, for the cube's reason: what the share of
+		// the sky is read out of is its ninth entry, and a scene that has asked
+		// for nothing yet binds the one texel that says all of it
+		let occlusion = Occlusion::new(&device, &queue, width, height)?;
 		let bindings = frame_bindings(&device, &globals_layout, &globals, &atlas, &Held {
 			decals: &decal_sampler,
 			environment: &environment,
 			split: &split,
+			occlusion: occlusion.bound(),
 		});
 
-		// one per wrap mode rather than one per material: a sampler is a small
-		// piece of fixed-function state with two settings anybody actually
-		// wants, so the table is two entries long and is built once. A material
-		// picks with an index. @ref [`Wrap`].
-		let samplers =
-			[build_sampler(&device, Wrap::Repeat), build_sampler(&device, Wrap::Clamp)];
+		let samplers = wraps(&device);
 
 		// before the maps and before the pipelines: the depth pass reads the
 		// joints as its second group and the scene reads them as its fourth,
@@ -911,7 +912,6 @@ impl Scene {
 		let post = post::Chain::new(&device, format, width, height)?;
 		let shaft = Shaft::new(&device, width, height)?;
 		let focus = Focus::new(&device, width, height)?;
-		let occlusion = Occlusion::new(&device, width, height)?;
 
 		let instances = placements(&device)?;
 
@@ -937,8 +937,11 @@ impl Scene {
 			focusing: None,
 			prepass: Prepass::new(width, height),
 			showing: None,
+			occluded: occlusion.epoch(),
 			occlusion,
 			occluding: None,
+			#[cfg(test)]
+			rebound: 0,
 			#[cfg(test)]
 			anyway: false,
 			shadows,
@@ -1164,6 +1167,14 @@ impl Scene {
 			view,
 			&self.timings,
 		);
+
+		// and group nought made again over what that left, in a frame that made
+		// its buffers or let them go. After the pass before the scene has bound
+		// the old group rather than before, which that pass can afford: none of
+		// its entry points reads the share.
+		if self.occlusion.epoch() != self.occluded {
+			self.rebind();
+		}
 
 		let scene_marks = self.timings.writes(Pass::Scene, Ends::Both);
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1403,6 +1414,11 @@ impl Scene {
 	#[cfg(test)]
 	pub(crate) const fn prepare_anyway(&mut self, asked: bool) { self.anyway = asked; }
 
+	/// How many times group nought has been made again since the scene was
+	/// built, for a test.
+	#[cfg(test)]
+	pub(crate) const fn rebinds(&self) -> u32 { self.rebound }
+
 	/// What this frame cost, for whoever asked to be told.
 	///
 	/// Blocks on the queue. @ref [`Timings::settle`] for why, and for why the
@@ -1531,7 +1547,7 @@ impl Scene {
 			.atlas
 			.ensure(&self.device, &self.queue, &world.textures, &self.pictures)
 		{
-			self.bindings = self.frame_group();
+			self.rebind();
 		}
 
 		let room = world
@@ -1929,7 +1945,7 @@ impl Scene {
 			.environment
 			.update(&self.device, &self.queue, world, wanted)
 		{
-			self.bindings = self.frame_group();
+			self.rebind();
 		}
 	}
 
@@ -1970,17 +1986,33 @@ impl Scene {
 		f32::from(u16::try_from(self.environment.levels()).unwrap_or(0))
 	}
 
-	/// Group nought, rebuilt around whatever the atlas and the environment are
-	/// now.
+	/// Group nought, rebuilt around whatever the atlas, the environment and the
+	/// share of the sky are now.
 	///
-	/// Two things make it stale and both are rare: the decals' atlas growing,
-	/// and the world naming a different environment. @ref [`frame_bindings`].
-	fn frame_group(&self) -> BindGroup {
-		frame_bindings(&self.device, &self.globals_layout, &self.globals, &self.atlas, &Held {
-			decals: &self.decal_sampler,
-			environment: &self.environment,
-			split: &self.split,
-		})
+	/// Three things make it stale. Two are rare, the decals' atlas growing and
+	/// the world naming a different environment; the third is the share's
+	/// buffers being made or let go, which is a frame that starts or stops
+	/// asking for them and a picture that changes size. @ref
+	/// [`frame_bindings`].
+	fn rebind(&mut self) {
+		self.bindings = frame_bindings(
+			&self.device,
+			&self.globals_layout,
+			&self.globals,
+			&self.atlas,
+			&Held {
+				decals: &self.decal_sampler,
+				environment: &self.environment,
+				split: &self.split,
+				occlusion: self.occlusion.bound(),
+			},
+		);
+		self.occluded = self.occlusion.epoch();
+
+		#[cfg(test)]
+		{
+			self.rebound += 1;
+		}
 	}
 
 	fn upload(&mut self, world: &World) {
@@ -2656,14 +2688,16 @@ impl Scene {
 	}
 }
 
-/// The layout of group nought: the frame's uniform, and the decals' atlas read
-/// two ways with the sampler that reads it.
+/// The layout of group nought: the frame's uniform; the decals' atlas read two
+/// ways with the sampler that reads it; the environment and the split-sum
+/// table, each with its own; and how much of the sky each pixel sees.
 ///
-/// **One group for both**, rather than a fifth for the atlas: a device need
-/// only allow four, and all four are spoken for. The atlas belongs with the
-/// uniform anyway, because both are the frame's and neither is a material's.
-/// Every pipeline built against this - the sky, the debug lines, the
-/// particles - declares the three it does not read, which a layout allows.
+/// **One group for all of it**, rather than a fifth for the atlas: a device
+/// need only allow four, and all four are spoken for. The atlas belongs with
+/// the uniform anyway, because both are the frame's and neither is a
+/// material's. Every pipeline built against this - the sky, the debug lines,
+/// the particles, the pass before the scene - declares the entries it does not
+/// read, which a layout allows.
 ///
 /// @param device - the device to build against
 fn frame_layout(device: &Device) -> BindGroupLayout {
@@ -2705,6 +2739,7 @@ fn frame_layout(device: &Device) -> BindGroupLayout {
 			environment[1],
 			split[0],
 			split[1],
+			occlusion::entry(OCCLUSION_TEXTURE),
 		],
 	})
 }
@@ -2733,6 +2768,15 @@ const SPLIT_TEXTURE: u32 = 6;
 
 /// Which binding its sampler takes.
 const SPLIT_SAMPLER: u32 = 7;
+
+/// Which binding how much of the sky each pixel sees takes.
+///
+/// Beside the table for the table's reason, and bound in every frame for the
+/// same one: a frame nobody asked for the estimate in binds one texel that says
+/// all of it, so the fragment stage multiplies by one rather than branching.
+/// Read with `textureLoad`, so it needs no sampler. @ref
+/// [`occlusion`](crate::occlusion).
+const OCCLUSION_TEXTURE: u32 = 8;
 
 /// Group nought, over this frame's uniform and the atlas as it stands.
 ///
@@ -2787,6 +2831,10 @@ fn frame_bindings(
 				binding: SPLIT_SAMPLER,
 				resource: BindingResource::Sampler(held.split.sampler()),
 			},
+			BindGroupEntry {
+				binding: OCCLUSION_TEXTURE,
+				resource: BindingResource::TextureView(held.occlusion),
+			},
 		],
 	})
 }
@@ -2804,6 +2852,10 @@ struct Held<'a> {
 
 	/// The table that says how much of either one a surface sends back.
 	split: &'a Split,
+
+	/// How much of the sky each pixel sees, or one texel that says all of it.
+	/// @ref [`Occlusion::bound`].
+	occlusion: &'a TextureView,
 }
 
 /// The sampler every decal's picture is read through.
@@ -2869,6 +2921,30 @@ fn material_layout(device: &Device) -> BindGroupLayout {
 			},
 		],
 	})
+}
+
+/// The buffer every frame's [`Globals`] is written into, the uniform at group
+/// nought's first entry.
+///
+/// @param device - the device to build against
+fn globals_uniform(device: &Device) -> Result<Buffer> {
+	Ok(device.create_buffer(&BufferDescriptor {
+		label: Some("globals"),
+		size: size_bytes::<Globals>(1)?,
+		usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+		mapped_at_creation: false,
+	}))
+}
+
+/// Every sampler a material can pick, in [`Wrap`]'s discriminant order.
+///
+/// One per wrap mode rather than one per material: a sampler is a small piece
+/// of fixed-function state with two settings anybody actually wants, so the
+/// table is two entries long and is built once. A material picks with an index.
+///
+/// @param device - the device to build against
+fn wraps(device: &Device) -> [Sampler; 2] {
+	[build_sampler(device, Wrap::Repeat), build_sampler(device, Wrap::Clamp)]
 }
 
 /// One sampler, for one wrap mode.

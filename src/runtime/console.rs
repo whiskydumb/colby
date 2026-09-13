@@ -618,6 +618,16 @@ fn install_render(world: &mut World) {
 		Value::Bool(true),
 		"reflect the world's environment map, when its sky names one",
 	);
+	// how much of the light arriving from everywhere a nearby wall or corner
+	// takes away. On, and not saved, like the shadows and for their reason; a
+	// strength rather than a switch, and nought records no pass at all, which
+	// is the picture a build from before it took.
+	world.cvars.var(
+		colby_engine::occlusion::STRENGTH,
+		Value::Float(colby_engine::occlusion::DEFAULT_STRENGTH),
+		"how much of the light arriving from everywhere a nearby wall or corner takes away: one \
+		 is all of it, nought is none",
+	);
 	// what a frame cannot see is left out of it: the view for the picture and
 	// each cascade's box for its shadows. On, and not saved, like the shadows:
 	// what the switch is for is measuring what the test saves, and showing
@@ -1418,6 +1428,10 @@ mod tests {
 		(colby_engine::cull::ENABLED, Value::Bool(true)),
 		(colby_engine::depth::VIEW, Value::Float(colby_engine::depth::NO_VIEW)),
 		(colby_engine::prepass::VIEW, Value::Float(colby_engine::prepass::NO_VIEW)),
+		(
+			colby_engine::occlusion::STRENGTH,
+			Value::Float(colby_engine::occlusion::DEFAULT_STRENGTH),
+		),
 		// `crate::console::volumes`, all four
 		(colby_audio::MASTER, Value::Float(1.0)),
 		(colby_audio::EFFECTS, Value::Float(1.0)),
