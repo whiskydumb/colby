@@ -21,8 +21,8 @@ use std::{env, sync::Arc};
 use colby_core::{Result, debug, err, info, warn};
 use wgpu::{
 	Adapter, BackendOptions, Backends, Device, DeviceDescriptor, ExperimentalFeatures, Features,
-	Instance, InstanceDescriptor, Limits, MemoryHints, NoopBackendOptions, PowerPreference,
-	Queue, RequestAdapterOptions, Trace,
+	Instance, InstanceDescriptor, InstanceFlags, Limits, MemoryHints, NoopBackendOptions,
+	PowerPreference, Queue, RequestAdapterOptions, Trace,
 };
 use winit::window::Window;
 
@@ -143,6 +143,12 @@ fn choose(asked: Option<&str>, forced: Option<&str>, have: Backends) -> (Backend
 /// It is never dropped, which for a test binary is the point: a device that
 /// outlives every test on it cannot be the thing a later test is waiting for.
 ///
+/// **The same shape of fault came back once and was something else**, so the
+/// device is the first thing to check and not the only one: on 2026-09-12 the
+/// engine's suite faulted two runs in five with every test on this one device,
+/// and what it was that time was the graphics API's own debug layer. @ref
+/// [`layers`].
+///
 /// @return the device, or `None` on a machine with no adapter - which every
 /// caller skips on rather than failing
 #[cfg(test)]
@@ -257,11 +263,11 @@ pub struct Gpu {
 
 	/// The split-sum table of the shading lobe, baked once for this device.
 	///
-	/// **Here rather than on the scene that reads it, and the reason is
-	/// measured.** The table is the same one for every scene a device draws,
-	/// so a copy per scene is waste - and on this machine it is worse than
-	/// waste: one more texture per scene, with a second device alive beside
-	/// this one, faults the process. @ref [`brdf`](crate::brdf).
+	/// **Here rather than on the scene that reads it**, because the table
+	/// depends on the device and on nothing else: it is the same one for
+	/// every world, every camera and every size a device ever draws, so a copy
+	/// per scene would be a texture, a view and a sampler apiece for one
+	/// answer. @ref [`brdf`](crate::brdf).
 	split: Arc<Split>,
 }
 
@@ -322,6 +328,7 @@ impl Gpu {
 	async fn create(backends: Backends, present_to: Option<&Window>) -> Result<Option<Self>> {
 		let instance = Instance::new(InstanceDescriptor {
 			backends,
+			flags: layers(),
 			// **the one backend that has to be asked for twice**, and that is
 			// wgpu's decision rather than this one: a stub that draws nothing
 			// must not be reachable by a set of flags somebody widened, so it
@@ -398,6 +405,41 @@ impl Gpu {
 		let split = Arc::new(Split::new(&device, &queue)?);
 
 		Ok(Some(Self { instance, adapter, device, queue, split }))
+	}
+}
+
+/// Whether to ask each graphics API for its own debug layer.
+///
+/// wgpu's answer in a debug build is yes, and this says **no in a test
+/// binary**. The layers are a machine's, not this project's: on Windows the
+/// one that matters arrives with whatever Vulkan SDK is installed, and it is
+/// loaded into the process by name. The one on this machine dereferences a
+/// null pointer and takes the process with it - no panic, no failing test, the
+/// harness simply stopping mid-list - when a test binary holds a device on a
+/// second graphics API beside the one it draws with, which is what the test
+/// that compares two of them does. **Measured 2026-09-12: twelve faults in
+/// thirty runs of the engine's suite with the layers on and none in twenty
+/// with them off**, everything else the same.
+///
+/// What that costs the gate is nothing it could see. The layers report through
+/// `log`, a test binary installs no subscriber, and no test reads or fails on
+/// what they say; what still runs is the whole of wgpu's own validation and
+/// the whole of naga's, which is what every mistake in this tree has actually
+/// been caught by. A real run keeps them, because there a person is reading
+/// the console, and that is where they are worth having.
+///
+/// `cfg!(test)` is this crate's own test binary, which is the one that holds
+/// two devices. The interface's and the editor's hold one each and have never
+/// faulted; if either ever grows a second, this is the line to widen.
+///
+/// @return the flags the instance is made with
+fn layers() -> InstanceFlags {
+	let asked = InstanceFlags::from_build_config();
+
+	if cfg!(test) {
+		asked.difference(InstanceFlags::VALIDATION)
+	} else {
+		asked
 	}
 }
 
