@@ -658,8 +658,8 @@ fn install_render(world: &mut World) {
 	world.cvars.var(
 		colby_engine::prepass::VIEW,
 		Value::Float(colby_engine::prepass::NO_VIEW),
-		"draw what every surface is instead of the picture: 1 its normal, 2 its roughness; \
-		 nought is the picture",
+		"draw what every surface is instead of the picture: 1 its normal, 2 its roughness, 3 \
+		 how much of the sky it sees; nought is the picture",
 	);
 	// how many samples a pixel of the world is drawn with. **Saved**, unlike
 	// the two above and like `r.backend`: how much a machine can afford to

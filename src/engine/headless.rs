@@ -260,6 +260,31 @@ mod tests {
 	}
 
 	#[test]
+	fn and_works_out_how_much_of_the_sky_every_pixel_sees_at_one_sample_and_at_four() {
+		// the estimate and the average are only recorded in a frame something
+		// asks for them in, and both read what the pass before the scene wrote -
+		// so this builds and validates the first two readers of that buffer and
+		// the view that draws what they work out, across both sample counts
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+
+		for samples in ["1", "4", "1"] {
+			tuned(&mut world, samples);
+			world
+				.cvars
+				.var(prepass::VIEW, Value::Float(prepass::NO_VIEW), "");
+			world.cvars.set(prepass::VIEW, "3");
+
+			capture.shoot(&mut world).expect(
+				"how much of the sky each pixel sees, drawn instead of the picture, renders",
+			);
+		}
+	}
+
+	#[test]
 	fn and_smears_the_sky_around_the_sun_at_one_sample_and_at_four() {
 		// the three shaft passes are only recorded in a frame that asks for
 		// them, and the mask reads the depth the way the view above does - so

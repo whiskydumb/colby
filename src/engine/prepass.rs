@@ -63,9 +63,11 @@ use crate::scene::{DEPTH_FORMAT, vertex_buffers};
 
 /// The console variable that draws what this pass wrote instead of the picture.
 ///
-/// One draws the normal as a color, two the roughness as a grey, and anything
-/// else is the picture. A tool, like the depth view: off until somebody sets it
-/// and never saved.
+/// One draws the normal as a color, two the roughness as a grey, three how much
+/// of the sky each pixel sees - the first thing worked out from what this pass
+/// wrote, @ref [`occlusion`](crate::occlusion) - and anything else is the
+/// picture. A tool, like the depth view: off until somebody sets it and never
+/// saved.
 pub const VIEW: &str = "r.normals";
 
 /// What [`VIEW`] holds until somebody sets it, which is the picture.
@@ -88,12 +90,17 @@ pub(crate) enum Showing {
 
 	/// The roughness, as a grey.
 	Roughness,
+
+	/// How much of the sky each pixel sees, as a grey: not a number this pass
+	/// writes but the first one worked out from what it writes. @ref
+	/// [`occlusion`](crate::occlusion).
+	Occlusion,
 }
 
 /// What [`VIEW`] asks this frame to draw, if anything.
 ///
-/// A number rather than a word, because every tool of this kind is one: one
-/// and two are the answers, and anything else - a nan among them - is the
+/// A number rather than a word, because every tool of this kind is one: one,
+/// two and three are the answers, and anything else - a nan among them - is the
 /// picture.
 ///
 /// @param world - for the console variable
@@ -105,6 +112,8 @@ pub(crate) fn showing_of(world: &World) -> Option<Showing> {
 		Some(Showing::Normal)
 	} else if (1.5..2.5).contains(&asked) {
 		Some(Showing::Roughness)
+	} else if (2.5..3.5).contains(&asked) {
+		Some(Showing::Occlusion)
 	} else {
 		None
 	}
@@ -150,6 +159,16 @@ pub(crate) struct Prepass {
 	/// seven-twenty for the rest of the run.
 	targets: Option<Targets>,
 
+	/// Which making of [`targets`](Self::targets) a reader is looking at.
+	///
+	/// A reader that runs every frame keeps its bind group beside this and
+	/// makes the group again when the two disagree: it moves whenever the
+	/// targets are let go, which a pair of new ones is always made after, and
+	/// never comes back to a value it has had. @ref
+	/// [`Depth::epoch`](crate::depth::Depth::epoch), which is the same bargain
+	/// for the depth after the scene.
+	epoch: u64,
+
 	/// One per (the picture has holes in it, bones move it), built the first
 	/// frame something asks.
 	///
@@ -168,6 +187,7 @@ impl Prepass {
 		Self {
 			size: (width, height),
 			targets: None,
+			epoch: 0,
 			pipelines: None,
 		}
 	}
@@ -186,7 +206,11 @@ impl Prepass {
 	}
 
 	/// Lets both targets go, for a frame nothing reads them in.
-	pub(crate) fn release(&mut self) { self.targets = None; }
+	pub(crate) fn release(&mut self) {
+		if self.targets.take().is_some() {
+			self.epoch = self.epoch.wrapping_add(1);
+		}
+	}
 
 	/// Builds whatever this frame's pass needs and does not have yet.
 	///
@@ -218,6 +242,10 @@ impl Prepass {
 
 		true
 	}
+
+	/// Which making of the targets a reader is looking at. @ref
+	/// [`epoch`](Self::epoch)'s field for when it moves.
+	pub(crate) const fn epoch(&self) -> u64 { self.epoch }
 
 	/// The pipelines built again from new source, or nothing if they have
 	/// never been built at all.
@@ -329,8 +357,8 @@ impl Prepass {
 	///
 	/// Not the depth the scene tests against, and at four samples not the
 	/// nearest of four: the middle of the pixel, the same raster the surfaces
-	/// beside it came out of. A test's until something reads it.
-	#[cfg(test)]
+	/// beside it came out of. @ref [`occlusion`](crate::occlusion), which reads
+	/// both.
 	pub(crate) fn depth(&self) -> Option<&TextureView> {
 		self.targets
 			.as_ref()
@@ -1486,7 +1514,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_view_that_is_not_one_or_two_draws_the_picture_and_the_depth_view_wins() {
+	fn a_view_that_is_not_one_two_or_three_draws_the_picture_and_the_depth_view_wins() {
 		let Some(mut capture) = capture() else {
 			return;
 		};
@@ -1500,7 +1528,7 @@ mod tests {
 			.shoot(&mut world)
 			.expect("the capture renders");
 
-		for asked in ["3", "-1", "0.25"] {
+		for asked in ["4", "-1", "0.25"] {
 			asking(&mut world, "4", asked);
 
 			let again = capture

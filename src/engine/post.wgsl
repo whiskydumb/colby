@@ -496,3 +496,27 @@ fn fragment_surfaces(input: ScreenOutput) -> @location(0) vec4<f32> {
 
     return vec4<f32>(level, 1.0);
 }
+
+// How much of the sky each pixel sees, worked out from what the pass before the
+// scene wrote: half the picture on each axis, r the share and g how far along
+// the view it was worked out. At a binding of its own for the surfaces' reason.
+@group(1) @binding(4) var occlusion: texture_2d<f32>;
+
+// That share instead of the picture, as a grey, each pixel showing the texel it
+// is twice the place of - so a pixel at an even place on both axes shows the
+// share worked out for exactly it. White where nothing hides the sky and where
+// nothing was drawn.
+//
+// **A byte is a share**, the depth view's rule: on an sRGB target the curve is
+// undone first, so half the sky is 128 in the file.
+@fragment
+fn fragment_occlusion(input: ScreenOutput) -> @location(0) vec4<f32> {
+    let held = textureLoad(occlusion, vec2<i32>(input.clip_position.xy) / 2, 0);
+    var level = clamp(held.r, 0.0, 1.0);
+
+    if (tuning.depth.w > 0.5) {
+        level = undone(level);
+    }
+
+    return vec4<f32>(level, level, level, 1.0);
+}

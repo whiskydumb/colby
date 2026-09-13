@@ -60,6 +60,7 @@ use crate::{
 	focus::{self, Focus},
 	gpu::Gpu,
 	lines::Lines,
+	occlusion::{self, Occlusion},
 	post,
 	prepass::{self, Prepass},
 	shader::Shader,
@@ -735,6 +736,12 @@ pub struct Scene {
 	/// somebody asked. Read in [`Scene::upload`], for the reason
 	/// [`seeing`](Self::seeing) is. @ref [`prepass::VIEW`].
 	showing: Option<prepass::Showing>,
+	/// How much of the sky each pixel sees, worked out from what that pass
+	/// wrote. @ref [`occlusion`].
+	occlusion: Occlusion,
+	/// What that is asked for this frame, or nothing. Read in
+	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
+	occluding: Option<occlusion::Asking>,
 	/// Whether a test asked for the pass before the scene with nothing to read
 	/// it, which is how a test shows that the pass moves no pixel of the
 	/// picture. @ref [`prepare_anyway`](Self::prepare_anyway).
@@ -904,13 +911,9 @@ impl Scene {
 		let post = post::Chain::new(&device, format, width, height)?;
 		let shaft = Shaft::new(&device, width, height)?;
 		let focus = Focus::new(&device, width, height)?;
+		let occlusion = Occlusion::new(&device, width, height)?;
 
-		let instances = device.create_buffer(&BufferDescriptor {
-			label: Some("placements"),
-			size: size_bytes::<Placement>(MAX_ENTITIES * LISTS)?,
-			usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-			mapped_at_creation: false,
-		});
+		let instances = placements(&device)?;
 
 		Ok(Self {
 			device,
@@ -934,6 +937,8 @@ impl Scene {
 			focusing: None,
 			prepass: Prepass::new(width, height),
 			showing: None,
+			occlusion,
+			occluding: None,
 			#[cfg(test)]
 			anyway: false,
 			shadows,
@@ -984,6 +989,7 @@ impl Scene {
 		self.shaft.resize(width, height);
 		self.focus.resize(width, height);
 		self.prepass.resize(width, height);
+		self.occlusion.resize(width, height);
 	}
 
 	/// Rebuilds everything that has to agree about how many samples a pixel is.
@@ -1147,6 +1153,17 @@ impl Scene {
 		// a surface before it is lit has to find it written already. @ref
 		// [`prepass`].
 		self.prepare(&mut encoder, view);
+
+		// and straight after it, for the same reason and for the one after it:
+		// the scene is about to light what this works out
+		self.occlusion.render(
+			&mut encoder,
+			&self.queue,
+			self.occluding,
+			&self.prepass,
+			view,
+			&self.timings,
+		);
 
 		let scene_marks = self.timings.writes(Pass::Scene, Ends::Both);
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1322,9 +1339,13 @@ impl Scene {
 				.map(|view| post::Seen { view, white, lens })
 		});
 		let surfaces = self.showing.and_then(|showing| {
-			self.prepass
-				.surfaces()
-				.map(|view| post::Prepared { view, showing })
+			let view = match showing {
+				| prepass::Showing::Occlusion => self.occlusion.done(),
+				| prepass::Showing::Normal | prepass::Showing::Roughness =>
+					self.prepass.surfaces(),
+			};
+
+			view.map(|view| post::Prepared { view, showing })
 		});
 
 		self.post.resolve(
@@ -1364,6 +1385,13 @@ impl Scene {
 	pub(crate) fn prepass_depth_values(&self) -> Option<Vec<f32>> {
 		self.prepass
 			.depth_values(&self.device, &self.queue)
+	}
+
+	/// How much of the sky each texel of the half-sized buffer sees and how far
+	/// along the view it is, for a test. @ref [`Occlusion::values`].
+	#[cfg(test)]
+	pub(crate) fn occlusion_values(&self) -> Option<Vec<[f32; 2]>> {
+		self.occlusion.values(&self.device, &self.queue)
 	}
 
 	/// Asks for the pass before the scene whether or not anything reads it,
@@ -1677,10 +1705,12 @@ impl Scene {
 	/// Whether anything reads what the pass before the scene writes, this
 	/// frame.
 	///
-	/// The view that draws it is the only reader so far. A test can ask for it
-	/// with nothing reading it at all, @ref
+	/// Its two readers are the view that draws it and the occlusion worked out
+	/// from it. A test can ask for it with nothing reading it at all, @ref
 	/// [`prepare_anyway`](Self::prepare_anyway).
-	fn preparing(&self) -> bool { self.showing.is_some() || self.asked_anyway() }
+	fn preparing(&self) -> bool {
+		self.showing.is_some() || self.occluding.is_some() || self.asked_anyway()
+	}
 
 	/// Whether a test asked for the pass with nothing to read it.
 	#[cfg(test)]
@@ -2005,6 +2035,7 @@ impl Scene {
 		// the depth view wins when both are asked for, and a view nobody sees
 		// asks for no pass
 		self.showing = prepass::showing_of(world).filter(|_| self.seeing.is_none());
+		self.occluding = occlusion::asking_of(world, &camera, self.showing);
 		self.shafting = shaft::asking_of(world, &camera);
 		self.focusing = focus::asking_of(world, &camera);
 
@@ -3109,6 +3140,19 @@ fn samples_of(asked: f32) -> u32 {
 	} else {
 		post::NO_SAMPLES
 	}
+}
+
+/// The buffer every placement a frame draws is written into: room for every
+/// entity in every list a frame draws it in.
+///
+/// @param device - the device to build against
+fn placements(device: &Device) -> Result<Buffer> {
+	Ok(device.create_buffer(&BufferDescriptor {
+		label: Some("placements"),
+		size: size_bytes::<Placement>(MAX_ENTITIES * LISTS)?,
+		usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+		mapped_at_creation: false,
+	}))
 }
 
 /// The size in bytes of `count` values of `T`, as a buffer size.

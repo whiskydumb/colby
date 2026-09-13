@@ -290,6 +290,14 @@ pub(crate) struct Chain {
 	/// that it and the depth above are never two names for one slot.
 	surfaces_layout: BindGroupLayout,
 
+	/// What draws how much of the sky each pixel sees instead of the picture.
+	/// @ref [`occlusion`](crate::occlusion).
+	occluding: RenderPipeline,
+
+	/// How it is handed that buffer: one binding, the fifth of its group, for
+	/// the reason the surfaces have the fourth.
+	occlusion_layout: BindGroupLayout,
+
 	/// Whether the target the last pass writes applies the sRGB curve on the
 	/// way out, which the depth view undoes so that a byte is a distance.
 	srgb: bool,
@@ -355,27 +363,26 @@ impl Chain {
 
 		let built =
 			pipelines(device, &module, format, [&numbers_layout, &texture_layout, &eye_layout]);
-		// beside the seven rather than among them: it reads the depth where
-		// they read the picture, so its second group is a layout of its own
-		let depth_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-			label: Some("post depth"),
-			entries: &[crate::depth::entry(2)],
-		});
-		let seeing = screen_pipeline(device, &module, "post depth", "fragment_depth", format, &[
-			Some(&numbers_layout),
-			Some(&depth_layout),
-		]);
-		// and beside that one for the same reason, reading what the pass before
-		// the scene wrote
-		let surfaces_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-			label: Some("post surfaces"),
-			entries: &[crate::prepass::entry(3)],
-		});
-		let surfacing =
-			screen_pipeline(device, &module, "post surfaces", "fragment_surfaces", format, &[
-				Some(&numbers_layout),
-				Some(&surfaces_layout),
-			]);
+		// beside the seven rather than among them: each draws a buffer of its own
+		// in the picture's place, so its second group is a layout of its own
+		let (seeing, depth_layout) = instead_of(
+			device,
+			(&module, format, &numbers_layout),
+			("post depth", "fragment_depth"),
+			crate::depth::entry(2),
+		);
+		let (surfacing, surfaces_layout) = instead_of(
+			device,
+			(&module, format, &numbers_layout),
+			("post surfaces", "fragment_surfaces"),
+			crate::prepass::entry(3),
+		);
+		let (occluding, occlusion_layout) = instead_of(
+			device,
+			(&module, format, &numbers_layout),
+			("post occlusion", "fragment_occlusion"),
+			crate::occlusion::entry(4),
+		);
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
 			return Err(err!(Graphics("the post-processing pipelines: {complaint}")));
@@ -423,6 +430,8 @@ impl Chain {
 			depth_layout,
 			surfacing,
 			surfaces_layout,
+			occluding,
+			occlusion_layout,
 			srgb: format.is_srgb(),
 			device: device.clone(),
 			size: (width, height),
@@ -568,14 +577,21 @@ impl Chain {
 		}
 
 		if let Some(prepared) = last.surfaces {
+			let (label, pipeline, layout, binding) = match prepared.showing {
+				| Showing::Normal | Showing::Roughness =>
+					("post surfaces", &self.surfacing, &self.surfaces_layout, 3),
+				| Showing::Occlusion =>
+					("post occlusion", &self.occluding, &self.occlusion_layout, 4),
+			};
+
 			self.instead(
 				encoder,
 				last.into,
 				Instead {
-					label: "post surfaces",
-					pipeline: &self.surfacing,
-					layout: &self.surfaces_layout,
-					binding: 3,
+					label,
+					pipeline,
+					layout,
+					binding,
 					view: prepared.view,
 				},
 				composite,
@@ -1065,6 +1081,7 @@ const fn number_of(showing: Showing) -> f32 {
 	match showing {
 		| Showing::Normal => 1.0,
 		| Showing::Roughness => 2.0,
+		| Showing::Occlusion => 3.0,
 	}
 }
 
@@ -1419,6 +1436,30 @@ fn adding_pipeline(
 			alpha: BlendComponent::REPLACE,
 		}),
 	)
+}
+
+/// A pass that draws one buffer in the picture's place: its layout, one entry
+/// in the second group, and its pipeline over the full-screen triangle.
+///
+/// @param device - the device to build against
+/// @param built - the module, the format the last pass writes and the numbers'
+/// layout, which every one of these shares
+/// @param names - the label and the fragment entry point
+/// @param entry - how the buffer is bound
+fn instead_of(
+	device: &Device,
+	(module, format, numbers): (&wgpu::ShaderModule, TextureFormat, &BindGroupLayout),
+	(label, fragment): (&str, &str),
+	entry: BindGroupLayoutEntry,
+) -> (RenderPipeline, BindGroupLayout) {
+	let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+		label: Some(label),
+		entries: &[entry],
+	});
+	let pipeline =
+		screen_pipeline(device, module, label, fragment, format, &[Some(numbers), Some(&layout)]);
+
+	(pipeline, layout)
 }
 
 /// One pipeline over the full-screen triangle, with no vertex buffers and no

@@ -25,6 +25,7 @@ pub mod image;
 mod lines;
 #[cfg(test)]
 mod lobe;
+mod occlusion;
 pub mod overlay;
 mod post;
 pub mod prepass;
