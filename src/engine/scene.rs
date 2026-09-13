@@ -63,6 +63,7 @@ use crate::{
 	occlusion::{self, Occlusion},
 	post,
 	prepass::{self, Prepass},
+	reflection::{self, Reflection},
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, LOCAL_TILES, Maps, Slots, Tile},
 	shaft::{self, Asking, Shaft},
@@ -745,6 +746,12 @@ pub struct Scene {
 	/// Which making of that share group nought was made over. @ref
 	/// [`Occlusion::epoch`].
 	occluded: u64,
+	/// What each pixel's reflection finds on the picture, worked out from what
+	/// the pass before the scene wrote. @ref [`reflection`].
+	reflection: Reflection,
+	/// What that is asked for this frame, or nothing. Read in
+	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
+	reflecting: Option<reflection::Asking>,
 	/// How many times group nought has been made again, which is how a test
 	/// shows a kept group is kept. @ref [`rebinds`](Self::rebinds).
 	#[cfg(test)]
@@ -754,6 +761,10 @@ pub struct Scene {
 	/// picture. @ref [`prepare_anyway`](Self::prepare_anyway).
 	#[cfg(test)]
 	anyway: bool,
+	/// Whether a test asked for the reflections with nothing to read them, the
+	/// same bargain for them. @ref [`reflect_anyway`](Self::reflect_anyway).
+	#[cfg(test)]
+	reflected_anyway: bool,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
 	/// The cube a surface's reflections are read out of. @ref [`env`].
@@ -873,7 +884,7 @@ impl Scene {
 		// and before group nought too, for the cube's reason: what the share of
 		// the sky is read out of is its ninth entry, and a scene that has asked
 		// for nothing yet binds the one texel that says all of it
-		let occlusion = Occlusion::new(&device, &queue, width, height)?;
+		let (occlusion, reflection) = readers(&device, &queue, (width, height))?;
 		let bindings = frame_bindings(&device, &globals_layout, &globals, &atlas, &Held {
 			decals: &decal_sampler,
 			environment: &environment,
@@ -940,10 +951,14 @@ impl Scene {
 			occluded: occlusion.epoch(),
 			occlusion,
 			occluding: None,
+			reflection,
+			reflecting: None,
 			#[cfg(test)]
 			rebound: 0,
 			#[cfg(test)]
 			anyway: false,
+			#[cfg(test)]
+			reflected_anyway: false,
 			shadows,
 			environment,
 			split,
@@ -993,6 +1008,7 @@ impl Scene {
 		self.focus.resize(width, height);
 		self.prepass.resize(width, height);
 		self.occlusion.resize(width, height);
+		self.reflection.resize(width, height);
 	}
 
 	/// Rebuilds everything that has to agree about how many samples a pixel is.
@@ -1091,9 +1107,18 @@ impl Scene {
 		let prepass = self
 			.prepass
 			.rebuilt(&self.device, &groups, source)?;
+		// and the reflections' first pass, which lights what it finds with this
+		// same source: what a mirror shows and what the eye sees are lit by one
+		// arithmetic or by none
+		let reflection = self.reflection.rebuilt(
+			&self.device,
+			[&self.globals_layout, self.shadows.sample_layout()],
+			source,
+		)?;
 
 		self.pipelines = table;
 		self.prepass.replace(prepass);
+		self.reflection.replace(reflection);
 		source.clone_into(&mut self.built);
 
 		Ok(())
@@ -1175,6 +1200,30 @@ impl Scene {
 		if self.occlusion.epoch() != self.occluded {
 			self.rebind();
 		}
+
+		// and after that, because what a reflection meets is lit with the share
+		// of the sky as it now stands, and before the scene, which reads what
+		// the reflections found
+		if self.reflecting.is_some() {
+			self.reflection.ensure(
+				&self.device,
+				[&self.globals_layout, self.shadows.sample_layout()],
+				&self.built,
+			);
+		}
+
+		self.reflection.render(
+			&mut encoder,
+			&self.queue,
+			reflection::Frame {
+				asked: self.reflecting,
+				prepass: &self.prepass,
+				scene: &self.bindings,
+				shadows: self.shadows.bindings(),
+				timings: &self.timings,
+			},
+			view,
+		);
 
 		let scene_marks = self.timings.writes(Pass::Scene, Ends::Both);
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1354,6 +1403,9 @@ impl Scene {
 				| prepass::Showing::Occlusion => self.occlusion.done(),
 				| prepass::Showing::Normal | prepass::Showing::Roughness =>
 					self.prepass.surfaces(),
+				| prepass::Showing::Material => self.prepass.material(),
+				| prepass::Showing::Reflections | prepass::Showing::Coverage =>
+					self.reflection.done(),
 			};
 
 			view.map(|view| post::Prepared { view, showing })
@@ -1405,6 +1457,33 @@ impl Scene {
 		self.occlusion.values(&self.device, &self.queue)
 	}
 
+	/// What the pass before the scene wrote for each pixel's material, for a
+	/// test. @ref [`Prepass::material_values`].
+	#[cfg(test)]
+	pub(crate) fn material_values(&self) -> Option<Vec<[f32; 4]>> {
+		self.prepass
+			.material_values(&self.device, &self.queue)
+	}
+
+	/// What the reflections found for each pixel, for a test. @ref
+	/// [`Reflection::values`].
+	#[cfg(test)]
+	pub(crate) fn reflection_values(&self) -> Option<Vec<[f32; 4]>> {
+		self.reflection.values(&self.device, &self.queue)
+	}
+
+	/// What their first pass found for each texel of the half-sized buffer,
+	/// for a test. @ref [`Reflection::raw_values`].
+	#[cfg(test)]
+	pub(crate) fn reflection_raw_values(&self) -> Option<Vec<[f32; 4]>> {
+		self.reflection
+			.raw_values(&self.device, &self.queue)
+	}
+
+	/// Which making of the reflections' buffers the scene holds, for a test.
+	#[cfg(test)]
+	pub(crate) const fn reflection_epoch(&self) -> u64 { self.reflection.epoch() }
+
 	/// Asks for the pass before the scene whether or not anything reads it,
 	/// for a test.
 	///
@@ -1413,6 +1492,12 @@ impl Scene {
 	/// view that does read it draws the buffer in the picture's place.
 	#[cfg(test)]
 	pub(crate) const fn prepare_anyway(&mut self, asked: bool) { self.anyway = asked; }
+
+	/// Asks for the reflections whether or not anything reads them, for a test:
+	/// the way to have them and the picture in the same frame while nothing in
+	/// the picture reads them yet.
+	#[cfg(test)]
+	pub(crate) const fn reflect_anyway(&mut self, asked: bool) { self.reflected_anyway = asked; }
 
 	/// How many times group nought has been made again since the scene was
 	/// built, for a test.
@@ -1725,7 +1810,10 @@ impl Scene {
 	/// from it. A test can ask for it with nothing reading it at all, @ref
 	/// [`prepare_anyway`](Self::prepare_anyway).
 	fn preparing(&self) -> bool {
-		self.showing.is_some() || self.occluding.is_some() || self.asked_anyway()
+		self.showing.is_some()
+			|| self.occluding.is_some()
+			|| self.reflecting.is_some()
+			|| self.asked_anyway()
 	}
 
 	/// Whether a test asked for the pass with nothing to read it.
@@ -1739,6 +1827,18 @@ impl Scene {
 		reason = "the test build's twin reads a field this build does not have"
 	)]
 	const fn asked_anyway(&self) -> bool { false }
+
+	/// Whether a test asked for the reflections with nothing to read them.
+	#[cfg(test)]
+	const fn reflections_anyway(&self) -> bool { self.reflected_anyway }
+
+	/// Nothing outside a test asks for reflections nobody reads.
+	#[cfg(not(test))]
+	#[expect(
+		clippy::unused_self,
+		reason = "the test build's twin reads a field this build does not have"
+	)]
+	const fn reflections_anyway(&self) -> bool { false }
 
 	/// Which one draws a batch into a shadow map.
 	///
@@ -2068,6 +2168,8 @@ impl Scene {
 		// asks for no pass
 		self.showing = prepass::showing_of(world).filter(|_| self.seeing.is_none());
 		self.occluding = occlusion::asking_of(world, &camera, self.showing);
+		self.reflecting =
+			reflection::asking_of(world, &camera, self.showing, self.reflections_anyway());
 		self.shafting = shaft::asking_of(world, &camera);
 		self.focusing = focus::asking_of(world, &camera);
 
@@ -2686,6 +2788,23 @@ impl Scene {
 			}),
 		}
 	}
+}
+
+/// The two things that read what the pass before the scene writes, neither of
+/// which has made a buffer yet.
+///
+/// @param device - the device to build against
+/// @param queue - where the occlusion's one texel is written
+/// @param (width, height) - the picture's size
+fn readers(
+	device: &Device,
+	queue: &Queue,
+	(width, height): (u32, u32),
+) -> Result<(Occlusion, Reflection)> {
+	Ok((
+		Occlusion::new(device, queue, width, height)?,
+		Reflection::new(device, width, height)?,
+	))
 }
 
 /// The layout of group nought: the frame's uniform; the decals' atlas read two

@@ -298,6 +298,15 @@ pub(crate) struct Chain {
 	/// the reason the surfaces have the fourth.
 	occlusion_layout: BindGroupLayout,
 
+	/// What draws a buffer of colors instead of the picture: the material the
+	/// pass before the scene wrote, or what the reflections found. @ref
+	/// [`reflection`](crate::reflection).
+	coloring: RenderPipeline,
+
+	/// How it is handed that buffer: one binding, the sixth of its group, for
+	/// the reason the surfaces have the fourth.
+	colors_layout: BindGroupLayout,
+
 	/// Whether the target the last pass writes applies the sRGB curve on the
 	/// way out, which the depth view undoes so that a byte is a distance.
 	srgb: bool,
@@ -324,19 +333,7 @@ impl Chain {
 		height: u32,
 	) -> Result<Self> {
 		let (numbers_layout, texture_layout, eye_layout) = layouts(device);
-
-		// clamped rather than repeating: every one of these passes reads a
-		// picture, and a tap that ran off the edge and came back on the other
-		// side would fold the left of the screen into the right.
-		let sampler = device.create_sampler(&SamplerDescriptor {
-			label: Some("post"),
-			address_mode_u: AddressMode::ClampToEdge,
-			address_mode_v: AddressMode::ClampToEdge,
-			address_mode_w: AddressMode::ClampToEdge,
-			mag_filter: FilterMode::Linear,
-			min_filter: FilterMode::Linear,
-			..SamplerDescriptor::default()
-		});
+		let sampler = clamped(device);
 
 		let tuning = device.create_buffer(&BufferDescriptor {
 			label: Some("post tuning"),
@@ -382,6 +379,12 @@ impl Chain {
 			(&module, format, &numbers_layout),
 			("post occlusion", "fragment_occlusion"),
 			crate::occlusion::entry(4),
+		);
+		let (coloring, colors_layout) = instead_of(
+			device,
+			(&module, format, &numbers_layout),
+			("post colors", "fragment_colors"),
+			crate::prepass::entry(5),
 		);
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
@@ -432,6 +435,8 @@ impl Chain {
 			surfaces_layout,
 			occluding,
 			occlusion_layout,
+			coloring,
+			colors_layout,
 			srgb: format.is_srgb(),
 			device: device.clone(),
 			size: (width, height),
@@ -582,6 +587,8 @@ impl Chain {
 					("post surfaces", &self.surfacing, &self.surfaces_layout, 3),
 				| Showing::Occlusion =>
 					("post occlusion", &self.occluding, &self.occlusion_layout, 4),
+				| Showing::Material | Showing::Reflections | Showing::Coverage =>
+					("post colors", &self.coloring, &self.colors_layout, 5),
 			};
 
 			self.instead(
@@ -1075,13 +1082,17 @@ fn tuning_of(post: Post, moving: f32, depth: [f32; 4]) -> Tuning {
 	}
 }
 
-/// Which of the pass before the scene's two numbers a view draws, as the float
-/// the tuning block holds it in.
+/// Which of the pass before the scene's buffers a view draws, and which of its
+/// numbers, as the float the tuning block holds it in: the number the view's
+/// own console variable names it by.
 const fn number_of(showing: Showing) -> f32 {
 	match showing {
 		| Showing::Normal => 1.0,
 		| Showing::Roughness => 2.0,
 		| Showing::Occlusion => 3.0,
+		| Showing::Material => 4.0,
+		| Showing::Reflections => 5.0,
+		| Showing::Coverage => 6.0,
 	}
 }
 
@@ -1436,6 +1447,25 @@ fn adding_pipeline(
 			alpha: BlendComponent::REPLACE,
 		}),
 	)
+}
+
+/// The sampler every pass here reads a picture through.
+///
+/// Clamped rather than repeating: every one of these passes reads a picture,
+/// and a tap that ran off the edge and came back on the other side would fold
+/// the left of the screen into the right.
+///
+/// @param device - the device to build against
+fn clamped(device: &Device) -> Sampler {
+	device.create_sampler(&SamplerDescriptor {
+		label: Some("post"),
+		address_mode_u: AddressMode::ClampToEdge,
+		address_mode_v: AddressMode::ClampToEdge,
+		address_mode_w: AddressMode::ClampToEdge,
+		mag_filter: FilterMode::Linear,
+		min_filter: FilterMode::Linear,
+		..SamplerDescriptor::default()
+	})
 }
 
 /// A pass that draws one buffer in the picture's place: its layout, one entry

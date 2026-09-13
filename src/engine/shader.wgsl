@@ -998,19 +998,23 @@ fn occlusion_at(pixel: vec2<f32>, along_view: f32, slope: f32) -> f32 {
 }
 
 // What the pass before the scene writes for a solid surface: the normal it is
-// about to be lit with, and how rough it is where the lobe reads it.
+// about to be lit with, how rough it is where the lobe reads it, and what it is
+// made of.
 //
 // **The surface `shade` lights, not a cheaper cousin of it.** The normal map and
 // every decal have turned the normal by the time it is written, because this
 // asks the same function `shade` asks.
 //
-// The albedo is not sampled. Its color is the one thing about a surface this
-// pass does not write, and a solid surface keeps its whole face whatever the
-// picture says, so a white texel stands in and is multiplied into a color
-// nobody reads.
+// **The albedo is sampled**, because the color is written: a reflection that
+// finds this surface lights it again from what the buffer holds, and a surface
+// lit with a white texel where its picture is would come back the wrong color.
+// A solid surface keeps its whole face whatever the picture's alpha says, as
+// the scene's own entry point does.
 @fragment
-fn fragment_prepass(input: VertexOutput) -> @location(0) vec4<f32> {
-    return prepared(surface_at(input, vec4<f32>(1.0)));
+fn fragment_prepass(input: VertexOutput) -> Prepared {
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+
+    return prepared(surface_at(input, sampled));
 }
 
 // The same for a surface whose picture has holes in it, which leaves a hole in
@@ -1021,7 +1025,7 @@ fn fragment_prepass(input: VertexOutput) -> @location(0) vec4<f32> {
 // turns on at four samples has nothing to spread across here: a leaf's edge is
 // hard in the buffer where it is soft in the picture.
 @fragment
-fn fragment_prepass_masked(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment_prepass_masked(input: VertexOutput) -> Prepared {
     let sampled = textureSample(albedo, surface_sampler, input.uv);
     if (sampled.a < MASK_CUTOFF) {
         discard;
@@ -1030,15 +1034,346 @@ fn fragment_prepass_masked(input: VertexOutput) -> @location(0) vec4<f32> {
     return prepared(surface_at(input, sampled));
 }
 
-// A surface as the pass before the scene stores it: xyz the normal, in the
-// world and of unit length, and w the roughness the lobe reads.
+// What the pass before the scene writes for one pixel, into its two targets.
+struct Prepared {
+    // xyz the normal, in the world and of unit length; w the roughness.
+    @location(0) surface: vec4<f32>,
+    // rgb the color, which is the material's times the entity's times the
+    // picture's with every decal painted over it; a how metal it is.
+    @location(1) material: vec4<f32>,
+};
+
+// A surface as the pass before the scene stores it.
 //
 // **The roughness is held above `MIN_ROUGHNESS` here as `shade` holds it**,
 // which is what the lobe is evaluated at, and it is also what makes nought in
 // that channel mean that nothing was drawn: the pass clears the target to
-// nought, and no surface is ever smoother than that.
-fn prepared(surface: Surface) -> vec4<f32> {
-    return vec4<f32>(surface.normal, clamp(surface.roughness, MIN_ROUGHNESS, 1.0));
+// nought, and no surface is ever smoother than that. **How metal it is is held
+// inside nought and one as `shade` holds it**, and the color is not held at
+// all, for the same reason: what is written is what the light is worked out
+// from.
+fn prepared(surface: Surface) -> Prepared {
+    return Prepared(
+        vec4<f32>(surface.normal, clamp(surface.roughness, MIN_ROUGHNESS, 1.0)),
+        vec4<f32>(surface.color, clamp(surface.metallic, 0.0, 1.0)),
+    );
+}
+
+// The numbers the pass that follows reflections reads. Laid out the way
+// `colby_engine::reflection::Tuning` writes them, and the way `reflection.wgsl`
+// reads the same block.
+struct Mirror {
+    // World space into view space, a row an axis.
+    view_x: vec4<f32>,
+    view_y: vec4<f32>,
+    view_z: vec4<f32>,
+    // x and y how far the projection scales a view-space x and y at a distance
+    // of one; z and w its `z_axis.z` and `w_axis.z`, which turn a stored depth
+    // back into a distance.
+    lens: vec4<f32>,
+    // x and y the size of the whole target in pixels; w how much of what a
+    // reflection finds the picture takes.
+    size: vec4<f32>,
+    // The rectangle of the target the picture is drawn into: x, y, width,
+    // height, in pixels.
+    rect: vec4<f32>,
+};
+
+// What that pass reads, in the group the scene binds a material in: the pass
+// binds no material, and a group a pipeline declares has to be bound, so the
+// group it has room in is this one. At bindings the material's three are not,
+// so that the two layouts are never two names for one slot.
+@group(1) @binding(3) var<uniform> mirror: Mirror;
+@group(1) @binding(4) var prepared_depth: texture_depth_2d;
+@group(1) @binding(5) var prepared_surfaces: texture_2d<f32>;
+@group(1) @binding(6) var prepared_material: texture_2d<f32>;
+
+// The roughness at and past which no reflection is followed.
+//
+// **0.6, the field's middle**: one engine stops at a half, three at 0.6 and one
+// at 0.7. Past it a reflection is so wide that what the picture holds along it
+// is no better an answer than the prefiltered sky, and every texel followed
+// costs a march.
+const MIRROR_CUTOFF: f32 = 0.6;
+
+// Where what a reflection finds starts to fade towards the cutoff, so that a
+// surface whose roughness crosses it does not show a line.
+const MIRROR_FADE: f32 = 0.5;
+
+// How many steps a reflection takes across the picture at most, and never more
+// than one a pixel.
+const MIRROR_STEPS: u32 = 64u;
+
+// How many times a step that went behind something is halved to find where it
+// crossed.
+const MIRROR_HALVINGS: u32 = 5u;
+
+// How far behind what the picture shows a ray may be, as a share of that
+// thing's distance, and still have met it rather than passed behind it.
+//
+// The depth is a surface seen from the eye and says nothing about how thick
+// anything is, so this is the one guess a march cannot do without. A share
+// rather than a length, because a pixel covers more depth the further away it
+// is.
+const MIRROR_THICKNESS: f32 = 0.05;
+
+// How far along its direction a reflection is followed before it is cut to
+// the picture, in world units: far enough that the picture's edge or the near
+// plane cuts it first.
+const MIRROR_REACH: f32 = 1000.0;
+
+// Which way one texel's reflection leaves, drawn from the surface's own lobe.
+//
+// **One direction a texel, one of nine across a three by three tile**, the
+// occlusion's tile and for its reason: the pass after this one averages a
+// rough surface's texel with the eight around it, and on a surface that is
+// every one of the nine directions exactly once, so what is left is the error
+// of nine directions and not a pattern. The nine are three turns about the
+// normal times three bands of how far a facet leans, each in the middle of its
+// band, drawn through the same distribution the environment was filtered with.
+//
+// A facet whose reflection would go under the surface sends nothing back that
+// way, and the mirror direction stands in for it.
+//
+// @param normal - the surface's, of unit length
+// @param towards_eye - the way the eye is from the surface, of unit length
+// @param roughness - the surface's, held above `MIN_ROUGHNESS` already
+// @param cell - which of the nine, @ref `tile_of`
+fn lobe_way(normal: vec3<f32>, towards_eye: vec3<f32>, roughness: f32, cell: u32) -> vec3<f32> {
+    let turn = (f32(cell % 3u) + 0.5) / 3.0;
+    let band = (f32(cell / 3u) + 0.5) / 3.0;
+    let a = roughness * roughness;
+    let cosine = sqrt((1.0 - band) / (1.0 + (a * a - 1.0) * band));
+    let sine = sqrt(max(1.0 - cosine * cosine, 0.0));
+    let angle = turn * 6.28318531;
+
+    let helper = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(normal.z) < 0.999);
+    let right = normalize(cross(helper, normal));
+    let up = cross(normal, right);
+    let facet = normalize(right * (cos(angle) * sine) + up * (sin(angle) * sine) + normal * cosine);
+    let way = reflect(-towards_eye, facet);
+
+    if (dot(way, normal) <= 0.0) {
+        return reflect(-towards_eye, normal);
+    }
+
+    return way;
+}
+
+// Where a texel is in the three by three tile, as one of nine: the occlusion's
+// order, whose neighbors never follow each other.
+//
+// **Counted from the corner of the rectangle the picture is drawn into**, not
+// from the target's: a picture drawn into the middle of a window by the tools
+// around it draws every direction where the same picture drawn alone draws it.
+fn tile_of(texel: vec2<i32>) -> u32 {
+    var order = array<u32, 9>(0u, 5u, 7u, 6u, 1u, 3u, 4u, 8u, 2u);
+    let corner = vec2<i32>(mirror.rect.xy) / 2;
+    let at = vec2<u32>(max(texel - corner, vec2<i32>(0))) % vec2<u32>(3u);
+
+    return order[at.y * 3u + at.x];
+}
+
+// How far along the view a stored depth is.
+fn mirror_distance(stored: f32) -> f32 {
+    return mirror.lens.w / (stored + mirror.lens.z);
+}
+
+// A point of the view, laid out on the picture: in pixels of the target.
+fn on_picture(ndc: vec2<f32>) -> vec2<f32> {
+    return mirror.rect.xy + (ndc * vec2<f32>(0.5, -0.5) + 0.5) * mirror.rect.zw;
+}
+
+// Where the surface at a pixel of the target is in the world.
+fn unprojected(pixel: vec2<i32>, stored: f32) -> vec3<f32> {
+    let share = (vec2<f32>(pixel) + 0.5 - mirror.rect.xy) / mirror.rect.zw;
+    let ndc = vec2<f32>(share.x * 2.0 - 1.0, 1.0 - share.y * 2.0);
+    let point = globals.inverse_view_projection * vec4<f32>(ndc, stored, 1.0);
+
+    return point.xyz / point.w;
+}
+
+// How much of a segment of the picture lies inside the rectangle drawn into,
+// as a share of it, with half a pixel to spare at every edge.
+fn inside_share(origin: vec2<f32>, across: vec2<f32>) -> f32 {
+    let low = mirror.rect.xy + 0.5;
+    let high = mirror.rect.xy + mirror.rect.zw - 0.5;
+    var share = 1.0;
+
+    if (across.x > 0.0) {
+        share = min(share, (high.x - origin.x) / across.x);
+    } else if (across.x < 0.0) {
+        share = min(share, (low.x - origin.x) / across.x);
+    }
+
+    if (across.y > 0.0) {
+        share = min(share, (high.y - origin.y) / across.y);
+    } else if (across.y < 0.0) {
+        share = min(share, (low.y - origin.y) / across.y);
+    }
+
+    return max(share, 0.0);
+}
+
+// Whether a point of a ray, as a share of its way across the picture, lies
+// behind what the picture shows there.
+//
+// **Only behind a surface that faces the ray.** A ray cannot pass behind a
+// surface it is leaving the front of, and treating it as behind one is what a
+// ray grazing a floor on its way to the foot of a wall does for a pixel or two
+// wherever the depth at a pixel's middle is a hair nearer than the ray at its
+// edge: it then stays behind, crosses into the wall already behind it, and
+// finds nothing at the wall's foot. Nothing is behind a pixel nothing was drawn
+// in, either.
+//
+// @param way - the ray's direction in the world, of unit length
+fn gone_behind(origin: vec3<f32>, finish: vec3<f32>, share: f32, way: vec3<f32>) -> bool {
+    let at = mix(origin, finish, share);
+    let place = vec2<i32>(floor(on_picture(at.xy)));
+    let stored = textureLoad(prepared_depth, place, 0);
+
+    return stored < 1.0 && at.z > stored && dot(textureLoad(prepared_surfaces, place, 0).xyz, way) < 0.0;
+}
+
+// What a march along one ray found: the pixel of the thing it met, and whether
+// it met anything.
+struct Found {
+    place: vec2<i32>,
+    met: bool,
+};
+
+// Follows a ray across the picture until it meets something the picture shows.
+//
+// **Evenly in the picture, not in the world**, and the depth of the ray is
+// interpolated as the depth the picture stores: a projection carries a line to
+// a line, and along it a stored depth is linear in the picture where a
+// distance is not. A step at most a pixel long, from a pixel and a half out.
+//
+// **A step that goes behind something is halved until the crossing is found**,
+// and the crossing is kept only if the ray is behind the thing there by less
+// than `MIRROR_THICKNESS` of its distance and the thing faces the ray. What
+// fails either test is a ray passing behind a silhouette or a surface seeing
+// itself, and the march goes on past it.
+//
+// @param here - where the ray leaves from
+// @param way - which way, of unit length
+fn marched(here: vec3<f32>, way: vec3<f32>) -> Found {
+    let missed = Found(vec2<i32>(0), false);
+    let start = globals.view_projection * vec4<f32>(here, 1.0);
+    var end = globals.view_projection * vec4<f32>(here + way * MIRROR_REACH, 1.0);
+
+    // a ray coming towards the eye stops just short of the near plane, which is
+    // where a stored depth is nought
+    if (end.z < 0.0) {
+        end = mix(start, end, start.z / (start.z - end.z) * 0.999);
+    }
+
+    let origin = start.xyz / start.w;
+    let finish = end.xyz / end.w;
+    let start_pixel = on_picture(origin.xy);
+    let across = on_picture(finish.xy) - start_pixel;
+    let whole = length(across);
+    let limit = inside_share(start_pixel, across);
+    let length_inside = whole * limit;
+
+    if (length_inside < 2.0) {
+        return missed;
+    }
+
+    let first = 1.5 / whole;
+    let steps = min(MIRROR_STEPS, u32(length_inside));
+    var before = first;
+    var was_behind = false;
+
+    for (var step = 1u; step <= steps; step++) {
+        let share = first + (limit - first) * f32(step) / f32(steps);
+        let behind = gone_behind(origin, finish, share, way);
+
+        if (behind && !was_behind) {
+            var low = before;
+            var high = share;
+
+            for (var halving = 0u; halving < MIRROR_HALVINGS; halving++) {
+                let middle = (low + high) * 0.5;
+
+                if (gone_behind(origin, finish, middle, way)) {
+                    high = middle;
+                } else {
+                    low = middle;
+                }
+            }
+
+            let at = mix(origin, finish, high);
+            let place = vec2<i32>(floor(on_picture(at.xy)));
+            let stored = textureLoad(prepared_depth, place, 0);
+            let held = textureLoad(prepared_surfaces, place, 0);
+            let how_far = mirror_distance(stored);
+            let gap = mirror_distance(at.z) - how_far;
+
+            if (held.w > 0.0 && gap <= MIRROR_THICKNESS * how_far) {
+                return Found(place, true);
+            }
+        }
+
+        was_behind = behind;
+        before = share;
+    }
+
+    return missed;
+}
+
+// What one texel of the picture's reflection finds on the picture: rgb the
+// light the thing it met sends back towards it, and a how much of the
+// reflection that stands for - one where something was met and nought where
+// nothing was, both faded towards the roughness past which nothing is
+// followed. Already multiplied, so an average of them is an average of light.
+//
+// **The thing met is lit here, not read off a picture.** Every screen-space
+// reflection in the field reads the color the picture already has at the
+// place a ray lands, and three of four read it off the frame before, because
+// in a renderer that lights as it draws the picture for this frame does not
+// exist yet. This one lights the place from what the pass before the scene
+// wrote about it, with `lit_at` - the scene's own arithmetic, towards the point
+// the ray left rather than towards the eye - so one frame is enough, nothing
+// is a frame late, and a polished thing seen in a mirror shows what it shows
+// from the mirror rather than what it shows the eye. What is not lit is what
+// the buffers do not hold: anything blended, particles, the lines, and the
+// reflections the thing met would itself show, for which the sky stands in.
+// @ref `colby_engine::reflection`.
+@fragment
+fn fragment_reflections(input: SkyOutput) -> @location(0) vec4<f32> {
+    let texel = vec2<i32>(input.clip_position.xy);
+    let pixel = texel * 2;
+    let stored = textureLoad(prepared_depth, pixel, 0);
+    let held = textureLoad(prepared_surfaces, pixel, 0);
+    let roughness = held.w;
+
+    if (stored >= 1.0 || roughness <= 0.0 || roughness >= MIRROR_CUTOFF) {
+        return vec4<f32>(0.0);
+    }
+
+    let here = unprojected(pixel, stored);
+    let way = lobe_way(held.xyz, normalize(globals.eye.xyz - here), roughness, tile_of(texel));
+    let found = marched(here, way);
+
+    if (!found.met) {
+        return vec4<f32>(0.0);
+    }
+
+    let place = found.place;
+    let there = unprojected(place, textureLoad(prepared_depth, place, 0));
+    let hit = textureLoad(prepared_surfaces, place, 0);
+    let made = textureLoad(prepared_material, place, 0);
+    let surface = Surface(made.rgb, made.a, hit.w, hit.xyz);
+    let slice = cascade_of(dot(there - globals.eye.xyz, globals.forward.xyz));
+    // the share of the sky the thing met sees, read at its own texel: the one
+    // texel a frame that asks for no occlusion binds says all of it
+    let last = vec2<i32>(textureDimensions(occlusion)) - vec2<i32>(1);
+    let lit = textureLoad(occlusion, min(place / 2, last), 0).r;
+    let light = lit_at(surface, there, normalize(here - there), slice, lit);
+    let fade = 1.0 - smoothstep(MIRROR_FADE, MIRROR_CUTOFF, roughness);
+
+    return vec4<f32>(light * fade, fade);
 }
 
 // What one point of a surface is made of, before it is lit: what its own
@@ -1208,6 +1543,44 @@ fn surface_at(input: VertexOutput, sampled: vec4<f32>) -> Surface {
 // for because the masked one has to ask before its discard: @ref `seen`
 fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32) -> vec3<f32> {
     let surface = surface_at(input, sampled);
+    let towards_eye = normalize(globals.eye.xyz - input.world_position);
+    let view_depth = dot(input.world_position - globals.eye.xyz, globals.forward.xyz);
+    let slice = cascade_of(view_depth);
+    let color = lit_at(surface, input.world_position, towards_eye, slice, lit);
+
+    if (globals.shadow.w > 0.5) {
+        return color * cascade_color(slice);
+    }
+
+    return fogged(color, input.world_position);
+}
+
+// How much light one point of a surface sends one way: every light this
+// renderer has, from the sun through the lamps to what arrives from everywhere.
+//
+// **A function of its own because two passes ask it**, `surface_at`'s reason
+// from the other end. The scene lights the surface a fragment covers, towards
+// the eye; the pass that follows reflections lights the surface a reflected ray
+// found, towards the point it was reflected from, out of what the pass before
+// the scene wrote down about it. One arithmetic for both is what makes a thing
+// seen in a mirror the same thing seen straight on. @ref
+// `fragment_reflections`.
+//
+// Nothing here knows which way the eye is except through `towards_eye`, and
+// nothing here fogs or tints: both are the picture's business.
+//
+// @param surface - what the point is made of, decals painted
+// @param world_position - where it is
+// @param towards_eye - the way the light is sent, as a unit vector
+// @param slice - the cascade the point falls in, @ref `cascade_of`
+// @param lit - how much of the sky the point sees
+fn lit_at(
+    surface: Surface,
+    world_position: vec3<f32>,
+    towards_eye: vec3<f32>,
+    slice: i32,
+    lit: f32,
+) -> vec3<f32> {
     let base_color = surface.color;
 
     let metallic = clamp(surface.metallic, 0.0, 1.0);
@@ -1218,7 +1591,6 @@ fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32) -> vec3<f32> {
 
     let normal = surface.normal;
     let towards_light = normalize(-globals.light.xyz);
-    let towards_eye = normalize(globals.eye.xyz - input.world_position);
 
     let normal_dot_light = max(dot(normal, towards_light), 0.0);
     let normal_dot_view = max(dot(normal, towards_eye), 0.0001);
@@ -1233,9 +1605,7 @@ fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32) -> vec3<f32> {
     // contribution, each lamp below asks its own maps for its own answer, and
     // the ambient stands in for everything that reaches a surface by some
     // other route.
-    let view_depth = dot(input.world_position - globals.eye.xyz, globals.forward.xyz);
-    let slice = cascade_of(view_depth);
-    let reaching = shadowing(input.world_position, normal, 1.0 - normal_dot_light, slice);
+    let reaching = shadowing(world_position, normal, 1.0 - normal_dot_light, slice);
 
     let direct = lit_by(
         normal,
@@ -1247,7 +1617,7 @@ fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32) -> vec3<f32> {
         normal_dot_view,
     ) * reaching
         + lamps_at(
-            input.world_position,
+            world_position,
             normal,
             towards_eye,
             f0,
@@ -1309,13 +1679,7 @@ fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32) -> vec3<f32> {
     indirect *= lit;
 
     // @ref `HDR_CEILING`: past it a smooth highlight would not fit the target.
-    let color = min(direct + indirect, vec3<f32>(HDR_CEILING));
-
-    if (globals.shadow.w > 0.5) {
-        return color * cascade_color(slice);
-    }
-
-    return fogged(color, input.world_position);
+    return min(direct + indirect, vec3<f32>(HDR_CEILING));
 }
 
 // A surface faded towards the fog by how far away it is.

@@ -2,13 +2,15 @@
 //! lights it.
 //!
 //! One pass over the solid half of the picture's own list, into targets of its
-//! own, writing three things a pixel: how far away the nearest surface is, the
-//! normal that surface is about to be lit with, and how rough it is there. What
-//! reads them is whatever has to know about a surface *before* the scene's pass
-//! lights it. An occlusion term that darkens only the light a lamp did not send
-//! is exactly that, and it cannot take the depth the scene writes: by the time
-//! that depth exists the lighting is done. @ref [`depth`](crate::depth) for the
-//! depth a pass *after* the scene reads.
+//! own, writing four things a pixel: how far away the nearest surface is, the
+//! normal that surface is about to be lit with, how rough it is there, and what
+//! it is made of. What reads them is whatever has to know about a surface
+//! *before* the scene's pass lights it. An occlusion term that darkens only the
+//! light a lamp did not send is exactly that, and it cannot take the depth the
+//! scene writes: by the time that depth exists the lighting is done. So is a
+//! reflection of one surface in another, which has to light the surface it
+//! finds before the scene lights the one it is found in. @ref
+//! [`depth`](crate::depth) for the depth a pass *after* the scene reads.
 //!
 //! **Its own depth, not the scene's.** The scene's pass clears its buffer and
 //! draws exactly as it did before this existed, and this pass keeps a buffer of
@@ -26,14 +28,15 @@
 //! which carries the flag that lets it be bound - and what it reads at an edge
 //! is the middle of the pixel rather than the nearest of four samples.
 //!
-//! **What the buffer holds**, one texel a pixel in sixteen-bit floats: xyz the
-//! normal in the world, signed and of unit length, with nothing packed; w the
-//! roughness the lobe reads. Nought in every channel is a pixel nothing was
-//! drawn in, which a surface cannot write because no surface is smoother than
-//! the smoothest the lobe is drawn at. What it does **not** hold: anything that
-//! blends, so a reader sees what is behind a pane of glass, as the depth after
-//! the scene does; particles, the debug lines and the sky; and a surface's
-//! color, how metal it is and how it moved.
+//! **What the buffers hold**, one texel a pixel in sixteen-bit floats. The
+//! surfaces: xyz the normal in the world, signed and of unit length, with
+//! nothing packed; w the roughness the lobe reads. Nought in every channel is a
+//! pixel nothing was drawn in, which a surface cannot write because no surface
+//! is smoother than the smoothest the lobe is drawn at. The material: rgb the
+//! color the surface is lit with, its picture sampled and its decals painted,
+//! and a how metal it is. What neither holds: anything that blends, so a reader
+//! sees what is behind a pane of glass, as the depth after the scene does;
+//! particles, the debug lines and the sky; and how a surface moved.
 //!
 //! **The surface the scene lights, not a cheaper cousin of it.** The fragment
 //! stage asks `surface_at` in `shader.wgsl`, which is the function the scene's
@@ -65,9 +68,11 @@ use crate::scene::{DEPTH_FORMAT, vertex_buffers};
 ///
 /// One draws the normal as a color, two the roughness as a grey, three how much
 /// of the sky each pixel sees - the first thing worked out from what this pass
-/// wrote, @ref [`occlusion`](crate::occlusion) - and anything else is the
-/// picture. A tool, like the depth view: off until somebody sets it and never
-/// saved.
+/// wrote, @ref [`occlusion`](crate::occlusion) - four the color each surface is
+/// lit with, five what each pixel's reflection finds on the picture and six how
+/// much of its reflection it found there, @ref
+/// [`reflection`](crate::reflection). Anything else is the picture. A tool,
+/// like the depth view: off until somebody sets it and never saved.
 pub const VIEW: &str = "r.normals";
 
 /// What [`VIEW`] holds until somebody sets it, which is the picture.
@@ -95,28 +100,46 @@ pub(crate) enum Showing {
 	/// writes but the first one worked out from what it writes. @ref
 	/// [`occlusion`](crate::occlusion).
 	Occlusion,
+
+	/// The color each surface is lit with, as it is.
+	Material,
+
+	/// What each pixel's reflection found on the picture, as light, already
+	/// multiplied by how much of it was found. @ref
+	/// [`reflection`](crate::reflection).
+	Reflections,
+
+	/// How much of each pixel's reflection was found on the picture, as a grey.
+	Coverage,
 }
 
 /// What [`VIEW`] asks this frame to draw, if anything.
 ///
-/// A number rather than a word, because every tool of this kind is one: one,
-/// two and three are the answers, and anything else - a nan among them - is the
-/// picture.
+/// A number rather than a word, because every tool of this kind is one: one to
+/// six are the answers, and anything else - a nan among them - is the picture.
 ///
 /// @param world - for the console variable
 #[must_use]
 pub(crate) fn showing_of(world: &World) -> Option<Showing> {
 	let asked = world.cvars.float(VIEW)?;
+	let answers = [
+		Showing::Normal,
+		Showing::Roughness,
+		Showing::Occlusion,
+		Showing::Material,
+		Showing::Reflections,
+		Showing::Coverage,
+	];
 
-	if (0.5..1.5).contains(&asked) {
-		Some(Showing::Normal)
-	} else if (1.5..2.5).contains(&asked) {
-		Some(Showing::Roughness)
-	} else if (2.5..3.5).contains(&asked) {
-		Some(Showing::Occlusion)
-	} else {
-		None
-	}
+	answers
+		.into_iter()
+		.zip(1_u8..)
+		.find(|(_, number)| {
+			let number = f32::from(*number);
+
+			(number - 0.5..number + 0.5).contains(&asked)
+		})
+		.map(|(showing, _)| showing)
 }
 
 /// How a reader binds [`Prepass::surfaces`]: a float texture of one sample,
@@ -136,7 +159,7 @@ pub(crate) const fn entry(binding: u32) -> BindGroupLayoutEntry {
 	}
 }
 
-/// The two targets the pass writes.
+/// The three targets the pass writes.
 struct Targets {
 	/// How far away the nearest solid surface is, stored the way the scene's
 	/// own depth stores it.
@@ -144,6 +167,14 @@ struct Targets {
 
 	/// Its normal and its roughness.
 	surfaces: TextureView,
+
+	/// Its color and how metal it is, in [`FORMAT`] as well.
+	///
+	/// **Floats rather than eight bits of sRGB**, which would be half the
+	/// memory: a color here is lit again by a reflection, and a second answer
+	/// that works that light out has to know the color the first one used to
+	/// the bit rather than to the byte an sRGB write rounds it to.
+	material: TextureView,
 }
 
 /// The pass before the scene, and what it writes into.
@@ -282,7 +313,7 @@ impl Prepass {
 	}
 
 	/// Begins this frame's pass, cleared: nought in every channel of the
-	/// surfaces and the far plane in the depth.
+	/// surfaces and the material, and the far plane in the depth.
 	///
 	/// @param encoder - the frame's
 	/// @param marks - the span this pass is, if anybody is measuring
@@ -295,19 +326,23 @@ impl Prepass {
 	) -> Option<RenderPass<'pass>> {
 		let targets = self.targets.as_ref()?;
 
-		Some(encoder.begin_render_pass(&RenderPassDescriptor {
-			label: Some("prepass"),
-			color_attachments: &[Some(RenderPassColorAttachment {
-				view: &targets.surfaces,
+		// nought is what says nothing was drawn, and it has to be there wherever
+		// nothing is
+		let cleared = |view| {
+			Some(RenderPassColorAttachment {
+				view,
 				depth_slice: None,
 				resolve_target: None,
 				ops: Operations {
-					// nought is what says nothing was drawn, and it has to be
-					// there wherever nothing is
 					load: LoadOp::Clear(Color::TRANSPARENT),
 					store: StoreOp::Store,
 				},
-			})],
+			})
+		};
+
+		Some(encoder.begin_render_pass(&RenderPassDescriptor {
+			label: Some("prepass"),
+			color_attachments: &[cleared(&targets.surfaces), cleared(&targets.material)],
 			depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
 				view: &targets.depth,
 				depth_ops: Some(Operations {
@@ -365,6 +400,28 @@ impl Prepass {
 			.map(|targets| &targets.depth)
 	}
 
+	/// What a reader binds for the material this frame, one sample a pixel:
+	/// rgb the color and a how metal it is. Bound with [`entry`], like the
+	/// surfaces.
+	pub(crate) fn material(&self) -> Option<&TextureView> {
+		self.targets
+			.as_ref()
+			.map(|targets| &targets.material)
+	}
+
+	/// What the material holds, four floats a pixel, top row first. A test's.
+	///
+	/// @param device - to build the staging buffer on
+	/// @param queue - to submit the copy on
+	#[cfg(test)]
+	pub(crate) fn material_values(
+		&self,
+		device: &Device,
+		queue: &wgpu::Queue,
+	) -> Option<Vec<[f32; 4]>> {
+		halves(device, queue, self.material()?)
+	}
+
 	/// What the surfaces hold, four floats a pixel, top row first. A test's.
 	///
 	/// @param device - to build the staging buffer on
@@ -375,23 +432,7 @@ impl Prepass {
 		device: &Device,
 		queue: &wgpu::Queue,
 	) -> Option<Vec<[f32; 4]>> {
-		let texture = self.surfaces()?.texture();
-		let bytes =
-			crate::depth::copied_out(device, queue, texture, wgpu::TextureAspect::All, 8)?;
-
-		Some(
-			bytes
-				.chunks_exact(8)
-				.map(|texel| {
-					[0, 2, 4, 6].map(|at| {
-						let low = texel.get(at).copied().unwrap_or(0);
-						let high = texel.get(at + 1).copied().unwrap_or(0);
-
-						crate::post::half_into(u16::from_le_bytes([low, high]))
-					})
-				})
-				.collect(),
-		)
+		halves(device, queue, self.surfaces()?)
 	}
 
 	/// What the depth this pass wrote holds, one float a pixel. A test's.
@@ -510,16 +551,22 @@ fn pipeline(
 				"fragment_prepass"
 			}),
 			compilation_options: PipelineCompilationOptions::default(),
-			targets: &[Some(ColorTargetState {
-				format: FORMAT,
-				blend: Some(BlendState::REPLACE),
-				write_mask: ColorWrites::ALL,
-			})],
+			// the surfaces, then the material, in the order `Prepared` in
+			// `shader.wgsl` lays its two outputs out
+			targets: &[WRITTEN, WRITTEN],
 		}),
 		multiview_mask: None,
 		cache: None,
 	})
 }
+
+/// How each of the pass's two color targets is written: in [`FORMAT`], every
+/// channel, replacing what was there.
+const WRITTEN: Option<ColorTargetState> = Some(ColorTargetState {
+	format: FORMAT,
+	blend: Some(BlendState::REPLACE),
+	write_mask: ColorWrites::ALL,
+});
 
 /// What one of the four is called in a graphics debugger.
 const fn label_of(wanted: Wanted) -> &'static str {
@@ -531,7 +578,7 @@ const fn label_of(wanted: Wanted) -> &'static str {
 	}
 }
 
-/// Both targets, at a size.
+/// All three targets, at a size.
 fn targets(device: &Device, (width, height): (u32, u32)) -> Targets {
 	let target = |label, format| {
 		device
@@ -557,6 +604,7 @@ fn targets(device: &Device, (width, height): (u32, u32)) -> Targets {
 	Targets {
 		depth: target("prepass depth", DEPTH_FORMAT),
 		surfaces: target("prepass surfaces", FORMAT),
+		material: target("prepass material", FORMAT),
 	}
 }
 
@@ -568,6 +616,36 @@ const fn copied() -> TextureUsages {
 	} else {
 		TextureUsages::empty()
 	}
+}
+
+/// Four half floats a texel of a buffer this pass or a reader of it wrote, read
+/// back, top row first. A test's.
+///
+/// @param device - to build the staging buffer on
+/// @param queue - to submit the copy on
+/// @param view - a view of the whole of an `Rgba16Float` texture
+#[cfg(test)]
+pub(crate) fn halves(
+	device: &Device,
+	queue: &wgpu::Queue,
+	view: &TextureView,
+) -> Option<Vec<[f32; 4]>> {
+	let bytes =
+		crate::depth::copied_out(device, queue, view.texture(), wgpu::TextureAspect::All, 8)?;
+
+	Some(
+		bytes
+			.chunks_exact(8)
+			.map(|texel| {
+				[0, 2, 4, 6].map(|at| {
+					let low = texel.get(at).copied().unwrap_or(0);
+					let high = texel.get(at + 1).copied().unwrap_or(0);
+
+					crate::post::half_into(u16::from_le_bytes([low, high]))
+				})
+			})
+			.collect(),
+	)
 }
 
 #[cfg(test)]
@@ -950,6 +1028,77 @@ mod tests {
 	/// face down `+z`, so a camera looking back along it sees three faces
 	/// alike.
 	fn corner() -> Quat { Quat::from_rotation_arc(Vec3::ONE.normalize(), Vec3::Z) }
+
+	#[test]
+	fn the_material_is_the_color_a_surface_is_lit_with_and_how_metal_it_is() {
+		// the entity's tint times the material's color times the picture's texel
+		// undone out of sRGB, and how metal it is as the material says - what
+		// `shade` lights, and what a reflection that finds this surface lights
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = stage();
+		let texel = [128, 64, 255, 255];
+		let picture = picture(&mut world, "test/albedo", Texel::Rgba8Srgb, texel);
+		let base = Vec3::new(0.5, 1.0, 0.8);
+		let tint = Vec3::new(0.9, 0.6, 0.4);
+		let material = world.materials.insert("test/painted", Material {
+			base_color: base,
+			metallic: 0.7,
+			roughness: 0.4,
+			..Material::textured(picture)
+		});
+		let id = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: corner(),
+			scale: Vec3::splat(2.0),
+		});
+
+		world
+			.entities
+			.set_renderable(id, Renderable::of(MeshId::CUBE, material, tint));
+		asking(&mut world, "1", "0");
+		capture.scene_mut().prepare_anyway(true);
+		capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		let values = capture
+			.scene_mut()
+			.material_values()
+			.expect("asked for, so written");
+		let undone = |byte: u8| {
+			let level = f32::from(byte) / 255.0;
+
+			if level <= 0.04045 {
+				level / 12.92
+			} else {
+				((level + 0.055) / 1.055).powf(2.4)
+			}
+		};
+		let wanted =
+			tint * base * Vec3::new(undone(texel[0]), undone(texel[1]), undone(texel[2]));
+		let middle = at(&values, pixel_of(&world, Vec3::ZERO));
+
+		assert!(
+			(Vec3::new(middle[0], middle[1], middle[2]) - wanted)
+				.abs()
+				.max_element()
+				<= WITHIN,
+			"the color written is {middle:?}, where {wanted} is what the surface is lit with"
+		);
+		assert!(
+			(middle[3] - 0.7).abs() <= WITHIN,
+			"and how metal it is, {}, where the material says 0.7",
+			middle[3]
+		);
+		assert!(
+			at(&values, 0)
+				.iter()
+				.all(|value| value.abs() < f32::EPSILON),
+			"and nought in the corner, where nothing is"
+		);
+	}
 
 	#[test]
 	fn a_decal_turns_the_normal_and_the_roughness_inside_its_box_and_nowhere_else() {
@@ -1400,14 +1549,13 @@ mod tests {
 		capture.draw(&mut world, &mut []);
 
 		let source = include_str!("shader.wgsl");
-		let anchor =
-			"return vec4<f32>(surface.normal, clamp(surface.roughness, MIN_ROUGHNESS, 1.0));";
+		let anchor = "vec4<f32>(surface.normal, clamp(surface.roughness, MIN_ROUGHNESS, 1.0)),";
 
-		assert!(source.contains(anchor), "the line this test edits has moved");
+		assert_eq!(source.matches(anchor).count(), 1, "the line this test edits has moved");
 
 		capture
 			.scene_mut()
-			.set_shader(&source.replace(anchor, "return vec4<f32>(0.0, 0.0, 1.0, 0.25);"))
+			.set_shader(&source.replace(anchor, "vec4<f32>(0.0, 0.0, 1.0, 0.25),"))
 			.expect("the edited shader compiles");
 		capture.draw(&mut world, &mut []);
 
@@ -1522,7 +1670,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_view_that_is_not_one_two_or_three_draws_the_picture_and_the_depth_view_wins() {
+	fn a_view_that_is_not_one_to_six_draws_the_picture_and_the_depth_view_wins() {
 		let Some(mut capture) = capture() else {
 			return;
 		};
@@ -1536,7 +1684,7 @@ mod tests {
 			.shoot(&mut world)
 			.expect("the capture renders");
 
-		for asked in ["4", "-1", "0.25"] {
+		for asked in ["7", "-1", "0.25", "6.5"] {
 			asking(&mut world, "4", asked);
 
 			let again = capture

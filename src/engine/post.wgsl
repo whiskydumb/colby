@@ -497,6 +497,34 @@ fn fragment_surfaces(input: ScreenOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(level, 1.0);
 }
 
+// A buffer of four floats a pixel whose first three are a color: the material
+// the pass before the scene wrote, or what the reflections found. At a binding
+// of its own for the surfaces' reason.
+@group(1) @binding(5) var colors: texture_2d<f32>;
+
+// That buffer instead of the picture: at four and five its color as it is, and
+// at six its fourth number as a grey. Nothing is black here but what is black,
+// because none of these three buffers says "nothing was drawn" with a number
+// of its own.
+//
+// **A byte is a number**, the depth view's rule: on an sRGB target the curve is
+// undone first, so a color of a half is half of 255 in the file.
+@fragment
+fn fragment_colors(input: ScreenOutput) -> @location(0) vec4<f32> {
+    let held = textureLoad(colors, vec2<i32>(input.clip_position.xy), 0);
+    var level = clamp(held.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    if (tuning.depth.x > 5.5) {
+        level = vec3<f32>(clamp(held.a, 0.0, 1.0));
+    }
+
+    if (tuning.depth.w > 0.5) {
+        level = vec3<f32>(undone(level.x), undone(level.y), undone(level.z));
+    }
+
+    return vec4<f32>(level, 1.0);
+}
+
 // How much of the sky each pixel sees, worked out from what the pass before the
 // scene wrote: half the picture on each axis, r the share and g how far along
 // the view it was worked out. At a binding of its own for the surfaces' reason.
