@@ -805,10 +805,41 @@ fn lamp_shadowing(lamp: Lamp, world_position: vec3<f32>, normal: vec3<f32>, lean
         return 1.0;
     }
 
-    let first = u32(max(lamp.shadow.x, 0.0));
     let reach = length(world_position - lamp.position_range.xyz);
     let push = lamp.shadow.z * reach * mix(2.0, 4.0, clamp(lean, 0.0, 1.0));
-    let at = world_position + normal * push;
+    let landed = lamp_landing(lamp, world_position + normal * push);
+
+    if (!landed.inside) {
+        return 1.0;
+    }
+
+    return gather(globals.lamp_tiles[landed.tile], landed.uv, landed.depth);
+}
+
+// Where a point lands in the map of a lamp that has one: which tile, where in
+// it, and how far along the map's own depth.
+struct Landing {
+    tile: u32,
+    uv: vec2<f32>,
+    depth: f32,
+    // false for a point no map of the lamp's can say anything about
+    inside: bool,
+}
+
+// Which of a lamp's maps a point falls in, and where.
+//
+// **One function for both of the things that ask**: a surface asks with its
+// point pushed off its own face, and the air asks with a point that has no face
+// to push off. Which face of a point light a direction picks and how the tile
+// is read are the same question either way, and two answers to it would be two
+// shadows of one lamp.
+//
+// @param lamp - the light, which carries where its maps are and how many
+// @param at - the point, already moved wherever the asker moves it
+fn lamp_landing(lamp: Lamp, at: vec3<f32>) -> Landing {
+    let count = u32(max(lamp.shadow.y, 0.0));
+    let first = u32(max(lamp.shadow.x, 0.0));
+    let outside = Landing(0u, vec2<f32>(0.0), 0.0, false);
 
     var face = 0u;
     if (count > 1u) {
@@ -830,7 +861,7 @@ fn lamp_shadowing(lamp: Lamp, world_position: vec3<f32>, normal: vec3<f32>, lean
     // behind the map's own eye, which a push across a face edge can just about
     // manage at grazing angles. Nothing there is in this map's shadow.
     if (clip.w <= 0.0) {
-        return 1.0;
+        return outside;
     }
 
     let ndc = clip.xyz / clip.w;
@@ -838,13 +869,13 @@ fn lamp_shadowing(lamp: Lamp, world_position: vec3<f32>, normal: vec3<f32>, lean
     // in front of the near plane or past the far one. The far one is the
     // lamp's own reach, so a point past it was already outside the falloff.
     if (ndc.z <= 0.0 || ndc.z >= 1.0) {
-        return 1.0;
+        return outside;
     }
 
     // clip space counts y upwards and a texture counts it down.
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 
-    return gather(globals.lamp_tiles[index], uv, ndc.z);
+    return Landing(index, uv, ndc.z, true);
 }
 
 // How much alpha a texel needs before a masked surface draws it at all.
@@ -1167,8 +1198,15 @@ fn lobe_way(normal: vec3<f32>, towards_eye: vec3<f32>, roughness: f32, cell: u32
 // from the target's: a picture drawn into the middle of a window by the tools
 // around it draws every direction where the same picture drawn alone draws it.
 fn tile_of(texel: vec2<i32>) -> u32 {
+    return tile_at(texel, mirror.rect);
+}
+
+// Where a texel is in the three by three tile, counted from the corner of a
+// rectangle of the target: `tile_of`'s arithmetic for any pass that draws into
+// a rectangle of its own.
+fn tile_at(texel: vec2<i32>, rect: vec4<f32>) -> u32 {
     var order = array<u32, 9>(0u, 5u, 7u, 6u, 1u, 3u, 4u, 8u, 2u);
-    let corner = vec2<i32>(mirror.rect.xy) / 2;
+    let corner = vec2<i32>(rect.xy) / 2;
     let at = vec2<u32>(max(texel - corner, vec2<i32>(0))) % vec2<u32>(3u);
 
     return order[at.y * 3u + at.x];
@@ -1374,6 +1412,381 @@ fn fragment_reflections(input: SkyOutput) -> @location(0) vec4<f32> {
     let fade = 1.0 - smoothstep(MIRROR_FADE, MIRROR_CUTOFF, roughness);
 
     return vec4<f32>(light * fade, fade);
+}
+
+// The numbers the passes that light the air read. Laid out the way
+// `colby_engine::haze::Tuning` writes them, and the way `haze.wgsl` reads the
+// same block.
+struct Air {
+    // x how much of the light crossing a unit of air the air scatters; y how
+    // far from the eye the air goes on; z and w the projection's `z_axis.z`
+    // and `w_axis.z`, which turn a stored depth back into a distance.
+    medium: vec4<f32>,
+    // x and y the size of the whole target in pixels; z and w unused.
+    size: vec4<f32>,
+    // The rectangle of the target the picture is drawn into: x, y, width,
+    // height, in pixels.
+    rect: vec4<f32>,
+};
+
+// What those passes read, in the group the scene binds a material in: neither
+// binds a material, and a group a pipeline declares has to be bound. At
+// bindings neither the material's three nor the reflections' four are, so that
+// no two layouts are two names for one slot.
+@group(1) @binding(7) var<uniform> air: Air;
+
+// The depth the scene wrote, one sample a pixel whatever it was drawn with.
+@group(1) @binding(8) var air_depth: texture_depth_2d;
+
+// What the march found, averaged, at half the picture on each axis. Read by the
+// pass that puts it over the picture, and bound beside the march as well, which
+// reads it nowhere: one group for both.
+@group(1) @binding(9) var air_found: texture_2d<f32>;
+
+// How many places a lamp's light is sampled at along the stretch of a ray the
+// lamp can reach.
+//
+// **Sixteen, measured rather than chosen**, with the engine at seven-twenty
+// against the same march at five hundred and twelve places and nothing
+// averaged: a point lamp's glow was left with 39 pixels past two levels at
+// sixteen places spread by the angle below, 234 at eight and 24 at thirty-two,
+// and with 829 at sixteen spread evenly in distance. Sixteen is the number of
+// the one engine in the field with this shape, too.
+const AIR_STEPS: u32 = 16u;
+
+// How many lamps one texel's ray is followed through, the nearest first.
+//
+// A frame carries up to thirty-two and a ray through the middle of a lit room
+// can cross the reach of all of them; this is what keeps a texel at sixty-four
+// taps of a shadow map at the most, the reflections' count.
+const AIR_LAMPS: u32 = 4u;
+
+// How much more of what the air scatters carries on the way it was going than
+// comes back: the asymmetry of Henyey and Greenstein's lobe. Two tenths, where
+// the two engines in the field that start from a number start.
+const AIR_ASYMMETRY: f32 = 0.2;
+
+// The nearest a ray is counted as passing a lamp, in world units.
+//
+// A ray through a point light's very middle meets an inverse square with
+// nothing under it, and the sum along the ray has no finite answer; the surface
+// shading holds the same distance off at a centimeter.
+const AIR_NEAREST: f32 = 0.01;
+
+// How far a texel's distance may be from a pixel's, as a share of the pixel's,
+// and still stand for the air in front of the same surface.
+const AIR_PLANE: f32 = 0.05;
+
+// One ray of the air: where it starts, which way it goes, and how far.
+struct AirRay {
+    origin: vec3<f32>,
+    way: vec3<f32>,
+    // to what the pixel shows, or to where the air ends, whichever is nearer
+    far: f32,
+}
+
+// How far along the view a stored depth is.
+fn air_distance(stored: f32) -> f32 {
+    return air.medium.w / (stored + air.medium.z);
+}
+
+// The ray through the middle of a pixel of the target, out to whatever the
+// depth says is there - the far plane, where nothing was drawn.
+fn air_ray(pixel: vec2<i32>) -> AirRay {
+    let stored = textureLoad(air_depth, pixel, 0);
+    let share = (vec2<f32>(pixel) + 0.5 - air.rect.xy) / air.rect.zw;
+    let ndc = vec2<f32>(share.x * 2.0 - 1.0, 1.0 - share.y * 2.0);
+    let point = globals.inverse_view_projection * vec4<f32>(ndc, stored, 1.0);
+    let seen = point.xyz / point.w - globals.eye.xyz;
+    let distance = length(seen);
+
+    return AirRay(globals.eye.xyz, seen / max(distance, 1.0e-6), min(distance, air.medium.y));
+}
+
+// The stretch of a ray a lamp can light: inside its reach, inside a cone's
+// cone, and short of the ray's end. Nought long for a lamp the ray misses.
+fn air_span(lamp: Lamp, ray: AirRay) -> vec2<f32> {
+    let offset = ray.origin - lamp.position_range.xyz;
+    let b = dot(ray.way, offset);
+    let c = dot(offset, offset) - lamp.position_range.w * lamp.position_range.w;
+    let discriminant = b * b - c;
+
+    if (discriminant <= 0.0) {
+        return vec2<f32>(0.0);
+    }
+
+    let root = sqrt(discriminant);
+    let near = max(-b - root, 0.0);
+    let far = min(-b + root, ray.far);
+
+    if (far <= near) {
+        return vec2<f32>(0.0);
+    }
+
+    // a point light packs a scale of nought, and its reach is all there is
+    if (lamp.color.w == 0.0) {
+        return vec2<f32>(near, far);
+    }
+
+    return air_cone(lamp, ray, vec2<f32>(near, far));
+}
+
+// The part of a stretch of a ray inside a cone's lit half.
+//
+// **A line meets the lit half of a cone, which is convex, in one piece at
+// most**, so of the three pieces the two places the line crosses the cone's
+// surface cut the stretch into, the one whose middle is inside is the answer,
+// and a line that never crosses is inside or outside all the way along. The
+// edge is where the cone's falloff reaches nought, out of the two numbers it is
+// packed as: a lamp's light past it is none, so the air there needs no step.
+fn air_cone(lamp: Lamp, ray: AirRay, span: vec2<f32>) -> vec2<f32> {
+    let axis = lamp.direction.xyz;
+    let edge = -lamp.direction.w / lamp.color.w;
+    let edge_square = edge * edge;
+    let offset = ray.origin - lamp.position_range.xyz;
+    let way_along = dot(ray.way, axis);
+    let offset_along = dot(offset, axis);
+    let qa = way_along * way_along - edge_square;
+    let qb = 2.0 * (way_along * offset_along - dot(ray.way, offset) * edge_square);
+    let qc = offset_along * offset_along - dot(offset, offset) * edge_square;
+    let discriminant = qb * qb - 4.0 * qa * qc;
+    var cuts = array<f32, 4>(span.x, span.x, span.y, span.y);
+
+    if (discriminant > 0.0 && abs(qa) > 1.0e-8) {
+        let root = sqrt(discriminant);
+        let one = (-qb - root) / (2.0 * qa);
+        let other = (-qb + root) / (2.0 * qa);
+
+        cuts[1] = clamp(min(one, other), span.x, span.y);
+        cuts[2] = clamp(max(one, other), span.x, span.y);
+    }
+
+    for (var piece = 0u; piece < 3u; piece++) {
+        let start = cuts[piece];
+        let end = cuts[piece + 1u];
+
+        if (end <= start) {
+            continue;
+        }
+
+        let middle = offset + ray.way * ((start + end) * 0.5);
+
+        if (dot(middle, axis) > edge * length(middle)) {
+            return vec2<f32>(start, end);
+        }
+    }
+
+    return vec2<f32>(0.0);
+}
+
+// How much of the light a unit of air scatters goes one way, per unit of solid
+// angle: Henyey and Greenstein's lobe, which sums to one over every way there
+// is.
+//
+// @param cosine - between the way the light was going and the way it leaves
+fn scattered(cosine: f32) -> f32 {
+    let g = AIR_ASYMMETRY;
+    let denominator = 1.0 + g * g - 2.0 * g * cosine;
+
+    return (1.0 - g * g) / (4.0 * 3.14159265 * denominator * sqrt(denominator));
+}
+
+// How much of one lamp's light reaches a point of the air: one tap of its map,
+// where a surface takes nine.
+//
+// **One tap rather than nine**: a point of the air is averaged with its
+// neighbors along the ray and across the tile afterwards, which is what the
+// eight around the middle tap buy a surface. The point is moved a little way
+// towards the lamp first, for the reason a surface is pushed off its own face:
+// a point of the air just in front of a wall would read the wall's own depth
+// and put itself in the wall's shadow.
+fn air_lamp_shadowing(lamp: Lamp, at: vec3<f32>) -> f32 {
+    let count = u32(max(lamp.shadow.y, 0.0));
+    if (globals.shadow.z < 0.5 || count == 0u) {
+        return 1.0;
+    }
+
+    let towards = lamp.position_range.xyz - at;
+    let reach = length(towards);
+    let push = lamp.shadow.z * reach * 2.0;
+    let landed = lamp_landing(lamp, at + towards * (push / max(reach, 1.0e-6)));
+
+    if (!landed.inside) {
+        return 1.0;
+    }
+
+    let tile = globals.lamp_tiles[landed.tile];
+    let uv = clamp(tile.place.xy + landed.uv * tile.place.z, tile.bounds.xy, tile.bounds.zw);
+
+    return textureSampleCompareLevel(shadow_maps, shadow_sampler, uv, i32(tile.place.w), landed.depth);
+}
+
+// The light one lamp sends towards the eye out of one stretch of a ray.
+//
+// **The places sampled are spread evenly in the angle the stretch covers as
+// seen from the lamp**, not evenly in distance. Each stands for as much of the
+// lamp's view as the next, which crowds them where the ray passes the lamp -
+// where an inverse square puts nearly all of its light - and the weight each
+// carries is that inverse square turned round, so a ray passing close to a lamp
+// adds up what is there rather than stepping over it. It is how the field's
+// path tracers sample a point light in a medium, and for the same reason.
+//
+// What each place adds is the lamp's own light the way a surface would get it -
+// its falloff, a cone's cone and its shadow - scattered towards the eye by the
+// lobe above, and dimmed by the air between the place and the eye. The pi is
+// the one `lit_by` multiplies back, so that the air in front of a lamp and a
+// white wall in front of it are lit by the same lamp.
+//
+// @param offset - where in its step each place sits, nought to one, which is
+// what the tile spreads
+fn air_lamp(lamp: Lamp, ray: AirRay, span: vec2<f32>, offset: f32) -> vec3<f32> {
+    let to_lamp = lamp.position_range.xyz - ray.origin;
+    let closest = dot(to_lamp, ray.way);
+    let apart = max(length(to_lamp - ray.way * closest), AIR_NEAREST);
+    let first = atan((span.x - closest) / apart);
+    let last = atan((span.y - closest) / apart);
+    let range_square = lamp.position_range.w * lamp.position_range.w;
+    var total = 0.0;
+
+    for (var step = 0u; step < AIR_STEPS; step++) {
+        let angle = mix(first, last, (f32(step) + offset) / f32(AIR_STEPS));
+        let along = closest + apart * tan(angle);
+        let at = ray.origin + ray.way * along;
+        let leaving = at - lamp.position_range.xyz;
+        let distance_square = dot(leaving, leaving);
+        let leaving_way = leaving * inverseSqrt(max(distance_square, 1.0e-8));
+        // a point light packs a scale of nought and an offset of one
+        let cone = clamp(dot(lamp.direction.xyz, leaving_way) * lamp.color.w + lamp.direction.w, 0.0, 1.0);
+        let spread = apart * apart + (along - closest) * (along - closest);
+
+        total += lamp_falloff(distance_square, range_square)
+            * cone
+            * cone
+            * scattered(dot(leaving_way, -ray.way))
+            * exp(-air.medium.x * along)
+            * air_lamp_shadowing(lamp, at)
+            * spread;
+    }
+
+    return lamp.color.rgb * (total * air.medium.x * (last - first) / (f32(AIR_STEPS) * apart) * 3.14159265);
+}
+
+// The light the air along one texel's ray sends towards the eye: every lamp the
+// frame carries whose light the ray crosses, up to `AIR_LAMPS` of them, the
+// nearest first. rgb the light and nothing in the fourth.
+//
+// **One ray a texel**, through the middle of the pixel the texel stands for, out
+// to what the depth after the scene says is there. Where along its steps a
+// texel's samples sit is one of nine places over the occlusion's three by three
+// tile, and the pass after this one averages each texel with its neighbors, so
+// what is left on a stretch of air is the error of nine times as many places
+// and not a pattern. @ref `colby_engine::haze`.
+@fragment
+fn fragment_haze(input: SkyOutput) -> @location(0) vec4<f32> {
+    let texel = vec2<i32>(input.clip_position.xy);
+    let ray = air_ray(texel * 2);
+    let offset = (f32(tile_at(texel, air.rect)) + 0.5) / 9.0;
+    let count = min(globals.counts.x, MAX_LAMPS);
+    var light = vec3<f32>(0.0);
+    var followed = 0u;
+
+    for (var index = 0u; index < count; index++) {
+        if (followed >= AIR_LAMPS) {
+            break;
+        }
+
+        let lamp = globals.lamps[index];
+        let span = air_span(lamp, ray);
+
+        if (span.y <= span.x) {
+            continue;
+        }
+
+        followed += 1u;
+        light += air_lamp(lamp, ray, span, offset);
+    }
+
+    return vec4<f32>(light, 1.0);
+}
+
+// What the air is lit by from everywhere at once: the world's ambient color, or
+// its environment averaged over every way there is - the roughest level
+// straight up and straight down, which between them cover the whole sphere.
+fn air_ambient() -> vec3<f32> {
+    if (globals.sky_horizon.w > 0.5) {
+        return (ambient_radiance(vec3<f32>(0.0, 1.0, 0.0)) + ambient_radiance(vec3<f32>(0.0, -1.0, 0.0))) * 0.5;
+    }
+
+    return globals.ambient.rgb;
+}
+
+// What the march found, at the whole picture's size: four texels blended by
+// where the pixel lies between them, and a texel that is not in front of the
+// pixel's own surface read as whichever of the four is nearest it in distance.
+//
+// **A pixel at an even place on both axes reads its own texel and nothing
+// else**, to the last bit, and the blend is `a + (b - a) * t` so four equal
+// texels come back equal.
+fn air_blown_up(pixel: vec2<i32>) -> vec3<f32> {
+    let first = vec2<i32>(air.rect.xy) / 2;
+    let last = (vec2<i32>(air.rect.xy + air.rect.zw) + 1) / 2 - 1;
+    let base = pixel / 2;
+    let t = vec2<f32>(pixel - base * 2) * 0.5;
+    let along = air_distance(textureLoad(air_depth, pixel, 0));
+    let places = array<vec2<i32>, 4>(
+        clamp(base, first, last),
+        clamp(base + vec2<i32>(1, 0), first, last),
+        clamp(base + vec2<i32>(0, 1), first, last),
+        clamp(base + vec2<i32>(1, 1), first, last),
+    );
+
+    var texels = array<vec3<f32>, 4>();
+    var own = array<bool, 4>();
+    var nearest = 0u;
+    var closest = 3.4e38;
+
+    for (var index = 0u; index < 4u; index++) {
+        let gap = abs(air_distance(textureLoad(air_depth, places[index] * 2, 0)) - along);
+
+        texels[index] = textureLoad(air_found, places[index], 0).rgb;
+        own[index] = gap <= AIR_PLANE * along;
+
+        if (gap < closest) {
+            closest = gap;
+            nearest = index;
+        }
+    }
+
+    for (var index = 0u; index < 4u; index++) {
+        if (!own[index]) {
+            texels[index] = texels[nearest];
+        }
+    }
+
+    let upper = texels[0] + (texels[1] - texels[0]) * t.x;
+    let lower = texels[2] + (texels[3] - texels[2]) * t.x;
+
+    return upper + (lower - upper) * t.y;
+}
+
+// The air over the picture: what it sends towards the eye added, and what it
+// takes out of the light behind it taken, both in one blend.
+//
+// **rgb is what the air sends and alpha is what it takes**: the pipeline blends
+// `this + picture * (1 - alpha)`, so with alpha the share of the light behind
+// that the air scatters away, what comes out is the picture dimmed by the air
+// and lit by it. The share is worked out here at every pixel from its own
+// distance - `1 - exp(-haze * d)`, exact - and the light is the march's,
+// blown back up; the light from everywhere at once is the one part with no
+// shadow to cut it, and is worked out in closed form, `ambient * (1 - exp(-haze
+// * d))`, which is what the air adds when every way is lit alike.
+@fragment
+fn fragment_haze_apply(input: SkyOutput) -> @location(0) vec4<f32> {
+    let pixel = vec2<i32>(input.clip_position.xy);
+    let ray = air_ray(pixel);
+    let kept = exp(-air.medium.x * ray.far);
+
+    return vec4<f32>(air_blown_up(pixel) + air_ambient() * (1.0 - kept), 1.0 - kept);
 }
 
 // What one point of a surface is made of, before it is lit: what its own

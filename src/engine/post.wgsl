@@ -525,6 +525,30 @@ fn fragment_colors(input: ScreenOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(level, 1.0);
 }
 
+// The light a haze sends towards the eye along each pixel's ray, averaged, at
+// half the picture on each axis: rgb light and nothing in the fourth. At a
+// binding of its own for the surfaces' reason.
+@group(1) @binding(6) var air: texture_2d<f32>;
+
+// That light instead of the picture, each pixel showing the texel it is twice
+// the place of, as the share of the sky is shown: so a pixel at an even place
+// on both axes shows exactly what was worked out for it. Black where the air
+// sends nothing.
+//
+// **A byte is a number**, the depth view's rule: on an sRGB target the curve is
+// undone first, so a light of a half is half of 255 in the file.
+@fragment
+fn fragment_air(input: ScreenOutput) -> @location(0) vec4<f32> {
+    let held = textureLoad(air, vec2<i32>(input.clip_position.xy) / 2, 0);
+    var level = clamp(held.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    if (tuning.depth.w > 0.5) {
+        level = vec3<f32>(undone(level.x), undone(level.y), undone(level.z));
+    }
+
+    return vec4<f32>(level, 1.0);
+}
+
 // How much of the sky each pixel sees, worked out from what the pass before the
 // scene wrote: half the picture on each axis, r the share and g how far along
 // the view it was worked out. At a binding of its own for the surfaces' reason.

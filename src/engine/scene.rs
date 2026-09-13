@@ -59,6 +59,7 @@ use crate::{
 	env::{self, Environment},
 	focus::{self, Focus},
 	gpu::Gpu,
+	haze::{self, Haze},
 	lines::Lines,
 	occlusion::{self, Occlusion},
 	post,
@@ -752,6 +753,12 @@ pub struct Scene {
 	/// What that is asked for this frame, or nothing. Read in
 	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
 	reflecting: Option<reflection::Asking>,
+	/// The light a haze sends towards the eye, worked out after the scene from
+	/// the depth it wrote. @ref [`haze`].
+	haze: Haze,
+	/// What that is asked for this frame, or nothing. Read in
+	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
+	hazing: Option<haze::Asking>,
 	/// How many times group nought has been made again, which is how a test
 	/// shows a kept group is kept. @ref [`rebinds`](Self::rebinds).
 	#[cfg(test)]
@@ -884,7 +891,7 @@ impl Scene {
 		// and before group nought too, for the cube's reason: what the share of
 		// the sky is read out of is its ninth entry, and a scene that has asked
 		// for nothing yet binds the one texel that says all of it
-		let (occlusion, reflection) = readers(&device, &queue, (width, height))?;
+		let (occlusion, reflection, haze) = readers(&device, &queue, (width, height))?;
 		let bindings = frame_bindings(&device, &globals_layout, &globals, &atlas, &Held {
 			decals: &decal_sampler,
 			environment: &environment,
@@ -900,26 +907,12 @@ impl Scene {
 		let joints = Joints::new(&device)?;
 		let shadows = Maps::new(&device, joints.layout(), &material_layout)?;
 		let shader = Shader::new("shader.wgsl", include_str!("shader.wgsl"));
-		let groups =
-			[&globals_layout, &material_layout, shadows.sample_layout(), joints.layout()];
-		// the six, the sky and the lines all draw into the float target rather
-		// than into the window: what reaches the window is the composite, and
-		// it is the only thing built for the window's own format.
-		// one sample here whatever the console will say, because there is no
-		// console yet: a `Scene` is built before the world it draws exists.
-		// The first frame reads the variable and rebuilds if it has to, which
-		// is the same path a person turning it on mid-run takes. @ref
-		// `sampling`.
-		let pipelines = Pipelines::build(
+		let (pipelines, depth, lines, sparks) = drawing(
 			&device,
-			post::HDR_FORMAT,
-			&groups,
+			[&globals_layout, &material_layout, shadows.sample_layout(), joints.layout()],
 			shader.source(),
-			post::NO_SAMPLES,
+			(width, height),
 		)?;
-		let depth = Depth::new(&device, post::NO_SAMPLES, width, height)?;
-		let lines = Lines::new(&device, post::HDR_FORMAT, &globals_layout, post::NO_SAMPLES)?;
-		let sparks = Sparks::new(&device, post::HDR_FORMAT, post::NO_SAMPLES);
 		let post = post::Chain::new(&device, format, width, height)?;
 		let shaft = Shaft::new(&device, width, height)?;
 		let focus = Focus::new(&device, width, height)?;
@@ -953,6 +946,8 @@ impl Scene {
 			occluding: None,
 			reflection,
 			reflecting: None,
+			haze,
+			hazing: None,
 			#[cfg(test)]
 			rebound: 0,
 			#[cfg(test)]
@@ -1009,6 +1004,7 @@ impl Scene {
 		self.prepass.resize(width, height);
 		self.occlusion.resize(width, height);
 		self.reflection.resize(width, height);
+		self.haze.resize(width, height);
 	}
 
 	/// Rebuilds everything that has to agree about how many samples a pixel is.
@@ -1115,10 +1111,19 @@ impl Scene {
 			[&self.globals_layout, self.shadows.sample_layout()],
 			source,
 		)?;
+		// and the air's two passes, which light it with the same lamps: the light
+		// a lamp throws on a wall and the light it throws into the air in front of
+		// the wall are one lamp's or none
+		let haze = self.haze.rebuilt(
+			&self.device,
+			[&self.globals_layout, self.shadows.sample_layout()],
+			source,
+		)?;
 
 		self.pipelines = table;
 		self.prepass.replace(prepass);
 		self.reflection.replace(reflection);
+		self.haze.replace(haze);
 		source.clone_into(&mut self.built);
 
 		Ok(())
@@ -1277,7 +1282,7 @@ impl Scene {
 				// written by it and by nothing else, so returning here would
 				// leave the frame holding whatever was in it last.
 				drop(pass);
-				self.finish(encoder, world, seconds, target);
+				self.finish(encoder, world, (seconds, view), target);
 
 				return;
 			};
@@ -1334,7 +1339,7 @@ impl Scene {
 		// thing is squeezed onto the screen. Everything above this line drew
 		// into sixteen-bit floats, and nothing above it wrote a pixel of the
 		// frame that is about to be shown.
-		self.finish(encoder, world, seconds, target);
+		self.finish(encoder, world, (seconds, view), target);
 	}
 
 	/// Everything after the scene's own pass: the depth made readable if
@@ -1346,25 +1351,55 @@ impl Scene {
 	///
 	/// @param encoder - the frame's, with the scene's pass in it
 	/// @param world - for what the post-processing is asked to do
-	/// @param seconds - how long the frame was, for the eye
+	/// @param (seconds, view) - how long the frame was, for the eye, and the
+	/// part of the target the picture is drawn into, or the whole of it
 	/// @param target - what the last pass writes
 	fn finish(
 		&mut self,
 		mut encoder: CommandEncoder,
 		world: &World,
-		seconds: f32,
+		(seconds, view): (f32, Option<Viewport>),
 		target: &TextureView,
 	) {
 		// between the scene that wrote the depth and everything after it that
 		// reads it, and only in a frame something does. **Anything**: the view
 		// that draws the depth was the first reader, the smear around the sun
-		// is the second and the lens is the third, so the question is whether
-		// one of them asked rather than whether that one did.
+		// the second, the lens the third and the haze the fourth, so the
+		// question is whether one of them asked rather than whether that one
+		// did.
 		self.depth.make_readable(
 			&self.device,
 			&mut encoder,
-			self.seeing.is_some() || self.shafting.is_some() || self.focusing.is_some(),
+			self.seeing.is_some()
+				|| self.shafting.is_some()
+				|| self.focusing.is_some()
+				|| self.hazing.is_some(),
 			&self.timings,
+		);
+
+		// first of everything after the scene, because the air is between the
+		// eye and everything the picture holds: the smear around the sun, the
+		// lens, the eye and the bloom all read a picture the air is already in
+		if self.hazing.is_some() {
+			self.haze.ensure(
+				&self.device,
+				[&self.globals_layout, self.shadows.sample_layout()],
+				&self.built,
+			);
+		}
+
+		self.haze.render(
+			&mut encoder,
+			&self.queue,
+			haze::Frame {
+				asked: self.hazing,
+				depth: &self.depth,
+				scene: &self.bindings,
+				shadows: self.shadows.bindings(),
+				picture: self.post.picture(),
+				timings: &self.timings,
+			},
+			view,
 		);
 
 		// before the eye is measured and before the bloom is gathered, so
@@ -1406,6 +1441,7 @@ impl Scene {
 				| prepass::Showing::Material => self.prepass.material(),
 				| prepass::Showing::Reflections | prepass::Showing::Coverage =>
 					self.reflection.done(),
+				| prepass::Showing::Haze => self.haze.found(),
 			};
 
 			view.map(|view| post::Prepared { view, showing })
@@ -1483,6 +1519,27 @@ impl Scene {
 	/// Which making of the reflections' buffers the scene holds, for a test.
 	#[cfg(test)]
 	pub(crate) const fn reflection_epoch(&self) -> u64 { self.reflection.epoch() }
+
+	/// What the air along each texel's ray sends towards the eye, averaged, at
+	/// half the picture's size, for a test. @ref [`Haze::values`].
+	#[cfg(test)]
+	pub(crate) fn haze_values(&self) -> Option<Vec<[f32; 4]>> {
+		self.haze.values(&self.device, &self.queue)
+	}
+
+	/// The same before the average, for a test. @ref [`Haze::raw_values`].
+	#[cfg(test)]
+	pub(crate) fn haze_raw_values(&self) -> Option<Vec<[f32; 4]>> {
+		self.haze.raw_values(&self.device, &self.queue)
+	}
+
+	/// Which making of the haze's buffers the scene holds, for a test.
+	#[cfg(test)]
+	pub(crate) const fn haze_epoch(&self) -> u64 { self.haze.epoch() }
+
+	/// Whether the haze's passes were built, for a test. @ref [`Haze::built`].
+	#[cfg(test)]
+	pub(crate) const fn haze_built(&self) -> bool { self.haze.built() }
 
 	/// Asks for the pass before the scene whether or not anything reads it,
 	/// for a test.
@@ -1806,11 +1863,14 @@ impl Scene {
 	/// Whether anything reads what the pass before the scene writes, this
 	/// frame.
 	///
-	/// Its two readers are the view that draws it and the occlusion worked out
-	/// from it. A test can ask for it with nothing reading it at all, @ref
+	/// Its readers are the views that draw it or what is worked out from it,
+	/// the occlusion and the reflections - and not the view of the air, which
+	/// is worked out from the depth after the scene. A test can ask for it with
+	/// nothing reading it at all, @ref
 	/// [`prepare_anyway`](Self::prepare_anyway).
 	fn preparing(&self) -> bool {
-		self.showing.is_some()
+		self.showing
+			.is_some_and(|showing| showing != prepass::Showing::Haze)
 			|| self.occluding.is_some()
 			|| self.reflecting.is_some()
 			|| self.asked_anyway()
@@ -2170,6 +2230,7 @@ impl Scene {
 		self.occluding = occlusion::asking_of(world, &camera, self.showing);
 		self.reflecting =
 			reflection::asking_of(world, &camera, self.showing, self.reflections_anyway());
+		self.hazing = haze::asking_of(world, &camera, self.showing);
 		self.shafting = shaft::asking_of(world, &camera);
 		self.focusing = focus::asking_of(world, &camera);
 
@@ -2790,8 +2851,8 @@ impl Scene {
 	}
 }
 
-/// The two things that read what the pass before the scene writes, neither of
-/// which has made a buffer yet.
+/// The two things that read what the pass before the scene writes, and the
+/// haze, which reads the depth after it: none of them has made a buffer yet.
 ///
 /// @param device - the device to build against
 /// @param queue - where the occlusion's one texel is written
@@ -2800,10 +2861,40 @@ fn readers(
 	device: &Device,
 	queue: &Queue,
 	(width, height): (u32, u32),
-) -> Result<(Occlusion, Reflection)> {
+) -> Result<(Occlusion, Reflection, Haze)> {
 	Ok((
 		Occlusion::new(device, queue, width, height)?,
 		Reflection::new(device, width, height)?,
+		Haze::new(device, width, height)?,
+	))
+}
+
+/// Everything the scene's own pass draws with that has to agree about how
+/// many samples a pixel is: the table of pipelines, the depth they test
+/// against, the lines and the particles. @ref `Scene::sampling`.
+///
+/// All of them draw into the float target rather than into the window: what
+/// reaches the window is the composite, and it is the only thing built for the
+/// window's own format. And at one sample whatever the console will say,
+/// because there is no console yet: a `Scene` is built before the world it
+/// draws exists. The first frame reads the variable and rebuilds if it has to,
+/// which is the same path a person turning it on mid-run takes.
+///
+/// @param device - the device to build against
+/// @param groups - the scene's four bind group layouts, in group order
+/// @param source - the WGSL the table is built from
+/// @param (width, height) - the picture's size
+fn drawing(
+	device: &Device,
+	groups: [&BindGroupLayout; 4],
+	source: &str,
+	(width, height): (u32, u32),
+) -> Result<(Pipelines, Depth, Lines, Sparks)> {
+	Ok((
+		Pipelines::build(device, post::HDR_FORMAT, &groups, source, post::NO_SAMPLES)?,
+		Depth::new(device, post::NO_SAMPLES, width, height)?,
+		Lines::new(device, post::HDR_FORMAT, groups[0], post::NO_SAMPLES)?,
+		Sparks::new(device, post::HDR_FORMAT, post::NO_SAMPLES),
 	))
 }
 

@@ -20,6 +20,7 @@ pub mod depth;
 pub mod env;
 mod focus;
 pub mod gpu;
+mod haze;
 mod headless;
 pub mod image;
 mod lines;

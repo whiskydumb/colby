@@ -10,7 +10,7 @@
 //!
 //! ```text
 //!    0  SceneHeader                      208 bytes
-//!  208  Setting                          224 bytes, one of them
+//!  208  Setting                          232 bytes, one of them
 //!    .  [Stood; stood_count]              84 bytes each
 //!    .  [Lit;   lit_count]                36 bytes each
 //!    .  [Shed;  shed_count]               88 bytes each
@@ -83,7 +83,12 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// that already exists - was not available: a build that did not know the bit
 /// would refuse the file rather than ignore it. So the record grew, and what
 /// grew is a flags word, which the *next* bit will be free to join.
-pub const FORMAT_VERSION: u32 = 16;
+///
+/// Seventeen since the world says how hazy its air is: one word on the settings
+/// record, whose spare the sky's environment had spent. The record is
+/// eight-aligned by the `steps` at its top, so the word cost itself and a new
+/// spare. @ref [`Setting::spare`].
+pub const FORMAT_VERSION: u32 = 17;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -461,10 +466,23 @@ pub struct Setting {
 	/// world with the clear color behind it, which is the graceful answer
 	/// rather than the wrong one.
 	///
-	/// **There is no spare after this one.** The record is eight-aligned by the
-	/// `steps` at the top, so the next field to arrive costs four bytes of
-	/// itself, four of a new spare, and the version.
+	/// When it was spent there was no spare after it, and the next field to
+	/// arrive paid four bytes of itself, four of a new spare, and the version:
+	/// that was [`haze`](Self::haze).
 	pub sky_cubemap: u32,
+
+	/// How much of the light crossing a unit of air the air scatters.
+	pub haze: f32,
+
+	/// Nothing, and kept that way on purpose: the word the next field to arrive
+	/// takes without moving [`FORMAT_VERSION`].
+	///
+	/// The record is eight-aligned by the `steps` at the top, so its length has
+	/// to be a multiple of eight, and [`haze`](Self::haze) left it four short.
+	/// A file written before anything means this word holds nought there, so
+	/// whatever takes it next has to read nought as "the world does not say",
+	/// which is what the two fields that took a spare before did.
+	pub spare: u32,
 }
 
 // a record with padding in it is not `Pod`, so this would already have failed
@@ -1499,6 +1517,8 @@ const EMPTY_SETTING: Setting = Setting {
 	focus_range: 0.0,
 	blur: 0.0,
 	sky_cubemap: 0,
+	haze: 0.0,
+	spare: 0,
 };
 
 /// Writes a world out as a `.cscene`.
@@ -1998,6 +2018,8 @@ fn setting_of(stage: Stage, cubemap: &str, names: &mut Names) -> Setting {
 		focus_range: stage.camera.focus_range,
 		blur: stage.camera.blur,
 		sky_cubemap: names.put(cubemap),
+		haze: stage.post.haze,
+		spare: 0,
 	}
 }
 
@@ -2044,6 +2066,7 @@ fn stage_of(setting: Setting) -> Stage {
 			fog: Vec3::from_array(setting.fog),
 			fog_density: setting.fog_density,
 			shafts: setting.shafts,
+			haze: setting.haze,
 		},
 		light: Vec3::from_array(setting.light),
 		ambient: Vec3::from_array(setting.ambient),
@@ -2825,6 +2848,7 @@ mod tests {
 					fog: Vec3::new(0.31, 0.42, 0.53),
 					fog_density: 0.02,
 					shafts: 0.7,
+					haze: 0.035,
 				},
 				light: Vec3::new(-0.4, -1.0, -0.3),
 				ambient: Vec3::splat(0.25),
@@ -3153,10 +3177,11 @@ mod tests {
 	}
 
 	#[test]
-	fn the_settings_record_ends_in_the_name_that_spent_its_spare() {
-		// the claim the spare was kept for, collected: the word at the end of
-		// the record is now a name offset, the record is the length it was, and
-		// the field before it is where it was. @ref [`Setting::sky_cubemap`].
+	fn the_settings_record_ends_in_a_spare_word_again_after_the_haze() {
+		// the claim the version bump was paid for, collected: the name that
+		// spent the last spare is where it was, the haze is the word after it,
+		// and the record ends in a new spare holding nought. @ref
+		// [`Setting::spare`].
 		let data = SceneData {
 			sky_cubemap: "skies/dusk".to_owned(),
 			stage: Stage {
@@ -3167,19 +3192,26 @@ mod tests {
 		};
 		let bytes = encode(&data).expect("it fits in one file");
 		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
-		let at = usize::try_from(header.setting_offset).expect("it is an offset")
-			+ offset_of!(Setting, sky_cubemap);
+		let start = usize::try_from(header.setting_offset).expect("it is an offset");
+		let spare = start + offset_of!(Setting, spare);
 
 		assert_eq!(
-			at + 4,
-			usize::try_from(header.setting_offset).expect("it is an offset")
-				+ size_of::<Setting>(),
-			"it is the last word of the record, which is the spare it took"
+			offset_of!(Setting, haze),
+			offset_of!(Setting, sky_cubemap) + 4,
+			"the haze is the word after the name"
 		);
 		assert_eq!(
-			size_of::<Setting>(),
-			224,
-			"and the record is the length it already was, which is what makes the word free"
+			spare + 4,
+			start + size_of::<Setting>(),
+			"and the spare is the last word of the record"
+		);
+		assert_eq!(size_of::<Setting>(), 232, "which is two words longer than it was");
+		assert_eq!(
+			u32::from_le_bytes(
+				<[u8; 4]>::try_from(&bytes[spare..spare + 4]).expect("four bytes of a word")
+			),
+			0,
+			"and a written file holds nought there, which is what makes the word free"
 		);
 
 		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
@@ -3189,8 +3221,12 @@ mod tests {
 		assert_eq!(read.sky_cubemap, "skies/dusk", "the name came back");
 		assert_eq!(read.stage.sky.kind, SkyKind::Cubemap, "and so did the word beside it");
 		assert!(
+			(read.stage.post.haze - data.stage.post.haze).abs() < 1.0e-9,
+			"and so did the haze"
+		);
+		assert!(
 			(read.stage.camera.blur - data.stage.camera.blur).abs() < 1.0e-9,
-			"and the field before it is still where it was"
+			"and the field before the name is still where it was"
 		);
 	}
 

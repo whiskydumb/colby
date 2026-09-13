@@ -361,6 +361,39 @@ mod tests {
 	}
 
 	#[test]
+	fn and_lights_the_air_with_every_lamp_at_one_sample_and_at_four() {
+		// the march and the pass that puts it over the picture are built from the
+		// scene's own source the first frame a world's air is hazy in, and a pass
+		// that would not build only says so and leaves the air clear - so this
+		// asks whether they were built, and lets the average and the view of the
+		// air be validated beside them, across both sample counts and back
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+
+		world.post.haze = 0.05;
+
+		for (samples, showing) in [("1", "0"), ("4", "7"), ("1", "7"), ("4", "0")] {
+			tuned(&mut world, samples);
+			world
+				.cvars
+				.var(prepass::VIEW, Value::Float(prepass::NO_VIEW), "");
+			world.cvars.set(prepass::VIEW, showing);
+
+			capture
+				.shoot(&mut world)
+				.expect("the air renders at either sample count");
+
+			assert!(
+				capture.scene_mut().haze_built(),
+				"and its passes were built and validated rather than left out with a warning"
+			);
+		}
+	}
+
+	#[test]
 	fn a_shader_that_does_not_compile_is_refused_here_the_way_a_card_refuses_it() {
 		// what says the two above have teeth. Nothing is drawn on this device,
 		// so "the frame rendered" could mean the pipelines were never built -

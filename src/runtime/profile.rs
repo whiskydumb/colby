@@ -35,9 +35,9 @@
 //! and Unreal one-poles every number in `stat unit`
 //! (`UnrealClient.cpp:381-400`).
 //!
-//! Nothing is read back off the GPU except the twelve timestamps. A picture
-//! copied to a mappable buffer is three and a half megabytes that no frame
-//! anybody plays ever pays, and it would be the largest row in the table.
+//! Nothing is read back off the GPU except the thirteen spans' timestamps. A
+//! picture copied to a mappable buffer is three and a half megabytes that no
+//! frame anybody plays ever pays, and it would be the largest row in the table.
 
 use std::time::Duration;
 
@@ -88,9 +88,9 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Twelve spans of hardware, two of recording, five of simulation and one of
+/// Thirteen spans of hardware, two of recording, five of simulation and one of
 /// particles.
-const ROWS: usize = 20;
+const ROWS: usize = 21;
 
 /// Which row of the table is the whole solver step.
 ///
@@ -99,11 +99,11 @@ const ROWS: usize = 20;
 /// below has to leave these two alone or move them on purpose; `gpu depth`
 /// went in above them and moved both, `gpu shaft` did it again, `gpu focus` a
 /// third time, `gpu lamps` a fourth, `gpu prepass` a fifth, `gpu occlusion` a
-/// sixth and `gpu reflections` a seventh.
-const STEP_ROW: usize = 18;
+/// sixth, `gpu reflections` a seventh and `gpu haze` an eighth.
+const STEP_ROW: usize = 19;
 
 /// Which row is the particles.
-const SPARKS_ROW: usize = 19;
+const SPARKS_ROW: usize = 20;
 
 /// How many frames the live table averages over.
 ///
@@ -223,7 +223,7 @@ impl Live {
 	/// @param passes - what the hardware spent, per [`Pass`] in slot order,
 	/// from a frame two or three behind the one this is called in
 	/// @param count - how many render passes that frame recorded
-	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 12], count: u32) {
+	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 13], count: u32) {
 		self.passes = Some(count);
 
 		for (at, took) in passes.into_iter().enumerate() {
@@ -433,6 +433,10 @@ pub(crate) const NAMES: [&str; ROWS] = [
 	// the depth made readable, between the scene that wrote it and everything
 	// after that reads it. Added with parity card B1.
 	"gpu depth",
+	// the light a haze sends towards the eye, which reads that depth and
+	// writes into the picture before every row below it reads the picture.
+	// Added with parity card C4.
+	"gpu haze",
 	// the light the air caught around the sun, which reads that depth and
 	// writes into the picture before either of the two below it read it.
 	// Added with parity card B2.
@@ -795,6 +799,7 @@ mod tests {
 				None,
 				None,
 				Some(Duration::from_micros(800)),
+				None,
 				None,
 				None,
 				None,

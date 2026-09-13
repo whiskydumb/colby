@@ -191,6 +191,29 @@ pub struct Post {
 	/// Off in a fresh world, which is where both engines that have it start.
 	/// @ref [`colby_engine`] for the passes.
 	pub shafts: f32,
+
+	/// How much of the light crossing a unit of air the air takes out of the
+	/// way and sends somewhere else, per unit of distance.
+	///
+	/// Zero is clear air, and no work either: the passes are skipped rather
+	/// than run and multiplied by nothing, the way [`shafts`](Self::shafts)
+	/// is. Anything above it is a haze every lamp's light can be seen
+	/// crossing, cut by whatever stands between the lamp and the air.
+	///
+	/// **Its own number rather than [`fog_density`](Self::fog_density).** The
+	/// fog is `exp(-(d * density)^2)`, which is what leaves what is near alone:
+	/// the air it stands for takes nothing out of the first unit of distance
+	/// from the eye and more out of every unit after. A lamp's light crossing
+	/// the air a pace in front of somebody would be invisible in it. This is
+	/// air that is the same everywhere, so a surface behind it keeps `exp(-d *
+	/// haze)` of its light, and what the air takes out of one ray it sends out
+	/// along others - all of it, nothing absorbed. The two stay apart and both
+	/// apply, the way three of the five engines here keep their volumetric
+	/// density apart from their ordinary fog.
+	///
+	/// Off in a fresh world, where five of the six engines here start. @ref
+	/// [`colby_engine`] for the passes.
+	pub haze: f32,
 }
 
 impl Post {
@@ -216,6 +239,7 @@ impl Post {
 		fog: Vec3::new(0.55, 0.60, 0.68),
 		fog_density: 0.0,
 		shafts: 0.0,
+		haze: 0.0,
 	};
 	/// Its fields, for an inspector, a reader and a writer. @ref
 	/// [`field`](super::field).
@@ -245,6 +269,7 @@ impl Post {
 		field!(Color, "fog", fog, "the color a distant surface fades towards"),
 		field!(Float, "fog_density", fog_density, "how quickly it fades, per unit of distance"),
 		field!(Float, "shafts", shafts, "how much light the air catches around the sun"),
+		field!(Float, "haze", haze, "how much of the light crossing a unit of air it scatters"),
 	];
 
 	/// The exposure a measured average asks for, before the clamp.
@@ -286,6 +311,10 @@ impl Post {
 	/// Whether the air catches anything around the sun.
 	#[must_use]
 	pub fn is_shafting(self) -> bool { self.shafts > 0.0 }
+
+	/// Whether there is any air to see light crossing.
+	#[must_use]
+	pub fn is_hazy(self) -> bool { self.haze > 0.0 }
 }
 
 impl Default for Post {
@@ -317,11 +346,30 @@ mod tests {
 	}
 
 	#[test]
-	fn a_world_starts_with_a_curve_and_without_bloom_fog_or_shafts() {
+	fn a_world_starts_with_a_curve_and_without_bloom_fog_shafts_or_haze() {
 		assert!(Post::DEFAULT.auto_exposure, "the eye adapts");
 		assert!(!Post::DEFAULT.is_blooming(), "nothing is added back");
 		assert!(!Post::DEFAULT.is_foggy(), "distance takes nothing away");
-		assert!(!Post::DEFAULT.is_shafting(), "and the air catches nothing");
+		assert!(!Post::DEFAULT.is_shafting(), "the air catches nothing around the sun");
+		assert!(!Post::DEFAULT.is_hazy(), "and there is no air to see light crossing");
+	}
+
+	#[test]
+	fn there_is_haze_only_at_a_density_above_nothing() {
+		// what decides whether the passes are recorded at all, so a number
+		// typed backwards, or one nobody could mean, is clear air rather than
+		// a haze that gives light back
+		for asked in [0.0, -0.0, -1.0, f32::NEG_INFINITY, f32::NAN] {
+			assert!(
+				!Post { haze: asked, ..Post::DEFAULT }.is_hazy(),
+				"a density of {asked} is none"
+			);
+		}
+
+		assert!(
+			Post { haze: 1.0e-6, ..Post::DEFAULT }.is_hazy(),
+			"and anything above nothing is some"
+		);
 	}
 
 	#[test]

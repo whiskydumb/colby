@@ -71,7 +71,8 @@ use crate::scene::{DEPTH_FORMAT, vertex_buffers};
 /// wrote, @ref [`occlusion`](crate::occlusion) - four the color each surface is
 /// lit with, five what each pixel's reflection finds on the picture and six how
 /// much of its reflection it found there, @ref
-/// [`reflection`](crate::reflection). Anything else is the picture. A tool,
+/// [`reflection`](crate::reflection), and seven the light a haze sends towards
+/// the eye, @ref [`haze`](crate::haze). Anything else is the picture. A tool,
 /// like the depth view: off until somebody sets it and never saved.
 pub const VIEW: &str = "r.normals";
 
@@ -111,12 +112,18 @@ pub(crate) enum Showing {
 
 	/// How much of each pixel's reflection was found on the picture, as a grey.
 	Coverage,
+
+	/// The light a haze sends towards the eye along each pixel's ray, as light:
+	/// not a number this pass writes, and not one it has to run for. @ref
+	/// [`haze`](crate::haze).
+	Haze,
 }
 
 /// What [`VIEW`] asks this frame to draw, if anything.
 ///
 /// A number rather than a word, because every tool of this kind is one: one to
-/// six are the answers, and anything else - a nan among them - is the picture.
+/// seven are the answers, and anything else - a nan among them - is the
+/// picture.
 ///
 /// @param world - for the console variable
 #[must_use]
@@ -129,6 +136,7 @@ pub(crate) fn showing_of(world: &World) -> Option<Showing> {
 		Showing::Material,
 		Showing::Reflections,
 		Showing::Coverage,
+		Showing::Haze,
 	];
 
 	answers
@@ -1670,7 +1678,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_view_that_is_not_one_to_six_draws_the_picture_and_the_depth_view_wins() {
+	fn a_view_that_is_not_one_to_seven_draws_the_picture_and_the_depth_view_wins() {
 		let Some(mut capture) = capture() else {
 			return;
 		};
@@ -1684,7 +1692,7 @@ mod tests {
 			.shoot(&mut world)
 			.expect("the capture renders");
 
-		for asked in ["7", "-1", "0.25", "6.5"] {
+		for asked in ["8", "-1", "0.25", "7.5"] {
 			asking(&mut world, "4", asked);
 
 			let again = capture

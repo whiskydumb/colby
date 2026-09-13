@@ -670,7 +670,8 @@ fn install_render(world: &mut World) {
 		Value::Float(colby_engine::prepass::NO_VIEW),
 		"draw what every surface is instead of the picture: 1 its normal, 2 its roughness, 3 \
 		 how much of the sky it sees, 4 its color, 5 what its reflection finds on the picture, \
-		 6 how much of its reflection is found there; nought is the picture",
+		 6 how much of its reflection is found there, 7 the light the air in front of it sends; \
+		 nought is the picture",
 	);
 	// how many samples a pixel of the world is drawn with. **Saved**, unlike
 	// the two above and like `r.backend`: how much a machine can afford to

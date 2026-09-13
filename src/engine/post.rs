@@ -307,6 +307,14 @@ pub(crate) struct Chain {
 	/// the reason the surfaces have the fourth.
 	colors_layout: BindGroupLayout,
 
+	/// What draws the light a haze sends towards the eye instead of the
+	/// picture. @ref [`haze`](crate::haze).
+	airing: RenderPipeline,
+
+	/// How it is handed that buffer: one binding, the seventh of its group, for
+	/// the reason the surfaces have the fourth.
+	air_layout: BindGroupLayout,
+
 	/// Whether the target the last pass writes applies the sRGB curve on the
 	/// way out, which the depth view undoes so that a byte is a distance.
 	srgb: bool,
@@ -360,32 +368,13 @@ impl Chain {
 
 		let built =
 			pipelines(device, &module, format, [&numbers_layout, &texture_layout, &eye_layout]);
-		// beside the seven rather than among them: each draws a buffer of its own
-		// in the picture's place, so its second group is a layout of its own
-		let (seeing, depth_layout) = instead_of(
-			device,
-			(&module, format, &numbers_layout),
-			("post depth", "fragment_depth"),
-			crate::depth::entry(2),
-		);
-		let (surfacing, surfaces_layout) = instead_of(
-			device,
-			(&module, format, &numbers_layout),
-			("post surfaces", "fragment_surfaces"),
-			crate::prepass::entry(3),
-		);
-		let (occluding, occlusion_layout) = instead_of(
-			device,
-			(&module, format, &numbers_layout),
-			("post occlusion", "fragment_occlusion"),
-			crate::occlusion::entry(4),
-		);
-		let (coloring, colors_layout) = instead_of(
-			device,
-			(&module, format, &numbers_layout),
-			("post colors", "fragment_colors"),
-			crate::prepass::entry(5),
-		);
+		let [
+			(seeing, depth_layout),
+			(surfacing, surfaces_layout),
+			(occluding, occlusion_layout),
+			(coloring, colors_layout),
+			(airing, air_layout),
+		] = views(device, (&module, format, &numbers_layout));
 
 		if let Some(complaint) = pollster::block_on(scope.pop()) {
 			return Err(err!(Graphics("the post-processing pipelines: {complaint}")));
@@ -437,6 +426,8 @@ impl Chain {
 			occlusion_layout,
 			coloring,
 			colors_layout,
+			airing,
+			air_layout,
 			srgb: format.is_srgb(),
 			device: device.clone(),
 			size: (width, height),
@@ -589,6 +580,7 @@ impl Chain {
 					("post occlusion", &self.occluding, &self.occlusion_layout, 4),
 				| Showing::Material | Showing::Reflections | Showing::Coverage =>
 					("post colors", &self.coloring, &self.colors_layout, 5),
+				| Showing::Haze => ("post air", &self.airing, &self.air_layout, 6),
 			};
 
 			self.instead(
@@ -1093,6 +1085,7 @@ const fn number_of(showing: Showing) -> f32 {
 		| Showing::Material => 4.0,
 		| Showing::Reflections => 5.0,
 		| Showing::Coverage => 6.0,
+		| Showing::Haze => 7.0,
 	}
 }
 
@@ -1466,6 +1459,38 @@ fn clamped(device: &Device) -> Sampler {
 		min_filter: FilterMode::Linear,
 		..SamplerDescriptor::default()
 	})
+}
+
+/// Every pass that draws a buffer in the picture's place: the depth, the
+/// surfaces, the share of the sky, a buffer of colors and the light a haze
+/// sends, in that order.
+///
+/// Beside the chain's seven rather than among them: each draws a buffer of its
+/// own in the picture's place, so its second group is a layout of its own.
+///
+/// @param device - the device to build against
+/// @param built - @ref [`instead_of`]
+fn views(
+	device: &Device,
+	built: (&wgpu::ShaderModule, TextureFormat, &BindGroupLayout),
+) -> [(RenderPipeline, BindGroupLayout); 5] {
+	[
+		instead_of(device, built, ("post depth", "fragment_depth"), crate::depth::entry(2)),
+		instead_of(
+			device,
+			built,
+			("post surfaces", "fragment_surfaces"),
+			crate::prepass::entry(3),
+		),
+		instead_of(
+			device,
+			built,
+			("post occlusion", "fragment_occlusion"),
+			crate::occlusion::entry(4),
+		),
+		instead_of(device, built, ("post colors", "fragment_colors"), crate::prepass::entry(5)),
+		instead_of(device, built, ("post air", "fragment_air"), crate::prepass::entry(6)),
+	]
 }
 
 /// A pass that draws one buffer in the picture's place: its layout, one entry
