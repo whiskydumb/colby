@@ -31,7 +31,7 @@ mod tests {
 	};
 	use wgpu::TextureFormat;
 
-	use crate::{Capture, Gpu, depth, occlusion, prepass, scene, shadow};
+	use crate::{Capture, Gpu, depth, occlusion, prepass, reflection, scene, shadow};
 
 	/// How big the target is. Small on purpose: nothing here reads it.
 	const SIZE: (u32, u32) = (16, 16);
@@ -389,6 +389,70 @@ mod tests {
 			assert!(
 				capture.scene_mut().haze_built(),
 				"and its passes were built and validated rather than left out with a warning"
+			);
+		}
+	}
+
+	#[test]
+	fn and_mixes_what_the_reflections_found_under_hazy_air_at_one_sample_and_at_four() {
+		// what the reflections found is the tenth entry of group nought, and every
+		// pipeline built against that group declares it: the scene's table, the pass
+		// before the scene, the reflections' first pass and the air's two, the last
+		// three built from the scene's own source the first frame something asks. A
+		// mirror floor under hazy air asks for all of them in one frame - across both
+		// sample counts and back, with the views of the reflections and of the air
+		// in between and the mix at a strength short of all of it - and a pass that
+		// would not build only says so and leaves its part out, so this asks whether
+		// each was built
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+		let mirror = world.materials.insert("test/mirror", Material {
+			roughness: 0.045,
+			metallic: 1.0,
+			..Material::DEFAULT
+		});
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, -1.0, 0.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(10.0, 0.5, 10.0),
+		});
+
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(MeshId::CUBE, mirror, Vec3::ONE));
+		world.post.haze = 0.05;
+
+		for (samples, showing, strength) in [
+			("1", "0", "1"),
+			("4", "5", "1"),
+			("1", "7", "0.5"),
+			("4", "0", "1"),
+			("1", "0", "0"),
+		] {
+			tuned(&mut world, samples);
+			world
+				.cvars
+				.var(prepass::VIEW, Value::Float(prepass::NO_VIEW), "");
+			world.cvars.set(prepass::VIEW, showing);
+			world
+				.cvars
+				.var(reflection::STRENGTH, Value::Float(reflection::DEFAULT_STRENGTH), "");
+			world.cvars.set(reflection::STRENGTH, strength);
+
+			capture
+				.shoot(&mut world)
+				.expect("reflections mixed under hazy air render at either sample count");
+
+			assert!(
+				capture.scene_mut().haze_built(),
+				"the air's passes were built against the group the mix is read out of"
+			);
+			assert!(
+				capture.scene_mut().reflection_built(),
+				"and so was the first pass of the reflections they are mixed from"
 			);
 		}
 	}

@@ -628,6 +628,15 @@ fn install_render(world: &mut World) {
 		"how much of the light arriving from everywhere a nearby wall or corner takes away: one \
 		 is all of it, nought is none",
 	);
+	// how much of what a smooth surface's reflection finds on the picture takes
+	// the place of what the sky would have given it. On, not saved, a strength,
+	// and nought records no pass at all, for the share of the sky's reasons.
+	world.cvars.var(
+		colby_engine::reflection::STRENGTH,
+		Value::Float(colby_engine::reflection::DEFAULT_STRENGTH),
+		"how much of what a smooth surface's reflection finds on the picture takes the place of \
+		 the sky's reflection: one is all of it, nought is none",
+	);
 	// what a frame cannot see is left out of it: the view for the picture and
 	// each cascade's box for its shadows. On, and not saved, like the shadows:
 	// what the switch is for is measuring what the test saves, and showing
@@ -1433,6 +1442,10 @@ mod tests {
 		(
 			colby_engine::occlusion::STRENGTH,
 			Value::Float(colby_engine::occlusion::DEFAULT_STRENGTH),
+		),
+		(
+			colby_engine::reflection::STRENGTH,
+			Value::Float(colby_engine::reflection::DEFAULT_STRENGTH),
 		),
 		// `crate::console::volumes`, all four
 		(colby_audio::MASTER, Value::Float(1.0)),

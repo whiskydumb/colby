@@ -12,9 +12,16 @@
 //! texel across the depth the pass before the scene wrote, at half the picture
 //! on each axis, and lights what it meets; the second averages a rough
 //! surface's texels with their neighbors on its own plane; the third brings the
-//! result back to the picture's size. The scene reads the last. @ref
-//! `fragment_reflections` in `shader.wgsl` for the first, and `reflection.wgsl`
-//! for the other two.
+//! result back to the picture's size. @ref `fragment_reflections` in
+//! `shader.wgsl` for the first, and `reflection.wgsl` for the other two.
+//!
+//! **The scene mixes the last into the light a surface sends back**, in the
+//! place of what the environment sends along the reflection, and before the air
+//! is laid over the picture - so the air in front of a mirror dims what the
+//! mirror shows as it dims the mirror. What was found is not darkened by the
+//! mirror's own share of the sky: the ray already met what is in its way. A
+//! frame nobody asks in binds one texel that says nothing was found, which
+//! mixes in nothing. @ref `lit_at` in `shader.wgsl`.
 //!
 //! **What a ray meets is lit, not read off a picture.** Every screen-space
 //! reflection in the field reads the color the picture already has where a ray
@@ -44,12 +51,13 @@ use wgpu::{
 	BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
 	BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
 	BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder, Device,
-	ErrorFilter, Extent3d, FragmentState, LoadOp, MultisampleState, Operations,
+	ErrorFilter, Extent3d, FragmentState, LoadOp, MultisampleState, Operations, Origin3d,
 	PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, Queue, RenderPass,
 	RenderPassColorAttachment, RenderPassDescriptor, RenderPassTimestampWrites, RenderPipeline,
 	RenderPipelineDescriptor, ShaderModule, ShaderModuleDescriptor, ShaderSource, ShaderStages,
-	StoreOp, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-	TextureViewDescriptor, VertexState,
+	StoreOp, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
+	TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+	VertexState,
 };
 
 use crate::{
@@ -58,6 +66,21 @@ use crate::{
 	shader::Shader,
 	timing::{Ends, Pass, Timings},
 };
+
+/// The console variable that says how much of what the reflections find the
+/// picture takes.
+///
+/// **A strength, on, and not saved**, the share of the sky's terms: one mixes
+/// all of what was found over the environment's reflection and nought none of
+/// it; a frame at nought records no pass and reads one texel that says nothing
+/// was found, so nought is the picture exactly as it was before any of this
+/// existed. On because what it corrects is the light itself - a floor showing
+/// the sky where a wall stands on it - and what a machine that cannot afford
+/// the correction needs is somewhere to say so.
+pub const STRENGTH: &str = "r.reflections";
+
+/// What [`STRENGTH`] holds until somebody sets it: all of it.
+pub const DEFAULT_STRENGTH: f32 = 1.0;
 
 /// The roughness at and past which no reflection is followed.
 ///
@@ -113,20 +136,28 @@ pub(crate) struct Asking {
 
 /// What this frame asks for, if anything.
 ///
-/// The views that draw what the reflections found ask, at the whole strength.
+/// The picture asks at the strength [`STRENGTH`] says, and not at all at
+/// nought. The views that draw what the reflections found ask whatever that
+/// says and at the whole strength, because what they draw is what was found
+/// rather than how much of it the picture takes - and the picture is not on the
+/// screen while they are.
 ///
-/// @param world - for the aspect
+/// @param world - for the aspect and the console variable
 /// @param camera - the camera this frame is drawn from
 /// @param showing - what the view is asked to draw, if anything
-/// @param anyway - whether a test asks with nothing reading them
 #[must_use]
 pub(crate) fn asking_of(
 	world: &World,
 	camera: &Camera,
 	showing: Option<Showing>,
-	anyway: bool,
 ) -> Option<Asking> {
-	if !anyway && !matches!(showing, Some(Showing::Reflections | Showing::Coverage)) {
+	let strength = if matches!(showing, Some(Showing::Reflections | Showing::Coverage)) {
+		1.0
+	} else {
+		strength_of(world)
+	};
+
+	if strength <= 0.0 {
 		return None;
 	}
 
@@ -136,8 +167,35 @@ pub(crate) fn asking_of(
 	Some(Asking {
 		view: [0, 1, 2].map(|axis| view.row(axis).to_array()),
 		lens: [lens.x_axis.x, lens.y_axis.y, lens.z_axis.z, lens.w_axis.z],
-		strength: 1.0,
+		strength,
 	})
+}
+
+/// How much of what is found the picture asks to take.
+///
+/// @param world - for the console variable
+fn strength_of(world: &World) -> f32 {
+	held(
+		world
+			.cvars
+			.float(STRENGTH)
+			.unwrap_or(DEFAULT_STRENGTH),
+	)
+}
+
+/// A strength as somebody asked for it, held inside nought and one.
+///
+/// A nan is the whole strength rather than none, the lamps' rule and the share
+/// of the sky's: a variable nobody meant to set should not quietly change the
+/// light.
+///
+/// @param asked - what the variable holds
+fn held(asked: f32) -> f32 {
+	if asked.is_nan() {
+		return DEFAULT_STRENGTH;
+	}
+
+	asked.clamp(0.0, 1.0)
 }
 
 /// The three buffers, and the groups the passes after the first read them
@@ -175,7 +233,17 @@ pub(crate) struct Reflection {
 
 	/// Which making of [`buffers`](Self::buffers) a reader is looking at: moved
 	/// when they are made and when they go.
+	///
+	/// **Moved when they are made as well as when they are let go**, the share
+	/// of the sky's rule and for its reason: the scene's frame group is made
+	/// whether there are buffers or not - over [`none`](Self::none) when there
+	/// are not - so a buffer arriving is a change that group has to hear about
+	/// too.
 	epoch: u64,
+
+	/// One texel that says nothing was found, which is what the scene binds in
+	/// a frame nobody asked for the reflections in.
+	none: TextureView,
 
 	/// How the first pass reads the tuning block and what the pass before the
 	/// scene wrote, and which of that pass's buffers the group is for. @ref
@@ -202,16 +270,18 @@ pub(crate) struct Reflection {
 }
 
 impl Reflection {
-	/// Builds the two passes that need nothing of the scene's, and the block
-	/// every pass reads its numbers from.
+	/// Builds the two passes that need nothing of the scene's, the block every
+	/// pass reads its numbers from and the texel a frame that asks for nothing
+	/// binds.
 	///
 	/// No buffer and no first pass yet: a frame that asks for nothing never
 	/// makes either.
 	///
 	/// @param device - the device to build against
+	/// @param queue - where the texel that says nothing was found is written
 	/// @param width - the picture's width in pixels
 	/// @param height - its height
-	pub(crate) fn new(device: &Device, width: u32, height: u32) -> Result<Self> {
+	pub(crate) fn new(device: &Device, queue: &Queue, width: u32, height: u32) -> Result<Self> {
 		let uniform = |binding| BindGroupLayoutEntry {
 			binding,
 			visibility: ShaderStages::FRAGMENT,
@@ -283,6 +353,7 @@ impl Reflection {
 			size: (width, height),
 			buffers: None,
 			epoch: 0,
+			none: nothing_found(device, queue),
 			mirror: None,
 			prepass_read: None,
 			trace: None,
@@ -570,9 +641,18 @@ impl Reflection {
 		self.buffers.as_ref().map(|buffers| &buffers.done)
 	}
 
-	/// Which making of the buffers [`done`](Self::done) hands back.
-	#[cfg(test)]
+	/// What the scene binds for what the reflections found:
+	/// [`done`](Self::done), or one texel that says nothing was found in a
+	/// frame that did not ask.
+	pub(crate) fn bound(&self) -> &TextureView { self.done().unwrap_or(&self.none) }
+
+	/// Which making of the buffers [`bound`](Self::bound) hands back. @ref
+	/// [`epoch`](Self::epoch)'s field for when it moves.
 	pub(crate) const fn epoch(&self) -> u64 { self.epoch }
+
+	/// Whether the first pass has been built. A test's.
+	#[cfg(test)]
+	pub(crate) const fn built(&self) -> bool { self.trace.is_some() }
 
 	/// What the last frame wrote, four floats a pixel, top row first. A test's.
 	///
@@ -606,6 +686,12 @@ pub(crate) struct Frame<'a> {
 
 	/// The scene's group nought: the frame's uniform, the environment, the
 	/// table and the share of the sky, which the first pass lights with.
+	///
+	/// **And what these passes found, which it does not read**: the group is
+	/// made again over new buffers only after they are written, so here it
+	/// holds whatever it was made over last - the one texel of nothing, or
+	/// what the frame before found - and what the first pass lights a thing
+	/// with is nothing found either way.
 	pub(crate) scene: &'a BindGroup,
 
 	/// The shadow atlas's group, which it lights with too.
@@ -699,6 +785,58 @@ fn buffers(
 		averaged,
 		done,
 	}
+}
+
+/// One texel of the buffers' format that says nothing was found.
+///
+/// **Nought in all four numbers, rgb as well as a**: the light is already
+/// multiplied by how much of the reflection it stands for, and the scene adds
+/// the rgb as it is, so a texel that said nothing with its fourth number alone
+/// would still add its first three. Read with the coordinate held inside it,
+/// because a read past the end may come back with an alpha of one, and what it
+/// mixes in is a nought added after everything else, which leaves every bit
+/// where it was.
+///
+/// @param device - the device to build against
+/// @param queue - where the texel is written
+fn nothing_found(device: &Device, queue: &Queue) -> TextureView {
+	let texture = device.create_texture(&TextureDescriptor {
+		label: Some("reflection none"),
+		size: Extent3d {
+			width: 1,
+			height: 1,
+			depth_or_array_layers: 1,
+		},
+		mip_level_count: 1,
+		sample_count: 1,
+		dimension: TextureDimension::D2,
+		format: FORMAT,
+		usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+		view_formats: &[],
+	});
+
+	// four sixteen-bit floats of nought are eight bytes of nought
+	queue.write_texture(
+		TexelCopyTextureInfo {
+			texture: &texture,
+			mip_level: 0,
+			origin: Origin3d::ZERO,
+			aspect: TextureAspect::All,
+		},
+		&[0_u8; 8],
+		TexelCopyBufferLayout {
+			offset: 0,
+			bytes_per_row: Some(8),
+			rows_per_image: Some(1),
+		},
+		Extent3d {
+			width: 1,
+			height: 1,
+			depth_or_array_layers: 1,
+		},
+	);
+
+	texture.create_view(&TextureViewDescriptor::default())
 }
 
 /// The copy bit a test reads a buffer back through: a test's and only a test's.
@@ -860,14 +998,14 @@ fn screen_pipeline(
 mod tests {
 	use colby_core::{
 		abi::{
-			Decal, EntityId, Material, MaterialId, MeshId, Post, Renderable, Sky, ToneMap,
-			Transform, Value, material::Blend,
+			CUBE_FACES, Decal, EntityId, Light, Material, MaterialId, MeshId, Post, Renderable,
+			Sky, Texel, TextureData, ToneMap, Transform, Value, material::Blend,
 		},
 		glam::{Quat, Vec2, Vec3},
 	};
 
 	use super::*;
-	use crate::{Capture, occlusion, prepass, scene::MSAA};
+	use crate::{Capture, Image, occlusion, prepass, scene::MSAA};
 
 	/// How big every capture here is.
 	const SIZE: (u32, u32) = (320, 240);
@@ -889,6 +1027,30 @@ mod tests {
 	/// `WITHIN` for why a whole step and not half of one.
 	const STEP: f32 = 5.0e-4;
 
+	/// How far a byte of the picture may lie outside what the picture without
+	/// the reflections, with what they found mixed in, can round to - worked
+	/// out in linear light with the other picture's rounding carried through
+	/// the curve.
+	///
+	/// **Measured at 0.21 and set at a little over twice it.** What is left
+	/// once both roundings are carried is the found light and the normal read
+	/// back out of sixteen-bit floats, and the table filtered here in `f32`
+	/// where the device filters it in its own steps. A fixed half byte either
+	/// way was measured too, and came out at 1.95: the mixed light is darker
+	/// than the plain, where the curve is steeper, and the half byte the plain
+	/// picture was rounded by grows on the way.
+	const PICTURE_WITHIN: f32 = 0.5;
+
+	/// The same for a picture in hazy air against three others: the same world
+	/// without the reflections in the same air, and with and without them in
+	/// clear air. **Measured at nought**, three roundings being carried, and
+	/// set at the picture's own allowance.
+	const AIR_WITHIN: f32 = 0.5;
+
+	/// How much of the light crossing a unit of air the hazy pictures' air
+	/// scatters.
+	const HAZE: f32 = 0.08;
+
 	/// A capture on the binary's one device, or `None` with no GPU.
 	fn capture() -> Option<Capture> {
 		let gpu = crate::gpu::shared()?;
@@ -909,10 +1071,103 @@ mod tests {
 			.cvars
 			.var(prepass::VIEW, Value::Float(prepass::NO_VIEW), "");
 		world.cvars.set(prepass::VIEW, showing);
+		occluding(world, "0");
+	}
+
+	/// How much of what is hidden the share of the sky takes away.
+	fn occluding(world: &mut World, asked: &str) {
 		world
 			.cvars
 			.var(occlusion::STRENGTH, Value::Float(occlusion::DEFAULT_STRENGTH), "");
-		world.cvars.set(occlusion::STRENGTH, "0");
+		world.cvars.set(occlusion::STRENGTH, asked);
+	}
+
+	/// How much of what the reflections find the picture takes.
+	fn reflections(world: &mut World, asked: &str) {
+		world
+			.cvars
+			.var(STRENGTH, Value::Float(DEFAULT_STRENGTH), "");
+		world.cvars.set(STRENGTH, asked);
+	}
+
+	/// The scene's own shader with one piece of it replaced, which has to be in
+	/// it exactly once.
+	fn variant(find: &str, replace: &str) -> String {
+		let source = include_str!("shader.wgsl");
+
+		assert_eq!(source.matches(find).count(), 1, "`{find}` is in the shader exactly once");
+
+		source.replace(find, replace)
+	}
+
+	/// A byte of an sRGB picture, or a place between two bytes, as the linear
+	/// level it encodes.
+	fn level_of(byte: f32) -> f32 {
+		let level = (byte / 255.0).clamp(0.0, 1.0);
+
+		if level <= 0.040_45 {
+			level / 12.92
+		} else {
+			((level + 0.055) / 1.055).powf(2.4)
+		}
+	}
+
+	/// The linear levels a byte of an sRGB picture can have been rounded from.
+	fn levels(byte: u8) -> (f32, f32) {
+		(level_of(f32::from(byte) - 0.5), level_of(f32::from(byte) + 0.5))
+	}
+
+	/// A linear level as the byte an sRGB target stores it as, before rounding.
+	fn encoded(level: f32) -> f32 {
+		let curved = if level <= 0.003_130_8 {
+			level * 12.92
+		} else {
+			1.055_f32.mul_add(level.powf(1.0 / 2.4), -0.055)
+		};
+
+		curved * 255.0
+	}
+
+	/// How far a byte of a picture lies outside the bytes a light somewhere
+	/// between two linear levels can be written as.
+	///
+	/// **The half byte a picture was rounded by is carried through the curve**
+	/// rather than taken to stay half a byte: light added to a byte's level can
+	/// land where the curve is twice as steep, and there the half byte it was
+	/// rounded from is a byte wide.
+	fn outside(seen: u8, (low, high): (f32, f32)) -> f32 {
+		let seen = f32::from(seen);
+		let lowest = encoded(low).clamp(0.0, 255.0) - 0.5;
+		let highest = encoded(high).clamp(0.0, 255.0) + 0.5;
+
+		(lowest - seen).max(seen - highest).max(0.0)
+	}
+
+	/// How far the three channels of a pixel lie outside what a pixel of
+	/// another picture with some light added can be written as, at worst. @ref
+	/// [`outside`].
+	fn added_outside(before: [u8; 4], added: Vec3, after: [u8; 4]) -> f32 {
+		(0..3)
+			.map(|channel| {
+				let (low, high) = levels(before[channel]);
+
+				outside(after[channel], (low + added[channel], high + added[channel]))
+			})
+			.fold(0.0, f32::max)
+	}
+
+	/// Every pixel of the picture, row by row.
+	fn every_pixel() -> impl Iterator<Item = (u32, u32)> {
+		(0..SIZE.1).flat_map(|row| (0..SIZE.0).map(move |column| (column, row)))
+	}
+
+	/// How many pixels of two pictures differ at all.
+	fn apart(one: &Image, other: &Image) -> usize {
+		one.pixels
+			.chunks_exact(4)
+			.zip(other.pixels.chunks_exact(4))
+			.filter(|(a, b)| a != b)
+			.count()
 	}
 
 	/// The picture's own look out of the way, and the light arriving from
@@ -974,13 +1229,27 @@ mod tests {
 
 	/// The same room with a wall of another height.
 	fn room_of(floor_roughness: f32, wall_metallic: f32, height: f32) -> World {
+		room_with(
+			Material {
+				roughness: floor_roughness,
+				..Material::DEFAULT
+			},
+			wall_metallic,
+			height,
+		)
+	}
+
+	/// The same room with a floor of any material: the floor's tint is its
+	/// color, so a metal floor reflects about a third of what reaches it where
+	/// a dielectric one reflects a few hundredths.
+	fn room_with(floor: Material, wall_metallic: f32, height: f32) -> World {
 		let mut world = World::new();
 
 		world.camera.position = Vec3::new(0.0, 1.2, 4.0);
 		world.camera.target = Vec3::new(0.0, 0.8, WALL);
 		flat(&mut world, 0.8);
 
-		let floor = made(&mut world, "test/floor", floor_roughness, 0.0);
+		let floor = world.materials.insert("test/floor", floor);
 		let wall = made(&mut world, "test/wall", 0.8, wall_metallic);
 
 		slab(
@@ -1852,13 +2121,14 @@ mod tests {
 	}
 
 	#[test]
-	fn the_passes_run_while_something_asks_and_let_their_buffers_go_after() {
+	fn the_passes_run_while_the_picture_or_a_view_asks_and_let_their_buffers_go_after() {
 		let Some(mut capture) = capture() else {
 			return;
 		};
 		let mut world = room(0.045, 0.0);
 
 		asking(&mut world, "1", "0");
+		reflections(&mut world, "0");
 		capture.draw(&mut world, &mut []);
 
 		let quiet = capture.scene_mut().spans().passes();
@@ -1869,6 +2139,7 @@ mod tests {
 			"a frame nobody asks in makes no buffer"
 		);
 
+		// the view asks whatever the strength says
 		asking(&mut world, "1", "5");
 		capture.draw(&mut world, &mut []);
 
@@ -1880,14 +2151,21 @@ mod tests {
 			 place"
 		);
 
-		asking(&mut world, "1", "6");
+		// and the picture asks at any strength above nought
+		asking(&mut world, "1", "0");
+		reflections(&mut world, "0.25");
 		capture.draw(&mut world, &mut []);
 
 		let kept = capture.scene_mut().reflection_epoch();
 
 		assert_eq!(kept, first + 1, "a second frame that asks keeps the buffers the first made");
+		assert_eq!(
+			capture.scene_mut().spans().passes(),
+			quiet + 4,
+			"and the picture at a quarter of the strength costs the same four passes"
+		);
 
-		asking(&mut world, "1", "0");
+		reflections(&mut world, "0");
 		capture.draw(&mut world, &mut []);
 
 		assert!(
@@ -1899,23 +2177,28 @@ mod tests {
 	}
 
 	#[test]
-	fn asking_for_the_reflections_moves_no_pixel_of_the_picture() {
+	fn a_world_with_nothing_smooth_enough_is_the_same_picture_with_the_reflections_and_without() {
+		// the passes run and follow nothing, and the scene reads a buffer the size
+		// of the picture that holds nought everywhere rather than the one texel of
+		// nothing: at both sample counts the picture is the one a frame that never
+		// asked draws, to the bit. Under a sun, so that the light a nought is added
+		// after is more than the ambient term
 		let Some(mut capture) = capture() else {
 			return;
 		};
-		let mut world = room(0.045, 1.0);
+		let mut world = room(CUTOFF + 0.02, 1.0);
 
 		world.light = Vec3::new(-0.4, -1.0, -0.5);
 
 		for samples in ["4", "1"] {
 			asking(&mut world, samples, "0");
-			capture.scene_mut().reflect_anyway(false);
+			reflections(&mut world, "0");
 
 			let plain = capture
 				.shoot(&mut world)
 				.expect("the capture renders");
 
-			capture.scene_mut().reflect_anyway(true);
+			reflections(&mut world, "1");
 
 			let asked = capture
 				.shoot(&mut world)
@@ -1927,11 +2210,9 @@ mod tests {
 			);
 			assert!(
 				plain.pixels == asked.pixels,
-				"at {samples} samples a frame with the reflections in it is the same picture"
+				"at {samples} samples a frame whose reflections found nothing mixes in nothing"
 			);
 		}
-
-		capture.scene_mut().reflect_anyway(false);
 	}
 
 	#[test]
@@ -1945,7 +2226,7 @@ mod tests {
 		capture.draw(&mut world, &mut []);
 
 		let source = include_str!("shader.wgsl");
-		let anchor = "return vec4<f32>(light * fade, fade);";
+		let anchor = "return vec4<f32>(light * fade, fade) * mirror.size.w;";
 
 		assert_eq!(source.matches(anchor).count(), 1, "the line this test edits has moved");
 
@@ -2084,6 +2365,650 @@ mod tests {
 				.iter()
 				.all(|value| value.abs_diff(77) <= 1),
 			"the floor's color, 0.3, is the byte 77, and it is {floor_seen:?}"
+		);
+	}
+
+	/// Every pixel of the room's mirror floor well in front of the wall, with
+	/// the point of the floor it shows and the normal it is lit with: the
+	/// pixels whose surface, as the pass before the scene wrote it, faces up
+	/// and is a mirror.
+	fn floor_pixels(world: &World, surfaces: &[[f32; 4]]) -> Vec<(Pixel, Vec3, Vec3)> {
+		every_pixel()
+			.filter_map(|pixel| {
+				let surface = at(surfaces, pixel);
+				let (near, way) = ray(world, pixel);
+				let floor = near + way * (-near.y / way.y);
+
+				(surface[1] > 0.9 && surface[3] < 0.1 && way.y < 0.0 && floor.z > WALL + 0.05)
+					.then(|| (pixel, floor, Vec3::new(surface[0], surface[1], surface[2])))
+			})
+			.collect()
+	}
+
+	/// What fraction of the light arriving from everywhere the room's floor
+	/// sends back towards the eye at a point: the table at the floor's own
+	/// normal, its tint of 0.3 as metal as asked.
+	fn floor_lobe(eye: Vec3, (floor, normal): (Vec3, Vec3), metallic: f32) -> Vec3 {
+		let towards = (eye - floor).normalize();
+		let f0 = Vec3::splat(0.04).lerp(Vec3::splat(0.3), metallic);
+
+		ambient_brdf(normal.dot(towards).max(1.0e-4), f0, 0.045)
+	}
+
+	/// One picture of a world, with the air as hazy as asked and the
+	/// reflections at a strength.
+	fn shot(capture: &mut Capture, world: &mut World, haze: f32, strength: &str) -> Image {
+		world.post.haze = haze;
+		reflections(world, strength);
+
+		capture.shoot(world).expect("the capture renders")
+	}
+
+	#[test]
+	fn a_strength_nobody_could_mean_lands_somewhere_definite() {
+		// no device: what a frame asks for is worked out before anything is drawn.
+		// Compared as bits, and written out as literals rather than read off the
+		// constants they check
+		let mut world = World::new();
+		let camera = world.render_camera();
+		let asked = |world: &World, showing| {
+			asking_of(world, &camera, showing).map(|asking| asking.strength.to_bits())
+		};
+		let whole = Some(1.0_f32.to_bits());
+
+		assert_eq!(asked(&world, None), whole, "a world that never said is taken at all of it");
+
+		for (typed, wanted) in
+			[("0.25", Some(0.25_f32.to_bits())), ("0", None), ("-1", None), ("3", whole)]
+		{
+			reflections(&mut world, typed);
+
+			assert_eq!(asked(&world, None), wanted, "a strength of {typed}");
+		}
+
+		// the console refuses a nan typed at it, and a game setting the variable
+		// does not have to
+		assert_eq!(held(f32::NAN).to_bits(), 1.0_f32.to_bits(), "a nan is all of it");
+
+		reflections(&mut world, "0");
+
+		assert_eq!(
+			asked(&world, Some(Showing::Reflections)),
+			whole,
+			"the view of what was found asks at the whole of it whatever the strength says"
+		);
+		assert_eq!(
+			asked(&world, Some(Showing::Coverage)),
+			whole,
+			"and so does the view of how much"
+		);
+		assert_eq!(
+			asked(&world, Some(Showing::Occlusion)),
+			None,
+			"while a view of something else asks for nothing"
+		);
+	}
+
+	/// A metal mirror, the room's floor for the tests a dielectric one reflects
+	/// too little of the wall in to tell two answers apart.
+	fn metal_mirror() -> Material {
+		Material {
+			roughness: 0.045,
+			metallic: 1.0,
+			..Material::DEFAULT
+		}
+	}
+
+	/// An environment the same in every direction and at every roughness, named
+	/// as the world's sky: every texel the half float one, so that what it
+	/// sends along any reflection is one to the bit.
+	fn even_sky(world: &mut World) {
+		let side = 8;
+		let levels = (0..TextureData::full_chain(side, side))
+			.map(|level| {
+				let across = usize::try_from((side >> level).max(1)).unwrap_or(1);
+
+				[0x00, 0x3C].repeat(across * across * 6 * 4)
+			})
+			.collect();
+		let cube = world.textures.insert("test/even", TextureData {
+			width: side,
+			height: side,
+			faces: CUBE_FACES,
+			texel: Texel::Rgba16Float,
+			levels,
+		});
+
+		world.sky = Sky::environment(cube);
+	}
+
+	#[test]
+	fn the_picture_is_the_one_without_reflections_with_what_they_found_in_place_of_the_sky() {
+		// two pictures of the room lit by nothing but the light arriving from
+		// everywhere, with the reflections and without them, and what they found
+		// read back: at every pixel of the mirror floor the first is the second with
+		// `(found - stand-in * a)` times the floor's own lobe added, worked out here
+		// in linear light and put back through the curve - the found light over the
+		// light itself, in the place of the share of what the environment sends
+		// that it stands for. A dielectric floor and a metal one, whose lobes are ten
+		// times apart; the metal one drawn by the masked entry point as well, with
+		// nothing in its picture to cut away; and the metal one under an environment,
+		// whose one in every direction is what the found light takes the place of
+		// rather than the ambient color
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		for (metallic, blend, environment) in [
+			(0.0, Blend::Opaque, false),
+			(1.0, Blend::Mask, false),
+			(1.0, Blend::Opaque, true),
+		] {
+			let mut world = room_with(
+				Material {
+					roughness: 0.045,
+					metallic,
+					blend,
+					..Material::DEFAULT
+				},
+				0.0,
+				HEIGHT,
+			);
+			let stand_in = if environment {
+				even_sky(&mut world);
+				1.0
+			} else {
+				0.8
+			};
+
+			asking(&mut world, "1", "0");
+
+			let mixed = shot(&mut capture, &mut world, 0.0, "1");
+			let values = capture
+				.scene_mut()
+				.reflection_values()
+				.expect("asked for, so written");
+			let surfaces = capture
+				.scene_mut()
+				.surface_values()
+				.expect("the pass before the scene ran");
+			let plain = shot(&mut capture, &mut world, 0.0, "0");
+			let eye = world.render_camera().position;
+			let pixels = floor_pixels(&world, &surfaces);
+			let mut worst = 0.0_f32;
+			let mut moved = 0;
+
+			for (pixel, floor, normal) in &pixels {
+				let [r, g, b, a] = at(&values, *pixel);
+				let lobe = floor_lobe(eye, (*floor, *normal), metallic);
+				let added = (Vec3::new(r, g, b) - Vec3::splat(stand_in) * a) * lobe;
+				let before = plain.pixel(pixel.0, pixel.1);
+				let after = mixed.pixel(pixel.0, pixel.1);
+
+				worst = worst.max(added_outside(before, added, after));
+				moved += usize::from(
+					(0..3).any(|channel| after[channel].abs_diff(before[channel]) > 3),
+				);
+			}
+
+			assert!(pixels.len() > 10_000, "the room shows its floor: {} pixels", pixels.len());
+			assert!(
+				moved > 1000,
+				"with {metallic} metal, {blend:?}, an environment {environment}, what the \
+				 reflections found moves {moved} pixels of the floor by more than three bytes"
+			);
+			assert!(
+				worst <= PICTURE_WITHIN,
+				"with {metallic} metal, {blend:?}, an environment {environment}, the picture is \
+				 the one without the reflections with what they found mixed in, and it is out \
+				 by {worst} of a byte over {} pixels",
+				pixels.len()
+			);
+		}
+	}
+
+	#[test]
+	fn what_a_reflection_found_is_not_dimmed_by_the_mirror_s_own_share_of_the_sky() {
+		// the same two pictures of a metal floor with the share of the sky taken
+		// away, and the share read back beside what was found. At the floor's even
+		// pixels, which read their own texel of the share and nothing else, the
+		// picture is the one without reflections with `(found - ambient * a *
+		// share)` times the lobe added: what is left of the environment's part keeps
+		// its share and the found light does not. The floor at the wall's foot sees
+		// less of the sky because of the very wall its reflection found, and that is
+		// where the two answers tell apart
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room_with(metal_mirror(), 0.0, HEIGHT);
+
+		asking(&mut world, "1", "0");
+		occluding(&mut world, "1");
+
+		let mixed = shot(&mut capture, &mut world, 0.0, "1");
+		let values = capture
+			.scene_mut()
+			.reflection_values()
+			.expect("asked for, so written");
+		let surfaces = capture
+			.scene_mut()
+			.surface_values()
+			.expect("the pass before the scene ran");
+		let shares = capture
+			.scene_mut()
+			.occlusion_values()
+			.expect("asked for, so written");
+		let plain = shot(&mut capture, &mut world, 0.0, "0");
+		let eye = world.render_camera().position;
+		let mut worst = 0.0_f32;
+		let mut checked = 0;
+		let mut tellable = 0;
+
+		for (pixel, floor, normal) in floor_pixels(&world, &surfaces)
+			.into_iter()
+			.filter(|(pixel, ..)| pixel.0 % 2 == 0 && pixel.1 % 2 == 0)
+		{
+			let share = shares
+				.get(
+					usize::try_from(pixel.1 / 2 * (SIZE.0 / 2) + pixel.0 / 2)
+						.unwrap_or(usize::MAX),
+				)
+				.map_or(1.0, |texel| texel[0]);
+			let [r, g, b, a] = at(&values, pixel);
+			let lobe = floor_lobe(eye, (floor, normal), 1.0);
+			let found = Vec3::new(r, g, b);
+			let kept = (found - Vec3::splat(0.8) * (a * share)) * lobe;
+			let dimmed = (found * share - Vec3::splat(0.8) * (a * share)) * lobe;
+			let before = plain.pixel(pixel.0, pixel.1);
+			let after = mixed.pixel(pixel.0, pixel.1);
+			checked += 1;
+			worst = worst.max(added_outside(before, kept, after));
+			tellable += usize::from(added_outside(before, dimmed, after) > 2.0);
+		}
+
+		assert!(checked > 5000, "the room shows its floor: {checked} even pixels");
+		assert!(
+			tellable > 100,
+			"only {tellable} pixels of the floor are more than two bytes from a found light the \
+			 share had dimmed"
+		);
+		assert!(
+			worst <= PICTURE_WITHIN,
+			"the found light keeps all of itself and the environment's part its share, and the \
+			 picture is out by {worst} of a byte over {checked} pixels"
+		);
+	}
+
+	#[test]
+	fn the_air_dims_what_a_reflection_found_as_it_dims_the_mirror_that_shows_it() {
+		// the mix is the scene's own light and the air is laid over the picture after
+		// it: four pictures of a metal floor finding the wall, with the reflections
+		// and without, in hazy air and in clear, and at every pixel of the floor what
+		// the reflections add in hazy air is what they add in clear air times the
+		// share of the light that crosses the air from the floor to the eye. Nothing
+		// the air is lit by reads the reflections, so the air's own light is the same
+		// in both hazy pictures and falls out of the difference; a mix laid over the
+		// air would add all of what it adds in clear air
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room_with(metal_mirror(), 0.0, HEIGHT);
+
+		asking(&mut world, "1", "0");
+
+		let clear_plain = shot(&mut capture, &mut world, 0.0, "0");
+		let hazy_plain = shot(&mut capture, &mut world, HAZE, "0");
+		let hazy_mixed = shot(&mut capture, &mut world, HAZE, "1");
+		let clear_mixed = shot(&mut capture, &mut world, 0.0, "1");
+		let surfaces = capture
+			.scene_mut()
+			.surface_values()
+			.expect("the pass before the scene ran");
+		let eye = world.render_camera().position;
+		let pixels = floor_pixels(&world, &surfaces);
+		let mut worst = 0.0_f32;
+		let mut tellable = 0;
+
+		for (pixel, floor, _) in &pixels {
+			let through = (-HAZE * (*floor - eye).length()).exp();
+			let [clear_on, clear_off, hazy_on, hazy_off] =
+				[&clear_mixed, &clear_plain, &hazy_mixed, &hazy_plain]
+					.map(|picture| picture.pixel(pixel.0, pixel.1));
+			let mut told = false;
+
+			for channel in 0..3 {
+				let (hazy_low, hazy_high) = levels(hazy_off[channel]);
+				let (on_low, on_high) = levels(clear_on[channel]);
+				let (off_low, off_high) = levels(clear_off[channel]);
+				// what the reflections add in clear air, as far as two rounded
+				// pictures can say
+				let (least, most) = (on_low - off_high, on_high - off_low);
+
+				worst = worst.max(outside(
+					hazy_on[channel],
+					(least.mul_add(through, hazy_low), most.mul_add(through, hazy_high)),
+				));
+				told |= outside(hazy_on[channel], (hazy_low + least, hazy_high + most)) > 2.0;
+			}
+
+			tellable += usize::from(told);
+		}
+
+		assert!(
+			tellable > 1000,
+			"only {tellable} pixels of the floor are more than two bytes from a reflection laid \
+			 over the air"
+		);
+		assert!(
+			worst <= AIR_WITHIN,
+			"what the reflections add in hazy air is what they add in clear air, dimmed by the \
+			 air, and it is out by {worst} of a byte over {} pixels",
+			pixels.len()
+		);
+	}
+
+	#[test]
+	fn a_pane_of_glass_over_a_mirror_mixes_in_nothing_of_what_the_mirror_found() {
+		// nothing that blends is in the buffers, so what they hold at a pane's pixels
+		// is what the mirror floor behind the pane found, and the pane is lit with
+		// nothing found whatever that says. A polished metal pane opaque enough to
+		// hide what is behind it is what makes that a comparison of its own pixels:
+		// with the reflections and without they are the same to the bit, while the
+		// same pane reading the buffer the way a solid surface does is not
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let reading = variant(
+			"shade(input, sampled, 1.0, vec4<f32>(0.0)), sampled.a * input.tint.a",
+			"shade(input, sampled, 1.0, found_at(input.clip_position.xy)), sampled.a * \
+			 input.tint.a",
+		);
+
+		for samples in ["1", "4"] {
+			let mut world = room(0.045, 0.0);
+
+			asking(&mut world, samples, "0");
+			capture
+				.scene_mut()
+				.set_shader(include_str!("shader.wgsl"))
+				.expect("the scene's own shader builds");
+
+			let bare = shot(&mut capture, &mut world, 0.0, "0");
+			let glass = world.materials.insert("test/pane", Material {
+				blend: Blend::Alpha,
+				opacity: 1.0,
+				roughness: 0.045,
+				metallic: 1.0,
+				..Material::colored(Vec3::new(0.9, 0.8, 0.5))
+			});
+			let pane = world.entities.spawn_at(Transform {
+				position: Vec3::new(0.0, 0.5, -1.0),
+				rotation: Quat::IDENTITY,
+				scale: Vec3::new(2.4, 0.8, 0.05),
+			});
+
+			world
+				.entities
+				.set_renderable(pane, Renderable::of(MeshId::CUBE, glass, Vec3::ONE));
+
+			let plain = shot(&mut capture, &mut world, 0.0, "0");
+			let mixed = shot(&mut capture, &mut world, 0.0, "1");
+
+			capture
+				.scene_mut()
+				.set_shader(&reading)
+				.expect("the shader whose glass reads the buffer builds");
+
+			let wrong = shot(&mut capture, &mut world, 0.0, "1");
+			// the pane's own pixels, well inside it: covered, and so is every pixel
+			// around them, so that no sample of what is behind is in them
+			let covered =
+				|column: u32, row: u32| plain.pixel(column, row) != bare.pixel(column, row);
+			let inside: Vec<Pixel> = every_pixel()
+				.filter(|&(column, row)| {
+					column > 0
+						&& row > 0 && column < SIZE.0 - 1
+						&& row < SIZE.1 - 1
+						&& covered(column, row)
+						&& covered(column - 1, row)
+						&& covered(column + 1, row)
+						&& covered(column, row - 1)
+						&& covered(column, row + 1)
+				})
+				.collect();
+			let same = inside
+				.iter()
+				.filter(|&&(column, row)| mixed.pixel(column, row) == plain.pixel(column, row))
+				.count();
+			let taken = inside
+				.iter()
+				.filter(|&&(column, row)| wrong.pixel(column, row) != mixed.pixel(column, row))
+				.count();
+
+			assert!(inside.len() > 2000, "the pane is in the picture: {} pixels", inside.len());
+			assert_eq!(same, inside.len(), "at {samples} samples the pane mixes in nothing");
+			assert!(taken > 500, "and glass that read the buffer would: {taken} pixels");
+		}
+
+		capture
+			.scene_mut()
+			.set_shader(include_str!("shader.wgsl"))
+			.expect("the scene's own shader builds");
+	}
+
+	#[test]
+	fn half_the_strength_mixes_in_half_of_what_was_found() {
+		// light and share alike, so that what half the strength mixes in is half the
+		// found light over half of what the environment would have given
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room(0.35, 1.0);
+
+		asking(&mut world, "1", "0");
+		reflections(&mut world, "1");
+
+		let whole = found(&mut capture, &mut world);
+
+		reflections(&mut world, "0.5");
+
+		let half = found(&mut capture, &mut world);
+		let mut seen = 0;
+
+		for (one, other) in whole.iter().zip(&half) {
+			seen += usize::from(one[3] > 0.25);
+
+			for channel in 0..4 {
+				assert!(
+					near_to(other[channel], one[channel] * 0.5, 2.0 * STEP),
+					"channel {channel} is {} at half the strength where it is {} at all of it",
+					other[channel],
+					one[channel]
+				);
+			}
+		}
+
+		assert!(seen > 1000, "only {seen} pixels found enough to halve");
+	}
+
+	#[test]
+	fn at_nought_the_picture_is_the_one_a_shader_that_mixes_nothing_draws() {
+		// the one texel a frame at nought binds says nothing was found, and what it
+		// mixes in is a nought added after everything else, which has to leave every
+		// bit where it was. The second answer is the shader with the add taken out,
+		// which draws the same picture at any strength. The frame at one comes first,
+		// so the frame at nought after it has let its buffers go and has to have made
+		// group nought again rather than reading them stale. Under a sun and a lamp
+		// and with the share of the sky taken away, so that an add that reached any
+		// of them would be in the picture too
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room(0.045, 1.0);
+		let lamp = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(-1.0, 1.0, -1.5)));
+
+		world.light = Vec3::new(-0.4, -1.0, -0.5);
+		world
+			.entities
+			.set_light(lamp, Light::point(Vec3::new(1.0, 0.8, 0.6), 3.0, 4.0));
+
+		let unmixed = variant("direct + indirect + mixed", "direct + indirect");
+
+		for samples in ["1", "4"] {
+			asking(&mut world, samples, "0");
+			occluding(&mut world, "1");
+			capture
+				.scene_mut()
+				.set_shader(include_str!("shader.wgsl"))
+				.expect("the scene's own shader builds");
+
+			let mixed = shot(&mut capture, &mut world, 0.0, "1");
+			let plain = shot(&mut capture, &mut world, 0.0, "0");
+
+			capture
+				.scene_mut()
+				.set_shader(&unmixed)
+				.expect("the shader without the mix builds");
+
+			let passes_asked = shot(&mut capture, &mut world, 0.0, "1");
+			let nothing = shot(&mut capture, &mut world, 0.0, "0");
+
+			assert!(
+				plain.pixels == nothing.pixels,
+				"at {samples} samples nought draws what a shader that mixes nothing draws"
+			);
+			assert!(
+				passes_asked.pixels == nothing.pixels,
+				"and asking for the passes without the mix changes no pixel either"
+			);
+			assert!(
+				apart(&mixed, &plain) > 1000,
+				"while at one the floor shows the wall: {} pixels moved",
+				apart(&mixed, &plain)
+			);
+		}
+
+		capture
+			.scene_mut()
+			.set_shader(include_str!("shader.wgsl"))
+			.expect("the scene's own shader builds");
+	}
+
+	#[test]
+	fn group_nought_is_made_again_only_when_the_reflections_buffers_are_made_or_let_go() {
+		// kept rather than made each frame: a frame that asks what the last one asked
+		// binds the group it already has, and nothing a picture shows would say
+		// otherwise
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room(0.045, 0.0);
+
+		asking(&mut world, "1", "0");
+		reflections(&mut world, "1");
+		capture.draw(&mut world, &mut []);
+
+		let first = capture.scene_mut().rebinds();
+
+		for _ in 0..4 {
+			capture.draw(&mut world, &mut []);
+		}
+
+		assert!(
+			first >= 1,
+			"the first frame that asks makes the buffers and the group over them"
+		);
+		assert_eq!(
+			capture.scene_mut().rebinds(),
+			first,
+			"four frames that ask the same make no group"
+		);
+
+		reflections(&mut world, "0");
+		capture.draw(&mut world, &mut []);
+		capture.draw(&mut world, &mut []);
+
+		assert_eq!(capture.scene_mut().rebinds(), first + 1, "the buffers let go is one group");
+
+		reflections(&mut world, "0.5");
+		capture.draw(&mut world, &mut []);
+		capture.draw(&mut world, &mut []);
+
+		assert_eq!(capture.scene_mut().rebinds(), first + 2, "and made again is one more");
+	}
+
+	#[test]
+	fn a_second_frame_finds_what_the_first_found_because_what_is_met_is_lit_with_nothing_found() {
+		// a polished metal panel leaning over the mirror floor, so that each finds
+		// the other: the floor's texels meet the panel at pixels where the panel found
+		// the floor. The first pass lights what it meets with nothing found, so the
+		// second frame, whose group nought holds what the first found, finds the same
+		// to the bit; lit with what was found where it lands, it would find the first
+		// frame's reflections inside its own
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = room(0.045, 0.0);
+		let polished = made(&mut world, "test/leaning", 0.045, 1.0);
+		let leaning = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, 1.0, -1.5),
+			rotation: Quat::from_rotation_x(0.6),
+			scale: Vec3::new(3.0, 1.5, 0.1),
+		});
+
+		world
+			.entities
+			.set_renderable(leaning, Renderable::of(MeshId::CUBE, polished, Vec3::ONE));
+		asking(&mut world, "1", "0");
+		reflections(&mut world, "1");
+		capture.draw(&mut world, &mut []);
+
+		let first = capture
+			.scene_mut()
+			.reflection_raw_values()
+			.expect("asked for, so written");
+
+		capture.draw(&mut world, &mut []);
+
+		let second = capture
+			.scene_mut()
+			.reflection_raw_values()
+			.expect("asked for, so written");
+
+		assert!(first == second, "the second frame finds what the first found, to the bit");
+
+		capture
+			.scene_mut()
+			.set_shader(&variant(
+				"slice, lit, vec4<f32>(0.0));",
+				"slice, lit, textureLoad(reflections, place, 0));",
+			))
+			.expect("the shader that lights what it meets with what was found there builds");
+		capture.draw(&mut world, &mut []);
+
+		let fed = capture
+			.scene_mut()
+			.reflection_raw_values()
+			.expect("asked for, so written");
+		let brighter = second
+			.iter()
+			.zip(&fed)
+			.filter(|(one, other)| {
+				(0..3).any(|channel| (other[channel] - one[channel]).abs() > 0.01)
+			})
+			.count();
+
+		capture
+			.scene_mut()
+			.set_shader(include_str!("shader.wgsl"))
+			.expect("the scene's own shader builds");
+
+		assert!(
+			brighter > 100,
+			"and lit with what the frame before found, {brighter} texels would find something \
+			 else"
 		);
 	}
 }

@@ -30,7 +30,7 @@ pub mod occlusion;
 pub mod overlay;
 mod post;
 pub mod prepass;
-mod reflection;
+pub mod reflection;
 pub mod renderer;
 pub mod scene;
 pub mod shader;

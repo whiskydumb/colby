@@ -23,6 +23,8 @@
 // the world's environment when its sky names one and its one ambient color
 // when it does not, both through the same split-sum table, and both multiplied
 // by how much of the sky the surface can see - which nothing a light sends is.
+// Where a smooth surface's reflection found something on the picture, what it
+// found takes the environment's place in that term.
 //
 // The local lights are a flat array walked by every fragment: no tiles, no
 // clusters, no per-object list. What keeps that affordable is that the CPU
@@ -200,6 +202,14 @@ const SPLIT_SIDE: f32 = 64.0;
 // in a frame nobody asked for it in. Beside the table for the table's reason.
 // @ref `colby_engine::occlusion`, and `occlusion_at` for how it is read.
 @group(0) @binding(8) var occlusion: texture_2d<f32>;
+
+// What each pixel's reflection found on the picture, worked out before this pass
+// from the pass before the scene: the picture's size, rgb the light already
+// multiplied by a and a how much of the reflection it stands for, or one texel
+// of nothing in a frame nobody asked for them in. Beside the share for the
+// share's reason. @ref `colby_engine::reflection`, and `lit_at` for how it is
+// mixed.
+@group(0) @binding(9) var reflections: texture_2d<f32>;
 
 @group(1) @binding(0) var albedo: texture_2d<f32>;
 @group(1) @binding(1) var surface_sampler: sampler;
@@ -931,7 +941,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // mode does with the number in its other modes.
     let sampled = textureSample(albedo, surface_sampler, input.uv);
 
-    return vec4<f32>(shade(input, sampled, seen(input)), 1.0);
+    return vec4<f32>(shade(input, sampled, seen(input), found_at(input.clip_position.xy)), 1.0);
 }
 
 // The same, for a surface whose picture has holes in it.
@@ -952,7 +962,7 @@ fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    return vec4<f32>(shade(input, sampled, lit), 1.0);
+    return vec4<f32>(shade(input, sampled, lit, found_at(input.clip_position.xy)), 1.0);
 }
 
 // And for a surface what is behind still shows through.
@@ -964,15 +974,16 @@ fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
 // this runs in is sorted far to near, both of which are the pipeline's doing
 // rather than anything this file can see.
 //
-// **All of the sky, whatever is around it.** Nothing that blends is in the
-// buffer the share was worked out from, so what the buffer holds at a pane's
-// pixels is the share of whatever is behind the pane, and darkening the glass
-// by it would be lighting one surface with another's corners.
+// **All of the sky, whatever is around it, and no reflection found.** Nothing
+// that blends is in the buffers the share and the reflections were worked out
+// from, so what they hold at a pane's pixels is the share of whatever is behind
+// the pane and what its reflection found, and reading either would be lighting
+// one surface with another's corners and another's mirror.
 @fragment
 fn fragment_blended(input: VertexOutput) -> @location(0) vec4<f32> {
     let sampled = textureSample(albedo, surface_sampler, input.uv);
 
-    return vec4<f32>(shade(input, sampled, 1.0), sampled.a * input.tint.a);
+    return vec4<f32>(shade(input, sampled, 1.0, vec4<f32>(0.0)), sampled.a * input.tint.a);
 }
 
 // How much of the sky the point a fragment of the solid or the masked half is
@@ -1061,6 +1072,29 @@ fn occlusion_at(pixel: vec2<f32>, along_view: f32, slope: f32) -> f32 {
     let lower = shares[2] + (shares[3] - shares[2]) * t.x;
 
     return upper + (lower - upper) * t.y;
+}
+
+// What a fragment's reflection found on the picture: the texel of its own pixel,
+// light already multiplied by how much of the reflection it stands for.
+//
+// **One texel and no match on distance.** The buffer is the picture's size and
+// was brought up to it on each pixel's own surface already, so at one sample a
+// pixel a fragment reads exactly what was found for it. At four, a fragment on
+// an edge is shaded at the middle of a pixel whose texel may be the surface
+// behind it, and reads that; the engines in the field that mix a reflection
+// into a forward pass read it at the pixel the same way.
+//
+// **The coordinate is held inside what is bound**, as the share's is, though for
+// another reason: a read past the end of a texture may come back as nought with
+// an alpha of one, which here would be all of a reflection found and none of the
+// light it stands for. Held, the one texel a frame that asked for nothing binds
+// says nothing was found for every pixel of the picture.
+//
+// @param pixel - the fragment's place on the picture, in pixels
+fn found_at(pixel: vec2<f32>) -> vec4<f32> {
+    let last = vec2<i32>(textureDimensions(reflections)) - vec2<i32>(1);
+
+    return textureLoad(reflections, min(vec2<i32>(pixel), last), 0);
 }
 
 // What the pass before the scene writes for a solid surface: the normal it is
@@ -1411,8 +1445,13 @@ fn marched(here: vec3<f32>, way: vec3<f32>) -> Found {
 // is a frame late, and a polished thing seen in a mirror shows what it shows
 // from the mirror rather than what it shows the eye. What is not lit is what
 // the buffers do not hold: anything blended, particles, the lines, and the
-// reflections the thing met would itself show, for which the sky stands in.
-// @ref `colby_engine::reflection`.
+// reflections the thing met would itself show, for which the sky stands in -
+// the thing is lit with nothing found, so what the last frame's reflections
+// found never comes back into this one's. @ref `colby_engine::reflection`.
+//
+// **All of it at the whole strength, and a share of it at a share**: rgb and a
+// alike, so that a reflection taken at half its strength is half the found
+// light mixed over half of what the environment would have given.
 @fragment
 fn fragment_reflections(input: SkyOutput) -> @location(0) vec4<f32> {
     let texel = vec2<i32>(input.clip_position.xy);
@@ -1443,10 +1482,10 @@ fn fragment_reflections(input: SkyOutput) -> @location(0) vec4<f32> {
     // texel a frame that asks for no occlusion binds says all of it
     let last = vec2<i32>(textureDimensions(occlusion)) - vec2<i32>(1);
     let lit = textureLoad(occlusion, min(place / 2, last), 0).r;
-    let light = lit_at(surface, there, normalize(here - there), slice, lit);
+    let light = lit_at(surface, there, normalize(here - there), slice, lit, vec4<f32>(0.0));
     let fade = 1.0 - smoothstep(MIRROR_FADE, MIRROR_CUTOFF, roughness);
 
-    return vec4<f32>(light * fade, fade);
+    return vec4<f32>(light * fade, fade) * mirror.size.w;
 }
 
 // The numbers the passes that light the air read. Laid out the way
@@ -2073,12 +2112,14 @@ fn surface_at(input: VertexOutput, sampled: vec4<f32>) -> Surface {
 //
 // @param lit - how much of the sky the point sees, which the entry point asks
 // for because the masked one has to ask before its discard: @ref `seen`
-fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32) -> vec3<f32> {
+// @param found - what the point's reflection found on the picture, which the
+// entry point asks for because glass asks for none: @ref `found_at`
+fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32, found: vec4<f32>) -> vec3<f32> {
     let surface = surface_at(input, sampled);
     let towards_eye = normalize(globals.eye.xyz - input.world_position);
     let view_depth = dot(input.world_position - globals.eye.xyz, globals.forward.xyz);
     let slice = cascade_of(view_depth);
-    let color = lit_at(surface, input.world_position, towards_eye, slice, lit);
+    let color = lit_at(surface, input.world_position, towards_eye, slice, lit, found);
 
     if (globals.shadow.w > 0.5) {
         return color * cascade_color(slice);
@@ -2106,12 +2147,16 @@ fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32) -> vec3<f32> {
 // @param towards_eye - the way the light is sent, as a unit vector
 // @param slice - the cascade the point falls in, @ref `cascade_of`
 // @param lit - how much of the sky the point sees
+// @param found - what the point's reflection found on the picture, rgb light
+// already multiplied by a and a how much of the reflection it stands for:
+// nought for a point nothing was followed from, @ref `found_at`
 fn lit_at(
     surface: Surface,
     world_position: vec3<f32>,
     towards_eye: vec3<f32>,
     slice: i32,
     lit: f32,
+    found: vec4<f32>,
 ) -> vec3<f32> {
     let base_color = surface.color;
 
@@ -2190,14 +2235,23 @@ fn lit_at(
     let ambient_specular = ambient_brdf(normal_dot_view, f0, roughness);
     let indirect_diffuse = ambient_diffuse(diffuse_color, ambient_specular);
     var indirect: vec3<f32>;
+    // what the environment sends back along the reflection - the sky's level
+    // for this roughness, or the one ambient color - which is what a reflection
+    // found on the picture takes the place of
+    var stand_in: vec3<f32>;
 
     if (globals.sky_horizon.w > 0.5) {
         let reflected = reflect(-towards_eye, normal);
 
         indirect = ambient_radiance(normal) * indirect_diffuse
             + reflected_radiance(reflected, roughness) * ambient_specular;
+        // read again rather than named once and used in both places: named,
+        // the sum above was compiled another way, and a world with an
+        // environment moved by a level at two pixels where nothing was found
+        stand_in = reflected_radiance(reflected, roughness);
     } else {
         indirect = globals.ambient.rgb * (indirect_diffuse + ambient_specular);
+        stand_in = globals.ambient.rgb;
     }
 
     // how much of the sky this point can see, and it multiplies this term and
@@ -2210,8 +2264,31 @@ fn lit_at(
     // that both are multiplied by the same thing the same way.
     indirect *= lit;
 
+    // what the reflection found on the picture, in the place of the share of
+    // what the environment sends along it that the found light stands for:
+    // `stand_in * lit * (1 - a) + found` where the sum above has `stand_in *
+    // lit`, times the same lobe, which is the environment's reflection and the
+    // found one mixed over the light itself rather than over what the surface
+    // sends back of it.
+    //
+    // **What was found is not multiplied by how much of the sky the point
+    // sees.** That share stands for the light arriving from far off that
+    // something near hides; a found reflection is not far off, it is the near
+    // thing, met by a ray and lit where it stands, its own share of the sky
+    // included. A floor at the foot of a wall sees less of the sky because of
+    // the wall, and the wall is what its reflection found: darkening it again
+    // would count the wall twice. What is left of the environment's reflection
+    // keeps the share, as it had it.
+    //
+    // **Added last, and as a difference.** The sum above is what the picture was
+    // before any of this existed, and a nought added after it leaves it to the
+    // bit - where an add a compiler cannot see is nought, put anywhere else in a
+    // sum, may have the add before it fused into its multiply and rounded a hair
+    // apart.
+    let mixed = (found.rgb - stand_in * (found.a * lit)) * ambient_specular;
+
     // @ref `HDR_CEILING`: past it a smooth highlight would not fit the target.
-    return min(direct + indirect, vec3<f32>(HDR_CEILING));
+    return min(direct + indirect + mixed, vec3<f32>(HDR_CEILING));
 }
 
 // A surface faded towards the fog by how far away it is.

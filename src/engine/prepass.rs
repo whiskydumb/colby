@@ -668,7 +668,7 @@ mod tests {
 	};
 
 	use super::*;
-	use crate::{Capture, depth, occlusion, scene::MSAA};
+	use crate::{Capture, depth, occlusion, reflection, scene::MSAA};
 
 	/// How big every capture here is.
 	const SIZE: (u32, u32) = (320, 240);
@@ -717,9 +717,10 @@ mod tests {
 
 	/// How many samples a pixel is drawn with, and what the view draws.
 	///
-	/// **And no share of the sky taken away**, which would ask for this pass in
-	/// every frame: what these tests are about is the pass as the view or a
-	/// test asks for it, so nothing else may ask.
+	/// **And no share of the sky taken away and no reflections mixed in**,
+	/// either of which would ask for this pass in every frame: what these
+	/// tests are about is the pass as the view or a test asks for it, so
+	/// nothing else may ask.
 	fn asking(world: &mut World, samples: &str, showing: &str) {
 		world.cvars.var(MSAA, Value::Float(1.0), "");
 		world.cvars.set(MSAA, samples);
@@ -729,6 +730,10 @@ mod tests {
 			.cvars
 			.var(occlusion::STRENGTH, Value::Float(occlusion::DEFAULT_STRENGTH), "");
 		world.cvars.set(occlusion::STRENGTH, "0");
+		world
+			.cvars
+			.var(reflection::STRENGTH, Value::Float(reflection::DEFAULT_STRENGTH), "");
+		world.cvars.set(reflection::STRENGTH, "0");
 	}
 
 	/// A camera eight units back from the origin and looking at it.

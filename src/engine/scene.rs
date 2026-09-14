@@ -753,6 +753,9 @@ pub struct Scene {
 	/// What that is asked for this frame, or nothing. Read in
 	/// [`Scene::upload`], for the reason [`seeing`](Self::seeing) is.
 	reflecting: Option<reflection::Asking>,
+	/// Which making of what that found group nought was made over. @ref
+	/// [`Reflection::epoch`].
+	reflected: u64,
 	/// The light a haze sends towards the eye, worked out after the scene from
 	/// the depth it wrote. @ref [`haze`].
 	haze: Haze,
@@ -768,10 +771,6 @@ pub struct Scene {
 	/// picture. @ref [`prepare_anyway`](Self::prepare_anyway).
 	#[cfg(test)]
 	anyway: bool,
-	/// Whether a test asked for the reflections with nothing to read them, the
-	/// same bargain for them. @ref [`reflect_anyway`](Self::reflect_anyway).
-	#[cfg(test)]
-	reflected_anyway: bool,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
 	/// The cube a surface's reflections are read out of. @ref [`env`].
@@ -889,14 +888,16 @@ impl Scene {
 		// [`Gpu::split`].
 		let split = Arc::clone(gpu.split());
 		// and before group nought too, for the cube's reason: what the share of
-		// the sky is read out of is its ninth entry, and a scene that has asked
-		// for nothing yet binds the one texel that says all of it
+		// the sky and what the reflections found are read out of are its ninth
+		// and tenth entries, and a scene that has asked for nothing yet binds the
+		// texel that says all of the one and the texel that says none of the other
 		let (occlusion, reflection, haze) = readers(&device, &queue, (width, height))?;
 		let bindings = frame_bindings(&device, &globals_layout, &globals, &atlas, &Held {
 			decals: &decal_sampler,
 			environment: &environment,
 			split: &split,
 			occlusion: occlusion.bound(),
+			reflection: reflection.bound(),
 		});
 
 		let samplers = wraps(&device);
@@ -944,6 +945,7 @@ impl Scene {
 			occluded: occlusion.epoch(),
 			occlusion,
 			occluding: None,
+			reflected: reflection.epoch(),
 			reflection,
 			reflecting: None,
 			haze,
@@ -952,8 +954,6 @@ impl Scene {
 			rebound: 0,
 			#[cfg(test)]
 			anyway: false,
-			#[cfg(test)]
-			reflected_anyway: false,
 			shadows,
 			environment,
 			split,
@@ -1209,26 +1209,7 @@ impl Scene {
 		// and after that, because what a reflection meets is lit with the share
 		// of the sky as it now stands, and before the scene, which reads what
 		// the reflections found
-		if self.reflecting.is_some() {
-			self.reflection.ensure(
-				&self.device,
-				[&self.globals_layout, self.shadows.sample_layout()],
-				&self.built,
-			);
-		}
-
-		self.reflection.render(
-			&mut encoder,
-			&self.queue,
-			reflection::Frame {
-				asked: self.reflecting,
-				prepass: &self.prepass,
-				scene: &self.bindings,
-				shadows: self.shadows.bindings(),
-				timings: &self.timings,
-			},
-			view,
-		);
+		self.reflect(&mut encoder, view);
 
 		let scene_marks = self.timings.writes(Pass::Scene, Ends::Both);
 		let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1340,6 +1321,45 @@ impl Scene {
 		// into sixteen-bit floats, and nothing above it wrote a pixel of the
 		// frame that is about to be shown.
 		self.finish(encoder, world, (seconds, view), target);
+	}
+
+	/// What each pixel's reflection finds on the picture, recorded between the
+	/// share of the sky and the scene's own pass, and group nought made again
+	/// over it in a frame that made its buffers or let them go.
+	///
+	/// **The group after the passes rather than before them**, where the
+	/// share's is made before the passes that follow it: the buffers are let
+	/// go inside [`Reflection::render`], and the first of its passes, which
+	/// binds the old group, lights what it finds with nothing found and never
+	/// reads that entry.
+	///
+	/// @param encoder - the frame's, with the share of the sky already in it
+	/// @param view - the part of the target the picture is drawn into, or all
+	fn reflect(&mut self, encoder: &mut CommandEncoder, view: Option<Viewport>) {
+		if self.reflecting.is_some() {
+			self.reflection.ensure(
+				&self.device,
+				[&self.globals_layout, self.shadows.sample_layout()],
+				&self.built,
+			);
+		}
+
+		self.reflection.render(
+			encoder,
+			&self.queue,
+			reflection::Frame {
+				asked: self.reflecting,
+				prepass: &self.prepass,
+				scene: &self.bindings,
+				shadows: self.shadows.bindings(),
+				timings: &self.timings,
+			},
+			view,
+		);
+
+		if self.reflection.epoch() != self.reflected {
+			self.rebind();
+		}
 	}
 
 	/// Everything after the scene's own pass: the depth made readable if
@@ -1550,11 +1570,10 @@ impl Scene {
 	#[cfg(test)]
 	pub(crate) const fn prepare_anyway(&mut self, asked: bool) { self.anyway = asked; }
 
-	/// Asks for the reflections whether or not anything reads them, for a test:
-	/// the way to have them and the picture in the same frame while nothing in
-	/// the picture reads them yet.
+	/// Whether the reflections' first pass was built, for a test. @ref
+	/// [`Reflection::built`].
 	#[cfg(test)]
-	pub(crate) const fn reflect_anyway(&mut self, asked: bool) { self.reflected_anyway = asked; }
+	pub(crate) const fn reflection_built(&self) -> bool { self.reflection.built() }
 
 	/// How many times group nought has been made again since the scene was
 	/// built, for a test.
@@ -1888,18 +1907,6 @@ impl Scene {
 	)]
 	const fn asked_anyway(&self) -> bool { false }
 
-	/// Whether a test asked for the reflections with nothing to read them.
-	#[cfg(test)]
-	const fn reflections_anyway(&self) -> bool { self.reflected_anyway }
-
-	/// Nothing outside a test asks for reflections nobody reads.
-	#[cfg(not(test))]
-	#[expect(
-		clippy::unused_self,
-		reason = "the test build's twin reads a field this build does not have"
-	)]
-	const fn reflections_anyway(&self) -> bool { false }
-
 	/// Which one draws a batch into a shadow map.
 	///
 	/// A match rather than a lookup, so that a mode nobody has thought about
@@ -2146,14 +2153,14 @@ impl Scene {
 		f32::from(u16::try_from(self.environment.levels()).unwrap_or(0))
 	}
 
-	/// Group nought, rebuilt around whatever the atlas, the environment and the
-	/// share of the sky are now.
+	/// Group nought, rebuilt around whatever the atlas, the environment, the
+	/// share of the sky and what the reflections found are now.
 	///
-	/// Three things make it stale. Two are rare, the decals' atlas growing and
-	/// the world naming a different environment; the third is the share's
-	/// buffers being made or let go, which is a frame that starts or stops
-	/// asking for them and a picture that changes size. @ref
-	/// [`frame_bindings`].
+	/// Four things make it stale. Two are rare, the decals' atlas growing and
+	/// the world naming a different environment; the other two are the share's
+	/// buffers and the reflections' being made or let go, which is a frame that
+	/// starts or stops asking for one of them and a picture that changes size.
+	/// @ref [`frame_bindings`].
 	fn rebind(&mut self) {
 		self.bindings = frame_bindings(
 			&self.device,
@@ -2165,9 +2172,11 @@ impl Scene {
 				environment: &self.environment,
 				split: &self.split,
 				occlusion: self.occlusion.bound(),
+				reflection: self.reflection.bound(),
 			},
 		);
 		self.occluded = self.occlusion.epoch();
+		self.reflected = self.reflection.epoch();
 
 		#[cfg(test)]
 		{
@@ -2228,8 +2237,7 @@ impl Scene {
 		// asks for no pass
 		self.showing = prepass::showing_of(world).filter(|_| self.seeing.is_none());
 		self.occluding = occlusion::asking_of(world, &camera, self.showing);
-		self.reflecting =
-			reflection::asking_of(world, &camera, self.showing, self.reflections_anyway());
+		self.reflecting = reflection::asking_of(world, &camera, self.showing);
 		self.hazing = haze::asking_of(world, &camera, self.showing);
 		self.shafting = shaft::asking_of(world, &camera);
 		self.focusing = focus::asking_of(world, &camera);
@@ -2855,7 +2863,8 @@ impl Scene {
 /// haze, which reads the depth after it: none of them has made a buffer yet.
 ///
 /// @param device - the device to build against
-/// @param queue - where the occlusion's one texel is written
+/// @param queue - where the occlusion's and the reflections' one texels are
+/// written
 /// @param (width, height) - the picture's size
 fn readers(
 	device: &Device,
@@ -2864,7 +2873,7 @@ fn readers(
 ) -> Result<(Occlusion, Reflection, Haze)> {
 	Ok((
 		Occlusion::new(device, queue, width, height)?,
-		Reflection::new(device, width, height)?,
+		Reflection::new(device, queue, width, height)?,
 		Haze::new(device, width, height)?,
 	))
 }
@@ -2900,7 +2909,8 @@ fn drawing(
 
 /// The layout of group nought: the frame's uniform; the decals' atlas read two
 /// ways with the sampler that reads it; the environment and the split-sum
-/// table, each with its own; and how much of the sky each pixel sees.
+/// table, each with its own; how much of the sky each pixel sees; and what each
+/// pixel's reflection found.
 ///
 /// **One group for all of it**, rather than a fifth for the atlas: a device
 /// need only allow four, and all four are spoken for. The atlas belongs with
@@ -2950,6 +2960,7 @@ fn frame_layout(device: &Device) -> BindGroupLayout {
 			split[0],
 			split[1],
 			occlusion::entry(OCCLUSION_TEXTURE),
+			prepass::entry(REFLECTION_TEXTURE),
 		],
 	})
 }
@@ -2987,6 +2998,15 @@ const SPLIT_SAMPLER: u32 = 7;
 /// Read with `textureLoad`, so it needs no sampler. @ref
 /// [`occlusion`](crate::occlusion).
 const OCCLUSION_TEXTURE: u32 = 8;
+
+/// Which binding what each pixel's reflection found takes.
+///
+/// Beside the share for the share's reason, and bound in every frame for the
+/// same one: a frame nobody asked for the reflections in binds one texel that
+/// says nothing was found, so the fragment stage adds a nought rather than
+/// branching. Read with `textureLoad`, so it needs no sampler. @ref
+/// [`reflection`](crate::reflection).
+const REFLECTION_TEXTURE: u32 = 9;
 
 /// Group nought, over this frame's uniform and the atlas as it stands.
 ///
@@ -3045,6 +3065,10 @@ fn frame_bindings(
 				binding: OCCLUSION_TEXTURE,
 				resource: BindingResource::TextureView(held.occlusion),
 			},
+			BindGroupEntry {
+				binding: REFLECTION_TEXTURE,
+				resource: BindingResource::TextureView(held.reflection),
+			},
 		],
 	})
 }
@@ -3066,6 +3090,10 @@ struct Held<'a> {
 	/// How much of the sky each pixel sees, or one texel that says all of it.
 	/// @ref [`Occlusion::bound`].
 	occlusion: &'a TextureView,
+
+	/// What each pixel's reflection found, or one texel that says nothing was.
+	/// @ref [`Reflection::bound`].
+	reflection: &'a TextureView,
 }
 
 /// The sampler every decal's picture is read through.

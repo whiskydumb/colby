@@ -775,7 +775,7 @@ mod tests {
 	};
 
 	use super::*;
-	use crate::{Capture, Image, prepass, scene::MSAA};
+	use crate::{Capture, Image, prepass, reflection, scene::MSAA};
 
 	/// How big every capture here is.
 	const SIZE: (u32, u32) = (320, 240);
@@ -870,6 +870,10 @@ mod tests {
 	}
 
 	/// How many samples a pixel is drawn with, and what the view draws.
+	///
+	/// **And no reflections**, whose passes read the same buffer before the
+	/// scene: what these tests count and compare is the share, so nothing else
+	/// may ask for that buffer.
 	fn asking(world: &mut World, samples: &str, showing: &str) {
 		world.cvars.var(MSAA, Value::Float(1.0), "");
 		world.cvars.set(MSAA, samples);
@@ -877,6 +881,10 @@ mod tests {
 			.cvars
 			.var(prepass::VIEW, Value::Float(prepass::NO_VIEW), "");
 		world.cvars.set(prepass::VIEW, showing);
+		world
+			.cvars
+			.var(reflection::STRENGTH, Value::Float(reflection::DEFAULT_STRENGTH), "");
+		world.cvars.set(reflection::STRENGTH, "0");
 	}
 
 	/// How much of what is hidden the picture takes away.
@@ -1764,8 +1772,8 @@ mod tests {
 			return;
 		};
 		let reading = variant(
-			"shade(input, sampled, 1.0), sampled.a * input.tint.a",
-			"shade(input, sampled, seen(input)), sampled.a * input.tint.a",
+			"shade(input, sampled, 1.0, vec4<f32>(0.0)), sampled.a * input.tint.a",
+			"shade(input, sampled, seen(input), vec4<f32>(0.0)), sampled.a * input.tint.a",
 		);
 
 		for samples in ["1", "4"] {
@@ -1857,7 +1865,8 @@ mod tests {
 		let Some(mut capture) = capture() else {
 			return;
 		};
-		let anchor = "return vec4<f32>(shade(input, sampled, seen(input)), 1.0);";
+		let anchor = "return vec4<f32>(shade(input, sampled, seen(input), \
+		              found_at(input.clip_position.xy)), 1.0);";
 		let painted = variant(anchor, "return vec4<f32>(input.tint.rgb * seen(input), 1.0);");
 		let whole = variant(anchor, "return vec4<f32>(input.tint.rgb, 1.0);");
 		let matching = "let own = abs(texels[index].g - along_view) <= within;";
