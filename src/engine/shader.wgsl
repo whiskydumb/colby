@@ -438,20 +438,40 @@ fn shadowing(world_position: vec3<f32>, normal: vec3<f32>, lean: f32, slice: i32
     }
 
     let push = cascade_texel(slice) * mix(2.0, 4.0, clamp(lean, 0.0, 1.0));
-    let clip = globals.light_view_projection[slice] * vec4<f32>(world_position + normal * push, 1.0);
+    let landed = cascade_landing(world_position + normal * push, slice);
+
+    if (!landed.inside) {
+        return 1.0;
+    }
+
+    return gather(globals.cascade_tiles[landed.tile], landed.uv, landed.depth);
+}
+
+// Where a point lands in one cascade's map, and how far along its depth.
+//
+// **One function for both of the things that ask**, for `lamp_landing`'s
+// reason: a surface asks with its point pushed off its own face, and the air
+// with its point where it is. Where a point lands and what the map holds there
+// are the same question either way, and two answers to it would be two shadows
+// of one sun.
+//
+// @param at - the point, already moved wherever the asker moves it
+// @param slice - which cascade, nought to three, @ref `cascade_of`
+fn cascade_landing(at: vec3<f32>, slice: i32) -> Landing {
+    let clip = globals.light_view_projection[slice] * vec4<f32>(at, 1.0);
     let ndc = clip.xyz / clip.w;
 
     // in front of the light's near plane, which nothing in the world should be:
     // the box is pulled back behind every caster. Past the far plane is a point
     // the cascade does not reach, and both answer the same way.
     if (ndc.z <= 0.0 || ndc.z >= 1.0) {
-        return 1.0;
+        return Landing(0u, vec2<f32>(0.0), 0.0, false);
     }
 
     // clip space counts y upwards and a texture counts it down.
-    let at = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 
-    return gather(globals.cascade_tiles[slice], at, ndc.z);
+    return Landing(u32(slice), uv, ndc.z, true);
 }
 
 // How much of one map's light reaches a point already projected into it.
@@ -491,6 +511,19 @@ fn gather(tile: Tile, at: vec2<f32>, depth: f32) -> f32 {
     }
 
     return lit / 9.0;
+}
+
+// The same out of one tap where `gather` takes nine: what a point of the air
+// asks, which is averaged along its ray and across the tile afterwards and has
+// no use for the eight around it. @ref `air_lamp_shadowing`.
+//
+// @param tile - where the map sits
+// @param at - where the point landed in it, nought to one
+// @param depth - how far the point is, in the map's own depth range
+fn tapped(tile: Tile, at: vec2<f32>, depth: f32) -> f32 {
+    let uv = clamp(tile.place.xy + at * tile.place.z, tile.bounds.xy, tile.bounds.zw);
+
+    return textureSampleCompareLevel(shadow_maps, shadow_sampler, uv, i32(tile.place.w), depth);
 }
 
 // A color per cascade, for the console variable that paints them.
@@ -816,9 +849,11 @@ fn lamp_shadowing(lamp: Lamp, world_position: vec3<f32>, normal: vec3<f32>, lean
     return gather(globals.lamp_tiles[landed.tile], landed.uv, landed.depth);
 }
 
-// Where a point lands in the map of a lamp that has one: which tile, where in
-// it, and how far along the map's own depth.
+// Where a point lands in a shadow map: which tile, where in it, and how far
+// along the map's own depth.
 struct Landing {
+    // an index into the table the asker reads - a lamp's tiles for a lamp, the
+    // cascades' for the sun
     tile: u32,
     uv: vec2<f32>,
     depth: f32,
@@ -1615,10 +1650,7 @@ fn air_lamp_shadowing(lamp: Lamp, at: vec3<f32>) -> f32 {
         return 1.0;
     }
 
-    let tile = globals.lamp_tiles[landed.tile];
-    let uv = clamp(tile.place.xy + landed.uv * tile.place.z, tile.bounds.xy, tile.bounds.zw);
-
-    return textureSampleCompareLevel(shadow_maps, shadow_sampler, uv, i32(tile.place.w), landed.depth);
+    return tapped(globals.lamp_tiles[landed.tile], landed.uv, landed.depth);
 }
 
 // The light one lamp sends towards the eye out of one stretch of a ray.
@@ -1671,9 +1703,88 @@ fn air_lamp(lamp: Lamp, ray: AirRay, span: vec2<f32>, offset: f32) -> vec3<f32> 
     return lamp.color.rgb * (total * air.medium.x * (last - first) / (f32(AIR_STEPS) * apart) * 3.14159265);
 }
 
-// The light the air along one texel's ray sends towards the eye: every lamp the
-// frame carries whose light the ray crosses, up to `AIR_LAMPS` of them, the
-// nearest first. rgb the light and nothing in the fourth.
+// How many places the sun's light is sampled at along a texel's ray.
+//
+// **Sixteen, measured rather than chosen**, with the engine at seven-twenty
+// against the same march at five hundred and twelve places and nothing
+// averaged, on a beam of sun crossing a room through a window: 9,000 pixels
+// past two levels at sixteen, 39,097 at eight, 4,326 at twenty-four and 2,422 at
+// thirty-two, where every eight places cost the frame some twenty-three
+// microseconds. A number of its own rather than `AIR_STEPS`, because the two
+// estimates are not one: a lamp's places are spread by angle over the stretch
+// it reaches, and these evenly over the whole ray.
+const AIR_SUN_STEPS: u32 = 16u;
+
+// How much of the sun's light reaches a point of the air: one tap of the map of
+// the cascade the point's own distance along the view falls in.
+//
+// **The cascade is the point's and not the ray's**: a ray crosses every slice
+// between the eye and whatever it ends on, and a point is inside the box of the
+// slice its own view depth picks and no other - the rule a surface follows. A
+// point past the shadow distance is in no slice, and gets all of the light, as
+// a surface there does.
+//
+// **Not pushed towards the sun**, where a lamp's air is pushed towards the lamp.
+// The cascades are drawn with a slope-scaled bias and a lamp's maps with none,
+// and the bias already lifts a lit surface's depth away from the sun by as much
+// as the surface is turned from it, which is what keeps the air just in front of
+// the surface out of its shadow. A push on top of that only carries a point in
+// the shadow just under an edge the sun grazes into the edge and past its
+// lifted depth. Measured against a second answer on a window: two texels of
+// push put 23 pixels of the picture under its sill past two levels, the worst
+// of them at 19, where no push leaves one at 3.
+//
+// @param at - the point
+fn air_sun_shadowing(at: vec3<f32>) -> f32 {
+    let slice = cascade_of(dot(at - globals.eye.xyz, globals.forward.xyz));
+
+    if (globals.shadow.z < 0.5 || slice >= 4) {
+        return 1.0;
+    }
+
+    let landed = cascade_landing(at, slice);
+
+    if (!landed.inside) {
+        return 1.0;
+    }
+
+    return tapped(globals.cascade_tiles[landed.tile], landed.uv, landed.depth);
+}
+
+// The light the sun sends towards the eye out of the air along one ray.
+//
+// **The places are spread evenly along the whole ray**, not towards the eye:
+// the sun has no reach to cut a stretch out of and no inverse square to crowd
+// them at, and what takes its light away is a shadow that can fall anywhere
+// along the ray. Spread instead by how much of the air's light is left at each,
+// which crowds them near the eye, they left 42,726 pixels past two levels on the
+// same beam where these leave 9,000 - and worse the thicker the air, because a
+// beam crosses the middle of a room and not the air at the eye.
+//
+// Each place adds its shadow dimmed by the air between it and the eye. The lobe
+// is one number for the whole ray, because the sun's light travels the same way
+// everywhere, and the pi is the one `lit_by` multiplies back, as a lamp's is: a
+// white wall facing the sun and the air in front of it are lit by the same sun.
+//
+// @param offset - where in its step each place sits, nought to one, which is
+// what the tile spreads
+fn air_sun(ray: AirRay, offset: f32) -> vec3<f32> {
+    let travel = normalize(globals.light.xyz);
+    var total = 0.0;
+
+    for (var step = 0u; step < AIR_SUN_STEPS; step++) {
+        let along = ray.far * ((f32(step) + offset) / f32(AIR_SUN_STEPS));
+
+        total += air_sun_shadowing(ray.origin + ray.way * along) * exp(-air.medium.x * along);
+    }
+
+    return vec3<f32>(scattered(dot(travel, -ray.way)) * air.medium.x * ray.far * total / f32(AIR_SUN_STEPS) * 3.14159265);
+}
+
+// The light the air along one texel's ray sends towards the eye: the sun's, and
+// every lamp's the frame carries whose light the ray crosses, up to `AIR_LAMPS`
+// of them, the nearest first - the sun is none of the four. rgb the light and
+// nothing in the fourth.
 //
 // **One ray a texel**, through the middle of the pixel the texel stands for, out
 // to what the depth after the scene says is there. Where along its steps a
@@ -1705,6 +1816,14 @@ fn fragment_haze(input: SkyOutput) -> @location(0) vec4<f32> {
         followed += 1u;
         light += air_lamp(lamp, ray, span, offset);
     }
+
+    // **the sun after the lamps, not before them.** A sum that starts at a
+    // nought the compiler can see has the first lamp's add folded away; one
+    // that starts at the sun's light may have that add fused into the multiply
+    // before it, which rounds a hair apart - and it moved a room whose floor
+    // hides all of the sun by a level at eight pixels, where the sun sends
+    // exactly nothing. Added last, a sun of nought is a fused add of nought
+    light += air_sun(ray, offset);
 
     return vec4<f32>(light, 1.0);
 }

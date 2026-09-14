@@ -5,18 +5,24 @@
 //! point on the screen, and what it can show is what the picture holds past the
 //! middle of the view: a lamp in a shut room gives it nothing to smear, and a
 //! sun beside the view or behind it gives it no point to smear from. A haze is
-//! air: every lamp the frame carries lights it, whatever stands between the
-//! lamp and the air throws a shadow through it, and a wall in front of a lamp's
-//! reach ends the ray that would have crossed it. @ref [`shaft`](crate::shaft).
+//! air: the sun and every lamp the frame carries light it, whatever stands
+//! between a light and the air throws a shadow through it, and a wall in front
+//! of the air ends the ray that would have crossed it. @ref
+//! [`shaft`](crate::shaft).
 //!
 //! **Three passes, after the scene's.** The first follows one ray a texel at
 //! half the picture on each axis, from the eye out to what the depth says is
-//! there, and adds up what every lamp whose reach the ray crosses sends back
-//! along it; the second averages each texel with the ones around it that stand
-//! for the same air; the third puts the result over the picture at its whole
-//! size, dimmed by what the air takes and lit by what it adds. @ref
-//! `fragment_haze` and `fragment_haze_apply` in `shader.wgsl` for the first and
-//! the third, and `haze.wgsl` for the second.
+//! there, and adds up what the sun sends back along it through the cascades and
+//! what every lamp whose reach the ray crosses sends through its own maps; the
+//! second averages each texel with the ones around it that stand for the same
+//! air; the third puts the result over the picture at its whole size, dimmed by
+//! what the air takes and lit by what it adds. @ref `fragment_haze` and
+//! `fragment_haze_apply` in `shader.wgsl` for the first and the third, and
+//! `haze.wgsl` for the second.
+//!
+//! **The sun lights the air of every hazy world it reaches**, because a world
+//! has no sun that is off: its light is a direction, and white. A room the sun
+//! must not light is a room shut against it, as it is for the room's walls.
 //!
 //! **No history, and that was measured rather than assumed.** The engines in
 //! the field that keep a volume of cells over the view turn a history on inside
@@ -29,8 +35,9 @@
 //!
 //! **What it does not reach**: anything blended, particles and the debug lines,
 //! which the depth goes through - the air behind a pane of glass is added over
-//! the glass; the air past `REACH`; and the light a lamp that has no map sends,
-//! which crosses the air as it crosses walls.
+//! the glass; the air past `REACH`; and the shadow of a light that has none
+//! there - a lamp with no map, or the sun past the shadow distance - whose
+//! light crosses the air as it crosses walls.
 
 use colby_core::{
 	Result,
@@ -600,8 +607,8 @@ pub(crate) struct Frame<'a> {
 	/// environment the air's light from everywhere is read out of.
 	pub(crate) scene: &'a BindGroup,
 
-	/// The shadow atlas's group, which the march reads every lamp's map out
-	/// of.
+	/// The shadow atlas's group, which the march reads the cascades and every
+	/// lamp's map out of.
 	pub(crate) shadows: &'a BindGroup,
 
 	/// The picture, which the last pass puts the air over.
@@ -917,7 +924,7 @@ mod tests {
 	};
 
 	use super::*;
-	use crate::{Capture, depth, occlusion, prepass, scene::MSAA};
+	use crate::{Capture, depth, occlusion, prepass, scene::MSAA, shadow};
 
 	/// How big every capture here is.
 	const SIZE: (u32, u32) = (320, 240);
@@ -933,6 +940,10 @@ mod tests {
 	/// How many places along a stretch of a ray a lamp is sampled at, written
 	/// down again: `AIR_STEPS` in `shader.wgsl`.
 	const STEPS: u8 = 16;
+
+	/// How many places along a ray the sun is sampled at, written down again:
+	/// `AIR_SUN_STEPS`.
+	const SUN_STEPS: u8 = 16;
 
 	/// The asymmetry of the lobe, written down again: `AIR_ASYMMETRY`.
 	const ASYMMETRY: f32 = 0.2;
@@ -973,6 +984,12 @@ mod tests {
 	/// worst of eight rays, 1.0e-3.
 	const WITHIN_SUMMED: f64 = 3.0e-3;
 
+	/// The same for the sun's places: three times the worst of five rays,
+	/// 7.1e-3. Looser than a lamp's because a shadow across a ray is a step,
+	/// and nine offsets of sixteen places find a step only to within a
+	/// hundred and forty-fourth of the ray.
+	const WITHIN_SUN: f64 = 2.1e-2;
+
 	/// How much of the light crossing a unit of air the air scatters in the
 	/// test that reads what it takes out of the picture: thin enough that a
 	/// wall twenty units off keeps over half of its light.
@@ -1011,9 +1028,10 @@ mod tests {
 	}
 
 	/// A world with nothing in it yet and hazy air, looking from somewhere at
-	/// something: the picture's own look out of the way, and the light arriving
-	/// from everywhere the only light besides the lamps.
-	fn looking(eye: Vec3, at: Vec3, ambient: f32) -> World {
+	/// something, the sun's light going one way through it: the picture's
+	/// own look out of the way, and the light arriving from everywhere the only
+	/// light besides the sun and the lamps.
+	fn sunlit(eye: Vec3, at: Vec3, light: Vec3, ambient: f32) -> World {
 		let mut world = World::new();
 
 		world.camera.position = eye;
@@ -1027,8 +1045,35 @@ mod tests {
 		};
 		world.sky = Sky::NONE;
 		world.clear = Vec3::ZERO;
-		world.light = Vec3::Y;
+		world.light = light;
 		world.ambient = Vec3::splat(ambient);
+
+		world
+	}
+
+	/// The same with the sun kept out of the air, for what the lamps and the
+	/// air itself do: a world has no sun that is off.
+	///
+	/// **A wall at the eye's back, and the sun's light coming at the eye from
+	/// behind it**, so that the wall's shadow covers all of the air in front of
+	/// the eye - with the shadows drawn out past where the air ends, because
+	/// past the shadow distance the sun reaches everything. The eye looks away
+	/// from the wall; the wall shades what the eye sees as well, which a test
+	/// here only ever holds against the same world in clear air.
+	fn looking(eye: Vec3, at: Vec3, ambient: f32) -> World {
+		let mut world = sunlit(eye, at, Vec3::NEG_Z, ambient);
+		let shade = made(&mut world, "test/shade", 1.0);
+
+		slab(
+			&mut world,
+			shade,
+			(eye + Vec3::new(0.0, 0.0, 1.25), Vec3::new(400.0, 400.0, 0.5)),
+			Vec3::splat(0.5),
+		);
+		world
+			.cvars
+			.var(shadow::DISTANCE, Value::Float(shadow::DEFAULT_DISTANCE), "");
+		world.cvars.set(shadow::DISTANCE, "128");
 
 		world
 	}
@@ -1490,6 +1535,148 @@ mod tests {
 		(f32::from(ORDER[place]) + 0.5) / 9.0
 	}
 
+	/// How far along a ray each place the sun is sampled at is, the way
+	/// `air_sun` spreads them.
+	fn sun_places(ray: Ray, offset: f32) -> impl Iterator<Item = f32> {
+		(0..SUN_STEPS)
+			.map(move |step| ray.far * ((f32::from(step) + offset) / f32::from(SUN_STEPS)))
+	}
+
+	/// What the sun sends towards the eye out of the air along a ray:
+	/// `air_sun`, with how much of its light reaches a place answered by
+	/// `reached` - or nothing, when that cannot be said of some place along
+	/// it.
+	fn sun_along<F>(world: &World, ray: Ray, offset: f32, reached: F) -> Option<Vec3>
+	where
+		F: Fn(Vec3) -> Option<f32>,
+	{
+		let haze = world.post.haze;
+		let total = sun_places(ray, offset)
+			.map(|along| {
+				reached(ray.origin + ray.way * along).map(|share| share * (-haze * along).exp())
+			})
+			.sum::<Option<f32>>()?;
+		let travel = world.light.normalize();
+
+		Some(Vec3::splat(
+			lobe(travel.dot(-ray.way)) * haze * ray.far * total / f32::from(SUN_STEPS) * PI,
+		))
+	}
+
+	/// What the air along a ray sends towards the eye from the sun, summed in
+	/// even steps over the whole ray: the arithmetic `sun_along` stands in for.
+	///
+	/// @param reached - how much of the sun's light gets to a distance along
+	/// the ray
+	fn summed_sun<F>(world: &World, ray: Ray, reached: F) -> f64
+	where
+		F: Fn(f32) -> f32,
+	{
+		let haze = world.post.haze;
+		let step = ray.far / f32::from(SUMMED);
+		let scale = f64::from(lobe(world.light.normalize().dot(-ray.way)) * haze * PI * step);
+
+		(0..SUMMED)
+			.map(|index| {
+				let along = step * (f32::from(index) + 0.5);
+
+				f64::from(reached(along) * (-haze * along).exp()) * scale
+			})
+			.sum()
+	}
+
+	/// Every texel of what the march wrote held against the sun and the lamps
+	/// worked out here: the lamps in no shadow, the sun in whatever `reached`
+	/// says, and a texel it cannot say it of left out.
+	///
+	/// @return how many texels were held, and how many were left out
+	fn held_with_sun<F>(world: &World, found: &Found, lamps: &[Packed], reached: F) -> (u32, u32)
+	where
+		F: Fn(Vec3) -> Option<f32>,
+	{
+		let mut counted = (0, 0);
+
+		for texel in every_texel() {
+			let ray = ray_at(world, &found.depth, (texel.0 * 2, texel.1 * 2));
+			let offset = offset_of(texel);
+			let Some(sun) = sun_along(world, ray, offset, &reached) else {
+				counted.1 += 1;
+
+				continue;
+			};
+			let wanted = marched(lamps, ray, offset) + sun;
+			let got = light_of(texel_of(&found.raw, texel));
+
+			assert!(
+				near_light(got, wanted),
+				"the texel at {texel:?} holds {got} where the sun and the lamps add up to \
+				 {wanted}"
+			);
+
+			counted.0 += 1;
+		}
+
+		counted
+	}
+
+	/// Whether the way from a point towards the sun passes through a box
+	/// grown by a margin on every side, or shrunk by one under nought.
+	fn shades(at: Vec3, towards: Vec3, (low, high): (Vec3, Vec3), margin: f32) -> bool {
+		let inverse = towards.recip();
+		let one = (low - Vec3::splat(margin) - at) * inverse;
+		let other = (high + Vec3::splat(margin) - at) * inverse;
+		let (enters, leaves) = (one.min(other).max_element(), one.max(other).min_element());
+
+		enters <= leaves && leaves > 0.0
+	}
+
+	/// How much of the sun reaches a place a box may shadow, as far as a set of
+	/// cascades can say it.
+	///
+	/// None of it where the box shadows the place even shrunk by three texels
+	/// of the place's own cascade, all of it where the box grown by as much
+	/// does not, and nothing said in between: a map places a shadow's edge
+	/// only to within its texels. **Past the shadow distance all of it**,
+	/// unless `beyond` says to ask the box there too - which is what a sun
+	/// that stops at the distance would do.
+	fn under(
+		world: &World,
+		cascades: &shadow::Cascades,
+		caster: (Vec3, Vec3),
+		beyond: bool,
+	) -> impl Fn(Vec3) -> Option<f32> {
+		let camera = world.render_camera();
+		let (eye, forward) =
+			(camera.position, (camera.target - camera.position).normalize_or(Vec3::NEG_Z));
+		let towards = -world.light.normalize();
+		let (splits, texels) = (cascades.splits, cascades.texels);
+
+		move |at| {
+			let depth = (at - eye).dot(forward);
+			let last = splits[shadow::CASCADES - 1];
+
+			if (depth - last).abs() < 1.0e-3 {
+				return None;
+			}
+
+			if depth > last && !beyond {
+				return Some(1.0);
+			}
+
+			let slice = splits
+				.iter()
+				.position(|end| depth <= *end)
+				.unwrap_or(shadow::CASCADES - 1);
+			let margin = 3.0 * texels[slice];
+
+			match (shades(at, towards, caster, -margin), shades(at, towards, caster, margin)) {
+				| (true, _) => Some(0.0),
+				| (false, false) => Some(1.0),
+				| (false, true) => None,
+			}
+		}
+	}
+
 	/// What the air along a ray sends towards the eye from one lamp, summed in
 	/// even steps over the whole of the lamp's reach: no stretch worked out, no
 	/// cone cut out of it and no angle, only the arithmetic the march stands in
@@ -1777,6 +1964,7 @@ mod tests {
 			(scene, format!("const AIR_PLANE: f32 = {PLANE};")),
 			(average, format!("const PLANE: f32 = {PLANE};")),
 			(scene, format!("const AIR_STEPS: u32 = {STEPS}u;")),
+			(scene, format!("const AIR_SUN_STEPS: u32 = {SUN_STEPS}u;")),
 			(scene, format!("const AIR_ASYMMETRY: f32 = {ASYMMETRY};")),
 			(scene, format!("const AIR_NEAREST: f32 = {NEAREST};")),
 			(average, format!("const CLOSE: f32 = {CLOSE};")),
@@ -2725,5 +2913,280 @@ mod tests {
 
 		assert!(open.depth == behind.depth, "nothing blended writes the depth");
 		assert!(open.raw == behind.raw, "so nothing blended is where a ray of the air ends");
+	}
+
+	#[test]
+	fn the_places_along_a_ray_add_up_to_what_the_sun_sends_through_air_a_shadow_crosses() {
+		// sixteen places spread evenly, at each of the nine offsets the tile
+		// spreads them by, against the same air summed in sixty thousand even
+		// steps: out in the open, short of where the air ends, and with a shadow
+		// across the ray near the eye, in the middle and out to the end
+		let world = sunlit(Vec3::ZERO, Vec3::NEG_Z, Vec3::new(0.3, -1.0, -0.2), 0.0);
+		let way = Vec3::new(0.2, 0.1, -1.0).normalize();
+		let cases = [
+			(REACH, (0.0, 0.0)),
+			(9.0, (0.0, 0.0)),
+			(REACH, (4.3, 9.7)),
+			(20.0, (0.0, 3.3)),
+			(REACH, (29.0, REACH)),
+		];
+
+		for (far, (from, to)) in cases {
+			let ray = Ray { origin: Vec3::ZERO, way, far };
+			let reached = |along: f32| if (from..to).contains(&along) { 0.0 } else { 1.0 };
+			let answered = |at: Vec3| Some(reached(at.dot(way)));
+			let places = (0..9_u8)
+				.map(|place| sun_along(&world, ray, (f32::from(place) + 0.5) / 9.0, answered))
+				.map(|light| light.expect("every place is answered").x)
+				.sum::<f32>()
+				/ 9.0;
+			let wanted = summed_sun(&world, ray, reached);
+
+			assert!(
+				(f64::from(places) - wanted).abs() < WITHIN_SUN * wanted,
+				"along {far} with a shadow from {from} to {to} the places add up to {places} \
+				 where the air sends {wanted}"
+			);
+		}
+	}
+
+	#[test]
+	fn the_sun_in_open_air_lights_each_texel_by_what_the_places_along_its_ray_add_up_to() {
+		// nothing to throw a shadow, so all of the sun reaches every place: out to
+		// where the air ends in the middle of the view, which is past where
+		// anything is shadowed at all, and short of that towards the edges. Two
+		// ways for the light to travel, so that the lobe is asked at two angles
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		for light in [Vec3::new(0.3, -1.0, -0.2), Vec3::new(-0.5, 0.2, 1.0)] {
+			let mut world =
+				sunlit(Vec3::new(0.0, 1.0, 8.0), Vec3::new(0.0, 1.0, 0.0), light, 0.0);
+
+			asking(&mut world, "1", "0");
+
+			let found = drawn(&mut capture, &mut world);
+			let (held, left) = held_with_sun(&world, &found, &[], |_| Some(1.0));
+			let past = every_texel()
+				.filter(|texel| {
+					past_the_shadows(&world, &found, *texel, shadow::DEFAULT_DISTANCE)
+				})
+				.count();
+
+			assert_eq!(left, 0, "with the light going {light} every place is answered");
+			assert!(held > 19_000, "only {held} texels were held");
+			assert!(past > 2000, "and only {past} have a place past the shadow distance");
+		}
+	}
+
+	/// Whether the last of a texel's places is further along the view than a
+	/// distance: past the shadow distance, where no cascade is asked.
+	fn past_the_shadows(world: &World, found: &Found, texel: (u32, u32), distance: f32) -> bool {
+		let camera = world.render_camera();
+		let forward = (camera.target - camera.position).normalize_or(Vec3::NEG_Z);
+		let ray = ray_at(world, &found.depth, (texel.0 * 2, texel.1 * 2));
+
+		sun_places(ray, offset_of(texel)).any(|along| (ray.way * along).dot(forward) > distance)
+	}
+
+	#[test]
+	fn a_ceiling_between_the_sun_and_the_air_leaves_the_air_under_it_unlit_out_to_the_shadow_distance()
+	 {
+		// the eye under a ceiling it cannot see the end of, with a floor below.
+		// Every place the ceiling shadows gets none of the sun, every place it
+		// does not gets all of it, and a place past the shadow distance gets all
+		// of it under the ceiling too, as a surface there does - asked at the
+		// default distance, where no place under the ceiling is past it, and at
+		// four units, where most are
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = sunlit(
+			Vec3::new(0.0, 1.0, 0.0),
+			Vec3::new(0.0, 1.6, -10.0),
+			Vec3::new(0.3, -1.0, -0.2),
+			0.0,
+		);
+		let surface = made(&mut world, "test/surface", 0.8);
+		let ceiling = (Vec3::new(-6.0, 3.0, -14.0), Vec3::new(6.0, 3.2, 4.0));
+
+		slab(
+			&mut world,
+			surface,
+			((ceiling.0 + ceiling.1) * 0.5, ceiling.1 - ceiling.0),
+			Vec3::splat(0.5),
+		);
+		slab(
+			&mut world,
+			surface,
+			(Vec3::new(0.0, -0.1, 0.0), Vec3::new(200.0, 0.2, 200.0)),
+			Vec3::splat(0.5),
+		);
+		asking(&mut world, "1", "0");
+		world
+			.cvars
+			.var(shadow::DISTANCE, Value::Float(shadow::DEFAULT_DISTANCE), "");
+
+		for (distance, words) in [(shadow::DEFAULT_DISTANCE, "50"), (4.0, "4")] {
+			world.cvars.set(shadow::DISTANCE, words);
+
+			let found = drawn(&mut capture, &mut world);
+			let cascades =
+				shadow::fit(&world.render_camera(), world.aspect, world.light, distance);
+			let (held, left) =
+				held_with_sun(&world, &found, &[], under(&world, &cascades, ceiling, false));
+			let (dark, reprieved) = shadowed_places(&world, &found, &cascades, ceiling);
+
+			// measured: 18,603 held and 597 left out at the default distance,
+			// 19,093 and 107 at four; 14,921 and 6,347 in the shadow at every
+			// place; 12,853 with a place past four units that the ceiling shadows
+			assert!(held > 17_000, "at a distance of {distance} only {held} texels were held");
+			assert!(left < 1500, "and {left} were left out");
+
+			if distance < shadow::DEFAULT_DISTANCE {
+				assert!(dark > 4000, "and only {dark} have every place in the ceiling's shadow");
+				assert!(
+					reprieved > 10_000,
+					"and only {reprieved} have a place in its shadow lit for being past the \
+					 distance"
+				);
+			} else {
+				assert!(
+					dark > 10_000,
+					"and only {dark} have every place in the ceiling's shadow"
+				);
+				assert_eq!(reprieved, 0, "and none is past the distance");
+			}
+		}
+
+		// and with shadows off, the sun reaches all of the air, as it reaches every
+		// surface
+		world
+			.cvars
+			.var(shadow::ENABLED, Value::Bool(false), "off for this frame");
+
+		let found = drawn(&mut capture, &mut world);
+		let (held, left) = held_with_sun(&world, &found, &[], |_| Some(1.0));
+
+		assert_eq!((held, left), (19_200, 0), "with shadows off every texel is the open air's");
+	}
+
+	/// How many texels have every place in a box's shadow by a clear margin,
+	/// and how many have a place in it that is lit for being past the shadow
+	/// distance.
+	fn shadowed_places(
+		world: &World,
+		found: &Found,
+		cascades: &shadow::Cascades,
+		caster: (Vec3, Vec3),
+	) -> (u32, u32) {
+		let (asked, beyond) =
+			(under(world, cascades, caster, false), under(world, cascades, caster, true));
+		let mut counted = (0, 0);
+
+		for texel in every_texel() {
+			let ray = ray_at(world, &found.depth, (texel.0 * 2, texel.1 * 2));
+			let places: Vec<Vec3> = sun_places(ray, offset_of(texel))
+				.map(|along| ray.origin + ray.way * along)
+				.collect();
+
+			counted.0 += u32::from(places.iter().all(|at| asked(*at) == Some(0.0)));
+			counted.1 += u32::from(
+				places
+					.iter()
+					.any(|at| asked(*at) == Some(1.0) && beyond(*at) == Some(0.0)),
+			);
+		}
+
+		counted
+	}
+
+	#[test]
+	fn air_just_in_front_of_a_wall_the_sun_lights_is_not_in_the_walls_shadow() {
+		// the wall faces the sun and the eye together and nothing stands between
+		// the sun and the air, so all of the sun reaches every place - down to
+		// the last of each ray, which for one texel in nine sits nearer the wall
+		// than two texels of its cascade. What keeps it out of the wall's own
+		// shadow is the bias the cascades are drawn with: nothing moves the point
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world =
+			sunlit(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO, Vec3::new(0.35, -0.3, -1.0), 0.0);
+		let wall = made(&mut world, "test/wall", 0.8);
+
+		slab(
+			&mut world,
+			wall,
+			(Vec3::new(0.0, 0.0, -0.25), Vec3::new(60.0, 60.0, 0.5)),
+			Vec3::splat(0.5),
+		);
+		asking(&mut world, "1", "0");
+
+		let found = drawn(&mut capture, &mut world);
+		let (held, left) = held_with_sun(&world, &found, &[], |_| Some(1.0));
+		let cascades = shadow::fit(
+			&world.render_camera(),
+			world.aspect,
+			world.light,
+			shadow::DEFAULT_DISTANCE,
+		);
+		let close = every_texel()
+			.filter(|texel| {
+				let ray = ray_at(&world, &found.depth, (texel.0 * 2, texel.1 * 2));
+				let last = sun_places(ray, offset_of(*texel))
+					.last()
+					.unwrap_or(0.0);
+				let at = ray.origin + ray.way * last;
+
+				at.z < 2.0 * cascades.texels[1]
+			})
+			.count();
+
+		assert_eq!((held, left), (19_200, 0), "every texel is the open air's");
+		assert!(
+			close > 1000,
+			"but only {close} texels have a place within two texels of the wall"
+		);
+	}
+
+	#[test]
+	fn the_sun_lights_the_air_of_a_ray_that_follows_four_lamps_as_well() {
+		// the sun is none of the four lamps a texel's ray follows: five lamps in
+		// a row and the sun in open air, and a texel crossing four of them gets
+		// the sun as well as the four
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let lamp =
+			|x: f32, z: f32| (bare(Vec3::ONE, 3.0, 3.0), Transform::at(Vec3::new(x, 0.0, z)));
+		let mut world =
+			sunlit(Vec3::new(0.0, 0.0, 8.0), Vec3::ZERO, Vec3::new(0.3, -1.0, -0.2), 0.0);
+		let lamps = shining(&mut world, &[
+			lamp(4.0, -8.0),
+			lamp(0.0, 0.0),
+			lamp(0.0, -2.0),
+			lamp(0.0, -4.0),
+			lamp(0.0, -6.0),
+		]);
+
+		asking(&mut world, "1", "0");
+
+		let found = drawn(&mut capture, &mut world);
+		let (held, left) = held_with_sun(&world, &found, &lamps, |_| Some(1.0));
+		let four = every_texel()
+			.filter(|texel| {
+				let ray = ray_at(&world, &found.depth, (texel.0 * 2, texel.1 * 2));
+
+				lamps
+					.iter()
+					.filter(|lamp| crossing(lamp, ray) == Some(true))
+					.count() >= 4
+			})
+			.count();
+
+		assert_eq!((held, left), (19_200, 0), "every texel is the sun's and the lamps'");
+		assert!(four > 150, "but only {four} texels cross four lamps or more");
 	}
 }
