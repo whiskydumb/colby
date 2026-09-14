@@ -14,6 +14,7 @@
 
 mod brdf;
 pub mod capture;
+pub mod cover;
 pub mod cull;
 pub mod decal;
 pub mod depth;

@@ -176,6 +176,25 @@ impl Capture {
 		self.scene.render(&target, world, Some(view), 0.0);
 	}
 
+	/// Draws a frame into one rectangle of the target and reads the whole
+	/// target back. A test's.
+	///
+	/// @param world - the state to draw; its `aspect` is overwritten to match
+	/// the rectangle
+	/// @param view - the rectangle
+	/// @return the pixels of the whole target, top row first
+	#[cfg(test)]
+	pub(crate) fn shoot_within(
+		&mut self,
+		world: &mut World,
+		view: crate::Viewport,
+	) -> Result<Image> {
+		self.draw_within(world, view);
+		self.copy_out();
+
+		self.read_back()
+	}
+
 	/// The device this capture draws with.
 	///
 	/// For an [`Overlay`], which builds its pipelines against the same device

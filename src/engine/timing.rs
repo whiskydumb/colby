@@ -56,8 +56,8 @@ use std::{
 };
 
 use wgpu::{
-	Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, MapMode, PollType, QuerySet,
-	QuerySetDescriptor, QueryType, RenderPassTimestampWrites,
+	Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePassTimestampWrites, Device,
+	MapMode, PollType, QuerySet, QuerySetDescriptor, QueryType, RenderPassTimestampWrites,
 };
 
 /// How many nanoseconds a timestamp tick is worth when the queue will not say.
@@ -90,6 +90,13 @@ pub enum Pass {
 	/// color. None at all in a frame nothing reads them in. @ref
 	/// [`prepass`](crate::prepass).
 	Prepass,
+
+	/// What is wholly behind what the pass before the scene drew, found and
+	/// left out of the scene's lists: a pyramid of farthest depths, a test of
+	/// every box against it and a copy of what is kept, in one compute pass.
+	/// None at all in a frame the pass before the scene does not run in. @ref
+	/// [`cover`](crate::cover).
+	Cover,
 
 	/// How much of the sky each pixel sees, worked out from what the pass
 	/// before the scene wrote: an estimate and an average, both at half the
@@ -147,10 +154,11 @@ pub enum Pass {
 
 impl Pass {
 	/// Every span, in the order a frame runs them.
-	pub const ALL: [Self; 13] = [
+	pub const ALL: [Self; 14] = [
 		Self::Shadow,
 		Self::Lamps,
 		Self::Prepass,
+		Self::Cover,
 		Self::Occlusion,
 		Self::Reflections,
 		Self::Scene,
@@ -170,6 +178,7 @@ impl Pass {
 			| Self::Shadow => "shadow",
 			| Self::Lamps => "lamps",
 			| Self::Prepass => "prepass",
+			| Self::Cover => "cover",
 			| Self::Occlusion => "occlusion",
 			| Self::Reflections => "reflections",
 			| Self::Scene => "scene",
@@ -189,16 +198,17 @@ impl Pass {
 			| Self::Shadow => 0,
 			| Self::Lamps => 1,
 			| Self::Prepass => 2,
-			| Self::Occlusion => 3,
-			| Self::Reflections => 4,
-			| Self::Scene => 5,
-			| Self::Depth => 6,
-			| Self::Haze => 7,
-			| Self::Shaft => 8,
-			| Self::Focus => 9,
-			| Self::Meter => 10,
-			| Self::Glow => 11,
-			| Self::Composite => 12,
+			| Self::Cover => 3,
+			| Self::Occlusion => 4,
+			| Self::Reflections => 5,
+			| Self::Scene => 6,
+			| Self::Depth => 7,
+			| Self::Haze => 8,
+			| Self::Shaft => 9,
+			| Self::Focus => 10,
+			| Self::Meter => 11,
+			| Self::Glow => 12,
+			| Self::Composite => 13,
 		}
 	}
 
@@ -213,16 +223,17 @@ impl Pass {
 			| Self::Shadow => 0,
 			| Self::Lamps => 2,
 			| Self::Prepass => 4,
-			| Self::Occlusion => 6,
-			| Self::Reflections => 8,
-			| Self::Scene => 10,
-			| Self::Depth => 12,
-			| Self::Haze => 14,
-			| Self::Shaft => 16,
-			| Self::Focus => 18,
-			| Self::Meter => 20,
-			| Self::Glow => 22,
-			| Self::Composite => 24,
+			| Self::Cover => 6,
+			| Self::Occlusion => 8,
+			| Self::Reflections => 10,
+			| Self::Scene => 12,
+			| Self::Depth => 14,
+			| Self::Haze => 16,
+			| Self::Shaft => 18,
+			| Self::Focus => 20,
+			| Self::Meter => 22,
+			| Self::Glow => 24,
+			| Self::Composite => 26,
 		}
 	}
 }
@@ -298,7 +309,7 @@ pub(crate) enum Ends {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
 	/// What the hardware spent, per [`Pass`], in its `slot` order.
-	passes: [Option<Duration>; 13],
+	passes: [Option<Duration>; 14],
 
 	/// What this thread spent, per [`Work`], in its `slot` order.
 	work: [Option<Duration>; 2],
@@ -329,6 +340,10 @@ impl Frame {
 	#[must_use]
 	pub const fn passes(&self) -> u32 { self.count }
 }
+
+/// Where one pass writes its two ends: the query set, and the index of each end
+/// it writes.
+type Marks<'a> = (&'a QuerySet, Option<u32>, Option<u32>);
 
 /// Eight bytes a slot, little-endian, as `resolve_query_set` wrote them.
 ///
@@ -425,9 +440,9 @@ pub struct Timings {
 
 impl Timings {
 	/// How many timestamps the set holds: two per span.
-	const QUERIES: u32 = 26;
+	const QUERIES: u32 = 28;
 	/// The same number where a length is wanted. @ref [`Pass::query`].
-	const TICKS: usize = 26;
+	const TICKS: usize = 28;
 
 	/// An apparatus that measures nothing.
 	///
@@ -534,6 +549,44 @@ impl Timings {
 	/// @param pass - which span
 	/// @param ends - whether this pass opens it, closes it, or is all of it
 	pub(crate) fn writes(&self, pass: Pass, ends: Ends) -> Option<RenderPassTimestampWrites<'_>> {
+		let (query_set, beginning, end) = self.marks(pass, ends)?;
+
+		Some(RenderPassTimestampWrites {
+			query_set,
+			beginning_of_pass_write_index: beginning,
+			end_of_pass_write_index: end,
+		})
+	}
+
+	/// The same for a compute pass, which wgpu describes with a type of its
+	/// own.
+	///
+	/// Counted in [`Frame::passes`] like a render pass: what the count is for
+	/// is noticing a frame that grew a pass, and a compute pass is one.
+	///
+	/// @param pass - which span
+	/// @param ends - whether this pass opens it, closes it, or is all of it
+	pub(crate) fn compute_writes(
+		&self,
+		pass: Pass,
+		ends: Ends,
+	) -> Option<ComputePassTimestampWrites<'_>> {
+		let (query_set, beginning, end) = self.marks(pass, ends)?;
+
+		Some(ComputePassTimestampWrites {
+			query_set,
+			beginning_of_pass_write_index: beginning,
+			end_of_pass_write_index: end,
+		})
+	}
+
+	/// Counts a pass and notes its span, and says where its two ends go.
+	///
+	/// @param pass - which span
+	/// @param ends - whether this pass opens it, closes it, or is all of it
+	/// @return the query set and the indices of the two ends, or nothing for a
+	/// pass in the middle of a span and whenever nobody is measuring
+	fn marks(&self, pass: Pass, ends: Ends) -> Option<Marks<'_>> {
 		let slot = pass.slot();
 
 		// every pass calls this, including the ones in the middle of a span
@@ -554,17 +607,17 @@ impl Timings {
 			return None;
 		}
 
-		Some(RenderPassTimestampWrites {
-			query_set: self.set.as_ref()?,
-			beginning_of_pass_write_index: match ends {
+		Some((
+			self.set.as_ref()?,
+			match ends {
 				| Ends::Open | Ends::Both => Some(pass.query()),
 				| Ends::Middle | Ends::Close => None,
 			},
-			end_of_pass_write_index: match ends {
+			match ends {
 				| Ends::Close | Ends::Both => Some(pass.query() + 1),
 				| Ends::Middle | Ends::Open => None,
 			},
-		})
+		))
 	}
 
 	/// Records the resolve and the copy out, at the end of the frame's
@@ -756,7 +809,7 @@ impl Timings {
 		// read into a table of its own and then written over the frame in one
 		// go: `span` reads the mask off `self` and the frame is a field of
 		// the same `self`, so the two cannot be borrowed at once.
-		let mut spans = [None; 13];
+		let mut spans = [None; 14];
 
 		for pass in Pass::ALL {
 			if let Some(held) = spans.get_mut(pass.slot()) {

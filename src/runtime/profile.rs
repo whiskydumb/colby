@@ -35,7 +35,8 @@
 //! and Unreal one-poles every number in `stat unit`
 //! (`UnrealClient.cpp:381-400`).
 //!
-//! Nothing is read back off the GPU except the thirteen spans' timestamps. A
+//! Nothing is read back off the GPU except the fourteen spans' timestamps and
+//! the two words that count what was behind something nearer. A
 //! picture copied to a mappable buffer is three and a half megabytes that no
 //! frame anybody plays ever pays, and it would be the largest row in the table.
 
@@ -88,9 +89,9 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Thirteen spans of hardware, two of recording, five of simulation and one of
+/// Fourteen spans of hardware, two of recording, five of simulation and one of
 /// particles.
-const ROWS: usize = 21;
+const ROWS: usize = 22;
 
 /// Which row of the table is the whole solver step.
 ///
@@ -99,11 +100,12 @@ const ROWS: usize = 21;
 /// below has to leave these two alone or move them on purpose; `gpu depth`
 /// went in above them and moved both, `gpu shaft` did it again, `gpu focus` a
 /// third time, `gpu lamps` a fourth, `gpu prepass` a fifth, `gpu occlusion` a
-/// sixth, `gpu reflections` a seventh and `gpu haze` an eighth.
-const STEP_ROW: usize = 19;
+/// sixth, `gpu reflections` a seventh, `gpu haze` an eighth and `gpu cover` a
+/// ninth.
+const STEP_ROW: usize = 20;
 
 /// Which row is the particles.
-const SPARKS_ROW: usize = 20;
+const SPARKS_ROW: usize = 21;
 
 /// How many frames the live table averages over.
 ///
@@ -223,7 +225,7 @@ impl Live {
 	/// @param passes - what the hardware spent, per [`Pass`] in slot order,
 	/// from a frame two or three behind the one this is called in
 	/// @param count - how many render passes that frame recorded
-	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 13], count: u32) {
+	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 14], count: u32) {
 		self.passes = Some(count);
 
 		for (at, took) in passes.into_iter().enumerate() {
@@ -389,6 +391,14 @@ struct Table {
 	/// hidden. Beside `meshes`, and the two add up to every entity with one.
 	hidden: usize,
 
+	/// The most things any measured frame's picture left out of the scene's
+	/// pass for being wholly behind something nearer. Inside `drawn`, which
+	/// the pass before the scene still draws. @ref `colby_engine::cover`.
+	covered: usize,
+
+	/// The most triangles those things' meshes had between them.
+	covered_triangles: usize,
+
 	/// The most lamps any measured frame carried to the shader.
 	lamps: usize,
 
@@ -423,6 +433,9 @@ pub(crate) const NAMES: [&str; ROWS] = [
 	// every solid thing in view drawn once more before the scene, writing its
 	// depth, its normal and its roughness. Added with parity card C1.
 	"gpu prepass",
+	// what is wholly behind what the row above drew, found and left out of the
+	// scene's lists in one compute pass. Added with parity card D2.
+	"gpu cover",
 	// how much of the sky each pixel sees, worked out from what the row above
 	// wrote and read by the row below. Added with parity card C2.
 	"gpu occlusion",
@@ -478,6 +491,8 @@ impl Table {
 			cast: 0,
 			lamp_cast: 0,
 			hidden: 0,
+			covered: 0,
+			covered_triangles: 0,
 			lamps: 0,
 			decals: 0,
 			passes: None,
@@ -501,6 +516,10 @@ impl Table {
 		self.cast = self.cast.max(counts.drawn.cast);
 		self.lamp_cast = self.lamp_cast.max(counts.drawn.lamp_casts);
 		self.hidden = self.hidden.max(counts.drawn.hidden);
+		self.covered = self.covered.max(counts.drawn.covered);
+		self.covered_triangles = self
+			.covered_triangles
+			.max(counts.drawn.covered_triangles);
 		self.lamps = self.lamps.max(counts.drawn.lamps);
 		self.decals = self.decals.max(counts.drawn.decals);
 
@@ -579,6 +598,8 @@ impl Table {
 			cast = self.cast,
 			lamp_cast = self.lamp_cast,
 			hidden = self.hidden,
+			covered = self.covered,
+			covered_triangles = self.covered_triangles,
 			lamps = self.lamps,
 			decals = self.decals,
 			steady = self.steady,
@@ -798,6 +819,7 @@ mod tests {
 				None,
 				None,
 				None,
+				None,
 				Some(Duration::from_micros(800)),
 				None,
 				None,
@@ -811,8 +833,8 @@ mod tests {
 		);
 
 		assert!(live.profile().hardware, "now it has");
-		assert_eq!(live.profile().parts[5].mean, Some(Duration::from_micros(800)));
-		assert_eq!(live.profile().parts[5].name, "gpu scene", "in the sixth row");
+		assert_eq!(live.profile().parts[6].mean, Some(Duration::from_micros(800)));
+		assert_eq!(live.profile().parts[6].name, "gpu scene", "in the seventh row");
 		assert_eq!(live.profile().passes, Some(15), "and the count came with it");
 	}
 
@@ -935,6 +957,8 @@ mod tests {
 				hidden: 3,
 				lamps: 2,
 				decals: 5,
+				covered: 6,
+				covered_triangles: 72,
 			},
 		});
 
@@ -957,6 +981,11 @@ mod tests {
 			(table.meshes, table.drawn, table.cast, table.hidden, table.lamps, table.decals),
 			(10, 4, 12, 3, 2, 5),
 			"and how much of the world the frame drew"
+		);
+		assert_eq!(
+			(table.covered, table.covered_triangles),
+			(6, 72),
+			"and how much of that was behind something nearer"
 		);
 		assert_eq!(
 			table.rows[under + 5].mean(),

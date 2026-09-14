@@ -47,7 +47,9 @@ use colby_core::{
 /// switch is for is the other way round - drawing everything, which is how
 /// what the test saves is measured and how a picture is shown not to depend on
 /// it. One engine read has exactly this, on by default; the others have no
-/// switch at all.
+/// switch at all. **Off leaves out nothing at all**: what is behind something
+/// nearer is drawn too, whatever [`cover::ENABLED`](crate::cover::ENABLED)
+/// says.
 pub const ENABLED: &str = "r.cull";
 
 /// How much further out than the arithmetic says a box has to be before it is
@@ -406,6 +408,18 @@ pub struct Drawn {
 	/// decides it: the room a frame has, whether a decal's box touches the
 	/// view, and whether it is shown.
 	pub decals: usize,
+
+	/// How many of the things the picture's lists held were wholly behind what
+	/// the pass before the scene drew, and left out of the scene's pass.
+	///
+	/// Inside [`seen`](Self::seen) rather than beside it: what the view holds
+	/// is still drawn by the pass before the scene, which is what found them.
+	/// Counted on the device, so nought until a measuring frame reads it back.
+	/// @ref [`cover`](crate::cover).
+	pub covered: usize,
+
+	/// The triangles of those things' meshes, added together.
+	pub covered_triangles: usize,
 }
 
 #[cfg(test)]

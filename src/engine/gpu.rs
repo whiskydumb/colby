@@ -432,9 +432,21 @@ impl Gpu {
 /// two devices. The interface's and the editor's hold one each and have never
 /// faulted; if either ever grows a second, this is the line to widen.
 ///
+/// **And never wgpu's check of indirect draws, in any build.** The one draw
+/// taken from a buffer here is the scene's lists through what the test for
+/// what is behind something nearer kept, and the scene writes every command
+/// itself: the index count of the mesh it binds, a first index, a base vertex
+/// and a first instance of nought, and an instance count the copy can only
+/// lower. What the check does is copy every command through a compute pass of
+/// its own before the render pass, and it asserts that storage offsets align
+/// to at least thirty-two bytes, which the stub device's do not: every
+/// pipeline test on it panicked inside wgpu the day the draw went in. @ref
+/// [`cover`](crate::cover).
+///
 /// @return the flags the instance is made with
 fn layers() -> InstanceFlags {
-	let asked = InstanceFlags::from_build_config();
+	let asked =
+		InstanceFlags::from_build_config().difference(InstanceFlags::VALIDATION_INDIRECT_CALL);
 
 	if cfg!(test) {
 		asked.difference(InstanceFlags::VALIDATION)

@@ -38,10 +38,10 @@ use wgpu::{
 	BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, BlendState,
 	Buffer, BufferAddress, BufferBindingType, BufferDescriptor, BufferUsages, Color,
 	ColorTargetState, ColorWrites, CommandEncoder, CommandEncoderDescriptor, CompareFunction,
-	DepthBiasState, DepthStencilState, Device, ErrorFilter, Extent3d, Face, FilterMode,
-	FragmentState, FrontFace, IndexFormat, LoadOp, MipmapFilterMode, MultisampleState,
-	Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode,
-	PrimitiveState, PrimitiveTopology, Queue, RenderPass, RenderPassColorAttachment,
+	DepthBiasState, DepthStencilState, Device, DownlevelFlags, ErrorFilter, Extent3d, Face,
+	FilterMode, FragmentState, FrontFace, IndexFormat, LoadOp, MipmapFilterMode,
+	MultisampleState, Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor,
+	PolygonMode, PrimitiveState, PrimitiveTopology, Queue, RenderPass, RenderPassColorAttachment,
 	RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPassTimestampWrites,
 	RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
 	ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, StoreOp,
@@ -53,6 +53,7 @@ use wgpu::{
 
 use crate::{
 	brdf::{self, Split},
+	cover::{self, COMMAND_SIZE, Cover, Reach},
 	cull::{self, Bounds, Drawn, Frustum, Placed},
 	decal::{self, Atlas, Chosen, DECALS, Key, MAX_DECALS, Paint},
 	depth::{self, Depth},
@@ -585,6 +586,53 @@ impl Sorted {
 	}
 }
 
+/// What the test for what is behind something nearer works from, laid out while
+/// the frame is grouped. @ref [`cover`].
+struct Covering {
+	/// The test itself.
+	cover: Cover,
+
+	/// Whether this frame asks for it: the variable, the frustum test, and a
+	/// pass before the scene to read.
+	asked: bool,
+
+	/// Every staged entity's box, in [`Scene::staged`]'s order, while asked.
+	reached: Vec<Placed>,
+
+	/// One record a thing of the picture's lists, in placement order.
+	reaches: Vec<Reach>,
+
+	/// Five words a batch of those lists, the solid batches first.
+	commands: Vec<u32>,
+
+	/// The matrix this frame's picture is drawn through.
+	projection: Mat4,
+}
+
+/// How a list of batches is drawn: an instance range a batch, or through what
+/// the test kept. @ref [`Scene::draw_through`].
+#[derive(Clone, Copy)]
+enum Through<'a> {
+	/// Each batch's own run of the placements.
+	Instances,
+
+	/// Each batch's run of what the test kept, as many as its command says.
+	Kept {
+		/// The kept placements.
+		placements: &'a Buffer,
+
+		/// One command a batch.
+		commands: &'a Buffer,
+
+		/// How many bytes a placement is.
+		stride: BufferAddress,
+
+		/// Which command the list's first batch has: the blended list's come
+		/// after the solid list's.
+		offset: usize,
+	},
+}
+
 /// A run of instances that share both a mesh and a material.
 struct Batch {
 	mesh: usize,
@@ -845,6 +893,9 @@ pub struct Scene {
 	painted: Vec<Chosen>,
 	/// Every picture the world's decals throw, as the atlas knows them.
 	pictures: Vec<Key>,
+	/// What is left out of the scene's lists for being behind something nearer.
+	/// @ref [`cover`].
+	covering: Covering,
 	/// The float target the world is drawn into, and everything that squeezes
 	/// it back down. @ref [`post`](crate::post).
 	post: post::Chain,
@@ -919,6 +970,7 @@ impl Scene {
 		let focus = Focus::new(&device, width, height)?;
 
 		let instances = placements(&device)?;
+		let covering = covering(gpu, (width, height))?;
 
 		Ok(Self {
 			device,
@@ -984,6 +1036,7 @@ impl Scene {
 			lit: Vec::with_capacity(MAX_LAMPS),
 			painted: Vec::with_capacity(MAX_DECALS),
 			pictures: Vec::new(),
+			covering,
 			sky: false,
 			post,
 			// the period is a property of the queue and never changes, so it
@@ -1005,6 +1058,7 @@ impl Scene {
 		self.occlusion.resize(width, height);
 		self.reflection.resize(width, height);
 		self.haze.resize(width, height);
+		self.covering.cover.resize(width, height);
 	}
 
 	/// Rebuilds everything that has to agree about how many samples a pixel is.
@@ -1185,7 +1239,12 @@ impl Scene {
 		// after the shadows and before the scene's own pass, because what reads
 		// a surface before it is lit has to find it written already. @ref
 		// [`prepass`].
-		self.prepare(&mut encoder, view);
+		let prepared = self.prepare(&mut encoder, view);
+
+		// straight after it, because what it reads is the depth that pass has just
+		// written, and before everything that reads that pass too: none of them
+		// draws the lists this leaves things out of
+		self.cover(&mut encoder, view, prepared);
 
 		// and straight after it, for the same reason and for the one after it:
 		// the scene is about to light what this works out
@@ -1276,7 +1335,7 @@ impl Scene {
 		pass.set_bind_group(3, self.joints.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
 
-		self.draw(&mut pass, &self.batches);
+		self.draw(&mut pass, &self.batches, 0);
 
 		// after everything opaque and before everything else. Every pixel a
 		// wall covered is thrown away by the depth test before it is shaded,
@@ -1298,7 +1357,7 @@ impl Scene {
 		// with what is already in the target, so everything that could be
 		// behind it has to be there first - the debug lines included, which is
 		// what makes a line seen through glass read as being behind it.
-		self.draw(&mut pass, &self.blended);
+		self.draw(&mut pass, &self.blended, self.batches.len());
 
 		// and after even that. A particle writes no depth, so nothing it draws
 		// can hold anything else out, and it composites - which means every
@@ -1321,6 +1380,38 @@ impl Scene {
 		// into sixteen-bit floats, and nothing above it wrote a pixel of the
 		// frame that is about to be shown.
 		self.finish(encoder, world, (seconds, view), target);
+	}
+
+	/// What is wholly behind what the pass before the scene drew, found and
+	/// left out of the lists the scene's pass is about to draw. @ref
+	/// [`cover`].
+	///
+	/// @param encoder - the frame's, with the pass before the scene in it
+	/// @param view - the part of the target the picture is drawn into, or all
+	/// @param prepared - whether that pass drew this frame: a depth left from a
+	/// frame before is not this frame's, and nothing is tested against it
+	///
+	/// @note: no frame today asks for the test with that pass unrecorded and a
+	/// depth still held - the pass records whenever its targets exist and the
+	/// rectangle is inside the picture, and the test asks both - so a mutation
+	/// pass that dropped `prepared` passed everything. It stays because a depth
+	/// being held is not proof of whose frame it is.
+	fn cover(&mut self, encoder: &mut CommandEncoder, view: Option<Viewport>, prepared: bool) {
+		let instances = u32::try_from(self.covering.reaches.len()).unwrap_or(0);
+
+		self.covering.cover.render(
+			encoder,
+			&self.queue,
+			cover::Frame {
+				asked: self.covering.asked && prepared,
+				prepass: &self.prepass,
+				placements: &self.instances,
+				view_projection: self.covering.projection,
+				instances,
+				timings: &self.timings,
+			},
+			view,
+		);
 	}
 
 	/// What each pixel's reflection finds on the picture, recorded between the
@@ -1561,6 +1652,50 @@ impl Scene {
 	#[cfg(test)]
 	pub(crate) const fn haze_built(&self) -> bool { self.haze.built() }
 
+	/// What the test for what is behind something nearer is working with, for a
+	/// test: its pipelines, whether it made a pyramid, this frame's records and
+	/// the matrix the picture was drawn through.
+	#[cfg(test)]
+	pub(crate) const fn cover_state(&self) -> &Cover { &self.covering.cover }
+
+	/// This frame's records of the picture's lists, in placement order, for a
+	/// test.
+	#[cfg(test)]
+	pub(crate) fn cover_reaches(&self) -> &[Reach] { &self.covering.reaches }
+
+	/// The matrix this frame's picture was drawn through, for a test.
+	#[cfg(test)]
+	pub(crate) const fn cover_projection(&self) -> Mat4 { self.covering.projection }
+
+	/// One level of the pyramid, for a test. @ref [`Cover::level_values`].
+	#[cfg(test)]
+	pub(crate) fn cover_level_values(&self, level: u32) -> Option<(u32, Vec<f32>)> {
+		self.covering
+			.cover
+			.level_values(&self.device, &self.queue, level)
+	}
+
+	/// The commands this frame's lists were drawn through, five words a batch,
+	/// for a test.
+	#[cfg(test)]
+	pub(crate) fn cover_command_values(&self) -> Option<Vec<u32>> {
+		let batches = u32::try_from(self.batches.len() + self.blended.len()).ok()?;
+
+		self.covering
+			.cover
+			.command_values(&self.device, &self.queue, batches)
+	}
+
+	/// Whether the test kept each thing of this frame's lists, for a test.
+	#[cfg(test)]
+	pub(crate) fn cover_kept_values(&self) -> Option<Vec<u32>> {
+		let count = u32::try_from(self.covering.reaches.len()).ok()?;
+
+		self.covering
+			.cover
+			.kept_values(&self.device, &self.queue, count)
+	}
+
 	/// Asks for the pass before the scene whether or not anything reads it,
 	/// for a test.
 	///
@@ -1586,8 +1721,13 @@ impl Scene {
 	/// mode that calls it opens no window.
 	pub fn settle(&mut self) -> crate::timing::Frame {
 		let device = self.device.clone();
+		let frame = self.timings.settle(&device);
 
-		self.timings.settle(&device)
+		// after the timestamps, which have already waited for the frame: what
+		// the test left out is read the same way, and belongs to the same frame
+		self.covering.cover.settle(&device);
+
+		frame
 	}
 
 	/// What a frame cost, for whoever asked without being able to wait.
@@ -1598,6 +1738,7 @@ impl Scene {
 	pub fn collect(&mut self) -> Option<crate::timing::Frame> {
 		let device = self.device.clone();
 
+		self.covering.cover.poll(&device);
 		self.timings.poll(&device)
 	}
 
@@ -1622,8 +1763,21 @@ impl Scene {
 	/// Counts for a report, in the same spirit as [`sparks`](Self::sparks): a
 	/// number about the project at a given step, which a moved camera or a
 	/// switched-off test changes and nothing else does. @ref [`Drawn`].
+	///
+	/// What the test for what is behind something nearer left out is counted
+	/// where it was worked out, and is here once a measuring frame has read it
+	/// back: nought in a frame nobody measures. @ref [`cover`].
 	#[must_use]
-	pub const fn drawn(&self) -> Drawn { self.drawn }
+	pub fn drawn(&self) -> Drawn {
+		let counted = self.covering.cover.counted();
+		let count = |number: u32| usize::try_from(number).unwrap_or(usize::MAX);
+
+		Drawn {
+			covered: count(counted.instances),
+			covered_triangles: count(counted.triangles),
+			..self.drawn
+		}
+	}
 
 	/// Whether the particle pipelines have been built.
 	///
@@ -1764,11 +1918,26 @@ impl Scene {
 	/// order they were sorted in and the pipelines their materials name, and
 	/// neither of those is visible from here.
 	///
+	/// **Through what the test kept, in a frame it ran**: the same batches in
+	/// the same order, each drawing its run of the kept placements as one
+	/// command says. @ref [`cover`].
+	///
 	/// @param pass - the pass to record into, with groups nought, two and three
 	/// already bound
 	/// @param batches - the runs to draw, in order
-	fn draw(&self, pass: &mut RenderPass<'_>, batches: &[Batch]) {
-		self.draw_through(pass, batches, |blend, skinned| {
+	/// @param offset - which command the list's first batch has
+	fn draw(&self, pass: &mut RenderPass<'_>, batches: &[Batch], offset: usize) {
+		let through = self.covering.cover.drawn_through().map_or(
+			Through::Instances,
+			|(placements, commands)| Through::Kept {
+				placements,
+				commands,
+				stride: self.covering.cover.placement(),
+				offset,
+			},
+		);
+
+		self.draw_through(pass, (batches, through), |blend, skinned| {
 			Some(self.pipelines.get(blend, skinned))
 		});
 	}
@@ -1782,11 +1951,16 @@ impl Scene {
 	///
 	/// @param pass - the pass to record into, with groups nought, two and three
 	/// already bound
-	/// @param batches - the runs to draw, in order
+	/// @param (batches, through) - the runs to draw, in order, and whether each
+	/// draws its own instances or what the test kept of them
 	/// @param pick - the pipeline for a blend and whether bones move the mesh,
 	/// or nothing for a batch this pass does not draw
-	fn draw_through<'a, F>(&'a self, pass: &mut RenderPass<'_>, batches: &[Batch], pick: F)
-	where
+	fn draw_through<'a, F>(
+		&'a self,
+		pass: &mut RenderPass<'_>,
+		(batches, through): (&[Batch], Through<'_>),
+		pick: F,
+	) where
 		F: Fn(Blend, bool) -> Option<&'a RenderPipeline>,
 	{
 		// swapped when a batch wants another one rather than once per batch.
@@ -1795,7 +1969,7 @@ impl Scene {
 		// there are.
 		let mut bound = None;
 
-		for batch in batches {
+		for (index, batch) in batches.iter().enumerate() {
 			let (Some(mesh), Some(material), Some(pipeline)) = (
 				self.meshes.get(batch.mesh),
 				self.materials.get(batch.material),
@@ -1817,7 +1991,27 @@ impl Scene {
 			pass.set_bind_group(1, &material.bindings, &[]);
 			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
 			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
-			pass.draw_indexed(0..mesh.index_count, 0, batch.first..batch.first + batch.count);
+
+			match through {
+				| Through::Instances => pass.draw_indexed(
+					0..mesh.index_count,
+					0,
+					batch.first..batch.first + batch.count,
+				),
+				| Through::Kept { placements, commands, stride, offset } => {
+					// the batch's run of what was kept begins where its run of
+					// everything did, and the command's first instance is nought
+					pass.set_vertex_buffer(
+						1,
+						placements.slice(u64::from(batch.first) * stride..),
+					);
+					pass.draw_indexed_indirect(
+						commands,
+						u64::try_from(offset + index).unwrap_or(u64::MAX / COMMAND_SIZE)
+							* COMMAND_SIZE,
+					);
+				},
+			}
 		}
 	}
 
@@ -1831,11 +2025,12 @@ impl Scene {
 	/// @param encoder - the frame's, with the shadows already in it
 	/// @param view - the part of the target the picture is drawn into, or the
 	/// whole of it
-	fn prepare(&mut self, encoder: &mut CommandEncoder, view: Option<Viewport>) {
+	/// @return whether the pass was recorded this frame
+	fn prepare(&mut self, encoder: &mut CommandEncoder, view: Option<Viewport>) -> bool {
 		if !self.preparing() {
 			self.prepass.release();
 
-			return;
+			return false;
 		}
 
 		let groups = [
@@ -1849,21 +2044,21 @@ impl Scene {
 			.prepass
 			.ensure(&self.device, &groups, &self.built)
 		{
-			return;
+			return false;
 		}
 
 		let Some(mut pass) = self
 			.prepass
 			.begin(encoder, self.timings.writes(Pass::Prepass, Ends::Both))
 		else {
-			return;
+			return false;
 		};
 
 		// the rectangle the picture is cut to, and one with nothing inside the
 		// target leaves the pass cleared and nothing else, as the picture is
 		if let Some(asked) = view {
 			let Some(inside) = asked.within(self.size.0, self.size.1) else {
-				return;
+				return false;
 			};
 
 			cut(&mut pass, inside);
@@ -1874,9 +2069,11 @@ impl Scene {
 		pass.set_bind_group(3, self.joints.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
 
-		self.draw_through(&mut pass, &self.batches, |blend, skinned| {
+		self.draw_through(&mut pass, (&self.batches, Through::Instances), |blend, skinned| {
 			self.prepass.pipeline(blend, skinned)
 		});
+
+		true
 	}
 
 	/// Whether anything reads what the pass before the scene writes, this
@@ -2241,6 +2438,9 @@ impl Scene {
 		self.hazing = haze::asking_of(world, &camera, self.showing);
 		self.shafting = shaft::asking_of(world, &camera);
 		self.focusing = focus::asking_of(world, &camera);
+		// after every reader of the pass before the scene has said whether it
+		// reads: the test reads that pass's depth and does not ask for it
+		self.covering.asked = sight.culling && cover::asking_of(world) && self.preparing();
 
 		self.queue.write_buffer(
 			&self.globals,
@@ -2299,6 +2499,8 @@ impl Scene {
 		// after the grouping, which starts every count over
 		self.drawn.lamps = usize::try_from(count).unwrap_or(0);
 		self.drawn.decals = usize::try_from(painted).unwrap_or(0);
+
+		self.hand_over_to_cover(projection);
 
 		if self.placements.is_empty() {
 			return;
@@ -2536,6 +2738,9 @@ impl Scene {
 		self.joints.begin(world);
 		self.culling = sight.culling;
 		self.drawn = Drawn::default();
+		self.covering.reached.clear();
+		self.covering.reaches.clear();
+		self.covering.commands.clear();
 
 		for (id, _, renderable) in world.entities.iter() {
 			self.consider(world, sight, id, renderable);
@@ -2649,6 +2854,12 @@ impl Scene {
 		let Some(at) = self.stage(world, id, renderable, transform) else {
 			return;
 		};
+
+		// beside the placement it was staged with, at the same index: the test
+		// asks the very box the frustum was asked
+		if self.covering.asked {
+			self.covering.reached.push(placed);
+		}
 
 		let blended = blend == Blend::Alpha;
 		let entry = Sorted {
@@ -2855,6 +3066,78 @@ impl Scene {
 				skinned,
 				blend: entry.blend,
 			}),
+		}
+
+		if into.is_none() && self.covering.asked {
+			self.lay_down_reach(entry, mesh);
+		}
+	}
+
+	/// The test's record of one placement of the picture's lists, laid down in
+	/// the same order as the placement.
+	///
+	/// Its batch is the last one of its list, which is the one [`place`]
+	/// (Self::place) has just put it in; the blended batches' commands come
+	/// after the solid ones', because the solid list is laid out first.
+	///
+	/// @param entry - what was placed
+	/// @param mesh - its uploaded geometry's slot
+	fn lay_down_reach(&mut self, entry: Sorted, mesh: usize) {
+		let (list, before) = if entry.blend == Blend::Alpha {
+			(&self.blended, self.batches.len())
+		} else {
+			(&self.batches, 0)
+		};
+		let (Some(batch), Some(placed)) = (
+			list.last(),
+			usize::try_from(entry.at)
+				.ok()
+				.and_then(|at| self.covering.reached.get(at)),
+		) else {
+			return;
+		};
+		let number = u32::try_from(before + list.len() - 1).unwrap_or(u32::MAX);
+		let triangles = self
+			.meshes
+			.get(mesh)
+			.map_or(0, |uploaded| uploaded.index_count / 3);
+
+		self.covering
+			.reaches
+			.push(Reach::of(placed, number, batch.first, triangles));
+	}
+
+	/// What the grouping laid out for the test, handed to it: this frame's
+	/// matrix, and in a frame that asks, one command a batch and every thing's
+	/// record.
+	///
+	/// @param projection - the matrix this frame's picture is drawn through
+	fn hand_over_to_cover(&mut self, projection: Mat4) {
+		self.covering.projection = projection;
+
+		if !self.covering.asked {
+			return;
+		}
+
+		self.lay_out_commands();
+		self.covering
+			.cover
+			.upload(&self.queue, &self.covering.reaches, &self.covering.commands);
+	}
+
+	/// One command a batch of the picture's lists, the solid list first: its
+	/// mesh's index count and nothing else, every instance count at nought
+	/// until the test counts what it kept. @ref [`cover`].
+	fn lay_out_commands(&mut self) {
+		for batch in self.batches.iter().chain(&self.blended) {
+			let indices = self
+				.meshes
+				.get(batch.mesh)
+				.map_or(0, |uploaded| uploaded.index_count);
+
+			self.covering
+				.commands
+				.extend_from_slice(&[indices, 0, 0, 0, 0]);
 		}
 	}
 }
@@ -3464,9 +3747,34 @@ fn placements(device: &Device) -> Result<Buffer> {
 	Ok(device.create_buffer(&BufferDescriptor {
 		label: Some("placements"),
 		size: size_bytes::<Placement>(MAX_ENTITIES * LISTS)?,
-		usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+		// read as storage too, by the copy of what the test for what is behind
+		// something nearer kept. @ref [`cover`].
+		usage: BufferUsages::VERTEX | BufferUsages::COPY_DST | BufferUsages::STORAGE,
 		mapped_at_creation: false,
 	}))
+}
+
+/// What the test for what is behind something nearer starts from: nothing
+/// built, and the lists empty.
+///
+/// @param gpu - the device, and whether its adapter can run a compute pass and
+/// draw from an indirect command at all
+/// @param size - the picture's size
+fn covering(gpu: &Gpu, size: (u32, u32)) -> Result<Covering> {
+	let able = gpu
+		.adapter()
+		.get_downlevel_capabilities()
+		.flags
+		.contains(DownlevelFlags::COMPUTE_SHADERS | DownlevelFlags::INDIRECT_EXECUTION);
+
+	Ok(Covering {
+		cover: Cover::new(gpu.device(), able, size_bytes::<Placement>(1)?, size)?,
+		asked: false,
+		reached: Vec::with_capacity(MAX_ENTITIES),
+		reaches: Vec::with_capacity(MAX_ENTITIES),
+		commands: Vec::new(),
+		projection: Mat4::IDENTITY,
+	})
 }
 
 /// The size in bytes of `count` values of `T`, as a buffer size.

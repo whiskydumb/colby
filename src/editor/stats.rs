@@ -123,8 +123,9 @@ fn bounded(held: usize, refused: u32, what: &str) -> String {
 ///
 /// @param drawn - the last frame's counts
 /// @return the entities the picture drew out of those with a mesh, how many
-/// times the shadow cascades drew one, how many were hidden when any were, and
-/// how many decals it painted with when it painted any
+/// times the shadow cascades drew one, how many were hidden when any were, how
+/// many were behind something nearer when the frame is measured and any were,
+/// and how many decals it painted with when it painted any
 fn seen(drawn: Drawn) -> String {
 	let seen = format!("{} of {}, {} into the shadows", drawn.seen, drawn.meshes, drawn.cast);
 
@@ -133,6 +134,13 @@ fn seen(drawn: Drawn) -> String {
 	let seen = match drawn.hidden {
 		| 0 => seen,
 		| hidden => format!("{seen}, {hidden} hidden"),
+	};
+
+	// and what was behind something nearer on the same terms, which is only
+	// known while the frame is measured
+	let seen = match drawn.covered {
+		| 0 => seen,
+		| covered => format!("{seen}, {covered} behind"),
 	};
 
 	// and the decals on the same terms: a world that paints nothing reads as
@@ -174,6 +182,16 @@ mod tests {
 			seen(Drawn { decals: 3, ..drawn }),
 			"277 of 1000, 1303 into the shadows, 3 decals",
 			"and how many decals it painted with, when it painted any"
+		);
+		assert_eq!(
+			seen(Drawn {
+				covered: 64,
+				hidden: 12,
+				decals: 3,
+				..drawn
+			}),
+			"277 of 1000, 1303 into the shadows, 12 hidden, 64 behind, 3 decals",
+			"and how many were behind something nearer, when the frame is measured and any were"
 		);
 	}
 

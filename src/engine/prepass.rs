@@ -668,7 +668,7 @@ mod tests {
 	};
 
 	use super::*;
-	use crate::{Capture, depth, occlusion, reflection, scene::MSAA};
+	use crate::{Capture, cover, depth, occlusion, reflection, scene::MSAA};
 
 	/// How big every capture here is.
 	const SIZE: (u32, u32) = (320, 240);
@@ -734,6 +734,13 @@ mod tests {
 			.cvars
 			.var(reflection::STRENGTH, Value::Float(reflection::DEFAULT_STRENGTH), "");
 		world.cvars.set(reflection::STRENGTH, "0");
+		// and nothing left out for being behind something nearer: that is one
+		// pass more wherever the pass before the scene runs, and these tests
+		// count passes
+		world
+			.cvars
+			.var(cover::ENABLED, Value::Bool(true), "");
+		world.cvars.set(cover::ENABLED, "false");
 	}
 
 	/// A camera eight units back from the origin and looking at it.

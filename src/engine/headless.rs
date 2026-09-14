@@ -211,6 +211,31 @@ mod tests {
 	}
 
 	#[test]
+	fn and_leaves_out_what_is_behind_something_nearer_at_one_sample_and_at_four() {
+		// the one compute pass, its six pipelines against a shader of its own, and
+		// the scene's lists drawn through what it kept - all recorded in a frame
+		// the pass before the scene runs in, which with the defaults is every one
+		let Some(gpu) = headless() else {
+			return;
+		};
+		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = everything();
+
+		for samples in ["1", "4", "1"] {
+			tuned(&mut world, samples);
+
+			capture
+				.shoot(&mut world)
+				.expect("a frame leaving out what is behind renders");
+
+			assert!(
+				capture.scene_mut().cover_state().built(),
+				"at {samples} samples the test's pipelines were built and validated"
+			);
+		}
+	}
+
+	#[test]
 	fn and_draws_the_depth_instead_at_one_sample_and_at_four() {
 		// the view's pipeline and its bind group, and at four samples the pass
 		// that resolves the depth, are only recorded in a frame that asks for

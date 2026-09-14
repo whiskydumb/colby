@@ -646,6 +646,15 @@ fn install_render(world: &mut World) {
 		Value::Bool(true),
 		"leave out of a frame what its view and its shadows cannot reach",
 	);
+	// what is wholly behind what the pass before the scene drew is left out of
+	// the scene's own pass: on and not saved, the frustum test's terms, and for
+	// its reason - off is how what it saves is measured and how the picture is
+	// shown not to depend on it.
+	world.cvars.var(
+		colby_engine::cover::ENABLED,
+		Value::Bool(true),
+		"leave out of the picture what is wholly behind something nearer",
+	);
 	// how many point and cone lights one frame may carry. A ceiling rather
 	// than a switch: the array is the frame's whole budget for them, so the
 	// number a machine can afford is the thing worth being able to say.
@@ -1437,6 +1446,7 @@ mod tests {
 			Value::Float(colby_engine::shadow::DEFAULT_LOCAL_LAMPS),
 		),
 		(colby_engine::cull::ENABLED, Value::Bool(true)),
+		(colby_engine::cover::ENABLED, Value::Bool(true)),
 		(colby_engine::depth::VIEW, Value::Float(colby_engine::depth::NO_VIEW)),
 		(colby_engine::prepass::VIEW, Value::Float(colby_engine::prepass::NO_VIEW)),
 		(
