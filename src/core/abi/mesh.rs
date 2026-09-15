@@ -111,6 +111,35 @@ impl MeshVertex {
 	}
 }
 
+/// How many coarser levels a mesh may carry beside itself.
+///
+/// Seven, so a mesh has eight ways of being drawn in all. A chain that halves
+/// its triangles at every level is under one percent of them by the seventh,
+/// and what is worth drawing with fewer than that is a few pixels across.
+pub const MAX_LEVELS: usize = 7;
+
+/// A coarser way to draw a mesh: fewer of its own triangles, over the same
+/// vertices.
+///
+/// Only indices, because what makes a level is which triangles are drawn. The
+/// vertices a coarser level keeps are vertices the mesh already has, so their
+/// normals, tangents and bone weights are the ones the mesh was made with, and
+/// one vertex buffer serves every level. @ref [`MeshData::levels`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Level {
+	/// Three indices per triangle, each addressing the mesh's own vertices.
+	pub indices: Vec<u32>,
+
+	/// How far this level may stand from the mesh itself, in the mesh's own
+	/// units.
+	///
+	/// What decides where a level may be drawn: from far enough away that this
+	/// covers less than a pixel, the level and the mesh are the same picture.
+	/// It is an estimate that counts a turned normal as well as a moved
+	/// position, so it errs towards drawing the finer level.
+	pub error: f32,
+}
+
 /// How many bones may move one vertex.
 ///
 /// Four, which is what the exchange format allows in one set and what every
@@ -221,6 +250,17 @@ pub struct MeshData {
 	/// is no such thing as a partly skinned mesh, because the vertex a shader
 	/// reads has to be one shape or the other. @ref [`Self::skin_fits`].
 	pub skin: Vec<SkinVertex>,
+
+	/// Coarser ways to draw it, the finest first, or empty for a mesh that is
+	/// only ever drawn whole.
+	///
+	/// [`indices`](Self::indices) stays the mesh itself, and it is what
+	/// everything but a picture reads: a collision mesh, a walkable surface, a
+	/// bake and a thumbnail are all made of the whole mesh. Each level draws
+	/// fewer triangles than the one before it and stands no nearer to the mesh
+	/// than that one did. @ref [`Level`], [`Self::levels_are_in_range`] and
+	/// [`Self::levels_thin_out`].
+	pub levels: Vec<Level>,
 }
 
 impl MeshData {
@@ -298,6 +338,46 @@ impl MeshData {
 		self.skin
 			.iter()
 			.all(|vertex| vertex.bones_below(bones))
+	}
+
+	/// Whether every level is whole triangles over vertices that exist, and
+	/// there are no more levels than a mesh may carry.
+	///
+	/// Checked where geometry enters the process, for
+	/// [`indices_are_in_range`](Self::indices_are_in_range)'s reason: a level
+	/// is drawn by the same hardware, which reads whatever an index points at.
+	#[must_use]
+	pub fn levels_are_in_range(&self) -> bool {
+		let count = u32::try_from(self.vertices.len()).unwrap_or(0);
+
+		self.levels.len() <= MAX_LEVELS
+			&& self.levels.iter().all(|level| {
+				!level.indices.is_empty()
+					&& level.indices.len().is_multiple_of(3)
+					&& level.indices.iter().all(|index| *index < count)
+			})
+	}
+
+	/// Whether each level draws fewer triangles than the one before it and
+	/// stands no nearer to the mesh.
+	///
+	/// The order is what makes a choice among them a walk: the coarsest level
+	/// close enough is found by going down the list until one is too far, and a
+	/// list that thickened or came nearer on the way down would be walked past
+	/// the level that should have been drawn. The mesh itself is the level
+	/// before the first, drawing all of its triangles from no distance at all.
+	#[must_use]
+	pub fn levels_thin_out(&self) -> bool {
+		let mut before = (self.indices.len(), 0.0_f32);
+
+		self.levels.iter().all(|level| {
+			let thinner = level.indices.len() < before.0;
+			let further = level.error.is_finite() && level.error >= before.1;
+
+			before = (level.indices.len(), level.error);
+
+			thinner && further
+		})
 	}
 }
 
@@ -523,6 +603,7 @@ pub fn cube() -> MeshData {
 		vertices: Vec::with_capacity(CUBE_FACES.len() * FACE_CORNERS.len()),
 		indices: Vec::with_capacity(CUBE_FACES.len() * 6),
 		skin: Vec::new(),
+		levels: Vec::new(),
 	};
 
 	for (normal, right, up) in CUBE_FACES {
@@ -558,6 +639,7 @@ pub fn sphere() -> MeshData {
 		vertices: Vec::with_capacity((SPHERE_RINGS + 1) * (SPHERE_SEGMENTS + 1)),
 		indices: Vec::with_capacity(SPHERE_RINGS * SPHERE_SEGMENTS * 6),
 		skin: Vec::new(),
+		levels: Vec::new(),
 	};
 
 	let rings = fraction(SPHERE_RINGS);
@@ -663,6 +745,7 @@ mod tests {
 				.collect(),
 			indices: (0..u32::try_from(corners.len()).expect("the fixture is small")).collect(),
 			skin: Vec::new(),
+			levels: Vec::new(),
 		}
 	}
 
@@ -761,6 +844,7 @@ mod tests {
 			],
 			indices: vec![0, 1, 2, 0, 3, 4],
 			skin: Vec::new(),
+			levels: Vec::new(),
 		};
 
 		tangents(&mut mesh);
@@ -1204,5 +1288,92 @@ mod tests {
 		assert!(mesh.bones_are_in_range(4), "bone three is there in a skeleton of four");
 		assert!(!mesh.bones_are_in_range(3), "and is not in a skeleton of three");
 		assert!(quad().bones_are_in_range(0), "a mesh with no skin names no bones");
+	}
+
+	/// The cube with two coarser ways to draw it: ten of its triangles, then
+	/// four.
+	fn thinned() -> MeshData {
+		let mut mesh = cube();
+
+		mesh.levels = vec![
+			Level {
+				indices: mesh.indices[..30].to_vec(),
+				error: 0.1,
+			},
+			Level {
+				indices: mesh.indices[..12].to_vec(),
+				error: 0.25,
+			},
+		];
+
+		mesh
+	}
+
+	#[test]
+	fn a_level_is_whole_triangles_over_the_meshes_own_vertices() {
+		assert!(thinned().levels_are_in_range(), "two levels of the cube's own triangles");
+		assert!(cube().levels_are_in_range(), "and a mesh with none at all");
+
+		let mut past = thinned();
+		past.levels[1].indices[0] = 24;
+
+		assert!(!past.levels_are_in_range(), "an index one past the last vertex");
+
+		let mut partial = thinned();
+		partial.levels[0].indices.pop();
+
+		assert!(!partial.levels_are_in_range(), "a level that is not whole triangles");
+
+		let mut empty = thinned();
+		empty.levels[1].indices.clear();
+
+		assert!(!empty.levels_are_in_range(), "a level that draws nothing is not a level");
+
+		let mut many = cube();
+		many.levels = vec![Level { indices: vec![0, 1, 2], error: 0.0 }; MAX_LEVELS + 1];
+
+		assert!(!many.levels_are_in_range(), "more levels than a mesh may carry");
+
+		many.levels.pop();
+
+		assert!(many.levels_are_in_range(), "and as many as it may");
+	}
+
+	#[test]
+	fn each_level_draws_fewer_triangles_than_the_one_before_and_stands_no_nearer() {
+		assert!(thinned().levels_thin_out(), "ten triangles, then four, further each time");
+		assert!(cube().levels_thin_out(), "and a mesh with no levels thins out trivially");
+
+		let mut whole = thinned();
+		whole.levels[0].indices = whole.indices.clone();
+
+		assert!(!whole.levels_thin_out(), "a first level as thick as the mesh itself");
+
+		let mut thicker = thinned();
+		thicker.levels[1].indices = thicker.levels[0].indices.clone();
+
+		assert!(!thicker.levels_thin_out(), "a second level as thick as the first");
+
+		let mut nearer = thinned();
+		nearer.levels[1].error = 0.05;
+
+		assert!(!nearer.levels_thin_out(), "a coarser level nearer the mesh than a finer one");
+
+		let mut inside = thinned();
+		inside.levels[0].error = -0.1;
+
+		assert!(!inside.levels_thin_out(), "a level nearer the mesh than the mesh itself");
+
+		for lost in [f32::NAN, f32::INFINITY] {
+			let mut broken = thinned();
+			broken.levels[1].error = lost;
+
+			assert!(!broken.levels_thin_out(), "an error of {lost}");
+		}
+
+		let mut even = thinned();
+		even.levels[1].error = even.levels[0].error;
+
+		assert!(even.levels_thin_out(), "while two levels as far as each other are allowed");
 	}
 }

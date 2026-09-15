@@ -210,12 +210,12 @@ fn print(options: &Options, report: &Report) {
 /// One line about what an asset turned out to be.
 fn describe(produced: Produced) -> String {
 	match produced {
-		| Produced::Mesh { vertices, triangles, bounds } => {
+		| Produced::Mesh { vertices, triangles, bounds, levels } => {
 			let corner =
 				|corner: Vec3| format!("({:.2}, {:.2}, {:.2})", corner.x, corner.y, corner.z);
 
 			format!(
-				"{triangles:>6} tris {vertices:>6} verts   {} .. {}",
+				"{triangles:>6} tris {vertices:>6} verts {levels} levels   {} .. {}",
 				corner(bounds.0),
 				corner(bounds.1)
 			)

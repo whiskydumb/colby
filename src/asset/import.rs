@@ -39,18 +39,26 @@
 //!   `DefaultMaterialGroup.remaps { from, to }`, and it is how a `.material`
 //!   from step 5e gets worn without a gesture in the editor.
 //!
-//! **A `.obj` takes one of the three.** It compiles to a `.cmesh`, which is
+//! **And a fourth, how coarsely a mesh may be drawn from far away**, as the
+//! most coarser levels each mesh of the file is compiled with. Having none is
+//! the ordinary case here too: every mesh is compiled with as many levels as it
+//! thins out to, @ref [`crate::simplify`], and the key is for the file that
+//! wants fewer, or none - `"levels": 0` is a mesh that is only ever drawn
+//! whole.
+//!
+//! **A `.obj` takes two of the four.** It compiles to a `.cmesh`, which is
 //! one mesh with no names and no materials in it, so a sidecar beside one that
 //! says `skip` or `materials` is refused rather than half-obeyed. The
 //! transform is meaningful and is the one knob an OBJ most wants, the format
 //! carrying no unit at all: Unreal runs `.obj` through the same Interchange
-//! pipeline as everything else and hands it the same three offsets.
+//! pipeline as everything else and hands it the same three offsets. The levels
+//! mean what they mean for any other mesh.
 //!
-//! **Not here, and each for a reason**: LODs and attachment points, which
-//! nothing in this engine has; a physics shape, which a `.cmodel` has nowhere
-//! to put; clip trimming, which is a card of its own; and renaming a bone,
-//! which s&box does 288 times in its tree and Unreal does not do at import at
-//! all - it retargets afterwards, with an asset.
+//! **Not here, and each for a reason**: attachment points, which nothing in
+//! this engine has; a physics shape, which a `.cmodel` has nowhere to put; clip
+//! trimming, which is a card of its own; and renaming a bone, which s&box does
+//! 288 times in its tree and Unreal does not do at import at all - it retargets
+//! afterwards, with an asset.
 //!
 //! **Having none is the ordinary case**, and that is a deliberate difference
 //! from all three references: s&box's `.vmdl` *is* the asset, Unreal keeps the
@@ -63,7 +71,12 @@
 
 use std::path::{Path, PathBuf};
 
-use colby_core::{Result, abi::Transform, err, glam::Mat4};
+use colby_core::{
+	Result,
+	abi::{MAX_LEVELS, Transform},
+	err,
+	glam::Mat4,
+};
 
 use crate::{
 	json::Value,
@@ -80,8 +93,9 @@ pub const EXTENSION: &str = "model";
 /// arithmetic as a node folded under its parent.
 const SQUARE_ENOUGH: f32 = 1e-4;
 
-/// The two keys a table describes and cannot spell.
-const REFERENCES: [&str; 2] = ["skip", "materials"];
+/// The keys read by hand beside the transform's table: two lists of names and
+/// a count.
+const HAND: [&str; 3] = ["skip", "materials", "levels"];
 
 /// What a sidecar says.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -95,6 +109,10 @@ pub struct Import {
 	/// What each of the file's own materials is really made of: the name the
 	/// file gave it, and the asset name to wear instead.
 	pub materials: Vec<(String, String)>,
+
+	/// The most coarser levels each mesh is compiled with, or nothing for as
+	/// many as it thins out to. @ref [`Import::levels`].
+	pub levels: Option<usize>,
 }
 
 impl Import {
@@ -103,7 +121,16 @@ impl Import {
 		transform: Transform::IDENTITY,
 		skip: Vec::new(),
 		materials: Vec::new(),
+		levels: None,
 	};
+
+	/// How many coarser levels a mesh of this source may be compiled with.
+	///
+	/// [`MAX_LEVELS`] when the sidecar does not say, which is what a source
+	/// with no sidecar gets too; a mesh stops short of it wherever it stops
+	/// thinning out.
+	#[must_use]
+	pub fn levels(&self) -> usize { self.levels.unwrap_or(MAX_LEVELS).min(MAX_LEVELS) }
 
 	/// Whether this one says anything at all.
 	///
@@ -228,9 +255,9 @@ pub fn read_beside(source: &Path) -> Result<Option<Import>> {
 /// @param text - the whole file
 pub fn import(text: &str) -> Result<Import> {
 	let root = crate::json::parse(text)?;
-	let table = names(Transform::FIELDS, &REFERENCES);
+	let table = names(Transform::FIELDS, &HAND);
 
-	check(&root, &[table], &REFERENCES, "an import")?;
+	check(&root, &[table], &HAND, "an import")?;
 
 	let mut transform = Transform::IDENTITY;
 
@@ -247,6 +274,7 @@ pub fn import(text: &str) -> Result<Import> {
 		transform,
 		skip: skipped(&root)?,
 		materials: remapped(&root)?,
+		levels: counted(&root)?,
 	})
 }
 
@@ -288,6 +316,10 @@ pub fn export(sidecar: &Import) -> Result<String> {
 			.collect();
 
 		rows.put("materials", format!("{{ {} }}", pairs.join(", ")));
+	}
+
+	if let Some(levels) = sidecar.levels {
+		rows.put("levels", levels.to_string());
 	}
 
 	Ok(rows.text())
@@ -343,6 +375,28 @@ fn skipped(root: &Value) -> Result<Vec<String>> {
 		.collect()
 }
 
+/// The most coarser levels a mesh is compiled with, when the sidecar says.
+///
+/// A whole number up to [`MAX_LEVELS`], refused otherwise rather than clamped:
+/// a count of twelve is somebody expecting twelve, and a mesh carrying seven is
+/// not what they were told.
+fn counted(root: &Value) -> Result<Option<usize>> {
+	let Some(value) = root.get("levels") else {
+		return Ok(None);
+	};
+
+	value
+		.as_usize()
+		.filter(|levels| *levels <= MAX_LEVELS)
+		.map(Some)
+		.ok_or_else(|| {
+			err!(Asset(
+				"an import's levels is how many coarser levels a mesh is compiled with, a whole \
+				 number from 0 to {MAX_LEVELS}"
+			))
+		})
+}
+
 /// What each of the file's materials is really made of.
 fn remapped(root: &Value) -> Result<Vec<(String, String)>> {
 	let Some(value) = root.get("materials") else {
@@ -385,6 +439,7 @@ mod tests {
 			},
 			skip: vec!["collision_proxy".to_owned(), "helper".to_owned()],
 			materials: vec![("brass".to_owned(), "materials/brass".to_owned())],
+			levels: Some(3),
 		}
 	}
 
@@ -411,6 +466,7 @@ mod tests {
 
 		assert_eq!(read.skip, sample().skip, "the list, in order: {text}");
 		assert_eq!(read.materials, sample().materials, "and the map: {text}");
+		assert_eq!(read.levels, Some(3), "and the count: {text}");
 		assert!(
 			read.transform
 				.position
@@ -481,6 +537,56 @@ mod tests {
 				.skip,
 			vec!["helper".to_owned()]
 		);
+	}
+
+	#[test]
+	fn a_mesh_is_compiled_with_every_level_it_thins_out_to_unless_the_sidecar_says_fewer() {
+		assert_eq!(Import::NONE.levels(), MAX_LEVELS, "no sidecar is as many as there are");
+		assert_eq!(
+			import("{}").expect("an empty sidecar").levels(),
+			MAX_LEVELS,
+			"and so is one that does not say"
+		);
+		assert_eq!(
+			import(r#"{ "levels": 0 }"#)
+				.expect("none at all")
+				.levels(),
+			0,
+			"a mesh only ever drawn whole"
+		);
+		assert_eq!(
+			import(r#"{ "levels": 2 }"#)
+				.expect("two")
+				.levels(),
+			2,
+			"and two is two"
+		);
+		assert_eq!(
+			import(&format!(r#"{{ "levels": {MAX_LEVELS} }}"#))
+				.expect("as many as a mesh may carry")
+				.levels(),
+			MAX_LEVELS,
+			"the most there may be"
+		);
+		assert!(
+			!import(r#"{ "levels": 0 }"#)
+				.expect("none")
+				.is_silent(),
+			"and it says something"
+		);
+	}
+
+	#[test]
+	fn a_count_of_levels_that_is_not_one_a_mesh_can_have_is_refused() {
+		for wrong in ["8", "2.5", "-1", r#""four""#, "[2]", "true"] {
+			let refused = import(&format!(r#"{{ "levels": {wrong} }}"#))
+				.expect_err("not a count of levels");
+
+			assert!(
+				format!("{refused}").contains("levels"),
+				"{wrong} is refused, naming the key: {refused}"
+			);
+		}
 	}
 
 	#[test]
@@ -569,6 +675,10 @@ mod tests {
 			})
 			.is_ok(),
 			"and so is a transform, which is the one an OBJ most wants"
+		);
+		assert!(
+			check_mesh_only(&Import { levels: Some(0), ..Import::NONE }).is_ok(),
+			"and a count of levels, which one mesh has as much as any"
 		);
 
 		let refused = check_mesh_only(&sample()).expect_err("skip has nothing to act on");

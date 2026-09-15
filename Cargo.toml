@@ -166,6 +166,22 @@ features = ["lua54", "vendored"]
 version = "0.3"
 default-features = false
 
+# @note: the fifth dependency taken for the asset compiler, and the argument is
+# png's again: it works out the coarser levels a mesh is compiled with, which
+# happens when a source is compiled and never on a frame's path. It is bindings
+# to a C++ simplifier built with `cc`, which puts a C++ compiler in `just ci`
+# beside the C one Lua already wants. Measured on this workspace: two lock
+# entries, `meshopt` and `float-cmp`; every other crate it pulls was already
+# here. The alternative was writing the simplifier - an edge collapse over
+# quadrics with attribute weights, locked borders and seams, about three
+# thousand lines of reproducing somebody else's work - and the one pure-Rust
+# port published is a snapshot of an older version without the attribute half.
+# It sits behind one function, `colby_asset::simplify::levels`, and its tests
+# are what a replacement would have to pass. @ref the pre-commit audit list.
+[workspace.dependencies.meshopt]
+version = "0.6"
+default-features = false
+
 [workspace.dependencies.png]
 version = "0.18"
 default-features = false

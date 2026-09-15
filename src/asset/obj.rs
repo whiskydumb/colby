@@ -516,6 +516,7 @@ mod tests {
 			vertices: vec![MeshVertex::new(Vec3::ZERO, Vec3::Y, Vec2::new(0.25, 0.75))],
 			indices: Vec::new(),
 			skin: Vec::new(),
+			levels: Vec::new(),
 		};
 
 		one.vertices.push(one.vertices[0]);
@@ -550,6 +551,7 @@ mod tests {
 			],
 			indices: vec![0, 1, 2],
 			skin: Vec::new(),
+			levels: Vec::new(),
 		};
 		let text = export(&broken);
 

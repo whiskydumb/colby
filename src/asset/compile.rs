@@ -49,7 +49,7 @@ use std::{
 use colby_core::{
 	Error, Result,
 	abi::{
-		Transform,
+		MAX_LEVELS, Transform,
 		mesh::{self, MeshData},
 		texture::Texel,
 	},
@@ -60,7 +60,7 @@ use colby_core::{
 
 use crate::{
 	anim, cube, document, font, format, gltf, html, import, jpeg, level, loc, lua, material,
-	model, obj, png, radiance, scene, script, skeleton, sound,
+	model, obj, png, radiance, scene, script, simplify, skeleton, sound,
 	stamp::{self, Input, Stamps},
 	texture, ttf, wav,
 };
@@ -326,6 +326,9 @@ pub enum Produced {
 
 		/// The low and high corners of its bounding box.
 		bounds: (Vec3, Vec3),
+
+		/// How many coarser levels it was compiled with.
+		levels: usize,
 	},
 
 	/// Pixels.
@@ -762,6 +765,15 @@ fn compile_mesh(source: &Path) -> Result<(Vec<u8>, Produced)> {
 		moved(&mut data, sidecar);
 	}
 
+	// after the move, so a level is thinned from the shape the mesh will have
+	// and its distance is in the units the mesh is drawn in
+	data.levels = simplify::levels(
+		&data,
+		guide
+			.as_ref()
+			.map_or(MAX_LEVELS, import::Import::levels),
+	);
+
 	let bytes = match guide {
 		| Some(_) => format::encode_guided(&data),
 		| None => format::encode(&data),
@@ -771,6 +783,7 @@ fn compile_mesh(source: &Path) -> Result<(Vec<u8>, Produced)> {
 		vertices: data.vertices.len(),
 		triangles: data.triangles(),
 		bounds: data.bounds(),
+		levels: data.levels.len(),
 	};
 
 	Ok((bytes, produced))
@@ -852,7 +865,11 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 			continue;
 		}
 
-		let bytes = format::encode(&piece.data)
+		let data = MeshData {
+			levels: simplify::levels(&piece.data, sidecar.levels()),
+			..piece.data.clone()
+		};
+		let bytes = format::encode(&data)
 			.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 
 		fs::write(beside(&directory, &piece.name, format::EXTENSION), bytes)?;
@@ -1881,8 +1898,9 @@ f 1 2 3 4
 				vertices: 24,
 				triangles: 12,
 				bounds: (Vec3::splat(-0.5), Vec3::splat(0.5)),
+				levels: 0,
 			},
-			"six quads is twelve triangles, four vertices each because the shading is flat"
+			"six quads is twelve triangles, four vertices each because the shading is flat, and 			 nothing to thin out of twelve"
 		);
 
 		let file = MeshFile::open(&compiled.output).expect("the output is a mesh");
@@ -2489,6 +2507,121 @@ FORMAT=32-bit_rle_rgbe
 			"the cube is a unit cube again: {low:?}..{high:?}"
 		);
 		assert_eq!(run(&workspace, false).compiled.len(), 0, "and settles there");
+
+		drop(fs::remove_dir_all(&workspace));
+	}
+
+	/// A ball with bumps on it as OBJ, dense enough to thin out: every corner
+	/// names a position, a texture coordinate and a normal by one index, so the
+	/// importer shares every vertex a smooth surface shares.
+	///
+	/// @param rings - bands of latitude
+	/// @param segments - bands of longitude
+	fn bumpy_obj(rings: u16, segments: u16) -> String {
+		use std::fmt::Write as _;
+
+		let mut lines = [String::new(), String::new(), String::new(), String::new()];
+
+		for ring in 0..=rings {
+			let down = f32::from(ring) / f32::from(rings);
+			let angle = down * core::f32::consts::PI;
+
+			for segment in 0..=segments {
+				let around = f32::from(segment) / f32::from(segments);
+				let turn = around * core::f32::consts::TAU;
+				let way =
+					Vec3::new(angle.sin() * turn.cos(), angle.cos(), angle.sin() * turn.sin());
+				let at = way * (0.08 * (turn * 5.0).sin()).mul_add((angle * 4.0).cos(), 1.0);
+
+				writeln!(lines[0], "v {} {} {}", at.x, at.y, at.z).expect("a string takes it");
+				writeln!(lines[1], "vt {around} {down}").expect("a string takes it");
+				writeln!(lines[2], "vn {} {} {}", way.x, way.y, way.z)
+					.expect("a string takes it");
+			}
+		}
+
+		let stride = u32::from(segments) + 1;
+
+		// counted from one, the way the format counts
+		let corners = (0..u32::from(rings))
+			.flat_map(|ring| {
+				(0..u32::from(segments)).map(move |segment| ring * stride + segment + 1)
+			})
+			.flat_map(|top| {
+				let bottom = top + stride;
+
+				[[top, top + 1, bottom], [top + 1, bottom + 1, bottom]]
+			});
+
+		for [a, b, c] in corners {
+			writeln!(lines[3], "f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}")
+				.expect("a string takes it");
+		}
+
+		lines.concat()
+	}
+
+	#[test]
+	fn a_dense_obj_is_compiled_with_its_levels_and_a_sidecar_can_ask_for_fewer_or_none() {
+		let workspace = workspace("mesh-levels");
+		let text = bumpy_obj(32, 48);
+		let source = put(&workspace, "meshes/ball.obj", &text);
+		let output = output_root(&workspace)
+			.join("meshes")
+			.join("ball.cmesh");
+		let report = run(&workspace, false);
+
+		assert_eq!(report.failed.len(), 0, "{:?}", report.failed);
+
+		let Produced::Mesh { levels, triangles, .. } = report.compiled[0].produced else {
+			panic!("a mesh compiles to a mesh: {:?}", report.compiled[0].produced);
+		};
+		let whole = obj::import(&text).expect("the same text reads");
+		let chain = simplify::levels(&whole, MAX_LEVELS);
+		let read = MeshFile::open(&output)
+			.expect("it reads")
+			.to_mesh_data();
+
+		assert_eq!(triangles, 32 * 48 * 2, "every triangle of the ball in the mesh itself");
+		assert!(levels >= 3, "and a ball of three thousand triangles thins out: {levels}");
+		assert_eq!(read.levels.len(), levels, "the report counts what the file holds");
+		assert_eq!(read.levels, chain, "which is the simplifier's own chain for that text");
+		assert_eq!(read.indices, whole.indices, "while the mesh itself is untouched");
+
+		let sidecar = import::beside(&source);
+
+		fs::write(&sidecar, r#"{ "levels": 2 }"#).expect("the sidecar is written");
+		dated(&sidecar, written(&output) + Duration::from_secs(1));
+		run(&workspace, false);
+
+		let read = MeshFile::open(&output)
+			.expect("it reads")
+			.to_mesh_data();
+
+		assert_eq!(read.levels, chain[..2].to_vec(), "two asked for: the first two of the chain");
+		assert_eq!(format::flags_of(&output), Some(format::GUIDED), "and the mark with them");
+
+		fs::write(&sidecar, r#"{ "levels": 0 }"#).expect("the sidecar is written");
+		dated(&sidecar, written(&output) + Duration::from_secs(1));
+		run(&workspace, false);
+
+		let read = MeshFile::open(&output)
+			.expect("it reads")
+			.to_mesh_data();
+
+		assert!(read.levels.is_empty(), "none asked for, a mesh only ever drawn whole");
+
+		fs::remove_file(&sidecar).expect("and then somebody deletes it");
+		run(&workspace, false);
+
+		assert_eq!(
+			MeshFile::open(&output)
+				.expect("it reads")
+				.to_mesh_data()
+				.levels,
+			chain,
+			"which puts every level back"
+		);
 
 		drop(fs::remove_dir_all(&workspace));
 	}
@@ -3220,6 +3353,142 @@ mod model_tests {
 				.any(|surface| surface.name == "models/lamp/stone"),
 			"while the surface nobody remapped is still the model's own"
 		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	/// A model of one bumpy ball, as a document and the buffer beside it: dense
+	/// enough to thin out, with positions, normals and texture coordinates.
+	///
+	/// @return the document's text and the buffer's bytes
+	fn bumpy_model() -> (String, Vec<u8>) {
+		let (rings, segments) = (32_u16, 48_u16);
+		let (mut positions, mut normals, mut texcoords, mut indices) =
+			(Vec::new(), Vec::new(), Vec::new(), Vec::new());
+		let (mut low, mut high) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+
+		for ring in 0..=rings {
+			let down = f32::from(ring) / f32::from(rings);
+			let angle = down * core::f32::consts::PI;
+
+			for segment in 0..=segments {
+				let around = f32::from(segment) / f32::from(segments);
+				let turn = around * core::f32::consts::TAU;
+				let way =
+					Vec3::new(angle.sin() * turn.cos(), angle.cos(), angle.sin() * turn.sin());
+				let at = way * (0.08 * (turn * 5.0).sin()).mul_add((angle * 4.0).cos(), 1.0);
+
+				(low, high) = (low.min(at), high.max(at));
+				positions.extend(at.to_array());
+				normals.extend(way.to_array());
+				texcoords.extend([around, down]);
+			}
+		}
+
+		let stride = u32::from(segments) + 1;
+
+		for ring in 0..u32::from(rings) {
+			for segment in 0..u32::from(segments) {
+				let top = ring * stride + segment;
+				let bottom = top + stride;
+
+				indices.extend([top, top + 1, bottom, top + 1, bottom + 1, bottom]);
+			}
+		}
+
+		let count = positions.len() / 3;
+		let mut buffer = Vec::new();
+
+		buffer.extend(
+			positions
+				.iter()
+				.flat_map(|value: &f32| value.to_le_bytes()),
+		);
+		buffer.extend(
+			normals
+				.iter()
+				.flat_map(|value: &f32| value.to_le_bytes()),
+		);
+		buffer.extend(
+			texcoords
+				.iter()
+				.flat_map(|value: &f32| value.to_le_bytes()),
+		);
+		buffer.extend(
+			indices
+				.iter()
+				.flat_map(|value: &u32| value.to_le_bytes()),
+		);
+
+		let document = format!(
+			r#"{{ "asset": {{ "version": "2.0" }}, "scene": 0, "scenes": [ {{ "nodes": [0] }} ],
+			"nodes": [ {{ "name": "ball", "mesh": 0 }} ],
+			"meshes": [ {{ "name": "ball", "primitives": [ {{
+				"attributes": {{ "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2 }}, "indices": 3 }} ] }} ],
+			"buffers": [ {{ "uri": "lamp.bin", "byteLength": {bytes} }} ],
+			"bufferViews": [
+				{{ "buffer": 0, "byteOffset": 0, "byteLength": {three} }},
+				{{ "buffer": 0, "byteOffset": {three}, "byteLength": {three} }},
+				{{ "buffer": 0, "byteOffset": {six}, "byteLength": {two} }},
+				{{ "buffer": 0, "byteOffset": {eight}, "byteLength": {index_bytes} }} ],
+			"accessors": [
+				{{ "bufferView": 0, "componentType": 5126, "count": {count}, "type": "VEC3",
+					"min": [{}, {}, {}], "max": [{}, {}, {}] }},
+				{{ "bufferView": 1, "componentType": 5126, "count": {count}, "type": "VEC3" }},
+				{{ "bufferView": 2, "componentType": 5126, "count": {count}, "type": "VEC2" }},
+				{{ "bufferView": 3, "componentType": 5125, "count": {index_count}, "type": "SCALAR" }} ]
+			}}"#,
+			low.x,
+			low.y,
+			low.z,
+			high.x,
+			high.y,
+			high.z,
+			bytes = buffer.len(),
+			three = count * 12,
+			six = count * 24,
+			two = count * 8,
+			eight = count * 32,
+			index_bytes = indices.len() * 4,
+			index_count = indices.len(),
+		);
+
+		(document, buffer)
+	}
+
+	#[test]
+	fn every_piece_of_a_model_is_compiled_with_its_levels_and_the_sidecar_counts_for_it() {
+		let dir = workspace("levels");
+		let (document, buffer) = bumpy_model();
+
+		put(&dir, "models/lamp.gltf", document.as_bytes());
+		put(&dir, "models/lamp.bin", &buffer);
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.failed.len(), 0, "{:?}", report.failed);
+
+		let name = compiled(&dir).placements[0].mesh.clone();
+		let output = at(&output_root(&dir), &name, format::EXTENSION);
+		let read = MeshFile::open(&output)
+			.expect("the ball reads")
+			.to_mesh_data();
+		let whole = MeshData { levels: Vec::new(), ..read.clone() };
+		let chain = simplify::levels(&whole, MAX_LEVELS);
+
+		assert!(read.levels.len() >= 3, "a ball of three thousand triangles thins out");
+		assert_eq!(read.levels, chain, "and the levels are the simplifier's chain for it");
+
+		let sidecar = guide(&dir, "models/lamp.gltf", r#"{ "levels": 1 }"#);
+
+		dated(&sidecar, written(&output) + Duration::from_secs(1));
+		assert_eq!(run(&dir, false).failed.len(), 0, "the sidecar reads");
+
+		let read = MeshFile::open(&output)
+			.expect("the ball reads")
+			.to_mesh_data();
+
+		assert_eq!(read.levels, chain[..1].to_vec(), "one asked for, the first of the chain");
 
 		drop(fs::remove_dir_all(&dir));
 	}

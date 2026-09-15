@@ -48,6 +48,7 @@ pub mod radiance;
 pub mod scene;
 pub mod script;
 pub mod sdf;
+pub mod simplify;
 pub mod skeleton;
 pub mod sound;
 pub mod stamp;
