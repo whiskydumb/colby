@@ -294,13 +294,68 @@ pub(crate) fn transform(world: &World, at: Pick) -> Option<Transform> {
 /// An entity with a body under it is moved through the body, because that is
 /// the call that writes both and says the thing cut rather than traveled. An
 /// entity with no body is written directly and snapped, which is the same
-/// thing without the body half.
+/// thing without the body half. Either way the bodies under everything hanging
+/// off it go with it, @ref [`carry`].
 ///
 /// @param world - the world to write
 /// @param at - what to move
 /// @param transform - where it now is
 /// @return `true` if anything was moved
 pub(crate) fn place(world: &mut World, at: Pick, transform: Transform) -> bool {
+	if !put(world, at, transform) {
+		return false;
+	}
+
+	carry(world, at);
+
+	true
+}
+
+/// Puts every body driving something that hangs off what was moved where that
+/// thing is now drawn.
+///
+/// A body's place is the world's, and the solver writes a dynamic one back into
+/// its entity at every step, so a parent moved without the bodies under it has
+/// what hangs off it pulled back the moment play starts; a static one would
+/// follow only at that step, and a world being edited takes none. Written
+/// straight into each body rather than through a teleport: the entity under it
+/// has not moved in its own terms, only what it hangs off has, and putting its
+/// place back through the parent would round its own numbers for nothing.
+///
+/// @param world - the world to write
+/// @param at - what was moved: an entity, or the body driving one
+fn carry(world: &mut World, at: Pick) {
+	let moved = match at {
+		| Pick::Entity(id) => Some(id),
+		| Pick::Body(id) => drives(world, id),
+		| Pick::Nothing | Pick::Joint(_) | Pick::Material(_) | Pick::Model(_) => None,
+	};
+
+	let Some(moved) = moved else {
+		return;
+	};
+
+	let under: Vec<(BodyId, Transform)> = world
+		.bodies
+		.iter()
+		.filter(|(_, body)| hangs_off(world, body.entity, moved))
+		.filter_map(|(id, body)| {
+			world
+				.entities
+				.placed(body.entity)
+				.map(|placed| (id, placed))
+		})
+		.collect();
+
+	for (id, placed) in under {
+		if let Some(body) = world.bodies.get_mut(id) {
+			body.transform = placed;
+		}
+	}
+}
+
+/// The first half of [`place`]: the thing itself and the body under it.
+fn put(world: &mut World, at: Pick, transform: Transform) -> bool {
 	match at {
 		| Pick::Entity(id) => {
 			if let Some(body) = driver(world, id) {
@@ -757,6 +812,19 @@ fn copy_entities(world: &mut World, sources: &[EntityId]) -> Vec<(EntityId, Enti
 		if let Some(terrain) = world.entities.terrain(source).copied() {
 			world.entities.set_terrain(copy, terrain);
 		}
+
+		// and what it paints, whether it is hidden and whether decals paint it: the
+		// entity's own words, and a copy without them is a copy of part of the
+		// thing. A hidden thing duplicated came back shown, and a decal's copy
+		// painted nothing
+		if let Some(decal) = world.entities.decal(source).copied() {
+			world.entities.set_decal(copy, decal);
+		}
+
+		let hidden = world.entities.hidden(source);
+		world.entities.set_hidden(copy, hidden);
+		let takes = world.entities.takes_decals(source);
+		world.entities.set_takes_decals(copy, takes);
 
 		// and what its records hold, by name, the way a save carries it: the copy
 		// is the same thing to every record the world declares, and to a record
@@ -1242,7 +1310,7 @@ fn ratio(now: f32, before: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{Joint, ShapeKind};
+	use colby_core::abi::{Emitter, Joint, Light, ShapeKind, Terrain};
 
 	use super::*;
 
@@ -1920,6 +1988,214 @@ mod tests {
 		);
 		assert_eq!(world.entities.waiting(copy), &[waits], "and waits for what it waited for");
 		assert_eq!(world.entities.noted(copy), world.entities.noted(car), "every value, by name");
+	}
+
+	#[test]
+	fn a_duplicate_is_described_as_its_original_is_but_for_the_slot_it_took() {
+		// every word an entity carries, each away from its default, and the copy
+		// described beside the original. The description is taken apart field by
+		// field on purpose: a word added to it is a word this test has to be told
+		// about, which is what a hand-written copy needs, since this one carried
+		// no decal, `hidden` or `takes_decals` for as long as those three existed
+		let (mut world, lamp, ..) = peopled();
+		let texture = world
+			.textures
+			.insert("textures/spark", colby_core::abi::TextureData::white());
+
+		world
+			.entities
+			.set_renderable(lamp, Renderable::new(MeshId::CUBE, Vec3::new(0.2, 0.7, 0.9)));
+		world
+			.entities
+			.set_light(lamp, Light::spot(Vec3::new(1.0, 0.9, 0.7), 3.0, 8.0, 0.2, 0.5));
+		world
+			.entities
+			.set_emitter(lamp, Emitter { texture, ..Emitter::cone(12.0, 0.8, 0.3) });
+		world.entities.set_terrain(lamp, Terrain::of(7));
+		world
+			.entities
+			.set_decal(lamp, Decal { fade: 0.25, order: -2, ..Decal::BOX });
+		world.entities.set_hidden(lamp, true);
+		world.entities.set_takes_decals(lamp, false);
+
+		if let Some(drawing) = world
+			.entities
+			.record_mut(&colby_core::abi::DRAWING, lamp)
+		{
+			drawing.covers = 1;
+		}
+
+		let copies = duplicate(&mut world, &[Pick::Entity(lamp)]);
+		let Some(Pick::Entity(copy)) = copies.first().copied() else {
+			panic!("the copy of the lamp");
+		};
+
+		let described = scene::capture(&world);
+		let filed = |id: EntityId| {
+			described
+				.things
+				.iter()
+				.find(|thing| usize::try_from(thing.slot).is_ok_and(|slot| slot == id.slot()))
+				.cloned()
+				.expect("both are described")
+		};
+		let copied = filed(copy);
+		let scene::Thing {
+			name,
+			slot,
+			generation,
+			transform,
+			mesh,
+			material,
+			color,
+			light,
+			emitter,
+			emitter_texture,
+			terrain,
+			decal,
+			pose,
+			parent,
+			hidden,
+			takes_decals,
+			records,
+		} = filed(lamp);
+
+		assert!(
+			light.is_lit()
+				&& emitter.throws()
+				&& !emitter_texture.is_empty()
+				&& terrain.is_ground()
+				&& decal.paints()
+				&& hidden && !takes_decals
+				&& !records.is_empty(),
+			"every word of the original is away from its default, or the comparison proves \
+			 nothing"
+		);
+		assert_ne!(
+			(copied.slot, copied.generation),
+			(slot, generation),
+			"the copy is another thing, filed under a handle of its own"
+		);
+		assert_eq!(
+			copied,
+			scene::Thing {
+				name,
+				slot: copied.slot,
+				generation: copied.generation,
+				transform,
+				mesh,
+				material,
+				color,
+				light,
+				emitter,
+				emitter_texture,
+				terrain,
+				decal,
+				pose,
+				parent,
+				hidden,
+				takes_decals,
+				records,
+			},
+			"the copy is described as the original is"
+		);
+	}
+
+	#[test]
+	fn moving_a_parent_carries_the_bodies_of_everything_hanging_off_it() {
+		// a body's place is the world's, and the solver writes a dynamic one back
+		// into its entity every step: a parent moved without the bodies under it
+		// has what hangs off it pulled back the moment play starts
+		let mut world = World::new();
+		let group = world.entities.spawn_at(Transform::IDENTITY);
+		let crate_ = world.entities.spawn_at(Transform::at(Vec3::X));
+		let lid = world.entities.spawn_at(Transform::at(Vec3::Y));
+		let wall = world.entities.spawn_at(Transform::at(Vec3::Z));
+		let bystander = world
+			.entities
+			.spawn_at(Transform::at(Vec3::NEG_X));
+		assert!(world.entities.set_parent(crate_, group));
+		assert!(world.entities.set_parent(lid, crate_));
+		assert!(world.entities.set_parent(wall, group));
+		let falling = world.attach_body(crate_, BodyKind::Dynamic, Shape::UNIT);
+		let lifted = world.attach_body(lid, BodyKind::Kinematic, Shape::UNIT);
+		let standing = world.attach_body(wall, BodyKind::Static, Shape::UNIT);
+		let left = world.attach_body(bystander, BodyKind::Dynamic, Shape::UNIT);
+		// and away from its entity, the write a game makes when it moves a body
+		// without telling the entity: a body under nothing that moved is not put
+		// where its entity is either
+		if let Some(held) = world.bodies.get_mut(left) {
+			held.transform.position = Vec3::new(-1.0, 5.0, 0.0);
+		}
+		let put = Transform {
+			position: Vec3::new(5.0, 0.0, 0.0),
+			rotation: colby_core::glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+			scale: Vec3::ONE,
+		};
+
+		assert!(place(&mut world, Pick::Entity(group), put));
+
+		for (body, entity) in [(falling, crate_), (lifted, lid), (standing, wall)] {
+			let held = world
+				.bodies
+				.get(body)
+				.map(|it| it.transform)
+				.expect("alive");
+			let drawn = world.entities.placed(entity).expect("alive");
+
+			assert!(
+				held.position.abs_diff_eq(drawn.position, 1.0e-5)
+					&& held.rotation.abs_diff_eq(drawn.rotation, 1.0e-5),
+				"a body goes where its entity is drawn, two levels down as well: {held:?} and \
+				 {drawn:?}"
+			);
+		}
+
+		// what the solver does with a dynamic body at the next step
+		let drawn = world.entities.placed(crate_).expect("alive");
+		let held = world
+			.bodies
+			.get(falling)
+			.map(|it| it.transform)
+			.expect("alive");
+		assert!(world.entities.set_placed(crate_, held));
+		assert!(
+			world
+				.entities
+				.placed(crate_)
+				.is_some_and(|it| it.position.abs_diff_eq(drawn.position, 1.0e-5)),
+			"and the crate stays where the parent took it"
+		);
+
+		assert_eq!(
+			world
+				.bodies
+				.get(left)
+				.map(|it| it.transform.position),
+			Some(Vec3::new(-1.0, 5.0, 0.0)),
+			"a body under nothing that moved stays where it was"
+		);
+	}
+
+	#[test]
+	fn moving_the_body_of_a_parent_carries_the_bodies_hanging_off_its_entity() {
+		let mut world = World::new();
+		let car = world.entities.spawn_at(Transform::IDENTITY);
+		let wheel = world.entities.spawn_at(Transform::at(Vec3::X));
+		assert!(world.entities.set_parent(wheel, car));
+		let chassis = world.attach_body(car, BodyKind::Dynamic, Shape::UNIT);
+		let rim = world.attach_body(wheel, BodyKind::Dynamic, Shape::UNIT);
+
+		assert!(place(&mut world, Pick::Body(chassis), Transform::at(Vec3::new(0.0, 0.0, 9.0))));
+
+		assert_eq!(
+			world
+				.bodies
+				.get(rim)
+				.map(|it| it.transform.position),
+			Some(Vec3::new(1.0, 0.0, 9.0)),
+			"the wheel's body went with the car's"
+		);
 	}
 
 	#[test]

@@ -1225,14 +1225,17 @@ fn stepped(context: &Context) -> Vec<Change> {
 	context.input_mut(|input| {
 		let mut changes = Vec::new();
 
-		if input.consume_key(Modifiers::COMMAND, Key::Z) {
-			changes.push(Change::Undo);
-		}
-
-		if input.consume_key(Modifiers::COMMAND, Key::Y)
-			|| input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+		// the chord with a shift in it first: egui matches a key ignoring a shift
+		// the pattern does not name, so an undo asked for first takes the redo
+		// chord for itself
+		if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+			|| input.consume_key(Modifiers::COMMAND, Key::Y)
 		{
 			changes.push(Change::Redo);
+		}
+
+		if input.consume_key(Modifiers::COMMAND, Key::Z) {
+			changes.push(Change::Undo);
 		}
 
 		if input.consume_key(Modifiers::NONE, Key::Delete) {
@@ -1824,6 +1827,53 @@ mod tests {
 				.all(|thing| thing.parent == colby_core::abi::scene::NO_INDEX),
 			"and neither hanging off the other"
 		);
+	}
+
+	#[test]
+	fn ctrl_shift_z_and_ctrl_y_take_a_step_forward_again() {
+		// egui matches a key ignoring a shift the pattern does not name, so the
+		// chord with a shift in it has to be asked for before the one without, or
+		// it is taken for an undo. A probe of the build before this test found
+		// ctrl+shift+z handing back nothing at all
+		let mut world = World::new();
+		world.editing = true;
+		let car = world.entities.spawn_at(Transform::at(Vec3::X));
+		let wheel = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(3.0, 0.0, 0.0)));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Hang { child: wheel, parent: car });
+		frame(&mut panels, &mut world);
+		frame(&mut panels, &mut world);
+
+		for (key, chord) in
+			[(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT), (Key::Y, Modifiers::COMMAND)]
+		{
+			keyed(&mut panels, &mut world, Key::Z, Modifiers::COMMAND);
+			let back = panels
+				.restore
+				.take()
+				.expect("ctrl+z took a step back");
+			colby_core::abi::scene::restore(&mut world, &back).expect("the world takes it");
+			frame(&mut panels, &mut world);
+
+			keyed(&mut panels, &mut world, key, chord);
+			let forward = panels
+				.restore
+				.take()
+				.expect("the chord took a step forward");
+
+			assert!(
+				forward
+					.things
+					.iter()
+					.any(|thing| thing.parent != colby_core::abi::scene::NO_INDEX),
+				"the world after the hang, the wheel hanging off the car"
+			);
+
+			colby_core::abi::scene::restore(&mut world, &forward).expect("the world takes it");
+			frame(&mut panels, &mut world);
+		}
 	}
 
 	#[test]
