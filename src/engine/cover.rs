@@ -43,7 +43,10 @@
 //! things smaller than [`SIZE`] is drawn, into both passes: a thing under
 //! thirty-two pixels across can hide only what is smaller still, and every
 //! world measured left out as many things of the scene's pass with the split
-//! as without it.
+//! as without it. **Many small things can hide a great deal**, a wall of bricks
+//! or a fence of planks, and no size tells those apart from a heap of pebbles:
+//! a thing whose `drawing` record says it covers is drawn ahead of the test
+//! whatever its size, @ref [`Drawing`](colby_core::abi::Drawing).
 //!
 //! **What it leaves in.** Nothing is left out of a shadow map: a thing the eye
 //! cannot see can still throw a shadow the eye can, and taking the hidden
@@ -2487,6 +2490,122 @@ mod tests {
 			);
 			assert_eq!(apart(&split, &ahead), 0, "and the pictures are the same to the bit");
 		}
+	}
+
+	/// Says in a thing's record that it covers what is behind it, whatever its
+	/// size.
+	fn covers(world: &mut World, id: EntityId) {
+		if let Some(drawing) = world
+			.entities
+			.record_mut(&colby_core::abi::DRAWING, id)
+		{
+			drawing.covers = 1;
+		}
+	}
+
+	#[test]
+	fn a_small_thing_whose_record_says_it_covers_is_drawn_ahead_of_the_test_and_hides_what_is_behind()
+	 {
+		// the answer to the price the test above pins: the same two boxes, and the
+		// nearer one's record saying it covers. It is drawn ahead of the test as a
+		// large thing is, so the one behind it is left out of both halves - and
+		// the picture is still the one drawing everything ahead would draw
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = World::new();
+
+		world.camera.position = Vec3::new(0.0, 1.5, 6.0);
+		world.camera.target = Vec3::new(0.0, 1.0, 0.0);
+
+		let floor = world
+			.materials
+			.insert("test/floor", Material::DEFAULT);
+
+		slab(
+			&mut world,
+			floor,
+			(Vec3::new(0.0, -0.5, 0.0), Vec3::new(40.0, 1.0, 40.0)),
+			Vec3::splat(0.35),
+		);
+		let near = cube(&mut world, Vec3::new(0.0, 0.5, -8.0), GREY);
+		slab(
+			&mut world,
+			MaterialId::NONE,
+			(Vec3::new(0.0, 0.321, -10.5), Vec3::splat(0.25)),
+			GREEN,
+		);
+
+		for samples in ["1", "4"] {
+			sampled(&mut world, samples);
+			covering(&mut world, true);
+			sized(&mut world, "32");
+
+			let (split, _) = shot(&mut capture, &mut world);
+
+			covers(&mut world, near);
+
+			let (covered, drawn) = shot(&mut capture, &mut world);
+
+			assert_eq!(
+				(drawn.small, drawn.covered),
+				(1, 1),
+				"at {samples} samples the nearer box is drawn ahead, and the one behind it left \
+				 out"
+			);
+			assert_eq!(
+				capture.scene_mut().draws(),
+				[(2, 0), (0, 1), (0, 3), (0, 0)],
+				"the floor and the box that covers ahead of the test, the one behind after it"
+			);
+
+			sized(&mut world, "0");
+
+			let (ahead, drawn) = shot(&mut capture, &mut world);
+
+			assert_eq!((drawn.small, drawn.covered), (0, 1), "as drawing everything ahead does");
+			assert_eq!(apart(&covered, &ahead), 0, "and the pictures are the same to the bit");
+			assert_eq!(apart(&covered, &split), 0, "as they are with the record saying nothing");
+
+			if let Some(drawing) = world
+				.entities
+				.record_mut(&colby_core::abi::DRAWING, near)
+			{
+				drawing.covers = 0;
+			}
+		}
+	}
+
+	#[test]
+	fn a_pane_of_glass_that_covers_is_drawn_as_glass_is() {
+		// a blended thing never enters the pass before the scene, and a record
+		// saying it covers does not put it there: the pane counts as nothing small
+		// and nothing drawn ahead, the same with the word as without it
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = street(0.8);
+		let glass = world.materials.insert("test/glass", Material {
+			blend: Blend::Alpha,
+			opacity: 0.4,
+			..Material::DEFAULT
+		});
+		let pane = slab(&mut world, glass, (Vec3::new(0.0, 1.0, 2.0), Vec3::splat(0.2)), BLUE);
+
+		sampled(&mut world, "1");
+		covering(&mut world, true);
+		sized(&mut world, "32");
+
+		let (without, drawn) = shot(&mut capture, &mut world);
+		let draws = capture.scene_mut().draws();
+
+		covers(&mut world, pane);
+
+		let (with, counted) = shot(&mut capture, &mut world);
+
+		assert_eq!((drawn.small, counted.small), (0, 0), "glass is never small");
+		assert_eq!(capture.scene_mut().draws(), draws, "and the word draws nothing differently");
+		assert_eq!(apart(&without, &with), 0, "nor anything else");
 	}
 
 	#[test]

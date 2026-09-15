@@ -23,8 +23,9 @@ use std::sync::Arc;
 use colby_core::{
 	Result,
 	abi::{
-		Camera, EntityId, Light, LightKind, MAX_ENTITIES, Material, MeshData, MeshVertex, Meshes,
-		Renderable, SkinVertex, Texel, TextureData, TextureId, Textures, Transform, World,
+		Camera, DRAWING, EntityId, Light, LightKind, MAX_ENTITIES, Material, MeshData,
+		MeshVertex, Meshes, Renderable, SkinVertex, Texel, TextureData, TextureId, Textures,
+		Transform, World,
 		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
 	},
@@ -2984,8 +2985,16 @@ impl Scene {
 		self.covering.reaches.clear();
 		self.covering.commands.clear();
 
+		// one lookup of the record for the whole walk, rather than one a thing:
+		// the question is asked of every thing in view in a frame the test runs
+		let drawing = world.entities.column(&DRAWING);
+
 		for (id, _, renderable) in world.entities.iter() {
-			self.consider(world, sight, id, renderable);
+			let covers = drawing
+				.and_then(|column| column.get(id.slot()))
+				.is_some_and(|drawing| drawing.covers());
+
+			self.consider(world, sight, id, renderable, covers);
 		}
 
 		// a frame whose solid things are all small has nothing ahead of the test
@@ -3072,7 +3081,16 @@ impl Scene {
 	/// @param sight - what this frame can see
 	/// @param id - the entity
 	/// @param renderable - what it draws
-	fn consider(&mut self, world: &World, sight: &Sight, id: EntityId, renderable: &Renderable) {
+	/// @param covers - whether its record says it is drawn ahead of the test
+	/// for what is hidden whatever its size. @ref `colby_core::abi::Drawing`
+	fn consider(
+		&mut self,
+		world: &World,
+		sight: &Sight,
+		id: EntityId,
+		renderable: &Renderable,
+		covers: bool,
+	) {
 		let mesh = renderable.mesh.slot();
 		if mesh == 0 || mesh >= world.meshes.len() {
 			return;
@@ -3150,7 +3168,11 @@ impl Scene {
 		// @note: a thing out of view goes only into the maps' lists, whose
 		// entries carry no size, so a mutation pass that asked it of those too
 		// passed everything. It is here so that they take no distance.
-		let small = seen && !blended && sight.small(&placed);
+		//
+		// and never of a thing that covers: its record says it is one of many
+		// small pieces of something that hides a great deal, which only the
+		// pass ahead of the test puts into the depth the test reads
+		let small = seen && !blended && !covers && sight.small(&placed);
 		let entry = Sorted {
 			pass: u8::from(blended),
 			// worked out only for the half that is sorted on it, as how far
