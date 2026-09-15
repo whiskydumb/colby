@@ -399,6 +399,14 @@ struct Table {
 	/// The most triangles those things' meshes had between them.
 	covered_triangles: usize,
 
+	/// The most things any measured frame drew at a level coarser than their
+	/// mesh. Inside `drawn`. @ref `colby_engine::detail`.
+	lowered: usize,
+
+	/// The most triangles any measured frame's picture held, each thing at
+	/// the level it was drawn at.
+	triangles: usize,
+
 	/// The most lamps any measured frame carried to the shader.
 	lamps: usize,
 
@@ -493,6 +501,8 @@ impl Table {
 			hidden: 0,
 			covered: 0,
 			covered_triangles: 0,
+			lowered: 0,
+			triangles: 0,
 			lamps: 0,
 			decals: 0,
 			passes: None,
@@ -520,6 +530,8 @@ impl Table {
 		self.covered_triangles = self
 			.covered_triangles
 			.max(counts.drawn.covered_triangles);
+		self.lowered = self.lowered.max(counts.drawn.lowered);
+		self.triangles = self.triangles.max(counts.drawn.triangles);
 		self.lamps = self.lamps.max(counts.drawn.lamps);
 		self.decals = self.decals.max(counts.drawn.decals);
 
@@ -600,6 +612,8 @@ impl Table {
 			hidden = self.hidden,
 			covered = self.covered,
 			covered_triangles = self.covered_triangles,
+			lowered = self.lowered,
+			triangles = self.triangles,
 			lamps = self.lamps,
 			decals = self.decals,
 			steady = self.steady,
@@ -959,6 +973,8 @@ mod tests {
 				decals: 5,
 				covered: 6,
 				covered_triangles: 72,
+				lowered: 3,
+				triangles: 4096,
 			},
 		});
 
@@ -986,6 +1002,11 @@ mod tests {
 			(table.covered, table.covered_triangles),
 			(6, 72),
 			"and how much of that was behind something nearer"
+		);
+		assert_eq!(
+			(table.lowered, table.triangles),
+			(3, 4096),
+			"and how much of it was drawn coarser, and in how many triangles"
 		);
 		assert_eq!(
 			table.rows[under + 5].mean(),

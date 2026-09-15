@@ -420,6 +420,16 @@ pub struct Drawn {
 
 	/// The triangles of those things' meshes, added together.
 	pub covered_triangles: usize,
+
+	/// How many of the things the picture's lists held were drawn at a level
+	/// past nought: coarser than their mesh, because it stood far enough away.
+	/// @ref [`detail`](crate::detail).
+	pub lowered: usize,
+
+	/// The triangles the picture's lists hold, each thing at the level it was
+	/// drawn at: what the pass before the scene draws, and what the scene's
+	/// pass draws before what is behind something nearer is left out of it.
+	pub triangles: usize,
 }
 
 #[cfg(test)]

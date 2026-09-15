@@ -655,6 +655,16 @@ fn install_render(world: &mut World) {
 		Value::Bool(true),
 		"leave out of the picture what is wholly behind something nearer",
 	);
+	// how many pixels a coarser level of a mesh may be off before the mesh
+	// itself is drawn instead: one, and not saved, like the tests above and for
+	// their reason - nought draws every mesh whole, which is how what the
+	// levels save is measured and the picture a build from before them took.
+	world.cvars.var(
+		colby_engine::detail::THRESHOLD,
+		Value::Float(colby_engine::detail::DEFAULT_THRESHOLD),
+		"how many pixels a coarser level of a mesh may be off from the mesh: a thing far enough \
+		 away is drawn at the coarsest level within it; nought draws every mesh whole",
+	);
 	// how many point and cone lights one frame may carry. A ceiling rather
 	// than a switch: the array is the frame's whole budget for them, so the
 	// number a machine can afford is the thing worth being able to say.
@@ -1447,6 +1457,10 @@ mod tests {
 		),
 		(colby_engine::cull::ENABLED, Value::Bool(true)),
 		(colby_engine::cover::ENABLED, Value::Bool(true)),
+		(
+			colby_engine::detail::THRESHOLD,
+			Value::Float(colby_engine::detail::DEFAULT_THRESHOLD),
+		),
 		(colby_engine::depth::VIEW, Value::Float(colby_engine::depth::NO_VIEW)),
 		(colby_engine::prepass::VIEW, Value::Float(colby_engine::prepass::NO_VIEW)),
 		(

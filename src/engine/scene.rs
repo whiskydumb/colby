@@ -17,7 +17,7 @@
 //! [`World::render_camera`], which place it between the last two simulated
 //! states. That is the whole of the renderer's part in the fixed timestep.
 
-use core::mem::offset_of;
+use core::{mem::offset_of, ops::Range};
 use std::sync::Arc;
 
 use colby_core::{
@@ -57,6 +57,7 @@ use crate::{
 	cull::{self, Bounds, Drawn, Frustum, Placed},
 	decal::{self, Atlas, Chosen, DECALS, Key, MAX_DECALS, Paint},
 	depth::{self, Depth},
+	detail,
 	env::{self, Environment},
 	focus::{self, Focus},
 	gpu::Gpu,
@@ -407,11 +408,24 @@ struct Placement {
 /// matching, and the next frame re-uploads.
 struct GpuMesh {
 	vertices: Buffer,
+	/// The mesh's own indices, and every coarser level's after them.
 	indices: Buffer,
 	/// The bones and weights, for a mesh that has them.
 	skin: Option<Buffer>,
+	/// How many of [`indices`](Self::indices) are the mesh itself.
 	index_count: u32,
 	revision: u32,
+
+	/// Every coarser level, finest first: where its indices start in the one
+	/// buffer, how many there are, and how far it stands from the mesh.
+	///
+	/// Empty for a mesh drawn only whole. The level a batch draws is found here
+	/// by its number, nought being the mesh itself. @ref [`detail`].
+	levels: Vec<(Range<u32>, f32)>,
+
+	/// How far each of [`levels`](Self::levels) stands from the mesh, apart,
+	/// for the walk that picks one. @ref [`detail::Eye::level`].
+	errors: Vec<f32>,
 
 	/// The box around the mesh, in the shape it was modeled in.
 	///
@@ -432,6 +446,19 @@ struct GpuMesh {
 	/// Worked out at upload beside [`bounds`](Self::bounds), for the same
 	/// reason and from the same walk over the vertices. @ref [`cull::bones`].
 	bones: Vec<Option<Bounds>>,
+}
+
+impl GpuMesh {
+	/// The run of indices one level draws: the mesh itself for nought, and the
+	/// mesh itself for a level it does not have.
+	///
+	/// @param level - nought for the mesh, one for its finest coarser level
+	fn run(&self, level: u8) -> Range<u32> {
+		usize::from(level)
+			.checked_sub(1)
+			.and_then(|at| self.levels.get(at))
+			.map_or(0..self.index_count, |(run, _)| run.clone())
+	}
 }
 
 /// One texture, uploaded, with its whole mip chain.
@@ -521,6 +548,9 @@ struct Sight {
 
 	/// Whether to ask at all. @ref [`cull::ENABLED`].
 	culling: bool,
+
+	/// What every thing's level is asked against. @ref [`detail`].
+	detail: detail::Eye,
 }
 
 /// One entity, in the order it is going to be written into the frame.
@@ -551,6 +581,14 @@ struct Sorted {
 	depth: i32,
 
 	mesh: u32,
+
+	/// Which of its mesh's levels it is drawn at, nought being the mesh itself.
+	///
+	/// In the key between the mesh and the material, so the things drawn at one
+	/// level of one mesh are one batch: a level is a run of the mesh's indices,
+	/// and a batch draws one run. @ref [`detail`].
+	level: u8,
+
 	material: u32,
 
 	/// Its slot decides nothing but the order of two entities a frame could not
@@ -581,8 +619,8 @@ impl Sorted {
 	///
 	/// The mode is not in it and does not have to be: `pass` is a function of
 	/// it and comes first, so the two halves are already apart.
-	const fn key(&self) -> (u8, i32, u32, u32, usize) {
-		(self.pass, self.depth, self.mesh, self.material, self.entity.slot())
+	const fn key(&self) -> (u8, i32, u32, u8, u32, usize) {
+		(self.pass, self.depth, self.mesh, self.level, self.material, self.entity.slot())
 	}
 }
 
@@ -633,9 +671,11 @@ enum Through<'a> {
 	},
 }
 
-/// A run of instances that share both a mesh and a material.
+/// A run of instances that share a mesh, a level of it and a material.
 struct Batch {
 	mesh: usize,
+	/// Which run of the mesh's indices it draws, nought being the mesh itself.
+	level: u8,
 	material: usize,
 	first: u32,
 	count: u32,
@@ -1201,7 +1241,7 @@ impl Scene {
 		self.sampling(world);
 
 		self.timings.open(Work::Upload);
-		self.upload(world);
+		self.upload(world, view);
 		self.timings.close(Work::Upload);
 
 		// from here to the submit, which is what the label means: how long
@@ -1994,7 +2034,7 @@ impl Scene {
 
 			match through {
 				| Through::Instances => pass.draw_indexed(
-					0..mesh.index_count,
+					mesh.run(batch.level),
 					0,
 					batch.first..batch.first + batch.count,
 				),
@@ -2250,7 +2290,7 @@ impl Scene {
 
 			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
 			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
-			pass.draw_indexed(0..mesh.index_count, 0, batch.first..batch.first + batch.count);
+			pass.draw_indexed(mesh.run(batch.level), 0, batch.first..batch.first + batch.count);
 		}
 	}
 
@@ -2381,7 +2421,7 @@ impl Scene {
 		}
 	}
 
-	fn upload(&mut self, world: &World) {
+	fn upload(&mut self, world: &World, view: Option<Viewport>) {
 		self.sync_tables(world);
 
 		// asked for once and used twice on purpose. This is where the frame
@@ -2420,6 +2460,7 @@ impl Scene {
 			faces: [Frustum::of(Mat4::IDENTITY); LOCAL_TILES],
 			maps: 0,
 			culling: world.cvars.bool(cull::ENABLED).unwrap_or(true),
+			detail: self.eye_of(world, &camera, view),
 		};
 		let (lamps, count) = self.lamps(world, &sight);
 		let sight = Sight {
@@ -2509,6 +2550,26 @@ impl Scene {
 		self.queue
 			.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.placements));
 		self.joints.upload(&self.queue);
+	}
+
+	/// What this frame asks every thing's level against. @ref [`detail`].
+	///
+	/// @param world - the world being drawn, for its aspect and the console
+	/// @param camera - the camera the picture is drawn from
+	/// @param view - the rectangle the picture is drawn into, when it is drawn
+	/// into one: a level is a pixel's worth of the picture that is seen, and
+	/// the rest of the target is not it
+	fn eye_of(&self, world: &World, camera: &Camera, view: Option<Viewport>) -> detail::Eye {
+		detail::Eye::new(
+			camera.position,
+			camera.projection(world.aspect),
+			view.and_then(|asked| asked.within(self.size.0, self.size.1))
+				.map_or(self.size.1, |inside| inside.height),
+			world
+				.cvars
+				.float(detail::THRESHOLD)
+				.unwrap_or(detail::DEFAULT_THRESHOLD),
+		)
 	}
 
 	/// This frame's cascades, or none at all with the shadows switched off.
@@ -2764,6 +2825,24 @@ impl Scene {
 		}
 
 		self.drawn.seen = self.order.len();
+		self.drawn.lowered = self
+			.order
+			.iter()
+			.filter(|entry| entry.level > 0)
+			.count();
+		self.drawn.triangles = self
+			.batches
+			.iter()
+			.chain(&self.blended)
+			.map(|batch| {
+				let run = self
+					.meshes
+					.get(batch.mesh)
+					.map_or(0, |uploaded| uploaded.run(batch.level).len());
+
+				run / 3 * usize::try_from(batch.count).unwrap_or(0)
+			})
+			.sum();
 		self.drawn.cast = if sight.cascades.is_none() {
 			0
 		} else if sight.culling {
@@ -2862,6 +2941,10 @@ impl Scene {
 		}
 
 		let blended = blend == Blend::Alpha;
+		// once, here, for every list the thing goes into: the picture, the pass
+		// before it, the test for what is behind something nearer and every map
+		// draw the same surface. @ref [`detail`].
+		let level = self.level_of(sight, &placed, mesh, transform);
 		let entry = Sorted {
 			pass: u8::from(blended),
 			// worked out only for the half that is sorted on it, as how far
@@ -2877,6 +2960,7 @@ impl Scene {
 				0
 			},
 			mesh,
+			level,
 			material,
 			entity: id,
 			blend,
@@ -2891,6 +2975,25 @@ impl Scene {
 		if casts != 0 {
 			self.casters.push(entry);
 		}
+	}
+
+	/// Which of a mesh's levels one thing is drawn at this frame.
+	///
+	/// @param sight - what this frame can see, the eye among it
+	/// @param placed - the thing's box, in the world
+	/// @param mesh - its uploaded geometry's slot
+	/// @param transform - where it is drawn, for its largest size
+	/// @return nought for the mesh itself, one for its finest coarser level
+	fn level_of(&self, sight: &Sight, placed: &Placed, mesh: u32, transform: Transform) -> u8 {
+		let Some(uploaded) = usize::try_from(mesh)
+			.ok()
+			.and_then(|slot| self.meshes.get(slot))
+		else {
+			return 0;
+		};
+		let size = transform.scale.abs().max_element();
+
+		u8::try_from(sight.detail.level(placed, size, &uploaded.errors)).unwrap_or(u8::MAX)
 	}
 
 	/// The box an entity's geometry fills in the world this frame.
@@ -3057,9 +3160,14 @@ impl Scene {
 		self.placements.push(placement);
 
 		match batches.last_mut() {
-			| Some(batch) if batch.mesh == mesh && batch.material == material => batch.count += 1,
+			| Some(batch)
+				if batch.mesh == mesh
+					&& batch.level == entry.level
+					&& batch.material == material =>
+				batch.count += 1,
 			| _ => batches.push(Batch {
 				mesh,
+				level: entry.level,
 				material,
 				first,
 				count: 1,
@@ -3100,7 +3208,8 @@ impl Scene {
 		let triangles = self
 			.meshes
 			.get(mesh)
-			.map_or(0, |uploaded| uploaded.index_count / 3);
+			.map_or(0, |uploaded| uploaded.run(batch.level).len() / 3);
+		let triangles = u32::try_from(triangles).unwrap_or(u32::MAX);
 
 		self.covering
 			.reaches
@@ -3125,19 +3234,20 @@ impl Scene {
 			.upload(&self.queue, &self.covering.reaches, &self.covering.commands);
 	}
 
-	/// One command a batch of the picture's lists, the solid list first: its
-	/// mesh's index count and nothing else, every instance count at nought
-	/// until the test counts what it kept. @ref [`cover`].
+	/// One command a batch of the picture's lists, the solid list first: the
+	/// run of its mesh's indices its level draws - how many, and where the run
+	/// starts - every instance count at nought until the test counts what it
+	/// kept. @ref [`cover`].
 	fn lay_out_commands(&mut self) {
 		for batch in self.batches.iter().chain(&self.blended) {
-			let indices = self
+			let run = self
 				.meshes
 				.get(batch.mesh)
-				.map_or(0, |uploaded| uploaded.index_count);
+				.map_or(0..0, |uploaded| uploaded.run(batch.level));
 
 			self.covering
 				.commands
-				.extend_from_slice(&[indices, 0, 0, 0, 0]);
+				.extend_from_slice(&[run.end - run.start, 0, run.start, 0, 0]);
 		}
 	}
 }
@@ -3514,7 +3624,21 @@ fn normal_scale(scale: Vec3) -> Vec3 {
 }
 
 /// Uploads one mesh's geometry.
+///
+/// The mesh's own indices first and every coarser level's after them, in one
+/// buffer, so a level is a run of it and the draw that picks one binds nothing
+/// new. @ref [`GpuMesh::run`].
 fn upload_mesh(device: &Device, queue: &Queue, data: &MeshData, revision: u32) -> GpuMesh {
+	let mut indices = data.indices.clone();
+	let mut levels = Vec::with_capacity(data.levels.len());
+
+	for level in &data.levels {
+		let first = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+
+		indices.extend_from_slice(&level.indices);
+		levels.push((first..u32::try_from(indices.len()).unwrap_or(u32::MAX), level.error));
+	}
+
 	GpuMesh {
 		vertices: create_buffer(
 			device,
@@ -3527,7 +3651,7 @@ fn upload_mesh(device: &Device, queue: &Queue, data: &MeshData, revision: u32) -
 			device,
 			queue,
 			"mesh indices",
-			bytemuck::cast_slice(&data.indices),
+			bytemuck::cast_slice(&indices),
 			BufferUsages::INDEX,
 		),
 		// nothing at all rather than an empty buffer for a mesh nothing bends,
@@ -3545,6 +3669,8 @@ fn upload_mesh(device: &Device, queue: &Queue, data: &MeshData, revision: u32) -
 		}),
 		index_count: u32::try_from(data.indices.len()).unwrap_or(0),
 		revision,
+		errors: levels.iter().map(|(_, error)| *error).collect(),
+		levels,
 		bounds: Bounds::of(data),
 		bones: cull::bones(data),
 	}

@@ -18,6 +18,7 @@ pub mod cover;
 pub mod cull;
 pub mod decal;
 pub mod depth;
+pub mod detail;
 pub mod env;
 mod focus;
 pub mod gpu;
