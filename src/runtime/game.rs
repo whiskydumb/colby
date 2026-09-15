@@ -19,17 +19,20 @@ use colby_core::{
 
 /// Tidies up after a module's `init`.
 ///
-/// Two things, both of which can only be done once the new build has had its
+/// Three things, all of which can only be done once the new build has had its
 /// say. The world is advanced, because a module swap is a discontinuity
 /// whatever the game does about it - `init` may have rebuilt the scene, moved
 /// the camera or spawned everything from scratch, and none of that is movement.
-/// And the console table is swept, which drops the variables the *previous*
-/// build registered and this one did not: renamed, or gone.
+/// The console table is swept, which drops the variables the *previous* build
+/// registered and this one did not: renamed, or gone. And so are the records:
+/// one the new build did not declare again goes, and what it held waits by name
+/// for a build that brings it back. @ref `colby_core::abi::record`.
 ///
 /// @param world - the state the module was just initialized against
 fn settle(world: &mut World) {
 	world.advance();
 	world.cvars.sweep();
+	world.entities.records_mut().sweep();
 }
 
 /// The loaded game, or the absence of one.
@@ -158,8 +161,13 @@ impl Game {
 		// that includes anything it registers later from `update`. The mode
 		// stays set for as long as a module is loaded, because a command
 		// attributed to the engine by mistake would outlive the code it points
-		// at. @ref `Cvars::forget_module`.
+		// at. @ref `Cvars::forget_module`. A record the module declares is its
+		// too, for the sweep that follows its next reload.
 		world.cvars.attribute(Owner::Module);
+		world
+			.entities
+			.records_mut()
+			.attribute(Owner::Module);
 
 		info!(module = self.name, reloads = world.reloads, "game module swapped in");
 		self.call("init", api.init, world);
@@ -179,6 +187,17 @@ impl Game {
 		// about to be freed, and one left in the table is a jump into nothing
 		// the next time somebody types its name.
 		world.cvars.forget_module();
+		// and its records are marked, which drops nothing: a record holds no
+		// pointer into the image, only values, and the next build declaring it
+		// again keeps them. @ref `Records::forget_module`.
+		//
+		// @note: no test reaches this line - a swap needs a built module, and the
+		// tests mark the records themselves - so a mutation that took it out is
+		// caught by nothing. What it would break is plain: the next build could
+		// not declare a record with other fields (it would be declared twice
+		// within one build), and a record it did not declare would never be
+		// swept. A live run across reloads is what checks it.
+		world.entities.records_mut().forget_module();
 
 		// dropping the module unloads it and runs the canary check.
 		drop(self.module.take());
@@ -229,6 +248,10 @@ impl Game {
 		// Nothing is ever unloaded here, so this only decides what `help` says
 		// about who owns what.
 		world.cvars.attribute(Owner::Module);
+		world
+			.entities
+			.records_mut()
+			.attribute(Owner::Module);
 
 		info!("game linked in statically");
 		self.call("init", api.init, world);
@@ -242,5 +265,64 @@ impl Game {
 		if let Some(api) = self.api.take() {
 			self.call("shutdown", api.shutdown, world);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use colby_core::{
+		abi::{Record, World, cvar::Owner},
+		bytemuck::{Pod, Zeroable},
+	};
+
+	use super::settle;
+
+	/// A record a game keeps, for the one question a swap asks of records.
+	#[repr(C)]
+	#[derive(Clone, Copy, Pod, Zeroable)]
+	#[bytemuck(crate = "::colby_core::bytemuck")]
+	struct Door {
+		speed: f32,
+	}
+
+	/// The door as a game declares it.
+	const DOOR: Record<Door> = Record {
+		name: "door",
+		help: "a thing that swings",
+		rows: &[colby_core::row!(Float, Door, speed, "how fast")],
+		default: Door { speed: 1.0 },
+	};
+
+	#[test]
+	fn a_record_the_new_build_did_not_declare_is_swept_once_it_has_had_its_say() {
+		// what the swap does around a module's init, without a module: the old
+		// build's records are marked as it goes, the new build declares what it
+		// declares, and what it did not goes - kept by name, waiting
+		let mut world = World::new();
+		let id = world.entities.spawn();
+
+		world
+			.entities
+			.records_mut()
+			.attribute(Owner::Module);
+		world
+			.entities
+			.declare(&DOOR)
+			.expect("a door is a record a world holds");
+
+		if let Some(door) = world.entities.record_mut(&DOOR, id) {
+			door.speed = 4.0;
+		}
+
+		world.entities.records_mut().forget_module();
+		settle(&mut world);
+
+		assert!(world.entities.record(&DOOR, id).is_none(), "the door went with the build");
+		assert_eq!(world.entities.waiting(id).len(), 1, "and what it held waits for it");
+		assert_eq!(
+			world.entities.records().tables().len(),
+			1,
+			"while the engine's own record is nobody's to sweep"
+		);
 	}
 }

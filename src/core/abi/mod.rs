@@ -48,6 +48,7 @@ pub mod physics;
 pub mod pose;
 pub mod post;
 pub mod ragdoll;
+pub mod record;
 pub mod registry;
 pub mod scene;
 pub mod script;
@@ -74,7 +75,7 @@ pub use self::{
 	cvar::{Args, ConsoleFn, Cvars, Value},
 	debug::{Debug, Label, Line, Pen},
 	decal::{DEFAULT_FADE, Decal, DecalKind, MAX_FADE},
-	entity::{Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
+	entity::{DRAWING, Drawing, Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
 	field::Field,
 	font::{Font, FontData, FontId, Fonts, Glyph},
 	ik::Reach,
@@ -99,6 +100,7 @@ pub use self::{
 	pose::{MAX_POSES, Pose, PoseId, Poses},
 	post::{Post, ToneMap},
 	ragdoll::{Build, MAX_PARTS, NO_PART, Part, Ragdoll, Segment},
+	record::{Declared, Noted, Record, Records, Refused, Row, Spelled},
 	registry::{Entry, Registry},
 	scene::{
 		Arena, Form, Grafted, Link, Posed, Remap, Restored, Scene, SceneData, SceneId, Scenes,
@@ -121,7 +123,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 72;
+pub const ABI_VERSION: u32 = 73;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -634,8 +636,26 @@ pub struct World {
 
 impl World {
 	/// A world with nothing in it.
+	///
+	/// Nothing but the engine's own records, which every world declares before
+	/// anything is put in it: a scene restored into a world has somewhere for
+	/// what it says about [`Drawing`] to land. @ref [`record`].
 	#[must_use]
 	pub fn new() -> Self {
+		let mut world = Self::bare();
+
+		// @note: a record the engine declares is a constant a test holds to be
+		// one a world can hold, so this cannot fail on any build that passed it.
+		world
+			.entities
+			.declare(&DRAWING)
+			.expect("the engine's own records are ones a world holds");
+
+		world
+	}
+
+	/// A world with nothing in it, not even the engine's records.
+	fn bare() -> Self {
 		Self {
 			time: 0.0,
 			dt: crate::time::STEP_SECONDS,

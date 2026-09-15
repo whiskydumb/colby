@@ -9,13 +9,14 @@
 //! behind.
 //!
 //! ```text
-//!    0  SceneHeader                      208 bytes
-//!  208  Setting                          232 bytes, one of them
+//!    0  SceneHeader                      224 bytes
+//!  224  Setting                          232 bytes, one of them
 //!    .  [Stood; stood_count]              84 bytes each
-//!    .  [Lit;   lit_count]                36 bytes each
+//!    .  [Lit;   lit_count]                40 bytes each
 //!    .  [Shed;  shed_count]               88 bytes each
 //!    .  [Sod;   sod_count]                44 bytes each
 //!    .  [Daub;  daub_count]               16 bytes each
+//!    .  [Jot;   jot_count]                32 bytes each
 //!    .  [Bulk;  bulk_count]              132 bytes each
 //!    .  [Wet;   wet_count]                36 bytes each
 //!    .  [Tie;   tie_count]               100 bytes each
@@ -54,8 +55,8 @@ use colby_core::{
 	Result,
 	abi::{
 		BodyKind, Camera, Decal, DecalKind, Emitter, EmitterKind, JointKind, Layers, Light,
-		LightKind, Post, ShapeKind, Sky, SkyKind, SparkBlend, Terrain, TerrainKind, TextureId,
-		ToneMap, Transform, Water, WaterKind,
+		LightKind, Noted, Post, ShapeKind, Sky, SkyKind, SparkBlend, Spelled, Terrain,
+		TerrainKind, TextureId, ToneMap, Transform, Water, WaterKind,
 		net::MAX_PEERS,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
@@ -88,13 +89,17 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// record, whose spare the sky's environment had spent. The record is
 /// eight-aligned by the `steps` at its top, so the word cost itself and a new
 /// spare. @ref [`Setting::spare`].
-pub const FORMAT_VERSION: u32 = 17;
+///
+/// Eighteen since an entity carries records: a block of [`Jot`]s, one a value
+/// that differs from its record's default, each naming the record and the
+/// field. The header had no spare words left and grew by four.
+pub const FORMAT_VERSION: u32 = 18;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
 
 /// How big [`SceneHeader`] is, and where the first block starts.
-pub const HEADER_BYTES: usize = 208;
+pub const HEADER_BYTES: usize = 224;
 
 /// The bit in [`SceneHeader::flags`] that says the file carries a game's arena.
 ///
@@ -313,13 +318,32 @@ pub struct SceneHeader {
 	/// block's reason: painting is the rare thing an entity does, and every
 	/// version before this one wrote none at all.
 	pub daub_count: u32,
+
+	/// Bytes per record value. Must be `size_of::<Jot>()`.
+	///
+	/// This and the two after it are a block's three words, and the fourth is
+	/// [`spare`](Self::spare): the decal block took the last spare words, so
+	/// this one grew the header by four and keeps one over.
+	pub jot_stride: u32,
+
+	/// Where the record values start.
+	pub jot_offset: u32,
+
+	/// How many record values there are, over every entity.
+	///
+	/// One a value that differs from its record's default, rather than a record
+	/// per entity: a world of a thousand crates at every default writes none.
+	pub jot_count: u32,
+
+	/// Nought. The first word the next block takes.
+	pub spare: u32,
 }
 
 // the light block took the header's last three spare words, the water block
 // grew it by four and left one over, the emitter block took that one and three
-// more, the terrain block took the two those left and two more, and the decal
-// block took the three that left - two hundred and eight bytes with nothing to
-// spare. The next block added grows it by four words and keeps one spare.
+// more, the terrain block took the two those left and two more, the decal block
+// took the three that left, and the record block grew it by four again and
+// kept one - two hundred and twenty-four bytes with one word to spare.
 //
 // the blocks after the header inherit the buffer's alignment only because the
 // header is a multiple of it, and a field added without shrinking the spare
@@ -328,7 +352,7 @@ pub struct SceneHeader {
 // the first one whose length a game chooses. @ref `Places::of`.
 const _: () = assert!(
 	size_of::<SceneHeader>() == HEADER_BYTES,
-	"the header has to stay two hundred and eight bytes"
+	"the header has to stay two hundred and twenty-four bytes"
 );
 
 /// The world's own settings: where it looks from, what lights it, how hard it
@@ -646,6 +670,51 @@ pub struct Daub {
 
 	/// Which of two decals painting one surface is on top: the higher.
 	pub order: i32,
+}
+
+/// The [`Jot::spelling`] of a flag: nought or one in the first word.
+pub const JOT_TRUTH: u32 = 0;
+
+/// The spelling of one number: a double, its low half in the first word and
+/// its high half in the second.
+pub const JOT_NUMBER: u32 = 1;
+
+/// The spelling of a word: its offset into the blob in the first word.
+///
+/// Two, three and four numbers are spelled as their count, each an `f32` in a
+/// word of its own, which is why this is five.
+pub const JOT_WORD: u32 = 5;
+
+/// One value of one record an entity carries, as the file holds it.
+///
+/// Keyed by the entity's place in the entity block the way a [`Lit`] is, and
+/// written only for a value that differs from its record's default. **By name
+/// rather than by place**: the record and the field are offsets into the blob,
+/// and the value is a spelling with no kind, because the records a file is read
+/// into are whatever the running game declares - a later build, or none yet.
+/// @ref [`record`](colby_core::abi::record).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Jot {
+	/// Which entry of the entity block this belongs to.
+	pub thing: u32,
+
+	/// Offset into the blob of the record's name.
+	pub record: u32,
+
+	/// Offset into the blob of the field's name.
+	pub field: u32,
+
+	/// How [`value`](Self::value) is spelled: [`JOT_TRUTH`], [`JOT_NUMBER`],
+	/// two to four for as many numbers, or [`JOT_WORD`].
+	///
+	/// A spelling this build does not know reads as no value, for the reason a
+	/// light of an unknown kind reads as no light.
+	pub spelling: u32,
+
+	/// The value, in the words its spelling says.
+	pub value: [u32; 4],
 }
 
 /// One entity's light, as the file holds it.
@@ -1096,6 +1165,10 @@ impl SceneFile {
 	#[must_use]
 	pub fn daub(&self) -> &[Daub] { self.block(self.header.daub_offset, self.header.daub_count) }
 
+	/// Every record value, over every entity.
+	#[must_use]
+	pub fn jot(&self) -> &[Jot] { self.block(self.header.jot_offset, self.header.jot_count) }
+
 	/// The body block.
 	#[must_use]
 	pub fn bulk(&self) -> &[Bulk] { self.block(self.header.bulk_offset, self.header.bulk_count) }
@@ -1349,7 +1422,54 @@ impl SceneFile {
 			}
 		}
 
+		// and what the entities' records hold, in the file's own order a fifth
+		// time and in the order each entity's values were written
+		for record in self.jot() {
+			let noted = self.noted(record);
+
+			if let Some((thing, noted)) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+				.zip(noted)
+			{
+				thing.records.push(noted);
+			}
+		}
+
 		things
+	}
+
+	/// One record value, with its names read out.
+	///
+	/// @return nothing for a spelling this build does not know, or a value that
+	/// names no record or no field, which no declared record could take
+	fn noted(&self, jot: &Jot) -> Option<Noted> {
+		let [first, second, ..] = jot.value;
+		let numbers = |count: usize| {
+			jot.value
+				.iter()
+				.take(count)
+				.map(|word| f32::from_bits(*word))
+				.collect()
+		};
+
+		let value = match jot.spelling {
+			| JOT_TRUTH => Spelled::Truth(first != 0),
+			| JOT_NUMBER => Spelled::Number(f64::from_bits(
+				u64::from(first) | (u64::from(second) << u32::BITS),
+			)),
+			| 2..=4 => Spelled::Numbers(numbers(usize::try_from(jot.spelling).ok()?)),
+			| JOT_WORD => Spelled::Word(self.name(first).to_owned()),
+			| _ => return None,
+		};
+		let record = self.name(jot.record);
+		let field = self.name(jot.field);
+
+		(!record.is_empty() && !field.is_empty()).then(|| Noted {
+			record: record.to_owned(),
+			field: field.to_owned(),
+			value,
+		})
 	}
 
 	/// One entity record, with its names read out.
@@ -1375,6 +1495,8 @@ impl SceneFile {
 			parent: stood.parent,
 			hidden: stood.flags & STOOD_HIDDEN != 0,
 			takes_decals: stood.flags & STOOD_UNDECALED == 0,
+			// and whatever its records hold, out of the record block.
+			records: Vec::new(),
 		}
 	}
 
@@ -1533,6 +1655,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		.map(|thing| stood_of(thing, &mut names))
 		.collect();
 	let carried = carried_of(data, &mut names)?;
+	let jot = jots_of(data, &mut names)?;
 	let bulk: Vec<Bulk> = data
 		.solids
 		.iter()
@@ -1584,6 +1707,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		shed: &carried.shed,
 		sod: &carried.sod,
 		daub: &carried.daub,
+		jot: &jot,
 		bulk: &bulk,
 		wet: &wet,
 		tie: &tie,
@@ -1603,6 +1727,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::cast_slice(&carried.shed));
 	out.extend_from_slice(bytemuck::cast_slice(&carried.sod));
 	out.extend_from_slice(bytemuck::cast_slice(&carried.daub));
+	out.extend_from_slice(bytemuck::cast_slice(&jot));
 	out.extend_from_slice(bytemuck::cast_slice(&bulk));
 	out.extend_from_slice(bytemuck::cast_slice(&wet));
 	out.extend_from_slice(bytemuck::cast_slice(&tie));
@@ -1662,6 +1787,80 @@ fn carried_of(data: &SceneData, names: &mut Names) -> Result<Carried> {
 	})
 }
 
+/// Every record value in a description, one a value, keyed by the entity's
+/// place in the entity block.
+///
+/// Lifted out of [`encode`], which counts its lines. The names go into the
+/// blob after every entity's own and every emitter's picture, which is the
+/// order the blob has always been written in.
+///
+/// @param data - the description being written
+/// @param names - the blob the record's, the field's and a word's names go into
+fn jots_of(data: &SceneData, names: &mut Names) -> Result<Vec<Jot>> {
+	let mut jots = Vec::new();
+
+	for (index, thing) in data.things.iter().enumerate() {
+		for noted in &thing.records {
+			jots.push(jot_of(index, noted, names)?);
+		}
+	}
+
+	Ok(jots)
+}
+
+/// One record value, as the file holds it.
+///
+/// @param index - the entity's place in the entity block
+/// @param noted - the value, by name
+/// @param names - the blob its names go into
+fn jot_of(index: usize, noted: &Noted, names: &mut Names) -> Result<Jot> {
+	let mut value = [0; 4];
+	let spelling = match &noted.value {
+		| Spelled::Truth(truth) => {
+			value[0] = u32::from(*truth);
+
+			JOT_TRUTH
+		},
+		| Spelled::Number(number) => {
+			let bits = number.to_bits();
+
+			value[0] = u32::try_from(bits & u64::from(u32::MAX)).unwrap_or(0);
+			value[1] = u32::try_from(bits >> u32::BITS).unwrap_or(0);
+
+			JOT_NUMBER
+		},
+		| Spelled::Numbers(numbers) => {
+			if !(2..=4).contains(&numbers.len()) {
+				return Err(err!(Asset(
+					"{}.{} holds {} numbers, and a record's value is two to four",
+					noted.record,
+					noted.field,
+					numbers.len()
+				)));
+			}
+
+			for (word, number) in value.iter_mut().zip(numbers) {
+				*word = number.to_bits();
+			}
+
+			count(numbers.len(), "a record's numbers")?
+		},
+		| Spelled::Word(word) => {
+			value[0] = names.put(word);
+
+			JOT_WORD
+		},
+	};
+
+	Ok(Jot {
+		thing: count(index, "a scene's records")?,
+		record: names.put(&noted.record),
+		field: names.put(&noted.field),
+		spelling,
+		value,
+	})
+}
+
 /// Where each block lands, worked out once so the header and the writing
 /// cannot disagree.
 struct Places {
@@ -1671,6 +1870,7 @@ struct Places {
 	shed: usize,
 	sod: usize,
 	daub: usize,
+	jot: usize,
 	bulk: usize,
 	wet: usize,
 	tie: usize,
@@ -1692,6 +1892,7 @@ impl Places {
 			shed,
 			sod,
 			daub,
+			jot,
 			bulk,
 			wet,
 			tie,
@@ -1713,7 +1914,9 @@ impl Places {
 		let sod_at = shed_at + size_of_val(shed);
 		// and the decals beside all three, for the same argument a fourth time.
 		let daub_at = sod_at + size_of_val(sod);
-		let bulk_at = daub_at + size_of_val(daub);
+		// and the records' values beside the decals, a fifth time.
+		let jot_at = daub_at + size_of_val(daub);
+		let bulk_at = jot_at + size_of_val(jot);
 		let wet_at = bulk_at + size_of_val(bulk);
 		let tie_at = wet_at + size_of_val(wet);
 		let bent_at = tie_at + size_of_val(tie);
@@ -1737,6 +1940,7 @@ impl Places {
 			shed: shed_at,
 			sod: sod_at,
 			daub: daub_at,
+			jot: jot_at,
 			bulk: bulk_at,
 			wet: wet_at,
 			tie: tie_at,
@@ -1758,6 +1962,7 @@ struct Blocks<'a> {
 	shed: &'a [Shed],
 	sod: &'a [Sod],
 	daub: &'a [Daub],
+	jot: &'a [Jot],
 	bulk: &'a [Bulk],
 	wet: &'a [Wet],
 	tie: &'a [Tie],
@@ -1780,6 +1985,7 @@ fn head(
 		shed,
 		sod,
 		daub,
+		jot,
 		bulk,
 		wet,
 		tie,
@@ -1853,6 +2059,10 @@ fn head(
 		daub_stride: width::<Daub>("a scene's records")?,
 		daub_offset: count(places.daub, "a scene's records")?,
 		daub_count: count(daub.len(), "a scene's records")?,
+		jot_stride: width::<Jot>("a scene's records")?,
+		jot_offset: count(places.jot, "a scene's records")?,
+		jot_count: count(jot.len(), "a scene's records")?,
+		spare: 0,
 	})
 }
 
@@ -2463,6 +2673,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 		(header.shed_stride, size_of::<Shed>(), "emitters"),
 		(header.sod_stride, size_of::<Sod>(), "terrains"),
 		(header.daub_stride, size_of::<Daub>(), "decals"),
+		(header.jot_stride, size_of::<Jot>(), "record values"),
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
 		(header.wet_stride, size_of::<Wet>(), "waters"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
@@ -2537,6 +2748,7 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 	fits::<Shed>(bytes, HEADER_BYTES, (header.shed_offset, header.shed_count), "emitters")?;
 	fits::<Sod>(bytes, HEADER_BYTES, (header.sod_offset, header.sod_count), "terrains")?;
 	fits::<Daub>(bytes, HEADER_BYTES, (header.daub_offset, header.daub_count), "decals")?;
+	fits::<Jot>(bytes, HEADER_BYTES, (header.jot_offset, header.jot_count), "record values")?;
 	fits::<Bulk>(bytes, HEADER_BYTES, (header.bulk_offset, header.bulk_count), "bodies")?;
 	fits::<Wet>(bytes, HEADER_BYTES, (header.wet_offset, header.wet_count), "waters")?;
 	fits::<Tie>(bytes, HEADER_BYTES, (header.tie_offset, header.tie_count), "joints")?;
@@ -2656,6 +2868,7 @@ mod tests {
 				// and refusing decals, so its word of flags carries both bits
 				takes_decals: false,
 				decal: Decal::NONE,
+				records: Vec::new(),
 			},
 			Thing {
 				name: String::new(),
@@ -2718,7 +2931,30 @@ mod tests {
 				// on the second one for the light's reason, with both numbers off
 				// their defaults and the order below nought
 				decal: Decal { fade: 0.25, order: -7, ..Decal::BOX },
+				// on the second one for the light's reason, one of every spelling
+				// and two records, with a whole number no single-precision number
+				// holds, so a value read at the wrong width comes back wrong
+				records: sample_records(),
 			},
+		]
+	}
+
+	/// One value of every spelling, over two records.
+	fn sample_records() -> Vec<Noted> {
+		let noted = |record: &str, field: &str, value: Spelled| Noted {
+			record: record.to_owned(),
+			field: field.to_owned(),
+			value,
+		};
+
+		vec![
+			noted("drawing", "covers", Spelled::Truth(true)),
+			noted("door", "count", Spelled::Number(16_777_217.0)),
+			noted("door", "mark", Spelled::Numbers(vec![0.5, -0.25])),
+			noted("door", "hinge", Spelled::Numbers(vec![1.0, 2.0, 3.0])),
+			noted("door", "lean", Spelled::Numbers(vec![0.0, 0.0, 0.0, 1.0])),
+			noted("door", "style", Spelled::Word("slide".to_owned())),
+			noted("door", "open", Spelled::Truth(false)),
 		]
 	}
 
@@ -3431,6 +3667,109 @@ mod tests {
 		);
 	}
 
+	/// The sample written out, with one word of its first record value
+	/// overwritten.
+	///
+	/// @param at - the record's own field offset, in bytes
+	/// @param word - what to put there
+	fn jot_word_changed(at: usize, word: u32) -> SceneData {
+		let data = sample();
+		let mut bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let first = usize::try_from(header.jot_offset).expect("it is an offset") + at;
+
+		assert_eq!(header.jot_count, 7, "the sample carries seven record values");
+		bytes[first..first + 4].copy_from_slice(&word.to_le_bytes());
+
+		SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a changed word is not a broken file")
+			.to_scene_data()
+	}
+
+	#[test]
+	fn a_record_value_is_written_against_its_place_in_the_entity_block_and_comes_back_exactly() {
+		// the second entity again: its slot is two and its place in the block one
+		let data = sample();
+		let bytes = encode(&data).expect("it fits in one file");
+		let file = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("readable");
+
+		assert!(file.jot().iter().all(|jot| jot.thing == 1), "every value is the second entry's");
+		assert_eq!(
+			file.jot()
+				.iter()
+				.map(|jot| jot.spelling)
+				.collect::<Vec<_>>(),
+			vec![JOT_TRUTH, JOT_NUMBER, 2, 3, 4, JOT_WORD, JOT_TRUTH],
+			"one of every spelling"
+		);
+		assert_eq!(
+			round_trip(&data).things[1].records,
+			sample_records(),
+			"and every value comes back, in its order, the whole number to the unit"
+		);
+	}
+
+	#[test]
+	fn a_world_whose_records_are_at_their_defaults_writes_no_record_values() {
+		let mut data = sample();
+		for thing in &mut data.things {
+			thing.records.clear();
+		}
+
+		let bytes = encode(&data).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+
+		assert_eq!(header.jot_count, 0, "nothing to write down, so nothing is");
+		assert_eq!(header.jot_stride, 32, "and the stride is said all the same");
+		assert_eq!(round_trip(&data), data, "and it comes back the same way");
+	}
+
+	#[test]
+	fn a_record_value_naming_an_entity_that_is_not_there_is_dropped() {
+		let read = jot_word_changed(offset_of!(Jot, thing), 99);
+
+		assert_eq!(read.things[1].records.len(), 6, "the first value went nowhere");
+		assert_eq!(read.things[1].records[..], sample_records()[1..], "and the rest are there");
+	}
+
+	#[test]
+	fn a_record_value_spelled_in_a_way_this_build_does_not_know_reads_as_nothing() {
+		let read = jot_word_changed(offset_of!(Jot, spelling), 9);
+
+		assert_eq!(read.things[1].records[..], sample_records()[1..], "only that value is lost");
+
+		let unnamed = jot_word_changed(offset_of!(Jot, field), 0);
+
+		assert_eq!(
+			unnamed.things[1].records[..],
+			sample_records()[1..],
+			"and a value naming no field is no value either"
+		);
+	}
+
+	#[test]
+	fn a_record_value_of_numbers_no_record_holds_is_refused_rather_than_written() {
+		// none and one as well as five: a count is the spelling, so none would be
+		// written as a flag and one as half of a double
+		for many in [0, 1, 5] {
+			let mut data = sample();
+			data.things[0].records = vec![Noted {
+				record: "door".to_owned(),
+				field: "far".to_owned(),
+				value: Spelled::Numbers(vec![1.0; many]),
+			}];
+
+			let refused = encode(&data)
+				.expect_err("that many numbers are not a value")
+				.to_string();
+
+			assert!(
+				refused.contains("door.far") && refused.contains("two to four"),
+				"{many} numbers, got {refused}"
+			);
+		}
+	}
+
 	#[test]
 	fn whether_an_entity_takes_decals_survives_both_ways() {
 		for takes in [false, true] {
@@ -3597,7 +3936,9 @@ mod tests {
 		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
 
 		assert!(header.daub_offset > header.sod_offset, "the decals after the ground");
-		assert!(header.bulk_offset > header.daub_offset, "and the bodies after the decals");
+		assert!(header.jot_offset > header.daub_offset, "the record values after the decals");
+		assert!(header.bulk_offset > header.jot_offset, "and the bodies after the record values");
+		assert_eq!(header.spare, 0, "with a spare word holding nought");
 		assert!(
 			header.shed_offset > header.lit_offset,
 			"the emitters are written after the lights"
@@ -3886,6 +4227,13 @@ mod tests {
 	}
 
 	#[test]
+	fn a_record_value_of_the_wrong_width_is_refused_like_every_other_record() {
+		let refused = patched(offset_of!(SceneHeader, jot_stride), 16);
+
+		assert!(refused.contains("record values are 16 bytes each"), "got {refused}");
+	}
+
+	#[test]
 	fn a_short_arena_does_not_push_the_peer_records_off_a_boundary() {
 		// the records are laid out before the arena precisely so that this
 		// cannot happen. A five-byte arena is legal - `put_raw` takes a short
@@ -4058,6 +4406,7 @@ mod tests {
 			(offset_of!(SceneHeader, shed_offset), "emitters"),
 			(offset_of!(SceneHeader, sod_offset), "terrains"),
 			(offset_of!(SceneHeader, daub_offset), "decals"),
+			(offset_of!(SceneHeader, jot_offset), "record values"),
 			(offset_of!(SceneHeader, bulk_offset), "bodies"),
 			(offset_of!(SceneHeader, wet_offset), "waters"),
 			(offset_of!(SceneHeader, tie_offset), "joints"),

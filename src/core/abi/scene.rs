@@ -73,6 +73,7 @@ use crate::{
 		Shape, ShapeKind, Sky, Terrain, TextureId, Transform, Water, World,
 		field::{Field, field},
 		net::MAX_PEERS,
+		record::{self, Noted},
 		state::STATE_BYTES,
 	},
 	err,
@@ -263,6 +264,18 @@ pub struct Thing {
 	/// leave alone is painted unless it says otherwise. @ref
 	/// [`Entities::takes_decals`](crate::abi::Entities::takes_decals).
 	pub takes_decals: bool,
+
+	/// What its records hold that is worth writing down, by record and field
+	/// name.
+	///
+	/// Names rather than places, and a spelling rather than a kind, because
+	/// the records a description is read into may not be the ones it was
+	/// written from: a later build of a game, or one that has not declared
+	/// them yet. Only what differs from a record's default is here, and what
+	/// waited for a record nobody had declared is here as well, so a world
+	/// written down while its game is not loaded loses nothing. @ref
+	/// [`record`](crate::abi::record).
+	pub records: Vec<Noted>,
 }
 
 impl Default for Thing {
@@ -285,6 +298,7 @@ impl Default for Thing {
 			parent: NO_INDEX,
 			hidden: false,
 			takes_decals: true,
+			records: Vec::new(),
 		}
 	}
 }
@@ -1295,6 +1309,7 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 				.copied()
 				.unwrap_or(Decal::NONE),
 			takes_decals: world.entities.takes_decals(id),
+			records: world.entities.noted(id),
 			name: world.entities.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
 			generation: id.generation(),
@@ -1583,6 +1598,8 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 			.set_takes_decals(*id, thing.takes_decals);
 	}
 
+	note(world, &things, &scene.things, "a restore");
+
 	for (id, solid) in solids.iter().zip(&scene.solids) {
 		world.bodies.set_name(*id, &solid.name);
 	}
@@ -1710,6 +1727,8 @@ pub fn graft(world: &mut World, piece: &SceneData) -> Grafted {
 	for (id, thing) in things.iter().zip(&piece.things) {
 		world.entities.set_name(*id, &thing.name);
 	}
+
+	note(world, &things, &piece.things, "a piece of a world");
 
 	for (id, solid) in solids.iter().zip(&piece.solids) {
 		world.bodies.set_name(*id, &solid.name);
@@ -2365,6 +2384,7 @@ pub fn instantiate(world: &mut World, scene: &SceneData, at: Vec3) -> Remap {
 	// thing it hangs off.
 	let ids: Vec<EntityId> = things.iter().map(|(_, id)| *id).collect();
 	hang(world, &ids, &ids, &scene.things);
+	note(world, &ids, &scene.things, "a copy");
 
 	let solids: Vec<(String, BodyId)> = scene
 		.solids
@@ -2379,6 +2399,26 @@ pub fn instantiate(world: &mut World, scene: &SceneData, at: Vec3) -> Remap {
 		.collect();
 
 	Remap { things, solids, links, poses }
+}
+
+/// Puts what a description says about each entity's records onto what it
+/// became, and says once for the whole of it what no record could take.
+///
+/// After every entity has landed and by handle, for the reason a name is set
+/// that way: an entity refused its slot is a null handle and takes nothing.
+///
+/// @param world - the world the entities landed in
+/// @param ids - what each description became, in its order
+/// @param things - the descriptions
+/// @param during - what the load is, for the one line it may say
+fn note(world: &mut World, ids: &[EntityId], things: &[Thing], during: &str) {
+	let mut refused = Vec::new();
+
+	for (id, thing) in ids.iter().zip(things) {
+		refused.extend(world.entities.note(*id, &thing.records));
+	}
+
+	record::report(&refused, during);
 }
 
 /// Creates one pose, standing where the description left its bones.
@@ -2508,7 +2548,8 @@ mod tests {
 	use super::*;
 	use crate::{
 		abi::{
-			Command, MAX_ENTITIES, Material, MeshData, PeerId, Role, SkyKind, TextureData, mesh,
+			Command, DRAWING, Drawing, MAX_ENTITIES, Material, MeshData, PeerId, Role, SkyKind,
+			TextureData, mesh,
 			skeleton::{Bone, SkeletonData, SkeletonId},
 		},
 		glam::Vec2,
@@ -5507,6 +5548,203 @@ mod tests {
 		assert!(world.entities.set_takes_decals(car, false));
 
 		assert!(!capture(&world).same_world(&before), "and so is one that takes none");
+	}
+
+	/// A game's record, for the tests of what a description does with one.
+	#[repr(C)]
+	#[derive(Clone, Copy, Debug, PartialEq, crate::bytemuck::Pod, crate::bytemuck::Zeroable)]
+	struct Gate {
+		open: u32,
+		speed: f32,
+	}
+
+	/// The gate as a game declares it.
+	const GATE: crate::abi::Record<Gate> = crate::abi::Record {
+		name: "gate",
+		help: "a thing that opens",
+		rows: &[
+			crate::row!(Bool, Gate, open, "whether it stands open"),
+			crate::row!(Float, Gate, speed, "how fast it opens"),
+		],
+		default: Gate { open: 0, speed: 1.0 },
+	};
+
+	/// Says the wheel covers what is behind it.
+	fn covering(world: &mut World, id: EntityId) {
+		if let Some(drawing) = world.entities.record_mut(&DRAWING, id) {
+			drawing.covers = 1;
+		}
+	}
+
+	#[test]
+	fn a_record_is_written_down_by_name_and_put_back() {
+		let (mut world, car, wheel) = hung();
+		covering(&mut world, wheel);
+
+		let scene = capture(&world);
+
+		assert!(scene.things[0].records.is_empty(), "the car is at every default");
+		assert_eq!(
+			scene.things[1].records,
+			vec![Noted {
+				record: "drawing".to_owned(),
+				field: "covers".to_owned(),
+				value: record::Spelled::Truth(true),
+			}],
+			"and the wheel's record is written down by name"
+		);
+
+		let mut again = World::new();
+		restore(&mut again, &scene).expect("nothing to disagree about");
+
+		assert!(
+			again
+				.entities
+				.record(&DRAWING, wheel)
+				.is_some_and(|drawing| drawing.covers()),
+			"it comes back"
+		);
+		assert_eq!(
+			again.entities.record(&DRAWING, car),
+			Some(&Drawing::NONE),
+			"on the wheel alone"
+		);
+	}
+
+	#[test]
+	fn a_copy_of_a_record_carries_it_and_so_does_a_piece_that_crossed() {
+		let (mut world, _, wheel) = hung();
+		let body = world.attach_body(wheel, BodyKind::Dynamic, Shape::cuboid(Vec3::splat(0.5)));
+		covering(&mut world, wheel);
+		let scene = capture(&world);
+
+		let mut pasted = World::new();
+		let put = instantiate(&mut pasted, &scene, Vec3::ZERO);
+
+		assert!(
+			pasted
+				.entities
+				.record(&DRAWING, put.entity_named("wheel"))
+				.is_some_and(|drawing| drawing.covers()),
+			"the copy covers"
+		);
+		assert_eq!(
+			pasted
+				.entities
+				.record(&DRAWING, put.entity_named("car")),
+			Some(&Drawing::NONE),
+			"and only that one"
+		);
+
+		let piece = scene.piece(&records_of(&scene, body));
+		let mut far = World::new();
+		restore(&mut far, &scene).expect("agrees");
+		assert!(far.entities.despawn(wheel));
+		assert!(far.bodies.despawn(body));
+
+		assert_eq!(graft(&mut far, &piece).things, 1, "the wheel appeared");
+		assert!(
+			far.entities
+				.record(&DRAWING, wheel)
+				.is_some_and(|drawing| drawing.covers()),
+			"and it arrived covering"
+		);
+	}
+
+	#[test]
+	fn a_record_written_is_a_change_to_the_world() {
+		// what undo stands on, the hidden word's test a third time
+		let (mut world, _, wheel) = hung();
+		let before = capture(&world);
+		covering(&mut world, wheel);
+
+		assert!(!capture(&world).same_world(&before), "a wheel that covers is another world");
+	}
+
+	#[test]
+	fn a_record_the_world_has_not_declared_waits_through_a_restore_and_lands_when_it_is() {
+		// how a world starts: the startup scene is put back before the game that
+		// declares its records is loaded
+		let (mut world, car, wheel) = hung();
+		world
+			.entities
+			.declare(&GATE)
+			.expect("a gate is a record a world holds");
+
+		if let Some(gate) = world.entities.record_mut(&GATE, car) {
+			gate.speed = 3.0;
+		}
+
+		let scene = capture(&world);
+		let mut starting = World::new();
+		restore(&mut starting, &scene).expect("nothing to disagree about");
+
+		assert!(starting.entities.record(&GATE, car).is_none(), "nobody declared a gate here");
+		assert_eq!(starting.entities.waiting(car).len(), 1, "so its speed waits");
+		assert!(
+			capture(&starting).same_world(&scene),
+			"and a world written down meanwhile is the world it came from"
+		);
+
+		let declared = starting
+			.entities
+			.declare(&GATE)
+			.expect("the game declares it");
+
+		assert_eq!(declared.kept, 1, "and what waited is taken");
+		assert_eq!(
+			starting
+				.entities
+				.record(&GATE, car)
+				.map(|gate| gate.speed.to_bits()),
+			Some(3.0_f32.to_bits()),
+			"as the car's"
+		);
+		assert_eq!(
+			starting.entities.record(&GATE, wheel),
+			Some(&GATE.default),
+			"and not the wheel's"
+		);
+		assert!(starting.entities.waiting(car).is_empty(), "with nothing left waiting");
+	}
+
+	#[test]
+	fn a_value_no_field_takes_is_dropped_and_the_rest_of_the_world_is_put_back() {
+		let (world, car, wheel) = hung();
+		let mut scene = capture(&world);
+		scene.things[0].records = vec![
+			Noted {
+				record: "drawing".to_owned(),
+				field: "covers".to_owned(),
+				value: record::Spelled::Number(1.0),
+			},
+			Noted {
+				record: "drawing".to_owned(),
+				field: "hides".to_owned(),
+				value: record::Spelled::Truth(true),
+			},
+		];
+		scene.things[1].records = vec![Noted {
+			record: "drawing".to_owned(),
+			field: "covers".to_owned(),
+			value: record::Spelled::Truth(true),
+		}];
+
+		let mut again = World::new();
+		restore(&mut again, &scene).expect("a value nobody takes is not a refusal of the world");
+
+		assert_eq!(again.entities.record(&DRAWING, car), Some(&Drawing::NONE), "both dropped");
+		assert!(
+			again.entities.waiting(car).is_empty(),
+			"rather than waiting: drawing is declared"
+		);
+		assert!(
+			again
+				.entities
+				.record(&DRAWING, wheel)
+				.is_some_and(|drawing| drawing.covers()),
+			"and the value that fits is put back"
+		);
 	}
 
 	#[test]

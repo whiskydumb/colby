@@ -61,6 +61,15 @@
 //! each an error naming the entity; the order the two are written in does not
 //! matter.
 //!
+//! **What an entity's records hold is by name, under `"records"`.** A record
+//! is a set of fields the engine or a game declares for every entity, @ref
+//! [`record`](colby_core::abi::record), and a source writes the ones that are
+//! not at their defaults: `"records": { "drawing": { "covers": true } }`. A
+//! record the engine declares is checked here against its fields, the way
+//! every table the engine owns is; a record a game declares cannot be, because
+//! nothing that compiles a scene loads a game, and what it holds is checked
+//! when it meets the world that declares it.
+//!
 //! **A pose is a record of its own and an entity names it**, rather than an
 //! entity naming a skeleton directly. The two are not the same claim: a model
 //! of two materials is two entities moved by one set of bones, and two
@@ -77,8 +86,9 @@ use colby_core::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, Decal, Emitter, EntityId, Field, Joint, JointKind,
-		Layers, Light, MeshId, Post, Renderable, Shape, Sky, Terrain, Transform,
+		Layers, Light, MeshId, Noted, Post, Renderable, Shape, Sky, Spelled, Terrain, Transform,
 		field::{self, Kind},
+		record,
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
 	err,
@@ -292,6 +302,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 				"emitter",
 				"terrain",
 				"decal",
+				"records",
 			],
 			"an entity",
 		)?;
@@ -390,12 +401,116 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			parent: NO_INDEX,
 			hidden,
 			takes_decals,
+			records: records(entry.get("records"))?,
 		});
 	}
 
 	hang(&mut things, value)?;
 
 	Ok(things)
+}
+
+/// What an entity's records hold, as the source spells it.
+///
+/// A record by name, and under it a field by name and a value spelled the way
+/// JSON spells one: true or false, a number, a list of two to four numbers, or
+/// a word. A record the engine declares is checked against its fields - a
+/// field it does not have and a value it does not hold are refused, naming
+/// both - and a record a game declares is taken as written, because whether a
+/// game has that field is a question only the running game can answer.
+///
+/// @param value - the entity's `records`, or nothing
+fn records(value: Option<&Value>) -> Result<Vec<Noted>> {
+	let Some(value) = value else {
+		return Ok(Vec::new());
+	};
+
+	let shape =
+		|| err!(Asset("an entity's records are an object of records, each an object of fields"));
+	let Value::Object(written) = value else {
+		return Err(shape());
+	};
+
+	let mut noted = Vec::new();
+
+	for (name, fields) in written {
+		let Value::Object(fields) = fields else {
+			return Err(shape());
+		};
+
+		if !record::is_name(name) {
+			return Err(err!(
+				Asset(
+					"an entity has a record called {name:?}; a record's name is lowercase \
+					 letters, 				 digits and underscores"
+				)
+			));
+		}
+
+		let engine = record::ENGINE
+			.iter()
+			.find(|shape| shape.name == name);
+
+		for (field, value) in fields {
+			noted.push(field_of(name, engine, field, value)?);
+		}
+	}
+
+	Ok(noted)
+}
+
+/// One field of one record, as the source spells it, checked against the
+/// record's own fields when the record is the engine's.
+///
+/// @param record - the record's name
+/// @param engine - the record's fields, when the engine declares it
+/// @param field - the field's name
+/// @param value - what the source says it holds
+fn field_of(
+	record: &str,
+	engine: Option<&record::Shape>,
+	field: &str,
+	value: &Value,
+) -> Result<Noted> {
+	let spelled = spelled(value).ok_or_else(|| {
+		err!(Asset(
+			"{record}.{field} should be true or false, a number, two to four numbers, or a word"
+		))
+	})?;
+
+	if let Some(shape) = engine {
+		let row = shape
+			.rows
+			.iter()
+			.find(|row| row.name == field)
+			.ok_or_else(|| err!(Asset("the record {record} has no field called {field}")))?;
+
+		if !record::fits(row.kind, &spelled) {
+			return Err(err!(Asset("{record}.{field} should be {}", row.kind.name())));
+		}
+	}
+
+	Ok(Noted {
+		record: record.to_owned(),
+		field: field.to_owned(),
+		value: spelled,
+	})
+}
+
+/// One record value as JSON spells it, or nothing for a value that is not one.
+fn spelled(value: &Value) -> Option<Spelled> {
+	Some(match value {
+		| Value::Bool(truth) => Spelled::Truth(*truth),
+		| Value::Number(number) => Spelled::Number(*number),
+		| Value::String(word) => Spelled::Word(word.clone()),
+		| Value::Array(parts) if (2..=4).contains(&parts.len()) => Spelled::Numbers(
+			parts
+				.iter()
+				.map(|part| part.as_f32().filter(|it| it.is_finite()))
+				.collect::<Option<Vec<f32>>>()?,
+		),
+		| _ => return None,
+	})
 }
 
 /// One of an entity's words that is true or false, or its usual answer
@@ -1278,8 +1393,81 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> R
 		},
 		|_| None,
 	)?;
+	// and its records under their own key, a record an object and its fields
+	// in the order they were written down, and no key at all for an entity at
+	// every default
+	if let Some(written) = records_of(&thing.records)? {
+		rows.put("records", written);
+	}
 
 	Ok(rows.text())
+}
+
+/// What an entity's records hold, as one JSON object, or nothing for none.
+///
+/// Records in the order their first value was written down and fields in
+/// theirs, so a world written twice is the same text twice.
+fn records_of(noted: &[Noted]) -> Result<Option<String>> {
+	if noted.is_empty() {
+		return Ok(None);
+	}
+
+	let mut names: Vec<&str> = Vec::new();
+
+	for one in noted {
+		if !names.contains(&one.record.as_str()) {
+			names.push(&one.record);
+		}
+	}
+
+	let mut written = Vec::with_capacity(names.len());
+
+	for name in names {
+		let fields = noted
+			.iter()
+			.filter(|one| one.record == name)
+			.map(|one| Ok(format!("{}: {}", as_text(&one.field), spelling_of(one)?)))
+			.collect::<Result<Vec<String>>>()?;
+
+		written.push(format!("{}: {{ {} }}", as_text(name), fields.join(", ")));
+	}
+
+	Ok(Some(format!("{{ {} }}", written.join(", "))))
+}
+
+/// One record value, spelled the way [`spelled`] reads it back.
+///
+/// A number an `f32` holds exactly is written in the shortest text that reads
+/// back as that `f32`, so a field's `0.1` is `0.1` in the file rather than
+/// the seventeen digits of the double beside it.
+fn spelling_of(noted: &Noted) -> Result<String> {
+	let unwritable =
+		|| err!(Asset("{}.{} holds a number JSON cannot write", noted.record, noted.field));
+
+	Ok(match &noted.value {
+		| Spelled::Truth(truth) => truth.to_string(),
+		| Spelled::Number(number) => {
+			if !number.is_finite() {
+				return Err(unwritable());
+			}
+
+			match Value::Number(*number).as_f32() {
+				| Some(narrow) if f64::from(narrow).to_bits() == number.to_bits() =>
+					as_number(narrow),
+				| _ => format!("{number}"),
+			}
+		},
+		| Spelled::Numbers(numbers) => {
+			if !numbers.iter().all(|it| it.is_finite()) {
+				return Err(unwritable());
+			}
+
+			let parts: Vec<String> = numbers.iter().map(|it| as_number(*it)).collect();
+
+			format!("[{}]", parts.join(", "))
+		},
+		| Spelled::Word(word) => as_text(word),
+	})
 }
 
 /// One pose: which skeleton it wears, and nothing about where its bones are.
@@ -1915,6 +2103,119 @@ mod tests {
 			.to_string();
 
 		assert!(refused.contains("hidden") && refused.contains("true or false"), "got {refused}");
+	}
+
+	/// What a source says one field of one record holds.
+	fn noted(record: &str, field: &str, value: Spelled) -> Noted {
+		Noted {
+			record: record.to_owned(),
+			field: field.to_owned(),
+			value,
+		}
+	}
+
+	#[test]
+	fn an_entity_s_records_are_read_by_name_and_written_back_the_same() {
+		let text = r#"{ "entities": [
+			{ "name": "brick", "records": {
+				"drawing": { "covers": true },
+				"door": { "speed": 2.5, "hinge": [1, 0, 0], "style": "slide", "open": false,
+				          "count": 16777217, "mark": [0.5, 0.1] }
+			} },
+			{ "name": "plain" }
+		] }"#;
+		let scene = import(text).expect("a source with records in it reads");
+
+		assert_eq!(
+			scene.things[0].records,
+			vec![
+				noted("drawing", "covers", Spelled::Truth(true)),
+				noted("door", "speed", Spelled::Number(2.5)),
+				noted("door", "hinge", Spelled::Numbers(vec![1.0, 0.0, 0.0])),
+				noted("door", "style", Spelled::Word("slide".to_owned())),
+				noted("door", "open", Spelled::Truth(false)),
+				noted("door", "count", Spelled::Number(16_777_217.0)),
+				noted("door", "mark", Spelled::Numbers(vec![0.5, 0.1])),
+			],
+			"every value by name, in the order written"
+		);
+		assert!(scene.things[1].records.is_empty(), "and an entity that says nothing holds none");
+
+		let written = export(&scene).expect("it writes");
+
+		assert!(
+			written.contains(
+				r#""records": { "drawing": { "covers": true }, "door": { "speed": 2.5, "hinge": [1, 0, 0], "style": "slide", "open": false, "count": 16777217, "mark": [0.5, 0.1] } }"#
+			),
+			"written back as it was spelled, a number an f32 holds in its shortest text: {written}"
+		);
+		assert_eq!(written.matches("records").count(), 1, "and only on the entity that has some");
+		assert_eq!(
+			import(&written).expect("and read again"),
+			scene,
+			"the text round trip is exact"
+		);
+	}
+
+	#[test]
+	fn a_record_the_engine_declares_is_checked_as_it_is_read_and_a_game_s_is_taken_as_written() {
+		for (text, said) in [
+			(r#"{ "drawing": { "hides": true } }"#, "has no field called hides"),
+			(r#"{ "drawing": { "covers": 1 } }"#, "should be true or false"),
+			(r#"{ "door": { "speed": null } }"#, "door.speed should be"),
+			(r#"{ "door": { "speed": [1] } }"#, "door.speed should be"),
+			(r#"{ "door": { "speed": [1, 2, 3, 4, 5] } }"#, "two to four numbers"),
+			(r#"{ "door": { "speed": [1, "two"] } }"#, "door.speed should be"),
+			(r#"{ "door": { "speed": { "a": 1 } } }"#, "door.speed should be"),
+			(r#"{ "door": 3 }"#, "an object of records"),
+			(r#"{ "Door": { "speed": 1 } }"#, "lowercase letters"),
+			(r#"[ "door" ]"#, "an object of records"),
+		] {
+			let source = format!(r#"{{ "entities": [ {{ "records": {text} }} ] }}"#);
+			let refused = import(&source)
+				.expect_err("the records are wrong")
+				.to_string();
+
+			assert!(refused.contains(said), "{text}: expected {said:?}, got {refused}");
+		}
+
+		let game = import(
+			r#"{ "entities": [ { "records": { "door": { "anything": [1, 2, 3], "at_all": "x" } } } ] }"#,
+		)
+		.expect("a game's record is taken as written: nothing here knows its fields");
+
+		assert_eq!(game.things[0].records.len(), 2, "both of them");
+	}
+
+	#[test]
+	fn a_record_value_json_cannot_write_is_refused_and_a_double_is_written_whole() {
+		let mut scene = import(r#"{ "entities": [ { "name": "a" } ] }"#).expect("reads");
+
+		scene.things[0].records = vec![
+			noted("door", "near", Spelled::Number(f64::from(0.1_f32))),
+			noted("door", "far", Spelled::Number(0.1)),
+			noted("door", "big", Spelled::Number(123_456_789_012.0)),
+		];
+
+		let written = export(&scene).expect("every number here has a spelling");
+
+		assert!(
+			written.contains(r#""near": 0.1, "far": 0.1, "big": 123456789012"#),
+			"an f32's value in its own shortest text, a double's in its own: {written}"
+		);
+
+		scene.things[0].records = vec![noted("door", "speed", Spelled::Number(f64::NAN))];
+
+		let refused = export(&scene)
+			.expect_err("a nan has no spelling")
+			.to_string();
+
+		assert!(refused.contains("door.speed"), "the field is named: {refused}");
+
+		scene.things[0].records =
+			vec![noted("door", "hinge", Spelled::Numbers(vec![f32::INFINITY, 0.0]))];
+
+		assert!(export(&scene).is_err(), "nor does an infinity among numbers");
 	}
 
 	#[test]

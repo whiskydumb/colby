@@ -38,16 +38,18 @@
 
 use super::{
 	decal::Decal,
-	field::{Field, field},
+	field::{Field, Value, field},
 	light::Light,
 	material::MaterialId,
 	mesh::MeshId,
 	names::Names,
 	particles::Emitter,
 	pose::PoseId,
+	record::{Declared, Noted, Record, Records, Refused},
 	terrain::Terrain,
 };
 use crate::{
+	Result,
 	bytemuck::{Pod, Zeroable},
 	glam::{Mat4, Quat, Vec3},
 };
@@ -356,6 +358,53 @@ impl Default for Renderable {
 	fn default() -> Self { Self::NOTHING }
 }
 
+/// How the renderer treats an entity beyond what it looks like.
+///
+/// **The engine's own record**, which every entity carries: declared the way a
+/// game declares its fields, @ref [`record`](super::record), so the inspector,
+/// a scene source, a save and a piece of the world on the wire reach it through
+/// the one path a game's fields take. A flag like this on [`Renderable`] would
+/// have been a table row and a file record and a key and a line in three
+/// loaders; here it is a row.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct Drawing {
+	/// Whether it is drawn into the pass before the scene ahead of the test for
+	/// what is hidden, whatever its size: nought for no, anything else for yes.
+	///
+	/// For a thing that is one of many small pieces of something that hides a
+	/// great deal - a brick in a wall, a plank in a fence. A thing too small on
+	/// screen is otherwise drawn after the test, so what only small things hide
+	/// is drawn; one that covers is in the depth the test reads.
+	pub covers: u32,
+}
+
+impl Drawing {
+	/// What every entity starts as: drawn however its size says.
+	pub const NONE: Self = Self { covers: 0 };
+
+	/// Whether it is drawn ahead of the test whatever its size.
+	#[must_use]
+	pub const fn covers(self) -> bool { self.covers != 0 }
+}
+
+impl Default for Drawing {
+	fn default() -> Self { Self::NONE }
+}
+
+/// [`Drawing`] as the record every world declares.
+pub const DRAWING: Record<Drawing> = Record {
+	name: "drawing",
+	help: "how the renderer treats the entity beyond what it looks like",
+	rows: &[crate::row!(
+		Bool,
+		Drawing,
+		covers,
+		"drawn into the pass before the scene ahead of the cover test, whatever its size"
+	)],
+	default: Drawing::NONE,
+};
+
 /// The host's entity table.
 ///
 /// Component storage is hard-coded to one array of [`Transform`] because there
@@ -423,6 +472,11 @@ pub struct Entities {
 	/// and the one array here that is not read by anything the engine does -
 	/// it exists for whoever has to point at a particular entity in words.
 	names: Names,
+	/// Every declared record, one copy a slot. The same slots again: a
+	/// record is something an entity carries, like its light, and a slot is
+	/// handed out holding every record's default. @ref
+	/// [`record`](super::record).
+	records: Records,
 	generations: Vec<u32>,
 	alive: Vec<bool>,
 	free: Vec<u32>,
@@ -452,6 +506,7 @@ impl Entities {
 			hidden: Vec::new(),
 			undecaled: Vec::new(),
 			names: Names::new(),
+			records: Records::new(),
 			generations: Vec::new(),
 			alive: Vec::new(),
 			free: Vec::new(),
@@ -510,6 +565,9 @@ impl Entities {
 		// here rather than at the despawn because a slot reaches the free list
 		// three ways and leaves it one. @ref `abi::names`.
 		self.names.set(slot, "");
+		// and it carries every record at its default, with nothing waiting,
+		// for the name's reason.
+		self.records.clear(slot);
 		self.live += 1;
 
 		EntityId {
@@ -1022,6 +1080,111 @@ impl Entities {
 		true
 	}
 
+	/// Declares a record every entity carries, or declares it again.
+	///
+	/// What a game calls from `init`, once for each record it keeps on an
+	/// entity. @ref [`Records::declare`] for what a second declaration does,
+	/// and [`record`](super::record) for what a record is.
+	///
+	/// @param record - what to declare
+	/// @return what it took of what was already in the world by name
+	///
+	/// # Errors
+	///
+	/// When the record cannot be held, or another has its name.
+	pub fn declare<T: Pod>(&mut self, record: &Record<T>) -> Result<Declared> {
+		self.records.declare(record)
+	}
+
+	/// One entity's copy of a record, as the struct it was declared over.
+	///
+	/// @param record - which record
+	/// @param id - the entity
+	/// @return nothing for a stale handle, a record nobody declared, or a
+	/// struct of another size than the one declared
+	#[must_use]
+	pub fn record<T: Pod>(&self, record: &Record<T>, id: EntityId) -> Option<&T> {
+		self.records.view(record, self.slot(id)?)
+	}
+
+	/// One entity's copy of a record, to change.
+	pub fn record_mut<T: Pod>(&mut self, record: &Record<T>, id: EntityId) -> Option<&mut T> {
+		let slot = self.slot(id)?;
+
+		self.records.view_mut(record, slot)
+	}
+
+	/// Every slot's copy of a record, in slot order, dead slots included.
+	///
+	/// For a pass that already walks the table and holds each entity's slot:
+	/// one lookup of the record for the whole walk rather than one an entity.
+	/// A caller with a handle and not a walk asks [`record`](Self::record).
+	#[must_use]
+	pub fn column<T: Pod>(&self, record: &Record<T>) -> Option<&[T]> {
+		self.records.column(record)
+	}
+
+	/// Every declared record: what an inspector and a writer walk.
+	#[must_use]
+	pub const fn records(&self) -> &Records { &self.records }
+
+	/// Every declared record, to declare into and for the host to attribute,
+	/// mark and sweep across a reload.
+	pub const fn records_mut(&mut self) -> &mut Records { &mut self.records }
+
+	/// One field of one entity's record, whatever it holds.
+	///
+	/// @param id - the entity
+	/// @param table - the record's place in [`Records::tables`]
+	/// @param column - the field's place in its record's columns
+	#[must_use]
+	pub fn field(&self, id: EntityId, table: usize, column: usize) -> Option<Value> {
+		self.records.field(table, column, self.slot(id)?)
+	}
+
+	/// Writes one field of one entity's record.
+	///
+	/// @return whether it was written: `false` for a stale handle, or a value
+	/// the field does not hold
+	pub fn set_field(
+		&mut self,
+		id: EntityId,
+		table: usize,
+		column: usize,
+		value: &Value,
+	) -> bool {
+		self.slot(id)
+			.is_some_and(|slot| self.records.set_field(table, column, slot, value))
+	}
+
+	/// What one entity's records hold that is worth writing down, by name.
+	///
+	/// @ref [`record`](super::record) for why a value leaves a world by name.
+	#[must_use]
+	pub fn noted(&self, id: EntityId) -> Vec<Noted> {
+		self.slot(id)
+			.map_or_else(Vec::new, |slot| self.records.noted(slot))
+	}
+
+	/// Puts written values into one entity's records.
+	///
+	/// @return what no declared record could take, for the caller to report
+	/// once for a whole load
+	pub fn note(&mut self, id: EntityId, noted: &[Noted]) -> Vec<Refused> {
+		let Some(slot) = self.slot(id) else {
+			return Vec::new();
+		};
+
+		self.records.note(slot, noted)
+	}
+
+	/// What waits in one entity for a record nobody has declared.
+	#[must_use]
+	pub fn waiting(&self, id: EntityId) -> &[Noted] {
+		self.slot(id)
+			.map_or(&[], |slot| self.records.waiting(slot))
+	}
+
 	/// Moves the present into the past, ready for another step.
 	///
 	/// The host calls this before every simulation step, and once more after a
@@ -1209,6 +1372,7 @@ impl Entities {
 		self.undecaled.clear();
 		self.undecaled.resize(slots, false);
 		self.names.reset(slots);
+		self.records.reset(slots);
 		self.generations.clear();
 		self.generations
 			.extend_from_slice(&generations[..slots]);
@@ -1271,6 +1435,7 @@ impl Entities {
 			self.hidden.push(false);
 			self.undecaled.push(false);
 			self.names.push();
+			self.records.push();
 			self.generations.push(0);
 			self.alive.push(false);
 
@@ -1330,6 +1495,9 @@ impl Entities {
 		// reason: a table handed plain records has this set by handle after.
 		self.hidden[slot] = false;
 		self.undecaled[slot] = false;
+		// and every record at its default, for the light's reason: a record is
+		// written by handle afterwards, by whoever put the entity back.
+		self.records.clear(slot);
 		self.generations[slot] = self.generations[slot].max(1);
 		self.live += 1;
 
@@ -1405,6 +1573,7 @@ impl Entities {
 		self.hidden.push(false);
 		self.undecaled.push(false);
 		self.names.push();
+		self.records.push();
 		self.generations.push(0);
 		self.alive.push(false);
 
@@ -2140,6 +2309,79 @@ mod tests {
 		let put = entities.restore(&[4], &[(0, Transform::IDENTITY, Renderable::NOTHING)]);
 		assert_eq!(entities.decal(put[0]).copied(), Some(Decal::NONE), "restored into it");
 		assert!(entities.takes_decals(put[0]), "and takes decals");
+	}
+
+	#[test]
+	fn a_slot_handed_out_again_carries_every_record_at_its_default_however_it_is_handed_out() {
+		// the hidden word's test a third time, for what a record adds: each way a
+		// slot comes back into use, tried on a slot whose record was written and
+		// which had something waiting for a record nobody declared
+		let mut entities = Entities::new();
+		entities
+			.declare(&DRAWING)
+			.expect("drawing is a record a world holds");
+
+		let waits = [Noted {
+			record: "door".to_owned(),
+			field: "open".to_owned(),
+			value: super::super::record::Spelled::Truth(true),
+		}];
+		let mark = |entities: &mut Entities, id: EntityId| {
+			if let Some(drawing) = entities.record_mut(&DRAWING, id) {
+				drawing.covers = 1;
+			}
+
+			assert!(entities.note(id, &waits).is_empty(), "a door nobody declared waits");
+			assert_eq!(entities.noted(id).len(), 2, "and both are there to write down");
+		};
+		let fresh = |entities: &Entities, id: EntityId, how: &str| {
+			assert_eq!(entities.record(&DRAWING, id), Some(&Drawing::NONE), "{how}: the default");
+			assert!(entities.waiting(id).is_empty(), "{how}: and nothing waits");
+		};
+
+		let old = entities.spawn();
+		mark(&mut entities, old);
+		assert!(entities.despawn(old));
+		assert!(entities.record(&DRAWING, old).is_none(), "a stale handle reaches no record");
+		assert!(entities.noted(old).is_empty(), "and has nothing to write down");
+
+		let spawned = entities.spawn();
+		assert_eq!(
+			spawned.slot(),
+			old.slot(),
+			"the fixture reuses the slot, or it proves nothing"
+		);
+		fresh(&entities, spawned, "spawned into it");
+
+		mark(&mut entities, spawned);
+		assert!(entities.despawn(spawned));
+		let grafted = entities.graft(old.slot(), 9, Transform::IDENTITY, Renderable::NOTHING);
+		assert!(grafted.is_some(), "the slot was free to graft into");
+		fresh(&entities, grafted, "grafted into it");
+
+		mark(&mut entities, grafted);
+		let put = entities.restore(&[4], &[(0, Transform::IDENTITY, Renderable::NOTHING)]);
+		fresh(&entities, put[0], "restored into it");
+
+		let far = entities.graft(6, 2, Transform::IDENTITY, Renderable::NOTHING);
+		assert_eq!(
+			entities.column(&DRAWING).map(<[Drawing]>::len),
+			Some(7),
+			"a graft past the end grows the record with every other array"
+		);
+		fresh(&entities, far, "grafted past the end");
+		assert!(
+			!entities.set_field(old, 0, 0, &Value::Bool(true)),
+			"and a stale handle writes no field"
+		);
+		assert!(entities.set_field(far, 0, 0, &Value::Bool(true)), "where a live one does");
+		assert_eq!(entities.field(far, 0, 0), Some(Value::Bool(true)), "and reads it back");
+		assert!(
+			entities
+				.record(&DRAWING, far)
+				.is_some_and(|it| it.covers()),
+			"as the struct"
+		);
 	}
 
 	#[test]

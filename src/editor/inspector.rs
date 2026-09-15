@@ -9,6 +9,11 @@
 //! entity hangs off - because a handle is worth showing by name and a table
 //! knows nothing about names.
 //!
+//! **An entity's records are the same rows over a table the engine does not
+//! know the type of**, @ref [`records`]: the engine's own `drawing` and a
+//! game's `door` are drawn by one loop, from the fields their declarations
+//! named, and written back field by field through the entity's handle.
+//!
 //! **Every write is written down first**, @ref [`History::begin`]: a row is
 //! edited on a copy of the record, and the copy goes back into the world only
 //! after the world as it stood has been captured, so that a number dragged
@@ -23,7 +28,7 @@ use colby_core::{
 	abi::{
 		Body, BodyId, Decal, Emitter, EntityId, Field, Joint, JointId, Light, Material,
 		MaterialId, ModelId, Post, Renderable, Sky, Terrain, TextureId, Transform, World,
-		field::{Kind, Value},
+		field::Value,
 		scene::{self, Stage},
 	},
 	glam::{EulerRot, Quat, Vec2, Vec3},
@@ -99,6 +104,7 @@ fn detail(
 			thrower(ui, world, id, history);
 			land(ui, world, id, history);
 			paint(ui, world, id, history);
+			records(ui, world, id, history);
 		},
 		| Pick::Body(id) => {
 			naming(ui, world, pick, history, rename);
@@ -300,6 +306,93 @@ fn paint(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 		history.begin("decals paint it", world);
 		world.entities.set_takes_decals(id, takes);
 	}
+}
+
+/// What an entity's records hold: a grid for each declared record, and a
+/// line for whatever waits for a record nobody has declared.
+///
+/// **Every record, whatever the entity is**, for the light's reason: every
+/// entity carries every record, and a section that appeared only for an entity
+/// that was already a door would leave nowhere to make one. Nothing here knows
+/// what a record's fields are; the engine's and a game's are drawn alike, from
+/// the declaration the host copied. @ref `colby_core::abi::record`.
+///
+/// What waits is shown and not edited: it has no kind until the record that
+/// takes it is declared, and it is kept so that a world written down while its
+/// game is not loaded loses nothing.
+fn records(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+	for table in 0..world.entities.records().tables().len() {
+		record(ui, world, id, table, history);
+	}
+
+	let mut waiting: Vec<(&str, usize)> = Vec::new();
+
+	for one in world.entities.waiting(id) {
+		match waiting
+			.iter_mut()
+			.find(|(record, _)| *record == one.record)
+		{
+			| Some((_, many)) => *many += 1,
+			| None => waiting.push((&one.record, 1)),
+		}
+	}
+
+	for (record, many) in waiting {
+		ui.label(format!(
+			"{record}: {} kept for a record nobody has declared",
+			counted(many, "value")
+		));
+	}
+}
+
+/// One declared record of one entity: its name, and a row a field.
+///
+/// Its columns are copied out first, because the grid writes the world a row
+/// at a time and a borrow of the table would hold the world for the whole of
+/// it.
+///
+/// @param table - the record's place in the declared records
+fn record(ui: &mut Ui, world: &mut World, id: EntityId, table: usize, history: &mut History) {
+	let Some((name, help, columns)) = world
+		.entities
+		.records()
+		.tables()
+		.get(table)
+		.map(|held| (held.name().to_owned(), held.help().to_owned(), held.columns().to_vec()))
+	else {
+		return;
+	};
+
+	ui.label(RichText::new(&name).strong())
+		.on_hover_text(help);
+
+	Grid::new(format!("record {name}"))
+		.num_columns(2)
+		.show(ui, |ui| {
+			for (index, column) in columns.iter().enumerate() {
+				let Some(held) = world.entities.field(id, table, index) else {
+					continue;
+				};
+				let words: Vec<&str> = column
+					.kind()
+					.words()
+					.iter()
+					.map(String::as_str)
+					.collect();
+				let mut value = held.clone();
+
+				ui.label(column.name())
+					.on_hover_text(column.help());
+				widget(ui, &format!("{name}.{}", column.name()), &words, &mut value);
+
+				if value != held {
+					history.begin("record", world);
+					world.entities.set_field(id, table, index, &value);
+				}
+
+				ui.end_row();
+			}
+		});
 }
 
 /// Everything the solver reads about a body, to edit.
@@ -647,7 +740,7 @@ fn inspect<T>(ui: &mut Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> b
 
 			let held = field.get(record);
 			let mut value = held.clone();
-			widget(ui, field, &mut value);
+			widget(ui, field.name, field.kind.words(), &mut value);
 
 			if value != held && field.set(record, value) {
 				edited = true;
@@ -663,10 +756,10 @@ fn inspect<T>(ui: &mut Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> b
 /// The widget one value is edited with, by its kind.
 ///
 /// @param ui - where to draw
-/// @param field - whose value it is, for the words a word may be and for an
-/// id no other widget in the panel has
+/// @param salt - an id no other widget in the panel has: the field's name
+/// @param words - the words a word may be, and none for any other value
 /// @param value - what to draw and edit in place
-fn widget<T>(ui: &mut Ui, field: &Field<T>, value: &mut Value) {
+fn widget(ui: &mut Ui, salt: &str, words: &[&str], value: &mut Value) {
 	match value {
 		| Value::Bool(held) => {
 			ui.checkbox(held, "");
@@ -684,7 +777,7 @@ fn widget<T>(ui: &mut Ui, field: &Field<T>, value: &mut Value) {
 		| Value::Vec3(held) => vector(ui, held, MOVE_SPEED),
 		| Value::Quat(held) => turn(ui, held),
 		| Value::Color(held) => color(ui, held),
-		| Value::Word(held) => words(ui, field.name, field.kind, held),
+		| Value::Word(held) => pick(ui, salt, words, held),
 		// never reached: a reference is skipped before a widget is asked for,
 		// @ref `inspect`. A slot number is what there would be to show.
 		| Value::Entity(_)
@@ -779,8 +872,7 @@ fn color(ui: &mut Ui, value: &mut Vec3) {
 }
 
 /// One of a few words, as a drop-down over the field's own list.
-fn words(ui: &mut Ui, salt: &str, kind: Kind, held: &mut u32) {
-	let list = kind.words();
+fn pick(ui: &mut Ui, salt: &str, list: &[&str], held: &mut u32) {
 	let shown = usize::try_from(*held)
 		.ok()
 		.and_then(|index| list.get(index))
@@ -827,6 +919,26 @@ mod tests {
 		assert_eq!(edited, *record, "nothing was touched, so nothing may have moved");
 
 		written
+	}
+
+	/// Every piece of text a frame painted, for a test that asks what a panel
+	/// shows rather than what it wrote.
+	fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+		let mut texts = Vec::new();
+		let mut open: Vec<&egui::Shape> = shapes
+			.iter()
+			.map(|clipped| &clipped.shape)
+			.collect();
+
+		while let Some(shape) = open.pop() {
+			if let egui::Shape::Text(text) = shape {
+				texts.push(text.galley.text().to_owned());
+			} else if let egui::Shape::Vec(inner) = shape {
+				open.extend(inner);
+			}
+		}
+
+		texts
 	}
 
 	/// A world holding one material under a name, and its handle.
@@ -942,6 +1054,123 @@ mod tests {
 			!untouched(&Post::DEFAULT, Post::FIELDS),
 			"and the post-processing, its word, its checkbox and its ten numbers included"
 		);
+	}
+
+	/// A game's record with a field of every kind a widget has to draw.
+	#[repr(C)]
+	#[derive(Clone, Copy, colby_core::bytemuck::Pod, colby_core::bytemuck::Zeroable)]
+	#[bytemuck(crate = "::colby_core::bytemuck")]
+	struct Door {
+		open: u32,
+		speed: f32,
+		turns: i32,
+		hinge: [f32; 3],
+		tint: [f32; 3],
+		lean: [f32; 4],
+		mark: [f32; 2],
+		style: u32,
+	}
+
+	/// The door as a game declares it.
+	const DOOR: colby_core::abi::Record<Door> = colby_core::abi::Record {
+		name: "door",
+		help: "a thing that swings",
+		rows: &[
+			colby_core::row!(Bool, Door, open, "whether it stands open"),
+			colby_core::row!(Float, Door, speed, "how fast"),
+			colby_core::row!(Int, Door, turns, "how many times"),
+			colby_core::row!(Vec3, Door, hinge, "what it swings about"),
+			colby_core::row!(Color, Door, tint, "its paint"),
+			colby_core::row!(Quat, Door, lean, "how it hangs"),
+			colby_core::row!(Vec2, Door, mark, "where its handle is"),
+			colby_core::row!(Word(&["swing", "slide"]), Door, style, "how it opens"),
+		],
+		default: Door {
+			open: 0,
+			speed: 1.0,
+			turns: 0,
+			hinge: [0.0, 1.0, 0.0],
+			tint: [1.0, 1.0, 1.0],
+			lean: [0.0, 0.0, 0.0, 1.0],
+			mark: [0.5, 0.5],
+			style: 0,
+		},
+	};
+
+	#[test]
+	fn an_entity_s_records_are_drawn_and_a_frame_nobody_touched_writes_nothing() {
+		// the rotation's trap again, for the rows a record draws: every kind a
+		// widget has, a rotation that is none of the easy ones, and a value
+		// waiting for a record nobody declared beside them. The world is being
+		// edited, so a write would open a step
+		let context = Context::default();
+		let mut world = World::new();
+		let mut history = History::default();
+		let id = world.entities.spawn();
+
+		world.editing = true;
+		world
+			.entities
+			.declare(&DOOR)
+			.expect("a door is a record a world holds");
+
+		if let Some(door) = world.entities.record_mut(&DOOR, id) {
+			door.open = 1;
+			door.speed = 0.37;
+			door.turns = -3;
+			door.tint = [0.2, 0.7, 0.9];
+			door.lean = Quat::from_euler(EulerRot::YXZ, 1.2, -0.4, 2.9).to_array();
+			door.style = 1;
+		}
+
+		if let Some(drawing) = world
+			.entities
+			.record_mut(&colby_core::abi::DRAWING, id)
+		{
+			drawing.covers = 1;
+		}
+
+		world.entities.note(id, &[colby_core::abi::Noted {
+			record: "gate".to_owned(),
+			field: "open".to_owned(),
+			value: colby_core::abi::Spelled::Truth(true),
+		}]);
+
+		let before = world.entities.noted(id);
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320.0, 4000.0))),
+				..Default::default()
+			},
+			|ui| detail(ui, &mut world, Pick::Entity(id), &mut history, false, None),
+		);
+		output.textures_delta.clear();
+
+		let texts = painted(&output.shapes);
+
+		for shown in ["drawing", "door", "gate: 1 value kept for a record nobody has declared"] {
+			assert!(
+				texts.iter().any(|text| text == shown),
+				"the panel shows {shown:?}, got {texts:?}"
+			);
+		}
+
+		assert_eq!(before.len(), 8, "the fixture holds a value in each record and one waiting");
+		assert_eq!(world.entities.noted(id), before, "a frame nobody touched moves no record");
+
+		// and opens nothing, so the next change is a step of its own rather than
+		// the tail of one the panel never stopped writing
+		history.settle(&world);
+		history.begin("move", &world);
+
+		if let Some(transform) = world.entities.transform_mut(id) {
+			transform.position.x += 1.0;
+		}
+
+		history.settle(&world);
+		history.settle(&world);
+
+		assert_eq!(history.undoable(), Some("move"), "and writes nothing down");
 	}
 
 	#[test]

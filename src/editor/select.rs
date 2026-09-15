@@ -23,7 +23,7 @@ use colby_asset::compile::Kind;
 use colby_core::{
 	abi::{
 		Body, BodyId, BodyKind, Decal, EntityId, JointId, MaterialId, MeshId, ModelId,
-		Renderable, Shape, Transform, Water, World, material, scene,
+		Renderable, Shape, Transform, Water, World, material, record, scene,
 	},
 	glam::Vec3,
 };
@@ -757,6 +757,12 @@ fn copy_entities(world: &mut World, sources: &[EntityId]) -> Vec<(EntityId, Enti
 		if let Some(terrain) = world.entities.terrain(source).copied() {
 			world.entities.set_terrain(copy, terrain);
 		}
+
+		// and what its records hold, by name, the way a save carries it: the copy
+		// is the same thing to every record the world declares, and to a record
+		// nobody has declared yet it waits the way the original's value does
+		let noted = world.entities.noted(source);
+		record::report(&world.entities.note(copy, &noted), "a duplicate");
 
 		let name = world.entities.name(source).to_owned();
 		world.entities.set_name(copy, &name);
@@ -1869,6 +1875,51 @@ mod tests {
 					.any(|joint| driving.contains(&joint.second)),
 			"one still to the world, one to the other copy"
 		);
+	}
+
+	#[test]
+	fn a_duplicate_carries_what_its_records_hold_and_what_waits_for_one() {
+		// the copy is a fourth path a thing takes out of the world and back into
+		// it, beside a save, a paste and a piece that crossed, and the only one
+		// that does not go through a description: found by a live run of the
+		// editor whose copy came back at every default
+		let (mut world, car, ..) = peopled();
+
+		if let Some(drawing) = world
+			.entities
+			.record_mut(&colby_core::abi::DRAWING, car)
+		{
+			drawing.covers = 1;
+		}
+
+		let waits = colby_core::abi::Noted {
+			record: "door".to_owned(),
+			field: "open".to_owned(),
+			value: colby_core::abi::Spelled::Truth(true),
+		};
+
+		assert!(
+			world
+				.entities
+				.note(car, std::slice::from_ref(&waits))
+				.is_empty(),
+			"a door nobody declared"
+		);
+
+		let copies = duplicate(&mut world, &[Pick::Entity(car)]);
+		let Some(Pick::Entity(copy)) = copies.first().copied() else {
+			panic!("the copy of the car");
+		};
+
+		assert!(
+			world
+				.entities
+				.record(&colby_core::abi::DRAWING, copy)
+				.is_some_and(|drawing| drawing.covers()),
+			"the copy covers what the original covers"
+		);
+		assert_eq!(world.entities.waiting(copy), &[waits], "and waits for what it waited for");
+		assert_eq!(world.entities.noted(copy), world.entities.noted(car), "every value, by name");
 	}
 
 	#[test]
