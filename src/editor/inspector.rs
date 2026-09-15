@@ -19,6 +19,12 @@
 //! after the world as it stood has been captured, so that a number dragged
 //! in a field is one step back however many frames the drag took.
 //!
+//! **What is shown is the last thing picked, and what is changed is written to
+//! everything picked of its kind**: the field that moved and nothing else, part
+//! by part for a vector, in the same step back. @ref [`select::Edit`] for what
+//! a changed field becomes on another thing. So a wall of bricks picked whole
+//! is marked as covering by one tick of one box.
+//!
 //! Everything that can be tested lives in [`select`](crate::select); what is
 //! here is the drawing, and it is checked by looking at it - except that an
 //! inspector nobody touches writes nothing, which a headless frame can check.
@@ -37,7 +43,7 @@ use egui::{ComboBox, DragValue, Grid, Label, RichText, ScrollArea, Ui};
 
 use crate::{
 	history::History,
-	select::{self, Pick, Selection},
+	select::{self, Edit, Pick, Selection},
 };
 
 /// How far a drag of one pixel moves three numbers.
@@ -70,21 +76,33 @@ pub(crate) fn show(
 		.show(ui, |ui| {
 			if selection.len() > 1 {
 				ui.label(format!(
-					"{} selected: the last picked is shown, and a drag moves all of them",
+					"{} selected: the last picked is shown, a drag moves all of them, and a \
+					 field changed here is written to all of them of its kind",
 					selection.len()
 				));
 				ui.separator();
 			}
 
-			detail(ui, world, selection.at(), history, rename, project);
+			let pick = selection.at();
+			let others: Vec<Pick> = selection
+				.others()
+				.into_iter()
+				.filter(|other| core::mem::discriminant(other) == core::mem::discriminant(&pick))
+				.collect();
+
+			detail(ui, world, pick, &others, history, rename, project);
 		});
 }
 
 /// The selected thing, in detail.
+///
+/// @param others - everything else selected of the same kind, which a changed
+/// field is written to as well
 fn detail(
 	ui: &mut Ui,
 	world: &mut World,
 	pick: Pick,
+	others: &[Pick],
 	history: &mut History,
 	rename: bool,
 	project: Option<&Project>,
@@ -96,15 +114,27 @@ fn detail(
 			settings(ui, world, history);
 		},
 		| Pick::Entity(id) => {
+			let entities: Vec<EntityId> = others
+				.iter()
+				.filter_map(|other| match *other {
+					| Pick::Entity(other) => Some(other),
+					| Pick::Nothing
+					| Pick::Body(_)
+					| Pick::Joint(_)
+					| Pick::Material(_)
+					| Pick::Model(_) => None,
+				})
+				.collect();
+
 			naming(ui, world, pick, history, rename);
 			hanging(ui, world, id);
-			placing(ui, world, pick, history);
-			look(ui, world, id, history);
-			lamp(ui, world, id, history);
-			thrower(ui, world, id, history);
-			land(ui, world, id, history);
-			paint(ui, world, id, history);
-			records(ui, world, id, history);
+			placing(ui, world, pick, others, history);
+			look(ui, world, id, &entities, history);
+			lamp(ui, world, id, &entities, history);
+			thrower(ui, world, id, &entities, history);
+			land(ui, world, id, &entities, history);
+			paint(ui, world, id, &entities, history);
+			records(ui, world, id, &entities, history);
 		},
 		| Pick::Body(id) => {
 			naming(ui, world, pick, history, rename);
@@ -112,12 +142,12 @@ fn detail(
 				|| "gone".to_owned(),
 				|body| format!("a {}", select::body_words(body)),
 			));
-			placing(ui, world, pick, history);
-			solid(ui, world, id, history);
+			placing(ui, world, pick, others, history);
+			solid(ui, world, id, others, history);
 		},
 		| Pick::Joint(id) => {
 			naming(ui, world, pick, history, rename);
-			tie(ui, world, id, history);
+			tie(ui, world, id, others, history);
 		},
 		| Pick::Material(id) => coat(ui, world, id),
 		| Pick::Model(id) => made_of(ui, world, id, project),
@@ -179,30 +209,74 @@ fn hanging(ui: &mut Ui, world: &World, id: EntityId) {
 /// In the thing's own terms - inside its parent, for an entity that hangs off
 /// one - because that is what a person expects to type; the gizmo in the
 /// viewport works in the world. @ref `select::local`.
-fn placing(ui: &mut Ui, world: &mut World, pick: Pick, history: &mut History) {
+fn placing(ui: &mut Ui, world: &mut World, pick: Pick, others: &[Pick], history: &mut History) {
 	let Some(transform) = select::local(world, pick) else {
 		return;
 	};
 
 	let mut edited = transform;
+	let edits = inspect(ui, "transform", &mut edited, Transform::FIELDS);
 
-	if inspect(ui, "transform", &mut edited, Transform::FIELDS) {
+	if !edits.is_empty() {
 		history.begin("place", world);
 		select::place_local(world, pick, edited);
+		select::spread_places(world, others, &edits);
+	}
+}
+
+/// Writes what was changed in one table of the entity shown into the same
+/// table of every other entity selected.
+///
+/// @param read - an entity's copy of the table
+/// @param write - puts a copy back
+fn onto<T>(
+	world: &mut World,
+	others: &[EntityId],
+	fields: &[Field<T>],
+	edits: &[Edit],
+	read: fn(&World, EntityId) -> Option<T>,
+	write: fn(&mut World, EntityId, T) -> bool,
+) {
+	for &other in others {
+		if let Some(mut theirs) = read(world, other)
+			&& select::spread(&mut theirs, fields, edits)
+		{
+			write(world, other, theirs);
+		}
 	}
 }
 
 /// What an entity looks like: the plain half of its renderable, which is the
 /// tint. The mesh, the material and the pose are handles, and the tree names
 /// the mesh in the row above.
-fn look(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+fn look(
+	ui: &mut Ui,
+	world: &mut World,
+	id: EntityId,
+	others: &[EntityId],
+	history: &mut History,
+) {
 	let Some(mut renderable) = world.entities.renderable(id).copied() else {
 		return;
 	};
 
-	if inspect(ui, "renderable", &mut renderable, Renderable::FIELDS) {
+	let edits = inspect(ui, "renderable", &mut renderable, Renderable::FIELDS);
+
+	if !edits.is_empty() {
 		history.begin("tint", world);
 		world.entities.set_renderable(id, renderable);
+		// @note: a mutation passing the others nothing here survives the suite. The
+		// one field this table edits is a color, whose picker a headless frame does
+		// not press, and what the call does is the lamp's, the ground's, the
+		// emitter's and the decal's, which the suite presses.
+		onto(
+			world,
+			others,
+			Renderable::FIELDS,
+			&edits,
+			|world, id| world.entities.renderable(id).copied(),
+			|world, id, renderable| world.entities.set_renderable(id, renderable),
+		);
 	}
 }
 
@@ -218,10 +292,10 @@ fn look(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 /// written back. @ref `colby_core::abi::scene::set_settings`.
 fn settings(ui: &mut Ui, world: &mut World, history: &mut History) {
 	let mut stage = scene::settings(world);
-	let mut moved = inspect(ui, "world", &mut stage, Stage::FIELDS);
+	let mut moved = !inspect(ui, "world", &mut stage, Stage::FIELDS).is_empty();
 
-	moved |= inspect(ui, "sky", &mut stage.sky, Sky::FIELDS);
-	moved |= inspect(ui, "post", &mut stage.post, Post::FIELDS);
+	moved |= !inspect(ui, "sky", &mut stage.sky, Sky::FIELDS).is_empty();
+	moved |= !inspect(ui, "post", &mut stage.post, Post::FIELDS).is_empty();
 
 	if moved {
 		history.begin("world", world);
@@ -236,14 +310,30 @@ fn settings(ui: &mut Ui, world: &mut World, history: &mut History) {
 /// entities that were already lights would leave nowhere to do it. Every
 /// field is plain, so the whole of it is the table. @ref
 /// `colby_core::abi::light`.
-fn lamp(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+fn lamp(
+	ui: &mut Ui,
+	world: &mut World,
+	id: EntityId,
+	others: &[EntityId],
+	history: &mut History,
+) {
 	let Some(mut light) = world.entities.light(id).copied() else {
 		return;
 	};
 
-	if inspect(ui, "light", &mut light, Light::FIELDS) {
+	let edits = inspect(ui, "light", &mut light, Light::FIELDS);
+
+	if !edits.is_empty() {
 		history.begin("light", world);
 		world.entities.set_light(id, light);
+		onto(
+			world,
+			others,
+			Light::FIELDS,
+			&edits,
+			|world, id| world.entities.light(id).copied(),
+			|world, id, light| world.entities.set_light(id, light),
+		);
 	}
 }
 
@@ -253,14 +343,30 @@ fn lamp(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 /// into a fire is picking a word in a drop-down, and a section that appeared
 /// only for entities that were already emitters would leave nowhere to do it.
 /// @ref `colby_core::abi::particles`.
-fn thrower(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+fn thrower(
+	ui: &mut Ui,
+	world: &mut World,
+	id: EntityId,
+	others: &[EntityId],
+	history: &mut History,
+) {
 	let Some(mut emitter) = world.entities.emitter(id).copied() else {
 		return;
 	};
 
-	if inspect(ui, "emitter", &mut emitter, Emitter::FIELDS) {
+	let edits = inspect(ui, "emitter", &mut emitter, Emitter::FIELDS);
+
+	if !edits.is_empty() {
 		history.begin("emitter", world);
 		world.entities.set_emitter(id, emitter);
+		onto(
+			world,
+			others,
+			Emitter::FIELDS,
+			&edits,
+			|world, id| world.entities.emitter(id).copied(),
+			|world, id, emitter| world.entities.set_emitter(id, emitter),
+		);
 	}
 }
 
@@ -272,14 +378,30 @@ fn thrower(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) 
 /// half a million triangles once per drag event. That is what the ceiling in
 /// `colby_core::abi::terrain` is for, and it is the reason this section has no
 /// live preview of its own - the world *is* the preview.
-fn land(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+fn land(
+	ui: &mut Ui,
+	world: &mut World,
+	id: EntityId,
+	others: &[EntityId],
+	history: &mut History,
+) {
 	let Some(mut terrain) = world.entities.terrain(id).copied() else {
 		return;
 	};
 
-	if inspect(ui, "terrain", &mut terrain, Terrain::FIELDS) {
+	let edits = inspect(ui, "terrain", &mut terrain, Terrain::FIELDS);
+
+	if !edits.is_empty() {
 		history.begin("terrain", world);
 		world.entities.set_terrain(id, terrain);
+		onto(
+			world,
+			others,
+			Terrain::FIELDS,
+			&edits,
+			|world, id| world.entities.terrain(id).copied(),
+			|world, id, terrain| world.entities.set_terrain(id, terrain),
+		);
 	}
 }
 
@@ -289,12 +411,28 @@ fn land(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 /// picking a word in a drop-down. The word against decals sits under it,
 /// because it is the other half of the same question and nothing else on the
 /// panel is about paint. @ref `colby_core::abi::decal`.
-fn paint(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
-	if let Some(mut decal) = world.entities.decal(id).copied()
-		&& inspect(ui, "decal", &mut decal, Decal::FIELDS)
-	{
-		history.begin("decal", world);
-		world.entities.set_decal(id, decal);
+fn paint(
+	ui: &mut Ui,
+	world: &mut World,
+	id: EntityId,
+	others: &[EntityId],
+	history: &mut History,
+) {
+	if let Some(mut decal) = world.entities.decal(id).copied() {
+		let edits = inspect(ui, "decal", &mut decal, Decal::FIELDS);
+
+		if !edits.is_empty() {
+			history.begin("decal", world);
+			world.entities.set_decal(id, decal);
+			onto(
+				world,
+				others,
+				Decal::FIELDS,
+				&edits,
+				|world, id| world.entities.decal(id).copied(),
+				|world, id, decal| world.entities.set_decal(id, decal),
+			);
+		}
 	}
 
 	let mut takes = world.entities.takes_decals(id);
@@ -304,7 +442,10 @@ fn paint(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 		.changed()
 	{
 		history.begin("decals paint it", world);
-		world.entities.set_takes_decals(id, takes);
+
+		for &each in std::iter::once(&id).chain(others) {
+			world.entities.set_takes_decals(each, takes);
+		}
 	}
 }
 
@@ -320,9 +461,15 @@ fn paint(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
 /// What waits is shown and not edited: it has no kind until the record that
 /// takes it is declared, and it is kept so that a world written down while its
 /// game is not loaded loses nothing.
-fn records(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+fn records(
+	ui: &mut Ui,
+	world: &mut World,
+	id: EntityId,
+	others: &[EntityId],
+	history: &mut History,
+) {
 	for table in 0..world.entities.records().tables().len() {
-		record(ui, world, id, table, history);
+		record(ui, world, id, others, table, history);
 	}
 
 	let mut waiting: Vec<(&str, usize)> = Vec::new();
@@ -351,8 +498,17 @@ fn records(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) 
 /// at a time and a borrow of the table would hold the world for the whole of
 /// it.
 ///
+/// @param others - every other entity selected, which a changed field is
+/// written to as well
 /// @param table - the record's place in the declared records
-fn record(ui: &mut Ui, world: &mut World, id: EntityId, table: usize, history: &mut History) {
+fn record(
+	ui: &mut Ui,
+	world: &mut World,
+	id: EntityId,
+	others: &[EntityId],
+	table: usize,
+	history: &mut History,
+) {
 	let Some((name, help, columns)) = world
 		.entities
 		.records()
@@ -388,6 +544,7 @@ fn record(ui: &mut Ui, world: &mut World, id: EntityId, table: usize, history: &
 				if value != held {
 					history.begin("record", world);
 					world.entities.set_field(id, table, index, &value);
+					select::spread_record(world, others, table, &Edit { index, held, value });
 				}
 
 				ui.end_row();
@@ -399,16 +556,28 @@ fn record(ui: &mut Ui, world: &mut World, id: EntityId, table: usize, history: &
 ///
 /// Its place is the row above, through the transform's own table, and the
 /// entity it drives is the branch it hangs under in the tree.
-fn solid(ui: &mut Ui, world: &mut World, id: BodyId, history: &mut History) {
+fn solid(ui: &mut Ui, world: &mut World, id: BodyId, others: &[Pick], history: &mut History) {
 	let Some(mut body) = world.bodies.get(id).copied() else {
 		return;
 	};
 
-	if inspect(ui, "body", &mut body, Body::FIELDS) {
-		history.begin("body", world);
+	let edits = inspect(ui, "body", &mut body, Body::FIELDS);
 
-		if let Some(held) = world.bodies.get_mut(id) {
-			*held = body;
+	if edits.is_empty() {
+		return;
+	}
+
+	history.begin("body", world);
+
+	if let Some(held) = world.bodies.get_mut(id) {
+		*held = body;
+	}
+
+	for other in others {
+		if let Pick::Body(other) = *other
+			&& let Some(held) = world.bodies.get_mut(other)
+		{
+			select::spread(held, Body::FIELDS, &edits);
 		}
 	}
 }
@@ -418,7 +587,7 @@ fn solid(ui: &mut Ui, world: &mut World, id: BodyId, history: &mut History) {
 /// Its two bodies are handles, which the table describes and cannot name, so
 /// the two rows that name them are drawn here; the anchors are in each body's
 /// own space, and are numbers all the same.
-fn tie(ui: &mut Ui, world: &mut World, id: JointId, history: &mut History) {
+fn tie(ui: &mut Ui, world: &mut World, id: JointId, others: &[Pick], history: &mut History) {
 	let Some(mut joint) = world.joints.get(id).copied() else {
 		return;
 	};
@@ -437,11 +606,23 @@ fn tie(ui: &mut Ui, world: &mut World, id: JointId, history: &mut History) {
 		ui.end_row();
 	});
 
-	if inspect(ui, "joint", &mut joint, Joint::FIELDS) {
-		history.begin("joint", world);
+	let edits = inspect(ui, "joint", &mut joint, Joint::FIELDS);
 
-		if let Some(held) = world.joints.get_mut(id) {
-			*held = joint;
+	if edits.is_empty() {
+		return;
+	}
+
+	history.begin("joint", world);
+
+	if let Some(held) = world.joints.get_mut(id) {
+		*held = joint;
+	}
+
+	for other in others {
+		if let Pick::Joint(other) = *other
+			&& let Some(held) = world.joints.get_mut(other)
+		{
+			select::spread(held, Joint::FIELDS, &edits);
 		}
 	}
 }
@@ -489,7 +670,7 @@ fn coat(ui: &mut Ui, world: &mut World, id: MaterialId) {
 			ui.end_row();
 		});
 
-	edited |= inspect(ui, "material", &mut material, Material::FIELDS);
+	edited |= !inspect(ui, "material", &mut material, Material::FIELDS).is_empty();
 
 	if edited && let Some(held) = world.materials.get_mut(id) {
 		*held = material;
@@ -726,12 +907,13 @@ fn resolve(world: &World, typed: &str, handle: &mut TextureId) -> bool {
 /// @param salt - what tells this grid from another in the same panel
 /// @param record - what to show and edit
 /// @param fields - its table
-/// @return whether any field was written
-fn inspect<T>(ui: &mut Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> bool {
-	let mut edited = false;
+/// @return every field that was written, with what it held before, for
+/// whatever else is selected
+fn inspect<T>(ui: &mut Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> Vec<Edit> {
+	let mut edits = Vec::new();
 
 	Grid::new(salt).num_columns(2).show(ui, |ui| {
-		for field in fields {
+		for (index, field) in fields.iter().enumerate() {
 			if field.kind.is_reference() {
 				continue;
 			}
@@ -742,15 +924,15 @@ fn inspect<T>(ui: &mut Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> b
 			let mut value = held.clone();
 			widget(ui, field.name, field.kind.words(), &mut value);
 
-			if value != held && field.set(record, value) {
-				edited = true;
+			if value != held && field.set(record, value.clone()) {
+				edits.push(Edit { index, held, value });
 			}
 
 			ui.end_row();
 		}
 	});
 
-	edited
+	edits
 }
 
 /// The widget one value is edited with, by its kind.
@@ -912,7 +1094,7 @@ mod tests {
 		// wrong one for a test - so the delta is cleared on purpose, the way
 		// the editor does on its way out.
 		let mut output = context.run_ui(RawInput::default(), |ui| {
-			written = inspect(ui, "test", &mut edited, fields);
+			written = !inspect(ui, "test", &mut edited, fields).is_empty();
 		});
 		output.textures_delta.clear();
 
@@ -1136,19 +1318,30 @@ mod tests {
 			value: colby_core::abi::Spelled::Truth(true),
 		}]);
 
+		// and something else selected beside it, which a frame nobody touched must
+		// leave alone as well
+		let other = world.entities.spawn();
+		let others = [Pick::Entity(other)];
+		let theirs = world.entities.noted(other);
+
 		let before = world.entities.noted(id);
 		let mut output = context.run_ui(
 			RawInput {
 				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320.0, 4000.0))),
 				..Default::default()
 			},
-			|ui| detail(ui, &mut world, Pick::Entity(id), &mut history, false, None),
+			|ui| detail(ui, &mut world, Pick::Entity(id), &others, &mut history, false, None),
 		);
 		output.textures_delta.clear();
 
 		let texts = painted(&output.shapes);
 
-		for shown in ["drawing", "door", "gate: 1 value kept for a record nobody has declared"] {
+		for shown in [
+			"drawing",
+			"editing",
+			"door",
+			"gate: 1 value kept for a record nobody has declared",
+		] {
 			assert!(
 				texts.iter().any(|text| text == shown),
 				"the panel shows {shown:?}, got {texts:?}"
@@ -1157,6 +1350,7 @@ mod tests {
 
 		assert_eq!(before.len(), 8, "the fixture holds a value in each record and one waiting");
 		assert_eq!(world.entities.noted(id), before, "a frame nobody touched moves no record");
+		assert_eq!(world.entities.noted(other), theirs, "and none of what is selected beside it");
 
 		// and opens nothing, so the next change is a step of its own rather than
 		// the tail of one the panel never stopped writing
@@ -1183,7 +1377,7 @@ mod tests {
 		let was = scene::settings(&world);
 
 		let mut output = context.run_ui(RawInput::default(), |ui| {
-			detail(ui, &mut world, Pick::Nothing, &mut history, false, None);
+			detail(ui, &mut world, Pick::Nothing, &[], &mut history, false, None);
 		});
 		output.textures_delta.clear();
 
@@ -1286,5 +1480,379 @@ mod tests {
 		assert_eq!(counted(0, "piece"), "0 pieces");
 		assert_eq!(counted(1, "piece"), "1 piece");
 		assert_eq!(counted(5, "piece"), "5 pieces");
+	}
+
+	/// Every shape a frame painted, with what a list of shapes holds taken out
+	/// of it.
+	fn flat(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Shape> {
+		let mut found = Vec::new();
+		let mut open: Vec<egui::Shape> = shapes
+			.iter()
+			.map(|clipped| clipped.shape.clone())
+			.collect();
+
+		while let Some(shape) = open.pop() {
+			if let egui::Shape::Vec(inner) = shape {
+				open.extend(inner);
+			} else {
+				found.push(shape);
+			}
+		}
+
+		found
+	}
+
+	/// Where to click to press a checkbox a frame painted: the middle of its
+	/// own words when it has some, and otherwise of the first box painted on
+	/// the row of the label in front of it, past the label's end.
+	fn checkbox(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<Pos2> {
+		let flat = flat(shapes);
+		let words = flat.iter().find_map(|shape| match shape {
+			| egui::Shape::Text(text) if text.galley.text() == label =>
+				Some(text.visual_bounding_rect()),
+			| _ => None,
+		})?;
+
+		if label.contains(' ') {
+			return Some(words.center());
+		}
+
+		flat.iter()
+			.filter_map(|shape| match shape {
+				| egui::Shape::Rect(boxed)
+					if boxed.rect.min.x >= words.max.x
+						&& (boxed.rect.center().y - words.center().y).abs() < words.height() =>
+					Some(boxed.rect),
+				| _ => None,
+			})
+			.min_by(|one, two| one.min.x.total_cmp(&two.min.x))
+			.map(|boxed| boxed.center())
+	}
+
+	/// Frames of a panel over one context: the first to find the widget beside
+	/// a label, the second to press it, and one more for each list of what is
+	/// to follow the press. Drawn once a frame whatever egui asks, because a
+	/// checkbox drawn twice answers a click twice.
+	fn driven(label: &str, then: &[&[egui::Event]], draw: &mut dyn FnMut(&mut Ui)) {
+		let context = Context::default();
+		let shapes = painted_frame(&context, Vec::new(), draw);
+		let at = checkbox(&shapes, label).expect("the label and its widget were painted");
+		let mut events = vec![egui::Event::PointerMoved(at)];
+
+		for down in [true, false] {
+			events.push(egui::Event::PointerButton {
+				pos: at,
+				button: egui::PointerButton::Primary,
+				pressed: down,
+				modifiers: egui::Modifiers::NONE,
+			});
+		}
+
+		drop(painted_frame(&context, events, draw));
+
+		for events in then {
+			drop(painted_frame(&context, events.to_vec(), draw));
+		}
+	}
+
+	/// One frame of a panel over a context, and what it painted.
+	///
+	/// A frame with nothing in it is drawn every time egui asks, so that what
+	/// it hands back is the pass that laid everything out; a frame with a
+	/// press in it is drawn once, so that the press is answered once.
+	fn painted_frame(
+		context: &Context,
+		events: Vec<egui::Event>,
+		draw: &mut dyn FnMut(&mut Ui),
+	) -> Vec<egui::epaint::ClippedShape> {
+		let pressing = !events.is_empty();
+		let mut once = false;
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(360.0, 6000.0))),
+				events,
+				..Default::default()
+			},
+			|ui| {
+				if !pressing || !once {
+					once = true;
+					draw(ui);
+				}
+			},
+		);
+		output.textures_delta.clear();
+
+		output.shapes
+	}
+
+	/// The checkbox beside a label in the inspector over what is picked,
+	/// pressed.
+	fn pressed(
+		world: &mut World,
+		pick: Pick,
+		others: &[Pick],
+		history: &mut History,
+		label: &str,
+	) {
+		driven(label, &[], &mut |ui| detail(ui, world, pick, others, history, false, None));
+	}
+
+	/// What a key pressed on a number that has taken the keyboard does: one
+	/// step of its speed up.
+	const UP: egui::Event = egui::Event::Key {
+		key: egui::Key::ArrowUp,
+		physical_key: None,
+		pressed: true,
+		repeat: false,
+		modifiers: egui::Modifiers::NONE,
+	};
+
+	/// The number beside a label in the inspector over what is picked, clicked
+	/// into and stepped up once.
+	fn stepped(
+		world: &mut World,
+		pick: Pick,
+		others: &[Pick],
+		history: &mut History,
+		label: &str,
+	) {
+		driven(label, &[&[UP]], &mut |ui| detail(ui, world, pick, others, history, false, None));
+	}
+
+	/// The number beside a label in the inspector over what is picked, clicked
+	/// into and typed over, then left: a whole number, which a step up cannot
+	/// move, and a frame after the typing, which is when egui takes what was
+	/// typed.
+	fn typed(
+		world: &mut World,
+		pick: Pick,
+		others: &[Pick],
+		history: &mut History,
+		label: &str,
+		number: &str,
+	) {
+		let enter = egui::Event::Key {
+			key: egui::Key::Enter,
+			physical_key: None,
+			pressed: true,
+			repeat: false,
+			modifiers: egui::Modifiers::NONE,
+		};
+
+		driven(label, &[&[egui::Event::Text(number.to_owned()), enter], &[]], &mut |ui| {
+			detail(ui, world, pick, others, history, false, None);
+		});
+	}
+
+	#[test]
+	fn a_number_stepped_on_what_is_shown_is_written_to_every_entity_picked() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut history = History::default();
+		let [shown, other, alone] = [(); 3].map(|()| world.entities.spawn());
+		let picked = [Pick::Entity(other)];
+
+		if let Some(at) = world.entities.transform_mut(other) {
+			at.position = Vec3::new(5.0, 6.0, 7.0);
+		}
+
+		stepped(&mut world, Pick::Entity(shown), &picked, &mut history, "position");
+		let across = world
+			.entities
+			.transform(shown)
+			.map_or(0.0, |it| it.position.x);
+		assert!(across > 0.0, "the number moved on the entity shown: {across}");
+		assert_eq!(
+			world
+				.entities
+				.transform(other)
+				.map(|it| it.position),
+			Some(Vec3::new(across, 6.0, 7.0)),
+			"and across on the entity picked with it, which keeps its own height and depth"
+		);
+		assert_eq!(
+			world
+				.entities
+				.transform(alone)
+				.map(|it| it.position),
+			Some(Vec3::ZERO)
+		);
+
+		stepped(&mut world, Pick::Entity(shown), &picked, &mut history, "rate");
+		let rate = |world: &World, id| {
+			world
+				.entities
+				.emitter(id)
+				.map_or(0.0, |it| it.rate)
+		};
+		assert!(rate(&world, shown) > Emitter::NONE.rate, "an emitter's rate, stepped");
+		assert!(
+			(rate(&world, other) - rate(&world, shown)).abs() < f32::EPSILON
+				&& (rate(&world, alone) - Emitter::NONE.rate).abs() < f32::EPSILON,
+			"on the emitter picked with it and not on the other"
+		);
+
+		// order typed rather than fade stepped: the fade's row is under the note egui
+		// draws over a second widget of one id in a debug build, which takes the
+		// click, and a whole number steps a quarter at a time and rounds back
+		typed(&mut world, Pick::Entity(shown), &picked, &mut history, "order", "3");
+		let order = |world: &World, id| world.entities.decal(id).map_or(0, |it| it.order);
+		assert_eq!(
+			[order(&world, shown), order(&world, other), order(&world, alone)],
+			[3, 3, Decal::NONE.order],
+			"and a decal's order, typed"
+		);
+	}
+
+	#[test]
+	fn a_place_changed_on_an_entity_is_not_written_to_a_body_picked_beside_it() {
+		// the inspector shows the entity and a changed field goes to what is picked
+		// of its kind: a body's place is the world's and would be moved by an
+		// entity's own numbers
+		let mut world = World::new();
+		world.editing = true;
+		let mut history = History::default();
+		let crate_ = world.entities.spawn();
+		let stone = world.bodies.spawn(Body::new(
+			colby_core::abi::BodyKind::Static,
+			Shape::UNIT,
+			Transform::at(Vec3::new(5.0, 0.0, 0.0)),
+		));
+		let mut selection = Selection::default();
+		selection.set(&world, Pick::Body(stone));
+		selection.toggle(&world, Pick::Entity(crate_));
+
+		driven("position", &[&[UP]], &mut |ui| {
+			show(ui, &mut world, &selection, &mut history, false, None);
+		});
+
+		assert!(
+			world
+				.entities
+				.transform(crate_)
+				.is_some_and(|it| it.position.x > 0.0),
+			"the entity shown moved"
+		);
+		assert_eq!(
+			world
+				.bodies
+				.get(stone)
+				.map(|it| it.transform.position),
+			Some(Vec3::new(5.0, 0.0, 0.0)),
+			"and the body picked beside it did not"
+		);
+	}
+
+	#[test]
+	fn a_record_field_ticked_on_what_is_shown_is_written_to_every_entity_picked_as_one_step() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut history = History::default();
+		let [shown, left, right, alone] = [(); 4].map(|()| world.entities.spawn());
+		let covering = |world: &World, id| {
+			world
+				.entities
+				.record(&colby_core::abi::DRAWING, id)
+				.is_some_and(|it| it.covers())
+		};
+
+		pressed(
+			&mut world,
+			Pick::Entity(shown),
+			&[Pick::Entity(left), Pick::Entity(right)],
+			&mut history,
+			"covers",
+		);
+
+		assert!(covering(&world, shown), "the brick shown covers");
+		assert!(
+			covering(&world, left) && covering(&world, right),
+			"and so does every brick picked with it"
+		);
+		assert!(!covering(&world, alone), "and nothing that was not picked");
+
+		// the frame that wrote, and the first one nobody wrote in, which closes it
+		history.settle(&world);
+		history.settle(&world);
+		assert_eq!(history.undoable(), Some("record"), "as one step back");
+	}
+
+	#[test]
+	fn a_table_s_flag_ticked_on_what_is_shown_is_written_to_every_thing_of_its_kind_picked() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut history = History::default();
+		let [shown, other, alone] = [(); 3].map(|()| world.entities.spawn());
+		let picked = [Pick::Entity(other)];
+
+		pressed(&mut world, Pick::Entity(shown), &picked, &mut history, "shadow");
+		let shadowed = |world: &World, id| {
+			world
+				.entities
+				.light(id)
+				.is_some_and(|it| it.shadow)
+		};
+		assert_eq!(
+			[shadowed(&world, shown), shadowed(&world, other), shadowed(&world, alone)],
+			[false, false, true],
+			"a lamp's shadow, on the lamp shown and the lamp picked with it"
+		);
+
+		pressed(&mut world, Pick::Entity(shown), &picked, &mut history, "solid");
+		let solid = |world: &World, id| {
+			world
+				.entities
+				.terrain(id)
+				.is_some_and(|it| it.solid)
+		};
+		assert_eq!(
+			[solid(&world, shown), solid(&world, other), solid(&world, alone)],
+			[!Terrain::NONE.solid, !Terrain::NONE.solid, Terrain::NONE.solid],
+			"ground's, the same"
+		);
+
+		pressed(&mut world, Pick::Entity(shown), &picked, &mut history, "decals paint it");
+		assert_eq!(
+			[
+				world.entities.takes_decals(shown),
+				world.entities.takes_decals(other),
+				world.entities.takes_decals(alone)
+			],
+			[false, false, true],
+			"and whether decals paint it"
+		);
+
+		let [one, two, three] = [(); 3].map(|()| {
+			world.bodies.spawn(Body::new(
+				colby_core::abi::BodyKind::Static,
+				Shape::UNIT,
+				Transform::IDENTITY,
+			))
+		});
+
+		pressed(&mut world, Pick::Body(one), &[Pick::Body(two)], &mut history, "sensor");
+		let sensing = |world: &World, id| world.bodies.get(id).is_some_and(|it| it.sensor);
+		assert_eq!(
+			[sensing(&world, one), sensing(&world, two), sensing(&world, three)],
+			[true, true, false],
+			"a body's, on the bodies picked"
+		);
+
+		let [first, second, third] = [(); 3].map(|()| {
+			world
+				.joints
+				.spawn(Joint::weld(one, two, (Vec3::ZERO, Vec3::X)))
+		});
+
+		pressed(&mut world, Pick::Joint(first), &[Pick::Joint(second)], &mut history, "collide");
+		let colliding = |world: &World, id| world.joints.get(id).is_some_and(|it| it.collide);
+		assert_eq!(
+			[colliding(&world, first), colliding(&world, second), colliding(&world, third)],
+			[!Joint::weld(one, two, (Vec3::ZERO, Vec3::X)).collide; 2]
+				.into_iter()
+				.chain([Joint::weld(one, two, (Vec3::ZERO, Vec3::X)).collide])
+				.collect::<Vec<bool>>()[..],
+			"and a joint's"
+		);
 	}
 }

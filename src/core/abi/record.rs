@@ -158,7 +158,7 @@ pub struct Shape {
 /// A scene source that writes one of these is checked against it when it is
 /// compiled, the way every other table the engine owns is. A record a game
 /// declares cannot be: the compiler never loads a game.
-pub const ENGINE: &[Shape] = &[super::entity::DRAWING.shape()];
+pub const ENGINE: &[Shape] = &[super::entity::DRAWING.shape(), super::entity::EDITING.shape()];
 
 /// Checks that a field is stored as the type its kind is held in.
 ///
@@ -2183,8 +2183,26 @@ mod tests {
 		records
 			.declare(&super::super::entity::DRAWING)
 			.expect("drawing is a record a world holds");
+		records
+			.declare(&super::super::entity::EDITING)
+			.expect("editing is a record a world holds");
 
 		assert_eq!(ENGINE.len(), records.tables().len(), "every engine record, and only them");
-		assert_eq!(ENGINE[0].name, records.tables()[0].name(), "by name");
+
+		for (shape, table) in ENGINE.iter().zip(records.tables()) {
+			assert_eq!(shape.name, table.name(), "by name, in the order a world declares them");
+		}
+
+		let world = super::super::World::new();
+		let declared: Vec<&str> = world
+			.entities
+			.records()
+			.tables()
+			.iter()
+			.map(Table::name)
+			.collect();
+		let listed: Vec<&str> = ENGINE.iter().map(|shape| shape.name).collect();
+
+		assert_eq!(declared, listed, "and a world declares exactly the records the list names");
 	}
 }

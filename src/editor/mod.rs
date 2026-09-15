@@ -265,6 +265,19 @@ pub(crate) enum Change {
 		parent: EntityId,
 	},
 
+	/// Put the entities selected into a new group, and select it.
+	Group,
+
+	/// Take the groups selected apart, and select what was in them.
+	Ungroup,
+
+	/// Select everything hanging off an entity, and not the entity.
+	///
+	/// What marks a whole wall in one gesture: the wall's group is the row the
+	/// menu opened on, and a field changed afterwards is written to every
+	/// brick.
+	Inside(EntityId),
+
 	/// Hide an entity and everything hanging off it, or show it again.
 	Hide {
 		/// Which.
@@ -672,6 +685,14 @@ impl Panels {
 			self.viewport
 				.run(&context, world, &self.selection, self.view, self.tabs.history())
 		{
+			// the outermost group around what is under the pointer, and exactly
+			// what is under it with alt held
+			let pick = if context.input(|input| input.modifiers.alt) {
+				pick
+			} else {
+				select::grouped(world, pick)
+			};
+
 			if context.input(|input| input.modifiers.command) {
 				self.selection.toggle(world, pick);
 			} else {
@@ -771,6 +792,60 @@ impl Panels {
 		self.selection.clear();
 
 		info!(entities = went.entities, bodies = went.bodies, joints = went.joints, "deleted");
+	}
+
+	/// Puts the entities selected into a new group, as one record, and selects
+	/// the group.
+	fn group(&mut self, world: &mut World) {
+		let picks = self.selection.picks();
+		if !picks
+			.iter()
+			.any(|pick| matches!(pick, Pick::Entity(_)))
+		{
+			return;
+		}
+
+		self.tabs.history().begin("group", world);
+		let made = select::group(world, &picks, Editor::grid(world));
+
+		if made.is_empty() {
+			warn!("there was no room in the world for a group");
+
+			return;
+		}
+
+		self.selection.clear();
+		for pick in &made {
+			self.selection.toggle(world, *pick);
+		}
+
+		info!(picked = picks.len(), "grouped");
+	}
+
+	/// Takes the groups selected apart, as one record, and selects what was in
+	/// them.
+	fn ungroup(&mut self, world: &mut World) {
+		let picks = self.selection.picks();
+		if !picks.iter().any(|pick| match *pick {
+			| Pick::Entity(id) => select::is_group(world, id),
+			| Pick::Nothing
+			| Pick::Body(_)
+			| Pick::Joint(_)
+			| Pick::Material(_)
+			| Pick::Model(_) => false,
+		}) {
+			return;
+		}
+
+		self.tabs.history().begin("ungroup", world);
+		let released = select::ungroup(world, &picks);
+
+		self.selection.clear();
+		for pick in &released {
+			self.selection.toggle(world, *pick);
+		}
+
+		info!(released = released.len(), "ungrouped");
 	}
 
 	/// Copies everything selected, as one record, and selects the copies.
@@ -908,6 +983,15 @@ impl Panels {
 					// other two are a race with the world. Worth a line, not
 					// a stop.
 					debug!(?child, ?parent, "nothing was hung");
+				}
+			},
+			| Change::Group => self.group(world),
+			| Change::Ungroup => self.ungroup(world),
+			| Change::Inside(entity) => {
+				self.selection.clear();
+
+				for id in select::descendants(world, entity) {
+					self.selection.toggle(world, Pick::Entity(id));
 				}
 			},
 			| Change::Hide { entity, hidden } => {
@@ -1211,7 +1295,7 @@ impl Panels {
 }
 
 /// The keys, if they were pressed where nothing else wanted them: a step
-/// back and forward, delete, duplicate, rename.
+/// back and forward, delete, duplicate, group and ungroup, rename.
 ///
 /// Skipped while a text field is taking typing, so that a ctrl+z or a
 /// delete in it stays the field's - and only then: a row or a button that
@@ -1244,6 +1328,15 @@ fn stepped(context: &Context) -> Vec<Change> {
 
 		if input.consume_key(Modifiers::COMMAND, Key::D) {
 			changes.push(Change::Duplicate);
+		}
+
+		// the shift first again, for the reason the redo chord is
+		if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::G) {
+			changes.push(Change::Ungroup);
+		}
+
+		if input.consume_key(Modifiers::COMMAND, Key::G) {
+			changes.push(Change::Group);
 		}
 
 		if input.consume_key(Modifiers::NONE, Key::F2) {
@@ -1330,7 +1423,29 @@ mod tests {
 	/// and a frame built twice would answer a key twice - the same guard
 	/// `Shell::run` keeps.
 	fn frame_with(panels: &mut Panels, world: &mut World, events: Vec<egui::Event>) -> Rect {
-		let context = Context::default();
+		frame_holding(panels, world, events, Modifiers::NONE)
+	}
+
+	/// The same, with modifier keys held down through it.
+	fn frame_holding(
+		panels: &mut Panels,
+		world: &mut World,
+		events: Vec<egui::Event>,
+		modifiers: Modifiers,
+	) -> Rect {
+		frame_on(&Context::default(), panels, world, events, modifiers).0
+	}
+
+	/// The same over a context that lasts, for what egui answers from the frame
+	/// before: whether the pointer is over a panel or over what the panels
+	/// left, which a fresh context cannot say and answers as a panel.
+	fn frame_on(
+		context: &Context,
+		panels: &mut Panels,
+		world: &mut World,
+		events: Vec<egui::Event>,
+		modifiers: Modifiers,
+	) -> (Rect, Vec<egui::epaint::ClippedShape>) {
 		let clock = Clock::new();
 		let host = Host {
 			clock: &clock,
@@ -1342,6 +1457,11 @@ mod tests {
 		};
 		let mut view = Rect::NOTHING;
 		let mut built = false;
+		// the keys held are an event of their own, ahead of what they are held
+		// through
+		let events = std::iter::once(egui::Event::ModifiersChanged(modifiers))
+			.chain(events)
+			.collect();
 
 		let mut output = context.run_ui(
 			RawInput {
@@ -1361,7 +1481,7 @@ mod tests {
 		// shell does on its way out.
 		output.textures_delta.clear();
 
-		view
+		(view, output.shapes)
 	}
 
 	#[test]
@@ -1894,6 +2014,214 @@ mod tests {
 		assert!(world.entities.alive(bystander), "and nothing else");
 		assert_eq!(panels.selection.at(), Pick::Nothing, "nothing is selected now");
 		assert_eq!(panels.tabs.history().undoable(), Some("delete"), "and it is one step back");
+	}
+
+	#[test]
+	fn ctrl_g_groups_what_is_selected_and_ctrl_shift_g_takes_it_apart_each_one_step() {
+		let mut world = World::new();
+		world.editing = true;
+		let crate_ = world.entities.spawn_at(Transform::at(Vec3::X));
+		let barrel = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(3.0, 0.0, 0.0)));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(crate_)));
+		panels.apply(&mut world, Change::Toggle(Pick::Entity(barrel)));
+
+		keyed(&mut panels, &mut world, Key::G, Modifiers::COMMAND);
+		frame(&mut panels, &mut world);
+
+		let Pick::Entity(group) = panels.selection.at() else {
+			panic!("the group is what is selected");
+		};
+		assert_eq!(panels.selection.len(), 1, "and nothing else");
+		assert!(select::is_group(&world, group), "and it is one");
+		assert_eq!(world.entities.parent(crate_), group, "with the crate in it");
+		assert_eq!(world.entities.parent(barrel), group, "and the barrel");
+		assert_eq!(panels.tabs.history().undoable(), Some("group"), "one step back");
+
+		keyed(&mut panels, &mut world, Key::G, Modifiers::COMMAND | Modifiers::SHIFT);
+		frame(&mut panels, &mut world);
+
+		assert!(!world.entities.alive(group), "taken apart, the empty group went");
+		assert_eq!(
+			world.entities.parent(crate_),
+			EntityId::NONE,
+			"and the crate stands on its own"
+		);
+		assert!(
+			panels.selection.is(Pick::Entity(crate_))
+				&& panels.selection.is(Pick::Entity(barrel)),
+			"with what was inside selected"
+		);
+		assert_eq!(panels.tabs.history().undoable(), Some("ungroup"), "one step back as well");
+	}
+
+	#[test]
+	fn a_click_in_the_picture_selects_the_outermost_group_and_with_alt_what_is_under_it() {
+		let mut world = World::new();
+		world.editing = true;
+		world.camera.position = Vec3::new(0.0, 0.0, 10.0);
+		world.camera.target = Vec3::ZERO;
+		let group = world.entities.spawn();
+		let crate_ = world.entities.spawn_at(Transform::IDENTITY);
+		world.entities.set_renderable(
+			crate_,
+			colby_core::abi::Renderable::new(colby_core::abi::MeshId::CUBE, Vec3::ONE),
+		);
+		assert!(world.entities.set_parent(crate_, group));
+
+		if let Some(editing) = world
+			.entities
+			.record_mut(&colby_core::abi::EDITING, group)
+		{
+			editing.group = 1;
+		}
+
+		let mut panels = Panels::default();
+		let context = Context::default();
+		let (view, _) = frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let size = Vec2::new(view.width(), view.height());
+		let at = gizmo::project(
+			world
+				.render_camera()
+				.view_projection(size.x / size.y),
+			Vec3::ZERO,
+			size,
+		)
+		.expect("the crate is in front of the camera");
+		let pointer = Pos2::new(view.min.x + at.x, view.min.y + at.y);
+		let click = || {
+			let mut events = vec![egui::Event::PointerMoved(pointer)];
+
+			for pressed in [true, false] {
+				events.push(egui::Event::PointerButton {
+					pos: pointer,
+					button: egui::PointerButton::Primary,
+					pressed,
+					modifiers: Modifiers::NONE,
+				});
+			}
+
+			events
+		};
+
+		drop(frame_on(&context, &mut panels, &mut world, click(), Modifiers::NONE));
+
+		assert_eq!(panels.selection.at(), Pick::Entity(group), "the group around the crate");
+
+		panels.apply(&mut world, Change::Select(Pick::Nothing));
+		drop(frame_on(&context, &mut panels, &mut world, click(), Modifiers::ALT));
+
+		assert_eq!(
+			panels.selection.at(),
+			Pick::Entity(crate_),
+			"and the crate itself with alt held"
+		);
+	}
+
+	/// How many straight lines some shapes draw, a list of shapes opened up.
+	fn straight_lines(shapes: Vec<egui::epaint::ClippedShape>) -> usize {
+		let mut open: Vec<egui::Shape> = shapes
+			.into_iter()
+			.map(|clipped| clipped.shape)
+			.collect();
+		let mut count = 0;
+
+		while let Some(shape) = open.pop() {
+			match shape {
+				| egui::Shape::Vec(inner) => open.extend(inner),
+				| egui::Shape::LineSegment { .. } => count += 1,
+				| _ => {},
+			}
+		}
+
+		count
+	}
+
+	#[test]
+	fn a_selected_group_is_drawn_in_a_box_and_a_selected_member_is_not() {
+		let mut world = World::new();
+		world.editing = true;
+		world.camera.position = Vec3::new(0.0, 3.0, 10.0);
+		world.camera.target = Vec3::ZERO;
+		let group = world.entities.spawn();
+		let crate_ = world.entities.spawn_at(Transform::at(Vec3::X));
+		world.entities.set_renderable(
+			crate_,
+			colby_core::abi::Renderable::new(colby_core::abi::MeshId::CUBE, Vec3::ONE),
+		);
+		assert!(world.entities.set_parent(crate_, group));
+
+		if let Some(editing) = world
+			.entities
+			.record_mut(&colby_core::abi::EDITING, group)
+		{
+			editing.group = 1;
+		}
+
+		// the second of two frames over one context, which is the one that laid
+		// everything out; every straight line in it, the gizmo's arms among them
+		let lines = |world: &mut World, pick: Pick| {
+			let mut panels = Panels::default();
+			panels.apply(world, Change::Select(pick));
+			let context = Context::default();
+			drop(frame_on(&context, &mut panels, world, Vec::new(), Modifiers::NONE));
+			let (_, shapes) = frame_on(&context, &mut panels, world, Vec::new(), Modifiers::NONE);
+
+			straight_lines(shapes)
+		};
+
+		let boxed = lines(&mut world, Pick::Entity(group));
+		let plain = lines(&mut world, Pick::Entity(crate_));
+
+		assert_eq!(
+			boxed,
+			plain + 12,
+			"the group's box is twelve edges beside the gizmo both of them have"
+		);
+	}
+
+	#[test]
+	fn a_group_is_not_made_of_nothing_and_nothing_is_written_down_for_it() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut panels = Panels::default();
+		let count = world.entities.len();
+
+		keyed(&mut panels, &mut world, Key::G, Modifiers::COMMAND);
+		frame(&mut panels, &mut world);
+		keyed(&mut panels, &mut world, Key::G, Modifiers::COMMAND | Modifiers::SHIFT);
+		frame(&mut panels, &mut world);
+
+		assert_eq!(world.entities.len(), count, "no group of nothing");
+		assert_eq!(panels.tabs.history().undoable(), None, "and no step back over it");
+	}
+
+	#[test]
+	fn selecting_what_hangs_off_a_row_selects_the_branch_and_not_the_row() {
+		let mut world = World::new();
+		let wall = world.entities.spawn();
+		let bricks =
+			[Vec3::X, Vec3::Y, Vec3::Z].map(|at| world.entities.spawn_at(Transform::at(at)));
+		let mortar = world.entities.spawn();
+
+		for brick in bricks {
+			assert!(world.entities.set_parent(brick, wall));
+		}
+
+		assert!(world.entities.set_parent(mortar, bricks[0]));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(wall)));
+
+		panels.apply(&mut world, Change::Inside(wall));
+
+		assert!(!panels.selection.is(Pick::Entity(wall)), "not the wall");
+		assert_eq!(panels.selection.len(), 4, "every brick, and what hangs off a brick");
+
+		for id in bricks.into_iter().chain([mortar]) {
+			assert!(panels.selection.is(Pick::Entity(id)));
+		}
 	}
 
 	#[test]

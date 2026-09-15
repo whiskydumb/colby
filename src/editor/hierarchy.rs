@@ -20,8 +20,13 @@
 //! each other. @ref [`select::entity_label`].
 //!
 //! **A click selects, a ctrl-click adds or takes out**, and a right click
-//! selects and opens the two things done to a selection: duplicate and
-//! delete, which the keys do as well.
+//! selects and opens what is done to a selection: duplicate, delete, group and
+//! ungroup, which the keys do as well, and on a row something hangs off,
+//! selecting what does.
+//!
+//! **A group is a row like any other**, with a word beside its name: an entity
+//! that other entities hang off and that a click in the picture selects in
+//! their place. @ref [`select::grouped`].
 //!
 //! Nothing here changes the world: a press is handed back as a [`Change`] and
 //! applied by the caller, so the panel can be drawn in a test without a
@@ -164,13 +169,13 @@ impl Hierarchy {
 		changes: &mut Vec<Change>,
 		id: EntityId,
 	) {
-		entity_row(ui, world, selection, changes, id);
-
 		let driving = self.driving(world, id);
 		let children = self
 			.children
 			.get(id.slot())
 			.map_or(&[][..], Vec::as_slice);
+
+		entity_row(ui, world, selection, changes, id, !children.is_empty());
 
 		if driving.is_empty() && children.is_empty() {
 			return;
@@ -243,13 +248,17 @@ impl Hierarchy {
 }
 
 /// One entity's line: a row that can be dragged onto another, and dropped
-/// on.
+/// on, and says so when the entity is a group.
+///
+/// @param holds - whether anything hangs off it, which is when its menu offers
+/// to select what does
 fn entity_row(
 	ui: &mut Ui,
 	world: &World,
 	selection: &Selection,
 	changes: &mut Vec<Change>,
 	id: EntityId,
+	holds: bool,
 ) {
 	let pick = Pick::Entity(id);
 	let label = select::entity_label(world, id);
@@ -269,7 +278,18 @@ fn entity_row(
 			// to the topmost widget that senses one, and a wrapper that senses
 			// only drags laid over a row that senses only clicks is a row
 			// nobody can click.
-			ui.add(Button::selectable(selection.is(pick), text).sense(Sense::click_and_drag()))
+			let pressed = ui
+				.add(Button::selectable(selection.is(pick), text).sense(Sense::click_and_drag()));
+
+			// a word beside the name rather than a new kind of row: a group is an
+			// entity like any other, and the one thing that tells it apart is what
+			// a click in the picture does
+			if select::is_group(world, id) {
+				ui.weak("group")
+					.on_hover_text("a click in the picture on anything in it selects it");
+			}
+
+			pressed
 		})
 		.inner;
 
@@ -277,7 +297,7 @@ fn entity_row(
 	// lands, so a row that went away mid-drag hangs nothing.
 	response.dnd_set_drag_payload(id);
 
-	acted(ui, &response, selection, changes, pick);
+	acted(ui, &response, selection, changes, pick, holds.then_some(id));
 
 	if response.dragged() {
 		ghost(ui, &label);
@@ -369,18 +389,21 @@ fn ghost(ui: &Ui, label: &str) {
 fn row(ui: &mut Ui, selection: &Selection, changes: &mut Vec<Change>, pick: Pick, label: &str) {
 	let response = ui.selectable_label(selection.is(pick), label);
 
-	acted(ui, &response, selection, changes, pick);
+	acted(ui, &response, selection, changes, pick, None);
 }
 
 /// What a press on any row comes to: a click selects, a ctrl-click adds or
 /// takes out, a right click selects what was not selected and opens the
 /// menu over the selection.
+///
+/// @param holds - the entity the row is, when something hangs off it
 fn acted(
 	ui: &Ui,
 	response: &Response,
 	selection: &Selection,
 	changes: &mut Vec<Change>,
 	pick: Pick,
+	holds: Option<EntityId>,
 ) {
 	if response.clicked() {
 		changes.push(if ui.input(|input| input.modifiers.command) {
@@ -394,12 +417,14 @@ fn acted(
 		changes.push(Change::Select(pick));
 	}
 
-	response.context_menu(|ui| menu(ui, changes));
+	response.context_menu(|ui| menu(ui, changes, holds));
 }
 
-/// The two things done to a selection, for the people who do not know the
-/// keys yet.
-fn menu(ui: &mut Ui, changes: &mut Vec<Change>) {
+/// The things done to a selection, for the people who do not know the keys
+/// yet, and one done to the row's own branch.
+///
+/// @param holds - the entity the menu opened on, when something hangs off it
+fn menu(ui: &mut Ui, changes: &mut Vec<Change>, holds: Option<EntityId>) {
 	if ui.button("duplicate  ctrl+d").clicked() {
 		changes.push(Change::Duplicate);
 		ui.close();
@@ -407,6 +432,23 @@ fn menu(ui: &mut Ui, changes: &mut Vec<Change>) {
 
 	if ui.button("delete  del").clicked() {
 		changes.push(Change::Delete);
+		ui.close();
+	}
+
+	if ui.button("group  ctrl+g").clicked() {
+		changes.push(Change::Group);
+		ui.close();
+	}
+
+	if ui.button("ungroup  ctrl+shift+g").clicked() {
+		changes.push(Change::Ungroup);
+		ui.close();
+	}
+
+	if let Some(id) = holds
+		&& ui.button("select what hangs off it").clicked()
+	{
+		changes.push(Change::Inside(id));
 		ui.close();
 	}
 }
@@ -542,19 +584,71 @@ mod tests {
 	}
 
 	/// One press and one release, which is a click.
-	fn clicked(at: Pos2) -> Vec<egui::Event> {
+	fn clicked(at: Pos2) -> Vec<egui::Event> { pressed(at, PointerButton::Primary) }
+
+	/// One press and one release of a button.
+	fn pressed(at: Pos2, button: PointerButton) -> Vec<egui::Event> {
 		let mut events = vec![egui::Event::PointerMoved(at)];
 
 		for pressed in [true, false] {
 			events.push(egui::Event::PointerButton {
 				pos: at,
-				button: PointerButton::Primary,
+				button,
 				pressed,
 				modifiers: Modifiers::NONE,
 			});
 		}
 
 		events
+	}
+
+	/// The whole tree drawn once over one context: every word it painted, each
+	/// with where, and what pressing it asked for.
+	fn tree_frame(
+		context: &Context,
+		hierarchy: &mut Hierarchy,
+		world: &World,
+		selection: &Selection,
+		events: Vec<egui::Event>,
+	) -> (Vec<(String, Rect)>, Vec<Change>) {
+		let mut changes = Vec::new();
+		let mut once = false;
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 600.0))),
+				events,
+				..Default::default()
+			},
+			|ui| {
+				if !once {
+					once = true;
+					hierarchy.show(ui, world, selection, &mut changes);
+				}
+			},
+		);
+		output.textures_delta.clear();
+
+		(words(output.shapes), changes)
+	}
+
+	/// Every word some shapes paint, a list of shapes opened up.
+	fn words(shapes: Vec<egui::epaint::ClippedShape>) -> Vec<(String, Rect)> {
+		let mut words = Vec::new();
+		let mut open: Vec<egui::Shape> = shapes
+			.into_iter()
+			.map(|clipped| clipped.shape)
+			.collect();
+
+		while let Some(shape) = open.pop() {
+			match shape {
+				| egui::Shape::Vec(inner) => open.extend(inner),
+				| egui::Shape::Text(text) =>
+					words.push((text.galley.text().to_owned(), text.visual_bounding_rect())),
+				| _ => {},
+			}
+		}
+
+		words
 	}
 
 	/// One eye drawn on its own, and what pressing it asked for.
@@ -630,5 +724,80 @@ mod tests {
 		let (changes, _) = eyed(&context, &world, wheel, clicked(drawn.center()));
 
 		assert_eq!(changes, vec![Change::Hide { entity: wheel, hidden: true }]);
+	}
+
+	#[test]
+	fn a_group_s_row_says_so_and_its_menu_offers_what_is_done_to_a_group() {
+		let mut world = yard();
+		let car = named(&world, "car");
+
+		if let Some(editing) = world
+			.entities
+			.record_mut(&colby_core::abi::EDITING, car)
+		{
+			editing.group = 1;
+		}
+
+		let mut hierarchy = Hierarchy::default();
+		let selection = Selection::default();
+		let context = Context::default();
+		let mut frame = |events: Vec<egui::Event>| {
+			tree_frame(&context, &mut hierarchy, &world, &selection, events)
+		};
+
+		let (words, _) = frame(Vec::new());
+		let said = |words: &[(String, Rect)], word: &str| {
+			words.iter().filter(|(it, _)| it == word).count()
+		};
+
+		assert_eq!(
+			said(&words, "group"),
+			1,
+			"the car's row says it is a group, and the wheel's does not"
+		);
+
+		let row = words
+			.iter()
+			.find(|(it, _)| it == "car")
+			.map(|(_, rect)| rect.center())
+			.expect("the car's row was painted");
+
+		drop(frame(pressed(row, PointerButton::Secondary)));
+		let (words, _) = frame(Vec::new());
+
+		for offered in ["group  ctrl+g", "ungroup  ctrl+shift+g", "select what hangs off it"] {
+			assert_eq!(said(&words, offered), 1, "the menu offers {offered:?}");
+		}
+
+		// and each of the three asks for what it says
+		for (offered, asked) in [
+			("group  ctrl+g", Change::Group),
+			("ungroup  ctrl+shift+g", Change::Ungroup),
+			("select what hangs off it", Change::Inside(car)),
+		] {
+			let (words, _) = frame(Vec::new());
+			let item = words
+				.iter()
+				.find(|(it, _)| it == offered)
+				.map(|(_, rect)| rect.center());
+
+			let item = match item {
+				| Some(item) => item,
+				| None => {
+					drop(frame(pressed(row, PointerButton::Secondary)));
+					let (words, _) = frame(Vec::new());
+
+					words
+						.iter()
+						.find(|(it, _)| it == offered)
+						.map(|(_, rect)| rect.center())
+						.expect("the menu opened again")
+				},
+			};
+
+			let (_, changes) = frame(pressed(item, PointerButton::Primary));
+
+			assert_eq!(changes, vec![asked], "pressing {offered:?}");
+		}
 	}
 }

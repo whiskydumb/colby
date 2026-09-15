@@ -2162,6 +2162,8 @@ mod tests {
 		for (text, said) in [
 			(r#"{ "drawing": { "hides": true } }"#, "has no field called hides"),
 			(r#"{ "drawing": { "covers": 1 } }"#, "should be true or false"),
+			(r#"{ "editing": { "grouped": true } }"#, "has no field called grouped"),
+			(r#"{ "editing": { "group": "yes" } }"#, "editing.group should be true or false"),
 			(r#"{ "door": { "speed": null } }"#, "door.speed should be"),
 			(r#"{ "door": { "speed": [1] } }"#, "door.speed should be"),
 			(r#"{ "door": { "speed": [1, 2, 3, 4, 5] } }"#, "two to four numbers"),
@@ -2185,6 +2187,16 @@ mod tests {
 		.expect("a game's record is taken as written: nothing here knows its fields");
 
 		assert_eq!(game.things[0].records.len(), 2, "both of them");
+
+		let group =
+			import(r#"{ "entities": [ { "records": { "editing": { "group": true } } } ] }"#)
+				.expect("the editor's word on a group is the engine's to check, and this is it");
+
+		assert_eq!(group.things[0].records, vec![noted(
+			"editing",
+			"group",
+			Spelled::Truth(true)
+		)]);
 	}
 
 	#[test]

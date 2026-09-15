@@ -22,10 +22,11 @@
 use colby_asset::compile::Kind;
 use colby_core::{
 	abi::{
-		Body, BodyId, BodyKind, Decal, EntityId, JointId, MaterialId, MeshId, ModelId,
-		Renderable, Shape, Transform, Water, World, material, record, scene,
+		Body, BodyId, BodyKind, Decal, EDITING, Emitter, EntityId, Field, JointId, MaterialId,
+		MeshId, ModelId, Renderable, Shape, Transform, Water, World, field::Value, material,
+		record, scene,
 	},
-	glam::Vec3,
+	glam::{Vec2, Vec3},
 };
 
 /// One thing in the world, whichever of the three tables it lives in.
@@ -937,6 +938,284 @@ fn copy_joints(world: &mut World, body_copies: &[(BodyId, BodyId)]) -> Vec<(Join
 	joint_copies
 }
 
+/// What a new group is called, until somebody names it.
+pub(crate) const GROUP: &str = "group";
+
+/// Whether an entity is a group: its `editing` record says a click on anything
+/// hanging off it selects it. @ref [`Editing`](colby_core::abi::Editing).
+pub(crate) fn is_group(world: &World, id: EntityId) -> bool {
+	world
+		.entities
+		.record(&EDITING, id)
+		.is_some_and(|editing| editing.group())
+}
+
+/// What a click in the picture on something selects: the outermost group it
+/// hangs off, or the thing itself when it hangs off none.
+///
+/// **Outermost rather than nearest**: what a person grouped last is the thing
+/// they reach for, and a group inside it, or one of its members, is reached
+/// from the hierarchy or with alt held, which asks for exactly what is under
+/// the pointer. A parent that is not a group is walked through, so a folder of
+/// groups does not swallow every click in it.
+///
+/// @param world - what to look in
+/// @param pick - what is under the pointer
+pub(crate) fn grouped(world: &World, pick: Pick) -> Pick {
+	let Pick::Entity(id) = pick else {
+		return pick;
+	};
+
+	let mut found = id;
+	let mut above = world.entities.parent(id);
+
+	// bounded like the walk in `hangs_off`, and for its reason
+	for _ in 0..colby_core::abi::MAX_ENTITIES {
+		if !above.is_some() {
+			break;
+		}
+
+		if is_group(world, above) {
+			found = above;
+		}
+
+		above = world.entities.parent(above);
+	}
+
+	Pick::Entity(found)
+}
+
+/// The box in the world around some entities, each counted on its own.
+///
+/// A thing that draws counts as the eight corners of its mesh's box carried
+/// through where it is drawn, so a turned thing counts as the room it takes up.
+/// A thing that draws nothing counts as the point it stands at, which is where
+/// a lamp or an empty group is.
+///
+/// @param world - what to look in
+/// @param ids - the entities; a stale handle counts as nothing
+/// @return the least and the greatest corner, or nothing when nothing counted
+pub(crate) fn bounds(world: &World, ids: &[EntityId]) -> Option<(Vec3, Vec3)> {
+	let mut low = Vec3::splat(f32::INFINITY);
+	let mut high = Vec3::splat(f32::NEG_INFINITY);
+
+	for &id in ids {
+		let Some(placed) = world.entities.placed(id) else {
+			continue;
+		};
+
+		// a mesh with nothing in it reports a point, and the null mesh is such a
+		// mesh: `aim::under`'s rule for a thing that draws nothing
+		let boxed = world
+			.entities
+			.renderable(id)
+			.and_then(|look| world.meshes.get(look.mesh))
+			.map(|mesh| mesh.value().bounds())
+			.filter(|(min, max)| !min.cmpge(*max).all());
+
+		let Some((min, max)) = boxed else {
+			low = low.min(placed.position);
+			high = high.max(placed.position);
+
+			continue;
+		};
+
+		let matrix = placed.matrix();
+
+		for corner in [
+			Vec3::new(min.x, min.y, min.z),
+			Vec3::new(max.x, min.y, min.z),
+			Vec3::new(min.x, max.y, min.z),
+			Vec3::new(max.x, max.y, min.z),
+			Vec3::new(min.x, min.y, max.z),
+			Vec3::new(max.x, min.y, max.z),
+			Vec3::new(min.x, max.y, max.z),
+			Vec3::new(max.x, max.y, max.z),
+		] {
+			let at = matrix.transform_point3(corner);
+			low = low.min(at);
+			high = high.max(at);
+		}
+	}
+
+	low.cmple(high).all().then_some((low, high))
+}
+
+/// The entities picked that hang off no other entity picked: alive, once, in
+/// the order they were picked.
+///
+/// What a group takes in. A child picked together with its parent already goes
+/// wherever the parent goes, and hanging it off the group as well would take it
+/// out of the parent it was picked inside.
+fn tops(world: &World, picks: &[Pick]) -> Vec<EntityId> {
+	let picked: Vec<EntityId> = picks
+		.iter()
+		.filter_map(|pick| {
+			if let Pick::Entity(id) = *pick
+				&& world.entities.alive(id)
+			{
+				Some(id)
+			} else {
+				None
+			}
+		})
+		.collect();
+
+	let mut found: Vec<EntityId> = Vec::new();
+
+	for &id in &picked {
+		let inside = picked
+			.iter()
+			.any(|&other| other != id && hangs_off(world, id, other));
+
+		if !inside && !found.contains(&id) {
+			found.push(id);
+		}
+	}
+
+	found
+}
+
+/// Puts the entities picked into a new group: an entity that draws nothing,
+/// marked as a group, that they hang off.
+///
+/// **Where it stands**: the middle of the box around everything going into it,
+/// on the grid when there is one, neither turned nor scaled. The middle is
+/// where a person reaches for what they grouped, and the grid is there so that
+/// a group dragged on it keeps what hangs off it on the grid too. **What it
+/// hangs off**: whatever all of them hang off, when that is one thing, and
+/// nothing otherwise. **What moves**: nothing. Each thing keeps its place in
+/// the world and only what it is measured from changes, @ref [`hang`], so a
+/// body under it is where it was and stays right.
+///
+/// A group picked goes inside the new one whole, rather than being taken apart
+/// into it: nothing here flattens what somebody built.
+///
+/// @param world - the world to write
+/// @param picks - what was selected; only entities are grouped
+/// @param step - the grid, or nothing for none
+/// @return the group, for the selection; empty when no entity was picked or
+/// there was no room for one
+pub(crate) fn group(world: &mut World, picks: &[Pick], step: Option<f32>) -> Vec<Pick> {
+	let tops = tops(world, picks);
+
+	let Some(&first) = tops.first() else {
+		return Vec::new();
+	};
+
+	let Some((low, high)) = bounds(world, &branches(world, picks)) else {
+		return Vec::new();
+	};
+
+	let middle = snapped((low + high) * 0.5, step.unwrap_or(0.0));
+	let above = world.entities.parent(first);
+	let parent = if tops
+		.iter()
+		.all(|&id| world.entities.parent(id) == above)
+	{
+		above
+	} else {
+		EntityId::NONE
+	};
+
+	let group = world.entities.spawn_at(Transform::at(middle));
+	if !group.is_some() {
+		return Vec::new();
+	}
+
+	world.entities.set_name(group, GROUP);
+
+	if let Some(editing) = world.entities.record_mut(&EDITING, group) {
+		editing.group = 1;
+	}
+
+	// hung off what they hung off, and standing in the middle of them in the
+	// world whatever that is
+	world.entities.set_parent(group, parent);
+	world
+		.entities
+		.set_placed(group, Transform::at(middle));
+
+	for &id in &tops {
+		hang(world, id, group);
+	}
+
+	vec![Pick::Entity(group)]
+}
+
+/// Takes the groups picked apart: what hangs off each hangs where the group
+/// did, keeping its place in the world, and a group that is nothing but a
+/// group goes.
+///
+/// A group that is something else as well stays where it is and is only no
+/// longer a group: one that draws, shines, throws, paints or is ground, or that
+/// a body drives, would take more than the grouping with it. Something picked
+/// that is not a group is left alone.
+///
+/// @param world - the world to write
+/// @param picks - what was selected
+/// @return what hung off the groups, for the selection
+pub(crate) fn ungroup(world: &mut World, picks: &[Pick]) -> Vec<Pick> {
+	let mut released: Vec<Pick> = Vec::new();
+
+	for &pick in picks {
+		let Pick::Entity(group) = pick else {
+			continue;
+		};
+
+		if !is_group(world, group) {
+			continue;
+		}
+
+		let above = world.entities.parent(group);
+		let inside: Vec<EntityId> = world
+			.entities
+			.iter()
+			.map(|(id, ..)| id)
+			.filter(|&id| world.entities.parent(id) == group)
+			.collect();
+
+		for id in inside {
+			hang(world, id, above);
+			released.push(Pick::Entity(id));
+		}
+
+		if hollow(world, group) {
+			world.entities.despawn(group);
+		} else if let Some(editing) = world.entities.record_mut(&EDITING, group) {
+			editing.group = 0;
+		}
+	}
+
+	released
+}
+
+/// Whether an entity is nothing but somewhere to hang things: it draws, shines,
+/// throws, paints and grounds nothing, and no body drives it.
+fn hollow(world: &World, id: EntityId) -> bool {
+	world
+		.entities
+		.renderable(id)
+		.is_some_and(|look| !look.mesh.is_some())
+		&& !world
+			.entities
+			.light(id)
+			.is_some_and(|light| light.is_lit())
+		&& !world
+			.entities
+			.emitter(id)
+			.is_some_and(Emitter::throws)
+		&& !world
+			.entities
+			.decal(id)
+			.is_some_and(|decal| decal.paints())
+		&& !world
+			.entities
+			.terrain(id)
+			.is_some_and(|terrain| terrain.is_ground())
+		&& driver(world, id).is_none()
+}
+
 /// How big a pool is when somebody asks for one, in world units.
 ///
 /// Wide, shallow and not square: a pool that came out a cube would have to be
@@ -1308,9 +1587,126 @@ fn ratio(now: f32, before: f32) -> f32 {
 	}
 }
 
+/// One field an inspector changed on the thing it shows, to be written to
+/// everything else selected with it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Edit {
+	/// The field's place in its table.
+	pub(crate) index: usize,
+
+	/// What it held on the thing shown, before the change.
+	pub(crate) held: Value,
+
+	/// What it holds now.
+	pub(crate) value: Value,
+}
+
+impl Edit {
+	/// What the same field of another thing becomes: the parts of the value
+	/// that were changed, and the other thing's own for the rest.
+	///
+	/// **Part by part for two and three numbers and a color**, so that dragging
+	/// the height of forty things moves each one's height and leaves each one
+	/// where it was across. A rotation goes whole: its three angles are a round
+	/// trip, and one of them alone names no rotation anybody asked for.
+	///
+	/// @param other - what the other thing holds in the field now
+	pub(crate) fn onto(&self, other: &Value) -> Value {
+		match (&self.held, &self.value, other) {
+			| (Value::Vec2(held), Value::Vec2(value), Value::Vec2(other)) => Value::Vec2(
+				Vec2::new(part(held.x, value.x, other.x), part(held.y, value.y, other.y)),
+			),
+			| (Value::Vec3(held), Value::Vec3(value), Value::Vec3(other)) =>
+				Value::Vec3(parts(*held, *value, *other)),
+			| (Value::Color(held), Value::Color(value), Value::Color(other)) =>
+				Value::Color(parts(*held, *value, *other)),
+			| _ => self.value.clone(),
+		}
+	}
+}
+
+/// Three numbers of a changed value: each changed one, and the other's own for
+/// the rest.
+fn parts(held: Vec3, value: Vec3, other: Vec3) -> Vec3 {
+	Vec3::new(
+		part(held.x, value.x, other.x),
+		part(held.y, value.y, other.y),
+		part(held.z, value.z, other.z),
+	)
+}
+
+/// One number of a changed value: the new one if it moved, the other's own if
+/// it did not. By its bits, so a number dragged away and back is one that did
+/// not move.
+fn part(held: f32, value: f32, other: f32) -> f32 {
+	if value.to_bits() == held.to_bits() {
+		other
+	} else {
+		value
+	}
+}
+
+/// Writes what was changed on the thing shown into another record of its kind.
+///
+/// @param record - the other thing's record, written in place
+/// @param fields - the record's table
+/// @param edits - what was changed
+/// @return whether any field of it was written
+pub(crate) fn spread<T>(record: &mut T, fields: &[Field<T>], edits: &[Edit]) -> bool {
+	let mut written = false;
+
+	for edit in edits {
+		let Some(field) = fields.get(edit.index) else {
+			continue;
+		};
+
+		let now = field.get(record);
+		written |= field.set(record, edit.onto(&now));
+	}
+
+	written
+}
+
+/// Writes one field of a declared record, changed on the entity shown, into
+/// the same record of every other entity selected.
+///
+/// @param world - the world to write
+/// @param others - the other entities
+/// @param table - the record's place in the declared records
+/// @param edit - what was changed, its index the field's column
+pub(crate) fn spread_record(world: &mut World, others: &[EntityId], table: usize, edit: &Edit) {
+	for &other in others {
+		let Some(now) = world.entities.field(other, table, edit.index) else {
+			continue;
+		};
+
+		world
+			.entities
+			.set_field(other, table, edit.index, &edit.onto(&now));
+	}
+}
+
+/// Writes what was changed in the place of the thing shown into the places of
+/// everything else selected, each in its own terms. @ref [`local`].
+///
+/// @param world - the world to write
+/// @param others - the other things
+/// @param edits - what was changed in the transform
+pub(crate) fn spread_places(world: &mut World, others: &[Pick], edits: &[Edit]) {
+	for &other in others {
+		let Some(mut transform) = local(world, other) else {
+			continue;
+		};
+
+		if spread(&mut transform, Transform::FIELDS, edits) {
+			place_local(world, other, transform);
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{Emitter, Joint, Light, ShapeKind, Terrain};
+	use colby_core::abi::{Joint, Light, ShapeKind, Terrain};
 
 	use super::*;
 
@@ -2195,6 +2591,488 @@ mod tests {
 				.map(|it| it.transform.position),
 			Some(Vec3::new(1.0, 0.0, 9.0)),
 			"the wheel's body went with the car's"
+		);
+	}
+
+	/// Marks an entity as a group, or stops it being one.
+	fn marked(world: &mut World, id: EntityId, group: bool) {
+		if let Some(editing) = world.entities.record_mut(&EDITING, id) {
+			editing.group = u32::from(group);
+		}
+	}
+
+	/// Whether two places in the world are the same place, to within rounding.
+	fn same_place(one: Option<Transform>, two: Option<Transform>) -> bool {
+		match (one, two) {
+			| (Some(one), Some(two)) =>
+				one.position.abs_diff_eq(two.position, 1.0e-5)
+					&& one.rotation.abs_diff_eq(two.rotation, 1.0e-5)
+					&& one.scale.abs_diff_eq(two.scale, 1.0e-5),
+			| _ => false,
+		}
+	}
+
+	#[test]
+	fn a_click_selects_the_outermost_group_around_what_it_landed_on() {
+		let mut world = World::new();
+		let street = world.entities.spawn();
+		let folder = world.entities.spawn();
+		let wall = world.entities.spawn();
+		let brick = world.entities.spawn_at(Transform::at(Vec3::X));
+		let loose = world.entities.spawn();
+		assert!(world.entities.set_parent(folder, street));
+		assert!(world.entities.set_parent(wall, folder));
+		assert!(world.entities.set_parent(brick, wall));
+		marked(&mut world, street, true);
+		marked(&mut world, wall, true);
+
+		assert_eq!(
+			grouped(&world, Pick::Entity(brick)),
+			Pick::Entity(street),
+			"the outermost group, walked up through a parent that is not one"
+		);
+		assert_eq!(
+			grouped(&world, Pick::Entity(folder)),
+			Pick::Entity(street),
+			"from anywhere inside it"
+		);
+		assert_eq!(
+			grouped(&world, Pick::Entity(loose)),
+			Pick::Entity(loose),
+			"and the thing itself when it hangs off no group"
+		);
+
+		marked(&mut world, street, false);
+
+		assert_eq!(
+			grouped(&world, Pick::Entity(brick)),
+			Pick::Entity(wall),
+			"a street that is only a parent is walked through to the wall inside it"
+		);
+		assert_eq!(grouped(&world, Pick::Entity(wall)), Pick::Entity(wall), "a group is its own");
+		assert_eq!(grouped(&world, Pick::Nothing), Pick::Nothing, "and nothing is nothing");
+	}
+
+	#[test]
+	fn the_box_around_things_counts_a_mesh_by_its_corners_and_what_draws_nothing_as_a_point() {
+		let mut world = World::new();
+		let slab = world.entities.spawn_at(Transform {
+			position: Vec3::new(10.0, 0.0, 0.0),
+			rotation: colby_core::glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+			scale: Vec3::new(2.0, 4.0, 6.0),
+		});
+		world
+			.entities
+			.set_renderable(slab, Renderable::new(MeshId::CUBE, Vec3::ONE));
+		let lamp = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(0.0, 3.0, 0.0)));
+		let gone = world.entities.spawn();
+		assert!(world.entities.despawn(gone));
+
+		let (low, high) = bounds(&world, &[slab, lamp, gone]).expect("two things count");
+
+		assert!(
+			low.abs_diff_eq(Vec3::new(0.0, -2.0, -1.0), 1.0e-5)
+				&& high.abs_diff_eq(Vec3::new(13.0, 3.0, 1.0), 1.0e-5),
+			"a unit cube six long turned a quarter reaches three either way across x, and a \
+			 lamp is where it stands: {low} {high}"
+		);
+		assert!(bounds(&world, &[]).is_none(), "nothing counted is no box");
+		assert!(bounds(&world, &[gone]).is_none(), "and nor is a stale handle");
+	}
+
+	#[test]
+	fn a_group_is_made_in_the_middle_of_what_it_holds_on_the_grid_and_nothing_moves() {
+		let mut world = World::new();
+		let [Pick::Entity(near)] = block(&mut world, Vec3::ZERO, None)[..] else {
+			panic!("a block");
+		};
+		let [Pick::Entity(far)] = block(&mut world, Vec3::new(3.2, 0.0, 0.0), None)[..] else {
+			panic!("a block");
+		};
+		let lid = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(0.0, 1.2, 0.0)));
+		assert!(world.entities.set_parent(lid, near));
+		let bystander = world.entities.spawn_at(Transform::at(Vec3::Z));
+		let places = [near, far, lid, bystander].map(|id| world.entities.placed(id));
+
+		let made = group(
+			&mut world,
+			&[
+				Pick::Entity(near),
+				Pick::Entity(lid),
+				Pick::Entity(far),
+				Pick::Body(BodyId::NONE),
+			],
+			Some(0.5),
+		);
+
+		let [Pick::Entity(group)] = made[..] else {
+			panic!("the group is what is selected: {made:?}");
+		};
+		assert!(is_group(&world, group), "marked as one");
+		assert_eq!(world.entities.name(group), GROUP);
+		assert!(hollow(&world, group), "and nothing but somewhere to hang things");
+		assert!(
+			world.entities.placed(group).is_some_and(|it| it
+				.position
+				.abs_diff_eq(Vec3::new(1.5, 1.0, 0.0), 1.0e-5)),
+			"the middle of both blocks and of the lid standing 1.7 up, 1.6 across and 0.85 up, \
+			 on the half-unit grid"
+		);
+		assert_eq!(world.entities.parent(group), EntityId::NONE, "both stood on their own");
+		assert_eq!(world.entities.parent(near), group, "the first block hangs off it");
+		assert_eq!(world.entities.parent(far), group, "and the second");
+		assert_eq!(
+			world.entities.parent(lid),
+			near,
+			"and the lid stays in the block it was picked in"
+		);
+		assert_eq!(world.entities.parent(bystander), EntityId::NONE, "and nothing else moved in");
+
+		for (id, was) in [near, far, lid, bystander]
+			.into_iter()
+			.zip(places)
+		{
+			assert!(same_place(world.entities.placed(id), was), "nothing moved in the world");
+		}
+
+		for (_, body) in world.bodies.iter() {
+			assert!(
+				same_place(Some(body.transform), world.entities.placed(body.entity)),
+				"and a body is still where its block is"
+			);
+		}
+	}
+
+	#[test]
+	fn a_group_hangs_off_what_its_things_hung_off_and_off_nothing_when_they_hung_apart() {
+		let mut world = World::new();
+		let car = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(5.0, 0.0, 0.0)));
+		let left = world.entities.spawn_at(Transform::at(Vec3::X));
+		let right = world
+			.entities
+			.spawn_at(Transform::at(Vec3::NEG_X));
+		assert!(world.entities.set_parent(left, car));
+		assert!(world.entities.set_parent(right, car));
+		let crate_ = world.entities.spawn_at(Transform::at(Vec3::Z));
+		let places = [left, right].map(|id| world.entities.placed(id));
+
+		let [Pick::Entity(wheels)] =
+			group(&mut world, &[Pick::Entity(left), Pick::Entity(right)], None)[..]
+		else {
+			panic!("a group");
+		};
+
+		assert_eq!(world.entities.parent(wheels), car, "inside the car both wheels were in");
+		assert!(
+			world.entities.placed(wheels).is_some_and(|it| it
+				.position
+				.abs_diff_eq(Vec3::new(5.0, 0.0, 0.0), 1.0e-5)),
+			"standing between them in the world"
+		);
+
+		for (id, was) in [left, right].into_iter().zip(places) {
+			assert!(same_place(world.entities.placed(id), was), "and the wheels stayed put");
+		}
+
+		let [Pick::Entity(mixed)] =
+			group(&mut world, &[Pick::Entity(left), Pick::Entity(crate_)], None)[..]
+		else {
+			panic!("a group");
+		};
+
+		assert_eq!(
+			world.entities.parent(mixed),
+			EntityId::NONE,
+			"a wheel and a crate hung apart, so the group stands on its own"
+		);
+	}
+
+	#[test]
+	fn a_group_picked_goes_into_the_new_group_whole() {
+		let mut world = World::new();
+		let [one, two, three] =
+			[Vec3::X, Vec3::Y, Vec3::Z].map(|at| world.entities.spawn_at(Transform::at(at)));
+
+		let [Pick::Entity(inner)] =
+			group(&mut world, &[Pick::Entity(one), Pick::Entity(two)], None)[..]
+		else {
+			panic!("a group");
+		};
+		let [Pick::Entity(outer)] =
+			group(&mut world, &[Pick::Entity(inner), Pick::Entity(three)], None)[..]
+		else {
+			panic!("a group");
+		};
+
+		assert_eq!(world.entities.parent(inner), outer, "the first group went in");
+		assert!(is_group(&world, inner), "still a group");
+		assert_eq!(world.entities.parent(one), inner, "with what it held still in it");
+		assert_eq!(world.entities.parent(three), outer);
+		assert_eq!(
+			grouped(&world, Pick::Entity(one)),
+			Pick::Entity(outer),
+			"and a click reaches the outer one"
+		);
+	}
+
+	#[test]
+	fn nothing_is_grouped_when_no_entity_is_picked() {
+		let (mut world, _, body, joint) = peopled();
+		let count = world.entities.len();
+
+		assert!(
+			group(&mut world, &[Pick::Body(body), Pick::Joint(joint), Pick::Nothing], None)
+				.is_empty()
+		);
+		assert_eq!(world.entities.len(), count, "and no entity was made for it");
+	}
+
+	#[test]
+	fn ungrouping_hangs_what_was_inside_where_the_group_hung_and_takes_an_empty_group_away() {
+		let mut world = World::new();
+		let car = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(5.0, 0.0, 0.0)));
+		let left = world.entities.spawn_at(Transform::at(Vec3::X));
+		let right = world
+			.entities
+			.spawn_at(Transform::at(Vec3::NEG_X));
+		assert!(world.entities.set_parent(left, car));
+		assert!(world.entities.set_parent(right, car));
+		let [Pick::Entity(wheels)] =
+			group(&mut world, &[Pick::Entity(left), Pick::Entity(right)], Some(0.5))[..]
+		else {
+			panic!("a group");
+		};
+		let places = [left, right].map(|id| world.entities.placed(id));
+
+		let released = ungroup(&mut world, &[Pick::Entity(wheels), Pick::Entity(car)]);
+
+		assert!(!world.entities.alive(wheels), "an empty group goes");
+		assert!(world.entities.alive(car), "and a car that is not a group is left alone");
+		assert_eq!(
+			released,
+			vec![Pick::Entity(left), Pick::Entity(right)],
+			"what was inside is what is selected"
+		);
+
+		for (id, was) in [left, right].into_iter().zip(places) {
+			assert_eq!(world.entities.parent(id), car, "hanging where the group hung");
+			assert!(same_place(world.entities.placed(id), was), "where it stood in the world");
+		}
+
+		// a group that is something else as well: a crate somebody marked
+		let crate_ = world.entities.spawn_at(Transform::at(Vec3::Z));
+		world
+			.entities
+			.set_renderable(crate_, Renderable::new(MeshId::CUBE, Vec3::ONE));
+		let lid = world.entities.spawn_at(Transform::at(Vec3::Y));
+		assert!(world.entities.set_parent(lid, crate_));
+		marked(&mut world, crate_, true);
+
+		assert_eq!(ungroup(&mut world, &[Pick::Entity(crate_)]), vec![Pick::Entity(lid)]);
+		assert!(world.entities.alive(crate_), "a crate is more than a group and stays");
+		assert!(!is_group(&world, crate_), "only no longer one");
+		assert_eq!(world.entities.parent(lid), EntityId::NONE, "and its lid stands on its own");
+	}
+
+	#[test]
+	fn a_group_a_body_drives_is_only_unmarked() {
+		let mut world = World::new();
+		let raft = world.entities.spawn();
+		let plank = world.entities.spawn_at(Transform::at(Vec3::X));
+		assert!(world.entities.set_parent(plank, raft));
+		assert!(
+			world
+				.attach_body(raft, BodyKind::Dynamic, Shape::UNIT)
+				.is_some()
+		);
+		marked(&mut world, raft, true);
+
+		assert_eq!(ungroup(&mut world, &[Pick::Entity(raft)]), vec![Pick::Entity(plank)]);
+
+		assert!(world.entities.alive(raft), "taking it away would leave a body driving nothing");
+		assert!(!is_group(&world, raft));
+	}
+
+	#[test]
+	fn a_changed_part_of_a_value_is_written_onto_another_and_the_rest_is_its_own() {
+		let three = Edit {
+			index: 0,
+			held: Value::Vec3(Vec3::new(1.0, 2.0, 3.0)),
+			value: Value::Vec3(Vec3::new(1.0, 5.0, 3.0)),
+		};
+
+		assert_eq!(
+			three.onto(&Value::Vec3(Vec3::new(7.0, 8.0, 9.0))),
+			Value::Vec3(Vec3::new(7.0, 5.0, 9.0)),
+			"the height moved, and each keeps its own across"
+		);
+
+		let tint = Edit {
+			index: 0,
+			held: Value::Color(Vec3::new(0.1, 0.2, 0.3)),
+			value: Value::Color(Vec3::new(0.1, 0.2, 0.9)),
+		};
+
+		assert_eq!(
+			tint.onto(&Value::Color(Vec3::new(0.5, 0.5, 0.5))),
+			Value::Color(Vec3::new(0.5, 0.5, 0.9)),
+			"a color the same way"
+		);
+
+		let two = Edit {
+			index: 0,
+			held: Value::Vec2(Vec2::new(1.0, 1.0)),
+			value: Value::Vec2(Vec2::new(2.0, 1.0)),
+		};
+
+		assert_eq!(
+			two.onto(&Value::Vec2(Vec2::new(4.0, 6.0))),
+			Value::Vec2(Vec2::new(2.0, 6.0)),
+			"and two numbers"
+		);
+
+		let turned = colby_core::glam::Quat::from_rotation_z(0.5);
+		let turn = Edit {
+			index: 0,
+			held: Value::Quat(colby_core::glam::Quat::IDENTITY),
+			value: Value::Quat(turned),
+		};
+
+		assert_eq!(
+			turn.onto(&Value::Quat(colby_core::glam::Quat::from_rotation_x(1.0))),
+			Value::Quat(turned),
+			"a rotation goes whole"
+		);
+
+		let flag = Edit {
+			index: 0,
+			held: Value::Bool(false),
+			value: Value::Bool(true),
+		};
+
+		assert_eq!(flag.onto(&Value::Bool(false)), Value::Bool(true), "and a flag");
+		assert_eq!(
+			Edit {
+				index: 0,
+				held: Value::Float(1.0),
+				value: Value::Float(2.0)
+			}
+			.onto(&Value::Float(9.0)),
+			Value::Float(2.0),
+			"and a number"
+		);
+	}
+
+	#[test]
+	fn a_changed_field_is_spread_into_another_record_and_the_rest_is_left() {
+		let range = Light::FIELDS
+			.iter()
+			.position(|field| field.name == "range")
+			.expect("a lamp has a range");
+		let shown = Light::spot(Vec3::ONE, 3.0, 8.0, 0.2, 0.5);
+		let mut other = Light::spot(Vec3::new(1.0, 0.0, 0.0), 1.0, 2.0, 0.1, 0.4);
+		let edits = [Edit {
+			index: range,
+			held: Value::Float(shown.range),
+			value: Value::Float(20.0),
+		}];
+
+		assert!(spread(&mut other, Light::FIELDS, &edits));
+		assert!((other.range - 20.0).abs() < f32::EPSILON, "the range went in");
+		assert_eq!(other.color, Vec3::new(1.0, 0.0, 0.0), "and its color is its own");
+		assert!((other.intensity - 1.0).abs() < f32::EPSILON, "and so is how bright it is");
+		assert!(
+			!spread(&mut other, Light::FIELDS, &[Edit { index: 999, ..edits[0].clone() }]),
+			"a field past the table writes nothing"
+		);
+	}
+
+	#[test]
+	fn a_changed_record_field_is_spread_to_every_other_entity_picked() {
+		let mut world = World::new();
+		let [shown, wall, other, left] = [(); 4].map(|()| world.entities.spawn());
+		let drawing = world
+			.entities
+			.records()
+			.tables()
+			.iter()
+			.position(|table| table.name() == "drawing")
+			.expect("every world declares drawing");
+
+		spread_record(&mut world, &[wall, other], drawing, &Edit {
+			index: 0,
+			held: Value::Bool(false),
+			value: Value::Bool(true),
+		});
+
+		for id in [wall, other] {
+			assert!(
+				world
+					.entities
+					.record(&colby_core::abi::DRAWING, id)
+					.is_some_and(|it| it.covers()),
+				"covering now"
+			);
+		}
+
+		for id in [shown, left] {
+			assert!(
+				!world
+					.entities
+					.record(&colby_core::abi::DRAWING, id)
+					.is_some_and(|it| it.covers()),
+				"and what was not in the list was not written"
+			);
+		}
+	}
+
+	#[test]
+	fn a_changed_place_is_spread_to_each_other_thing_in_its_own_terms() {
+		let mut world = World::new();
+		let parent = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(0.0, 10.0, 0.0)));
+		let child = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(1.0, 1.0, 1.0)));
+		assert!(world.entities.set_parent(child, parent));
+		let root = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(4.0, 4.0, 4.0)));
+		let position = Transform::FIELDS
+			.iter()
+			.position(|field| field.name == "position")
+			.expect("a transform has a position");
+
+		spread_places(&mut world, &[Pick::Entity(child), Pick::Entity(root)], &[Edit {
+			index: position,
+			held: Value::Vec3(Vec3::new(2.0, 2.0, 2.0)),
+			value: Value::Vec3(Vec3::new(2.0, 0.0, 2.0)),
+		}]);
+
+		assert_eq!(
+			world
+				.entities
+				.transform(child)
+				.map(|it| it.position),
+			Some(Vec3::new(1.0, 0.0, 1.0)),
+			"the child's height inside its parent, and its own across"
+		);
+		assert_eq!(
+			world
+				.entities
+				.transform(root)
+				.map(|it| it.position),
+			Some(Vec3::new(4.0, 0.0, 4.0)),
+			"and the root's in the world"
 		);
 	}
 

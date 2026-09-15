@@ -405,6 +405,53 @@ pub const DRAWING: Record<Drawing> = Record {
 	default: Drawing::NONE,
 };
 
+/// How the editor treats an entity beyond where it is and what it looks like.
+///
+/// **The engine's second record**, for [`Drawing`]'s reason: a word any entity
+/// may carry that the inspector, a scene source, a save, a copy and a piece of
+/// the world on the wire already reach through the one path a game's fields
+/// take. Nothing that runs a game reads it, and a build with no editor in it
+/// carries it all the same, so a world written down by one keeps what the other
+/// wrote.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct Editing {
+	/// Whether a click in the picture on anything hanging off it selects it
+	/// instead: nought for no, anything else for yes.
+	///
+	/// What makes an entity a group rather than only a parent. The outermost
+	/// group around what was clicked is what a click selects, so a group inside
+	/// a group, and anything inside one, is reached from the hierarchy or with
+	/// alt held.
+	pub group: u32,
+}
+
+impl Editing {
+	/// What every entity starts as: selected by a click on itself alone.
+	pub const NONE: Self = Self { group: 0 };
+
+	/// Whether a click on anything hanging off it selects it.
+	#[must_use]
+	pub const fn group(self) -> bool { self.group != 0 }
+}
+
+impl Default for Editing {
+	fn default() -> Self { Self::NONE }
+}
+
+/// [`Editing`] as the record every world declares.
+pub const EDITING: Record<Editing> = Record {
+	name: "editing",
+	help: "how the editor treats the entity",
+	rows: &[crate::row!(
+		Bool,
+		Editing,
+		group,
+		"a click in the picture on anything hanging off it selects it instead"
+	)],
+	default: Editing::NONE,
+};
+
 /// The host's entity table.
 ///
 /// Component storage is hard-coded to one array of [`Transform`] because there

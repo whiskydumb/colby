@@ -38,7 +38,7 @@
 
 use colby_core::{
 	abi::{Camera, LightKind, Transform, World},
-	glam::{Vec2, Vec3},
+	glam::{Mat4, Quat, Vec2, Vec3},
 	trace,
 };
 use egui::{Color32, Context, Key, LayerId, Painter, PointerButton, Pos2, Rect, Stroke, vec2};
@@ -66,6 +66,12 @@ const LIT: Color32 = Color32::from_rgb(255, 235, 120);
 /// than something under the pointer, and it has to read as ink that is not
 /// asking to be grabbed.
 const LAMP: Color32 = Color32::from_rgb(190, 170, 70);
+
+/// What the box around a selected group is drawn in.
+///
+/// Dim like [`LAMP`] and of another hue: where a group reaches is a fact about
+/// the scene, and a lamp's reach and a group's box can be on screen together.
+const GROUPED: Color32 = Color32::from_rgb(120, 150, 190);
 
 /// The eight corners of the unit cube a decal's box is, in its own space.
 const BOX_CORNERS: [Vec3; 8] = [
@@ -320,6 +326,7 @@ impl Viewport {
 
 		lamps(context, world, selection, &camera, viewport, view);
 		decals(context, world, selection, &camera, viewport, view);
+		groups(context, world, selection, &camera, viewport, view);
 		handles.paint(
 			context,
 			self.grab
@@ -530,13 +537,71 @@ fn decals(
 			.placed(id)
 			.unwrap_or_default()
 			.matrix();
-		let ends = BOX_CORNERS
-			.map(|at| gizmo::project(view_projection, matrix.transform_point3(at), viewport));
 
-		for (from, to) in BOX_EDGES {
-			if let (Some(start), Some(end)) = (ends[from], ends[to]) {
-				painter.line_segment([spot(start + corner), spot(end + corner)], stroke);
-			}
+		edges(&painter, view_projection, matrix, viewport, corner, stroke);
+	}
+}
+
+/// The box around everything hanging off each selected group, drawn over the
+/// world.
+///
+/// A group draws nothing and a click cannot land on it, so without this the one
+/// thing on screen that says a group is selected is the gizmo in its middle,
+/// which says nothing about how far the group reaches. Square to the world, the
+/// way the box a group is put in the middle of is, and not a handle: nothing
+/// hit-tests it. @ref [`select::bounds`].
+fn groups(
+	context: &Context,
+	world: &World,
+	selection: &Selection,
+	camera: &Camera,
+	viewport: Vec2,
+	view: Rect,
+) {
+	let painter = context
+		.layer_painter(LayerId::background())
+		.with_clip_rect(view);
+	let corner = Vec2::new(view.min.x, view.min.y);
+	let stroke = Stroke::new(INK.0, GROUPED);
+	let view_projection = camera.view_projection(viewport.x / viewport.y.max(1.0));
+
+	for pick in selection.picks() {
+		let Pick::Entity(id) = pick else {
+			continue;
+		};
+
+		if !select::is_group(world, id) {
+			continue;
+		}
+
+		let Some((low, high)) = select::bounds(world, &select::descendants(world, id)) else {
+			continue;
+		};
+
+		let matrix =
+			Mat4::from_scale_rotation_translation(high - low, Quat::IDENTITY, (low + high) * 0.5);
+
+		edges(&painter, view_projection, matrix, viewport, corner, stroke);
+	}
+}
+
+/// The twelve edges of the box a matrix takes the unit cube to, drawn.
+///
+/// @param corner - where the picture is on the screen
+fn edges(
+	painter: &Painter,
+	view_projection: Mat4,
+	matrix: Mat4,
+	viewport: Vec2,
+	corner: Vec2,
+	stroke: Stroke,
+) {
+	let ends = BOX_CORNERS
+		.map(|at| gizmo::project(view_projection, matrix.transform_point3(at), viewport));
+
+	for (from, to) in BOX_EDGES {
+		if let (Some(start), Some(end)) = (ends[from], ends[to]) {
+			painter.line_segment([spot(start + corner), spot(end + corner)], stroke);
 		}
 	}
 }
@@ -826,7 +891,7 @@ mod tests {
 	fn the_grid_holds_a_move_and_a_size_and_leaves_a_turn_alone() {
 		let put = Transform {
 			position: Vec3::new(1.2, 0.0, -0.4),
-			rotation: colby_core::glam::Quat::from_rotation_y(0.3),
+			rotation: Quat::from_rotation_y(0.3),
 			scale: Vec3::new(1.1, 0.2, 2.4),
 		};
 
@@ -857,7 +922,7 @@ mod tests {
 	fn no_grid_holds_nothing() {
 		let put = Transform {
 			position: Vec3::new(1.237, -0.9, 0.04),
-			rotation: colby_core::glam::Quat::IDENTITY,
+			rotation: Quat::IDENTITY,
 			scale: Vec3::new(0.31, 1.77, 0.02),
 		};
 

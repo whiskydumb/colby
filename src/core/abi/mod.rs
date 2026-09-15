@@ -75,7 +75,10 @@ pub use self::{
 	cvar::{Args, ConsoleFn, Cvars, Value},
 	debug::{Debug, Label, Line, Pen},
 	decal::{DEFAULT_FADE, Decal, DecalKind, MAX_FADE},
-	entity::{DRAWING, Drawing, Entities, EntityId, MAX_ENTITIES, Renderable, Transform},
+	entity::{
+		DRAWING, Drawing, EDITING, Editing, Entities, EntityId, MAX_ENTITIES, Renderable,
+		Transform,
+	},
 	field::Field,
 	font::{Font, FontData, FontId, Fonts, Glyph},
 	ik::Reach,
@@ -639,7 +642,7 @@ impl World {
 	///
 	/// Nothing but the engine's own records, which every world declares before
 	/// anything is put in it: a scene restored into a world has somewhere for
-	/// what it says about [`Drawing`] to land. @ref [`record`].
+	/// what it says about [`Drawing`] and [`Editing`] to land. @ref [`record`].
 	#[must_use]
 	pub fn new() -> Self {
 		let mut world = Self::bare();
@@ -649,6 +652,10 @@ impl World {
 		world
 			.entities
 			.declare(&DRAWING)
+			.expect("the engine's own records are ones a world holds");
+		world
+			.entities
+			.declare(&EDITING)
 			.expect("the engine's own records are ones a world holds");
 
 		world

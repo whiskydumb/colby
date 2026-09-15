@@ -321,8 +321,8 @@ mod tests {
 		assert_eq!(world.entities.waiting(id).len(), 1, "and what it held waits for it");
 		assert_eq!(
 			world.entities.records().tables().len(),
-			1,
-			"while the engine's own record is nobody's to sweep"
+			colby_core::abi::record::ENGINE.len(),
+			"while the engine's own records are nobody's to sweep"
 		);
 	}
 }
