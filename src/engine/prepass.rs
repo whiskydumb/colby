@@ -1,16 +1,18 @@
 //! The pass before the scene: what every pixel's surface is, before anything
 //! lights it.
 //!
-//! One pass over the solid half of the picture's own list, into targets of its
-//! own, writing four things a pixel: how far away the nearest surface is, the
-//! normal that surface is about to be lit with, how rough it is there, and what
-//! it is made of. What reads them is whatever has to know about a surface
-//! *before* the scene's pass lights it. An occlusion term that darkens only the
-//! light a lamp did not send is exactly that, and it cannot take the depth the
-//! scene writes: by the time that depth exists the lighting is done. So is a
-//! reflection of one surface in another, which has to light the surface it
-//! finds before the scene lights the one it is found in. @ref
-//! [`depth`](crate::depth) for the depth a pass *after* the scene reads.
+//! One pass over the solid half of the picture's own list - two in a frame that
+//! tests for what is behind something nearer, the large things ahead of the
+//! test and the small ones it kept after it, @ref [`cover`](crate::cover) -
+//! into targets of its own, writing four things a pixel: how far away the
+//! nearest surface is, the normal that surface is about to be lit with, how
+//! rough it is there, and what it is made of. What reads them is whatever has
+//! to know about a surface *before* the scene's pass lights it. An occlusion
+//! term that darkens only the light a lamp did not send is exactly that, and it
+//! cannot take the depth the scene writes: by the time that depth exists the
+//! lighting is done. So is a reflection of one surface in another, which has to
+//! light the surface it finds before the scene lights the one it is found in.
+//! @ref [`depth`](crate::depth) for the depth a pass *after* the scene reads.
 //!
 //! **Its own depth, not the scene's.** The scene's pass clears its buffer and
 //! draws exactly as it did before this existed, and this pass keeps a buffer of
@@ -332,29 +334,62 @@ impl Prepass {
 		encoder: &'pass mut CommandEncoder,
 		marks: Option<RenderPassTimestampWrites<'pass>>,
 	) -> Option<RenderPass<'pass>> {
+		self.open(encoder, marks, true)
+	}
+
+	/// Begins the pass again over what it has written this frame: the small
+	/// things, drawn after the test into the targets the large ones left.
+	///
+	/// @param encoder - the frame's, with the first half and the test in it
+	/// @param marks - the span this pass is, if anybody is measuring
+	/// @return the pass, or nothing before [`ensure`](Self::ensure) has made
+	/// the targets
+	pub(crate) fn resume<'pass>(
+		&'pass self,
+		encoder: &'pass mut CommandEncoder,
+		marks: Option<RenderPassTimestampWrites<'pass>>,
+	) -> Option<RenderPass<'pass>> {
+		self.open(encoder, marks, false)
+	}
+
+	/// Begins a pass over the targets, cleared or as they stand.
+	///
+	/// @param encoder - the frame's
+	/// @param marks - the span this pass is, if anybody is measuring
+	/// @param cleared - whether the pass starts from nothing
+	fn open<'pass>(
+		&'pass self,
+		encoder: &'pass mut CommandEncoder,
+		marks: Option<RenderPassTimestampWrites<'pass>>,
+		cleared: bool,
+	) -> Option<RenderPass<'pass>> {
 		let targets = self.targets.as_ref()?;
 
 		// nought is what says nothing was drawn, and it has to be there wherever
 		// nothing is
-		let cleared = |view| {
+		let color = |view| {
 			Some(RenderPassColorAttachment {
 				view,
 				depth_slice: None,
 				resolve_target: None,
 				ops: Operations {
-					load: LoadOp::Clear(Color::TRANSPARENT),
+					load: if cleared {
+						LoadOp::Clear(Color::TRANSPARENT)
+					} else {
+						LoadOp::Load
+					},
 					store: StoreOp::Store,
 				},
 			})
 		};
 
 		Some(encoder.begin_render_pass(&RenderPassDescriptor {
-			label: Some("prepass"),
-			color_attachments: &[cleared(&targets.surfaces), cleared(&targets.material)],
+			label: Some(if cleared { "prepass" } else { "prepass small" }),
+			color_attachments: &[color(&targets.surfaces), color(&targets.material)],
 			depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
 				view: &targets.depth,
 				depth_ops: Some(Operations {
-					load: LoadOp::Clear(1.0),
+					load: if cleared { LoadOp::Clear(1.0) } else { LoadOp::Load },
 					store: StoreOp::Store,
 				}),
 				stencil_ops: None,

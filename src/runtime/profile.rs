@@ -89,9 +89,9 @@ const WARMUP: u32 = 30;
 
 /// How many parts of a frame the table has rows for.
 ///
-/// Fourteen spans of hardware, two of recording, five of simulation and one of
+/// Fifteen spans of hardware, two of recording, five of simulation and one of
 /// particles.
-const ROWS: usize = 22;
+const ROWS: usize = 23;
 
 /// Which row of the table is the whole solver step.
 ///
@@ -100,12 +100,12 @@ const ROWS: usize = 22;
 /// below has to leave these two alone or move them on purpose; `gpu depth`
 /// went in above them and moved both, `gpu shaft` did it again, `gpu focus` a
 /// third time, `gpu lamps` a fourth, `gpu prepass` a fifth, `gpu occlusion` a
-/// sixth, `gpu reflections` a seventh, `gpu haze` an eighth and `gpu cover` a
-/// ninth.
-const STEP_ROW: usize = 20;
+/// sixth, `gpu reflections` a seventh, `gpu haze` an eighth, `gpu cover` a
+/// ninth and `gpu small` a tenth.
+const STEP_ROW: usize = 21;
 
 /// Which row is the particles.
-const SPARKS_ROW: usize = 21;
+const SPARKS_ROW: usize = 22;
 
 /// How many frames the live table averages over.
 ///
@@ -225,7 +225,7 @@ impl Live {
 	/// @param passes - what the hardware spent, per [`Pass`] in slot order,
 	/// from a frame two or three behind the one this is called in
 	/// @param count - how many render passes that frame recorded
-	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 14], count: u32) {
+	pub(crate) fn hardware(&mut self, passes: [Option<Duration>; 15], count: u32) {
 		self.passes = Some(count);
 
 		for (at, took) in passes.into_iter().enumerate() {
@@ -399,6 +399,11 @@ struct Table {
 	/// The most triangles those things' meshes had between them.
 	covered_triangles: usize,
 
+	/// The most solid things any measured frame drew into the pass before the
+	/// scene after the test, for standing too small to be drawn ahead of it.
+	/// Inside `drawn`. @ref `colby_engine::cover::SIZE`.
+	small: usize,
+
 	/// The most things any measured frame drew at a level coarser than their
 	/// mesh. Inside `drawn`. @ref `colby_engine::detail`.
 	lowered: usize,
@@ -444,6 +449,9 @@ pub(crate) const NAMES: [&str; ROWS] = [
 	// what is wholly behind what the row above drew, found and left out of the
 	// scene's lists in one compute pass. Added with parity card D2.
 	"gpu cover",
+	// the small things of the pass before the scene, drawn after the row above
+	// and only if it kept them. Added with parity card D2's second commit.
+	"gpu small",
 	// how much of the sky each pixel sees, worked out from what the row above
 	// wrote and read by the row below. Added with parity card C2.
 	"gpu occlusion",
@@ -501,6 +509,7 @@ impl Table {
 			hidden: 0,
 			covered: 0,
 			covered_triangles: 0,
+			small: 0,
 			lowered: 0,
 			triangles: 0,
 			lamps: 0,
@@ -530,6 +539,7 @@ impl Table {
 		self.covered_triangles = self
 			.covered_triangles
 			.max(counts.drawn.covered_triangles);
+		self.small = self.small.max(counts.drawn.small);
 		self.lowered = self.lowered.max(counts.drawn.lowered);
 		self.triangles = self.triangles.max(counts.drawn.triangles);
 		self.lamps = self.lamps.max(counts.drawn.lamps);
@@ -612,6 +622,7 @@ impl Table {
 			hidden = self.hidden,
 			covered = self.covered,
 			covered_triangles = self.covered_triangles,
+			small = self.small,
 			lowered = self.lowered,
 			triangles = self.triangles,
 			lamps = self.lamps,
@@ -834,6 +845,7 @@ mod tests {
 				None,
 				None,
 				None,
+				None,
 				Some(Duration::from_micros(800)),
 				None,
 				None,
@@ -847,8 +859,8 @@ mod tests {
 		);
 
 		assert!(live.profile().hardware, "now it has");
-		assert_eq!(live.profile().parts[6].mean, Some(Duration::from_micros(800)));
-		assert_eq!(live.profile().parts[6].name, "gpu scene", "in the seventh row");
+		assert_eq!(live.profile().parts[7].mean, Some(Duration::from_micros(800)));
+		assert_eq!(live.profile().parts[7].name, "gpu scene", "in the eighth row");
 		assert_eq!(live.profile().passes, Some(15), "and the count came with it");
 	}
 
@@ -973,6 +985,7 @@ mod tests {
 				decals: 5,
 				covered: 6,
 				covered_triangles: 72,
+				small: 9,
 				lowered: 3,
 				triangles: 4096,
 			},
@@ -1002,6 +1015,10 @@ mod tests {
 			(table.covered, table.covered_triangles),
 			(6, 72),
 			"and how much of that was behind something nearer"
+		);
+		assert_eq!(
+			table.small, 9,
+			"and how much of it was drawn into the pass before the scene after the test"
 		);
 		assert_eq!(
 			(table.lowered, table.triangles),

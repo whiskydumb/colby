@@ -551,6 +551,24 @@ struct Sight {
 
 	/// What every thing's level is asked against. @ref [`detail`].
 	detail: detail::Eye,
+
+	/// How many pixels across a solid thing has to stand to be drawn into the
+	/// pass before the scene ahead of the test, or nothing in a frame that
+	/// draws everything ahead of it: one that runs no test, or one whose
+	/// variable says so. @ref [`cover::SIZE`].
+	small_under: Option<f32>,
+}
+
+impl Sight {
+	/// Whether one thing stands too small to be drawn into the pass before the
+	/// scene ahead of the test this frame: never in a frame that runs no test.
+	/// @ref [`cover::SIZE`].
+	///
+	/// @param placed - the thing's box, in the world
+	fn small(&self, placed: &Placed) -> bool {
+		self.small_under
+			.is_some_and(|size| self.detail.under(placed, size))
+	}
 }
 
 /// One entity, in the order it is going to be written into the frame.
@@ -591,6 +609,20 @@ struct Sorted {
 
 	material: u32,
 
+	/// Whether it stands too small to be drawn into the pass before the scene
+	/// ahead of the test, and so is drawn into it after the test and only if
+	/// the test kept it. @ref [`cover::SIZE`].
+	///
+	/// In the key between the material and the slot, so the things of one mesh
+	/// at one level in one material are two batches at most, its large things
+	/// and then its small ones, and the scene's own order moves only between
+	/// those two: a large thing is drawn ahead of a small one it followed by
+	/// slot, which only two surfaces at exactly one depth could tell apart.
+	/// False for everything blended, for everything in a frame that runs no
+	/// test or holds nothing solid that is large, and for what a map draws,
+	/// which draws both alike.
+	small: bool,
+
 	/// Its slot decides nothing but the order of two entities a frame could not
 	/// otherwise tell apart, which is what keeps a frame the same picture
 	/// twice - an unstable sort may put equal keys either way round.
@@ -619,8 +651,16 @@ impl Sorted {
 	///
 	/// The mode is not in it and does not have to be: `pass` is a function of
 	/// it and comes first, so the two halves are already apart.
-	const fn key(&self) -> (u8, i32, u32, u8, u32, usize) {
-		(self.pass, self.depth, self.mesh, self.level, self.material, self.entity.slot())
+	const fn key(&self) -> (u8, i32, u32, u8, u32, bool, usize) {
+		(
+			self.pass,
+			self.depth,
+			self.mesh,
+			self.level,
+			self.material,
+			self.small,
+			self.entity.slot(),
+		)
 	}
 }
 
@@ -671,6 +711,16 @@ enum Through<'a> {
 	},
 }
 
+/// Counts one batch drawn through its own placements or through what the test
+/// kept, for a test. @ref [`Scene::draws`].
+#[cfg(test)]
+const fn tally(drew: &mut (usize, usize), through: Through<'_>) {
+	match through {
+		| Through::Instances => drew.0 += 1,
+		| Through::Kept { .. } => drew.1 += 1,
+	}
+}
+
 /// A run of instances that share a mesh, a level of it and a material.
 struct Batch {
 	mesh: usize,
@@ -679,6 +729,10 @@ struct Batch {
 	material: usize,
 	first: u32,
 	count: u32,
+	/// Whether its things are drawn into the pass before the scene after the
+	/// test rather than ahead of it: true of every thing in the run, because it
+	/// is in the key the runs are cut on. @ref [`Sorted::small`].
+	small: bool,
 	/// Whether bones move this mesh, which decides which pipeline draws it.
 	///
 	/// A property of the mesh rather than of the instance, so a batch is
@@ -859,6 +913,11 @@ pub struct Scene {
 	/// picture. @ref [`prepare_anyway`](Self::prepare_anyway).
 	#[cfg(test)]
 	anyway: bool,
+	/// What every list drawn this frame was drawn through, which is how a test
+	/// shows what each half of the pass before the scene drew. @ref
+	/// [`draws`](Self::draws).
+	#[cfg(test)]
+	drew: core::cell::RefCell<Vec<(usize, usize)>>,
 	/// The depth array the light writes and the scene samples.
 	shadows: Maps,
 	/// The cube a surface's reflections are read out of. @ref [`env`].
@@ -1046,6 +1105,8 @@ impl Scene {
 			rebound: 0,
 			#[cfg(test)]
 			anyway: false,
+			#[cfg(test)]
+			drew: core::cell::RefCell::new(Vec::new()),
 			shadows,
 			environment,
 			split,
@@ -1240,6 +1301,9 @@ impl Scene {
 		self.reload_shader();
 		self.sampling(world);
 
+		#[cfg(test)]
+		self.drew.get_mut().clear();
+
 		self.timings.open(Work::Upload);
 		self.upload(world, view);
 		self.timings.close(Work::Upload);
@@ -1277,14 +1341,18 @@ impl Scene {
 		}
 
 		// after the shadows and before the scene's own pass, because what reads
-		// a surface before it is lit has to find it written already. @ref
-		// [`prepass`].
+		// a surface before it is lit has to find it written already: the large
+		// things of it here, and the small ones below. @ref [`prepass`].
 		let prepared = self.prepare(&mut encoder, view);
 
 		// straight after it, because what it reads is the depth that pass has just
 		// written, and before everything that reads that pass too: none of them
 		// draws the lists this leaves things out of
 		self.cover(&mut encoder, view, prepared);
+
+		// and straight after that, the small things through what it kept: the
+		// last of what the pass before the scene writes, before anything reads it
+		self.prepare_small(&mut encoder, view, prepared);
 
 		// and straight after it, for the same reason and for the one after it:
 		// the scene is about to light what this works out
@@ -1745,6 +1813,19 @@ impl Scene {
 	#[cfg(test)]
 	pub(crate) const fn prepare_anyway(&mut self, asked: bool) { self.anyway = asked; }
 
+	/// What every list drawn this frame was drawn through, in the order they
+	/// were drawn, for a test: for each, how many batches through their own
+	/// placements and how many through what the test kept. The large things of
+	/// the pass before the scene come first, its small things next in a frame
+	/// that has any, and the scene's solid and blended lists last.
+	#[cfg(test)]
+	pub(crate) fn draws(&self) -> Vec<(usize, usize)> { self.drew.borrow().clone() }
+
+	/// How many batches each shadow map's list was cut into this frame, the
+	/// cascades first, for a test.
+	#[cfg(test)]
+	pub(crate) fn map_batches(&self) -> Vec<usize> { self.casting.iter().map(Vec::len).collect() }
+
 	/// Whether the reflections' first pass was built, for a test. @ref
 	/// [`Reflection::built`].
 	#[cfg(test)]
@@ -1977,8 +2058,8 @@ impl Scene {
 			},
 		);
 
-		self.draw_through(pass, (batches, through), |blend, skinned| {
-			Some(self.pipelines.get(blend, skinned))
+		self.draw_through(pass, (batches, through), |batch| {
+			Some(self.pipelines.get(batch.blend, batch.skinned))
 		});
 	}
 
@@ -1993,28 +2074,28 @@ impl Scene {
 	/// already bound
 	/// @param (batches, through) - the runs to draw, in order, and whether each
 	/// draws its own instances or what the test kept of them
-	/// @param pick - the pipeline for a blend and whether bones move the mesh,
-	/// or nothing for a batch this pass does not draw
+	/// @param pick - the pipeline for a batch, from how it blends and whether
+	/// bones move its mesh, or nothing for a batch this pass does not draw
 	fn draw_through<'a, F>(
 		&'a self,
 		pass: &mut RenderPass<'_>,
 		(batches, through): (&[Batch], Through<'_>),
 		pick: F,
 	) where
-		F: Fn(Blend, bool) -> Option<&'a RenderPipeline>,
+		F: Fn(&Batch) -> Option<&'a RenderPipeline>,
 	{
 		// swapped when a batch wants another one rather than once per batch.
 		// The solid half is ordered by mesh and material, so a world of crates
 		// with one character in it changes pipeline twice however many crates
 		// there are.
 		let mut bound = None;
+		#[cfg(test)]
+		let mut drew = (0, 0);
 
 		for (index, batch) in batches.iter().enumerate() {
-			let (Some(mesh), Some(material), Some(pipeline)) = (
-				self.meshes.get(batch.mesh),
-				self.materials.get(batch.material),
-				pick(batch.blend, batch.skinned),
-			) else {
+			let (Some(mesh), Some(material), Some(pipeline)) =
+				(self.meshes.get(batch.mesh), self.materials.get(batch.material), pick(batch))
+			else {
 				continue;
 			};
 
@@ -2052,7 +2133,13 @@ impl Scene {
 					);
 				},
 			}
+
+			#[cfg(test)]
+			tally(&mut drew, through);
 		}
+
+		#[cfg(test)]
+		self.drew.borrow_mut().push(drew);
 	}
 
 	/// Records the pass before the scene, or lets what it writes into go.
@@ -2061,6 +2148,11 @@ impl Scene {
 	/// picture is drawn into: what the view leaves out and what is hidden are
 	/// left out of this as well, so a surface is written for exactly the pixels
 	/// the scene's pass is about to light. @ref [`prepass`].
+	///
+	/// **Its large things alone**, in a frame that runs the test for what is
+	/// behind something nearer: they are the depth the test reads, and what is
+	/// small is drawn after it, @ref [`prepare_small`](Self::prepare_small). A
+	/// frame that runs no test has nothing small in it.
 	///
 	/// @param encoder - the frame's, with the shadows already in it
 	/// @param view - the part of the target the picture is drawn into, or the
@@ -2109,11 +2201,82 @@ impl Scene {
 		pass.set_bind_group(3, self.joints.bindings(), &[]);
 		pass.set_vertex_buffer(1, self.instances.slice(..));
 
-		self.draw_through(&mut pass, (&self.batches, Through::Instances), |blend, skinned| {
-			self.prepass.pipeline(blend, skinned)
+		self.draw_through(&mut pass, (&self.batches, Through::Instances), |batch| {
+			self.prepass
+				.pipeline(batch.blend, batch.skinned)
+				.filter(|_| !batch.small)
 		});
 
 		true
+	}
+
+	/// Records the small things of the pass before the scene: what the test
+	/// kept of every solid thing too small to be drawn ahead of it. @ref
+	/// [`cover::SIZE`].
+	///
+	/// A pass of its own over the targets the large things left, between the
+	/// test and everything that reads what the pass before the scene wrote, and
+	/// only in a frame whose list holds something small - which only a frame
+	/// that asks for the test can. Through what the test kept when it ran, and
+	/// every small thing when it did not: a device that cannot run it, or a
+	/// test that would not build, still has every surface written.
+	///
+	/// @param encoder - the frame's, with the test in it
+	/// @param view - the part of the target the picture is drawn into, or the
+	/// whole of it
+	/// @param prepared - whether the large things' pass was recorded this frame
+	///
+	/// @note: a frame whose first half was not recorded either holds no targets
+	/// to begin again over or has a rectangle with nothing inside the target,
+	/// which returns below before anything is drawn - so a mutation pass that
+	/// took `prepared` out passed everything. It stays because targets being
+	/// held is not proof of whose frame they are.
+	fn prepare_small(
+		&self,
+		encoder: &mut CommandEncoder,
+		view: Option<Viewport>,
+		prepared: bool,
+	) {
+		if !prepared || !self.batches.iter().any(|batch| batch.small) {
+			return;
+		}
+
+		let through = self.covering.cover.drawn_through().map_or(
+			Through::Instances,
+			|(placements, commands)| Through::Kept {
+				placements,
+				commands,
+				stride: self.covering.cover.placement(),
+				offset: 0,
+			},
+		);
+		let Some(mut pass) = self
+			.prepass
+			.resume(encoder, self.timings.writes(Pass::Small, Ends::Both))
+		else {
+			return;
+		};
+
+		// the same rectangle as the first half: a new pass is cut to the whole
+		// target until it is told otherwise
+		if let Some(asked) = view {
+			let Some(inside) = asked.within(self.size.0, self.size.1) else {
+				return;
+			};
+
+			cut(&mut pass, inside);
+		}
+
+		pass.set_bind_group(0, &self.bindings, &[]);
+		pass.set_bind_group(2, self.shadows.bindings(), &[]);
+		pass.set_bind_group(3, self.joints.bindings(), &[]);
+		pass.set_vertex_buffer(1, self.instances.slice(..));
+
+		self.draw_through(&mut pass, (&self.batches, through), |batch| {
+			self.prepass
+				.pipeline(batch.blend, batch.skinned)
+				.filter(|_| batch.small)
+		});
 	}
 
 	/// Whether anything reads what the pass before the scene writes, this
@@ -2461,6 +2624,8 @@ impl Scene {
 			maps: 0,
 			culling: world.cvars.bool(cull::ENABLED).unwrap_or(true),
 			detail: self.eye_of(world, &camera, view),
+			// filled in below, once whether the test runs this frame is known
+			small_under: None,
 		};
 		let (lamps, count) = self.lamps(world, &sight);
 		let sight = Sight {
@@ -2481,7 +2646,7 @@ impl Scene {
 		self.focusing = focus::asking_of(world, &camera);
 		// after every reader of the pass before the scene has said whether it
 		// reads: the test reads that pass's depth and does not ask for it
-		self.covering.asked = sight.culling && cover::asking_of(world) && self.preparing();
+		let sight = self.ask_cover(world, &sight);
 
 		self.queue.write_buffer(
 			&self.globals,
@@ -2550,6 +2715,22 @@ impl Scene {
 		self.queue
 			.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.placements));
 		self.joints.upload(&self.queue);
+	}
+
+	/// Whether this frame runs the test for what is behind something nearer,
+	/// and how small a thing it draws into the pass before the scene after it.
+	///
+	/// @param world - the world being drawn, for the console
+	/// @param sight - what this frame can see, with the frustum test's switch
+	/// @return the same sight, saying what is small in a frame that runs the
+	/// test and that nothing is in one that does not
+	fn ask_cover(&mut self, world: &World, sight: &Sight) -> Sight {
+		self.covering.asked = sight.culling && cover::asking_of(world) && self.preparing();
+
+		Sight {
+			small_under: cover::sizing_of(world).filter(|_| self.covering.asked),
+			..*sight
+		}
 	}
 
 	/// What this frame asks every thing's level against. @ref [`detail`].
@@ -2807,6 +2988,19 @@ impl Scene {
 			self.consider(world, sight, id, renderable);
 		}
 
+		// a frame whose solid things are all small has nothing ahead of the test
+		// to hide anything: a pyramid of nothing leaves nothing out of either
+		// pass, so all of them are drawn ahead of it, which is the pass unsplit
+		if !self
+			.order
+			.iter()
+			.any(|entry| entry.blend != Blend::Alpha && !entry.small)
+		{
+			for entry in &mut self.order {
+				entry.small = false;
+			}
+		}
+
 		self.order.sort_unstable_by_key(Sorted::key);
 		self.casters.sort_unstable_by_key(Sorted::key);
 
@@ -2825,6 +3019,11 @@ impl Scene {
 		}
 
 		self.drawn.seen = self.order.len();
+		self.drawn.small = self
+			.order
+			.iter()
+			.filter(|entry| entry.small)
+			.count();
 		self.drawn.lowered = self
 			.order
 			.iter()
@@ -2945,6 +3144,13 @@ impl Scene {
 		// before it, the test for what is behind something nearer and every map
 		// draw the same surface. @ref [`detail`].
 		let level = self.level_of(sight, &placed, mesh, transform);
+		// asked only of a solid thing in view in a frame that runs the test: the
+		// only list it changes is the picture's solid one
+		//
+		// @note: a thing out of view goes only into the maps' lists, whose
+		// entries carry no size, so a mutation pass that asked it of those too
+		// passed everything. It is here so that they take no distance.
+		let small = seen && !blended && sight.small(&placed);
 		let entry = Sorted {
 			pass: u8::from(blended),
 			// worked out only for the half that is sorted on it, as how far
@@ -2962,6 +3168,7 @@ impl Scene {
 			mesh,
 			level,
 			material,
+			small,
 			entity: id,
 			blend,
 			at,
@@ -2972,8 +3179,10 @@ impl Scene {
 			self.order.push(entry);
 		}
 
+		// a map draws large and small alike, so its batches are not cut on it
 		if casts != 0 {
-			self.casters.push(entry);
+			self.casters
+				.push(Sorted { small: false, ..entry });
 		}
 	}
 
@@ -3163,7 +3372,8 @@ impl Scene {
 			| Some(batch)
 				if batch.mesh == mesh
 					&& batch.level == entry.level
-					&& batch.material == material =>
+					&& batch.material == material
+					&& batch.small == entry.small =>
 				batch.count += 1,
 			| _ => batches.push(Batch {
 				mesh,
@@ -3171,6 +3381,7 @@ impl Scene {
 				material,
 				first,
 				count: 1,
+				small: entry.small,
 				skinned,
 				blend: entry.blend,
 			}),

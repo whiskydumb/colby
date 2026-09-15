@@ -655,6 +655,17 @@ fn install_render(world: &mut World) {
 		Value::Bool(true),
 		"leave out of the picture what is wholly behind something nearer",
 	);
+	// how many pixels across a solid thing has to stand to be drawn into the
+	// pass before the scene ahead of that test: thirty-two, and not saved, for
+	// the test's reason - nought draws everything ahead of it, which is how what
+	// drawing the small things after it saves is measured
+	world.cvars.var(
+		colby_engine::cover::SIZE,
+		Value::Float(colby_engine::cover::DEFAULT_SIZE),
+		"how many pixels across a solid thing has to stand to be drawn before the test for what \
+		 is behind something nearer; a smaller thing is drawn after it, only if it is not \
+		 hidden; nought draws everything before it",
+	);
 	// how many pixels a coarser level of a mesh may be off before the mesh
 	// itself is drawn instead: one, and not saved, like the tests above and for
 	// their reason - nought draws every mesh whole, which is how what the
@@ -1457,6 +1468,7 @@ mod tests {
 		),
 		(colby_engine::cull::ENABLED, Value::Bool(true)),
 		(colby_engine::cover::ENABLED, Value::Bool(true)),
+		(colby_engine::cover::SIZE, Value::Float(colby_engine::cover::DEFAULT_SIZE)),
 		(
 			colby_engine::detail::THRESHOLD,
 			Value::Float(colby_engine::detail::DEFAULT_THRESHOLD),

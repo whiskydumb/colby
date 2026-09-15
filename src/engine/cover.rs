@@ -23,12 +23,33 @@
 //! the hardware which boxes passed read the answer a frame or two later, and
 //! whatever appears in between is missing for that long, from a mirror too.
 //!
-//! **What it leaves in.** The pass before the scene draws everything the view
-//! holds, because that is the depth all of this reads. Nothing is left out of a
-//! shadow map: a thing the eye cannot see can still throw a shadow the eye can,
-//! and taking the hidden things out of the shadows moved a hundred and forty
-//! pixels of a field of cubes by up to seventy-three levels. Lamps, decals,
-//! particles and the debug lines are not asked.
+//! **The pass before the scene in two halves.** Everything large in view is
+//! drawn into it ahead of the test, and that is the depth all of this reads;
+//! everything too small to hide much is drawn into it after the test, through
+//! what the test kept, so what is small and behind a wall never reaches either
+//! pass. On that street it took the pass from 112 microseconds to 54, and a
+//! frame with nothing small in it records the second half not at all. @ref
+//! [`SIZE`].
+//!
+//! **Split on the size, not on the last frame.** To split it on the last frame,
+//! drawing ahead of the test what that frame kept or testing everything first
+//! against that frame's depth as the one engine read that splits this pass
+//! does, takes a history and a second pyramid a frame. Measured in the first
+//! shape, with the pass that picks the first half out, it cost more on every
+//! world but the street than it saved there; and a screenshot has no last
+//! frame to split on.
+//!
+//! **What a small thing hides is not in the depth.** A thing hidden only by
+//! things smaller than [`SIZE`] is drawn, into both passes: a thing under
+//! thirty-two pixels across can hide only what is smaller still, and every
+//! world measured left out as many things of the scene's pass with the split
+//! as without it.
+//!
+//! **What it leaves in.** Nothing is left out of a shadow map: a thing the eye
+//! cannot see can still throw a shadow the eye can, and taking the hidden
+//! things out of the shadows moved a hundred and forty pixels of a field of
+//! cubes by up to seventy-three levels. Lamps, decals, particles and the debug
+//! lines are not asked.
 //!
 //! **Four samples a pixel see a little more than the one this reads.** The pass
 //! before the scene takes the middle of each pixel and the scene may take four
@@ -82,6 +103,21 @@ use crate::{
 /// saves is measured and how a picture is shown not to depend on it. `r.cull`
 /// off leaves out nothing at all, this included.
 pub const ENABLED: &str = "r.cover";
+
+/// The console variable that says how many pixels across a solid thing has to
+/// stand to be drawn into the pass before the scene ahead of the test.
+///
+/// **Thirty-two, and not saved.** A smaller thing is drawn into that pass
+/// after the test and only if the test kept it, so what is small and behind a
+/// wall reaches neither pass; a larger one is drawn ahead of it, into the depth
+/// the test reads. Nought draws everything ahead of the test, which is the pass
+/// as it was before it was split and how what the split saves is measured. The
+/// measure is a level's, @ref [`Eye::under`](crate::detail::Eye::under).
+pub const SIZE: &str = "r.cover_size";
+
+/// How many pixels across a thing has to stand to be drawn ahead of the test
+/// when nothing says otherwise.
+pub const DEFAULT_SIZE: f32 = 32.0;
 
 /// The format the pyramid is written in: one depth a texel.
 const FORMAT: TextureFormat = TextureFormat::R32Float;
@@ -177,6 +213,21 @@ pub(crate) struct Covered {
 /// @param world - for the console variable
 #[must_use]
 pub(crate) fn asking_of(world: &World) -> bool { world.cvars.bool(ENABLED).unwrap_or(true) }
+
+/// How many pixels across a thing has to stand to be drawn ahead of the test,
+/// or nothing when the variable draws everything ahead of it.
+///
+/// @param world - for the console variable
+///
+/// @note: nought, less and not a number are all nothing here, and every one
+/// of them would call nothing small anyway - @ref
+/// [`Eye::under`](crate::detail::Eye::under) is a product against a product -
+/// so a mutation pass that let them through passed everything. It is here so
+/// that a frame that splits nothing takes no distance to every thing in view.
+#[must_use]
+pub(crate) fn sizing_of(world: &World) -> Option<f32> {
+	Some(world.cvars.float(SIZE).unwrap_or(DEFAULT_SIZE)).filter(|size| *size > 0.0)
+}
 
 /// The buffers the test reads and writes, the same size for every picture.
 struct Lists {
@@ -1394,6 +1445,41 @@ mod tests {
 		world.settle();
 	}
 
+	/// How many pixels across a thing has to stand to be drawn into the pass
+	/// before the scene ahead of the test.
+	fn sized(world: &mut World, size: &str) {
+		world
+			.cvars
+			.var(super::SIZE, Value::Float(DEFAULT_SIZE), "");
+		world.cvars.set(super::SIZE, size);
+	}
+
+	/// The depth, the surfaces and the material of a pass before the scene, as
+	/// bits.
+	type Written = (Vec<u32>, Vec<[u32; 4]>, Vec<[u32; 4]>);
+
+	/// Everything the pass before the scene wrote, to the bit.
+	fn written(capture: &mut Capture) -> Written {
+		let scene = capture.scene_mut();
+		let texels = |values: Vec<[f32; 4]>| -> Vec<[u32; 4]> {
+			values
+				.into_iter()
+				.map(|texel| texel.map(f32::to_bits))
+				.collect()
+		};
+
+		(
+			scene
+				.prepass_depth_values()
+				.expect("the pass before the scene wrote its depth")
+				.into_iter()
+				.map(f32::to_bits)
+				.collect(),
+			texels(scene.surface_values().expect("and its surfaces")),
+			texels(scene.material_values().expect("and its material")),
+		)
+	}
+
 	/// A frame drawn, and what the test left out of it, read back.
 	fn shot(capture: &mut Capture, world: &mut World) -> (Image, cull::Drawn) {
 		let image = capture.shoot(world).expect("the capture renders");
@@ -1641,6 +1727,14 @@ mod tests {
 				drawn_framed.covered, drawn_alone.covered,
 				"at {samples} samples the rectangle leaves out what the picture alone does"
 			);
+			// a unit box eight away is twenty-seven pixels across in a picture 137
+			// tall and forty-seven in one 240 tall, so the row is small only when
+			// measured against the rectangle
+			assert!(drawn_alone.small >= 5, "the row is small in a picture this size");
+			assert_eq!(
+				drawn_framed.small, drawn_alone.small,
+				"and in the rectangle, which is measured against its own height"
+			);
 			assert_eq!(apart(&left_out, &everything), 0, "and draws the same picture as without");
 		}
 	}
@@ -1713,6 +1807,10 @@ mod tests {
 
 		sampled(&mut world, "1");
 		covering(&mut world, true);
+		// everything ahead of the test, so that the depth read back after the
+		// frame is the depth the pyramid was folded from: the farther boxes are
+		// small in a rectangle this size, and would be drawn after it
+		sized(&mut world, "0");
 		capture.draw_within(&mut world, view);
 
 		let depth = capture
@@ -2134,6 +2232,311 @@ mod tests {
 		let (whole, _) = shot(&mut capture, &mut world);
 
 		assert_eq!(apart(&in_front, &whole), 0, "and the picture is still the same to the bit");
+	}
+
+	#[test]
+	fn a_small_box_behind_a_wall_is_left_out_of_the_pass_before_the_scene_too_and_no_bit_it_wrote_moves()
+	 {
+		// two boxes too small to be drawn ahead of the test, one behind the wall
+		// and one in front of it, beside a box that is not small: the pass before
+		// the scene draws the large things, the test runs, and the pass draws the
+		// small box it kept - and every buffer it wrote is the one it writes
+		// drawing everything ahead of the test, and the one it writes with no
+		// test at all
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = street(0.8);
+		let glass = world.materials.insert("test/glass", Material {
+			blend: Blend::Alpha,
+			opacity: 0.4,
+			..Material::DEFAULT
+		});
+		let small = Vec3::splat(0.2);
+
+		// the large box between the two small ones in slot order, so that only a
+		// key that puts the small ones after the large ones makes them one batch
+		slab(&mut world, MaterialId::NONE, (Vec3::new(0.5, 0.5, -3.0), small), GREEN);
+		cube(&mut world, Vec3::new(3.0, 0.5, 2.0), BLUE);
+		slab(&mut world, MaterialId::NONE, (Vec3::new(1.2, 0.3, 3.0), small), GREEN);
+		// and a pane as small, which that pass never draws at all
+		slab(&mut world, glass, (Vec3::new(-1.5, 0.5, 2.5), Vec3::new(0.2, 0.2, 0.05)), BLUE);
+
+		for samples in ["1", "4"] {
+			sampled(&mut world, samples);
+			covering(&mut world, true);
+			sized(&mut world, "32");
+
+			let (halves, drawn) = shot(&mut capture, &mut world);
+			let passes = capture.scene_mut().spans().passes();
+			let maps = capture.scene_mut().map_batches();
+			let bits = written(&mut capture);
+
+			assert_eq!(
+				(drawn.small, drawn.covered),
+				(2, 1),
+				"at {samples} samples both small boxes are drawn after the test, and the one \
+				 behind the wall is left out"
+			);
+			assert_eq!(
+				capture.scene_mut().draws(),
+				[(2, 0), (0, 1), (0, 3), (0, 1)],
+				"the wall's and the floor's batches ahead of the test, the small boxes' batch \
+				 through what it kept, and the scene's two lists through it as well"
+			);
+
+			sized(&mut world, "0");
+
+			let (ahead, drawn) = shot(&mut capture, &mut world);
+
+			assert_eq!((drawn.small, drawn.covered), (0, 1), "nought draws everything ahead");
+			assert_eq!(
+				capture.scene_mut().draws(),
+				[(2, 0), (0, 2), (0, 1)],
+				"in one pass of two batches, the box and the wall in one of them"
+			);
+			assert_eq!(
+				capture.scene_mut().spans().passes(),
+				passes - 1,
+				"which is one pass fewer"
+			);
+			assert_eq!(
+				capture.scene_mut().map_batches(),
+				maps,
+				"and every shadow map was cut into the same batches, large and small alike"
+			);
+			assert!(
+				written(&mut capture) == bits,
+				"at {samples} samples the pass before the scene wrote the same bits in two \
+				 halves as in one"
+			);
+			assert_eq!(apart(&halves, &ahead), 0, "and the picture is the same to the bit");
+
+			covering(&mut world, false);
+			sized(&mut world, "32");
+
+			let (whole, drawn) = shot(&mut capture, &mut world);
+
+			assert_eq!(
+				(drawn.small, drawn.covered),
+				(0, 0),
+				"with the test off nothing is small and nothing is left out"
+			);
+			assert_eq!(
+				capture.scene_mut().draws(),
+				[(2, 0), (2, 0), (1, 0)],
+				"and every list is drawn through its own placements"
+			);
+			assert!(written(&mut capture) == bits, "that pass writes the same bits again");
+			assert_eq!(apart(&halves, &whole), 0, "and the picture is the same again");
+		}
+	}
+
+	#[test]
+	fn a_small_box_out_from_behind_a_wall_and_up_to_the_eye_is_in_every_frame_it_shows_and_in_the_mirror()
+	 {
+		// the series above for a box small enough to be drawn after the test:
+		// out past the end of a wall and then towards the eye until it is small
+		// no more, over a mirror floor, so that the pass before the scene has to
+		// hold the box in the very frame it shows. One scene leaving things out
+		// every frame against one drawing everything, frame by frame
+		let Some(gpu) = crate::gpu::shared() else {
+			return;
+		};
+		let mut kept = Capture::new(gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut whole = Capture::new(gpu, SIZE.0, SIZE.1).expect("the capture builds");
+		let mut world = World::new();
+
+		world.camera.position = Vec3::new(0.0, 1.5, 6.0);
+		world.camera.target = Vec3::new(0.0, 1.0, 0.0);
+		world.light = Vec3::new(-0.4, -1.0, -0.3).normalize();
+
+		let floor = world
+			.materials
+			.insert("test/floor", Material { roughness: 0.045, ..Material::DEFAULT });
+
+		slab(
+			&mut world,
+			floor,
+			(Vec3::new(0.0, -0.5, 0.0), Vec3::new(40.0, 1.0, 40.0)),
+			Vec3::splat(0.35),
+		);
+		// four wide and ending at one, so that the box shows past its end well
+		// inside the view
+		slab(
+			&mut world,
+			MaterialId::NONE,
+			(Vec3::new(-1.0, 2.0, 0.0), Vec3::new(4.0, 4.0, 0.5)),
+			GREY,
+		);
+
+		let moving = slab(
+			&mut world,
+			MaterialId::NONE,
+			(Vec3::new(-1.0, 0.175, -1.5), Vec3::splat(0.35)),
+			GREEN,
+		);
+		// behind the wall and out past its end, and then towards the eye until
+		// the box is nearer than it has to be to stand thirty-two pixels across
+		let places: Vec<Vec3> = (0..16_u8)
+			.map(|step| Vec3::new(f32::from(step).mul_add(0.3, -1.0), 0.175, -1.5))
+			.chain((1..=16_u8).map(|step| {
+				Vec3::new(3.5, 0.175, -1.5)
+					.lerp(Vec3::new(1.3, 0.175, 3.3), f32::from(step) / 16.0)
+			}))
+			.collect();
+		let (mut hidden, mut small, mut large) = (0, 0, 0);
+
+		sampled(&mut world, "4");
+		sized(&mut world, "32");
+
+		for (step, at) in places.into_iter().enumerate() {
+			moved(&mut world, moving, at);
+			covering(&mut world, true);
+
+			let (left_out, drawn) = shot(&mut kept, &mut world);
+
+			covering(&mut world, false);
+
+			let (drawn_whole, _) = shot(&mut whole, &mut world);
+
+			assert_eq!(
+				apart(&left_out, &drawn_whole),
+				0,
+				"at step {step} the scene that has been leaving things out draws the picture \
+				 the scene drawing everything draws"
+			);
+
+			match (drawn.covered, drawn.small) {
+				| (1, 1) => hidden += 1,
+				| (0, 1) => small += 1,
+				| (0, 0) => large += 1,
+				| counts =>
+					panic!("at step {step} the box alone can be small or left out: {counts:?}"),
+			}
+		}
+
+		assert!(
+			hidden >= 3 && small >= 3 && large >= 3,
+			"the box was behind the wall for {hidden} frames, out and small for {small} and \
+			 large for {large}"
+		);
+	}
+
+	#[test]
+	fn what_only_a_small_thing_hides_is_drawn_and_the_picture_is_the_one_that_left_it_out() {
+		// the price of the split: a box small enough to be drawn after the test
+		// hides a smaller one behind it, and the test reads only what the large
+		// things drew, so the one behind is drawn - where drawing everything
+		// ahead of the test leaves it out. Either way the same picture
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = World::new();
+
+		world.camera.position = Vec3::new(0.0, 1.5, 6.0);
+		world.camera.target = Vec3::new(0.0, 1.0, 0.0);
+
+		let floor = world
+			.materials
+			.insert("test/floor", Material::DEFAULT);
+
+		slab(
+			&mut world,
+			floor,
+			(Vec3::new(0.0, -0.5, 0.0), Vec3::new(40.0, 1.0, 40.0)),
+			Vec3::splat(0.35),
+		);
+		// a unit box fourteen away is twenty-eight pixels across in this picture,
+		// and a quarter of one behind it on the line from the eye is six
+		cube(&mut world, Vec3::new(0.0, 0.5, -8.0), GREY);
+		slab(
+			&mut world,
+			MaterialId::NONE,
+			(Vec3::new(0.0, 0.321, -10.5), Vec3::splat(0.25)),
+			GREEN,
+		);
+
+		for samples in ["1", "4"] {
+			sampled(&mut world, samples);
+			covering(&mut world, true);
+			sized(&mut world, "32");
+
+			let (split, drawn) = shot(&mut capture, &mut world);
+
+			assert_eq!(
+				(drawn.small, drawn.covered),
+				(2, 0),
+				"at {samples} samples both boxes are small, and nothing large hides the one \
+				 behind"
+			);
+			assert_eq!(
+				capture.scene_mut().draws(),
+				[(1, 0), (0, 1), (0, 2), (0, 0)],
+				"the floor ahead of the test and both boxes after it"
+			);
+
+			sized(&mut world, "0");
+
+			let (ahead, drawn) = shot(&mut capture, &mut world);
+
+			assert_eq!(
+				(drawn.small, drawn.covered),
+				(0, 1),
+				"drawn ahead of the test, the nearer box hides the one behind"
+			);
+			assert_eq!(apart(&split, &ahead), 0, "and the pictures are the same to the bit");
+		}
+	}
+
+	#[test]
+	fn a_world_of_nothing_but_small_things_draws_them_all_ahead_of_the_test() {
+		// the same two boxes with no floor under them: nothing solid is large,
+		// and a pyramid of nothing would leave nothing out of either pass - so
+		// both are drawn ahead of the test, and the nearer hides the one behind
+		// as it does with no split at all. A pane of glass beside them is large
+		// and changes none of it, because it is never drawn into that pass
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = World::new();
+		let glass = world.materials.insert("test/glass", Material {
+			blend: Blend::Alpha,
+			opacity: 0.4,
+			..Material::DEFAULT
+		});
+
+		world.camera.position = Vec3::new(0.0, 1.5, 6.0);
+		world.camera.target = Vec3::new(0.0, 1.0, 0.0);
+		cube(&mut world, Vec3::new(0.0, 0.5, -8.0), GREY);
+		slab(
+			&mut world,
+			MaterialId::NONE,
+			(Vec3::new(0.0, 0.321, -10.5), Vec3::splat(0.25)),
+			GREEN,
+		);
+		slab(&mut world, glass, (Vec3::new(-3.0, 1.0, 0.0), Vec3::new(2.0, 1.5, 0.1)), BLUE);
+		sampled(&mut world, "1");
+		covering(&mut world, true);
+		sized(&mut world, "32");
+
+		let (left_out, drawn) = shot(&mut capture, &mut world);
+		let passes = capture.scene_mut().spans().passes();
+
+		assert_eq!((drawn.small, drawn.covered), (0, 1), "nothing is small, and one is behind");
+		assert_eq!(
+			capture.scene_mut().draws(),
+			[(1, 0), (0, 1), (0, 1)],
+			"one pass before the scene, then the scene's two lists"
+		);
+
+		sized(&mut world, "0");
+
+		let (ahead, drawn) = shot(&mut capture, &mut world);
+
+		assert_eq!(drawn.covered, 1, "and drawing everything ahead leaves out the same");
+		assert_eq!(capture.scene_mut().spans().passes(), passes, "in as many passes");
+		assert_eq!(apart(&left_out, &ahead), 0, "and draws the same picture");
 	}
 
 	#[test]

@@ -112,6 +112,57 @@ impl Eye {
 			.take_while(|error| **error * size * self.pixels <= away)
 			.count()
 	}
+
+	/// Whether one thing stands under a number of pixels across.
+	///
+	/// Asked of every solid thing in view by a frame that draws the pass before
+	/// the scene around the test for what is behind something nearer, @ref
+	/// [`cover::SIZE`](crate::cover::SIZE), with the measure a level is asked
+	/// with: pixels, from the nearest point of the box.
+	///
+	/// **The ball around the box, not the box**: as wide as the box's longest
+	/// diagonal however it is turned, so a thing called small is never wider
+	/// than the number says. Written as a product against a product, like
+	/// [`level`](Self::level), so a thing the eye stands inside is never small,
+	/// and nor is anything against a size of nought or less or not a number.
+	///
+	/// **Most things are settled before the nearest point is asked**, the way
+	/// most planes are in [`Frustum::holds`](crate::cull::Frustum::holds): the
+	/// box's nearest point is no further than its middle, which the box holds,
+	/// and no nearer than the ball around it reaches. Only a thing whose size
+	/// in pixels lies between the two answers takes the three projections:
+	/// taking them for all of a street's seven hundred things was measured at
+	/// seventeen microseconds of its frame, and settling most of them first at
+	/// four.
+	///
+	/// @note: the two short answers are what a test over twenty thousand boxes
+	/// holds against the nearest point alone, and a mutation pass that took
+	/// both out passed everything - they change what an answer costs, never
+	/// what it is.
+	///
+	/// @param placed - the thing's box, in the world
+	/// @param size - how many pixels across
+	#[must_use]
+	pub fn under(&self, placed: &Placed, size: f32) -> bool {
+		let across = placed
+			.edges
+			.iter()
+			.map(|edge| edge.length_squared())
+			.sum::<f32>()
+			.sqrt() * 2.0;
+		let wide = across * self.pixels;
+		let middle = placed.center.distance(self.eye);
+
+		if wide >= size * middle {
+			return false;
+		}
+
+		if wide < size * (middle - across * 0.5) {
+			return true;
+		}
+
+		wide < size * distance(placed, self.eye)
+	}
 }
 
 /// How far from a point the nearest point of a box is.
@@ -296,6 +347,152 @@ mod tests {
 		});
 
 		assert_eq!(looking(1.0).level(&around, 1.0, &[1.0e-12]), 0, "nought away is never far");
+	}
+
+	#[test]
+	fn a_thing_under_the_size_is_small_and_one_exactly_that_size_across_is_not() {
+		// numbers a float holds exactly: a rod a unit long - its ball a unit
+		// across - eight units away, at 256 pixels a unit one unit away, is 32
+		// pixels across, which is not under 32
+		let view = Eye {
+			eye: Vec3::ZERO,
+			pixels: 256.0,
+			threshold: 1.0,
+		};
+		let rod = Bounds {
+			center: Vec3::ZERO,
+			half: Vec3::new(0.5, 0.0, 0.0),
+		}
+		.carried(Transform::at(Vec3::new(0.0, 0.0, -8.0)).matrix());
+
+		assert_eq!(
+			distance(&rod, Vec3::ZERO).to_bits(),
+			8.0_f32.to_bits(),
+			"the rod is eight away to the bit"
+		);
+		assert!(!view.under(&rod, 32.0), "exactly 32 across is not under 32");
+		assert!(view.under(&rod, 32.000_008), "and a hair more than 32 is");
+		assert!(view.under(&rod, 64.0), "as is anything larger");
+
+		// and a box whose middle is further than its nearest point and nearer
+		// than its ball, so that only the nearest point settles it: its ball is
+		// a unit and a quarter across, 320 pixels at 256 a unit, and its near
+		// face is eight away - exactly 40 pixels
+		let plate = placed(Transform {
+			position: Vec3::new(0.0, 0.0, -8.5),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(0.75, 0.0, 1.0),
+		});
+
+		assert_eq!(
+			distance(&plate, Vec3::ZERO).to_bits(),
+			8.0_f32.to_bits(),
+			"the plate's face is eight away to the bit"
+		);
+		assert!(!view.under(&plate, 40.0), "exactly 40 across is not under 40");
+		assert!(view.under(&plate, 40.000_004), "and a hair more than 40 is");
+	}
+
+	#[test]
+	fn a_ball_is_measured_along_all_three_edges_from_the_nearest_point_of_the_box() {
+		let view = looking(1.0);
+		let per_unit = 720.0 / (2.0 * 0.5_f32.tan());
+		// a box two by one by one, turned an eighth of a turn and standing twenty
+		// away: its ball is the root of six across, its longest edge two, and the
+		// half-edges added together four
+		let slab = placed(Transform {
+			position: Vec3::new(0.0, 0.0, -20.0),
+			rotation: Quat::from_rotation_y(FRAC_PI_4),
+			scale: Vec3::new(2.0, 1.0, 1.0),
+		});
+		let away = distance(&slab, Vec3::ZERO);
+		let across = 6.0_f32.sqrt() * per_unit / away;
+
+		assert!(away < 19.5, "the nearest point is nearer than its middle's face: {away}");
+		assert!(view.under(&slab, across * 1.001), "just over what it measures, it is under");
+		assert!(!view.under(&slab, across * 0.999), "and just short of it, it is not");
+		assert!(
+			!view.under(&slab, 2.2 * per_unit / away),
+			"a size its longest edge alone would be under, its ball is not"
+		);
+		assert!(
+			view.under(&slab, 3.0 * per_unit / away),
+			"and a size its half-edges added together would not be under, its ball is"
+		);
+	}
+
+	#[test]
+	fn settling_a_thing_by_its_middle_and_its_ball_first_gives_the_nearest_point_s_answer() {
+		// thousands of boxes of every size turned every way, near and far,
+		// against sizes from a hair to hundreds of pixels: the answer the two
+		// short ways give is the one the nearest point alone gives
+		let view = looking(1.0);
+		let mut seed = 0x2545_F491_u32;
+		let mut next = move || {
+			seed ^= seed << 13;
+			seed ^= seed >> 17;
+			seed ^= seed << 5;
+
+			f32::from(u16::try_from(seed >> 16).unwrap_or(0)) / 65_535.0
+		};
+		let (mut small, mut large) = (0, 0);
+
+		for _ in 0..20_000 {
+			let box_ = placed(Transform {
+				position: Vec3::new(
+					next().mul_add(200.0, -100.0),
+					next().mul_add(200.0, -100.0),
+					next().mul_add(200.0, -100.0),
+				),
+				rotation: Quat::from_euler(
+					colby_core::glam::EulerRot::YXZ,
+					next() * 6.3,
+					next() * 6.3,
+					next() * 6.3,
+				),
+				scale: Vec3::new(
+					next().mul_add(20.0, 0.01),
+					next().mul_add(20.0, 0.01),
+					next().mul_add(20.0, 0.01),
+				),
+			});
+			let size = next().mul_add(400.0, 0.5);
+			let across = box_
+				.edges
+				.iter()
+				.map(|edge| edge.length_squared())
+				.sum::<f32>()
+				.sqrt() * 2.0;
+			let nearest = across * view.pixels < size * distance(&box_, view.eye);
+			let answer = view.under(&box_, size);
+
+			assert_eq!(answer, nearest, "{box_:?} against {size} pixels");
+
+			if answer {
+				small += 1;
+			} else {
+				large += 1;
+			}
+		}
+
+		assert!(small > 2_000 && large > 2_000, "{small} small and {large} large");
+	}
+
+	#[test]
+	fn nothing_is_small_against_a_size_of_nought_or_worse_or_to_an_eye_inside_it() {
+		let far = placed(Transform::at(Vec3::new(0.0, 0.0, -1.0e6)));
+		let around = placed(Transform {
+			scale: Vec3::splat(4.0),
+			..Transform::IDENTITY
+		});
+
+		assert!(looking(1.0).under(&far, 1.0), "a million units away, a unit is small");
+
+		for size in [0.0, -1.0, f32::NAN] {
+			assert!(!looking(1.0).under(&far, size), "and nothing is under {size}");
+		}
+
+		assert!(!looking(1.0).under(&around, 1.0e6), "nought away is never small");
 	}
 
 	#[test]

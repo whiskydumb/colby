@@ -21,8 +21,8 @@
 mod tests {
 	use colby_core::{
 		abi::{
-			Decal, Emitter, Light, MeshId, Renderable, Spark, SparkBlend, Texel, TextureData,
-			TextureId, ToneMap, Transform, Value, World,
+			Decal, Emitter, Light, MaterialId, MeshId, Renderable, Spark, SparkBlend, Texel,
+			TextureData, TextureId, ToneMap, Transform, Value, World,
 			cvar::Cvars,
 			debug,
 			material::{Blend, Material},
@@ -31,7 +31,7 @@ mod tests {
 	};
 	use wgpu::TextureFormat;
 
-	use crate::{Capture, Gpu, depth, occlusion, prepass, reflection, scene, shadow};
+	use crate::{Capture, Gpu, cover, depth, occlusion, prepass, reflection, scene, shadow};
 
 	/// How big the target is. Small on purpose: nothing here reads it.
 	const SIZE: (u32, u32) = (16, 16);
@@ -220,9 +220,25 @@ mod tests {
 		};
 		let mut capture = Capture::new(&gpu, SIZE.0, SIZE.1).expect("the capture builds");
 		let mut world = everything();
+		// and a box a tenth the size of the others behind the first, so that the
+		// pass before the scene is drawn in its two halves: at four pixels
+		// across the three are large and this one is small
+		let small = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, 0.0, -1.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(0.1),
+		});
+
+		world
+			.entities
+			.set_renderable(small, Renderable::of(MeshId::CUBE, MaterialId::NONE, Vec3::ONE));
 
 		for samples in ["1", "4", "1"] {
 			tuned(&mut world, samples);
+			world
+				.cvars
+				.var(cover::SIZE, Value::Float(cover::DEFAULT_SIZE), "");
+			world.cvars.set(cover::SIZE, "4");
 
 			capture
 				.shoot(&mut world)
@@ -231,6 +247,12 @@ mod tests {
 			assert!(
 				capture.scene_mut().cover_state().built(),
 				"at {samples} samples the test's pipelines were built and validated"
+			);
+			assert_eq!(
+				capture.scene_mut().draws().len(),
+				4,
+				"and the small box was drawn into the pass before the scene after the test, a \
+				 pass of its own between the large things' and the scene's two lists"
 			);
 		}
 	}

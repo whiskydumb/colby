@@ -98,6 +98,12 @@ pub enum Pass {
 	/// [`cover`](crate::cover).
 	Cover,
 
+	/// The small things of the pass before the scene: every solid thing too
+	/// small to be drawn ahead of the test, drawn after it through what it
+	/// kept. None at all in a frame whose lists hold nothing small. @ref
+	/// [`cover::SIZE`](crate::cover::SIZE).
+	Small,
+
 	/// How much of the sky each pixel sees, worked out from what the pass
 	/// before the scene wrote: an estimate and an average, both at half the
 	/// picture on each axis. None at all in a frame nothing asks for it in.
@@ -154,11 +160,12 @@ pub enum Pass {
 
 impl Pass {
 	/// Every span, in the order a frame runs them.
-	pub const ALL: [Self; 14] = [
+	pub const ALL: [Self; 15] = [
 		Self::Shadow,
 		Self::Lamps,
 		Self::Prepass,
 		Self::Cover,
+		Self::Small,
 		Self::Occlusion,
 		Self::Reflections,
 		Self::Scene,
@@ -179,6 +186,7 @@ impl Pass {
 			| Self::Lamps => "lamps",
 			| Self::Prepass => "prepass",
 			| Self::Cover => "cover",
+			| Self::Small => "small",
 			| Self::Occlusion => "occlusion",
 			| Self::Reflections => "reflections",
 			| Self::Scene => "scene",
@@ -199,16 +207,17 @@ impl Pass {
 			| Self::Lamps => 1,
 			| Self::Prepass => 2,
 			| Self::Cover => 3,
-			| Self::Occlusion => 4,
-			| Self::Reflections => 5,
-			| Self::Scene => 6,
-			| Self::Depth => 7,
-			| Self::Haze => 8,
-			| Self::Shaft => 9,
-			| Self::Focus => 10,
-			| Self::Meter => 11,
-			| Self::Glow => 12,
-			| Self::Composite => 13,
+			| Self::Small => 4,
+			| Self::Occlusion => 5,
+			| Self::Reflections => 6,
+			| Self::Scene => 7,
+			| Self::Depth => 8,
+			| Self::Haze => 9,
+			| Self::Shaft => 10,
+			| Self::Focus => 11,
+			| Self::Meter => 12,
+			| Self::Glow => 13,
+			| Self::Composite => 14,
 		}
 	}
 
@@ -224,16 +233,17 @@ impl Pass {
 			| Self::Lamps => 2,
 			| Self::Prepass => 4,
 			| Self::Cover => 6,
-			| Self::Occlusion => 8,
-			| Self::Reflections => 10,
-			| Self::Scene => 12,
-			| Self::Depth => 14,
-			| Self::Haze => 16,
-			| Self::Shaft => 18,
-			| Self::Focus => 20,
-			| Self::Meter => 22,
-			| Self::Glow => 24,
-			| Self::Composite => 26,
+			| Self::Small => 8,
+			| Self::Occlusion => 10,
+			| Self::Reflections => 12,
+			| Self::Scene => 14,
+			| Self::Depth => 16,
+			| Self::Haze => 18,
+			| Self::Shaft => 20,
+			| Self::Focus => 22,
+			| Self::Meter => 24,
+			| Self::Glow => 26,
+			| Self::Composite => 28,
 		}
 	}
 }
@@ -309,7 +319,7 @@ pub(crate) enum Ends {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
 	/// What the hardware spent, per [`Pass`], in its `slot` order.
-	passes: [Option<Duration>; 14],
+	passes: [Option<Duration>; 15],
 
 	/// What this thread spent, per [`Work`], in its `slot` order.
 	work: [Option<Duration>; 2],
@@ -440,9 +450,9 @@ pub struct Timings {
 
 impl Timings {
 	/// How many timestamps the set holds: two per span.
-	const QUERIES: u32 = 28;
+	const QUERIES: u32 = 30;
 	/// The same number where a length is wanted. @ref [`Pass::query`].
-	const TICKS: usize = 28;
+	const TICKS: usize = 30;
 
 	/// An apparatus that measures nothing.
 	///
@@ -809,7 +819,7 @@ impl Timings {
 		// read into a table of its own and then written over the frame in one
 		// go: `span` reads the mask off `self` and the frame is a field of
 		// the same `self`, so the two cannot be borrowed at once.
-		let mut spans = [None; 14];
+		let mut spans = [None; 15];
 
 		for pass in Pass::ALL {
 			if let Some(held) = spans.get_mut(pass.slot()) {
