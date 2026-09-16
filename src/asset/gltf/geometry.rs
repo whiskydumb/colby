@@ -54,6 +54,20 @@ use crate::json::Value;
 /// The drawing mode colby reads. Everything else is skipped with a warning.
 const TRIANGLES: u32 = 4;
 
+/// Every vertex attribute this importer reads, plus the one that has its own
+/// complaint. Anything else a primitive names is said out loud, @ref
+/// [`Build::unread_attributes`].
+const READ_ATTRIBUTES: &[&str] = &[
+	"POSITION",
+	"NORMAL",
+	"TANGENT",
+	"TEXCOORD_0",
+	"JOINTS_0",
+	"WEIGHTS_0",
+	"JOINTS_1",
+	"WEIGHTS_1",
+];
+
 /// How far a rebuilt transform may drift before the flattening is called shear.
 const SQUARE_ENOUGH: f32 = 1e-4;
 
@@ -163,6 +177,8 @@ pub fn import(file: &Gltf) -> Result<Model> {
 	let mut moves = clip::read(file, &build.skins);
 
 	warnings.append(&mut moves.warnings);
+	warnings.extend(super::unread_extensions(file.document()));
+	warnings.extend(unread_cameras(file));
 
 	Ok(Model {
 		meshes: build.meshes,
@@ -172,6 +188,33 @@ pub fn import(file: &Gltf) -> Result<Model> {
 		skins: build.skins,
 		clips: moves.clips,
 		warnings,
+	})
+}
+
+/// Says so when the file carries cameras, which colby does not read.
+///
+/// A camera is a core part of glTF rather than an extension, so the warning
+/// about what a file uses cannot catch it: a scene exported whole rather than
+/// a prop carries the one it was framed with, and every one of them was passed
+/// over without a word. colby's camera belongs to the world and not to a
+/// model, so there is nowhere to put one; the point is that the file said
+/// something and the import did not answer.
+///
+/// A light is not here because a light *is* an extension in glTF
+/// (`KHR_lights_punctual`), and [`unread_extensions`](super::unread_extensions)
+/// names it.
+///
+/// @param file - the document
+/// @return one line, or none when the file has no cameras
+fn unread_cameras(file: &Gltf) -> Option<String> {
+	let cameras = file.table("cameras").len();
+
+	(cameras > 0).then(|| {
+		format!(
+			"the file carries {cameras} camera{}, which colby does not read: a camera belongs \
+			 to a world here rather than to a model",
+			if cameras == 1 { "" } else { "s" }
+		)
 	})
 }
 
@@ -321,6 +364,8 @@ impl Build<'_> {
 			return Ok(None);
 		}
 
+		self.unread_attributes(mesh, primitive, attributes);
+
 		let normals = self.lanes(attributes, "NORMAL", 3, count);
 		let uvs = self.lanes(attributes, "TEXCOORD_0", 2, count);
 		let tangents = self.lanes(attributes, "TANGENT", 4, count);
@@ -377,6 +422,41 @@ impl Build<'_> {
 		}
 
 		Ok(Some(data))
+	}
+
+	/// Names every vertex attribute this importer does not read.
+	///
+	/// A rule rather than a list of the ones somebody thought of: whatever a
+	/// primitive names that is not in [`READ_ATTRIBUTES`] is said out loud, so
+	/// a mesh that arrives grey because it was painted into `COLOR_0`, or one
+	/// whose lightmap coordinates went into `TEXCOORD_1`, says why instead of
+	/// looking like an exporter bug. It catches an exporter's own `_SOMETHING`
+	/// too, which is the case nobody would have written a line for.
+	///
+	/// `JOINTS_1` is left out of the complaint although it is not read: it has
+	/// a warning of its own further down that says the useful thing - that a
+	/// vertex named more than four bones and the first four were taken -
+	/// and `WEIGHTS_1` only ever appears beside it.
+	///
+	/// @param mesh - which mesh, for the message
+	/// @param primitive - which primitive of it
+	/// @param attributes - the primitive's `attributes` object
+	fn unread_attributes(&mut self, mesh: usize, primitive: usize, attributes: Option<&Value>) {
+		let dropped: Vec<&str> = attributes
+			.map_or(&[][..], Value::as_object)
+			.iter()
+			.map(|(name, _)| name.as_str())
+			.filter(|name| !READ_ATTRIBUTES.contains(name))
+			.collect();
+
+		if dropped.is_empty() {
+			return;
+		}
+
+		self.warnings.push(format!(
+			"mesh {mesh} primitive {primitive} names {}, which colby does not read",
+			dropped.join(", ")
+		));
 	}
 
 	/// What moves each vertex of one primitive, when bones do.
@@ -1201,6 +1281,10 @@ mod tests {
 		import(&file).expect("the document imports")
 	}
 
+	/// The same three points, stored as normalized signed shorts instead of
+	/// floats, which is what `KHR_mesh_quantization` lets an exporter do.
+	const QUANTIZED: &str = "AAAAAAAA/38AAAAAAAD/fwAA";
+
 	/// One piece by name.
 	fn piece<'a>(model: &'a Model, name: &str) -> &'a Piece {
 		model
@@ -1534,5 +1618,79 @@ mod tests {
 			.to_string();
 
 		assert!(message.contains("past the end"), "got {message}");
+	}
+
+	#[test]
+	fn a_mesh_quantized_into_shorts_is_the_same_triangle_as_one_written_in_floats() {
+		// what `KHR_mesh_quantization` is on the reading side, and the whole
+		// reason accepting it needed nothing built: the same three points
+		// stored as normalized shorts, widened by the machinery that was
+		// already there for texture coordinates
+		let text = format!(
+			"{{ \"asset\": {{ \"version\": \"2.0\" }}, \"extensionsRequired\": [ \
+			 \"KHR_mesh_quantization\" ], \"extensionsUsed\": [ \"KHR_mesh_quantization\" ], \
+			 \"buffers\": [ {{ \"byteLength\": 18, \"uri\": \
+			 \"data:application/octet-stream;base64,{QUANTIZED}\" }} ], \"bufferViews\": [ {{ \
+			 \"buffer\": 0, \"byteLength\": 18 }} ], \"accessors\": [ {{ \"bufferView\": 0, \
+			 \"componentType\": 5122, \"normalized\": true, \"count\": 3, \"type\": \"VEC3\" }} \
+			 ], \"meshes\": [ {{ \"name\": \"small\", \"primitives\": [ {{ \"attributes\": {{ \
+			 \"POSITION\": 0 }} }} ] }} ] }}"
+		);
+		let file = Gltf::read(text.as_bytes(), Path::new("model.gltf"), Path::new(""))
+			.expect("a file that requires it reads");
+		let model = import(&file).expect("and imports");
+		let plain = scene(
+			"\"meshes\": [ { \"name\": \"small\", \"primitives\": [ { \"attributes\": { \
+			 \"POSITION\": 0 } } ] } ]",
+		);
+
+		assert_eq!(
+			piece(&model, "small").data.vertices,
+			piece(&plain, "small").data.vertices,
+			"stored small and stored as floats, the same triangle to the vertex"
+		);
+		assert_eq!(model.warnings, Vec::<String>::new(), "and nothing to complain about");
+	}
+
+	#[test]
+	fn an_attribute_this_importer_does_not_read_is_named_rather_than_dropped() {
+		// COLOR_0 is the one that costs somebody an afternoon: a mesh painted
+		// in Blender arrives grey and nothing at all says why
+		let model = scene(
+			"\"meshes\": [ { \"name\": \"painted\", \"primitives\": [ { \"attributes\": { \
+			 \"POSITION\": 0, \"COLOR_0\": 0, \"TEXCOORD_1\": 0 } } ] } ]",
+		);
+
+		assert_eq!(model.warnings.len(), 1, "one line for the primitive: {:?}", model.warnings);
+		assert!(
+			model.warnings[0].contains("COLOR_0") && model.warnings[0].contains("TEXCOORD_1"),
+			"naming each of them: {:?}",
+			model.warnings
+		);
+		assert!(
+			scene(
+				"\"meshes\": [ { \"primitives\": [ { \"attributes\": { \"POSITION\": 0 } } ] } ]"
+			)
+			.warnings
+			.is_empty(),
+			"and a primitive with nothing extra on it says nothing"
+		);
+	}
+
+	#[test]
+	fn a_camera_in_the_file_is_named_rather_than_passed_over() {
+		// a scene exported whole rather than a prop carries the camera it was
+		// framed with, and every one of them used to go by without a word
+		let model = scene(
+			"\"cameras\": [ { \"type\": \"perspective\", \"perspective\": { \"yfov\": 1.0, \
+			 \"znear\": 0.1 } } ]",
+		);
+
+		assert_eq!(model.warnings.len(), 1, "one line: {:?}", model.warnings);
+		assert!(
+			model.warnings[0].contains("1 camera") && !model.warnings[0].contains("cameras"),
+			"counted, and in English: {:?}",
+			model.warnings
+		);
 	}
 }

@@ -21,10 +21,17 @@
 //! geometry asks for.
 //!
 //! **What is refused, and it is refused by name.** A file that declares an
-//! extension as *required* is refused, so a mesh compressed with one of the
-//! geometry extensions says so instead of arriving empty. A sparse accessor is
-//! refused: no exporter this engine is aimed at writes one, and guessing at it
-//! is worse than saying no. So is a version that is not 2.
+//! extension as *required* is refused unless it is one of [`READ_EXTENSIONS`],
+//! so a mesh compressed with one of the geometry extensions says so instead of
+//! arriving empty. A sparse accessor is refused: no exporter this engine is
+//! aimed at writes one, and guessing at it is worse than saying no. So is a
+//! version that is not 2.
+//!
+//! **What is dropped is dropped out loud.** An extension the file *uses*
+//! without requiring one is readable without it by definition, so it is not a
+//! refusal - but it is a thing the file says and this reader does not hear,
+//! and it is named in a warning rather than passed over. The same rule holds
+//! for a vertex attribute nothing here reads and for a camera.
 //!
 //! ```text
 //!   model.glb                              model.gltf + model.bin
@@ -760,19 +767,36 @@ fn check_version(document: &Value) -> Result<()> {
 	Ok(())
 }
 
+/// Every extension this reader understands well enough for a file to require.
+///
+/// **`KHR_mesh_quantization` is read for nothing**, and that is why it is here
+/// rather than in a card of its own. All the extension does is widen what an
+/// attribute accessor may hold - a position as shorts, a normal as signed
+/// bytes - and [`Gltf::floats`] already converts every integer component and
+/// already scales a `normalized` accessor into `0..1` or `-1..1` the way the
+/// specification says, which is the whole of the extension on the reading
+/// side. A position stored small is put back at its real size by the scale on
+/// the node above it, which the walk applies to every node anyway. Refusing it
+/// was one line and cost every file an exporter had quantized.
+pub const READ_EXTENSIONS: &[&str] = &["KHR_mesh_quantization"];
+
 /// Refuses a document that needs something this reader does not have.
 ///
-/// The list of what is implemented is empty on purpose. An extension a file
-/// merely *uses* is ignored, because that is what the specification says it is
-/// for; one it *requires* changes what the rest of the file means, and the two
-/// that matter in practice both compress geometry into something that would
-/// otherwise be read as nonsense.
+/// An extension a file merely *uses* is not a refusal, because the
+/// specification's own meaning of "used" is that the file reads without it;
+/// one it *requires* changes what the rest of the file means, and the two that
+/// matter in practice both compress geometry into something that would
+/// otherwise be read as nonsense. What a file uses and this reader does not
+/// read is named in a warning instead, @ref [`unread_extensions`].
 fn check_extensions(document: &Value) -> Result<()> {
-	let required = document
+	let refused = document
 		.get("extensionsRequired")
-		.map_or(&[][..], Value::as_array);
+		.map_or(&[][..], Value::as_array)
+		.iter()
+		.filter_map(Value::as_str)
+		.find(|named| !READ_EXTENSIONS.contains(named));
 
-	if let Some(named) = required.first().and_then(Value::as_str) {
+	if let Some(named) = refused {
 		return Err(err!(Asset(
 			"this file requires the {named} extension, which colby does not read; re-export \
 			 without it"
@@ -780,6 +804,28 @@ fn check_extensions(document: &Value) -> Result<()> {
 	}
 
 	Ok(())
+}
+
+/// Names every extension the document says it uses that this reader does not.
+///
+/// Not a refusal and not a failure: a file that *uses* an extension reads
+/// without it, by the specification's own rule. What this is is the one moment
+/// anybody can be told that a thing the exporter wrote down is not in what came
+/// out - a punctual light, a texture transform, an unlit material - and before
+/// this it was passed over in silence.
+///
+/// @param document - the parsed file
+/// @return one line per extension, in the order the file wrote them
+#[must_use]
+pub(crate) fn unread_extensions(document: &Value) -> Vec<String> {
+	document
+		.get("extensionsUsed")
+		.map_or(&[][..], Value::as_array)
+		.iter()
+		.filter_map(Value::as_str)
+		.filter(|named| !READ_EXTENSIONS.contains(named))
+		.map(|named| format!("the file uses the {named} extension, which colby does not read"))
+		.collect()
 }
 
 /// Reads every buffer a document names.
@@ -1360,6 +1406,50 @@ mod tests {
 
 		assert!(message.contains("KHR_draco_mesh_compression"), "got {message}");
 		assert!(message.contains("re-export"), "and says what to do about it: {message}");
+	}
+
+	#[test]
+	fn a_file_that_requires_quantized_meshes_is_read_rather_than_refused() {
+		// the machinery the extension needs is `floats`, which has widened
+		// every integer component and scaled every normalized accessor since
+		// before there was a reason to: all that stood in the way was the name
+		let text = "{ \"asset\": { \"version\": \"2.0\" }, \"extensionsRequired\": [ \
+		            \"KHR_mesh_quantization\" ], \"extensionsUsed\": [ \
+		            \"KHR_mesh_quantization\" ] }";
+
+		assert!(read(text).is_ok(), "the one extension this reader needs nothing new for");
+		assert_eq!(
+			unread_extensions(read(text).expect("it reads").document()),
+			Vec::<String>::new(),
+			"and nothing complains about it either, because it is read"
+		);
+
+		let beside = "{ \"asset\": { \"version\": \"2.0\" }, \"extensionsRequired\": [ \
+		              \"KHR_mesh_quantization\", \"KHR_draco_mesh_compression\" ] }";
+
+		assert!(
+			refusal(beside).contains("KHR_draco_mesh_compression"),
+			"and one it cannot read beside one it can is still refused, by the right name"
+		);
+	}
+
+	#[test]
+	fn an_extension_a_file_only_uses_is_named_rather_than_passed_over() {
+		// not a refusal: by the specification a file that only *uses* an
+		// extension reads without it. What it is is a thing the exporter wrote
+		// down that does not come out the other end, and before this nobody
+		// was told
+		let text = "{ \"asset\": { \"version\": \"2.0\" }, \"extensionsUsed\": [ \
+		            \"KHR_materials_emissive_strength\", \"KHR_lights_punctual\" ] }";
+		let file = read(text).expect("a file that only uses one still reads");
+		let said = unread_extensions(file.document());
+
+		assert_eq!(said.len(), 2, "one line each: {said:?}");
+		assert!(
+			said[0].contains("KHR_materials_emissive_strength")
+				&& said[1].contains("KHR_lights_punctual"),
+			"each named, in the order the file wrote them: {said:?}"
+		);
 	}
 
 	#[test]
