@@ -76,7 +76,61 @@ pub const MAX_ROWS: usize = 32;
 /// value to hide in.
 const WORD: usize = 4;
 
-/// One field of a record: what it is called, what it holds, and where it sits.
+/// How the editor draws a field of a record, when it draws one at all.
+///
+/// **A game's own thing with nothing to look at is the one place a helper
+/// cannot be code.** The engine's kinds - a lamp, a thrower, a decal - are few
+/// and the editor draws each by hand; a game's record is a shape nobody here
+/// has ever seen, its code does not run while a world is being edited, and a
+/// pointer into a module would die at the next reload. What crosses instead is
+/// this word beside the field, the way the name, the help line and the kind
+/// already do. One other engine in the field offers the same thing and offers
+/// exactly the second of these: a place you drag.
+///
+/// Both are read in the entity's **own** terms - a radius in world units out
+/// from where it stands, a place inside it - so a door carried across a room
+/// takes its numbers with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Draw {
+	/// Nothing: the field is a number in a panel and that is all.
+	#[default]
+	None,
+
+	/// How far something reaches, in world units: three circles around the
+	/// thing, and a handle on the rim. Only a [`Float`](super::field::Kind).
+	Radius,
+
+	/// A place in the thing's own space: a line out to it, and a handle there.
+	/// Only a [`Vec3`](super::field::Kind).
+	Point,
+}
+
+impl Draw {
+	/// The word it is named by in a message.
+	#[must_use]
+	pub const fn word(self) -> &'static str {
+		match self {
+			| Self::None => "nothing",
+			| Self::Radius => "a radius",
+			| Self::Point => "a place",
+		}
+	}
+
+	/// Whether a field of this kind can be drawn this way.
+	///
+	/// @param kind - what the field holds
+	#[must_use]
+	pub const fn fits(self, kind: Kind) -> bool {
+		match self {
+			| Self::None => true,
+			| Self::Radius => matches!(kind, Kind::Float),
+			| Self::Point => matches!(kind, Kind::Vec3),
+		}
+	}
+}
+
+/// One field of a record: what it is called, what it holds, where it sits, and
+/// how the editor draws it.
 ///
 /// Written with [`row!`](crate::row) out of the struct's own field, so that
 /// the name, the offset and the type cannot disagree with the struct.
@@ -95,6 +149,33 @@ pub struct Row {
 
 	/// How far into the record it starts, in bytes.
 	pub offset: usize,
+
+	/// How the editor draws it, or [`Draw::None`] for a field it does not.
+	pub draw: Draw,
+}
+
+impl Row {
+	/// The same row, drawn.
+	///
+	/// Written after [`row!`](crate::row) rather than inside it, so that a game
+	/// that draws nothing writes what it always wrote:
+	///
+	/// ```ignore
+	/// row!(Float, Door, reach, "how far it notices somebody").drawn(Draw::Radius)
+	/// ```
+	///
+	/// @param draw - how to draw it; refused when the field does not hold what
+	/// that way of drawing needs
+	#[must_use]
+	pub const fn drawn(self, draw: Draw) -> Self {
+		Self {
+			name: self.name,
+			help: self.help,
+			kind: self.kind,
+			offset: self.offset,
+			draw,
+		}
+	}
 }
 
 /// A record every entity carries, as the code declaring it spells it.
@@ -210,6 +291,7 @@ $crate::row!(@stored Quat, [f32; 4], $record, $field, $help)
 				$crate::abi::record::stored_as::<$record, u32>(|record| &record.$field);
 				::core::mem::offset_of!($record, $field)
 			},
+			draw: $crate::abi::record::Draw::None,
 		}
 	};
 	(@stored $kind:ident, $stored:ty, $record:ty, $field:ident, $help:literal) => {
@@ -217,6 +299,7 @@ $crate::row!(@stored Quat, [f32; 4], $record, $field, $help)
 			name: ::core::stringify!($field),
 			help: $help,
 			kind: $crate::abi::field::Kind::$kind,
+			draw: $crate::abi::record::Draw::None,
 			offset: {
 				$crate::abi::record::stored_as::<$record, $stored>(|record| &record.$field);
 				::core::mem::offset_of!($record, $field)
@@ -406,6 +489,7 @@ pub struct Column {
 	kind: ColumnKind,
 	/// Which word of the record it starts at.
 	at: usize,
+	draw: Draw,
 }
 
 impl Column {
@@ -420,6 +504,10 @@ impl Column {
 	/// What it holds.
 	#[must_use]
 	pub const fn kind(&self) -> &ColumnKind { &self.kind }
+
+	/// How the editor draws it, or [`Draw::None`] for a field it does not.
+	#[must_use]
+	pub const fn draw(&self) -> Draw { self.draw }
 
 	/// The words its value takes up in one record.
 	const fn span(&self) -> core::ops::Range<usize> { self.at..self.at + self.kind.width() }
@@ -871,6 +959,14 @@ impl Records {
 			held.owner = table.owner;
 			held.help = table.help;
 
+			// the words a build says *about* its fields rather than the fields
+			// themselves: a help line rewritten or a field newly drawn is not a
+			// change any value has to be carried through
+			for (column, now) in held.columns.iter_mut().zip(&table.columns) {
+				column.help.clone_from(&now.help);
+				column.draw = now.draw;
+			}
+
 			return Ok(Declared::default());
 		}
 
@@ -1111,6 +1207,14 @@ fn column_of(record: &str, row: &Row, taken: &mut [bool], before: &[Column]) -> 
 		)));
 	};
 
+	if !row.draw.fits(row.kind) {
+		return Err!(Module(error!(
+			"{record}.{field} is drawn as {}, which is not what {} holds",
+			row.draw.word(),
+			row.kind.name()
+		)));
+	}
+
 	held.fill(true);
 
 	Ok(Column {
@@ -1118,6 +1222,7 @@ fn column_of(record: &str, row: &Row, taken: &mut [bool], before: &[Column]) -> 
 		help: row.help.to_owned(),
 		kind,
 		at,
+		draw: row.draw,
 	})
 }
 
@@ -1280,6 +1385,40 @@ mod tests {
 	/// The words a door's `style` may be.
 	const STYLES: &[&str] = &["swing", "slide", "fold"];
 
+	/// The same door as a build that draws two of its fields spells it.
+	const DRAWN_DOOR: Record<Door> = Record {
+		name: "door",
+		help: "a thing that swings",
+		rows: &[
+			crate::row!(Bool, Door, open, "whether it stands open"),
+			crate::row!(Float, Door, speed, "how far it swings in a second").drawn(Draw::Radius),
+			crate::row!(Vec3, Door, hinge, "what it swings about").drawn(Draw::Point),
+			crate::row!(Word(STYLES), Door, style, "how it opens"),
+			crate::row!(Int, Door, turns, "how many times it has"),
+			crate::row!(Color, Door, tint, "its paint"),
+			crate::row!(Quat, Door, lean, "how it hangs"),
+			crate::row!(Vec2, Door, mark, "where its handle is"),
+		],
+		default: DOOR.default,
+	};
+
+	/// A door drawn in a way its field cannot be: a flag is not a radius.
+	const WRONGLY_DRAWN: Record<Door> = Record {
+		name: "door",
+		help: "a thing that swings",
+		rows: &[
+			crate::row!(Bool, Door, open, "whether it stands open").drawn(Draw::Radius),
+			crate::row!(Float, Door, speed, "how far it swings in a second"),
+			crate::row!(Vec3, Door, hinge, "what it swings about"),
+			crate::row!(Word(STYLES), Door, style, "how it opens"),
+			crate::row!(Int, Door, turns, "how many times it has"),
+			crate::row!(Color, Door, tint, "its paint"),
+			crate::row!(Quat, Door, lean, "how it hangs"),
+			crate::row!(Vec2, Door, mark, "where its handle is"),
+		],
+		default: DOOR.default,
+	};
+
 	/// A door as the game spells it.
 	const DOOR: Record<Door> = Record {
 		name: "door",
@@ -1428,7 +1567,13 @@ mod tests {
 
 	/// A field of a pair, by hand, so that it can be wrong.
 	const fn loose(name: &'static str, kind: Kind, offset: usize) -> Row {
-		Row { name, help: "a field", kind, offset }
+		Row {
+			name,
+			help: "a field",
+			kind,
+			offset,
+			draw: Draw::None,
+		}
 	}
 
 	/// A pair record of these fields.
@@ -1669,6 +1814,7 @@ mod tests {
 				help: "x",
 				kind: Kind::Bool,
 				offset: 0,
+				draw: Draw::None,
 			}],
 			default: Wide { words: [0; 64] },
 		};
@@ -2204,5 +2350,63 @@ mod tests {
 		let listed: Vec<&str> = ENGINE.iter().map(|shape| shape.name).collect();
 
 		assert_eq!(declared, listed, "and a world declares exactly the records the list names");
+	}
+
+	#[test]
+	fn a_field_drawn_in_a_way_it_cannot_be_is_refused_naming_it() {
+		let mut records = Records::new();
+		records.push();
+
+		let why = records
+			.declare(&WRONGLY_DRAWN)
+			.expect_err("a flag is not a radius");
+		let said = format!("{why}");
+
+		assert!(said.contains("door.open"), "it names the field: {said}");
+		assert!(said.contains("radius"), "and what it was asked to be: {said}");
+		assert!(records.tables().is_empty(), "and nothing was declared");
+	}
+
+	#[test]
+	fn a_field_says_how_it_is_drawn_and_nothing_else_does() {
+		let mut records = Records::new();
+		records.push();
+		records
+			.declare(&DRAWN_DOOR)
+			.expect("a door that draws two of its fields");
+
+		let table = &records.tables()[0];
+		let drawn: Vec<Draw> = table.columns().iter().map(Column::draw).collect();
+
+		assert_eq!(drawn[0], Draw::None, "a flag is a checkbox and nothing more");
+		assert_eq!(drawn[1], Draw::Radius);
+		assert_eq!(drawn[2], Draw::Point);
+	}
+
+	#[test]
+	fn a_build_that_draws_a_field_it_did_not_draw_before_moves_no_value() {
+		let mut records = Records::new();
+		records.push();
+		records.declare(&DOOR).expect("a door");
+
+		if let Some(door) = records.view_mut(&DOOR, 0) {
+			door.speed = 4.0;
+		}
+
+		// the same fields at the same places: what changed is a word about how
+		// a panel and a picture show one of them
+		let again = records
+			.declare(&DRAWN_DOOR)
+			.expect("the same door, drawn");
+
+		assert_eq!(again.kept, 0, "nothing was carried, because nothing moved");
+		assert_eq!(records.tables().len(), 1);
+		assert_eq!(records.tables()[0].columns()[1].draw(), Draw::Radius, "and it is drawn now");
+		assert!(
+			records
+				.view(&DOOR, 0)
+				.is_some_and(|door| (door.speed - 4.0).abs() < 1.0e-6),
+			"with the number somebody typed left alone"
+		);
 	}
 }
