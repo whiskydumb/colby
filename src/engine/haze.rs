@@ -954,6 +954,23 @@ mod tests {
 	/// How alike two texels' light is to be averaged: `CLOSE` in `haze.wgsl`.
 	const CLOSE: f32 = 0.25;
 
+	/// How near a neighbor may stand to the edge of what the average takes, in
+	/// its distance or in its light, and be taken either way by the device: a
+	/// share of the texel's distance, and of the brighter of the two lights.
+	///
+	/// **Worked out, not measured.** A brightness is three products added up,
+	/// which a shader compiler may fuse into multiply-adds or add in another
+	/// order; each of the five operations moves it by under an ulp, so where
+	/// two brightnesses stand a quarter apart the test can land about eleven
+	/// ulps of the larger either side, 1.3e-6. A distance is an exact add and
+	/// one divide and lands closer. Three times that.
+	///
+	/// **A tie is not a chance in a million here**: the march writes sixteen
+	/// bits, whose steps put two neighbors at exactly three quarters of each
+	/// other in every channel often enough that the room holds two such pairs
+	/// in a frame, and one of them one driver averaged and another did not.
+	const EDGE: f32 = 4.0e-6;
+
 	/// The order the places of the three by three tile are visited in, @ref
 	/// `tile_at` in `shader.wgsl`.
 	const ORDER: [u8; 9] = [0, 5, 7, 6, 1, 3, 4, 8, 2];
@@ -1757,21 +1774,24 @@ mod tests {
 	/// What the average makes of one texel, worked out from what the march
 	/// wrote and how far along the view each texel's surface is.
 	///
-	/// @return the average, and how many neighbors were turned away for being
-	/// in front of another surface and how many for being lit too differently
+	/// @return every average the device may hand back - the first with each
+	/// neighbor taken or turned away as worked out here, the rest with those
+	/// on an edge taken the other way, @ref [`EDGE`] - and how many neighbors
+	/// were turned away for being in front of another surface and how many for
+	/// being lit too differently
 	fn averaged_at<F>(
 		raw: &[[f32; 4]],
 		(column, row): (u32, u32),
 		distance: F,
-	) -> (Vec3, (u32, u32))
+	) -> (Vec<Vec3>, (u32, u32))
 	where
 		F: Fn((u32, u32)) -> f32,
 	{
 		let own = light_of(texel_of(raw, (column, row)));
 		let along = distance((column, row));
 		let bright = brightness(own);
-		let mut total = own;
-		let mut weight = 1.0;
+		let mut neighbors = Vec::new();
+		let mut edges = 0_u32;
 		let mut turned = (0, 0);
 
 		for place in AROUND
@@ -1780,19 +1800,48 @@ mod tests {
 		{
 			let light = light_of(texel_of(raw, place));
 			let theirs = brightness(light);
-			let near = (distance(place) - along).abs() <= PLANE * along;
-			let alike = (theirs - bright).abs() <= CLOSE * theirs.max(bright);
+			let apart = (distance(place) - along).abs();
+			let larger = theirs.max(bright);
+			let near = apart <= PLANE * along;
+			let alike = (theirs - bright).abs() <= CLOSE * larger;
+			let near_edge = PLANE.mul_add(-along, apart).abs() < EDGE * along;
+			let alike_edge = CLOSE
+				.mul_add(-larger, (theirs - bright).abs())
+				.abs() < EDGE * larger;
 
 			turned.0 += u32::from(!near);
 			turned.1 += u32::from(near && !alike);
 
-			if near && alike {
-				total += light;
-				weight += 1.0;
-			}
+			// an edge in one test matters only where the other test may take
+			// the neighbor
+			let on_edge =
+				(near_edge && (alike || alike_edge)) || (alike_edge && (near || near_edge));
+			let bit = on_edge.then(|| {
+				edges += 1;
+				edges - 1
+			});
+
+			neighbors.push((light, near && alike, bit));
 		}
 
-		(total / weight, turned)
+		// each number says which neighbors on an edge are taken the other way;
+		// the sum is added up in the order the shader adds it
+		let averages = (0..1_u32 << edges)
+			.map(|flipped| {
+				let (total, weight) = neighbors
+					.iter()
+					.filter(|(_, taken, bit)| {
+						*taken != bit.is_some_and(|bit| flipped & (1 << bit) != 0)
+					})
+					.fold((own, 1.0), |(total, weight), (light, ..)| {
+						(total + *light, weight + 1.0)
+					});
+
+				total / weight
+			})
+			.collect();
+
+		(averages, turned)
 	}
 
 	/// A linear level as the byte an sRGB target keeps of it.
@@ -2290,22 +2339,30 @@ mod tests {
 			lens.w_axis.z / (stored(&found.depth, (column * 2, row * 2)) + lens.z_axis.z)
 		};
 		let mut turned = (0, 0);
+		let mut edges = 0;
 
 		for texel in every_texel() {
-			let (wanted, away) = averaged_at(&found.raw, texel, distance);
+			let (averages, away) = averaged_at(&found.raw, texel, distance);
 			let got = light_of(texel_of(&found.averaged, texel));
 
 			assert!(
-				near_light(got, wanted),
-				"the texel at {texel:?} averaged to {got}, not {wanted}"
+				averages
+					.iter()
+					.any(|wanted| near_light(got, *wanted)),
+				"the texel at {texel:?} averaged to {got}, not any of {averages:?}"
 			);
 
 			turned.0 += away.0;
 			turned.1 += away.1;
+			edges += usize::from(averages.len() > 1);
 		}
 
 		assert!(turned.0 > 5000, "only {} neighbors stood in front of another surface", turned.0);
 		assert!(turned.1 > 5000, "and only {} were lit too differently", turned.1);
+
+		// four on every device measured: ten times that is an edge wider than
+		// the arithmetic, and a test that holds the average to nothing much
+		assert!(edges < 40, "{edges} texels had a neighbor on an edge");
 	}
 
 	#[test]
