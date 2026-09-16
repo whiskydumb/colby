@@ -33,13 +33,13 @@ use colby_asset::Project;
 use colby_core::{
 	abi::{
 		Body, BodyId, Decal, Emitter, EntityId, Field, Joint, JointId, Light, Material,
-		MaterialId, ModelId, Post, Renderable, Sky, Terrain, TextureId, Transform, World,
+		MaterialId, MeshId, ModelId, Post, Renderable, Sky, Terrain, TextureId, Transform, World,
 		field::Value,
 		scene::{self, Stage},
 	},
 	glam::{EulerRot, Quat, Vec2, Vec3},
 };
-use egui::{ComboBox, DragValue, Grid, Label, RichText, ScrollArea, Ui};
+use egui::{ComboBox, DragValue, Grid, Id, Label, RichText, ScrollArea, TextEdit, Ui};
 
 use crate::{
 	history::History,
@@ -215,7 +215,7 @@ fn placing(ui: &mut Ui, world: &mut World, pick: Pick, others: &[Pick], history:
 	};
 
 	let mut edited = transform;
-	let edits = inspect(ui, "transform", &mut edited, Transform::FIELDS);
+	let edits = inspect(ui, world, "transform", &mut edited, Transform::FIELDS);
 
 	if !edits.is_empty() {
 		history.begin("place", world);
@@ -238,7 +238,7 @@ fn look(
 		return;
 	};
 
-	let edits = inspect(ui, "renderable", &mut renderable, Renderable::FIELDS);
+	let edits = inspect(ui, world, "renderable", &mut renderable, Renderable::FIELDS);
 
 	if !edits.is_empty() {
 		history.begin("tint", world);
@@ -270,10 +270,10 @@ fn look(
 /// written back. @ref `colby_core::abi::scene::set_settings`.
 fn settings(ui: &mut Ui, world: &mut World, history: &mut History) {
 	let mut stage = scene::settings(world);
-	let mut moved = !inspect(ui, "world", &mut stage, Stage::FIELDS).is_empty();
+	let mut moved = !inspect(ui, world, "world", &mut stage, Stage::FIELDS).is_empty();
 
-	moved |= !inspect(ui, "sky", &mut stage.sky, Sky::FIELDS).is_empty();
-	moved |= !inspect(ui, "post", &mut stage.post, Post::FIELDS).is_empty();
+	moved |= !inspect(ui, world, "sky", &mut stage.sky, Sky::FIELDS).is_empty();
+	moved |= !inspect(ui, world, "post", &mut stage.post, Post::FIELDS).is_empty();
 
 	if moved {
 		history.begin("world", world);
@@ -299,7 +299,7 @@ fn lamp(
 		return;
 	};
 
-	let edits = inspect(ui, "light", &mut light, Light::FIELDS);
+	let edits = inspect(ui, world, "light", &mut light, Light::FIELDS);
 
 	if !edits.is_empty() {
 		history.begin("light", world);
@@ -332,7 +332,7 @@ fn thrower(
 		return;
 	};
 
-	let edits = inspect(ui, "emitter", &mut emitter, Emitter::FIELDS);
+	let edits = inspect(ui, world, "emitter", &mut emitter, Emitter::FIELDS);
 
 	if !edits.is_empty() {
 		history.begin("emitter", world);
@@ -367,7 +367,7 @@ fn land(
 		return;
 	};
 
-	let edits = inspect(ui, "terrain", &mut terrain, Terrain::FIELDS);
+	let edits = inspect(ui, world, "terrain", &mut terrain, Terrain::FIELDS);
 
 	if !edits.is_empty() {
 		history.begin("terrain", world);
@@ -397,7 +397,7 @@ fn paint(
 	history: &mut History,
 ) {
 	if let Some(mut decal) = world.entities.decal(id).copied() {
-		let edits = inspect(ui, "decal", &mut decal, Decal::FIELDS);
+		let edits = inspect(ui, world, "decal", &mut decal, Decal::FIELDS);
 
 		if !edits.is_empty() {
 			history.begin("decal", world);
@@ -542,7 +542,7 @@ fn solid(ui: &mut Ui, world: &mut World, id: BodyId, others: &[Pick], history: &
 		return;
 	};
 
-	let edits = inspect(ui, "body", &mut body, Body::FIELDS);
+	let edits = inspect(ui, world, "body", &mut body, Body::FIELDS);
 
 	if edits.is_empty() {
 		return;
@@ -587,7 +587,7 @@ fn tie(ui: &mut Ui, world: &mut World, id: JointId, others: &[Pick], history: &m
 		ui.end_row();
 	});
 
-	let edits = inspect(ui, "joint", &mut joint, Joint::FIELDS);
+	let edits = inspect(ui, world, "joint", &mut joint, Joint::FIELDS);
 
 	if edits.is_empty() {
 		return;
@@ -608,7 +608,7 @@ fn tie(ui: &mut Ui, world: &mut World, id: JointId, others: &[Pick], history: &m
 	}
 }
 
-/// A material: its two pictures by name, then everything else by table.
+/// A material, by its own table: the two pictures by name and the rest by kind.
 ///
 /// **No history.** Undo here is a snapshot of the *world*, and a material is a
 /// file the world happens to have loaded - a step back that put the old
@@ -629,29 +629,12 @@ fn coat(ui: &mut Ui, world: &mut World, id: MaterialId) {
 	ui.monospace(&name);
 	ui.separator();
 
-	let mut edited = false;
-	let mut albedo = world
-		.textures
-		.get(material.albedo)
-		.map_or_else(String::new, |entry| entry.name().to_owned());
-	let mut normal = world
-		.textures
-		.get(material.normal)
-		.map_or_else(String::new, |entry| entry.name().to_owned());
-
-	Grid::new("pictures")
-		.num_columns(2)
-		.show(ui, |ui| {
-			ui.label("albedo").on_hover_text(PICTURE);
-			edited |= named(ui, world, &mut albedo, &mut material.albedo);
-			ui.end_row();
-
-			ui.label("normal").on_hover_text(PICTURE);
-			edited |= named(ui, world, &mut normal, &mut material.normal);
-			ui.end_row();
-		});
-
-	edited |= !inspect(ui, "material", &mut material, Material::FIELDS).is_empty();
+	// the two pictures are rows of the table like everything else now: they
+	// are `Kind::Texture` fields, and a reference row is what a reference
+	// field draws as. The hand-written pair they replace kept their text in a
+	// local rebuilt from the handle every frame, so neither could be typed
+	// into - only pasted whole. @ref `reference`.
+	let edited = !inspect(ui, world, "material", &mut material, Material::FIELDS).is_empty();
 
 	if edited && let Some(held) = world.materials.get_mut(id) {
 		*held = material;
@@ -823,61 +806,122 @@ fn counted(many: usize, noun: &str) -> String {
 	}
 }
 
-/// What both picture rows say when hovered.
-const PICTURE: &str = "the asset name of a compiled texture, or empty for none";
+/// What a reference row says when hovered, after the field's own help.
+const BY_NAME: &str = "by asset name, or empty for none";
 
-/// One texture named by hand, because a handle has no spelling.
+/// The name of the thing a handle points at, or nothing when it points at
+/// nothing.
 ///
-/// The row is a field of text and the handle follows it: a name the registry
-/// answers to is taken, and one it does not is left in the field for the
-/// person to finish typing. **Not refused and not cleared** - a half-typed
-/// name is not an error, and clearing the handle on every keystroke would
-/// take the picture off the ball while somebody spells its name.
-///
-/// @param ui - where to draw
-/// @param world - the registry to look a name up in
-/// @param typed - the text field's contents, kept across frames by the caller
-/// @param handle - the material's own field, written when the name resolves
-/// @return whether the handle moved
-fn named(ui: &mut Ui, world: &World, typed: &mut String, handle: &mut TextureId) -> bool {
-	ui.text_edit_singleline(typed).changed() && resolve(world, typed, handle)
+/// @param world - the registries to read
+/// @param value - the handle
+/// @return its name, empty for a handle at nothing or a kind with no names
+fn spelled(world: &World, value: &Value) -> String {
+	match *value {
+		| Value::Mesh(id) => world
+			.meshes
+			.get(id)
+			.map_or_else(String::new, |entry| entry.name().to_owned()),
+		| Value::Material(id) => world.materials.name(id).to_owned(),
+		| Value::Texture(id) => world
+			.textures
+			.get(id)
+			.map_or_else(String::new, |entry| entry.name().to_owned()),
+		| _ => String::new(),
+	}
 }
 
-/// The rule behind that row, with no widget in it.
+/// Writes a handle from a name, if the name is one.
 ///
-/// Empty clears the handle; a name the registry answers to takes it; anything
-/// else leaves both alone, which is what a name somebody is halfway through
-/// typing is.
+/// Empty clears the handle; a name a registry answers to takes it; anything
+/// else leaves it alone, which is what a name somebody is halfway through
+/// typing is. **Not refused and not cleared** - a half-typed name is not an
+/// error, and clearing the handle on every keystroke would take the picture
+/// off the ball while somebody spells its name.
 ///
-/// @param world - the registry to look a name up in
+/// @param world - the registries to look a name up in
 /// @param typed - what is in the field
-/// @param handle - the material's own field, written when the name resolves
+/// @param value - the handle, written when the name resolves
 /// @return whether the handle moved
-fn resolve(world: &World, typed: &str, handle: &mut TextureId) -> bool {
-	if typed.trim().is_empty() {
-		let moved = handle.is_some();
-		*handle = TextureId::NONE;
+fn resolve(world: &World, typed: &str, value: &mut Value) -> bool {
+	let wanted = typed.trim();
 
-		return moved;
-	}
+	let found = match *value {
+		| Value::Mesh(_) if wanted.is_empty() => Value::Mesh(MeshId::NONE),
+		| Value::Mesh(_) => Value::Mesh(world.meshes.find(wanted)),
+		| Value::Material(_) if wanted.is_empty() => Value::Material(MaterialId::DEFAULT),
+		| Value::Material(_) => Value::Material(world.materials.find(wanted)),
+		| Value::Texture(_) if wanted.is_empty() => Value::Texture(TextureId::NONE),
+		| Value::Texture(_) => Value::Texture(world.textures.find(wanted)),
+		| _ => return false,
+	};
 
-	let found = world.textures.find(typed.trim());
-	if !found.is_some() || found == *handle {
+	// a name nothing answers to reads back as the null handle, which is what
+	// `Registry::find` says for anything it does not know. Clearing was asked
+	// for by an empty field and is handled above, so here it means "not yet".
+	if !wanted.is_empty() && spelled(world, &found).is_empty() {
 		return false;
 	}
 
-	*handle = found;
+	if found == *value {
+		return false;
+	}
+
+	*value = found;
 
 	true
 }
 
-/// One inspector over any record with a table: a row per plain field, and a
-/// widget the field's kind decides.
+/// A handle shown and edited as the name of the thing it points at.
 ///
-/// A reference is left out. The table says a body drives an entity, and a row
-/// that could only show a slot number would say less than the tree already
-/// does by nesting one under the other; where a relationship is worth a row,
-/// the caller draws it by name, @ref [`tie`].
+/// **The typed text lives in egui's own store between frames**, keyed by the
+/// row's id, and that is the whole reason this is not four lines. A name
+/// somebody is halfway through typing resolves to no handle, so there is
+/// nowhere in the world to keep it; a string rebuilt from the handle every
+/// frame - which is what the two picture rows used to do - puts the old name
+/// back on every keystroke, and egui keeps a cursor for a text field but never
+/// its text. So the field could only ever be changed by pasting a whole name
+/// in one go.
+///
+/// **The store is read only while the row has the keyboard**, and the question
+/// is asked before the widget is drawn rather than after it: a row that has
+/// just lost the keyboard has to show what the handle really says in the same
+/// frame, so a name left half-typed does not linger and a handle changed from
+/// somewhere else - an undo, another thing selected - turns up at once.
+///
+/// @param ui - where to draw
+/// @param world - the registries to look a name up in
+/// @param salt - the row's id, unique in the panel: the table and the field
+/// @param value - the handle, written when the name resolves
+/// @return whether the handle moved
+fn reference(ui: &mut Ui, world: &World, salt: &str, value: &mut Value) -> bool {
+	let id = Id::new(salt);
+	let held = ui.memory(|memory| memory.has_focus(id));
+	let mut typed = ui
+		.data(|data| data.get_temp::<String>(id))
+		.filter(|_| held)
+		.unwrap_or_else(|| spelled(world, value));
+
+	let response = ui.add(TextEdit::singleline(&mut typed).id(id));
+	let moved = response.changed() && resolve(world, &typed, value);
+
+	ui.data_mut(|data| data.insert_temp(id, typed));
+
+	moved
+}
+
+/// One inspector over any record with a table: a row per field, and a widget
+/// the field's kind decides.
+///
+/// **A handle into one of the asset registries is a row too**, drawn as the
+/// name of the thing it points at: an entity's mesh and its material, a body's
+/// collision mesh, a thrower's picture, a world's cubemap. Before this every
+/// reference was skipped, so what an entity was made of could only be changed
+/// by writing the `.scene` by hand - there was no control anywhere in the
+/// editor for it. A handle into the *world* is still skipped: an entity, a
+/// body or a joint is picked in the picture, a slot number is all a row could
+/// show, and the tree already says more by nesting one under the other. A pose
+/// is skipped for a different reason - poses are made at runtime and have no
+/// names to type.
 ///
 /// **A write is guarded by the numbers having actually changed**, field by
 /// field, and that matters more than it looks for a rotation: two different
@@ -885,26 +929,42 @@ fn resolve(world: &World, typed: &str, handle: &mut TextureId) -> bool {
 /// back in every frame would walk a rotation somewhere it was never dragged.
 ///
 /// @param ui - where to draw
+/// @param world - the registries a reference row reads a name out of
 /// @param salt - what tells this grid from another in the same panel, and what
 /// every widget in it is salted with
 /// @param record - what to show and edit
 /// @param fields - its table
 /// @return every field that was written, with what it held before, for
 /// whatever else is selected
-fn inspect<T>(ui: &mut Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> Vec<Edit> {
+fn inspect<T>(
+	ui: &mut Ui,
+	world: &World,
+	salt: &str,
+	record: &mut T,
+	fields: &[Field<T>],
+) -> Vec<Edit> {
 	let mut edits = Vec::new();
 
 	Grid::new(salt).num_columns(2).show(ui, |ui| {
 		for (index, field) in fields.iter().enumerate() {
-			if field.kind.is_reference() {
+			let held = field.get(record);
+			let named = matches!(held, Value::Mesh(_) | Value::Material(_) | Value::Texture(_));
+
+			if field.kind.is_reference() && !named {
 				continue;
 			}
 
-			ui.label(field.name).on_hover_text(field.help);
-
-			let held = field.get(record);
+			let row = format!("{salt}.{}", field.name);
 			let mut value = held.clone();
-			widget(ui, &format!("{salt}.{}", field.name), field.kind.words(), &mut value);
+
+			if named {
+				ui.label(field.name)
+					.on_hover_text(format!("{}, {BY_NAME}", field.help));
+				reference(ui, world, &row, &mut value);
+			} else {
+				ui.label(field.name).on_hover_text(field.help);
+				widget(ui, &row, field.kind.words(), &mut value);
+			}
 
 			if value != held && field.set(record, value.clone()) {
 				edits.push(Edit { index, held, value });
@@ -1057,7 +1117,7 @@ fn pick(ui: &mut Ui, salt: &str, list: &[&str], held: &mut u32) {
 
 #[cfg(test)]
 mod tests {
-	use colby_core::abi::{MeshId, Shape};
+	use colby_core::abi::Shape;
 	use egui::{Context, Pos2, RawInput, Rect, vec2};
 
 	use super::*;
@@ -1076,8 +1136,9 @@ mod tests {
 		// applied rather than dropped - the right rule for a painter and the
 		// wrong one for a test - so the delta is cleared on purpose, the way
 		// the editor does on its way out.
+		let world = World::new();
 		let mut output = context.run_ui(RawInput::default(), |ui| {
-			written = !inspect(ui, "test", &mut edited, fields).is_empty();
+			written = !inspect(ui, &world, "test", &mut edited, fields).is_empty();
 		});
 		output.textures_delta.clear();
 
@@ -1149,18 +1210,19 @@ mod tests {
 			.textures
 			.insert("textures/brass", colby_core::abi::TextureData::white());
 
-		let mut handle = TextureId::NONE;
+		let mut value = Value::Texture(TextureId::NONE);
+		let handle = |value: &Value| match *value {
+			| Value::Texture(id) => id,
+			| _ => panic!("the kind does not change under it: {value:?}"),
+		};
 
-		assert!(!resolve(&world, "textures/bra", &mut handle), "a half-typed name is nothing");
-		assert!(!handle.is_some(), "and the handle is left where it was");
-		assert!(resolve(&world, "textures/brass", &mut handle), "a whole one is taken");
-		assert!(handle.is_some(), "and the handle is what it resolved to");
-		assert!(
-			!resolve(&world, "textures/brass", &mut handle),
-			"the same name again is no move"
-		);
-		assert!(resolve(&world, "  ", &mut handle), "and nothing at all clears it");
-		assert!(!handle.is_some(), "which is how a picture is taken off");
+		assert!(!resolve(&world, "textures/bra", &mut value), "a half-typed name is nothing");
+		assert!(!handle(&value).is_some(), "and the handle is left where it was");
+		assert!(resolve(&world, "textures/brass", &mut value), "a whole one is taken");
+		assert!(handle(&value).is_some(), "and the handle is what it resolved to");
+		assert!(!resolve(&world, "textures/brass", &mut value), "the same name again is no move");
+		assert!(resolve(&world, "  ", &mut value), "and nothing at all clears it");
+		assert!(!handle(&value).is_some(), "which is how a picture is taken off");
 	}
 
 	#[test]
@@ -1850,6 +1912,7 @@ mod tests {
 		let context = Context::default();
 		context.options_mut(|options| options.warn_on_id_clash = true);
 
+		let world = World::new();
 		let (mut light, mut decal) = (Light::NONE, Decal::NONE);
 		let mut output = context.run_ui(
 			RawInput {
@@ -1857,8 +1920,8 @@ mod tests {
 				..Default::default()
 			},
 			|ui| {
-				inspect(ui, "light", &mut light, Light::FIELDS);
-				inspect(ui, "decal", &mut decal, Decal::FIELDS);
+				inspect(ui, &world, "light", &mut light, Light::FIELDS);
+				inspect(ui, &world, "decal", &mut decal, Decal::FIELDS);
 			},
 		);
 		output.textures_delta.clear();
@@ -1874,6 +1937,221 @@ mod tests {
 		assert!(
 			drawn.iter().any(|text| text == "kind"),
 			"and both tables really drew the row: {drawn:?}"
+		);
+	}
+
+	/// Types a name into a reference row a character at a time, a frame each,
+	/// and leaves the handle wherever the typing took it.
+	///
+	/// The row's id is [`Id::new`] of its salt, so a test can take the keyboard
+	/// for it without knowing where on screen it landed. A character is an
+	/// [`egui::Event::Text`], which is what a keyboard sends; the first frame
+	/// takes the focus and selects what is there, because a row already showing
+	/// a name is a row a person selects before retyping.
+	///
+	/// @param world - the registries the name is looked up in
+	/// @param salt - the row, as `inspect` spells it
+	/// @param value - the handle, edited in place
+	/// @param text - what to type, one character a frame
+	/// @return the context it typed into, whose store is where the row's text
+	/// lives between frames
+	fn typing(world: &World, salt: &str, value: &mut Value, text: &str) -> Context {
+		let context = Context::default();
+		let id = Id::new(salt);
+		let screen = Rect::from_min_size(Pos2::ZERO, vec2(320.0, 600.0));
+		let frame = |events: Vec<egui::Event>, value: &mut Value| {
+			let mut output = context.run_ui(
+				RawInput {
+					screen_rect: Some(screen),
+					events,
+					..Default::default()
+				},
+				|ui| {
+					ui.memory_mut(|memory| memory.request_focus(id));
+					reference(ui, world, salt, value);
+				},
+			);
+			output.textures_delta.clear();
+		};
+
+		frame(Vec::new(), value);
+		frame(
+			vec![egui::Event::Key {
+				key: egui::Key::A,
+				physical_key: None,
+				pressed: true,
+				repeat: false,
+				modifiers: egui::Modifiers::COMMAND,
+			}],
+			value,
+		);
+
+		for letter in text.chars() {
+			frame(vec![egui::Event::Text(letter.to_string())], value);
+		}
+
+		context.clone()
+	}
+
+	/// A name typed one character at a time reaches the handle.
+	///
+	/// **The row this replaces could not do this**, and nothing said so: it
+	/// kept the field's text in a local rebuilt from the handle every frame,
+	/// and egui keeps a cursor for a text field but never its text, so every
+	/// keystroke that did not happen to complete a whole asset name was put
+	/// back before the next frame drew. Only a paste of the finished name ever
+	/// worked.
+	#[test]
+	fn a_name_typed_a_letter_at_a_time_reaches_the_handle() {
+		let (mut world, _) = coated();
+		world
+			.textures
+			.insert("rust", colby_core::abi::TextureData::white());
+
+		let mut value = Value::Texture(TextureId::NONE);
+		drop(typing(&world, "material.albedo", &mut value, "rust"));
+
+		assert_eq!(
+			value,
+			Value::Texture(world.textures.find("rust")),
+			"four keystrokes over four frames spell a name the registry knows"
+		);
+	}
+
+	/// The row driven through the real panel, on the thing it is all for: what
+	/// an entity is made of, changed by typing a name, and written to every
+	/// entity picked with it.
+	///
+	/// Before this there was no control anywhere in the editor that could do
+	/// it: `inspect` skipped every reference, the asset browser's drop made a
+	/// new entity rather than re-pointing one, and a scene's meshes and
+	/// materials could only be assigned by writing the `.scene` by hand.
+	#[test]
+	fn an_entity_s_mesh_typed_in_the_panel_reaches_every_entity_picked() {
+		let mut world = World::new();
+		world.editing = true;
+		let mut history = History::default();
+		let cube = world
+			.meshes
+			.insert("cube", colby_core::abi::MeshData::default());
+		let [shown, other, alone] = [(); 3].map(|()| world.entities.spawn());
+
+		let select_all = [egui::Event::Key {
+			key: egui::Key::A,
+			physical_key: None,
+			pressed: true,
+			repeat: false,
+			modifiers: egui::Modifiers::COMMAND,
+		}];
+		let letters: Vec<Vec<egui::Event>> = "cube"
+			.chars()
+			.map(|letter| vec![egui::Event::Text(letter.to_string())])
+			.collect();
+		let mut then: Vec<&[egui::Event]> = vec![&select_all];
+		then.extend(letters.iter().map(Vec::as_slice));
+
+		driven("mesh", &then, &mut |ui| {
+			detail(
+				ui,
+				&mut world,
+				Pick::Entity(shown),
+				&[Pick::Entity(other)],
+				&mut history,
+				false,
+				None,
+			);
+		});
+
+		let mesh = |world: &World, id| {
+			world
+				.entities
+				.renderable(id)
+				.map(|look| look.mesh)
+		};
+
+		assert_eq!(mesh(&world, shown), Some(cube), "the entity shown is made of it");
+		assert_eq!(mesh(&world, other), Some(cube), "and so is the one picked with it");
+		assert_eq!(
+			mesh(&world, alone),
+			Some(MeshId::NONE),
+			"and the one nobody picked is left alone"
+		);
+	}
+
+	/// A name left half-typed does not linger once the row loses the keyboard.
+	///
+	/// The store is what lets a name be typed at all, and it is also what would
+	/// keep `cub` in the field forever if nothing put it back: the handle never
+	/// moved, so the row would be showing something the world does not say.
+	#[test]
+	fn a_half_typed_name_is_put_back_when_the_row_loses_the_keyboard() {
+		let mut world = World::new();
+		world
+			.meshes
+			.insert("cube", colby_core::abi::MeshData::default());
+
+		let mut value = Value::Mesh(world.meshes.find("cube"));
+		let context = typing(&world, "renderable.mesh", &mut value, "cub");
+
+		assert_eq!(
+			value,
+			Value::Mesh(world.meshes.find("cube")),
+			"a name that is not one leaves the handle where it was"
+		);
+
+		// one more frame on the same context, because that is where the row's
+		// text is kept, with the keyboard given up as a click elsewhere gives it
+		context.memory_mut(|memory| memory.surrender_focus(Id::new("renderable.mesh")));
+
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320.0, 600.0))),
+				..Default::default()
+			},
+			|ui| {
+				reference(ui, &world, "renderable.mesh", &mut value);
+			},
+		);
+		output.textures_delta.clear();
+
+		let drawn = painted(&output.shapes);
+
+		assert!(
+			drawn.iter().any(|text| text == "cube"),
+			"the row is back to what the handle really says: {drawn:?}"
+		);
+		assert!(
+			!drawn.iter().any(|text| text == "cub"),
+			"and the half-typed name is gone: {drawn:?}"
+		);
+	}
+
+	/// A reference row is drawn where a reference field is, and only where the
+	/// registries can spell one.
+	#[test]
+	fn a_reference_into_the_world_is_still_left_out_of_the_table() {
+		let world = World::new();
+		let mut edited = Body::dynamic(Shape::ball(1.0), Transform::IDENTITY, 1.0);
+		let context = Context::default();
+
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320.0, 600.0))),
+				..Default::default()
+			},
+			|ui| drop(inspect(ui, &world, "body", &mut edited, Body::FIELDS)),
+		);
+		output.textures_delta.clear();
+
+		let drawn = painted(&output.shapes);
+
+		assert!(
+			drawn.iter().any(|text| text == "shape.mesh"),
+			"a mesh is an asset and has a row: {drawn:?}"
+		);
+		assert!(
+			!drawn.iter().any(|text| text == "entity"),
+			"the entity it drives is picked in the picture, not typed: {drawn:?}"
 		);
 	}
 }
