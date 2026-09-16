@@ -64,6 +64,7 @@ mod browser;
 mod catalog;
 mod console;
 mod gizmo;
+mod helper;
 mod hierarchy;
 mod history;
 mod inspector;
@@ -103,6 +104,17 @@ pub const SHOW: &str = "editor.show";
 /// Godot's editor keeps one in the project. One number and a console line is
 /// the smallest thing that is honestly a grid.
 pub const GRID: &str = "editor.grid";
+
+/// The variable that decides whether the things with nothing to look at are
+/// drawn and can be clicked.
+///
+/// **On, and every editor read for this has the same switch** - a menu of
+/// kinds, a key, a show flag. What it is for is the same thing in all of them:
+/// a world full of lamps is a world full of glyphs, and somebody framing a
+/// picture wants the picture. Off takes the marks, the outlines, the reaches
+/// and the handles away *and* takes them out of a click, because a thing that
+/// answers a click while being invisible is worse than one that does neither.
+pub const HELPERS: &str = "editor.helpers";
 
 /// The variable that decides whether the world is being edited rather than
 /// played.
@@ -577,6 +589,12 @@ impl Editor {
 			Value::Float(GRID_STEP),
 			"how far apart the editor's grid is, in world units; 0 turns snapping off",
 		);
+		world.cvars.saved(
+			HELPERS,
+			Value::Bool(true),
+			"draw and pick the things that have nothing to look at: lamps, throwers, decals, \
+			 ties and bodies nobody draws",
+		);
 	}
 
 	/// The grid step this world is being edited on, or nothing for no snapping.
@@ -592,6 +610,12 @@ impl Editor {
 	/// @param world - where the variable lives
 	#[must_use]
 	pub fn shown(world: &World) -> bool { world.cvars.bool(SHOW).unwrap_or(false) }
+
+	/// Whether the things with nothing to look at are drawn and clickable.
+	///
+	/// @param world - where the variable lives
+	#[must_use]
+	pub fn helpers(world: &World) -> bool { world.cvars.bool(HELPERS).unwrap_or(true) }
 
 	/// Shows the editor if it is hidden, and hides it if it is not.
 	///
@@ -2117,6 +2141,371 @@ mod tests {
 			panels.selection.at(),
 			Pick::Entity(crate_),
 			"and the crate itself with alt held"
+		);
+	}
+
+	/// A lamp standing somewhere, drawing nothing at all.
+	fn lit(world: &mut World, at: Vec3) -> EntityId {
+		let id = world.entities.spawn_at(Transform::at(at));
+		world
+			.entities
+			.set_light(id, colby_core::abi::Light::point(Vec3::ONE, 1.0, 4.0));
+
+		id
+	}
+
+	/// A world being edited, looked at from nine back along z.
+	fn looked_at() -> World {
+		let mut world = World::new();
+		world.editing = true;
+		world.camera.position = Vec3::new(0.0, 0.0, 9.0);
+		world.camera.target = Vec3::ZERO;
+
+		world
+	}
+
+	/// Where something in the world lands in the window.
+	fn on_screen(world: &World, view: Rect, at: Vec3) -> Pos2 {
+		let size = Vec2::new(view.width(), view.height());
+		let point = gizmo::project(
+			world
+				.render_camera()
+				.view_projection(size.x / size.y),
+			at,
+			size,
+		)
+		.expect("it is in front of the camera");
+
+		Pos2::new(view.min.x + point.x, view.min.y + point.y)
+	}
+
+	/// A press and a release in one frame.
+	fn clicking(pointer: Pos2) -> Vec<egui::Event> {
+		let mut events = vec![egui::Event::PointerMoved(pointer)];
+
+		for pressed in [true, false] {
+			events.push(egui::Event::PointerButton {
+				pos: pointer,
+				button: egui::PointerButton::Primary,
+				pressed,
+				modifiers: Modifiers::NONE,
+			});
+		}
+
+		events
+	}
+
+	#[test]
+	fn a_click_on_a_lamp_s_mark_selects_it_where_a_ray_would_find_nothing() {
+		let mut world = looked_at();
+		let lamp = lit(&mut world, Vec3::ZERO);
+		let mut panels = Panels::default();
+		let context = Context::default();
+		let (view, _) = frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let pointer = on_screen(&world, view, Vec3::ZERO);
+
+		assert_eq!(
+			aim::under(&world, world.camera.position, Vec3::NEG_Z),
+			Pick::Nothing,
+			"a lamp has no mesh, so the ray finds nothing"
+		);
+
+		drop(frame_on(&context, &mut panels, &mut world, clicking(pointer), Modifiers::NONE));
+
+		assert_eq!(panels.selection.at(), Pick::Entity(lamp), "and the mark answers the click");
+	}
+
+	#[test]
+	fn a_click_on_a_mark_inside_a_group_selects_the_group_and_with_alt_the_lamp() {
+		let mut world = looked_at();
+		let lamp = lit(&mut world, Vec3::ZERO);
+		let group = world.entities.spawn();
+		assert!(world.entities.set_parent(lamp, group));
+
+		if let Some(editing) = world
+			.entities
+			.record_mut(&colby_core::abi::EDITING, group)
+		{
+			editing.group = 1;
+		}
+
+		let mut panels = Panels::default();
+		let context = Context::default();
+		let (view, _) = frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let pointer = on_screen(&world, view, Vec3::ZERO);
+
+		drop(frame_on(&context, &mut panels, &mut world, clicking(pointer), Modifiers::NONE));
+
+		assert_eq!(panels.selection.at(), Pick::Entity(group), "the group around the lamp");
+
+		panels.apply(&mut world, Change::Select(Pick::Nothing));
+		drop(frame_on(&context, &mut panels, &mut world, clicking(pointer), Modifiers::ALT));
+
+		assert_eq!(
+			panels.selection.at(),
+			Pick::Entity(lamp),
+			"and the lamp itself with alt held"
+		);
+	}
+
+	#[test]
+	fn the_switch_takes_the_marks_off_the_screen_and_out_of_a_click() {
+		let mut world = looked_at();
+		world.cvars.var(HELPERS, Value::Bool(false), "");
+		let lamp = lit(&mut world, Vec3::ZERO);
+		let mut panels = Panels::default();
+		let context = Context::default();
+		let (view, _) = frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let (_, shapes) =
+			frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let off = straight_lines(shapes);
+		let pointer = on_screen(&world, view, Vec3::ZERO);
+
+		drop(frame_on(&context, &mut panels, &mut world, clicking(pointer), Modifiers::NONE));
+
+		assert_eq!(panels.selection.at(), Pick::Nothing, "nothing to click on");
+
+		world.cvars.set(HELPERS, "true");
+		drop(frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE));
+		let (_, shapes) =
+			frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+
+		assert_eq!(straight_lines(shapes), off + 4, "a lamp's mark is four rays");
+
+		drop(frame_on(&context, &mut panels, &mut world, clicking(pointer), Modifiers::NONE));
+
+		assert_eq!(panels.selection.at(), Pick::Entity(lamp), "and it answers a click again");
+	}
+
+	#[test]
+	fn a_reach_dragged_by_its_handle_is_one_step_back_however_long_the_pointer_rests() {
+		let mut world = looked_at();
+		let lamp = lit(&mut world, Vec3::ZERO);
+		let other = lit(&mut world, Vec3::new(0.0, 3.0, 0.0));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(other)));
+		panels.apply(&mut world, Change::Toggle(Pick::Entity(lamp)));
+
+		let context = Context::default();
+		let (view, _) = frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let handle = helper::handles(&world, &world.render_camera(), Pick::Entity(lamp))
+			.first()
+			.copied()
+			.expect("a lit lamp offers its reach");
+		let pointer = on_screen(&world, view, handle.at);
+		let press = |pressed, at: Pos2| egui::Event::PointerButton {
+			pos: at,
+			button: egui::PointerButton::Primary,
+			pressed,
+			modifiers: Modifiers::NONE,
+		};
+
+		let held = |world: &World, id| {
+			world
+				.entities
+				.light(id)
+				.map(|light| light.range)
+				.unwrap_or_default()
+		};
+
+		drop(frame_on(
+			&context,
+			&mut panels,
+			&mut world,
+			vec![egui::Event::PointerMoved(pointer), press(true, pointer)],
+			Modifiers::NONE,
+		));
+
+		let out = Pos2::new(pointer.x + 40.0, pointer.y);
+		drop(frame_on(
+			&context,
+			&mut panels,
+			&mut world,
+			vec![egui::Event::PointerMoved(out)],
+			Modifiers::NONE,
+		));
+
+		let after = held(&world, lamp);
+		assert!(after > 4.0, "the drag let the lamp out: {after}");
+
+		// the pointer resting, which is what makes a drag several steps back
+		// anywhere the record is opened only by a value moving
+		for _ in 0..4 {
+			drop(frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE));
+		}
+
+		let far = Pos2::new(pointer.x + 80.0, pointer.y);
+		drop(frame_on(
+			&context,
+			&mut panels,
+			&mut world,
+			vec![egui::Event::PointerMoved(far)],
+			Modifiers::NONE,
+		));
+		drop(frame_on(
+			&context,
+			&mut panels,
+			&mut world,
+			vec![press(false, far)],
+			Modifiers::NONE,
+		));
+		drop(frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE));
+
+		let ended = held(&world, lamp);
+
+		assert!(ended > after, "and it kept going after the rest: {ended}");
+		assert_eq!(panels.tabs.history().len(), 1, "one step back for the whole drag");
+		assert_eq!(panels.tabs.history().undoable(), Some("reach"));
+		assert!(
+			(held(&world, other) - ended).abs() < 1.0e-4,
+			"and the other lamp picked reaches as far: {}",
+			held(&world, other)
+		);
+	}
+
+	#[test]
+	fn a_press_and_a_release_on_a_handle_are_not_a_click_on_what_is_behind_it() {
+		let mut world = looked_at();
+		let lamp = lit(&mut world, Vec3::ZERO);
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(lamp)));
+
+		let context = Context::default();
+		let (view, _) = frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let handle = helper::handles(&world, &world.render_camera(), Pick::Entity(lamp))
+			.first()
+			.copied()
+			.expect("a lit lamp offers its reach");
+		let pointer = on_screen(&world, view, handle.at);
+		let button = |pressed| {
+			vec![egui::Event::PointerButton {
+				pos: pointer,
+				button: egui::PointerButton::Primary,
+				pressed,
+				modifiers: Modifiers::NONE,
+			}]
+		};
+
+		// a real pointer presses in one frame and lets go in another, and the
+		// click is answered in the second: by then the drag is over, and what
+		// keeps the click off the world is the handle still being under it
+		drop(frame_on(
+			&context,
+			&mut panels,
+			&mut world,
+			vec![egui::Event::PointerMoved(pointer)],
+			Modifiers::NONE,
+		));
+		drop(frame_on(&context, &mut panels, &mut world, button(true), Modifiers::NONE));
+		drop(frame_on(&context, &mut panels, &mut world, button(false), Modifiers::NONE));
+
+		assert_eq!(
+			panels.selection.at(),
+			Pick::Entity(lamp),
+			"the lamp is still what is selected, and the empty world behind the handle is not"
+		);
+	}
+
+	/// What a game keeps on every entity, with a field drawn each way.
+	#[repr(C)]
+	#[derive(
+		Clone, Copy, Debug, PartialEq, colby_core::bytemuck::Pod, colby_core::bytemuck::Zeroable,
+	)]
+	#[bytemuck(crate = "::colby_core::bytemuck")]
+	struct Door {
+		reach: f32,
+		target: [f32; 3],
+	}
+
+	/// The door as the game spells it.
+	const DOOR: colby_core::abi::Record<Door> = colby_core::abi::Record {
+		name: "door",
+		help: "a thing that opens",
+		rows: &[
+			colby_core::row!(Float, Door, reach, "how far off it notices somebody")
+				.drawn(colby_core::abi::Draw::Radius),
+			colby_core::row!(Vec3, Door, target, "where it swings to")
+				.drawn(colby_core::abi::Draw::Point),
+		],
+		default: Door { reach: 3.0, target: [1.0, 0.0, 0.0] },
+	};
+
+	#[test]
+	fn what_a_game_s_record_draws_is_on_screen_and_goes_with_the_switch() {
+		let mut world = looked_at();
+		world.entities.declare(&DOOR).expect("a door");
+		let door = world.entities.spawn_at(Transform::at(Vec3::ZERO));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(door)));
+
+		let context = Context::default();
+		drop(frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE));
+		let (_, shapes) =
+			frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let drawn = straight_lines(shapes);
+
+		world.cvars.var(HELPERS, Value::Bool(false), "");
+		drop(frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE));
+		let (_, shapes) =
+			frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let off = straight_lines(shapes);
+
+		assert!(
+			drawn > off + 3 * 24,
+			"three circles and a line out to the place: {drawn} against {off}"
+		);
+	}
+
+	#[test]
+	fn a_record_s_radius_is_dragged_by_its_own_handle_in_one_step_back() {
+		let mut world = looked_at();
+		world.entities.declare(&DOOR).expect("a door");
+		let door = world.entities.spawn_at(Transform::at(Vec3::ZERO));
+		let mut panels = Panels::default();
+		panels.apply(&mut world, Change::Select(Pick::Entity(door)));
+
+		let context = Context::default();
+		let (view, _) = frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE);
+		let handle = helper::noted(&world, &world.render_camera(), Pick::Entity(door))
+			.into_iter()
+			.find(|handle| matches!(handle.knob, helper::Knob::Radius { .. }))
+			.expect("the record says one of its fields is a radius");
+		let pointer = on_screen(&world, view, handle.at);
+		let press = |pressed, at: Pos2| {
+			vec![egui::Event::PointerButton {
+				pos: at,
+				button: egui::PointerButton::Primary,
+				pressed,
+				modifiers: Modifiers::NONE,
+			}]
+		};
+		let mut events = vec![egui::Event::PointerMoved(pointer)];
+		events.extend(press(true, pointer));
+
+		drop(frame_on(&context, &mut panels, &mut world, events, Modifiers::NONE));
+
+		let out = Pos2::new(pointer.x + 60.0, pointer.y);
+		drop(frame_on(
+			&context,
+			&mut panels,
+			&mut world,
+			vec![egui::Event::PointerMoved(out)],
+			Modifiers::NONE,
+		));
+		drop(frame_on(&context, &mut panels, &mut world, press(false, out), Modifiers::NONE));
+		drop(frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE));
+
+		let Some(colby_core::abi::field::Value::Float(reach)) = world.entities.field(door, 2, 0)
+		else {
+			panic!("a door keeps a number");
+		};
+
+		assert!(reach > 3.0, "the field the record drew grew with the drag: {reach}");
+		assert_eq!(panels.tabs.history().len(), 1, "one step back for the drag");
+		assert_eq!(
+			panels.tabs.history().undoable(),
+			Some("record"),
+			"named as the panel names it"
 		);
 	}
 

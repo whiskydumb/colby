@@ -18,6 +18,13 @@
 //! handle is on screen, how wide the projection is. The window's corner is
 //! added back only when a handle is painted.
 //!
+//! **What has nothing to look at is drawn anyway.** A lamp, a thrower, a decal,
+//! a tie between two bodies and a body nobody draws are marked or outlined
+//! whatever is selected, and a click lands on those marks before it is offered
+//! to the meshes - what is painted on top is what is picked. @ref
+//! [`helper`](crate::helper), which owns all of that arithmetic;
+//! `editor.helpers` turns the lot off.
+//!
 //! - **right drag** turns the camera around what it is looking at;
 //! - **middle drag** slides what it is looking at across the view;
 //! - **the wheel** moves closer and further;
@@ -37,16 +44,19 @@
 //! [`gizmo`](crate::gizmo), which is where the arithmetic and the tests are.
 
 use colby_core::{
-	abi::{Camera, LightKind, Transform, World},
+	abi::{Camera, EmitterKind, EntityId, LightKind, Transform, World},
 	glam::{Mat4, Quat, Vec2, Vec3},
 	trace,
 };
-use egui::{Color32, Context, Key, LayerId, Painter, PointerButton, Pos2, Rect, Stroke, vec2};
+use egui::{
+	Color32, Context, Key, LayerId, Painter, PointerButton, Pos2, Rect, Stroke, StrokeKind, vec2,
+};
 
 use crate::{
 	Editor,
 	aim::{self, View},
 	gizmo::{self, Axis, Tool},
+	helper::{self, Drawn, Handle, Kind, Knob, MARK, Mark, Outline},
 	history::History,
 	select::{self, Pick, Selection},
 };
@@ -72,6 +82,30 @@ const LAMP: Color32 = Color32::from_rgb(190, 170, 70);
 /// Dim like [`LAMP`] and of another hue: where a group reaches is a fact about
 /// the scene, and a lamp's reach and a group's box can be on screen together.
 const GROUPED: Color32 = Color32::from_rgb(120, 150, 190);
+
+/// What a tie between two bodies is drawn in.
+///
+/// Its own hue, because a tie, a lamp's reach and a group's box can all be on
+/// screen at once and the eye has to tell them apart.
+const TIE: Color32 = Color32::from_rgb(110, 190, 200);
+
+/// What a body nobody draws is outlined in.
+const SOLID: Color32 = Color32::from_rgb(145, 145, 155);
+
+/// What a body full of fluid is outlined in.
+const FLUID: Color32 = Color32::from_rgb(90, 155, 210);
+
+/// What a thing that throws particles is marked in.
+const THROWN: Color32 = Color32::from_rgb(215, 140, 80);
+
+/// What a thing that paints is marked in.
+const PAINT: Color32 = Color32::from_rgb(165, 140, 220);
+
+/// What a field of a game's own record draws itself in.
+const NOTED: Color32 = Color32::from_rgb(110, 200, 150);
+
+/// How wide the blob in the middle of a mark is, in points.
+const EYE: f32 = 3.5;
 
 /// The eight corners of the unit cube a decal's box is, in its own space.
 const BOX_CORNERS: [Vec3; 8] = [
@@ -114,9 +148,38 @@ pub(crate) struct Viewport {
 	grab: Option<Grab>,
 }
 
-/// A drag of one handle, from the moment it was grabbed.
+/// A drag in progress: the gizmo moving everything selected, or one of the
+/// selected thing's own handles writing one of its fields.
 #[derive(Clone, Debug)]
-struct Grab {
+enum Grab {
+	/// An arm or a ring of the gizmo.
+	Tool(Pulled),
+
+	/// A handle of the thing itself. @ref [`helper`](crate::helper).
+	Field(Held),
+}
+
+/// A drag of one field's handle, from the moment it was grabbed.
+#[derive(Clone, Debug)]
+struct Held {
+	/// The handle as it stood when it was taken hold of: where its line is in
+	/// the world, and what its field held then.
+	handle: Handle,
+
+	/// What it hangs off.
+	pick: Pick,
+
+	/// Where on the handle's line or plane the pointer read the first time.
+	start: Vec3,
+
+	/// Every other entity picked, which the change is written to as well - the
+	/// inspector's rule for a changed field, through the same call.
+	others: Vec<EntityId>,
+}
+
+/// A drag of one of the gizmo's handles, from the moment it was grabbed.
+#[derive(Clone, Debug)]
+struct Pulled {
 	/// Which handle.
 	axis: Axis,
 
@@ -254,7 +317,8 @@ impl Viewport {
 		self.view = Some(view);
 	}
 
-	/// Draws the gizmo and applies whatever is being dragged with it.
+	/// Draws the gizmo, everything with nothing to look at, and applies
+	/// whatever is being dragged.
 	///
 	/// @return whether the pointer is on the gizmo's business rather than the
 	/// world's
@@ -274,18 +338,36 @@ impl Viewport {
 		history: &mut History,
 	) -> bool {
 		let pick = selection.at();
-		let Some(at) = select::transform(world, pick) else {
-			self.grab = None;
-
-			return false;
-		};
-
 		let camera = world.render_camera();
 		let viewport = size(view);
-		let handles = Handles::of(&camera, at, self.tool, viewport);
-		let over = held.at.and_then(|point| handles.under(point));
+		let shown = Editor::helpers(world);
 
-		if held.released {
+		// whatever is selected, and even when nothing is: a click cannot land
+		// on what is not drawn, which is the whole reason a mark exists
+		if shown {
+			helpers(context, world, selection, &camera, (viewport, view, held.at));
+		}
+
+		let mut knobs = if shown {
+			helper::handles(world, &camera, pick)
+		} else {
+			Vec::new()
+		};
+
+		if shown {
+			knobs.extend(helper::noted(world, &camera, pick));
+		}
+		let over_knob = held
+			.at
+			.and_then(|point| helper::grabbed(&knobs, &camera, viewport, point));
+
+		let placed = select::transform(world, pick);
+		let handles = placed.map(|at| Handles::of(&camera, at, self.tool, viewport));
+		let over = handles
+			.as_ref()
+			.and_then(|drawn| held.at.and_then(|point| drawn.under(point)));
+
+		if held.released || (placed.is_none() && knobs.is_empty()) {
 			self.grab = None;
 		}
 
@@ -297,25 +379,32 @@ impl Viewport {
 			trace!(
 				busy,
 				?over,
+				?over_knob,
 				at = ?held.at,
-				middle = ?handles.middle,
+				middle = ?handles.as_ref().and_then(|drawn| drawn.middle),
 				tool = self.tool.word(),
 				"the pointer went down in the world"
 			);
 		}
 
 		if held.pressed
-			&& !busy && let (Some(axis), Some(point)) = (over, held.at)
+			&& !busy && let Some(point) = held.at
 		{
-			// everything else selected, with where it stands now: the drag
-			// lands them from here, however long it lasts
-			let others = selection
-				.others()
-				.into_iter()
-				.filter_map(|other| select::transform(world, other).map(|was| (other, was)))
-				.collect();
+			// a field's own handle is asked before the arms: it is the smaller
+			// target and it is drawn on top of them
+			if let Some(handle) = over_knob.and_then(|index| knobs.get(index)) {
+				self.hold_field(&camera, selection, handle, point, viewport);
+			} else if let (Some(at), Some(axis)) = (placed, over) {
+				// everything else selected, with where it stands now: the drag
+				// lands them from here, however long it lasts
+				let others = selection
+					.others()
+					.into_iter()
+					.filter_map(|other| select::transform(world, other).map(|was| (other, was)))
+					.collect();
 
-			self.hold(&camera, at, axis, point, viewport, others);
+				self.hold(&camera, at, axis, point, viewport, others);
+			}
 		}
 
 		if held.down
@@ -324,21 +413,38 @@ impl Viewport {
 			self.pull(world, pick, &camera, point, viewport, history);
 		}
 
-		lamps(context, world, selection, &camera, viewport, view);
-		decals(context, world, selection, &camera, viewport, view);
-		groups(context, world, selection, &camera, viewport, view);
-		handles.paint(
-			context,
-			self.grab
-				.as_ref()
-				.map_or(over, |grab| Some(grab.axis)),
-			view,
-		);
+		let lit = self.holding().or_else(|| {
+			over_knob
+				.and_then(|index| knobs.get(index))
+				.map(|handle| handle.knob)
+		});
 
-		self.grab.is_some() || (over.is_some() && !busy)
+		paint_knobs(context, &knobs, lit, (&camera, viewport, view));
+
+		if let Some(drawn) = handles {
+			drawn.paint(context, self.turning().or(over), view);
+		}
+
+		self.grab.is_some() || ((over.is_some() || over_knob.is_some()) && !busy)
 	}
 
-	/// Takes hold of a handle.
+	/// Which of a thing's own handles the drag in progress is holding.
+	fn holding(&self) -> Option<Knob> {
+		match &self.grab {
+			| Some(Grab::Field(grab)) => Some(grab.handle.knob),
+			| Some(Grab::Tool(_)) | None => None,
+		}
+	}
+
+	/// Which of the gizmo's arms or rings the drag in progress is holding.
+	fn turning(&self) -> Option<Axis> {
+		match &self.grab {
+			| Some(Grab::Tool(grab)) => Some(grab.axis),
+			| Some(Grab::Field(_)) | None => None,
+		}
+	}
+
+	/// Takes hold of one of the gizmo's handles.
 	///
 	/// @param others - everything else selected, each with where it stands
 	fn hold(
@@ -354,7 +460,7 @@ impl Viewport {
 			return;
 		};
 
-		self.grab = Some(Grab {
+		self.grab = Some(Grab::Tool(Pulled {
 			axis,
 			tool: self.tool,
 			from: at,
@@ -363,14 +469,45 @@ impl Viewport {
 			last: start,
 			total: 0.0,
 			others,
-		});
+		}));
 	}
 
-	/// Applies the drag in progress.
+	/// Takes hold of one of the selected thing's own handles.
 	///
-	/// Written down first, every frame of it: the record opens on the first
-	/// frame and stays open while the drag writes, so the whole drag is one
-	/// step back. @ref [`History::begin`].
+	/// @param handle - the handle as it stands, which carries what its field
+	/// holds: a drag is measured against both
+	fn hold_field(
+		&mut self,
+		camera: &Camera,
+		selection: &Selection,
+		handle: &Handle,
+		point: Vec2,
+		viewport: Vec2,
+	) {
+		let Some(start) = helper::read(handle, camera, point, viewport) else {
+			return;
+		};
+
+		self.grab = Some(Grab::Field(Held {
+			handle: *handle,
+			pick: selection.at(),
+			start,
+			others: selection
+				.others()
+				.into_iter()
+				.filter_map(|other| match other {
+					| Pick::Entity(id) => Some(id),
+					| Pick::Nothing
+					| Pick::Body(_)
+					| Pick::Joint(_)
+					| Pick::Material(_)
+					| Pick::Model(_) => None,
+				})
+				.collect(),
+		}));
+	}
+
+	/// Applies whichever drag is in progress.
 	fn pull(
 		&mut self,
 		world: &mut World,
@@ -380,7 +517,28 @@ impl Viewport {
 		viewport: Vec2,
 		history: &mut History,
 	) {
-		let Some(grab) = self.grab.as_mut() else {
+		if matches!(self.grab, Some(Grab::Tool(_))) {
+			self.pull_tool(world, pick, camera, point, viewport, history);
+		} else if matches!(self.grab, Some(Grab::Field(_))) {
+			self.pull_field(world, camera, point, viewport, history);
+		}
+	}
+
+	/// Applies a drag of one of the gizmo's handles.
+	///
+	/// Written down first, every frame of it: the record opens on the first
+	/// frame and stays open while the drag writes, so the whole drag is one
+	/// step back. @ref [`History::begin`].
+	fn pull_tool(
+		&mut self,
+		world: &mut World,
+		pick: Pick,
+		camera: &Camera,
+		point: Vec2,
+		viewport: Vec2,
+		history: &mut History,
+	) {
+		let Some(Grab::Tool(grab)) = self.grab.as_mut() else {
 			return;
 		};
 
@@ -412,6 +570,268 @@ impl Viewport {
 
 		history.begin(tool.word(), world);
 		select::drag_all(world, pick, from, put, &others);
+	}
+
+	/// Applies a drag of one of the selected thing's own handles.
+	///
+	/// Written down every frame it is held, exactly as a gizmo drag is, and
+	/// that is what makes a drag with a pause in it one step back rather than
+	/// several: a record ends on the first frame nobody writes.
+	fn pull_field(
+		&self,
+		world: &mut World,
+		camera: &Camera,
+		point: Vec2,
+		viewport: Vec2,
+		history: &mut History,
+	) {
+		let Some(Grab::Field(grab)) = self.grab.as_ref() else {
+			return;
+		};
+
+		let Some(now) = helper::read(&grab.handle, camera, point, viewport) else {
+			return;
+		};
+
+		let value = helper::dragged(&grab.handle, now - grab.start, Editor::grid(world));
+
+		history.begin(grab.handle.knob.word(), world);
+		helper::write(world, grab.pick, &grab.others, &grab.handle, value);
+	}
+}
+
+/// Everything the editor draws for things that have nothing to look at.
+///
+/// @param at - where the pointer is, so that whatever it is resting on is drawn
+/// as the thing that would answer a click
+fn helpers(
+	context: &Context,
+	world: &World,
+	selection: &Selection,
+	camera: &Camera,
+	(viewport, view, at): (Vec2, Rect, Option<Vec2>),
+) {
+	let marked = helper::marks(world, camera, viewport);
+	let lines = helper::outlines(world);
+	let lit = at.and_then(|point| helper::nearest(&marked, point));
+	let touched = at
+		.filter(|_| lit.is_none())
+		.and_then(|point| helper::touched(&lines, camera, viewport, point));
+	let detail: Vec<(Vec3, Vec3)> = selection
+		.picks()
+		.into_iter()
+		.flat_map(|pick| helper::detail(world, pick))
+		.collect();
+
+	let sketched: Vec<(Vec3, Vec3)> = selection
+		.picks()
+		.into_iter()
+		.flat_map(|pick| helper::sketch(world, pick))
+		.collect();
+
+	paint_marks(context, &marked, lit, view);
+	paint_outlines(context, &lines, touched, &detail, camera, viewport, view);
+	paint_sketch(context, &sketched, camera, viewport, view);
+	lamps(context, world, selection, camera, viewport, view);
+	throwers(context, world, selection, camera, viewport, view);
+	decals(context, world, selection, camera, viewport, view);
+	groups(context, world, selection, camera, viewport, view);
+}
+
+/// Every mark, drawn where the thing it stands for stands.
+///
+/// A glyph of lines and circles rather than a picture: a mark says which of
+/// four things this is and nothing else, and an editor that had to load a
+/// texture to say it would have one more thing to go wrong.
+///
+/// @param lit - which of them the pointer is resting on
+fn paint_marks(context: &Context, marks: &[Mark], lit: Option<usize>, view: Rect) {
+	let painter = context
+		.layer_painter(LayerId::background())
+		.with_clip_rect(view);
+	let corner = Vec2::new(view.min.x, view.min.y);
+
+	for (index, mark) in marks.iter().enumerate() {
+		let color = if lit == Some(index) { LIT } else { tint(mark.kind) };
+		let stroke = Stroke::new(INK.0, color);
+		let at = spot(mark.at + corner);
+
+		match mark.kind {
+			| Kind::Lamp => {
+				painter.circle_filled(at, EYE, color);
+
+				for way in [Vec2::X, Vec2::NEG_X, Vec2::Y, Vec2::NEG_Y] {
+					painter.line_segment(
+						[
+							spot(mark.at + corner + way * (EYE + 2.0)),
+							spot(mark.at + corner + way * MARK),
+						],
+						stroke,
+					);
+				}
+			},
+			| Kind::Spot => {
+				painter.circle_filled(at, EYE, color);
+
+				// down the way it throws, so a cone aimed at the floor reads
+				// as one from above without turning the camera
+				let way = mark.aim.unwrap_or(Vec2::Y);
+
+				painter.line_segment(
+					[
+						spot(mark.at + corner + way * (EYE + 1.5)),
+						spot(mark.at + corner + way * (MARK + 4.0)),
+					],
+					stroke,
+				);
+			},
+			| Kind::Thrower =>
+				for offset in [
+					Vec2::ZERO,
+					Vec2::new(MARK * 0.7, -MARK * 0.6),
+					Vec2::new(-MARK * 0.6, -MARK * 0.7),
+				] {
+					painter.circle_filled(spot(mark.at + corner + offset), 2.0, color);
+				},
+			| Kind::Painter => {
+				let wide = MARK * 0.8;
+
+				painter.rect_stroke(
+					Rect::from_center_size(at, vec2(wide * 2.0, wide * 2.0)),
+					1.0,
+					stroke,
+					StrokeKind::Middle,
+				);
+				painter.circle_filled(at, 1.5, color);
+			},
+		}
+	}
+}
+
+/// What a kind of mark is drawn in.
+const fn tint(kind: Kind) -> Color32 {
+	match kind {
+		| Kind::Lamp | Kind::Spot => LAMP,
+		| Kind::Thrower => THROWN,
+		| Kind::Painter => PAINT,
+	}
+}
+
+/// Every outline, and whatever a selected thing adds to its own.
+///
+/// @param lit - which of them the pointer is resting on
+fn paint_outlines(
+	context: &Context,
+	lines: &[Outline],
+	lit: Option<usize>,
+	detail: &[(Vec3, Vec3)],
+	camera: &Camera,
+	viewport: Vec2,
+	view: Rect,
+) {
+	let painter = context
+		.layer_painter(LayerId::background())
+		.with_clip_rect(view);
+	let corner = Vec2::new(view.min.x, view.min.y);
+	let view_projection = camera.view_projection(viewport.x / viewport.y.max(1.0));
+
+	for (index, outline) in lines.iter().enumerate() {
+		let color = if lit == Some(index) {
+			LIT
+		} else {
+			match outline.drawn {
+				| Drawn::Tie => TIE,
+				| Drawn::Solid => SOLID,
+				| Drawn::Fluid => FLUID,
+			}
+		};
+		let stroke = Stroke::new(INK.0, color);
+
+		for (from, to) in &outline.segments {
+			segment(&painter, view_projection, (*from, *to), (viewport, corner), stroke);
+		}
+	}
+
+	let stroke = Stroke::new(INK.0, TIE);
+
+	for (from, to) in detail {
+		segment(&painter, view_projection, (*from, *to), (viewport, corner), stroke);
+	}
+}
+
+/// What a selected thing's own records draw: a radius as circles, a place as a
+/// line out to where it is.
+///
+/// Its own color, because it is the one thing on screen a *game* asked for: the
+/// rest of what is drawn here is the engine saying what it knows about a lamp,
+/// a tie or a box.
+fn paint_sketch(
+	context: &Context,
+	sketched: &[(Vec3, Vec3)],
+	camera: &Camera,
+	viewport: Vec2,
+	view: Rect,
+) {
+	let painter = context
+		.layer_painter(LayerId::background())
+		.with_clip_rect(view);
+	let corner = Vec2::new(view.min.x, view.min.y);
+	let view_projection = camera.view_projection(viewport.x / viewport.y.max(1.0));
+	let stroke = Stroke::new(INK.0, NOTED);
+
+	for (from, to) in sketched {
+		segment(&painter, view_projection, (*from, *to), (viewport, corner), stroke);
+	}
+}
+
+/// One line in the world, projected and drawn.
+///
+/// @param corner - where the picture is on the screen
+fn segment(
+	painter: &Painter,
+	view_projection: Mat4,
+	(from, to): (Vec3, Vec3),
+	(viewport, corner): (Vec2, Vec2),
+	stroke: Stroke,
+) {
+	let (Some(start), Some(end)) = (
+		gizmo::project(view_projection, from, viewport),
+		gizmo::project(view_projection, to, viewport),
+	) else {
+		return;
+	};
+
+	painter.line_segment([spot(start + corner), spot(end + corner)], stroke);
+}
+
+/// The handles a selected thing's own fields offer, drawn as blocks.
+///
+/// A block rather than a blob, which is what the size tool's arms end in: a
+/// handle here stretches a number the same way, and the shape is the one thing
+/// that says so before it is dragged.
+///
+/// @param lit - which field the pointer is resting on, or is dragging
+fn paint_knobs(
+	context: &Context,
+	knobs: &[Handle],
+	lit: Option<Knob>,
+	(camera, viewport, view): (&Camera, Vec2, Rect),
+) {
+	let painter = context
+		.layer_painter(LayerId::background())
+		.with_clip_rect(view);
+	let corner = Vec2::new(view.min.x, view.min.y);
+	let view_projection = camera.view_projection(viewport.x / viewport.y.max(1.0));
+
+	for handle in knobs {
+		let Some(at) = gizmo::project(view_projection, handle.at, viewport) else {
+			continue;
+		};
+
+		let color = if lit == Some(handle.knob) { LIT } else { LAMP };
+		let block = Rect::from_center_size(spot(at + corner), vec2(TIP * 2.0, TIP * 2.0));
+
+		painter.rect_filled(block, 1.0, color);
 	}
 }
 
@@ -457,7 +877,7 @@ fn lamps(
 		let at = world.entities.placed(id).unwrap_or_default();
 
 		if light.kind == LightKind::Spot {
-			let (_, outer) = light.cone();
+			let (inner, outer) = light.cone();
 			let way = (at.rotation * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
 
 			// four segments out of the apex rather than a polyline through all
@@ -480,6 +900,24 @@ fn lamps(
 				corner,
 				stroke,
 			);
+
+			// and the bright middle inside it, dimmer and only when there is
+			// one: `inner` is a number with no meaning on screen anywhere else,
+			// and it is nought until somebody sets it
+			if inner > 0.0 {
+				outline(
+					&painter,
+					&gizmo::circle(
+						camera,
+						at.position + way * light.range,
+						way,
+						light.range * inner.tan(),
+						viewport,
+					),
+					corner,
+					Stroke::new(INK.0, LAMP.gamma_multiply(0.55)),
+				);
+			}
 
 			continue;
 		}
@@ -532,13 +970,99 @@ fn decals(
 			continue;
 		}
 
-		let matrix = world
-			.entities
-			.placed(id)
-			.unwrap_or_default()
-			.matrix();
+		let placed = world.entities.placed(id).unwrap_or_default();
 
-		edges(&painter, view_projection, matrix, viewport, corner, stroke);
+		edges(&painter, view_projection, placed.matrix(), viewport, corner, stroke);
+
+		// and which way it throws its picture, which is the one thing about a
+		// decal the box does not say: a puddle and a picture on a wall are the
+		// same box turned two different ways
+		let way = (placed.rotation * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
+		let tip = placed.position + way * (placed.scale.z.abs() * 0.5);
+
+		for (from, to) in helper::arrow(placed.position, tip) {
+			segment(&painter, view_projection, (from, to), (viewport, corner), stroke);
+		}
+	}
+}
+
+/// What every selected thrower throws into, drawn over the world.
+///
+/// The lamps' reason a third time, and here it is the whole of what is on
+/// screen: an emitter has no geometry, and a world being edited has no cloud
+/// either - a cloud is the step's, and no step runs while somebody is editing.
+/// The cone is drawn as far as a particle thrown at full speed gets before it
+/// dies, @ref [`helper::reach`], so what `speed`, `life` and `drag` come to is
+/// a distance rather than three numbers in a panel.
+fn throwers(
+	context: &Context,
+	world: &World,
+	selection: &Selection,
+	camera: &Camera,
+	viewport: Vec2,
+	view: Rect,
+) {
+	let painter = context
+		.layer_painter(LayerId::background())
+		.with_clip_rect(view);
+	let corner = Vec2::new(view.min.x, view.min.y);
+	let stroke = Stroke::new(INK.0, THROWN);
+
+	for pick in selection.picks() {
+		let Pick::Entity(id) = pick else {
+			continue;
+		};
+
+		let Some(emitter) = world
+			.entities
+			.emitter(id)
+			.copied()
+			.filter(|it| it.kind.throws())
+		else {
+			continue;
+		};
+
+		let at = world.entities.placed(id).unwrap_or_default();
+		let far = helper::reach(&emitter);
+
+		if far <= 0.0 {
+			continue;
+		}
+
+		if emitter.kind == EmitterKind::Cone {
+			let way = (at.rotation * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
+			let edges = gizmo::cone(camera, at, far, emitter.spread, viewport);
+
+			for rim in edges.iter().skip(1) {
+				painter.line_segment([spot(edges[0] + corner), spot(*rim + corner)], stroke);
+			}
+
+			outline(
+				&painter,
+				&gizmo::circle(
+					camera,
+					at.position + way * far,
+					way,
+					far * emitter.spread.tan(),
+					viewport,
+				),
+				corner,
+				stroke,
+			);
+
+			continue;
+		}
+
+		// a point throws every way, so it reads as a ball: the lamp's three
+		// circles, for the lamp's reason
+		for normal in [Vec3::X, Vec3::Y, Vec3::Z] {
+			outline(
+				&painter,
+				&gizmo::circle(camera, at.position, normal, far, viewport),
+				corner,
+				stroke,
+			);
+		}
 	}
 }
 
@@ -878,6 +1402,16 @@ fn picked(world: &World, at: Vec2, viewport: Vec2) -> Pick {
 
 	if along.abs_diff_eq(Vec3::ZERO, f32::EPSILON) {
 		return Pick::Nothing;
+	}
+
+	// what is painted over the picture is what a click lands on. A mark has no
+	// depth at all, and a mesh is picked by its *bounds*, so a box the camera
+	// stands inside answers every ray at no distance and would take every
+	// click. @ref [`helper`](crate::helper) for the whole of that argument.
+	if Editor::helpers(world)
+		&& let Some(found) = helper::under(world, &camera, viewport, at)
+	{
+		return found;
 	}
 
 	aim::under(world, from, along)

@@ -989,8 +989,12 @@ pub(crate) fn grouped(world: &World, pick: Pick) -> Pick {
 ///
 /// A thing that draws counts as the eight corners of its mesh's box carried
 /// through where it is drawn, so a turned thing counts as the room it takes up.
-/// A thing that draws nothing counts as the point it stands at, which is where
-/// a lamp or an empty group is.
+/// **A decal counts as the box it paints inside**, which is its own transform's
+/// unit cube: a decal has no mesh and does have extents, and a group made
+/// around one should stand in the middle of what it covers. A thing that draws
+/// nothing else counts as the point it stands at, which is where a lamp, a
+/// thrower or an empty group is - how far a lamp reaches is what it does rather
+/// than where it is, and no engine read for this counts it either.
 ///
 /// @param world - what to look in
 /// @param ids - the entities; a stale handle counts as nothing
@@ -1011,7 +1015,14 @@ pub(crate) fn bounds(world: &World, ids: &[EntityId]) -> Option<(Vec3, Vec3)> {
 			.renderable(id)
 			.and_then(|look| world.meshes.get(look.mesh))
 			.map(|mesh| mesh.value().bounds())
-			.filter(|(min, max)| !min.cmpge(*max).all());
+			.filter(|(min, max)| !min.cmpge(*max).all())
+			.or_else(|| {
+				world
+					.entities
+					.decal(id)
+					.is_some_and(|decal| decal.paints())
+					.then_some((Vec3::splat(-0.5), Vec3::splat(0.5)))
+			});
 
 		let Some((min, max)) = boxed else {
 			low = low.min(placed.position);
@@ -1665,6 +1676,35 @@ pub(crate) fn spread<T>(record: &mut T, fields: &[Field<T>], edits: &[Edit]) -> 
 	}
 
 	written
+}
+
+/// Writes what was changed in one of an entity's tables into the same table of
+/// every other entity selected.
+///
+/// The one call a panel and a handle in the picture both make, so that a field
+/// changed in either place means the same thing for a selection of several.
+///
+/// @param world - the world to write
+/// @param others - the other entities
+/// @param fields - the table's own field list
+/// @param edits - what was changed
+/// @param read - an entity's copy of the table
+/// @param write - puts a copy back
+pub(crate) fn spread_into<T>(
+	world: &mut World,
+	others: &[EntityId],
+	fields: &[Field<T>],
+	edits: &[Edit],
+	read: fn(&World, EntityId) -> Option<T>,
+	write: fn(&mut World, EntityId, T) -> bool,
+) {
+	for &other in others {
+		if let Some(mut theirs) = read(world, other)
+			&& spread(&mut theirs, fields, edits)
+		{
+			write(world, other, theirs);
+		}
+	}
 }
 
 /// Writes one field of a declared record, changed on the entity shown, into
@@ -2680,6 +2720,40 @@ mod tests {
 		);
 		assert!(bounds(&world, &[]).is_none(), "nothing counted is no box");
 		assert!(bounds(&world, &[gone]).is_none(), "and nor is a stale handle");
+	}
+
+	#[test]
+	fn a_decal_counts_as_the_box_it_paints_inside_and_a_lamp_as_its_point() {
+		let mut world = World::new();
+		world
+			.meshes
+			.insert("meshes/cube", colby_core::abi::mesh::cube());
+
+		let decal = world.entities.spawn_at(Transform {
+			position: Vec3::new(2.0, 0.0, 0.0),
+			rotation: colby_core::glam::Quat::IDENTITY,
+			scale: Vec3::new(4.0, 2.0, 1.0),
+		});
+		world.entities.set_decal(decal, Decal::BOX);
+
+		let (low, high) = bounds(&world, &[decal]).expect("a decal has extents");
+
+		assert!(low.abs_diff_eq(Vec3::new(0.0, -1.0, -0.5), 1.0e-4), "the box it paints: {low}");
+		assert!(high.abs_diff_eq(Vec3::new(4.0, 1.0, 0.5), 1.0e-4), "{high}");
+
+		let lamp = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(2.0, 0.0, 0.0)));
+		world
+			.entities
+			.set_light(lamp, Light::point(Vec3::ONE, 1.0, 9.0));
+
+		let (low, high) = bounds(&world, &[lamp]).expect("a lamp is somewhere");
+
+		assert!(
+			low.abs_diff_eq(high, 1.0e-6) && low.abs_diff_eq(Vec3::new(2.0, 0.0, 0.0), 1.0e-4),
+			"and how far a lamp reaches is what it does rather than where it is: {low} {high}"
+		);
 	}
 
 	#[test]

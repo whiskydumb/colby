@@ -224,28 +224,6 @@ fn placing(ui: &mut Ui, world: &mut World, pick: Pick, others: &[Pick], history:
 	}
 }
 
-/// Writes what was changed in one table of the entity shown into the same
-/// table of every other entity selected.
-///
-/// @param read - an entity's copy of the table
-/// @param write - puts a copy back
-fn onto<T>(
-	world: &mut World,
-	others: &[EntityId],
-	fields: &[Field<T>],
-	edits: &[Edit],
-	read: fn(&World, EntityId) -> Option<T>,
-	write: fn(&mut World, EntityId, T) -> bool,
-) {
-	for &other in others {
-		if let Some(mut theirs) = read(world, other)
-			&& select::spread(&mut theirs, fields, edits)
-		{
-			write(world, other, theirs);
-		}
-	}
-}
-
 /// What an entity looks like: the plain half of its renderable, which is the
 /// tint. The mesh, the material and the pose are handles, and the tree names
 /// the mesh in the row above.
@@ -269,7 +247,7 @@ fn look(
 		// one field this table edits is a color, whose picker a headless frame does
 		// not press, and what the call does is the lamp's, the ground's, the
 		// emitter's and the decal's, which the suite presses.
-		onto(
+		select::spread_into(
 			world,
 			others,
 			Renderable::FIELDS,
@@ -326,7 +304,7 @@ fn lamp(
 	if !edits.is_empty() {
 		history.begin("light", world);
 		world.entities.set_light(id, light);
-		onto(
+		select::spread_into(
 			world,
 			others,
 			Light::FIELDS,
@@ -359,7 +337,7 @@ fn thrower(
 	if !edits.is_empty() {
 		history.begin("emitter", world);
 		world.entities.set_emitter(id, emitter);
-		onto(
+		select::spread_into(
 			world,
 			others,
 			Emitter::FIELDS,
@@ -394,7 +372,7 @@ fn land(
 	if !edits.is_empty() {
 		history.begin("terrain", world);
 		world.entities.set_terrain(id, terrain);
-		onto(
+		select::spread_into(
 			world,
 			others,
 			Terrain::FIELDS,
@@ -424,7 +402,7 @@ fn paint(
 		if !edits.is_empty() {
 			history.begin("decal", world);
 			world.entities.set_decal(id, decal);
-			onto(
+			select::spread_into(
 				world,
 				others,
 				Decal::FIELDS,
