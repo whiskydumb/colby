@@ -18,6 +18,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libasound2-dev pkg-config mesa-vulkan-drivers
+          dpkg-query -W -f='${Package} ${Version}\n' mesa-vulkan-drivers
+          lscpu | grep -m1 'Model name'
 
       - uses: taiki-e/install-action@v2
         with:
@@ -28,10 +30,31 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: the gate
-        run: just ci
+      - name: the gate, formatting
+        run: just fmt-check
+
+      - name: the gate, spelling
+        if: ${{ !cancelled() }}
+        run: just typos
+
+      - name: the gate, lints
+        if: ${{ !cancelled() }}
+        run: just clippy
+
+      - name: the gate, lints of the shipping configuration
+        if: ${{ !cancelled() }}
+        run: just clippy-static
+
+      - name: the gate, type check
+        if: ${{ !cancelled() }}
+        run: just check
+
+      - name: the gate, tests
+        if: ${{ !cancelled() }}
+        run: just test
 
       - name: the three oracles, each twice, byte for byte
+        if: ${{ !cancelled() }}
         run: |
           just shot one.png && just shot two.png && cmp one.png two.png
           just hear one.wav && just hear two.wav && cmp one.wav two.wav

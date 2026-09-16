@@ -65,8 +65,12 @@ clippy-static:
     cargo clippy --package colby --all-targets --no-default-features --features static_game {{locked}} -- -D warnings
 
 # run the test suite
+#
+# @note: --no-fail-fast because cargo otherwise stops at the first test binary
+# with a failure, and every binary after it in the alphabet never runs: a red
+# run then shows one failure where there may be several. The run is still red.
 test:
-    cargo test --workspace {{locked}}
+    cargo test --workspace --no-fail-fast {{locked}}
 
 # spell-check sources and docs
 typos:
@@ -76,6 +80,10 @@ typos:
 lint: fmt-check typos clippy clippy-static
 
 # the full gate
+#
+# @note: CI runs the same parts as steps of their own, each one even after
+# another failed, so that a red part does not hide the rest; a part added here
+# is a step added to .github/workflows/ci.yml.
 ci: lint check test
 
 # debug build with full symbols
