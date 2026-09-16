@@ -1056,8 +1056,6 @@ impl Panels {
 		}
 	}
 
-	/// Puts an asset into the world where it was dropped, as one record, and
-	/// selects what it became.
 	/// Asks for a mode, and writes the play down when one is starting.
 	///
 	/// The variable is written rather than the state, so a typed `sim.edit 1`

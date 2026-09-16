@@ -500,34 +500,37 @@ fn record(
 	ui.label(RichText::new(&name).strong())
 		.on_hover_text(help);
 
-	Grid::new(format!("record {name}"))
-		.num_columns(2)
-		.show(ui, |ui| {
-			for (index, column) in columns.iter().enumerate() {
-				let Some(held) = world.entities.field(id, table, index) else {
-					continue;
-				};
-				let words: Vec<&str> = column
-					.kind()
-					.words()
-					.iter()
-					.map(String::as_str)
-					.collect();
-				let mut value = held.clone();
+	// the grid and every widget in it share one salt, and it carries the word
+	// `record` so that a game's record called `light` cannot collide with the
+	// engine's own light table, which salts with its bare name
+	let salt = format!("record {name}");
 
-				ui.label(column.name())
-					.on_hover_text(column.help());
-				widget(ui, &format!("{name}.{}", column.name()), &words, &mut value);
+	Grid::new(&salt).num_columns(2).show(ui, |ui| {
+		for (index, column) in columns.iter().enumerate() {
+			let Some(held) = world.entities.field(id, table, index) else {
+				continue;
+			};
+			let words: Vec<&str> = column
+				.kind()
+				.words()
+				.iter()
+				.map(String::as_str)
+				.collect();
+			let mut value = held.clone();
 
-				if value != held {
-					history.begin("record", world);
-					world.entities.set_field(id, table, index, &value);
-					select::spread_record(world, others, table, &Edit { index, held, value });
-				}
+			ui.label(column.name())
+				.on_hover_text(column.help());
+			widget(ui, &format!("{salt}.{}", column.name()), &words, &mut value);
 
-				ui.end_row();
+			if value != held {
+				history.begin("record", world);
+				world.entities.set_field(id, table, index, &value);
+				select::spread_record(world, others, table, &Edit { index, held, value });
 			}
-		});
+
+			ui.end_row();
+		}
+	});
 }
 
 /// Everything the solver reads about a body, to edit.
@@ -882,7 +885,8 @@ fn resolve(world: &World, typed: &str, handle: &mut TextureId) -> bool {
 /// back in every frame would walk a rotation somewhere it was never dragged.
 ///
 /// @param ui - where to draw
-/// @param salt - what tells this grid from another in the same panel
+/// @param salt - what tells this grid from another in the same panel, and what
+/// every widget in it is salted with
 /// @param record - what to show and edit
 /// @param fields - its table
 /// @return every field that was written, with what it held before, for
@@ -900,7 +904,7 @@ fn inspect<T>(ui: &mut Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> V
 
 			let held = field.get(record);
 			let mut value = held.clone();
-			widget(ui, field.name, field.kind.words(), &mut value);
+			widget(ui, &format!("{salt}.{}", field.name), field.kind.words(), &mut value);
 
 			if value != held && field.set(record, value.clone()) {
 				edits.push(Edit { index, held, value });
@@ -916,7 +920,8 @@ fn inspect<T>(ui: &mut Ui, salt: &str, record: &mut T, fields: &[Field<T>]) -> V
 /// The widget one value is edited with, by its kind.
 ///
 /// @param ui - where to draw
-/// @param salt - an id no other widget in the panel has: the field's name
+/// @param salt - an id no other widget in the panel has: the table's name and
+/// the field's
 /// @param words - the words a word may be, and none for any other value
 /// @param value - what to draw and edit in place
 fn widget(ui: &mut Ui, salt: &str, words: &[&str], value: &mut Value) {
@@ -1831,6 +1836,44 @@ mod tests {
 				.chain([Joint::weld(one, two, (Vec3::ZERO, Vec3::X)).collide])
 				.collect::<Vec<bool>>()[..],
 			"and a joint's"
+		);
+	}
+
+	/// Two tables on one panel, each with a word field called `kind`.
+	///
+	/// Salted by the field's name alone both drop-downs are one id, and egui
+	/// covers the pair with its clash overlay - which is not only a wrong list
+	/// but a swallowed click, in every build with debug assertions. `kind` is a
+	/// word field of five tables here and `blend` of two.
+	#[test]
+	fn two_tables_with_a_field_of_one_name_do_not_share_a_widget_id() {
+		let context = Context::default();
+		context.options_mut(|options| options.warn_on_id_clash = true);
+
+		let (mut light, mut decal) = (Light::NONE, Decal::NONE);
+		let mut output = context.run_ui(
+			RawInput {
+				screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320.0, 600.0))),
+				..Default::default()
+			},
+			|ui| {
+				inspect(ui, "light", &mut light, Light::FIELDS);
+				inspect(ui, "decal", &mut decal, Decal::FIELDS);
+			},
+		);
+		output.textures_delta.clear();
+
+		let drawn = painted(&output.shapes);
+		let complaints: Vec<&str> = drawn
+			.iter()
+			.filter(|text| text.contains("use of widget ID"))
+			.map(String::as_str)
+			.collect();
+
+		assert!(complaints.is_empty(), "egui says two widgets share an id: {complaints:?}");
+		assert!(
+			drawn.iter().any(|text| text == "kind"),
+			"and both tables really drew the row: {drawn:?}"
 		);
 	}
 }

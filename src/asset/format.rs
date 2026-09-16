@@ -76,10 +76,14 @@ pub const EXTENSION: &str = "cmesh";
 
 /// [`MeshHeader::flags`]: a sidecar beside the source was read into this.
 ///
-/// The same bit a `.cmodel` carries and for the same reason: a `lamp.obj.model`
-/// deleted moves nothing in the source tree, so without this the mesh would go
-/// on standing at the scale of a file nobody can find. @ref
-/// [`model::GUIDED`](crate::model::GUIDED), `crate::compile::is_stale`.
+/// The same bit a `.cmodel` carries and for the same reason: the file's own
+/// record of how it came to be, for somebody looking at a compiled mesh and
+/// asking why it stands at the scale it does. **Nothing in the compiler reads
+/// it.** It used to be a second answer to "the sidecar was deleted", and that
+/// question is settled by the input list a pass writes down, which names a
+/// sidecar only while it is there: deleting one shortens the list and the mesh
+/// rebuilds. @ref [`model::GUIDED`](crate::model::GUIDED),
+/// `crate::compile::extra_inputs`.
 pub const GUIDED: u32 = 1 << 0;
 
 /// Every flag bit this build knows.
@@ -530,9 +534,8 @@ pub fn version_of(path: &Path) -> Option<u32> {
 
 /// The flag bits the file at this path sets, if it is one at all.
 ///
-/// The head alone, so the staleness sweep can ask whether an output was built
-/// through a sidecar without reading a file it may be about to rewrite. @ref
-/// [`GUIDED`], `crate::compile::is_stale`.
+/// The head alone, so a compiled mesh can be asked how it was built without
+/// reading a file that may be about to be rewritten. @ref [`GUIDED`].
 ///
 /// @param path - the `.cmesh` to look at
 #[must_use]

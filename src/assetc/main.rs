@@ -16,6 +16,14 @@
 //! somewhere else by hand, and with both pointed there is no project to read.
 //! A source that fails to compile is reported and the rest are compiled
 //! anyway; the exit status is non-zero if anything failed.
+//!
+//! **`--quiet` is about the report, not about the log.** What each source
+//! compiled to is this command's own output and `--quiet` silences all but the
+//! failures; a `warn!` the compiler writes goes through the same subscriber a
+//! run of the engine installs, and `COLBY_LOG` is what turns those up or down.
+//! Without one installed they were written into a process listening to nothing,
+//! which is what made the compiler quieter here than in the runner for no
+//! reason anybody chose.
 
 use std::{path::PathBuf, process::ExitCode};
 
@@ -23,7 +31,7 @@ use colby_asset::{
 	Project,
 	compile::{self, Produced, Report},
 };
-use colby_core::{Result, err, glam::Vec3};
+use colby_core::{Result, err, glam::Vec3, log};
 
 /// What the command line asked for.
 #[derive(Debug, Default)]
@@ -53,6 +61,12 @@ options:
 ";
 
 fn main() -> ExitCode {
+	if let Err(error) = log::init() {
+		eprintln!("colby-assetc: {error}");
+
+		return ExitCode::FAILURE;
+	}
+
 	let options = match Options::parse() {
 		| Ok(Some(options)) => options,
 		| Ok(None) => {

@@ -1235,10 +1235,6 @@ fn is_stale(source: &Path, output: &Path, root: &Path, stamps: &Stamps, filed: &
 		return true;
 	}
 
-	if guide_changed(source, output, kind) {
-		return true;
-	}
-
 	!stamps.matches(filed, &inputs(source, root))
 }
 
@@ -1301,12 +1297,12 @@ fn beside_is_stale(output: &Path) -> bool {
 /// geometry kinds may have a sidecar beside it saying how to read the file -
 /// @ref [`import`].
 ///
-/// **A sidecar is listed only when it is there.** A file that is not there has
-/// no time to read, and what a pass writes down about it is that it was
-/// absent - so a sidecar appearing beside a model is a list that changed, and
-/// a rebuild. What happens when one is *deleted* is answered twice over: the
-/// list changes here as well, and a mark in the output says so - @ref
-/// [`guide_changed`].
+/// **A sidecar is listed only when it is there**, so the list changes whichever
+/// way a sidecar moves: one appearing beside a model is a list that grew and
+/// one deleted is a list that shrank, and either is a rebuild. That is the
+/// whole answer - the `GUIDED` mark in the output is the file's own record of
+/// how it was built and nothing in the sweep reads it. @ref
+/// [`crate::format::GUIDED`].
 fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
 	let mut found = match kind {
 		| Kind::Document => {
@@ -1333,27 +1329,6 @@ fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
 	}
 
 	found
-}
-
-/// Whether an output was built through a sidecar that is not there any more.
-///
-/// The one thing the source tree cannot be asked. Deleting `lamp.gltf.model`
-/// moves nothing the sweep looks at - the `.gltf` did not change and the output
-/// is still newer than it - so without this the model would go on standing at
-/// the scale of a file nobody can find. The output says how it was built and
-/// this compares that against what is beside the source now.
-///
-/// @param source - the `.obj`, `.gltf` or `.glb`
-/// @param output - what it compiled to
-/// @param kind - which of the two it is
-fn guide_changed(source: &Path, output: &Path, kind: Kind) -> bool {
-	let was = match kind {
-		| Kind::Mesh => format::flags_of(output).is_some_and(|flags| flags & format::GUIDED != 0),
-		| Kind::Model => model::flags_of(output).is_some_and(|flags| flags & model::GUIDED != 0),
-		| _ => return false,
-	};
-
-	was && !import::beside(source).is_file()
 }
 
 /// Turns one `.lua` into the bytes of a `.clua`.
@@ -3523,9 +3498,10 @@ mod model_tests {
 
 	#[test]
 	fn deleting_a_sidecar_rebuilds_the_model_it_stood_beside() {
-		// the one thing the source tree cannot be asked: the .glb did not
-		// move and the output is still newer than it, so only the mark in the
-		// output knows the difference
+		// the .glb did not move and the output is still newer than it, so
+		// nothing about the two files themselves says this is stale. What says
+		// so is the list of inputs the last pass wrote down, which named the
+		// sidecar while it was there and does not name it now
 		let dir = workspace("guide-deleted");
 
 		put(&dir, "models/lamp.glb", PACKED);

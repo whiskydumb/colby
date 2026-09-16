@@ -1234,24 +1234,6 @@ fn hollow(world: &World, id: EntityId) -> bool {
 /// is going to want is a body of water rather than a tank.
 pub(crate) const POOL: Vec3 = Vec3::new(8.0, 3.0, 8.0);
 
-/// Puts a body of water in the world, and gives it something to look at.
-///
-/// **One entity and one body, and the two agree by construction.** The body's
-/// shape is the unit cube and its size is the transform's scale, which is
-/// exactly what the cube mesh the entity draws is - so the box that is drawn
-/// and the box that floats things are the same box, and the gizmo's size tool
-/// moves both at once. A shape with its own extents beside a mesh with its own
-/// scale would be two numbers a person has to keep equal by hand.
-///
-/// A cube rather than a quad at the surface, and it is worth saying why: a
-/// fluid is a *volume*, its walls are where things stop being in it, and a
-/// single plane at the top would draw a world where a pool and a puddle look
-/// identical. @ref [`Material::WATER`](colby_core::abi::Material::WATER) for
-/// the three rules that make it see-through.
-///
-/// @param world - the world to write
-/// @param at - where the middle of it goes
-/// @return what was made, for the selection; empty if the tables are full
 /// The nearest point on a grid of this step.
 ///
 /// **Half away rounds away from nought**, which is `f32::round`'s rule and is
@@ -1364,6 +1346,24 @@ pub(crate) fn block(world: &mut World, at: Vec3, step: Option<f32>) -> Vec<Pick>
 	vec![Pick::Entity(entity)]
 }
 
+/// Puts a body of water in the world, and gives it something to look at.
+///
+/// **One entity and one body, and the two agree by construction.** The body's
+/// shape is the unit cube and its size is the transform's scale, which is
+/// exactly what the cube mesh the entity draws is - so the box that is drawn
+/// and the box that floats things are the same box, and the gizmo's size tool
+/// moves both at once. A shape with its own extents beside a mesh with its own
+/// scale would be two numbers a person has to keep equal by hand.
+///
+/// A cube rather than a quad at the surface, and it is worth saying why: a
+/// fluid is a *volume*, its walls are where things stop being in it, and a
+/// single plane at the top would draw a world where a pool and a puddle look
+/// identical. @ref [`Material::WATER`](colby_core::abi::Material::WATER) for
+/// the three rules that make it see-through.
+///
+/// @param world - the world to write
+/// @param at - where the middle of it goes
+/// @return what was made, for the selection; empty if the tables are full
 pub(crate) fn water(world: &mut World, at: Vec3) -> Vec<Pick> {
 	let mut standing = Transform::at(at);
 	standing.scale = POOL;

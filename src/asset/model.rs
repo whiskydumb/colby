@@ -63,11 +63,12 @@ pub const EXTENSION: &str = "cmodel";
 
 /// [`ModelHeader::flags`]: a sidecar beside the source was read into this.
 ///
-/// The one thing the file itself could not otherwise be asked. A sidecar
-/// deleted leaves no trace in the source tree - the `.gltf` did not move, so
-/// the output is still newer than it - and without this bit the model would go
-/// on standing at the scale of a file nobody can find. The staleness sweep
-/// reads it and rebuilds. @ref `crate::compile::is_stale`,
+/// The file's own record of how it came to be, for somebody looking at a
+/// compiled model and asking why it stands at the scale it does. **Nothing in
+/// the compiler reads it.** It used to be a second answer to "the sidecar was
+/// deleted", and that question is settled by the input list a pass writes
+/// down, which names a sidecar only while it is there: deleting one shortens
+/// the list and the model rebuilds. @ref `crate::compile::extra_inputs`,
 /// `crate::import`.
 pub const GUIDED: u32 = 1 << 0;
 
@@ -532,9 +533,8 @@ pub fn version_of(path: &Path) -> Option<u32> {
 
 /// The flag bits the file at this path sets, if it is one at all.
 ///
-/// The head alone, so the staleness sweep can ask whether an output was built
-/// through a sidecar without reading a file it may be about to rewrite. @ref
-/// [`GUIDED`], `crate::compile::is_stale`.
+/// The head alone, so a compiled model can be asked how it was built without
+/// reading a file that may be about to be rewritten. @ref [`GUIDED`].
 ///
 /// @param path - the `.cmodel` to look at
 #[must_use]
