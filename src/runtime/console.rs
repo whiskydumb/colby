@@ -326,6 +326,7 @@ pub(crate) fn install(world: &mut World) {
 	install_loc(world);
 	install_nav(world);
 	install_scenes(world);
+	crate::light::install(world);
 	install_code(world);
 	install_audio(world);
 	install_net(world);

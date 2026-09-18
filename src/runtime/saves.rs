@@ -393,7 +393,7 @@ fn prop(world: &World, project: &Project, name: &str) -> Result {
 ///
 /// If the world holds a number JSON cannot write, or the directory or the file
 /// cannot be written.
-fn written(world: &World, path: &Path) -> Result<usize> {
+pub(crate) fn written(world: &World, path: &Path) -> Result<usize> {
 	let text = level::export(&scene::capture(world))?;
 
 	if let Some(directory) = path.parent() {
@@ -417,7 +417,7 @@ fn written(world: &World, path: &Path) -> Result<usize> {
 /// # Errors
 ///
 /// As [`path`], and for the same reasons.
-fn source(assets: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn source(assets: &Path, name: &str) -> Result<PathBuf> {
 	Ok(assets
 		.join(SOURCES)
 		.join(plain(name)?)
@@ -666,7 +666,7 @@ fn path(saves: &Path, name: &str) -> Result<PathBuf> {
 /// # Errors
 ///
 /// If the name is empty or is anything other than a plain file name.
-fn plain(name: &str) -> Result<&str> {
+pub(crate) fn plain(name: &str) -> Result<&str> {
 	let trimmed = name.trim();
 
 	if trimmed.is_empty() {

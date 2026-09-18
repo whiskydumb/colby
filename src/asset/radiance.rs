@@ -29,10 +29,21 @@
 //!
 //! This runs offline like every other importer. @ref
 //! [`texture`](crate::texture) for what is made of the result.
+//!
+//! **And the one format here that is written as well as read.** A bake of the
+//! world's light is a picture of light, as a sky is, and it is kept as a
+//! source under `assets/lightmaps/` for the reason a baked block is kept as an
+//! `.obj`: what the engine made is then an input like any other, compiled,
+//! watched and versioned. @ref [`encode`] and [`lightmap`].
 
 use std::{fs, path::Path};
 
-use colby_core::{Result, err};
+use colby_core::{
+	Result,
+	abi::{Texel, TextureData},
+	err,
+	utils::half::half,
+};
 
 /// The extension this importer claims.
 pub const EXTENSION: &str = "hdr";
@@ -148,6 +159,246 @@ fn widen(texel: &[u8]) -> [f32; 3] {
 		f64_to_f32(f64::from(green) * scale),
 		f64_to_f32(f64::from(blue) * scale),
 	]
+}
+
+/// Writes a picture in linear light as a Radiance file.
+///
+/// **Run-length scanlines**, the form every writer of the format emits and
+/// the reader above takes either way: a lightmap is mostly the dark between
+/// its charts, and a run of one byte is two bytes. A row too narrow or too
+/// wide for that form is written flat, as the format says it must be.
+///
+/// **Each texel is the quadruple nearest it.** The shared exponent is the
+/// largest channel's, found from its bits rather than from a logarithm, and
+/// each mantissa is its channel times a power of two rounded to the nearest
+/// whole number - so the value the reader decodes, `mantissa * 2^(e - 136)`
+/// with no half step added, is within half a step of the one written, and
+/// the same bytes come out on every machine. Nothing below nought and nothing
+/// that is not a number is light, and both are written as black.
+///
+/// @param width - how many texels across
+/// @param height - how many down, the first row being the top
+/// @param texels - three floats a texel, row by row
+/// @return the whole file
+///
+/// # Errors
+///
+/// If the picture is empty, larger than [`MAX_SIZE`] on either side, or has
+/// other than `width * height` texels.
+pub fn encode(width: u32, height: u32, texels: &[[f32; 3]]) -> Result<Vec<u8>> {
+	if width == 0 || height == 0 || width > MAX_SIZE || height > MAX_SIZE {
+		return Err(err!(Asset(
+			"a picture of {width}x{height} cannot be written; each side is 1 to {MAX_SIZE}"
+		)));
+	}
+
+	let across = usize::try_from(width).unwrap_or(0);
+	let down = usize::try_from(height).unwrap_or(0);
+
+	if texels.len() != across * down {
+		return Err(err!(Asset(
+			"a picture of {width}x{height} has {} texels, not {}",
+			texels.len(),
+			across * down
+		)));
+	}
+
+	let mut bytes =
+		format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {height} +X {width}\n").into_bytes();
+	let packs = (8..=0x7FFF).contains(&across);
+	let mut channel = Vec::with_capacity(across);
+
+	for row in texels.chunks_exact(across) {
+		let quadruples: Vec<[u8; 4]> = row.iter().map(|texel| narrowed(*texel)).collect();
+
+		if !packs {
+			bytes.extend(quadruples.iter().flatten());
+
+			continue;
+		}
+
+		bytes.extend_from_slice(&[2, 2, byte(across >> 8), byte(across & 0xFF)]);
+
+		for which in 0..4 {
+			channel.clear();
+			channel.extend(
+				quadruples
+					.iter()
+					.map(|quadruple| quadruple[which]),
+			);
+			packed(&channel, &mut bytes);
+		}
+	}
+
+	Ok(bytes)
+}
+
+/// The shortest run of one byte written as a run rather than as it is.
+///
+/// Four: a run is two bytes, and a literal of three bytes is four, so below
+/// this a run saves nothing and breaks a literal in two.
+const SHORTEST_RUN: usize = 4;
+
+/// The longest run one length byte can say: a length byte over a hundred and
+/// twenty-eight is a run of that many less a hundred and twenty-eight.
+const LONGEST_RUN: usize = 127;
+
+/// The longest stretch of bytes one length byte can say as they are.
+const LONGEST_LITERAL: usize = 128;
+
+/// One channel of one scanline in the run-length form.
+///
+/// @param channel - the channel's bytes, one a texel
+/// @param out - where the runs are written
+fn packed(channel: &[u8], out: &mut Vec<u8>) {
+	let mut at = 0;
+
+	while at < channel.len() {
+		let run = run_at(channel, at);
+
+		if run >= SHORTEST_RUN {
+			out.push(byte(128 + run));
+			out.push(channel[at]);
+			at += run;
+
+			continue;
+		}
+
+		let start = at;
+
+		while at < channel.len()
+			&& at - start < LONGEST_LITERAL
+			&& run_at(channel, at) < SHORTEST_RUN
+		{
+			at += 1;
+		}
+
+		out.push(byte(at - start));
+		out.extend_from_slice(&channel[start..at]);
+	}
+}
+
+/// How many bytes from here on are the byte here, up to the longest run.
+fn run_at(channel: &[u8], at: usize) -> usize {
+	channel
+		.get(at..)
+		.unwrap_or_default()
+		.iter()
+		.take(LONGEST_RUN)
+		.take_while(|byte| **byte == channel[at])
+		.count()
+}
+
+/// A count that the callers hold below 256, as the byte it is written as.
+fn byte(count: usize) -> u8 { u8::try_from(count).unwrap_or(u8::MAX) }
+
+/// Three linear channels as the RGBE quadruple nearest them.
+fn narrowed(texel: [f32; 3]) -> [u8; 4] {
+	// nothing below nought is light, and a comparison a not-a-number fails
+	// makes it nought as well
+	let channels = texel.map(|channel| if channel > 0.0 { f64::from(channel) } else { 0.0 });
+	let largest = channels[0].max(channels[1]).max(channels[2]);
+
+	// below this the largest mantissa would be a sliver of one step, which is
+	// what every reader and writer of the format takes as black
+	if largest < 1.0e-32 {
+		return [0; 4];
+	}
+
+	let exponent = exponent_of(largest);
+
+	// the next exponent as well: rounding the largest channel up can reach
+	// 256, which is the next exponent's 128
+	for exponent in [exponent, exponent + 1] {
+		let scale = two_to(8 - exponent);
+		let [red, green, blue] = channels.map(|channel| {
+			let scaled = channel * scale;
+
+			(scaled + 0.5).floor()
+		});
+
+		if red.max(green).max(blue) < 256.0 {
+			let Ok(shared) = u8::try_from(exponent + 128) else {
+				// past what one byte of exponent says: as bright as the format
+				// goes
+				return [255; 4];
+			};
+
+			return [mantissa(red), mantissa(green), mantissa(blue), shared];
+		}
+	}
+
+	[255; 4]
+}
+
+/// The exponent `e` a positive, finite number is `m * 2^e` at, with `m` from a
+/// half up to one: read from its bits, so no logarithm is asked.
+fn exponent_of(value: f64) -> i32 {
+	let biased = (value.to_bits() >> 52) & 0x7FF;
+
+	i32::try_from(biased).unwrap_or(0) - 1022
+}
+
+/// Two to a whole power, built from its bits.
+///
+/// @param power - between -1022 and 1023, which every caller is
+fn two_to(power: i32) -> f64 {
+	u64::try_from(power + 1023).map_or(0.0, |biased| f64::from_bits(biased << 52))
+}
+
+/// A mantissa already rounded to a whole number below 256.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "a whole number from nought to 255, rounded and held on the lines that make it"
+)]
+const fn mantissa(value: f64) -> u8 { value as u8 }
+
+/// A lightmap as the texture it compiles to.
+///
+/// **Flat, one level and half precision, and that is all three of its
+/// differences from a picture.** Flat, because a lightmap is not a sky; one
+/// level, because a coarser one would average the two texels between two
+/// charts together and every chart would bleed into the next; half precision,
+/// because light is not a number between nought and one. The alpha is one.
+///
+/// @param source - the lightmap as read
+/// @return the texture, or why it could not be made
+///
+/// # Errors
+///
+/// If the picture's sides do not add up to the texels it holds.
+pub fn lightmap(source: &Radiance) -> Result<TextureData> {
+	let one = half(1.0).to_le_bytes();
+	let level: Vec<u8> = source
+		.texels
+		.chunks_exact(3)
+		.flat_map(|texel| {
+			[texel[0], texel[1], texel[2]]
+				.map(|channel| half(channel).to_le_bytes())
+				.into_iter()
+				.flatten()
+				.chain(one)
+		})
+		.collect();
+	let data = TextureData {
+		width: source.width,
+		height: source.height,
+		faces: 1,
+		texel: Texel::Rgba16Float,
+		levels: vec![level],
+	};
+
+	if !data.is_consistent() {
+		return Err(err!(Asset(
+			"a lightmap of {}x{} does not hold that many texels",
+			source.width,
+			source.height
+		)));
+	}
+
+	Ok(data)
 }
 
 /// A double narrowed to a float, saturating rather than reaching infinity.
@@ -509,5 +760,206 @@ mod tests {
 		let refused = import(&bytes).expect_err("a file nobody wrote");
 
 		assert!(format!("{refused}").contains("past the"), "with the ceiling named: {refused}");
+	}
+
+	/// A spread of light: nought, tiny, dim, one, bright, a sun, and every
+	/// channel different from the other two.
+	fn spread() -> Vec<[f32; 3]> {
+		let mut texels = vec![
+			[0.0, 0.0, 0.0],
+			[1.0e-30, 2.0e-31, 0.0],
+			[0.013, 0.2, 0.0071],
+			[1.0, 1.0, 1.0],
+			[0.999, 0.5, 0.25],
+			[3.75, 12.5, 0.001],
+			[40_000.0, 1.0, 0.5],
+			// dim, and far above what the format takes as black
+			[0.0004, 0.0002, 0.0001],
+		];
+
+		// and a ramp long enough to run and to break a run
+		for step in 0..57_u16 {
+			let level = f32::from(step / 9) * 0.0625;
+
+			texels.push([level, level * 0.5, 1.0 - level]);
+		}
+
+		texels
+	}
+
+	/// The step one mantissa is worth at the exponent the largest channel
+	/// takes.
+	fn step_of(texel: [f32; 3]) -> f64 {
+		let largest = f64::from(texel[0].max(texel[1]).max(texel[2]));
+
+		two_to(exponent_of(largest) - 8)
+	}
+
+	#[test]
+	fn a_written_picture_reads_back_within_half_a_step_of_every_channel() {
+		let texels = spread();
+		let width = u32::try_from(texels.len()).expect("a short row");
+		let read = import(&encode(width, 1, &texels).expect("it is written")).expect("and read");
+
+		for (x, texel) in (0_u32..).zip(&texels) {
+			let got = read.at(x, 0);
+
+			if texel.iter().all(|channel| *channel < 1.0e-29) {
+				assert!(same(got, [0.0; 3]), "{texel:?} is below what the format holds");
+
+				continue;
+			}
+
+			for (wanted, came) in texel.iter().zip(got) {
+				let off = (f64::from(*wanted) - f64::from(came)).abs();
+
+				assert!(
+					off <= step_of(*texel) * 0.5,
+					"{wanted} came back as {came}, off by {off} of a step {}",
+					step_of(*texel)
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn what_the_format_holds_exactly_comes_back_to_the_bit() {
+		// a mantissa of 128 at any exponent, and 192 of 256 at one
+		let texels = [[1.0, 0.25, 0.5], [0.75, 0.375, 0.0]];
+		let read = import(&encode(2, 1, &texels).expect("written")).expect("read");
+
+		for (x, texel) in (0_u32..).zip(&texels) {
+			assert_eq!(
+				read.at(x, 0).map(f32::to_bits),
+				texel.map(f32::to_bits),
+				"texel {x} to the bit"
+			);
+		}
+	}
+
+	#[test]
+	fn a_channel_that_rounds_up_to_the_next_power_takes_the_next_exponent() {
+		// 0.999 is 255.7 of 256 at an exponent of nought, which rounds to 256:
+		// the quadruple is 128 at the exponent above instead, which is one
+		let read = import(&encode(1, 1, &[[0.999, 0.0, 0.0]]).expect("written")).expect("read");
+
+		assert!(
+			same(read.at(0, 0), [1.0, 0.0, 0.0]),
+			"not a mantissa of 256: {:?}",
+			read.at(0, 0)
+		);
+	}
+
+	#[test]
+	fn nothing_below_nought_and_nothing_that_is_not_a_number_is_light() {
+		let texels = [[-1.0, 0.5, 0.25], [f32::NAN, f32::NAN, f32::NAN], [-0.0, 0.0, -3.0]];
+		let read = import(&encode(3, 1, &texels).expect("written")).expect("read");
+
+		assert!(same(read.at(0, 0), [0.0, 0.5, 0.25]), "the one below nought is nought");
+		assert!(same(read.at(1, 0), [0.0; 3]), "and a not-a-number is black");
+		assert!(same(read.at(2, 0), [0.0; 3]), "and so is everything below it");
+	}
+
+	#[test]
+	fn a_long_row_of_changing_light_is_written_as_literals_and_reads_back_to_the_bit() {
+		// three hundred texels no two alike: no run anywhere, so every channel
+		// is literals, and a literal says at most a hundred and twenty-eight
+		let row: Vec<[f32; 3]> = (1..=300_u16)
+			.map(|step| {
+				let level = f32::from(step);
+
+				[level, level * 0.5, level * 0.25]
+			})
+			.collect();
+		let bytes = encode(300, 1, &row).expect("written");
+		let read = import(&bytes).expect("read");
+
+		for (x, texel) in (0_u32..).zip(&row) {
+			let step = step_of(*texel);
+
+			for (wanted, came) in texel.iter().zip(read.at(x, 0)) {
+				assert!(
+					(f64::from(*wanted) - f64::from(came)).abs() <= step * 0.5,
+					"texel {x}: {wanted} came back as {came}"
+				);
+			}
+		}
+
+		// each channel: 128 and 128 and 44 bytes, each run of them one byte
+		// longer for its length; and the four of the marker
+		let header = b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 300\n".len();
+		let red_green_blue_exponent = [300 + 3, 300 + 3, 300 + 3, 300 + 3];
+		let exponents: std::collections::HashSet<u8> = row
+			.iter()
+			.map(|texel| narrowed(*texel)[3])
+			.collect();
+
+		assert!(exponents.len() > 3, "the exponents change along the row: {exponents:?}");
+		assert!(
+			bytes.len() <= header + 4 + red_green_blue_exponent.iter().sum::<usize>(),
+			"written as literals, never longer than that: {}",
+			bytes.len()
+		);
+	}
+
+	#[test]
+	fn a_row_of_one_value_is_written_as_runs_and_a_narrow_one_as_it_is() {
+		let dark = vec![[0.0_f32; 3]; 300];
+		let header = b"#?RADIANCE
+FORMAT=32-bit_rle_rgbe
+
+-Y 1 +X 300
+"
+		.len();
+		let bytes = encode(300, 1, &dark).expect("written");
+
+		// four bytes of marker, then per channel three runs of 127, 127 and 46,
+		// two bytes each
+		assert_eq!(bytes.len(), header + 4 + 4 * 3 * 2, "three hundred texels of nothing");
+		assert!(same(import(&bytes).expect("read").at(299, 0), [0.0; 3]), "and it reads back");
+
+		let narrow = encode(3, 1, &[[1.0; 3], [0.5; 3], [0.25; 3]]).expect("written");
+		let header = b"#?RADIANCE
+FORMAT=32-bit_rle_rgbe
+
+-Y 1 +X 3
+"
+		.len();
+
+		assert_eq!(narrow.len(), header + 3 * 4, "a row narrower than eight is flat");
+		assert!(same(import(&narrow).expect("read").at(2, 0), [0.25; 3]), "and reads back");
+	}
+
+	#[test]
+	fn a_picture_whose_sides_do_not_match_its_texels_is_not_written() {
+		assert!(encode(2, 2, &[[1.0; 3]; 3]).is_err(), "three texels are not two by two");
+		assert!(encode(0, 1, &[]).is_err(), "and nothing is not a picture");
+		assert!(
+			encode(MAX_SIZE + 1, 1, &vec![[0.0; 3]; 8193]).is_err(),
+			"and nothing is written that this build would not read"
+		);
+	}
+
+	#[test]
+	fn a_lightmap_is_flat_of_one_level_and_half_precision_with_an_alpha_of_one() {
+		let read =
+			import(&encode(2, 1, &[[1.0, 0.5, 0.25], [2.0, 0.0, 0.125]]).expect("written"))
+				.expect("read");
+		let data = lightmap(&read).expect("a lightmap of two texels");
+
+		assert_eq!((data.width, data.height, data.faces), (2, 1, 1), "flat, as drawn");
+		assert_eq!(data.texel, Texel::Rgba16Float, "half precision");
+		assert_eq!(data.levels.len(), 1, "one level, so no chart bleeds into the next");
+
+		let halves: Vec<u16> = data.levels[0]
+			.chunks_exact(2)
+			.map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+			.collect();
+
+		assert_eq!(
+			halves,
+			[1.0, 0.5, 0.25, 1.0, 2.0, 0.0, 0.125, 1.0].map(half),
+			"each channel the half it is, and one for alpha"
+		);
 	}
 }

@@ -30,6 +30,9 @@ path = "projects/blank/game"
 [workspace.dependencies.colby_asset]
 path = "src/asset"
 
+[workspace.dependencies.colby_bake]
+path = "src/bake"
+
 [workspace.dependencies.colby_audio]
 path = "src/audio"
 
@@ -292,6 +295,14 @@ opt-level = 2
 [profile.dev.package.colby_asset]
 opt-level = 2
 
+# @note: the baker too, and for the same reason: a bake of a street is some
+# hundreds of millions of rays, which is half a minute optimized and a good
+# part of an hour at opt-level nought - and the editor that asks for one is a
+# debug build. Its answer does not depend on how it was optimized, because
+# nothing on its ray path is fused or reordered by the compiler.
+[profile.dev.package.colby_bake]
+opt-level = 2
+
 [profile.dbg]
 inherits = "dev"
 debug = "full"
@@ -301,6 +312,9 @@ debug = "limited"
 
 # the one place the asset compiler is built the way everything else is.
 [profile.dbg.package.colby_asset]
+opt-level = 0
+
+[profile.dbg.package.colby_bake]
 opt-level = 0
 
 [profile.bench]
@@ -354,6 +368,9 @@ inherits = "dev"
 opt-level = 2
 
 [profile.hot.package.colby_asset]
+opt-level = 2
+
+[profile.hot.package.colby_bake]
 opt-level = 2
 
 # Incremental compilation lets rustc choose different codegen-unit names between

@@ -452,6 +452,104 @@ pub const EDITING: Record<Editing> = Record {
 	default: Editing::NONE,
 };
 
+/// Where an entity's baked light is, and whether a bake reaches it at all.
+///
+/// **The engine's third record**, for [`Drawing`]'s reason: a place and a flag
+/// every entity may carry, which a scene source, a save, a copy and a piece of
+/// the world on the wire already reach through the path a game's fields take.
+/// The world's own [`lightmap`](super::World::lightmap) is one picture for
+/// every still thing, and this is where on it one thing's light is.
+///
+/// **A bake writes the place and never the flag**; a person or a game writes
+/// the flag. The place is whole texels on the lightmap, and a width of nought
+/// is a thing no bake reached - which is what every entity starts as.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct Baking {
+	/// Whether a bake leaves it out: nought for no, anything else for yes.
+	///
+	/// Out altogether, as a thing that moves is: it is not lit by the bake,
+	/// it throws no shadow into it and sends no light on. For a thing a game
+	/// will move without a body the solver knows about, which a bake cannot
+	/// tell from one that stands still.
+	pub skip: u32,
+
+	/// Where its light starts on the lightmap, in texels from the left.
+	pub left: i32,
+
+	/// And in texels from the top.
+	pub top: i32,
+
+	/// How many texels across its light takes, or nought for none.
+	pub width: i32,
+
+	/// And how many down.
+	pub height: i32,
+}
+
+impl Baking {
+	/// What every entity starts as: reached by a bake, and not baked yet.
+	pub const NONE: Self = Self {
+		skip: 0,
+		left: 0,
+		top: 0,
+		width: 0,
+		height: 0,
+	};
+
+	/// Whether a bake leaves it out.
+	#[must_use]
+	pub const fn skip(self) -> bool { self.skip != 0 }
+
+	/// Whether a bake gave it a place on the lightmap.
+	#[must_use]
+	pub const fn is_baked(self) -> bool { self.width > 0 && self.height > 0 }
+}
+
+impl Default for Baking {
+	fn default() -> Self { Self::NONE }
+}
+
+/// [`Baking`] as the record every world declares.
+pub const BAKING: Record<Baking> = Record {
+	name: "baking",
+	help: "where the entity's baked light is on the world's lightmap, and whether a bake leaves \
+	       it out",
+	rows: &[
+		crate::row!(
+			Bool,
+			Baking,
+			skip,
+			"left out of every bake: neither lit by it nor lighting anything in it"
+		),
+		crate::row!(
+			Int,
+			Baking,
+			left,
+			"where its light starts on the lightmap, in texels from the left; a bake writes it"
+		),
+		crate::row!(
+			Int,
+			Baking,
+			top,
+			"where its light starts on the lightmap, in texels from the top; a bake writes it"
+		),
+		crate::row!(
+			Int,
+			Baking,
+			width,
+			"how many texels across its light takes, nought for none; a bake writes it"
+		),
+		crate::row!(
+			Int,
+			Baking,
+			height,
+			"how many texels down its light takes; a bake writes it"
+		),
+	],
+	default: Baking::NONE,
+};
+
 /// The host's entity table.
 ///
 /// Component storage is hard-coded to one array of [`Transform`] because there

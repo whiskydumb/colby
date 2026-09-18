@@ -5,6 +5,7 @@
 //!   Scene::of(&world)                     what stands still, as triangles
 //!   scene.direct(at, normal)              the sun and the lamps at a point
 //!   scene.gather(at, normal, seed, ..)    the light arriving from every way
+//!   bake(&scene, settings, threads)       all of it, into one picture
 //! ```
 //!
 //! **What the renderer draws every frame is not what this works out.** The sun
@@ -46,20 +47,30 @@
 //! - [`picture`] - a texture read on the processor, for the color of a surface
 //!   a ray lands on;
 //! - [`gather`] - the pattern of directions, and the average of what they bring
-//!   back, over many points at once.
+//!   back, over many points at once;
+//! - [`atlas`] - where each still thing's light goes on one picture;
+//! - [`texels`] - which point of which surface each texel of it stands for;
+//! - [`lightmap`] - the passes that work the picture out, and the filling of
+//!   what no surface stands for.
 
+pub mod atlas;
 pub mod gather;
 pub mod light;
+pub mod lightmap;
 pub mod picture;
 pub mod scene;
 pub mod sky;
+pub mod texels;
 pub mod tree;
 
 pub use self::{
-	gather::{Gathered, Pattern, each},
+	atlas::{Atlas, MAX_SIDE, Placeless, Rect},
+	gather::{Gathered, Pattern, each, threads},
+	lightmap::{Baked, Report, Settings, bake},
 	picture::Picture,
 	scene::{Corner, Lamp, Look, Piece, Scene, Surface},
 	sky::Sky,
+	texels::{Sample, Texels},
 	tree::{Hit, Ray, Tree},
 };
 
@@ -79,7 +90,7 @@ mod tests {
 	};
 
 	use super::*;
-	use crate::gather::{seed, threads};
+	use crate::gather::seed;
 
 	/// A sky of six faces, four texels a side, every texel a color of its own:
 	/// a face read turned or mirrored reads other colors.
@@ -232,6 +243,40 @@ mod tests {
 				.iter()
 				.fold(held, |held, byte| (held ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01B3))
 		})
+	}
+
+	#[test]
+	fn a_whole_bake_answers_the_same_bytes_on_every_machine() {
+		// everything the gather's digest reaches, now through the places, the
+		// texels, the push, the passes and the fill: a lightmap of it and every
+		// place on it, as bits. The ball of square roots has no second set, so
+		// the path a thing with no place takes is in it too.
+		let scene = Scene::of(&everything());
+		let baked = bake(
+			&scene,
+			Settings {
+				rays: 32,
+				bounces: 2,
+				..Settings::DEFAULT
+			},
+			threads(),
+		)
+		.expect("the world bakes");
+		let answer =
+			digest(
+				baked
+					.light
+					.iter()
+					.flat_map(|texel| texel.to_array().map(f32::to_bits))
+					.chain(baked.places.iter().flat_map(|(_, place)| {
+						[place.left, place.top, place.width, place.height]
+					}))
+					.chain([baked.width, baked.height]),
+			);
+
+		assert_eq!(baked.placeless.len(), 1, "the ball, which has no second set");
+		// written down from the first run on one machine, as the gather's is
+		assert_eq!(answer, 0x6772_B35B_5C31_F6F6, "the digest of the whole bake: {answer:#018x}");
 	}
 
 	#[test]

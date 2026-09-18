@@ -1124,6 +1124,10 @@ mod tests {
 	}
 
 	/// The door as the game spells it.
+	/// Where a game's first record is among the declared ones: after every
+	/// record the engine declares itself.
+	const GAME: usize = colby_core::abi::record::ENGINE.len();
+
 	const DOOR: Record<Door> = Record {
 		name: "door",
 		help: "a thing that opens",
@@ -1836,7 +1840,7 @@ mod tests {
 
 		assert!(write(&mut world, Pick::Entity(id), &[other], &handle, value));
 
-		let Some(Value::Vec3(place)) = world.entities.field(id, 2, 1) else {
+		let Some(Value::Vec3(place)) = world.entities.field(id, GAME, 1) else {
 			panic!("the door's place is a field of three numbers");
 		};
 
@@ -1845,7 +1849,7 @@ mod tests {
 			"up two in the world is up two in a thing turned about y: {place}"
 		);
 
-		let Some(Value::Vec3(theirs)) = world.entities.field(other, 2, 1) else {
+		let Some(Value::Vec3(theirs)) = world.entities.field(other, GAME, 1) else {
 			panic!("every entity carries every record");
 		};
 
@@ -1884,7 +1888,7 @@ mod tests {
 			"nothing moved"
 		);
 		assert_eq!(
-			world.entities.field(other, 2, 0),
+			world.entities.field(other, GAME, 0),
 			Some(Value::Float(2.0)),
 			"so nothing was spread either"
 		);
@@ -1901,7 +1905,7 @@ mod tests {
 		let value = dragged(&handle, Vec3::X * 3.0, None);
 
 		assert!(write(&mut world, Pick::Entity(id), &[], &handle, value));
-		assert_eq!(world.entities.field(id, 2, 0), Some(Value::Float(5.0)));
+		assert_eq!(world.entities.field(id, GAME, 0), Some(Value::Float(5.0)));
 
 		let value = dragged(&handle, Vec3::X * -100.0, None);
 

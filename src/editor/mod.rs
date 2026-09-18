@@ -379,6 +379,12 @@ pub(crate) enum Change {
 	/// in step.
 	Bake(String),
 
+	/// Work the world's still light out, and write the picture and the scene.
+	///
+	/// The name is the bar's write field, as the blocks' bake takes it: the
+	/// picture and the scene it belongs to are called what the room is.
+	Light(String),
+
 	/// Put an asset into the world, where it was dropped.
 	Drop {
 		/// The asset name.
@@ -1052,6 +1058,7 @@ impl Panels {
 			| Change::Block => self.block(world),
 			| Change::Decal => self.decal(world),
 			| Change::Bake(name) => self.bake(world, &name),
+			| Change::Light(name) => self.light(world, &name),
 			| Change::Drop { name, kind, at } => self.drop(world, &name, kind, at),
 		}
 	}
@@ -1238,6 +1245,37 @@ impl Panels {
 		}
 
 		colby_core::abi::console::run(world, &format!("blocks.write {name}"));
+	}
+
+	/// Asks for the world's still light, the way the console does.
+	///
+	/// A step to go back over, because a bake writes every thing's place on the
+	/// picture into its record and names the picture on the world; the files it
+	/// writes stay, as the blocks' bake's do. The line is served before the
+	/// next frame's panels, so the gesture opened here is still open when the
+	/// bake lands in the world and closes on the frame after with the bake in
+	/// it. The tab is the scene of that name afterwards, as a write makes it.
+	///
+	/// @param world - the world to bake
+	/// @param name - the write field; its last part is the name, as the
+	/// blocks' bake takes it
+	fn light(&mut self, world: &mut World, name: &str) {
+		let name = name
+			.trim()
+			.rsplit('/')
+			.next()
+			.unwrap_or_default()
+			.to_owned();
+
+		if name.is_empty() {
+			warn!("name the room in the write field first; that is what the picture is called");
+
+			return;
+		}
+
+		self.tabs.history().begin("bake light", world);
+		colby_core::abi::console::run(world, &format!("light.bake {name}"));
+		self.tabs.rename(&name);
 	}
 
 	fn water(&mut self, world: &mut World) {
@@ -1760,6 +1798,30 @@ mod tests {
 		assert_eq!(world.asked.len(), 1, "one line waiting for the frame loop");
 		assert_eq!(world.asked[0].name, "code.open");
 		assert_eq!(world.asked[0].words, vec!["scripts/thruster".to_owned()]);
+	}
+
+	#[test]
+	fn baking_the_light_leaves_a_line_named_by_the_last_part_of_the_write_field() {
+		// the runner owns the project and the files, so what crosses is a line,
+		// as with a write; the name is the room's, as with the blocks' bake
+		let mut world = World::new();
+		world.editing = true;
+		world
+			.cvars
+			.command("light.bake", colby_core::abi::console::defer, "");
+		let mut panels = Panels::default();
+
+		panels.apply(&mut world, Change::Light("scenes/yard".to_owned()));
+
+		assert_eq!(world.asked.len(), 1, "one line waiting for the frame loop");
+		assert_eq!(world.asked[0].name, "light.bake");
+		assert_eq!(world.asked[0].words, vec!["yard".to_owned()], "the room, not the directory");
+		assert_eq!(panels.tabs.current().name, "yard", "and the tab is the scene it writes");
+
+		world.asked.clear();
+		panels.apply(&mut world, Change::Light("   ".to_owned()));
+
+		assert!(world.asked.is_empty(), "a bake with no name asks for nothing");
 	}
 
 	#[test]
@@ -2493,7 +2555,10 @@ mod tests {
 		drop(frame_on(&context, &mut panels, &mut world, press(false, out), Modifiers::NONE));
 		drop(frame_on(&context, &mut panels, &mut world, Vec::new(), Modifiers::NONE));
 
-		let Some(colby_core::abi::field::Value::Float(reach)) = world.entities.field(door, 2, 0)
+		let Some(colby_core::abi::field::Value::Float(reach)) =
+			world
+				.entities
+				.field(door, colby_core::abi::record::ENGINE.len(), 0)
 		else {
 			panic!("a door keeps a number");
 		};

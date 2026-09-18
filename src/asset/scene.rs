@@ -88,7 +88,8 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// Seventeen since the world says how hazy its air is: one word on the settings
 /// record, whose spare the sky's environment had spent. The record is
 /// eight-aligned by the `steps` at its top, so the word cost itself and a new
-/// spare. @ref [`Setting::spare`].
+/// spare - which the world's lightmap has since spent on its name, moving
+/// nothing. @ref [`Setting::lightmap`].
 ///
 /// Eighteen since an entity carries records: a block of [`Jot`]s, one a value
 /// that differs from its record's default, each naming the record and the
@@ -498,15 +499,19 @@ pub struct Setting {
 	/// How much of the light crossing a unit of air the air scatters.
 	pub haze: f32,
 
-	/// Nothing, and kept that way on purpose: the word the next field to arrive
-	/// takes without moving [`FORMAT_VERSION`].
+	/// Offset into the blob of the world's lightmap name, or zero for none.
 	///
-	/// The record is eight-aligned by the `steps` at the top, so its length has
-	/// to be a multiple of eight, and [`haze`](Self::haze) left it four short.
-	/// A file written before anything means this word holds nought there, so
-	/// whatever takes it next has to read nought as "the world does not say",
-	/// which is what the two fields that took a spare before did.
-	pub spare: u32,
+	/// **The spare [`haze`](Self::haze) paid for, spent on a name the way
+	/// [`sky_cubemap`](Self::sky_cubemap) spent the one before it, and it moved
+	/// no [`FORMAT_VERSION`].** A file written before it holds nought here, and
+	/// offset nought is the blob's empty name, so an older build reads a baked
+	/// world as one nobody baked - and one that does not know the record each
+	/// entity's place on the lightmap is kept in keeps that record by name
+	/// without reading it, @ref `jots_of`. Graceful rather than wrong.
+	///
+	/// There is no spare after it: the next field to arrive pays four bytes of
+	/// itself, four of a new spare, and the version.
+	pub lightmap: u32,
 }
 
 // a record with padding in it is not `Pod`, so this would already have failed
@@ -1323,6 +1328,7 @@ impl SceneFile {
 		SceneData {
 			stage: stage_of(self.setting()),
 			sky_cubemap: self.name(self.setting().sky_cubemap).to_owned(),
+			lightmap: self.name(self.setting().lightmap).to_owned(),
 			things,
 			solids,
 			links: self
@@ -1645,7 +1651,7 @@ const EMPTY_SETTING: Setting = Setting {
 	blur: 0.0,
 	sky_cubemap: 0,
 	haze: 0.0,
-	spare: 0,
+	lightmap: 0,
 };
 
 /// Writes a world out as a `.cscene`.
@@ -1691,7 +1697,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 
 	// last of the records to be made, because the blob has to be finished
 	// before its length goes into the header and this puts one name in it
-	let setting = setting_of(data.stage, &data.sky_cubemap, &mut names);
+	let setting = setting_of(data, &mut names);
 
 	let mut generations = data.thing_generations.clone();
 	generations.extend_from_slice(&data.solid_generations);
@@ -2202,9 +2208,11 @@ fn tie_of(link: &Link, names: &mut Names) -> Tie {
 	}
 }
 
-/// The settings record, from the description, with its one name put in the
+/// The settings record, from the description, with its two names put in the
 /// blob.
-fn setting_of(stage: Stage, cubemap: &str, names: &mut Names) -> Setting {
+fn setting_of(data: &SceneData, names: &mut Names) -> Setting {
+	let stage = data.stage;
+
 	Setting {
 		steps: stage.steps,
 		camera_position: stage.camera.position.to_array(),
@@ -2238,9 +2246,9 @@ fn setting_of(stage: Stage, cubemap: &str, names: &mut Names) -> Setting {
 		focus: stage.camera.focus,
 		focus_range: stage.camera.focus_range,
 		blur: stage.camera.blur,
-		sky_cubemap: names.put(cubemap),
+		sky_cubemap: names.put(&data.sky_cubemap),
 		haze: stage.post.haze,
-		spare: 0,
+		lightmap: names.put(&data.lightmap),
 	}
 }
 
@@ -3048,6 +3056,7 @@ mod tests {
 			things: sample_things(),
 			solids: sample_solids(),
 			sky_cubemap: String::new(),
+			lightmap: String::new(),
 			posed: vec![Posed {
 				name: "hero".to_owned(),
 				slot: 1,
@@ -3429,13 +3438,14 @@ mod tests {
 	}
 
 	#[test]
-	fn the_settings_record_ends_in_a_spare_word_again_after_the_haze() {
-		// the claim the version bump was paid for, collected: the name that
-		// spent the last spare is where it was, the haze is the word after it,
-		// and the record ends in a new spare holding nought. @ref
-		// [`Setting::spare`].
+	fn the_lightmap_s_name_is_the_last_word_of_the_settings_record() {
+		// the claim that let it cost no version, collected: the name that spent
+		// the spare before it is where it was, the haze after it, and the
+		// lightmap's name in the word the haze left - still the last word of a
+		// record that has not grown. @ref [`Setting::lightmap`].
 		let data = SceneData {
 			sky_cubemap: "skies/dusk".to_owned(),
+			lightmap: "lightmaps/yard".to_owned(),
 			stage: Stage {
 				sky: Sky::environment(TextureId::NONE),
 				..sample().stage
@@ -3445,40 +3455,52 @@ mod tests {
 		let bytes = encode(&data).expect("it fits in one file");
 		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
 		let start = usize::try_from(header.setting_offset).expect("it is an offset");
-		let spare = start + offset_of!(Setting, spare);
+		let named = start + offset_of!(Setting, lightmap);
 
 		assert_eq!(
 			offset_of!(Setting, haze),
 			offset_of!(Setting, sky_cubemap) + 4,
-			"the haze is the word after the name"
+			"the haze is the word after the sky's name"
 		);
 		assert_eq!(
-			spare + 4,
+			named + 4,
 			start + size_of::<Setting>(),
-			"and the spare is the last word of the record"
+			"and the lightmap's name is the last word of the record"
 		);
-		assert_eq!(size_of::<Setting>(), 232, "which is two words longer than it was");
-		assert_eq!(
-			u32::from_le_bytes(
-				<[u8; 4]>::try_from(&bytes[spare..spare + 4]).expect("four bytes of a word")
-			),
-			0,
-			"and a written file holds nought there, which is what makes the word free"
-		);
+		assert_eq!(size_of::<Setting>(), 232, "which is as long as it was");
 
 		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
-			.expect("a scene naming a sky")
+			.expect("a scene naming a sky and a lightmap")
 			.to_scene_data();
 
-		assert_eq!(read.sky_cubemap, "skies/dusk", "the name came back");
-		assert_eq!(read.stage.sky.kind, SkyKind::Cubemap, "and so did the word beside it");
+		assert_eq!(read.lightmap, "lightmaps/yard", "the name came back");
+		assert_eq!(read.sky_cubemap, "skies/dusk", "and so did the one before it");
 		assert!(
 			(read.stage.post.haze - data.stage.post.haze).abs() < 1.0e-9,
-			"and so did the haze"
+			"and the haze between them is still where it was"
 		);
-		assert!(
-			(read.stage.camera.blur - data.stage.camera.blur).abs() < 1.0e-9,
-			"and the field before the name is still where it was"
+	}
+
+	#[test]
+	fn a_scene_nobody_baked_puts_nought_in_the_word_an_older_build_wrote() {
+		// the other half: a file from before the word meant anything holds
+		// nought there, and nought is the empty name.
+		let bytes = encode(&sample()).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let at = usize::try_from(header.setting_offset).expect("it is an offset")
+			+ offset_of!(Setting, lightmap);
+		let word = u32::from_le_bytes(
+			<[u8; 4]>::try_from(&bytes[at..at + 4]).expect("four bytes of a word"),
+		);
+
+		assert_eq!(word, 0, "which is where the blob's empty name lives");
+		assert_eq!(
+			SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+				.expect("a scene nobody baked")
+				.to_scene_data()
+				.lightmap,
+			"",
+			"and it reads back as no lightmap"
 		);
 	}
 

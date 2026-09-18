@@ -239,7 +239,11 @@ pub struct Shape {
 /// A scene source that writes one of these is checked against it when it is
 /// compiled, the way every other table the engine owns is. A record a game
 /// declares cannot be: the compiler never loads a game.
-pub const ENGINE: &[Shape] = &[super::entity::DRAWING.shape(), super::entity::EDITING.shape()];
+pub const ENGINE: &[Shape] = &[
+	super::entity::DRAWING.shape(),
+	super::entity::EDITING.shape(),
+	super::entity::BAKING.shape(),
+];
 
 /// Checks that a field is stored as the type its kind is held in.
 ///
@@ -2332,6 +2336,9 @@ mod tests {
 		records
 			.declare(&super::super::entity::EDITING)
 			.expect("editing is a record a world holds");
+		records
+			.declare(&super::super::entity::BAKING)
+			.expect("baking is a record a world holds");
 
 		assert_eq!(ENGINE.len(), records.tables().len(), "every engine record, and only them");
 

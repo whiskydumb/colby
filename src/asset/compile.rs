@@ -27,15 +27,19 @@
 //! drift into disagreeing about what exists. Nothing else in the output tree is
 //! touched.
 //!
-//! **One thing here is decided by a file's name rather than by its contents**,
-//! and it is the only such rule in the project: a `.png` whose stem ends in
-//! [`NORMAL_SUFFIX`] or [`ORM_SUFFIX`] is compiled as numbers rather than as a
-//! color - @ref [`texel_of`]. A PNG has no field that could say so, and the
-//! alternative is a manifest beside every texture, which is a parser and a
-//! second staleness input for a question that has one answer per file and
-//! never changes. A model says what each of its pictures is for, and one whose
-//! name disagrees is copied out of it in the layout its use asks for, so the
-//! rule decides only what a picture that nothing but its name describes is.
+//! **Two things here are decided by a file's name rather than by its
+//! contents**, and they are the only such rules in the project. A `.png` whose
+//! stem ends in [`NORMAL_SUFFIX`] or [`ORM_SUFFIX`] is compiled as numbers
+//! rather than as a color - @ref [`texel_of`]. A PNG has no field that could
+//! say so, and the alternative is a manifest beside every texture, which is a
+//! parser and a second staleness input for a question that has one answer per
+//! file and never changes. A model says what each of its pictures is for, and
+//! one whose name disagrees is copied out of it in the layout its use asks for,
+//! so the rule decides only what a picture that nothing but its name describes
+//! is. And a `.hdr` under [`LIGHTMAPS`] is compiled flat, as the light a bake
+//! kept, rather than into the six faces of a sky - @ref [`is_lightmap`]. The
+//! format has no field for that either, and the directory is where the bake
+//! writes it, so the name is the one thing both ends already agree on.
 //!
 //! This is a library first. `just assets` runs it through `colby_assetc`, and
 //! the runner calls [`compile_dir`] in-process on a timer - the same code, so
@@ -93,6 +97,12 @@ pub const NORMAL_SUFFIX: &str = "_normal";
 /// Numbers for the reason a normal map is: an sRGB decode would bend a
 /// roughness of a half into a fifth.
 pub const ORM_SUFFIX: &str = "_orm";
+
+/// The directory under the source tree a bake keeps the world's light in.
+///
+/// Where a `.hdr` stops being a sky: one under it compiles to a flat picture of
+/// one level, @ref [`is_lightmap`], and one anywhere else to a cube.
+pub const LIGHTMAPS: &str = "lightmaps";
 
 /// The source extensions the compiler knows.
 pub const SOURCE_EXTENSIONS: &[&str] = &[
@@ -589,6 +599,23 @@ pub fn texel_of(source: &Path) -> Texel {
 	if named { Texel::Rgba8Unorm } else { Texel::Rgba8Srgb }
 }
 
+/// Whether a source is the light a bake kept rather than a sky: a file under
+/// [`LIGHTMAPS`], at the top of the source tree.
+///
+/// The second of the two rules decided by a name, and the reason it is one
+/// is in the module's comment.
+///
+/// @param root - the source tree
+/// @param source - the file, inside it
+#[must_use]
+pub fn is_lightmap(root: &Path, source: &Path) -> bool {
+	source
+		.strip_prefix(root)
+		.ok()
+		.and_then(|relative| relative.components().next())
+		.is_some_and(|first| first.as_os_str() == LIGHTMAPS)
+}
+
 /// Where a source compiles to.
 ///
 /// @param root - the source tree
@@ -658,18 +685,24 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 	let (bytes, produced) = match kind {
 		| Kind::Mesh => compile_mesh(source)?,
 		| Kind::Texture => {
-			let data = if has_extension(source, &[radiance::EXTENSION]) {
-				// the one import that does not hand its pixels over as they
-				// were: a sky arrives as one wide picture and leaves as six
-				// faces whose levels are a roughness rather than a size. @ref
-				// [`cube`](crate::cube).
-				cube::build(&radiance::import_file(source)?)
-					.map_err(|error| err!(Asset("{}: {error}", source.display())))?
-			} else if has_extension(source, &[png::EXTENSION]) {
-				png::import_file(source, texel_of(source))?
-			} else {
-				jpeg::import_file(source, texel_of(source))?
-			};
+			let data =
+				if has_extension(source, &[radiance::EXTENSION]) && is_lightmap(root, source) {
+					// the light a bake kept, flat and of one level, @ref
+					// [`radiance::lightmap`]
+					radiance::lightmap(&radiance::import_file(source)?)
+						.map_err(|error| err!(Asset("{}: {error}", source.display())))?
+				} else if has_extension(source, &[radiance::EXTENSION]) {
+					// the one import that does not hand its pixels over as they
+					// were: a sky arrives as one wide picture and leaves as six
+					// faces whose levels are a roughness rather than a size. @ref
+					// [`cube`](crate::cube).
+					cube::build(&radiance::import_file(source)?)
+						.map_err(|error| err!(Asset("{}: {error}", source.display())))?
+				} else if has_extension(source, &[png::EXTENSION]) {
+					png::import_file(source, texel_of(source))?
+				} else {
+					jpeg::import_file(source, texel_of(source))?
+				};
 			let bytes = texture::encode(&data)
 				.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 			let produced = Produced::Texture {
@@ -2152,6 +2185,73 @@ FORMAT=32-bit_rle_rgbe
 			Texel::Rgba16Float.code(),
 			"and so did the layout that holds a sun"
 		);
+	}
+
+	#[test]
+	fn a_radiance_file_under_lightmaps_compiles_flat_and_of_one_level() {
+		let workspace = workspace("lightmaps");
+		fs::create_dir_all(source_root(&workspace).join("lightmaps")).expect("the directory");
+		fs::create_dir_all(source_root(&workspace).join("skies")).expect("the other one");
+
+		// the same picture twice, a lightmap by where it is and a sky by where
+		// the other one is
+		let texels = [[1.0, 0.5, 0.25], [0.0, 0.0, 0.0], [2.0, 2.0, 2.0], [0.125, 0.25, 0.5]];
+		let hdr =
+			radiance::encode(4, 2, &[texels, texels].concat()).expect("a picture is written");
+
+		fs::write(source_root(&workspace).join("lightmaps/yard.hdr"), &hdr).expect("written");
+		fs::write(source_root(&workspace).join("skies/yard.hdr"), &hdr).expect("written");
+
+		let report = run(&workspace, false);
+
+		assert!(report.failed.is_empty(), "both compile: {:?}", report.failed);
+
+		let produced = |name: &str| {
+			report
+				.compiled
+				.iter()
+				.find(|compiled| compiled.name == name)
+				.map(|compiled| compiled.produced)
+				.expect("it is in the report")
+		};
+
+		assert_eq!(
+			produced("lightmaps/yard"),
+			Produced::Texture { width: 4, height: 2, faces: 1, levels: 1 },
+			"flat, as wide as it was drawn, and of one level"
+		);
+		assert_eq!(
+			produced("skies/yard"),
+			Produced::Texture {
+				width: cube::FACE_SIDE,
+				height: cube::FACE_SIDE,
+				faces: 6,
+				levels: 8,
+			},
+			"and the same bytes anywhere else are a sky"
+		);
+
+		let output = report
+			.compiled
+			.iter()
+			.find(|compiled| compiled.name == "lightmaps/yard")
+			.map(|compiled| compiled.output.clone())
+			.expect("it is in the report");
+		let file = TextureFile::open(&output).expect("the lightmap is a texture");
+
+		assert_eq!(file.header().texel, Texel::Rgba16Float.code(), "that holds light");
+		assert_eq!(file.header().faces(), 1, "on one face");
+	}
+
+	#[test]
+	fn only_a_file_at_the_top_of_lightmaps_is_one() {
+		let root = Path::new("assets");
+
+		assert!(is_lightmap(root, &root.join("lightmaps/yard.hdr")), "under the directory");
+		assert!(is_lightmap(root, &root.join("lightmaps/deep/yard.hdr")), "however deep");
+		assert!(!is_lightmap(root, &root.join("skies/lightmaps/yard.hdr")), "not further down");
+		assert!(!is_lightmap(root, &root.join("lightmaps.hdr")), "not a file of that name");
+		assert!(!is_lightmap(root, Path::new("elsewhere/lightmaps/yard.hdr")), "not outside");
 	}
 
 	#[test]

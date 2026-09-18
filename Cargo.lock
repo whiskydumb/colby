@@ -419,6 +419,7 @@ dependencies = [
  "blank_game",
  "colby_asset",
  "colby_audio",
+ "colby_bake",
  "colby_core",
  "colby_editor",
  "colby_engine",

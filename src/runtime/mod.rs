@@ -17,11 +17,12 @@
 //! **One state, one stand-up, one parser.** [`Runtime`] is the state a world
 //! needs to run and [`Runtime::open`] the one order it is brought up in, with
 //! a [`Front`] saying what kind of process this is; [`Launch`] is the command
-//! line read once. Six runs, and four of them open no window: `--shot` writes
-//! a picture, `--record` a sound, `--link` runs two endpoints against each
-//! other and prints a hash, `--host` and `--join` are the two windowless ends
-//! of a wire, and everything else is a window. @ref [`run`], which is where
-//! the six are told apart.
+//! line read once. Eight runs, and six of them open no window: `--shot` writes
+//! a picture, `--profile` measures one, `--record` a sound, `--link` runs two
+//! endpoints against each other and prints a hash, `--bake` works a scene's
+//! still light out, `--host` and `--join` are the two windowless ends of a
+//! wire, and everything else is a window. @ref [`run`], which is where the
+//! eight are told apart.
 
 // @note: crate-wide opt-in to the workspace `unsafe-code = "deny"`. Every unsafe
 // block in this crate is a call across the module boundary or the resolution of
@@ -41,6 +42,7 @@ mod input;
 mod launch;
 #[cfg(feature = "editor")]
 mod launcher;
+mod light;
 mod link;
 mod mode;
 #[cfg(feature = "hot_reload")]
@@ -158,6 +160,10 @@ pub fn run(arguments: &[String], build: Build, here: &Path) -> Result {
 		// does not: what a frame costs must not depend on what somebody last
 		// typed at a console. @ref `crate::profile`.
 		| Run::Profile(frames) => profile::take(&project, &build, &asked, frames),
+		// no window, no device and no module: a bake of a scene as it was
+		// written, both files written, and the process done. @ref
+		// `crate::light`.
+		| Run::Bake(scene) => light::run(&project, scene.as_deref(), &asked),
 		| Run::Record { path, steps } => record::take(&path, steps, &project, &build, &asked),
 		// a socket instead of a window, which is a run rather than a build: the
 		// same executable, the same module, the same step. @ref `crate::host`.

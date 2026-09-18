@@ -164,11 +164,12 @@ pub fn import(text: &str) -> Result<SceneData> {
 	let solids = bodies(root.get("bodies"), &things)?;
 	let links = joints(root.get("joints"), &solids)?;
 
-	let (stage, sky_cubemap) = stage(root.get("stage"))?;
+	let (stage, sky_cubemap, lightmap) = stage(root.get("stage"))?;
 
 	Ok(SceneData {
 		stage,
 		sky_cubemap,
+		lightmap,
 		thing_generations: vec![1; things.len()],
 		solid_generations: vec![1; solids.len()],
 		link_generations: vec![1; links.len()],
@@ -208,15 +209,20 @@ pub(crate) fn fields(value: &Value, known: &[&str], what: &str) -> Result<()> {
 
 /// The world's own settings, or the ones a world starts with.
 ///
-/// @return the settings and the sky's environment name, which is a *name* and
-/// therefore beside the table rather than in it - the same arrangement a
-/// material's two pictures have. @ref [`REFERENCES`].
-fn stage(value: Option<&Value>) -> Result<(Stage, String)> {
+/// @return the settings, the sky's environment name and the world's lightmap
+/// name, which are *names* and therefore beside the table rather than in it -
+/// the same arrangement a material's two pictures have. @ref [`REFERENCES`].
+fn stage(value: Option<&Value>) -> Result<(Stage, String, String)> {
 	let Some(value) = value else {
-		return Ok((Stage::DEFAULT, String::new()));
+		return Ok((Stage::DEFAULT, String::new(), String::new()));
 	};
 
-	check(value, &[names(Stage::FIELDS, &[])], &["camera", "sky", "post"], "a stage")?;
+	check(
+		value,
+		&[names(Stage::FIELDS, &[])],
+		&["camera", "sky", "post", LIGHTMAP],
+		"a stage",
+	)?;
 
 	let mut stage = Stage::DEFAULT;
 	read(&mut stage, value, Stage::FIELDS, "a stage")?;
@@ -245,8 +251,13 @@ fn stage(value: Option<&Value>) -> Result<(Stage, String)> {
 		read(&mut stage.post, after, Post::FIELDS, "the post-processing")?;
 	}
 
-	Ok((stage, cubemap))
+	Ok((stage, cubemap, text(value.get(LIGHTMAP))))
 }
+
+/// The stage's one field that is read by hand because it is a name: the
+/// picture a bake kept the world's light in. The sky's environment is the
+/// other name a stage holds, and it is under the sky. @ref [`REFERENCES`].
+const LIGHTMAP: &str = "lightmap";
 
 /// The sky's fields that are read by hand because they are names.
 ///
@@ -1164,7 +1175,7 @@ pub fn export(scene: &SceneData) -> Result<String> {
 	// written by whatever knows there is a next one. A trailing one is the
 	// single thing JSON refuses that is easy to write by accident.
 	let parts: Vec<String> = [
-		stage_of(&scene.stage, &scene.sky_cubemap)?,
+		stage_of(scene)?,
 		block("entities", &things),
 		block("bodies", &solids),
 		block("joints", &links),
@@ -1225,7 +1236,8 @@ fn named<T>(
 
 /// The world's own settings, or nothing if they are the ones a world starts
 /// with.
-fn stage_of(stage: &Stage, cubemap: &str) -> Result<Option<String>> {
+fn stage_of(scene: &SceneData) -> Result<Option<String>> {
+	let (stage, cubemap) = (&scene.stage, scene.sky_cubemap.as_str());
 	let mut rows = Rows::default();
 
 	put_all(
@@ -1279,6 +1291,9 @@ fn stage_of(stage: &Stage, cubemap: &str) -> Result<Option<String>> {
 		},
 		|_| None,
 	)?;
+	if let Some((name, written)) = named_row(LIGHTMAP, &scene.lightmap) {
+		rows.put(name, written);
+	}
 
 	if rows.is_empty() {
 		return Ok(None);
@@ -3078,6 +3093,22 @@ mod tests {
 
 		assert!(text.contains(r#""cubemap": "skies/dusk""#), "the name is written: {text}");
 		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+	}
+
+	#[test]
+	fn a_world_names_its_lightmap_and_the_name_survives_a_round_trip() {
+		let scene = import(r#"{ "stage": { "lightmap": "lightmaps/yard" } }"#).expect("a scene");
+
+		assert_eq!(scene.lightmap, "lightmaps/yard", "the name beside the table");
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains(r#""lightmap": "lightmaps/yard""#), "the name is written: {text}");
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+
+		let unbaked = export(&import("{}").expect("a scene of nothing")).expect("it writes");
+
+		assert!(!unbaked.contains("lightmap"), "a world nobody baked writes no row: {unbaked}");
 	}
 
 	#[test]

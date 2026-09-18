@@ -11,11 +11,11 @@
 //! things that will be where they are now when the light is read. So a thing
 //! is baked when it is drawn - alive, shown, with a mesh and not glass - and
 //! nothing that moves it: no body the solver or a game moves drives it or
-//! anything it hangs off, and no pose bends it. The same rule picks the lamps,
-//! so that a lamp a character carries lights the room each frame and throws
-//! nothing into the bake. Glass is left out because what passes through it is
-//! not a surface's to keep, which is the same reason the pass before the scene
-//! leaves it out.
+//! anything it hangs off, no pose bends it, and its [`Baking`] record does not
+//! say to leave it out. The same rule picks the lamps, so that a lamp a
+//! character carries lights the room each frame and throws nothing into the
+//! bake. Glass is left out because what passes through it is not a surface's
+//! to keep, which is the same reason the pass before the scene leaves it out.
 //!
 //! **What a surface is made of, to a ray, is the material the picture draws it
 //! with**: its color times the thing's own tint times the paint on its
@@ -31,7 +31,7 @@ use std::collections::HashSet;
 
 use colby_core::{
 	abi::{
-		EntityId, Entry, MeshId, Transform, World,
+		BAKING, Baking, EntityId, Entry, MeshId, Transform, World,
 		entity::MAX_ENTITIES,
 		light::{Light, LightKind},
 		material::{Blend, Material, Wrap},
@@ -119,6 +119,10 @@ pub struct Piece {
 
 	/// What it is made of.
 	pub look: Look,
+
+	/// How many texels across and down its mesh's second set was laid out
+	/// for, or nought and nought for a mesh with none.
+	pub sheet: [u32; 2],
 
 	/// Its first triangle in the scene's list.
 	pub first: u32,
@@ -215,6 +219,7 @@ impl Scene {
 		for (id, _, renderable) in world.entities.iter() {
 			if !world.entities.shown(id)
 				|| renderable.pose.is_some()
+				|| left_out(world, id)
 				|| !still(world, id, &moving)
 			{
 				continue;
@@ -510,6 +515,7 @@ impl Gathering {
 			entity,
 			mesh: mesh_id,
 			look,
+			sheet: mesh.sheet,
 			first,
 			count: made,
 		});
@@ -582,6 +588,14 @@ fn still(world: &World, id: EntityId, moving: &HashSet<EntityId>) -> bool {
 	true
 }
 
+/// Whether an entity's record says a bake leaves it out.
+fn left_out(world: &World, id: EntityId) -> bool {
+	world
+		.entities
+		.record(&BAKING, id)
+		.is_some_and(|baking| Baking::skip(*baking))
+}
+
 /// Every lamp that is lit, shown and still.
 fn lamps(world: &World, moving: &HashSet<EntityId>) -> Vec<Lamp> {
 	world
@@ -594,7 +608,7 @@ fn lamps(world: &World, moving: &HashSet<EntityId>) -> Vec<Lamp> {
 				.copied()
 				.filter(|light| light.is_lit())?;
 
-			if !world.entities.shown(id) || !still(world, id, moving) {
+			if !world.entities.shown(id) || left_out(world, id) || !still(world, id, moving) {
 				return None;
 			}
 
@@ -706,6 +720,45 @@ mod tests {
 		assert!(!baked(&scene).contains(&nothing), "and not an entity with no mesh");
 		assert_eq!(scene.triangles().len(), 24, "two cubes of twelve triangles");
 		assert_eq!(scene.tree().len(), 24, "every one of them in the tree");
+	}
+
+	#[test]
+	fn what_its_record_leaves_out_is_neither_a_surface_nor_a_lamp_of_the_bake() {
+		let mut world = World::new();
+		let kept = thing(&mut world, MeshId::CUBE, MaterialId::DEFAULT, Transform::IDENTITY);
+		let skipped = thing(
+			&mut world,
+			MeshId::CUBE,
+			MaterialId::DEFAULT,
+			Transform::at(Vec3::new(3.0, 0.0, 0.0)),
+		);
+		let lamp = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(0.0, 4.0, 0.0)));
+		let other = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(0.0, 5.0, 0.0)));
+
+		world
+			.entities
+			.set_light(lamp, Light::point(Vec3::ONE, 1.0, 9.0));
+		world
+			.entities
+			.set_light(other, Light::point(Vec3::ONE, 2.0, 9.0));
+
+		for id in [skipped, other] {
+			world
+				.entities
+				.record_mut(&BAKING, id)
+				.expect("every entity carries it")
+				.skip = 1;
+		}
+
+		let scene = Scene::of(&world);
+
+		assert_eq!(baked(&scene), vec![kept], "the cube its record leaves out is not baked");
+		assert_eq!(scene.lamps().len(), 1, "and nor is the lamp");
+		assert_eq!(scene.lamps()[0].color, Vec3::ONE, "the one left is the other one");
 	}
 
 	#[test]

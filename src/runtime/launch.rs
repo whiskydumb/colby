@@ -1,6 +1,6 @@
 //! What the command line asked for, read once and in one place.
 //!
-//! Six runs, eight flags, one pass. Every flag's shape is written down here
+//! Eight runs, eleven flags, one pass. Every flag's shape is written down here
 //! and nowhere else: `--flag`, `--flag value` and `--flag=value`, with a value
 //! taken from the next word only when it is one - a port that parses, a count
 //! that parses, a path that does not start with a dash - so that `--host
@@ -13,10 +13,11 @@
 //! person who typed `--shot` and `--record` meant one of them, and refusing to
 //! start would be worse than picking. The order is the one the runs are
 //! dispatched in: a two-endpoint run before everything, because it loads no
-//! module; then a picture, a sound, a host, a windowless client; and a window
-//! when nothing else was asked for - which itself serves when told to, talks
-//! when told to, and is on its own otherwise. Serving wins over talking for
-//! the same reason.
+//! module; then a bake, which loads none either; then a picture, a
+//! measurement, a sound, a host, a windowless client; and a window when nothing
+//! else was asked for - which itself serves when told to, talks when told to,
+//! and is on its own otherwise. Serving wins over talking for the same
+//! reason.
 
 use std::{
 	net::{SocketAddr, ToSocketAddrs},
@@ -33,6 +34,9 @@ use crate::{
 
 /// `--link [steps]`: two endpoints in one process, and a hash at the end.
 const LINK: &str = "--link";
+
+/// `--bake [scene]`: a scene's still light worked out, with no window.
+const BAKE: &str = "--bake";
 
 /// `--shot [path]`: one frame to a file.
 const SHOT: &str = "--shot";
@@ -143,14 +147,16 @@ impl Asked {
 
 	/// What the line last set one variable to, without a table.
 	///
-	/// **The one way round [`apply`](Self::apply), and it exists for one
-	/// variable.** The graphics API is read before there is a table to write
-	/// into - the device is made before the world comes up, because the screen
-	/// the world comes up behind needs something to be drawn on - so a
+	/// **The one way round [`apply`](Self::apply), for what is read before
+	/// there is a table.** The graphics API is read before there is a table to
+	/// write into - the device is made before the world comes up, because the
+	/// screen the world comes up behind needs something to be drawn on - so a
 	/// `--set r.backend vulkan` that waited for `apply` would be applied to a
 	/// device that had already chosen. The archive is read by name for exactly
 	/// the same reason; @ref [`crate::console::archived`], and
-	/// [`crate::console::backend`], which is the two of them in order.
+	/// [`crate::console::backend`], which is the two of them in order. A
+	/// windowless bake reads its three settings the same way, having no table
+	/// at all, @ref `crate::light`.
 	///
 	/// The *last* one, because `apply` sets them in order and the last write
 	/// is what a table would hold.
@@ -214,6 +220,10 @@ pub enum Run {
 	/// steps.
 	Link(u32),
 
+	/// A scene's still light worked out and written, with no window: the scene
+	/// under `assets/scenes/` of this name, or the one the project starts as.
+	Bake(Option<String>),
+
 	/// One frame, to this file.
 	Shot(PathBuf),
 
@@ -243,6 +253,8 @@ pub enum Run {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Flags {
 	link: Option<u32>,
+	bake: bool,
+	baking: Option<String>,
 	shot: Option<PathBuf>,
 	profile: Option<u32>,
 	record: Option<(PathBuf, u32)>,
@@ -268,6 +280,12 @@ impl Flags {
 							.count(inline, link::DEFAULT_STEPS)
 							.clamp(1, link::MAX_STEPS),
 					),
+				| BAKE => {
+					flags.bake = true;
+					flags.baking = words
+						.path(inline)
+						.map(|scene| scene.to_string_lossy().into_owned());
+				},
 				| SHOT =>
 					flags.shot = Some(
 						words
@@ -306,6 +324,8 @@ impl Flags {
 	fn decide(self) -> Run {
 		let Self {
 			link,
+			bake,
+			baking,
 			shot,
 			profile,
 			record,
@@ -317,6 +337,7 @@ impl Flags {
 		} = self;
 		let named = [
 			link.is_some(),
+			bake,
 			shot.is_some(),
 			profile.is_some(),
 			record.is_some(),
@@ -327,19 +348,23 @@ impl Flags {
 		.filter(|named| *named)
 		.count();
 
-		// the precedence, as a table: the first run named in dispatch order.
-		let chosen = match (link, shot, profile, record, host, join, listen, connect) {
+		// the precedence, as a table: the first run named in dispatch order. A
+		// bake comes straight after the two-endpoint run, because neither
+		// loads a module.
+		let chosen = match (link, bake, shot, profile, record, host, join, listen, connect) {
 			| (Some(steps), ..) => Run::Link(steps),
-			| (None, Some(path), ..) => Run::Shot(path),
-			| (None, None, Some(frames), ..) => Run::Profile(frames),
-			| (None, None, None, Some((path, steps)), ..) => Run::Record { path, steps },
-			| (None, None, None, None, Some(port), ..) => Run::Host(port),
-			| (None, None, None, None, None, Some(address), ..) => Run::Join(address),
-			| (None, None, None, None, None, None, Some(port), _) =>
+			| (None, true, ..) => Run::Bake(baking),
+			| (None, false, Some(path), ..) => Run::Shot(path),
+			| (None, false, None, Some(frames), ..) => Run::Profile(frames),
+			| (None, false, None, None, Some((path, steps)), ..) => Run::Record { path, steps },
+			| (None, false, None, None, None, Some(port), ..) => Run::Host(port),
+			| (None, false, None, None, None, None, Some(address), ..) => Run::Join(address),
+			| (None, false, None, None, None, None, None, Some(port), _) =>
 				Run::Window(Standing::Serving(port)),
-			| (None, None, None, None, None, None, None, Some(address)) =>
+			| (None, false, None, None, None, None, None, None, Some(address)) =>
 				Run::Window(Standing::Talking(address)),
-			| (None, None, None, None, None, None, None, None) => Run::Window(Standing::Alone),
+			| (None, false, None, None, None, None, None, None, None) =>
+				Run::Window(Standing::Alone),
 		};
 
 		if named > 1 {
@@ -673,6 +698,23 @@ mod tests {
 				.any(|entry| entry.name() == "r.test"),
 			"a screenshot at one sample would have left the window at one sample"
 		);
+	}
+
+	#[test]
+	fn a_bake_names_its_scene_or_takes_the_one_the_project_starts_as() {
+		assert_eq!(parse(&["--bake"]), Run::Bake(None), "no scene is the startup one");
+		assert_eq!(
+			parse(&["--bake", "yard"]),
+			Run::Bake(Some("yard".to_owned())),
+			"or the named"
+		);
+		assert_eq!(parse(&["--bake=yard"]), Run::Bake(Some("yard".to_owned())), "inline too");
+		assert_eq!(
+			parse(&["--bake", "--shot"]),
+			Run::Bake(None),
+			"a flag after it is not a scene, and a bake comes before a picture"
+		);
+		assert_eq!(parse(&["--link", "--bake"]), Run::Link(link::DEFAULT_STEPS), "a link first");
 	}
 
 	#[test]

@@ -690,6 +690,15 @@ pub struct SceneData {
 	/// by value relies on.
 	pub sky_cubemap: String,
 
+	/// The asset name of the picture a bake kept the world's light in, or
+	/// empty for a world nobody baked.
+	///
+	/// A name here and a handle on the world, for the sky's reason above:
+	/// where a texture landed this run says nothing about the next one. Each
+	/// entity's own place on it is in its [`Baking`](super::Baking) record,
+	/// which travels with the entity.
+	pub lightmap: String,
+
 	/// Every entity that was alive.
 	pub things: Vec<Thing>,
 
@@ -985,6 +994,7 @@ impl SceneData {
 		Self {
 			stage: self.stage,
 			sky_cubemap: self.sky_cubemap.clone(),
+			lightmap: self.lightmap.clone(),
 			thing_generations: vec![1; things.len()],
 			solid_generations: vec![1; kept.len()],
 			link_generations: vec![1; links.len()],
@@ -1168,6 +1178,11 @@ pub fn capture(world: &World) -> SceneData {
 		sky_cubemap: world
 			.textures
 			.get(world.sky.cubemap)
+			.map_or_else(String::new, |entry| entry.name().to_owned()),
+		// the same way, and for the same reason
+		lightmap: world
+			.textures
+			.get(world.lightmap)
 			.map_or_else(String::new, |entry| entry.name().to_owned()),
 		links: links(world, &solid_of),
 		posed,
@@ -1479,6 +1494,7 @@ impl Default for Scenes {
 static EMPTY: SceneData = SceneData {
 	stage: Stage::DEFAULT,
 	sky_cubemap: String::new(),
+	lightmap: String::new(),
 	things: Vec::new(),
 	solids: Vec::new(),
 	links: Vec::new(),
@@ -1633,6 +1649,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 	restore_players(world, scene);
 
 	stage_world(world, scene.stage, &scene.sky_cubemap);
+	world.lightmap = lightmap(world, &scene.lightmap);
 
 	Ok(Restored {
 		things: things.iter().filter(|id| id.is_some()).count(),
@@ -2186,6 +2203,26 @@ fn sky(world: &World, sky: Sky, name: &str) -> Sky {
 	}
 
 	Sky { cubemap: found, ..sky }
+}
+
+/// The picture a bake kept the world's light in, resolved out of the registry.
+///
+/// The sky's rule: a name nothing answers to is a warning and no lightmap,
+/// which draws the world as it was drawn before anybody baked it.
+///
+/// @param world - whose texture registry answers
+/// @param name - the lightmap's asset name, or empty
+fn lightmap(world: &World, name: &str) -> TextureId {
+	if name.is_empty() {
+		return TextureId::NONE;
+	}
+
+	let found = world.textures.find(name);
+	if !found.is_some() {
+		warn!(name, "a scene names a lightmap nothing answers to");
+	}
+
+	found
 }
 
 fn material(world: &World, name: &str) -> MaterialId {
@@ -5974,6 +6011,41 @@ mod tests {
 
 		// and back out again: the capture names what the handle points at
 		assert_eq!(capture(&world).sky_cubemap, "skies/dusk", "the name comes back");
+	}
+
+	#[test]
+	fn a_world_names_its_lightmap_and_a_load_turns_that_into_a_handle() {
+		let mut world = World::new();
+		let baked = world
+			.textures
+			.insert("lightmaps/yard", TextureData::white());
+		let described = SceneData {
+			lightmap: "lightmaps/yard".to_owned(),
+			..SceneData::default()
+		};
+
+		restore(&mut world, &described).expect("a world with a lightmap");
+
+		assert_eq!(world.lightmap, baked, "the name was resolved against the registry");
+		assert_eq!(capture(&world).lightmap, "lightmaps/yard", "and it comes back out");
+
+		restore(&mut world, &SceneData::default()).expect("a world nobody baked");
+
+		assert!(!world.lightmap.is_some(), "a description with no name has no lightmap");
+	}
+
+	#[test]
+	fn a_lightmap_nothing_answers_to_is_no_lightmap() {
+		let mut world = World::new();
+		let described = SceneData {
+			lightmap: "lightmaps/absent".to_owned(),
+			..SceneData::default()
+		};
+
+		restore(&mut world, &described).expect("a world is not lost over a missing picture");
+
+		assert!(!world.lightmap.is_some(), "no handle for a name nothing answers to");
+		assert_eq!(capture(&world).lightmap, "", "so nothing is named when it is written again");
 	}
 
 	#[test]

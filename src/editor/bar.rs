@@ -208,6 +208,18 @@ fn adding(ui: &mut Ui, filed: &str, changes: &mut Vec<Change>) -> Rect {
 		changes.push(Change::Bake(filed.to_owned()));
 	}
 
+	if ui
+		.button("bake light")
+		.on_hover_text(
+			"works out the light every still thing gets from the sky and the room, into 			 \
+			 assets/lightmaps/, and writes the scene with it, both with the name in the write 			 \
+			 field; the window stops while it does",
+		)
+		.clicked()
+	{
+		changes.push(Change::Light(filed.to_owned()));
+	}
+
 	response.rect
 }
 

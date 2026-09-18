@@ -750,10 +750,17 @@ fn duplicate(mesh: &mut MeshData, vertex: usize) -> u32 {
 /// make, whichever is wider, to sixteen tenths of it; the one whose sheet has
 /// the fewest texels is kept, and of those the squarest, then the narrowest.
 ///
-/// @param cells - each chart's cell, gutter and all
-/// @return each chart's corner, in the order given, and the sheet's width and
+/// **Public because a bake's atlas is the same problem one size up**: its
+/// cells are the sheets of every still thing, where these are the charts of one
+/// mesh, and a second packer would be a second answer to one question. Nothing
+/// is turned: a cell is placed the way round it came.
+///
+/// @param cells - each cell's width and height, whatever room it wants around
+/// it already in them
+/// @return each cell's corner, in the order given, and the sheet's width and
 /// height
-fn packed(cells: &[[u32; 2]]) -> (Vec<[u32; 2]>, [u32; 2]) {
+#[must_use]
+pub fn packed(cells: &[[u32; 2]]) -> (Vec<[u32; 2]>, [u32; 2]) {
 	let mut order: Vec<usize> = (0..cells.len()).collect();
 
 	order.sort_by_key(|&at| (Reverse(cells[at][1]), Reverse(cells[at][0]), at));

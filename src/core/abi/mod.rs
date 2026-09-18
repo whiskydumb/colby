@@ -76,8 +76,8 @@ pub use self::{
 	debug::{Debug, Label, Line, Pen},
 	decal::{DEFAULT_FADE, Decal, DecalKind, MAX_FADE},
 	entity::{
-		DRAWING, Drawing, EDITING, Editing, Entities, EntityId, MAX_ENTITIES, Renderable,
-		Transform,
+		BAKING, Baking, DRAWING, Drawing, EDITING, Editing, Entities, EntityId, MAX_ENTITIES,
+		Renderable, Transform,
 	},
 	field::Field,
 	font::{Font, FontData, FontId, Fonts, Glyph},
@@ -126,7 +126,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 78;
+pub const ABI_VERSION: u32 = 79;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -356,6 +356,17 @@ pub struct World {
 
 	/// How lit a surface facing away from the light still is. Game-written.
 	pub ambient: Vec3,
+
+	/// The picture a bake kept the light of every still thing in, or
+	/// [`TextureId::NONE`] for a world nobody baked.
+	///
+	/// Beside [`sky`](Self::sky) and [`ambient`](Self::ambient), because on a
+	/// surface a bake reached it is what takes their place: one picture for
+	/// the whole world, and each entity's [`Baking`] record says where on it
+	/// that entity's own light is. A handle, which the host resolves by name
+	/// when a scene is put in place, the way the sky's environment is; a bake
+	/// writes it, and so may a game.
+	pub lightmap: TextureId,
 
 	/// What every dynamic body accelerates by, in units a second squared.
 	///
@@ -642,7 +653,8 @@ impl World {
 	///
 	/// Nothing but the engine's own records, which every world declares before
 	/// anything is put in it: a scene restored into a world has somewhere for
-	/// what it says about [`Drawing`] and [`Editing`] to land. @ref [`record`].
+	/// what it says about [`Drawing`], [`Editing`] and [`Baking`] to land. @ref
+	/// [`record`].
 	#[must_use]
 	pub fn new() -> Self {
 		let mut world = Self::bare();
@@ -656,6 +668,10 @@ impl World {
 		world
 			.entities
 			.declare(&EDITING)
+			.expect("the engine's own records are ones a world holds");
+		world
+			.entities
+			.declare(&BAKING)
 			.expect("the engine's own records are ones a world holds");
 
 		world
@@ -685,6 +701,7 @@ impl World {
 			sky: Sky::NONE,
 			light: Vec3::new(-0.4, -1.0, -0.3),
 			ambient: Vec3::splat(0.25),
+			lightmap: TextureId::NONE,
 			gravity: Vec3::new(0.0, -9.81, 0.0),
 			quit: false,
 			owed_steps: 0,
