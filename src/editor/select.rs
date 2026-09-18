@@ -1505,11 +1505,12 @@ fn drop_mesh(world: &mut World, name: &str, at: Vec3) -> Vec<Pick> {
 
 /// A model, as an entity standing where it was dropped with a child per
 /// piece hanging off it, each drawing its mesh in its material where the
-/// model puts it.
+/// model puts it, or shining the lamp it is.
 ///
 /// What the table of placements is for: a game writes this loop itself,
 /// and the editor writes it once here. A pose is not given, so a skinned
-/// piece stands in its bind pose.
+/// piece stands in its bind pose. A lamp gets its light and keeps the
+/// renderable every entity starts with, which draws nothing: it has no mesh.
 fn drop_model(world: &mut World, name: &str, at: Vec3) -> Vec<Pick> {
 	let id = world.models.find(name);
 	let Some(model) = world.models.get(id) else {
@@ -1530,9 +1531,17 @@ fn drop_model(world: &mut World, name: &str, at: Vec3) -> Vec<Pick> {
 			continue;
 		}
 
-		world
-			.entities
-			.set_renderable(child, Renderable::of(placement.mesh, placement.material, Vec3::ONE));
+		if placement.mesh.is_some() {
+			world.entities.set_renderable(
+				child,
+				Renderable::of(placement.mesh, placement.material, Vec3::ONE),
+			);
+		}
+
+		if placement.light.kind.is_lit() {
+			world.entities.set_light(child, placement.light);
+		}
+
 		world.entities.set_name(child, &placement.name);
 		world.entities.set_parent(child, parent);
 	}
@@ -3312,6 +3321,60 @@ mod tests {
 			"where the model puts it, from where the model was dropped"
 		);
 		assert_eq!(world.entities.renderable(shade).map(|it| it.mesh), Some(MeshId::CUBE));
+	}
+
+	#[test]
+	fn a_dropped_models_lamp_shines_and_its_geometry_does_not() {
+		use colby_core::abi::{
+			Light, MeshId,
+			model::{ModelData, Placement},
+		};
+
+		let bulb = Light::spot(Vec3::new(1.0, 0.8, 0.6), 2.0, 6.0, 0.2, 0.5);
+		let mut world = World::new();
+		world.models.insert("models/lantern", ModelData {
+			placements: vec![
+				Placement {
+					name: "glass".to_owned(),
+					mesh: MeshId::CUBE,
+					..Placement::default()
+				},
+				Placement {
+					name: "flame".to_owned(),
+					transform: Transform::at(Vec3::Y),
+					light: bulb,
+					..Placement::default()
+				},
+			],
+		});
+
+		let landed = drop(&mut world, "models/lantern", Kind::Model, Vec3::ZERO);
+
+		let [Pick::Entity(parent)] = landed[..] else {
+			panic!("the model's own entity: {landed:?}");
+		};
+		let pieces = descendants(&world, parent);
+		let named = |name: &str| {
+			pieces
+				.iter()
+				.copied()
+				.find(|id| world.entities.name(*id) == name)
+				.unwrap_or_else(|| panic!("no piece called {name}"))
+		};
+		let (glass, flame) = (named("glass"), named("flame"));
+
+		assert_eq!(world.entities.light(flame).copied(), Some(bulb), "the lamp shines its light");
+		assert_eq!(
+			world.entities.renderable(flame).map(|it| it.mesh),
+			Some(MeshId::NONE),
+			"and draws nothing"
+		);
+		assert_eq!(
+			world.entities.light(glass).map(|it| it.kind),
+			Some(colby_core::abi::LightKind::None),
+			"while the geometry shines nothing"
+		);
+		assert_eq!(world.entities.renderable(glass).map(|it| it.mesh), Some(MeshId::CUBE));
 	}
 
 	#[test]

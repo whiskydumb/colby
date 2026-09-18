@@ -685,18 +685,7 @@ fn made_of(ui: &mut Ui, world: &mut World, id: ModelId, project: Option<&Project
 		.models
 		.placements(id)
 		.iter()
-		.map(|placement| {
-			let mesh = world
-				.meshes
-				.get(placement.mesh)
-				.map_or("", |entry| entry.name());
-
-			(
-				placement.name.clone(),
-				within(mesh, &inside),
-				within(world.materials.name(placement.material), &inside),
-			)
-		})
+		.map(|placement| piece_row(world, placement, &inside))
 		.collect();
 
 	ui.label(format!("{} standing", counted(pieces.len(), "piece")));
@@ -729,6 +718,39 @@ fn made_of(ui: &mut Ui, world: &mut World, id: ModelId, project: Option<&Project
 
 /// How tall the list of pieces may get before it scrolls, in points.
 const PIECES: f32 = 220.0;
+
+/// One piece's row: its name, what it is made of, and what it wears.
+///
+/// A lamp has no mesh to name and wears nothing, so its row says what it
+/// shines where a piece of geometry says what it is made of.
+///
+/// @param world - the registries the handles are named in
+/// @param placement - the piece
+/// @param inside - the model's name and a slash, which comes off its own names
+fn piece_row(
+	world: &World,
+	placement: &colby_core::abi::model::Placement,
+	inside: &str,
+) -> (String, String, String) {
+	if !placement.mesh.is_some() && placement.light.kind.is_lit() {
+		return (
+			placement.name.clone(),
+			format!("{} lamp", placement.light.kind.word()),
+			String::new(),
+		);
+	}
+
+	let mesh = world
+		.meshes
+		.get(placement.mesh)
+		.map_or("", |entry| entry.name());
+
+	(
+		placement.name.clone(),
+		within(mesh, inside),
+		within(world.materials.name(placement.material), inside),
+	)
+}
 
 /// An asset name with the model's own prefix taken off, when it has one.
 ///
@@ -1484,13 +1506,21 @@ mod tests {
 		let id = world
 			.models
 			.insert("models/lamp", colby_core::abi::model::ModelData {
-				placements: vec![colby_core::abi::model::Placement {
-					name: "shade".to_owned(),
-					mesh,
-					material,
-					skeleton: colby_core::abi::SkeletonId::NONE,
-					transform: Transform::IDENTITY,
-				}],
+				placements: vec![
+					colby_core::abi::model::Placement {
+						name: "shade".to_owned(),
+						mesh,
+						material,
+						skeleton: colby_core::abi::SkeletonId::NONE,
+						transform: Transform::IDENTITY,
+						light: Light::NONE,
+					},
+					colby_core::abi::model::Placement {
+						name: "bulb".to_owned(),
+						light: Light::point(Vec3::ONE, 2.0, 5.0),
+						..colby_core::abi::model::Placement::default()
+					},
+				],
 			});
 		let was = world.models.placements(id).to_vec();
 		let context = Context::default();
@@ -1506,6 +1536,35 @@ mod tests {
 			"a frame nobody touched leaves the model as it stood"
 		);
 		assert_eq!(world.models.name(id), "models/lamp", "and it is still called that");
+	}
+
+	#[test]
+	fn a_lamps_row_says_what_it_shines_where_a_pieces_says_what_it_is_made_of() {
+		let mut world = World::new();
+		let mesh = world
+			.meshes
+			.insert("models/lamp/shade", colby_core::abi::mesh::MeshData::default());
+		let shade = colby_core::abi::model::Placement {
+			name: "shade".to_owned(),
+			mesh,
+			..colby_core::abi::model::Placement::default()
+		};
+		let bulb = colby_core::abi::model::Placement {
+			name: "bulb".to_owned(),
+			light: Light::spot(Vec3::ONE, 2.0, 5.0, 0.2, 0.5),
+			..colby_core::abi::model::Placement::default()
+		};
+
+		assert_eq!(
+			piece_row(&world, &bulb, "models/lamp/"),
+			("bulb".to_owned(), "spot lamp".to_owned(), String::new()),
+			"a lamp's kind in the mesh's column, and nothing worn"
+		);
+		assert_eq!(
+			piece_row(&world, &shade, "models/lamp/").1,
+			"shade",
+			"while a piece of geometry names its mesh, as it always did"
+		);
 	}
 
 	#[test]

@@ -658,10 +658,13 @@ fn load_model(world: &mut World, path: &Path, name: &str) {
 		.iter()
 		.map(|placement| Placement {
 			name: placement.name.clone(),
+			// a lamp names no mesh, and an empty name is the null handle rather
+			// than a slot claimed for nothing
 			mesh: reserve_mesh(world, &placement.mesh),
 			material: reserve_material(world, &placement.material),
 			skeleton: reserve_skeleton(world, &placement.skeleton),
 			transform: placement.transform,
+			light: placement.light,
 		})
 		.collect();
 	let loaded = ModelData { placements };
@@ -680,10 +683,15 @@ fn load_model(world: &mut World, path: &Path, name: &str) {
 	}
 
 	let standing = loaded.placements.len();
+	let lamps = loaded
+		.placements
+		.iter()
+		.filter(|placement| placement.light.kind.is_lit())
+		.count();
 	let materials = data.materials.len();
 	let id = world.models.insert(name, loaded);
 
-	info!(name, slot = id.index(), standing, materials, "model loaded");
+	info!(name, slot = id.index(), standing, lamps, materials, "model loaded");
 }
 
 /// Reads one `.canim` into the world's clip registry.
@@ -830,7 +838,10 @@ fn reserve_texture(world: &mut World, name: &str) -> TextureId {
 mod tests {
 	use std::{fs, fs::File, thread::sleep};
 
-	use colby_core::abi::{Clip, Mesh, Model, Script, Texture};
+	use colby_core::{
+		abi::{Clip, Mesh, Model, Script, Texture},
+		glam::Vec3,
+	};
 
 	use super::*;
 
@@ -1611,7 +1622,7 @@ mod tests {
 		assert!(
 			brass
 				.emissive
-				.abs_diff_eq(colby_core::glam::Vec3::new(1.0, 0.5, 0.25), 1e-6),
+				.abs_diff_eq(Vec3::new(1.0, 0.5, 0.25), 1e-6),
 			"and its glow"
 		);
 		assert!(brass.unlit, "and the flag");
@@ -1660,6 +1671,46 @@ mod tests {
 			"holding what the file said rather than a reservation nobody filled: {}",
 			coat.roughness
 		);
+	}
+
+	#[test]
+	fn a_models_lamp_arrives_shining_and_standing_on_no_mesh() {
+		// the lamp crosses from the file into the table a game spawns from, and
+		// its empty mesh name is the null handle rather than a row claimed for
+		// nothing
+		let (source, output) = trees("model-lamp");
+
+		put(
+			&source,
+			"models/bulb.gltf",
+			"{ \"asset\": { \"version\": \"2.0\" }, \"extensionsUsed\": [ \
+			 \"KHR_lights_punctual\" ], \"extensions\": { \"KHR_lights_punctual\": { \
+			 \"lights\": [ { \"type\": \"point\", \"color\": [ 1, 0.5, 0.25 ], \"intensity\": \
+			 3000, \"range\": 6 } ] } }, \"nodes\": [ { \"name\": \"bulb\", \"translation\": [ \
+			 0, 2, 0 ], \"extensions\": { \"KHR_lights_punctual\": { \"light\": 0 } } } ], \
+			 \"scenes\": [ { \"nodes\": [ 0 ] } ] }",
+		);
+
+		let mut world = World::new();
+
+		Assets::at(source, output).sync(&mut world);
+
+		let model = world.models.find("models/bulb");
+		let [bulb] = world.models.placements(model) else {
+			panic!("one lamp stands: {:?}", world.models.placements(model));
+		};
+
+		assert!(!bulb.mesh.is_some(), "on no mesh");
+		assert_eq!(bulb.light.kind, colby_core::abi::LightKind::Point, "shining a point");
+		assert_eq!(bulb.light.color, Vec3::new(1.0, 0.5, 0.25), "of the file's color");
+		assert_eq!(bulb.light.range.to_bits(), 6.0_f32.to_bits(), "as far as the file said");
+		assert!(
+			bulb.transform
+				.position
+				.abs_diff_eq(Vec3::Y * 2.0, 1e-6),
+			"where it hangs"
+		);
+		assert!(!world.meshes.find("").is_some(), "and no mesh row answers to nothing");
 	}
 
 	#[test]

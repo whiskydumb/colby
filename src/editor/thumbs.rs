@@ -286,7 +286,8 @@ impl Thumbs {
 	/// Its meshes and its materials are opened from the compiled tree by
 	/// hand, the way a material's pictures are, and for the same reason:
 	/// a thumbnail world has no loader watching a directory. A piece whose
-	/// mesh is not there is left out rather than refusing the picture.
+	/// mesh is not there is left out rather than refusing the picture, and
+	/// so is a lamp, which has no mesh to be there.
 	///
 	/// @param gpu - the device, or nothing
 	/// @param output - the `.cmodel` on disk
@@ -315,7 +316,14 @@ impl Thumbs {
 		// into `self` to open a mesh
 		for slot in 0..self.pieces.len() {
 			let id = self.pieces[slot];
-			let Some(placement) = data.placements.get(slot) else {
+			// a lamp has nothing to draw and nowhere to be framed from: it
+			// would stretch the camera over empty air to reach where it hangs,
+			// and a thumbnail is lit by its own lights rather than the model's
+			let Some(placement) = data
+				.placements
+				.get(slot)
+				.filter(|placement| !placement.mesh.is_empty())
+			else {
 				self.world
 					.entities
 					.set_renderable(id, Renderable::NOTHING);
@@ -851,6 +859,7 @@ mod tests {
 					material: "models/tower/paint".to_owned(),
 					skeleton: String::new(),
 					transform: colby_core::abi::Transform::at(Vec3::Y * height),
+					light: colby_core::abi::Light::NONE,
 				})
 				.collect(),
 		};
@@ -917,6 +926,31 @@ mod tests {
 				.map(|renderable| renderable.mesh),
 			Some(MeshId::NONE),
 			"the spare draws nothing"
+		);
+
+		// a lamp hanging far above the one cube is not framed: it has nothing
+		// to draw, and a camera stretched up to reach it would shrink the cube
+		// to a speck
+		let lit = colby_asset::model::ModelData {
+			placements: vec![both.placements[0].clone(), colby_asset::model::Placement {
+				name: "bulb".to_owned(),
+				transform: colby_core::abi::Transform::at(Vec3::Y * 40.0),
+				light: colby_core::abi::Light::point(Vec3::ONE, 5.0, 20.0),
+				..colby_asset::model::Placement::default()
+			}],
+			..both
+		};
+		fs::write(&output, colby_asset::model::encode(&lit).expect("the model encodes"))
+			.expect("the third file");
+
+		let bulb = thumbs
+			.standing(Some(gpu), &output)
+			.expect("the lit model draws");
+		let (lamp, cube) = (covered(&bulb), covered(&alone));
+
+		assert!(
+			lamp.abs_diff(cube) * 50 <= cube,
+			"framed on the cube alone, the lamp left out: {lamp} against {cube}"
 		);
 	}
 

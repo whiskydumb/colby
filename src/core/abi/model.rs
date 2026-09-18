@@ -5,7 +5,7 @@
 //! pixels: those are meshes and textures in the tables beside this one,
 //! registered under their own names by the same loader that registers anything
 //! a person made by hand. What is here is the part nothing else could carry -
-//! **a list of what stands where**.
+//! **a list of what stands where**, the file's lamps among it.
 //!
 //! **Every handle in a placement is already resolved.** The compiler wrote
 //! names and the host looked them up, so a game reads a [`MeshId`] and a
@@ -21,11 +21,22 @@
 //!   let lamp = world.models.find("models/lamp");
 //!
 //!   for placement in world.models.placements(lamp) {
-//!       let entity = world.entities.spawn();
-//!       world.entities.set_transform(entity, placement.transform);
-//!       world.entities.set_renderable(entity, Renderable::of(..));
+//!       let entity = world.entities.spawn_at(placement.transform);
+//!
+//!       if placement.mesh.is_some() {
+//!           world.entities.set_renderable(entity, Renderable::of(..));
+//!       }
+//!
+//!       if placement.light.kind.is_lit() {
+//!           world.entities.set_light(entity, placement.light);
+//!       }
 //!   }
 //! ```
+//!
+//! **A piece is geometry or a lamp, and the loop asks which.** A lamp the file
+//! carried is a placement of its own with no mesh, and its entity keeps the
+//! renderable it was spawned with, which draws nothing; a piece of geometry
+//! carries [`Light::NONE`], which is the light it was spawned with.
 //!
 //! That loop is the whole surface, and it is deliberately a loop rather than a
 //! call: what a game does with a placement - whether it gives it a body, a
@@ -34,6 +45,7 @@
 
 use super::{
 	entity::Transform,
+	light::Light,
 	material::MaterialId,
 	mesh::MeshId,
 	registry::{Entry, Registry},
@@ -57,7 +69,7 @@ pub struct Placement {
 	/// particular rather than spawning all of them.
 	pub name: String,
 
-	/// The geometry that stands here.
+	/// The geometry that stands here, or [`MeshId::NONE`] for a lamp.
 	pub mesh: MeshId,
 
 	/// What it is made of, or [`MaterialId::DEFAULT`] when the file said
@@ -76,7 +88,19 @@ pub struct Placement {
 	pub skeleton: SkeletonId,
 
 	/// Where it stands, with the whole tree above it already worked in.
+	///
+	/// A lamp's scale is always one: a lamp takes its place and the way it
+	/// faces from the file, and neither its reach nor its brightness grows with
+	/// the node it hangs off, which is what the exchange format says of a
+	/// light.
 	pub transform: Transform,
+
+	/// What it shines, or [`Light::NONE`] for a piece that is geometry.
+	///
+	/// A cone throws down the placement's own -z, the rule every light in the
+	/// world follows, so the rotation beside it is the whole of which way it
+	/// points.
+	pub light: Light,
 }
 
 /// A model as the world holds it.
@@ -184,6 +208,7 @@ mod tests {
 					material: MaterialId::new(2),
 					skeleton: SkeletonId::NONE,
 					transform: Transform::at(Vec3::Y),
+					light: Light::NONE,
 				},
 				Placement {
 					name: "stem".to_owned(),
@@ -191,6 +216,13 @@ mod tests {
 					material: MaterialId::DEFAULT,
 					skeleton: SkeletonId::new(1),
 					transform: Transform::IDENTITY,
+					light: Light::NONE,
+				},
+				Placement {
+					name: "bulb".to_owned(),
+					transform: Transform::at(Vec3::Y * 2.0),
+					light: Light::point(Vec3::ONE, 2.0, 5.0),
+					..Placement::default()
 				},
 			],
 		}
@@ -202,8 +234,21 @@ mod tests {
 		let id = models.insert("models/lamp", lamp());
 
 		assert_eq!(models.find("models/lamp"), id);
-		assert_eq!(models.placements(id).len(), 2);
+		assert_eq!(models.placements(id).len(), 3);
 		assert_eq!(models.placements(id)[0].name, "shade");
+	}
+
+	#[test]
+	fn a_piece_is_geometry_that_shines_nothing_unless_it_says_otherwise() {
+		let piece = Placement::default();
+
+		assert_eq!(piece.light, Light::NONE, "a piece nobody said shines does not");
+		assert!(!piece.light.kind.is_lit(), "and the loop above gives it no light");
+		assert!(!piece.mesh.is_some(), "nor, having no mesh either, a renderable");
+
+		let bulb = &lamp().placements[2];
+
+		assert!(bulb.light.kind.is_lit() && !bulb.mesh.is_some(), "a lamp is the other way");
 	}
 
 	#[test]

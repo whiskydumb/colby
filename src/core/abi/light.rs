@@ -21,10 +21,12 @@
 //! derive from it. A world has one sun and any number of lamps.
 //!
 //! **The intensity is a multiplier, not a photometric unit.** Candelas and
-//! lumens only mean anything under an exposure, and there is no tonemap here
-//! yet; Unreal's own component constructor starts at `ELightUnits::Unitless`
-//! for the same kind of reason. @ref [`colby_engine`] for what the shader does
-//! with it.
+//! lumens only mean anything under an exposure; Unreal's own component
+//! constructor starts at `ELightUnits::Unitless` for the same kind of reason.
+//! Where a file does say candela, one is 683 pi of them: the number a lamp read
+//! from the exchange format is divided by on the way in, measured against a
+//! path tracer's picture of the same lamp. @ref [`colby_engine`] for what the
+//! shader does with it, and `colby_asset`'s glTF reader for the division.
 
 use super::field::{Field, field, word};
 use crate::glam::Vec3;

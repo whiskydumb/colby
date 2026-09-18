@@ -2,7 +2,7 @@
 //!
 //! The other half of the importer. [`super`] reads the file; this reads the
 //! *scene* in it, and what comes out is plain colby types with no glTF left in
-//! them. Five decisions are worth knowing before reading the code, because
+//! them. Six decisions are worth knowing before reading the code, because
 //! each is a place where this engine and the format disagree about shape.
 //!
 //! **One primitive is one mesh.** A glTF mesh holds primitives, each with its
@@ -39,18 +39,25 @@
 //! this engine already goes through. A vertex color or a second set of
 //! coordinates is a block of its own, written only when the file has either:
 //! the other is white or nought beside it.
+//!
+//! **A lamp stands on its own.** A node naming one of the file's lights stands
+//! a lamp where the node stands, facing the way the node faces, beside
+//! whatever mesh the node also carries: a lamp is a placement with no mesh,
+//! because a `Renderable` is one mesh and a light is not one. Its scale is
+//! dropped, which is what the lights extension says a node's scale does to a
+//! light. @ref `super::light` for what a lamp's numbers become.
 
 use colby_core::{
 	Result,
 	abi::{
-		Transform,
+		Light, Transform,
 		mesh::{self, BONES_PER_VERTEX, MeshData, MeshVertex, PaintVertex, SkinVertex},
 	},
 	err,
 	glam::{Mat4, Quat, Vec2, Vec3, Vec4},
 };
 
-use super::{Clip, Extracted, Gltf, Skin, Surface, clip, skin};
+use super::{Clip, Extracted, Gltf, Skin, Surface, clip, light, skin};
 use crate::json::Value;
 
 /// The drawing mode colby reads. Everything else is skipped with a warning.
@@ -86,6 +93,9 @@ pub struct Model {
 
 	/// Where each of them stands, in world space.
 	pub placements: Vec<Placement>,
+
+	/// Every lamp a node stands, in the order the walk met them.
+	pub lamps: Vec<Lamp>,
 
 	/// Every material the file declares, in its own order, which is what a
 	/// [`Piece::material`] indexes.
@@ -150,16 +160,35 @@ pub struct Placement {
 	pub skeleton: Option<usize>,
 }
 
+/// One lamp standing somewhere in the world.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Lamp {
+	/// The node's name, numbered when a piece of geometry already has it.
+	pub name: String,
+
+	/// What it shines, in colby's own units.
+	pub light: Light,
+
+	/// Where it stands and which way it faces, with the whole tree above it
+	/// worked in. The scale is always one.
+	pub transform: Transform,
+}
+
 /// Reads a file's scene into geometry.
 ///
 /// @param file - the document with its buffers, from [`Gltf::open`]
 /// @return every mesh, where each stands, and what could not be read
 pub fn import(file: &Gltf) -> Result<Model> {
 	let mut rigs = skin::read(file);
+	let mut lamps = light::read(file);
+
+	rigs.warnings.append(&mut lamps.warnings);
+
 	let mut build = Build {
 		file,
 		mesh_skin: mesh_skins(file, rigs.skins.len(), &mut rigs.warnings),
 		skins: rigs.skins,
+		lights: lamps.lights,
 		meshes: Vec::new(),
 		upright: Vec::new(),
 		mirrored: Vec::new(),
@@ -169,7 +198,7 @@ pub fn import(file: &Gltf) -> Result<Model> {
 	};
 
 	build.pieces()?;
-	let placements = build.walk();
+	let (placements, lamps) = build.walk();
 	let mut coats = super::material::read(file);
 	let mut warnings = build.warnings;
 
@@ -187,6 +216,7 @@ pub fn import(file: &Gltf) -> Result<Model> {
 	Ok(Model {
 		meshes: build.meshes,
 		placements,
+		lamps,
 		materials: coats.surfaces,
 		textures: coats.pictures,
 		skins: build.skins,
@@ -204,9 +234,9 @@ pub fn import(file: &Gltf) -> Result<Model> {
 /// model, so there is nowhere to put one; the point is that the file said
 /// something and the import did not answer.
 ///
-/// A light is not here because a light *is* an extension in glTF
-/// (`KHR_lights_punctual`), and [`unread_extensions`](super::unread_extensions)
-/// names it.
+/// A light is not here because a light is read: it is an extension in glTF
+/// (`KHR_lights_punctual`), and a sun, the one kind colby leaves out, is warned
+/// about where the lights are read. @ref `super::light`.
 ///
 /// @param file - the document
 /// @return one line, or none when the file has no cameras
@@ -268,6 +298,8 @@ struct Build<'a> {
 	file: &'a Gltf,
 	/// Every skin of the file, already sorted into skeletons.
 	skins: Vec<Skin>,
+	/// Every light the file declares, or nothing where colby does not take one.
+	lights: Vec<Option<Light>>,
 	/// Which skin moves each mesh, or nothing for a mesh bones do not move.
 	mesh_skin: Vec<Option<usize>>,
 	meshes: Vec<Piece>,
@@ -672,12 +704,13 @@ impl Build<'_> {
 		super::unique(&mut self.named, &base)
 	}
 
-	/// Walks the scene, working out where every piece stands.
-	fn walk(&mut self) -> Vec<Placement> {
+	/// Walks the scene, working out where every piece and every lamp stands.
+	fn walk(&mut self) -> (Vec<Placement>, Vec<Lamp>) {
 		let file = self.file;
 		let nodes = file.table("nodes");
 		let mut seen = vec![false; nodes.len()];
 		let mut placements = Vec::new();
+		let mut lamps = Vec::new();
 		let mut stack: Vec<(usize, Mat4)> = roots(self.file)
 			.into_iter()
 			.rev()
@@ -701,6 +734,7 @@ impl Build<'_> {
 			let world = above * local(node);
 
 			self.stand(index, node, world, &mut placements);
+			self.lamp(index, node, world, &mut lamps);
 
 			for child in node
 				.get("children")
@@ -713,7 +747,47 @@ impl Build<'_> {
 			}
 		}
 
-		placements
+		(placements, lamps)
+	}
+
+	/// Puts the lamp a node names where the node is, facing the way it faces.
+	///
+	/// The scale comes off: the extension says a node's scale touches neither
+	/// a light's reach nor its brightness. What a cone needs of the rest is its
+	/// -z, and the rotation carries that whatever the scale was - a mirror
+	/// included, because the decomposition puts a mirror's sign on x and leaves
+	/// z its length, so the rotation's -z is the matrix's -z made one long.
+	fn lamp(&mut self, index: usize, node: &Value, world: Mat4, out: &mut Vec<Lamp>) {
+		let Some(which) = light::named_by(node) else {
+			return;
+		};
+		let Some(named) = self.lights.get(which).copied() else {
+			self.warnings
+				.push(format!("node {index} names light {which}, which is not there"));
+
+			return;
+		};
+		// a sun, or a kind colby has no word for: said once, where the list
+		// was read, rather than once a node
+		let Some(light) = named else {
+			return;
+		};
+		let placed = self.decompose(index, world);
+		let written = node
+			.get("name")
+			.and_then(Value::as_str)
+			.unwrap_or("");
+		let mut base = super::tidy(written);
+
+		if base.is_empty() {
+			base = format!("node{index}");
+		}
+
+		out.push(Lamp {
+			name: super::unique(&mut self.placed, &base),
+			light,
+			transform: Transform { scale: Vec3::ONE, ..placed },
+		});
 	}
 
 	/// Puts one node's mesh where the node is.
@@ -1124,6 +1198,8 @@ fn primitives(file: &Gltf, mesh: usize) -> &[Value] {
 #[cfg(test)]
 mod tests {
 	use std::path::Path;
+
+	use colby_core::abi::LightKind;
 
 	use super::*;
 
@@ -2052,6 +2128,160 @@ mod tests {
 
 		assert_eq!(turned.indices, vec![0, 2, 1], "the winding turned");
 		assert_eq!(turned.paint, data.paint, "and the paint is still each vertex's own");
+	}
+
+	/// The lights a lamp test declares: a spot, a point, and a sun.
+	const LIGHTS: &str = "\"extensionsUsed\": [ \"KHR_lights_punctual\" ], \"extensions\": { \
+	                      \"KHR_lights_punctual\": { \"lights\": [ { \"type\": \"spot\", \
+	                      \"intensity\": 900 }, { \"type\": \"point\" }, { \"type\": \
+	                      \"directional\" } ] } }";
+
+	/// A document with those lights, one mesh, and these nodes under these
+	/// roots.
+	fn lit(nodes: &str, roots: &str) -> Model {
+		scene(&format!(
+			"{LIGHTS}, \"meshes\": [ {{ \"primitives\": [ {{ \"attributes\": {{ \"POSITION\": 0 \
+			 }} }} ] }} ], \"nodes\": [ {nodes} ], \"scenes\": [ {{ \"nodes\": [ {roots} ] }} ]"
+		))
+	}
+
+	/// The one lamp called this.
+	fn lamp<'a>(model: &'a Model, name: &str) -> &'a Lamp {
+		model
+			.lamps
+			.iter()
+			.find(|lamp| lamp.name == name)
+			.unwrap_or_else(|| panic!("no lamp called {name}: {:?}", model.lamps))
+	}
+
+	/// A turn of twenty degrees about y and a tilt of thirty-five down about x,
+	/// xyzw, as a node writes one.
+	const TURNED: &str = "[ -0.2961374, 0.16561121, 0.052217014, 0.93922785 ]";
+
+	#[test]
+	fn a_lamp_stands_where_its_node_stands_and_faces_the_way_it_faces() {
+		let model = lit(
+			&format!(
+				"{{ \"name\": \"cone\", \"translation\": [ 1, 2, 3 ], \"rotation\": {TURNED}, \
+				 \"extensions\": {{ \"KHR_lights_punctual\": {{ \"light\": 0 }} }} }}"
+			),
+			"0",
+		);
+		let cone = lamp(&model, "cone");
+
+		assert_eq!(cone.light.kind, LightKind::Spot, "the spot it names");
+		assert!(
+			cone.transform
+				.position
+				.abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), 1e-6),
+			"{cone:?}"
+		);
+		assert!(
+			cone.transform.rotation.abs_diff_eq(
+				Quat::from_xyzw(-0.296_137_4, 0.165_611_21, 0.052_217_014, 0.939_227_9),
+				1e-6
+			),
+			"turned as the node is: {cone:?}"
+		);
+		assert_eq!(cone.transform.scale, Vec3::ONE, "with no scale of its own");
+		assert!(model.placements.is_empty(), "and nothing drawn, the node having no mesh");
+	}
+
+	#[test]
+	fn a_mirrored_lamp_points_down_its_nodes_own_minus_z_and_leans_the_other_way() {
+		// the one case the rotation alone might get wrong: a node mirrored
+		// along z, whose -z is the world's +z. The lamp is right when its
+		// rotation's -z is the node's whole matrix's -z made one long.
+		let model = lit(
+			&format!(
+				"{{ \"name\": \"upright\", \"rotation\": {TURNED}, \"extensions\": {{ \
+				 \"KHR_lights_punctual\": {{ \"light\": 0 }} }} }}, {{ \"name\": \"mirrored\", \
+				 \"rotation\": {TURNED}, \"scale\": [ 1, 1, -1 ], \"extensions\": {{ \
+				 \"KHR_lights_punctual\": {{ \"light\": 0 }} }} }}"
+			),
+			"0, 1",
+		);
+		let turn = Quat::from_xyzw(-0.296_137_4, 0.165_611_21, 0.052_217_014, 0.939_227_9);
+		let matrix =
+			Mat4::from_scale_rotation_translation(Vec3::new(1.0, 1.0, -1.0), turn, Vec3::ZERO);
+		let wanted = matrix.transform_vector3(-Vec3::Z).normalize();
+		let mirrored = lamp(&model, "mirrored").transform;
+		let upright = lamp(&model, "upright").transform;
+
+		assert!(
+			(mirrored.rotation * -Vec3::Z).abs_diff_eq(wanted, 1e-5),
+			"down the matrix's -z: {} against {wanted}",
+			mirrored.rotation * -Vec3::Z
+		);
+		assert_eq!(mirrored.scale, Vec3::ONE, "and the mirror is not carried as a scale");
+		assert!(
+			(upright.rotation * -Vec3::Z).abs_diff_eq(-wanted, 1e-5),
+			"the unmirrored one points the other way along the same line"
+		);
+	}
+
+	#[test]
+	fn a_lamp_under_a_scaled_parent_moves_with_it_and_takes_none_of_the_scale() {
+		let model = lit(
+			"{ \"name\": \"stand\", \"scale\": [ 2, 3, 2 ], \"children\": [ 1 ] }, { \"name\": \
+			 \"bulb\", \"translation\": [ 0, 1, 0 ], \"extensions\": { \"KHR_lights_punctual\": \
+			 { \"light\": 1 } } }",
+			"0",
+		);
+		let bulb = lamp(&model, "bulb");
+
+		assert!(
+			bulb.transform
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 3.0, 0.0), 1e-6),
+			"{bulb:?}"
+		);
+		assert_eq!(bulb.transform.scale, Vec3::ONE, "{bulb:?}");
+		assert_eq!(bulb.light.kind, LightKind::Point, "the point it names");
+		assert!(
+			model.warnings.len() == 1 && model.warnings[0].contains("directional"),
+			"nothing to say but about the sun the fixture declares: {:?}",
+			model.warnings
+		);
+	}
+
+	#[test]
+	fn a_node_with_a_mesh_and_a_lamp_stands_both_under_two_names() {
+		let model = lit(
+			"{ \"name\": \"Lantern\", \"mesh\": 0, \"extensions\": { \"KHR_lights_punctual\": { \
+			 \"light\": 1 } } }",
+			"0",
+		);
+
+		assert_eq!(model.placements.len(), 1, "the glass");
+		assert_eq!(model.placements[0].name, "lantern", "which keeps the node's name");
+		assert_eq!(model.lamps.len(), 1, "and the flame");
+		assert_eq!(model.lamps[0].name, "lantern_1", "numbered, names being one list");
+	}
+
+	#[test]
+	fn a_sun_stands_nowhere_and_a_light_that_is_not_there_is_said() {
+		let model = lit(
+			"{ \"name\": \"sky\", \"extensions\": { \"KHR_lights_punctual\": { \"light\": 2 } } \
+			 }, { \"name\": \"lost\", \"extensions\": { \"KHR_lights_punctual\": { \"light\": 9 \
+			 } } }",
+			"0, 1",
+		);
+
+		assert!(model.lamps.is_empty(), "neither stands: {:?}", model.lamps);
+		assert_eq!(model.warnings.len(), 2, "one word each: {:?}", model.warnings);
+		assert!(
+			model
+				.warnings
+				.iter()
+				.any(|said| said.contains("directional"))
+				&& model
+					.warnings
+					.iter()
+					.any(|said| said.contains("light 9")),
+			"{:?}",
+			model.warnings
+		);
 	}
 
 	#[test]

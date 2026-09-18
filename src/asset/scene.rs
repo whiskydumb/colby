@@ -725,11 +725,16 @@ pub struct Jot {
 /// shapes bump [`FORMAT_VERSION`] once and only once; this one costs a world
 /// of a thousand crates and two lamps eighty bytes instead of forty
 /// thousand.
+///
+/// **The record a `.cmodel` writes for a lamp too**, keyed by the placement
+/// rather than by the entity, and read by the same rules: one light written
+/// down is one record whichever file it is in. @ref `crate::model`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
 pub struct Lit {
-	/// Which entry of the entity block this belongs to.
+	/// Which entry of the entity block this belongs to, or of the placement
+	/// block in a model.
 	pub thing: u32,
 
 	/// Which shape it throws, as
@@ -1770,7 +1775,9 @@ fn carried_of(data: &SceneData, names: &mut Names) -> Result<Carried> {
 	Ok(Carried {
 		lit: keyed()
 			.filter(|(_, thing)| thing.light.kind.is_lit())
-			.map(|(index, thing)| lit_of(index, thing.light))
+			.map(|(index, thing)| {
+				count(index, "a scene's records").map(|at| lit_of(at, thing.light))
+			})
 			.collect::<Result<Vec<_>>>()?,
 		shed: keyed()
 			.filter(|(_, thing)| thing.emitter.kind.throws())
@@ -2119,9 +2126,13 @@ fn wet_of(index: usize, water: Water) -> Result<Wet> {
 }
 
 /// One light, as the file holds it.
-fn lit_of(index: usize, light: Light) -> Result<Lit> {
-	Ok(Lit {
-		thing: count(index, "a scene's records")?,
+///
+/// @param thing - which entry of the block the record is keyed by: an entity
+/// in a scene, a placement in a model
+/// @param light - the light
+pub(crate) fn lit_of(thing: u32, light: Light) -> Lit {
+	Lit {
+		thing,
 		kind: light.kind.index(),
 		color: light.color.to_array(),
 		intensity: light.intensity,
@@ -2129,7 +2140,7 @@ fn lit_of(index: usize, light: Light) -> Result<Lit> {
 		inner: light.inner,
 		outer: light.outer,
 		flags: if light.shadow { 0 } else { LIT_UNSHADOWED },
-	})
+	}
 }
 
 /// One body, with its names put in the blob.
@@ -2468,7 +2479,12 @@ fn emitter_of(record: &Shed) -> Emitter {
 	}
 }
 
-fn light_of(record: &Lit) -> Light {
+/// The light a record describes.
+///
+/// A kind this build does not know reads as no light, and a flag it does not
+/// know as a property the record does not have - @ref [`Lit::kind`] and
+/// [`LIT_UNSHADOWED`] - in either file the record is in.
+pub(crate) fn light_of(record: &Lit) -> Light {
 	Light {
 		kind: LightKind::at(record.kind).unwrap_or(LightKind::None),
 		color: Vec3::from_array(record.color),

@@ -50,7 +50,7 @@ use std::{
 use colby_core::{
 	Error, Result,
 	abi::{
-		MAX_LEVELS, Transform,
+		Light, MAX_LEVELS, Transform,
 		mesh::{self, MeshData},
 		texture::Texel,
 	},
@@ -401,8 +401,11 @@ pub enum Produced {
 		/// How many materials it declares.
 		materials: usize,
 
-		/// How many pieces of it stand somewhere.
+		/// How many pieces of it stand somewhere, its lamps among them.
 		placements: usize,
+
+		/// How many of those pieces are lamps.
+		lamps: usize,
 	},
 
 	/// Samples.
@@ -925,6 +928,7 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 		.iter()
 		.map(|placement| placement.material.as_str())
 		.collect();
+	let lamps = lit(&imported, &sidecar, &mut warnings);
 	let data = model::ModelData {
 		guided: guide.is_some(),
 		materials: imported
@@ -933,13 +937,14 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 			.map(|surface| described(surface, &stem, &imported, root))
 			.filter(|surface| worn.contains(&surface.name.as_str()))
 			.collect(),
-		placements,
+		placements: placements.into_iter().chain(lamps).collect(),
 	};
 	let produced = Produced::Model {
 		meshes: data
 			.placements
 			.iter()
 			.map(|placement| placement.mesh.as_str())
+			.filter(|mesh| !mesh.is_empty())
 			.collect::<BTreeSet<_>>()
 			.len(),
 		skeletons: imported
@@ -955,6 +960,11 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 		textures: imported.textures.len(),
 		materials: data.materials.len(),
 		placements: data.placements.len(),
+		lamps: data
+			.placements
+			.iter()
+			.filter(|placement| placement.light.kind.is_lit())
+			.count(),
 	};
 	let bytes =
 		model::encode(&data).map_err(|error| err!(Asset("{}: {error}", source.display())))?;
@@ -991,12 +1001,7 @@ fn placed(
 			let piece = imported.meshes.get(placement.mesh)?;
 			let (transform, drift) = sidecar.applied(placement.transform);
 
-			if import::is_sheared(drift) {
-				warnings.push(format!(
-					"{} is sheared by the import transform, by {drift}, and colby places it 					 square",
-					placement.name
-				));
-			}
+			squared(&placement.name, drift, warnings);
 
 			if placement.skeleton.is_some() && !sidecar.is_silent() {
 				warnings.push(format!(
@@ -1023,9 +1028,58 @@ fn placed(
 					.map(|rig| format!("{stem}/{}", rig.name))
 					.unwrap_or_default(),
 				transform,
+				light: Light::NONE,
 			})
 		})
 		.collect()
+}
+
+/// Every lamp of a model that survives its sidecar, where the sidecar puts it.
+///
+/// **Two of the sidecar's answers reach a lamp**: whether to leave it out, by
+/// its name as any piece's is, and where it lands. A sidecar's scale does to a
+/// lamp what a node's does: it moves it, and changes neither its reach nor its
+/// brightness, so a lamp comes out with a scale of one whatever the import
+/// said. Its materials and its levels have nothing to say to a lamp.
+///
+/// @param imported - what the file turned out to hold
+/// @param sidecar - what the file beside it said
+/// @param warnings - where a word about a shear goes
+fn lit(
+	imported: &gltf::Model,
+	sidecar: &import::Import,
+	warnings: &mut Vec<String>,
+) -> Vec<model::Placement> {
+	imported
+		.lamps
+		.iter()
+		.filter(|lamp| sidecar.takes(&lamp.name))
+		.map(|lamp| {
+			let (landed, drift) = sidecar.applied(lamp.transform);
+
+			squared(&lamp.name, drift, warnings);
+
+			model::Placement {
+				name: lamp.name.clone(),
+				transform: Transform { scale: Vec3::ONE, ..landed },
+				light: lamp.light,
+				..model::Placement::default()
+			}
+		})
+		.collect()
+}
+
+/// Says so when the import transform shears a piece.
+///
+/// @param name - the piece
+/// @param drift - how far the sidecar's transform drifted, as `applied` said
+/// @param warnings - where the word goes
+fn squared(name: &str, drift: f32, warnings: &mut Vec<String>) {
+	if import::is_sheared(drift) {
+		warnings.push(format!(
+			"{name} is sheared by the import transform, by {drift}, and colby places it square"
+		));
+	}
 }
 
 /// What one compile hands back: the file, what is in it, and what it dropped.
@@ -3295,6 +3349,15 @@ mod model_tests {
 		let report = run(&dir, false);
 
 		assert_eq!(report.failed.len(), 0, "having none is not a failure: {:?}", report.failed);
+		assert!(
+			matches!(report.compiled[0].produced, Produced::Model {
+				placements: 5,
+				lamps: 0,
+				..
+			}),
+			"five pieces and no lamp among them: {:?}",
+			report.compiled[0].produced
+		);
 
 		let data = compiled(&dir);
 
@@ -3306,6 +3369,108 @@ mod model_tests {
 			Vec3::new(0.5, 1.5, 0.5),
 			"at the scale the file wrote, which is not the identity - so every test below 			 \
 			 that compares against this one is comparing against a real number"
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	/// A model of two lamps and nothing else, as an exporter writes them: a
+	/// spot three units up turned to look straight down, and a point with a
+	/// reach of its own.
+	const LAMPS: &str =
+		"{ \"asset\": { \"version\": \"2.0\" }, \"extensionsUsed\": [ \"KHR_lights_punctual\" \
+		 ], \"extensions\": { \"KHR_lights_punctual\": { \"lights\": [ { \"type\": \"spot\", \
+		 \"intensity\": 2000 }, { \"type\": \"point\", \"intensity\": 500, \"range\": 4 } ] } \
+		 }, \"nodes\": [ { \"name\": \"cone\", \"translation\": [ 0, 3, 0 ], \"rotation\": [ \
+		 -0.70710678, 0, 0, 0.70710678 ], \"extensions\": { \"KHR_lights_punctual\": { \
+		 \"light\": 0 } } }, { \"name\": \"bulb\", \"translation\": [ 1, 1, 0 ], \
+		 \"extensions\": { \"KHR_lights_punctual\": { \"light\": 1 } } } ], \"scenes\": [ { \
+		 \"nodes\": [ 0, 1 ] } ] }";
+
+	#[test]
+	fn a_model_of_lamps_compiles_to_placements_that_shine_and_draw_nothing() {
+		let dir = workspace("lamps");
+
+		put(&dir, "models/lamp.gltf", LAMPS.as_bytes());
+
+		let report = run(&dir, false);
+
+		assert_eq!(
+			report.failed.len(),
+			0,
+			"a model of lamps alone is a model: {:?}",
+			report.failed
+		);
+		assert!(
+			matches!(report.compiled[0].produced, Produced::Model {
+				meshes: 0,
+				placements: 2,
+				lamps: 2,
+				..
+			}),
+			"two lamps and nothing to draw: {:?}",
+			report.compiled[0].produced
+		);
+		assert!(report.compiled[0].warnings.is_empty(), "{:?}", report.compiled[0].warnings);
+
+		let data = compiled(&dir);
+		let cone = &data.placements[0];
+
+		assert_eq!(cone.name, "cone", "named by its node");
+		assert!(cone.mesh.is_empty() && cone.material.is_empty(), "nothing to draw: {cone:?}");
+		assert_eq!(cone.light.kind, colby_core::abi::LightKind::Spot, "and a spot to shine");
+		assert!(
+			(cone.transform.rotation * -Vec3::Z).abs_diff_eq(-Vec3::Y, 1e-6),
+			"turned to look straight down: {cone:?}"
+		);
+		assert_eq!(
+			data.placements[1].light.range.to_bits(),
+			4.0_f32.to_bits(),
+			"and the point keeps the reach the file gave it"
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_sidecar_moves_a_lamp_leaves_one_out_by_name_and_gives_it_no_scale() {
+		let dir = workspace("lamps-guided");
+
+		put(&dir, "models/lamp.gltf", LAMPS.as_bytes());
+		run(&dir, false);
+
+		let before = compiled(&dir);
+
+		guide(
+			&dir,
+			"models/lamp.gltf",
+			r#"{ "position": [0, 10, 0], "scale": [2, 2, 2], "skip": ["bulb"] }"#,
+		);
+
+		let report = run(&dir, false);
+
+		assert_eq!(report.failed.len(), 0, "{:?}", report.failed);
+
+		let after = compiled(&dir);
+
+		assert_eq!(
+			after.placements.len(),
+			1,
+			"the bulb left out by its name, as a piece would be"
+		);
+
+		let cone = &after.placements[0];
+
+		assert!(
+			cone.transform
+				.position
+				.abs_diff_eq(Vec3::new(0.0, 16.0, 0.0), 1e-5),
+			"moved, and its place scaled with everything else: {cone:?}"
+		);
+		assert_eq!(cone.transform.scale, Vec3::ONE, "but with no scale of its own");
+		assert_eq!(
+			cone.light, before.placements[0].light,
+			"and shining what it shone: an import's scale does to a lamp what a node's does"
 		);
 
 		drop(fs::remove_dir_all(&dir));

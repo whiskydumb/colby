@@ -813,7 +813,7 @@ fn opacity(written: Option<&Value>) -> f32 {
 
 /// The first three of three or four numbers, or nothing for a factor the file
 /// did not write whole.
-fn color(written: Option<&Value>) -> Option<Vec3> {
+pub(super) fn color(written: Option<&Value>) -> Option<Vec3> {
 	let cells = written.map(Value::as_array)?;
 
 	if cells.len() < 3 {

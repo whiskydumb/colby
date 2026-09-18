@@ -54,6 +54,7 @@ use crate::{
 
 mod clip;
 mod geometry;
+mod light;
 mod material;
 mod skin;
 #[cfg(test)]
@@ -61,7 +62,7 @@ mod walk;
 
 pub use self::{
 	clip::{Clip, Clips},
-	geometry::{Model, Piece, Placement, import},
+	geometry::{Lamp, Model, Piece, Placement, import},
 	material::{Extracted, Picture, Surface},
 	skin::{Skin, Skins},
 };
@@ -782,11 +783,15 @@ fn check_version(document: &Value) -> Result<()> {
 /// **The three material extensions are read into the material**: the strength
 /// the emitted light is given at, a transform of the pictures' coordinates, and
 /// a surface drawn with no light on it. @ref `material`.
+///
+/// **And the lamps are read into placements of their own**, all but a sun,
+/// which is warned about and left out. @ref `light`.
 pub const READ_EXTENSIONS: &[&str] = &[
 	"KHR_mesh_quantization",
 	"KHR_materials_emissive_strength",
 	"KHR_texture_transform",
 	"KHR_materials_unlit",
+	"KHR_lights_punctual",
 ];
 
 /// Refuses a document that needs something this reader does not have.
@@ -1450,24 +1455,25 @@ mod tests {
 		// was told
 		let text = "{ \"asset\": { \"version\": \"2.0\" }, \"extensionsUsed\": [ \
 		            \"KHR_materials_clearcoat\", \"KHR_texture_transform\", \
-		            \"KHR_lights_punctual\" ] }";
+		            \"KHR_lights_punctual\", \"KHR_materials_sheen\" ] }";
 		let file = read(text).expect("a file that only uses one still reads");
 		let said = unread_extensions(file.document());
 
-		assert_eq!(said.len(), 2, "one line each, and none for the one that is read: {said:?}");
+		assert_eq!(said.len(), 2, "one line each, and none for the two that are read: {said:?}");
 		assert!(
 			said[0].contains("KHR_materials_clearcoat")
-				&& said[1].contains("KHR_lights_punctual"),
+				&& said[1].contains("KHR_materials_sheen"),
 			"each named, in the order the file wrote them: {said:?}"
 		);
 	}
 
 	#[test]
-	fn a_file_that_requires_a_material_extension_colby_reads_is_read() {
+	fn a_file_that_requires_an_extension_colby_reads_is_read() {
 		for named in [
 			"KHR_materials_emissive_strength",
 			"KHR_texture_transform",
 			"KHR_materials_unlit",
+			"KHR_lights_punctual",
 		] {
 			let text = format!(
 				"{{ \"asset\": {{ \"version\": \"2.0\" }}, \"extensionsRequired\": [ \

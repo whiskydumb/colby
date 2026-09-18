@@ -3,18 +3,19 @@
 //! A model is not geometry and holds none. Its meshes are `.cmesh` files and
 //! its pictures are `.ctex` files, written beside it under a directory of its
 //! own name, and every one of them is an asset the engine already knows how to
-//! load. What is left over is the two things nothing else could carry: **what
-//! the file's surfaces are made of**, and **where each piece of it stands**.
-//! That is the whole of this format.
+//! load. What is left over is the three things nothing else could carry: **what
+//! the file's surfaces are made of**, **where each piece of it stands**, and
+//! **what the file's lamps shine**. That is the whole of this format.
 //!
 //! ```text
 //!   0  ModelHeader                      64 bytes
 //!  64  [Coat;  material_count]         100 bytes each
 //!   .  [Stand; placement_count]         56 bytes each
+//!   .  [Lit;   lamp_count]              40 bytes each
 //!   .  the string blob, NUL-separated UTF-8
 //! ```
 //!
-//! Both record blocks are `#[repr(C)]` and cast in place out of an
+//! Every record block is `#[repr(C)]` and cast in place out of an
 //! [`AlignedBytes`](crate::AlignedBytes), the same trick a `.cmesh` uses. Names
 //! cannot be, because they vary in length, so every name in a record is an
 //! offset into one blob of NUL-terminated text at the end of the file. Offset
@@ -33,13 +34,20 @@
 //! importer, because an entity in this engine has no parent to hang a local
 //! transform on - @ref `crate::gltf`. So a game reading this table spawns one
 //! entity per placement and writes the transform it is handed.
+//!
+//! **A lamp is a placement with nothing to draw and a light.** Its light is a
+//! scene's [`Lit`] record keyed by the placement's place in the block, the way
+//! a scene keys it by the entity's: one light written down is one record in
+//! either file, read by the same rules. Nearly every piece of a model shines
+//! nothing, so a block beside the placements costs a model of forty pieces and
+//! two lamps eighty bytes rather than forty bytes a piece.
 
 use std::path::Path;
 
 use colby_core::{
 	Result,
 	abi::{
-		Material as Surface, TextureId, Transform,
+		Light, Material as Surface, TextureId, Transform,
 		material::{Blend, Wrap},
 	},
 	bytemuck::{self, Pod, Zeroable},
@@ -47,16 +55,19 @@ use colby_core::{
 	glam::{Quat, Vec2, Vec3},
 };
 
-use crate::bytes::{AlignedBytes, Names, count, fits, span, width};
+use crate::{
+	bytes::{AlignedBytes, Names, count, fits, span, width},
+	scene::{Lit, light_of, lit_of},
+};
 
 /// The eight bytes every `.cmodel` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYMDL";
 
 /// The revision of everything in this module.
 ///
-/// Bump it whenever the header or either block changes shape. A file carrying a
+/// Bump it whenever the header or a block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// The extension a compiled model is written with.
 pub const EXTENSION: &str = "cmodel";
@@ -148,9 +159,19 @@ pub struct ModelHeader {
 	/// How long the string blob is.
 	pub names_length: u32,
 
+	/// Bytes per lamp record. Must be `size_of::<Lit>()`.
+	pub lit_stride: u32,
+
+	/// How many placements shine something.
+	pub lit_count: u32,
+
+	/// Where the lamp block starts.
+	pub lit_offset: u32,
+
 	/// Spare, so the header is sixty-four bytes and the blocks after it inherit
-	/// the buffer's alignment.
-	pub reserved: [u32; 4],
+	/// the buffer's alignment. The last of four; the lamps took the other
+	/// three.
+	pub reserved: u32,
 }
 
 // the whole point of the spare word is that the blocks after the header
@@ -259,7 +280,8 @@ pub struct Stand {
 	/// Offset into the blob of what this piece is called.
 	pub name: u32,
 
-	/// Offset of the asset name of the mesh that stands here.
+	/// Offset of the asset name of the mesh that stands here, or zero for a
+	/// lamp, whose light is in the lamp block.
 	pub mesh: u32,
 
 	/// Offset of the material's name, or zero for the default one.
@@ -511,7 +533,7 @@ pub struct Placement {
 	/// What this piece is called.
 	pub name: String,
 
-	/// The asset name of the mesh that stands here.
+	/// The asset name of the mesh that stands here, or empty for a lamp.
 	pub mesh: String,
 
 	/// The material's name, or empty for the default one.
@@ -526,6 +548,12 @@ pub struct Placement {
 
 	/// Where it stands, with the whole tree above it already worked in.
 	pub transform: Transform,
+
+	/// What it shines, or [`Light::NONE`] for a piece that is geometry.
+	///
+	/// Written as a [`Lit`] record keyed by this placement's place in the
+	/// block, and only for a light of a kind that shines.
+	pub light: Light,
 }
 
 /// A `.cmodel` held in memory, checked, and ready to be read in place.
@@ -572,6 +600,10 @@ impl ModelFile {
 		self.block(self.header.stand_offset, self.header.stand_count)
 	}
 
+	/// The lamp block, borrowed out of the buffer.
+	#[must_use]
+	pub fn lit(&self) -> &[Lit] { self.block(self.header.lit_offset, self.header.lit_count) }
+
 	/// One name out of the blob.
 	///
 	/// @param offset - what a record stored
@@ -608,8 +640,38 @@ impl ModelFile {
 	/// The one copy in the path, and it is here for the same reason a mesh's
 	/// is: what the host holds can also be built rather than read, and an entry
 	/// that sometimes borrows a file would be two types wearing one name.
+	///
+	/// A lamp record naming a placement the block does not have is dropped,
+	/// the rule a scene's reader has for an entity: a model missing one lamp is
+	/// a better answer than a load that did not happen.
 	#[must_use]
 	pub fn to_model_data(&self) -> ModelData {
+		let mut placements: Vec<Placement> = self
+			.stands()
+			.iter()
+			.map(|stand| Placement {
+				name: self.name(stand.name).to_owned(),
+				mesh: self.name(stand.mesh).to_owned(),
+				material: self.name(stand.material).to_owned(),
+				skeleton: self.name(stand.skeleton).to_owned(),
+				transform: Transform {
+					position: Vec3::from_array(stand.position),
+					rotation: Quat::from_array(stand.rotation),
+					scale: Vec3::from_array(stand.scale),
+				},
+				light: Light::NONE,
+			})
+			.collect();
+
+		for record in self.lit() {
+			if let Some(placement) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|at| placements.get_mut(at))
+			{
+				placement.light = light_of(record);
+			}
+		}
+
 		ModelData {
 			guided: self.header.flags & GUIDED != 0,
 			materials: self
@@ -619,21 +681,7 @@ impl ModelFile {
 					Material::of_coat(coat, self.name(coat.name).to_owned(), |at| self.name(at))
 				})
 				.collect(),
-			placements: self
-				.stands()
-				.iter()
-				.map(|stand| Placement {
-					name: self.name(stand.name).to_owned(),
-					mesh: self.name(stand.mesh).to_owned(),
-					material: self.name(stand.material).to_owned(),
-					skeleton: self.name(stand.skeleton).to_owned(),
-					transform: Transform {
-						position: Vec3::from_array(stand.position),
-						rotation: Quat::from_array(stand.rotation),
-						scale: Vec3::from_array(stand.scale),
-					},
-				})
-				.collect(),
+			placements,
 		}
 	}
 
@@ -687,10 +735,20 @@ pub fn encode(data: &ModelData) -> Result<Vec<u8>> {
 			scale: placement.transform.scale.to_array(),
 		})
 		.collect();
+	let lamps: Vec<Lit> = data
+		.placements
+		.iter()
+		.enumerate()
+		.filter(|(_, placement)| placement.light.kind.is_lit())
+		.map(|(index, placement)| {
+			count(index, "a model's records").map(|at| lit_of(at, placement.light))
+		})
+		.collect::<Result<_>>()?;
 
 	let coat_offset = HEADER_BYTES;
 	let stand_offset = coat_offset + size_of_val(coats.as_slice());
-	let names_offset = stand_offset + size_of_val(stands.as_slice());
+	let lit_offset = stand_offset + size_of_val(stands.as_slice());
+	let names_offset = lit_offset + size_of_val(lamps.as_slice());
 	let header = ModelHeader {
 		magic: MAGIC,
 		version: FORMAT_VERSION,
@@ -703,13 +761,17 @@ pub fn encode(data: &ModelData) -> Result<Vec<u8>> {
 		stand_offset: count(stand_offset, "a model's records")?,
 		names_offset: count(names_offset, "a model's records")?,
 		names_length: count(names.blob().len(), "a model's records")?,
-		reserved: [0; 4],
+		lit_stride: width::<Lit>("a model's records")?,
+		lit_count: count(lamps.len(), "a model's records")?,
+		lit_offset: count(lit_offset, "a model's records")?,
+		reserved: 0,
 	};
 
 	let mut out = Vec::with_capacity(names_offset + names.blob().len());
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::cast_slice(&coats));
 	out.extend_from_slice(bytemuck::cast_slice(&stands));
+	out.extend_from_slice(bytemuck::cast_slice(&lamps));
 	out.extend_from_slice(names.blob());
 
 	Ok(out)
@@ -787,6 +849,7 @@ fn check(bytes: &[u8]) -> std::result::Result<ModelHeader, String> {
 
 	if usize::try_from(header.coat_stride) != Ok(size_of::<Coat>())
 		|| usize::try_from(header.stand_stride) != Ok(size_of::<Stand>())
+		|| usize::try_from(header.lit_stride) != Ok(size_of::<Lit>())
 	{
 		return Err("this model's records are not the size this build reads".to_owned());
 	}
@@ -805,6 +868,10 @@ fn check(bytes: &[u8]) -> std::result::Result<ModelHeader, String> {
 	// line drawn in the other format that has both.
 	unknown_coats(bytes, &header)?;
 	fits::<Stand>(bytes, HEADER_BYTES, (header.stand_offset, header.stand_count), "placements")?;
+	// read by a scene's rules, which look at nothing inside a record: a kind or
+	// a flag this build does not know reads as less light, not as a refusal.
+	// @ref `crate::scene::light_of`.
+	fits::<Lit>(bytes, HEADER_BYTES, (header.lit_offset, header.lit_count), "lamps")?;
 	fits::<u8>(bytes, HEADER_BYTES, (header.names_offset, header.names_length), "names")?;
 
 	Ok(header)
@@ -835,6 +902,8 @@ fn unknown_coats(bytes: &[u8], header: &ModelHeader) -> std::result::Result<(), 
 mod tests {
 	use core::mem::offset_of;
 
+	use colby_core::abi::LightKind;
+
 	use super::*;
 
 	/// Half of a quarter turn, in the two places a unit quaternion holds it.
@@ -859,6 +928,7 @@ mod tests {
 						rotation: Quat::from_xyzw(0.0, TURN, 0.0, TURN),
 						scale: Vec3::new(1.0, 1.0, -1.0),
 					},
+					light: Light::NONE,
 				},
 				Placement {
 					name: "stem".to_owned(),
@@ -866,8 +936,33 @@ mod tests {
 					material: String::new(),
 					skeleton: "models/lamp/rig".to_owned(),
 					transform: Transform::IDENTITY,
+					light: Light::NONE,
+				},
+				Placement {
+					name: "bulb".to_owned(),
+					transform: Transform {
+						position: Vec3::new(0.0, 2.5, 0.0),
+						rotation: Quat::from_xyzw(TURN, 0.0, 0.0, TURN),
+						scale: Vec3::ONE,
+					},
+					light: bulb(),
+					..Placement::default()
 				},
 			],
+		}
+	}
+
+	/// A lamp with every number off the one a light starts with, so that a
+	/// round trip that dropped a field comes back unequal.
+	fn bulb() -> Light {
+		Light {
+			kind: LightKind::Spot,
+			color: Vec3::new(1.0, 0.8, 0.6),
+			intensity: 2.5,
+			range: 7.0,
+			inner: 0.2,
+			outer: 0.5,
+			shadow: false,
 		}
 	}
 
@@ -1006,8 +1101,109 @@ mod tests {
 
 		assert_eq!(usize::try_from(file.header().coat_stride), Ok(size_of::<Coat>()));
 		assert_eq!(usize::try_from(file.header().stand_stride), Ok(size_of::<Stand>()));
-		assert_eq!(file.coats().len(), 2, "and both blocks cast in place");
-		assert_eq!(file.stands().len(), 2);
+		assert_eq!(usize::try_from(file.header().lit_stride), Ok(size_of::<Lit>()));
+		assert_eq!(file.coats().len(), 2, "and every block casts in place");
+		assert_eq!(file.stands().len(), 3, "a lamp among the placements");
+		assert_eq!(file.lit().len(), 1, "and one lamp record, for it alone");
+	}
+
+	#[test]
+	fn a_lamp_is_a_placement_with_nothing_to_draw_and_a_record_keyed_by_it() {
+		let file = round_trip(&sample());
+
+		assert_eq!(file.lit()[0].thing, 2, "keyed by the bulb's place among the placements");
+		assert_eq!(file.stands()[2].mesh, 0, "which names no mesh");
+		assert_eq!(file.to_model_data().placements[2].light, bulb(), "and it shines what it did");
+		assert!(
+			file.to_model_data().placements[..2]
+				.iter()
+				.all(|piece| piece.light == Light::NONE),
+			"while the geometry shines nothing"
+		);
+	}
+
+	#[test]
+	fn the_sample_moves_every_number_a_lamp_has() {
+		// the round trip's argument again, for the lamp record
+		for field in Light::FIELDS {
+			assert!(
+				field.get(&bulb()) != field.get(&Light::NONE),
+				"the bulb leaves {} where a light starts",
+				field.name
+			);
+		}
+	}
+
+	#[test]
+	fn a_model_with_no_lamps_writes_no_lamp_records() {
+		let mut data = sample();
+
+		data.placements.truncate(2);
+
+		let file = round_trip(&data);
+
+		assert_eq!(file.header().lit_count, 0, "nothing shines, so nothing is written down");
+		assert_eq!(file.to_model_data(), data, "and nothing comes back shining");
+	}
+
+	/// Where the bulb's lamp record starts in the sample's bytes.
+	fn bulb_record(bytes: &[u8]) -> usize {
+		let header: ModelHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+
+		usize::try_from(header.lit_offset).expect("an offset")
+	}
+
+	#[test]
+	fn a_lamp_record_naming_a_placement_that_is_not_there_is_dropped() {
+		let mut bytes = encode(&sample()).expect("it writes");
+		let at = bulb_record(&bytes) + offset_of!(Lit, thing);
+
+		bytes[at..at + 4].copy_from_slice(&99_u32.to_le_bytes());
+
+		let read = ModelFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a model missing one lamp still reads")
+			.to_model_data();
+
+		assert!(
+			read.placements
+				.iter()
+				.all(|piece| piece.light == Light::NONE),
+			"and the lamp is the one thing missing"
+		);
+		assert_eq!(read.placements.len(), 3, "its placement still stands");
+	}
+
+	#[test]
+	fn a_lamp_of_a_kind_this_build_does_not_know_reads_as_no_light() {
+		// the scene's rule, because it is the scene's record
+		let mut bytes = encode(&sample()).expect("it writes");
+		let at = bulb_record(&bytes) + offset_of!(Lit, kind);
+
+		bytes[at..at + 4].copy_from_slice(&7_u32.to_le_bytes());
+
+		let read = ModelFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect("a kind is not refused")
+			.to_model_data();
+
+		assert_eq!(read.placements[2].light.kind, LightKind::None);
+	}
+
+	#[test]
+	fn a_lamp_block_the_header_mismeasures_is_refused() {
+		let stride = offset_of!(ModelHeader, lit_stride);
+
+		assert!(corrupt(stride, 99).contains("not the size this build reads"), "a record width");
+
+		let mut bytes = encode(&sample()).expect("it writes");
+		let at = offset_of!(ModelHeader, lit_count);
+
+		bytes[at..at + 4].copy_from_slice(&9999_u32.to_le_bytes());
+
+		let message = ModelFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("it is refused")
+			.to_string();
+
+		assert!(message.contains("lamps run from"), "got {message}");
 	}
 
 	#[test]
