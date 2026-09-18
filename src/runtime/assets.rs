@@ -586,26 +586,12 @@ fn load_scene(world: &mut World, path: &Path, name: &str) {
 	info!(name, slot = id.index(), entities, bodies, joints, "scene loaded");
 }
 
-/// Reads one `.cmodel` into the world's model table, and its materials into
-/// the material table.
-///
-/// **A placement's handles are resolved once and never again, so a name that
-/// is not loaded yet is *reserved* rather than left as nothing.** An empty
-/// entry claims the slot and the real asset overwrites it later; the handle
-/// the placement already carries is right either way, because a registry entry
-/// keeps its slot for the life of the process.
-///
-/// As it happens the walk usually reaches a model's meshes first - a path
-/// sorts by component, and `models/lamp` comes before `models/lamp.cmodel`.
-/// That is luck rather than a rule, and it is not the kind worth depending on:
-/// a mesh that arrives after its model would otherwise leave the model
-/// standing on nothing forever, because nothing re-resolves a placement.
-///
 /// A material a person wrote, registered under its own asset name.
 ///
-/// **The same three lines a model's own materials go through**, which is the
+/// **The one conversion a model's own materials go through**, which is the
 /// whole of why a `.cmat` describes the record a `.cmodel` writes: the two
 /// producers of a material meet here, and neither knows the other exists.
+/// @ref `colby_asset::model::Material::live`.
 ///
 /// A name cannot collide with a model's: a model's are written inside its own
 /// path - `models/lamp/brass` - and this one is the file's, `materials/brass`.
@@ -623,25 +609,34 @@ fn load_material(world: &mut World, path: &Path, name: &str) {
 		},
 	};
 
-	let albedo = reserve_texture(world, &described.albedo);
-	let normal = reserve_texture(world, &described.normal);
-	let id = world.materials.insert(name, Material {
-		base_color: described.base_color,
-		uv_scale: described.uv_scale,
-		wrap: described.wrap,
-		blend: described.blend,
-		opacity: described.opacity,
-		..Material::textured(albedo)
-			.bumped(normal)
-			.finished(described.metallic, described.roughness)
-	});
+	let material = described.live(|picture| reserve_texture(world, picture));
+	let id = world.materials.insert(name, material);
 
 	info!(name, slot = id.index(), "material loaded");
 }
 
+/// Reads one `.cmodel` into the world's model table, and its materials into
+/// the material table.
+///
+/// **A placement's handles are resolved once and never again, so a name that
+/// is not loaded yet is *reserved* rather than left as nothing.** An empty
+/// entry claims the slot and the real asset overwrites it later; the handle
+/// the placement already carries is right either way, because a registry entry
+/// keeps its slot for the life of the process.
+///
+/// As it happens the walk usually reaches a model's meshes first - a path
+/// sorts by component, and `models/lamp` comes before `models/lamp.cmodel`.
+/// That is luck rather than a rule, and it is not the kind worth depending on:
+/// a mesh that arrives after its model would otherwise leave the model
+/// standing on nothing forever, because nothing re-resolves a placement.
+///
 /// A model's materials land in `World::materials` beside the game's own. They
 /// are named inside the model's own path, so nothing a game declares can
 /// collide with one.
+///
+/// @param world - the tables to write
+/// @param path - the `.cmodel` on disk
+/// @param name - the asset name it registers under
 fn load_model(world: &mut World, path: &Path, name: &str) {
 	let data = match ModelFile::open(path) {
 		| Ok(file) => file.to_model_data(),
@@ -653,20 +648,9 @@ fn load_model(world: &mut World, path: &Path, name: &str) {
 	};
 
 	for material in &data.materials {
-		let albedo = reserve_texture(world, &material.albedo);
-		let normal = reserve_texture(world, &material.normal);
+		let live = material.live(|picture| reserve_texture(world, picture));
 
-		// `bumped` is what turns a material with no map into one holding the
-		// flat one, which is the ABI's own rewrite and not this loader's.
-		world.materials.insert(&material.name, Material {
-			base_color: material.base_color,
-			wrap: material.wrap,
-			blend: material.blend,
-			opacity: material.opacity,
-			..Material::textured(albedo)
-				.bumped(normal)
-				.finished(material.metallic, material.roughness)
-		});
+		world.materials.insert(&material.name, live);
 	}
 
 	let placements = data
@@ -1560,6 +1544,78 @@ mod tests {
 			.collect();
 
 		assert_eq!(named, vec!["column", "arm", "arm_mirror", "panel_0", "panel_1"]);
+	}
+
+	#[test]
+	fn a_models_material_arrives_with_every_number_its_file_gave_it() {
+		// a model's materials were copied into the world field by field, and the
+		// copy dropped the tiling - unseen while every model's was one. They go
+		// through the one conversion now, so a file's transform, glow and flag
+		// arrive whole, and its picture is reserved like any other.
+		let (source, output) = trees("model-whole-material");
+		let text = std::str::from_utf8(include_bytes!("../asset/gltf/fixtures/model.gltf"))
+			.expect("the fixture is text")
+			.replace(
+				"\"name\":\"brass\",",
+				"\"name\":\"brass\",\"emissiveFactor\":[1,0.5,0.25],\"extensions\":{\"\
+				 KHR_materials_unlit\":{}},",
+			)
+			.replacen(
+				"\"pbrMetallicRoughness\":{",
+				"\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":1,\"extensions\":{\"\
+				 KHR_texture_transform\":{\"offset\":[0.25,0.5],\"rotation\":0.75,\"scale\":[4,\
+				 2]}}},",
+				1,
+			);
+
+		put(&source, "models/lamp.gltf", &text);
+		put_bytes(
+			&source,
+			"models/model.bin",
+			include_bytes!("../asset/gltf/fixtures/model.bin"),
+		);
+		put_bytes(
+			&source,
+			"models/tiles.png",
+			include_bytes!("../asset/gltf/fixtures/tiles.png"),
+		);
+		put_bytes(
+			&source,
+			"models/tiles_normal.png",
+			include_bytes!("../asset/gltf/fixtures/tiles_normal.png"),
+		);
+
+		let mut world = World::new();
+
+		Assets::at(source, output).sync(&mut world);
+
+		let brass = world
+			.materials
+			.get(world.materials.find("models/lamp/brass"))
+			.copied()
+			.expect("the model's material reached the registry");
+
+		assert!(
+			brass
+				.uv_scale
+				.abs_diff_eq(colby_core::glam::Vec2::new(4.0, 2.0), 1e-6),
+			"the tiling a model's material used to lose: {}",
+			brass.uv_scale
+		);
+		assert!(
+			brass
+				.uv_offset
+				.abs_diff_eq(colby_core::glam::Vec2::new(0.25, 0.5), 1e-6)
+		);
+		assert!((brass.uv_rotation - 0.75).abs() < 1e-6, "and its turn");
+		assert!(
+			brass
+				.emissive
+				.abs_diff_eq(colby_core::glam::Vec3::new(1.0, 0.5, 0.25), 1e-6),
+			"and its glow"
+		);
+		assert!(brass.unlit, "and the flag");
+		assert!(brass.albedo.is_some(), "and its picture, reserved like any other");
 	}
 
 	#[test]

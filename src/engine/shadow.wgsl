@@ -51,10 +51,23 @@ struct InstanceInput {
 
 // The scene's own material group, at group two rather than one, and declared on
 // every pipeline here so that one bind group serves all four. The plain ones do
-// not read it; the normal map at binding two is not read by any of them, and a
-// shader is allowed to use less of a group than the layout declares.
+// not read it; the normal map at binding two and the pictures after it are not
+// read by any of them, and a shader is allowed to use less of a group than the
+// layout declares.
 @group(2) @binding(0) var albedo: texture_2d<f32>;
 @group(2) @binding(1) var surface_sampler: sampler;
+
+// What the material says beyond its instances' four numbers, of which this pass
+// reads the turn and the offset alone: a cutout's holes have to be where its
+// picture's are. The same block as `shader.wgsl`'s, and a test says so.
+struct Finish {
+    glow: vec4<f32>,
+    turn: vec4<f32>,
+    shift: vec4<f32>,
+    flags: vec4<u32>,
+};
+
+@group(2) @binding(10) var<uniform> finish: Finish;
 
 // The same half `shader.wgsl` compares against, and it has to be the same or a
 // fence would cast a shadow with different holes in it than the fence has. A
@@ -110,7 +123,7 @@ fn vertex_masked(vertex: VertexInput, instance: InstanceInput) -> MaskedOutput {
     var output: MaskedOutput;
     output.clip_position =
         cascade.light_view_projection * (model_of(instance) * vec4<f32>(vertex.position, 1.0));
-    output.uv = vertex.uv * instance.surface.zw;
+    output.uv = finish.shift.xy + turned(vertex.uv * instance.surface.zw, finish.turn);
     output.paint_alpha = vertex.paint.a;
 
     return output;
@@ -128,10 +141,17 @@ fn vertex_masked_skinned(
     var output: MaskedOutput;
     output.clip_position =
         cascade.light_view_projection * (model_of(instance) * (posed * vec4<f32>(vertex.position, 1.0)));
-    output.uv = vertex.uv * instance.surface.zw;
+    output.uv = finish.shift.xy + turned(vertex.uv * instance.surface.zw, finish.turn);
     output.paint_alpha = vertex.paint.a;
 
     return output;
+}
+
+// A set of coordinates turned by a material's angle: two rows, `u' = cos u +
+// sin v` and `v' = -sin u + cos v`. @ref `shader.wgsl`, where why it is rows
+// is written out; a test holds the two to one text.
+fn turned(uv: vec2<f32>, turn: vec4<f32>) -> vec2<f32> {
+    return vec2<f32>(turn.x * uv.x + turn.y * uv.y, turn.z * uv.x + turn.w * uv.y);
 }
 
 // The whole of the fragment stage: a texel that is a hole writes no depth.

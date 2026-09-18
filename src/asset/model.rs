@@ -9,7 +9,7 @@
 //!
 //! ```text
 //!   0  ModelHeader                      64 bytes
-//!  64  [Coat;  material_count]          44 bytes each
+//!  64  [Coat;  material_count]         100 bytes each
 //!   .  [Stand; placement_count]         56 bytes each
 //!   .  the string blob, NUL-separated UTF-8
 //! ```
@@ -39,7 +39,7 @@ use std::path::Path;
 use colby_core::{
 	Result,
 	abi::{
-		Transform,
+		Material as Surface, TextureId, Transform,
 		material::{Blend, Wrap},
 	},
 	bytemuck::{self, Pod, Zeroable},
@@ -56,7 +56,7 @@ pub const MAGIC: [u8; 8] = *b"COLBYMDL";
 ///
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// The extension a compiled model is written with.
 pub const EXTENSION: &str = "cmodel";
@@ -74,6 +74,24 @@ pub const GUIDED: u32 = 1 << 0;
 
 /// Every flag bit this build knows.
 const KNOWN_FLAGS: u32 = GUIDED;
+
+/// [`Coat::flags`]: the surface is drawn as its own color, with no light on it.
+pub const UNLIT: u32 = 1 << 0;
+
+/// [`Coat::flags`]: the occlusion picture is read from the second set of
+/// coordinates.
+pub const OCCLUSION_UV2: u32 = 1 << 1;
+
+/// [`Coat::flags`]: the glow picture is read from the second set of coordinates.
+pub const GLOW_UV2: u32 = 1 << 2;
+
+/// Every bit of [`Coat::flags`] this build knows.
+///
+/// **A bit it does not know is refused**, the header's rule rather than the
+/// scene's: every one of these changes how a surface is drawn, so a surface
+/// read without one it carried would be drawn as something it is not, and the
+/// version number has already caught every file this build is older than.
+const KNOWN_COAT_FLAGS: u32 = UNLIT | OCCLUSION_UV2 | GLOW_UV2;
 
 /// How big [`ModelHeader`] is, and where the first block starts.
 pub const HEADER_BYTES: usize = 64;
@@ -145,9 +163,18 @@ const _: () = assert!(
 
 /// What one surface of a model is made of.
 ///
-/// The same numbers `abi::Material` holds, with an offset where each of its two
-/// texture handles goes. Nothing here is a handle because no handle exists
+/// The same numbers `abi::Material` holds, with an offset where each of its
+/// five picture handles goes. Nothing here is a handle because no handle exists
 /// until the host has registered what these names point at.
+///
+/// **The record a `.cmat` writes too**, with its name at nought because a file
+/// of its own is named by its path: one material written down is one record
+/// whichever file it is in. @ref `crate::material`.
+///
+/// The fields after [`uv_scale`](Self::uv_scale) arrived together, with the
+/// rest of the exchange format's material, and are appended rather than put
+/// beside the fields they belong with, so that every offset before them stayed
+/// where it was.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
@@ -161,7 +188,7 @@ pub struct Coat {
 	/// Offset of the normal map's asset name, or zero for none.
 	pub normal: u32,
 
-	/// What happens past the edge of both, as [`Wrap::code`].
+	/// What happens past the edge of every picture, as [`Wrap::code`].
 	pub wrap: u32,
 
 	/// Linear RGB.
@@ -187,11 +214,42 @@ pub struct Coat {
 	/// Added with the `.material` source, and the reason it is here rather
 	/// than only there is that this record is *the* described material - the
 	/// live one has had the field since materials had textures, and two
-	/// described forms of one record is two things to keep in step. What a
-	/// glTF sets it to is one, because the exchange format puts a texture
-	/// transform in an extension nothing here reads yet.
+	/// described forms of one record is two things to keep in step.
 	pub uv_scale: [f32; 2],
+
+	/// Offset of the metal and roughness picture's asset name, or zero for
+	/// none.
+	pub finish: u32,
+
+	/// Offset of the occlusion picture's asset name, or zero for none.
+	pub occlusion: u32,
+
+	/// Offset of the glow picture's asset name, or zero for none.
+	pub glow: u32,
+
+	/// How much of the occlusion picture is applied.
+	pub occlusion_strength: f32,
+
+	/// The light the surface gives off, linear RGB.
+	pub emissive: [f32; 3],
+
+	/// How bright that light is, as a multiplier.
+	pub emissive_strength: f32,
+
+	/// Where the pictures on the first set of coordinates start.
+	pub uv_offset: [f32; 2],
+
+	/// How far they are turned, in radians.
+	pub uv_rotation: f32,
+
+	/// [`UNLIT`], [`OCCLUSION_UV2`] and [`GLOW_UV2`]; a bit this build does
+	/// not know is refused.
+	pub flags: u32,
 }
+
+// a record's size is written into every file's header and checked against
+// this build's, so a field added without meaning to be is caught here first
+const _: () = assert!(size_of::<Coat>() == 100, "a material record is a hundred bytes");
 
 /// One piece of a model standing somewhere.
 #[repr(C)]
@@ -243,6 +301,13 @@ pub struct ModelData {
 }
 
 /// One material, with its pictures named.
+///
+/// **The numbers are the live record's own**: an `abi::Material` whose five
+/// picture handles are left at what its default holds, because no handle exists
+/// until the host has registered what a name points at, and the names beside it
+/// in the five places the handles will go. So a field the live record grows is
+/// a field this form carries without being taught it, and the one thing that
+/// has to know both halves is [`live`](Self::live).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Material {
 	/// What it registers under.
@@ -254,26 +319,190 @@ pub struct Material {
 	/// The normal map's asset name, or empty for none.
 	pub normal: String,
 
-	/// Linear RGB.
-	pub base_color: Vec3,
+	/// The metal and roughness picture's asset name, or empty for none.
+	pub finish: String,
 
-	/// Zero for a dielectric, one for a metal.
-	pub metallic: f32,
+	/// The occlusion picture's asset name, or empty for none.
+	pub occlusion: String,
 
-	/// Nought is as smooth as a surface is drawn, and one is chalk.
-	pub roughness: f32,
+	/// The glow picture's asset name, or empty for none.
+	pub glow: String,
 
-	/// What happens past the edge of its pictures.
-	pub wrap: Wrap,
+	/// Every number, with the five pictures' handles at the default's.
+	pub surface: Surface,
+}
 
-	/// How its alpha is read.
-	pub blend: Blend,
+impl Material {
+	/// The live record this describes, each picture's handle whatever `handle`
+	/// makes of its name.
+	///
+	/// **The one conversion**, and every material on its way into a world goes
+	/// through it: a file somebody wrote, a model's own, and the editor's
+	/// pictures of either. Four copies of it by hand had already dropped a
+	/// field between them - a model's material lost its `uv_scale` on the way
+	/// in - which is what one function is for.
+	///
+	/// @param handle - what a picture's asset name resolves to, asked for the
+	/// albedo, the normal map, the finish, the occlusion and the glow in that
+	/// order, an empty name included
+	/// @return the record, with a normal map that resolves to nothing held as
+	/// the flat one, which is the ABI's own rewrite
+	pub fn live<F>(&self, mut handle: F) -> Surface
+	where
+		F: FnMut(&str) -> TextureId,
+	{
+		let albedo = handle(&self.albedo);
+		let normal = handle(&self.normal);
+		let finish = handle(&self.finish);
+		let occlusion = handle(&self.occlusion);
+		let glow = handle(&self.glow);
 
-	/// How much of the surface there is, where the mode above reads it.
-	pub opacity: f32,
+		Surface {
+			albedo,
+			finish,
+			occlusion,
+			glow,
+			..self.surface
+		}
+		.bumped(normal)
+	}
 
-	/// How many times its textures repeat across the mesh's own `0..1`.
-	pub uv_scale: Vec2,
+	/// A live record written down: its numbers, and its pictures by name.
+	///
+	/// The other way round from [`live`](Self::live), for whatever puts a
+	/// world's material back into a file.
+	///
+	/// @param name - what it registers under
+	/// @param live - the record
+	/// @param named - a picture's asset name, or empty for none
+	#[must_use]
+	pub fn described<F>(name: &str, live: &Surface, mut named: F) -> Self
+	where
+		F: FnMut(TextureId) -> String,
+	{
+		Self {
+			name: name.to_owned(),
+			albedo: named(live.albedo),
+			normal: named(live.normal),
+			finish: named(live.finish),
+			occlusion: named(live.occlusion),
+			glow: named(live.glow),
+			surface: Surface {
+				albedo: Surface::DEFAULT.albedo,
+				normal: Surface::DEFAULT.normal,
+				finish: Surface::DEFAULT.finish,
+				occlusion: Surface::DEFAULT.occlusion,
+				glow: Surface::DEFAULT.glow,
+				..*live
+			},
+		}
+	}
+
+	/// This material as the record a file holds.
+	///
+	/// @param name - where its name went in the file's blob, nought for a
+	/// `.cmat`, whose material is named by its path
+	/// @param names - the blob its pictures' names go into
+	pub(crate) fn coat(&self, name: u32, names: &mut Names) -> Coat {
+		let surface = &self.surface;
+		let flags = [
+			(surface.unlit, UNLIT),
+			(surface.occlusion_uv2, OCCLUSION_UV2),
+			(surface.glow_uv2, GLOW_UV2),
+		]
+		.iter()
+		.filter(|(set, _)| *set)
+		.fold(0, |held, (_, bit)| held | bit);
+
+		Coat {
+			name,
+			albedo: names.put(&self.albedo),
+			normal: names.put(&self.normal),
+			wrap: surface.wrap.code(),
+			base_color: surface.base_color.to_array(),
+			metallic: surface.metallic,
+			roughness: surface.roughness,
+			blend: surface.blend.code(),
+			opacity: surface.opacity,
+			uv_scale: surface.uv_scale.to_array(),
+			finish: names.put(&self.finish),
+			occlusion: names.put(&self.occlusion),
+			glow: names.put(&self.glow),
+			occlusion_strength: surface.occlusion_strength,
+			emissive: surface.emissive.to_array(),
+			emissive_strength: surface.emissive_strength,
+			uv_offset: surface.uv_offset.to_array(),
+			uv_rotation: surface.uv_rotation,
+			flags,
+		}
+	}
+
+	/// The material a file's record describes.
+	///
+	/// A wrap this build has no name for reads as the ordinary one, because
+	/// both of its answers are sensible; a mode or a flag it does not know was
+	/// refused before this was asked, by whichever file the record is in.
+	///
+	/// @param coat - the record
+	/// @param name - what it registers under
+	/// @param named - the text at an offset into the file's blob
+	pub(crate) fn of_coat<'a, F>(coat: &Coat, name: String, named: F) -> Self
+	where
+		F: Fn(u32) -> &'a str,
+	{
+		Self {
+			name,
+			albedo: named(coat.albedo).to_owned(),
+			normal: named(coat.normal).to_owned(),
+			finish: named(coat.finish).to_owned(),
+			occlusion: named(coat.occlusion).to_owned(),
+			glow: named(coat.glow).to_owned(),
+			surface: Surface {
+				base_color: Vec3::from_array(coat.base_color),
+				metallic: coat.metallic,
+				roughness: coat.roughness,
+				occlusion_strength: coat.occlusion_strength,
+				occlusion_uv2: coat.flags & OCCLUSION_UV2 != 0,
+				glow_uv2: coat.flags & GLOW_UV2 != 0,
+				emissive: Vec3::from_array(coat.emissive),
+				emissive_strength: coat.emissive_strength,
+				uv_scale: Vec2::from_array(coat.uv_scale),
+				uv_offset: Vec2::from_array(coat.uv_offset),
+				uv_rotation: coat.uv_rotation,
+				wrap: Wrap::at(coat.wrap).unwrap_or_default(),
+				blend: Blend::from_code(coat.blend).unwrap_or_default(),
+				opacity: coat.opacity,
+				unlit: coat.flags & UNLIT != 0,
+				..Surface::DEFAULT
+			},
+		}
+	}
+}
+
+/// Refuses a record naming an alpha mode or a flag this build does not have.
+///
+/// Asked by both files the record is written into, because both have to refuse
+/// the same records: a code has nothing smaller to fall back to, and a flag
+/// changes how the surface is drawn.
+///
+/// @param coat - the record
+/// @return nothing, or what was wrong with it
+pub(crate) fn unknown_in(coat: &Coat) -> std::result::Result<(), String> {
+	if Blend::from_code(coat.blend).is_none() {
+		return Err(format!(
+			"reads its alpha in mode {}, which this build does not have",
+			coat.blend
+		));
+	}
+
+	if coat.flags & !KNOWN_COAT_FLAGS != 0 {
+		return Err(format!(
+			"uses feature {:#x}, which this build does not",
+			coat.flags & !KNOWN_COAT_FLAGS
+		));
+	}
+
+	Ok(())
 }
 
 /// One piece of a model, and where it stands.
@@ -386,24 +615,8 @@ impl ModelFile {
 			materials: self
 				.coats()
 				.iter()
-				.map(|coat| Material {
-					name: self.name(coat.name).to_owned(),
-					albedo: self.name(coat.albedo).to_owned(),
-					normal: self.name(coat.normal).to_owned(),
-					base_color: Vec3::from_array(coat.base_color),
-					metallic: coat.metallic,
-					roughness: coat.roughness,
-					wrap: if coat.wrap == Wrap::Clamp.code() {
-						Wrap::Clamp
-					} else {
-						Wrap::Repeat
-					},
-					// unwrapped rather than defaulted: `check` refused the file
-					// if any coat named a mode this build does not know, so by
-					// here every one of them resolves.
-					blend: Blend::from_code(coat.blend).unwrap_or_default(),
-					opacity: coat.opacity,
-					uv_scale: Vec2::from_array(coat.uv_scale),
+				.map(|coat| {
+					Material::of_coat(coat, self.name(coat.name).to_owned(), |at| self.name(at))
 				})
 				.collect(),
 			placements: self
@@ -455,17 +668,10 @@ pub fn encode(data: &ModelData) -> Result<Vec<u8>> {
 	let coats: Vec<Coat> = data
 		.materials
 		.iter()
-		.map(|material| Coat {
-			name: names.put(&material.name),
-			albedo: names.put(&material.albedo),
-			normal: names.put(&material.normal),
-			wrap: material.wrap.code(),
-			base_color: material.base_color.to_array(),
-			metallic: material.metallic,
-			roughness: material.roughness,
-			blend: material.blend.code(),
-			opacity: material.opacity,
-			uv_scale: material.uv_scale.to_array(),
+		.map(|material| {
+			let name = names.put(&material.name);
+
+			material.coat(name, &mut names)
 		})
 		.collect();
 	let stands: Vec<Stand> = data
@@ -552,7 +758,6 @@ pub fn flags_of(path: &Path) -> Option<u32> {
 	Some(u32::from_le_bytes(flags))
 }
 
-/// The blob being built, and where each name already in it starts.
 /// Every way a `.cmodel` can be wrong, checked once.
 fn check(bytes: &[u8]) -> std::result::Result<ModelHeader, String> {
 	let head = bytes.get(..HEADER_BYTES).ok_or_else(|| {
@@ -592,25 +797,25 @@ fn check(bytes: &[u8]) -> std::result::Result<ModelHeader, String> {
 
 	fits::<Coat>(bytes, HEADER_BYTES, (header.coat_offset, header.coat_count), "materials")?;
 
-	// the one field in either record that is a *code*, and the only thing here
-	// that has to be looked at rather than measured: a wrap that is not one is
-	// read as the ordinary answer, because it has two values and both are
-	// sensible, while a mode this build does not know has nothing smaller to
-	// fall back to. @ref `colby-scene-format` for the same line drawn in the
-	// other format that has both.
-	unknown_blend(bytes, &header)?;
+	// the one field in either record that is a *code*, and the flags beside it,
+	// are the only things here that have to be looked at rather than measured:
+	// a wrap that is not one is read as the ordinary answer, because it has two
+	// values and both are sensible, while a mode this build does not know has
+	// nothing smaller to fall back to. @ref `colby-scene-format` for the same
+	// line drawn in the other format that has both.
+	unknown_coats(bytes, &header)?;
 	fits::<Stand>(bytes, HEADER_BYTES, (header.stand_offset, header.stand_count), "placements")?;
 	fits::<u8>(bytes, HEADER_BYTES, (header.names_offset, header.names_length), "names")?;
 
 	Ok(header)
 }
 
-/// Refuses a file naming an alpha mode this build does not have.
+/// Refuses a file naming an alpha mode or a flag this build does not have.
 ///
 /// @param bytes - the whole file
 /// @param header - its already-checked header
 /// @return nothing, or which coat named what
-fn unknown_blend(bytes: &[u8], header: &ModelHeader) -> std::result::Result<(), String> {
+fn unknown_coats(bytes: &[u8], header: &ModelHeader) -> std::result::Result<(), String> {
 	let Some(range) = span::<Coat>(header.coat_offset, header.coat_count) else {
 		return Ok(());
 	};
@@ -620,13 +825,7 @@ fn unknown_blend(bytes: &[u8], header: &ModelHeader) -> std::result::Result<(), 
 		.unwrap_or(&[]);
 
 	for (index, coat) in coats.iter().enumerate() {
-		if Blend::from_code(coat.blend).is_none() {
-			return Err(format!(
-				"material {index} of this model reads its alpha in mode {}, which this build \
-				 does not have",
-				coat.blend
-			));
-		}
+		unknown_in(coat).map_err(|what| format!("material {index} of this model {what}"))?;
 	}
 
 	Ok(())
@@ -648,38 +847,7 @@ mod tests {
 			// records: a file written without it and read back as `false`
 			// would still have compared equal to a fixture holding `false`.
 			guided: true,
-			materials: vec![
-				Material {
-					name: "models/lamp/brass".to_owned(),
-					albedo: "models/lamp/tiles".to_owned(),
-					normal: "models/lamp/tiles_normal".to_owned(),
-					base_color: Vec3::new(0.8, 0.6, 0.2),
-					metallic: 1.0,
-					roughness: 0.25,
-					wrap: Wrap::Clamp,
-					// the two below are deliberately different from each other
-					// and from the default in both records: a round trip that
-					// dropped either field, or wrote one material's answer to
-					// both, would come back equal to a fixture where they
-					// matched.
-					blend: Blend::Mask,
-					opacity: 1.0,
-					uv_scale: Vec2::new(4.0, 2.0),
-				},
-				Material {
-					name: "models/lamp/glass".to_owned(),
-					// the same picture, so the blob has one copy of its name
-					albedo: "models/lamp/tiles".to_owned(),
-					normal: String::new(),
-					base_color: Vec3::ONE,
-					metallic: 0.0,
-					roughness: 0.1,
-					wrap: Wrap::Repeat,
-					blend: Blend::Alpha,
-					opacity: 0.35,
-					uv_scale: Vec2::ONE,
-				},
-			],
+			materials: vec![brass(), glass()],
 			placements: vec![
 				Placement {
 					name: "shade".to_owned(),
@@ -700,6 +868,58 @@ mod tests {
 					transform: Transform::IDENTITY,
 				},
 			],
+		}
+	}
+
+	/// A material with every picture named and every number off its default.
+	///
+	/// Its flags and the glass's are deliberately each other's opposites, and
+	/// so are the two alpha modes: a round trip that dropped a field, or wrote
+	/// one material's answer to both, would come back equal to a fixture where
+	/// the two matched.
+	fn brass() -> Material {
+		Material {
+			name: "models/lamp/brass".to_owned(),
+			albedo: "models/lamp/tiles".to_owned(),
+			normal: "models/lamp/tiles_normal".to_owned(),
+			// one picture for both, which is how an exporter packs them
+			finish: "models/lamp/tiles_orm".to_owned(),
+			occlusion: "models/lamp/tiles_orm".to_owned(),
+			glow: "models/lamp/embers".to_owned(),
+			surface: Surface {
+				base_color: Vec3::new(0.8, 0.6, 0.2),
+				metallic: 1.0,
+				roughness: 0.25,
+				occlusion_strength: 0.5,
+				occlusion_uv2: true,
+				emissive: Vec3::new(1.0, 0.5, 0.25),
+				emissive_strength: 3.0,
+				uv_scale: Vec2::new(4.0, 2.0),
+				uv_offset: Vec2::new(0.25, -0.5),
+				uv_rotation: 0.75,
+				wrap: Wrap::Clamp,
+				blend: Blend::Mask,
+				opacity: 1.0,
+				..Surface::DEFAULT
+			},
+		}
+	}
+
+	/// A second material, sharing a picture with the first.
+	fn glass() -> Material {
+		Material {
+			name: "models/lamp/glass".to_owned(),
+			// the same picture, so the blob has one copy of its name
+			albedo: "models/lamp/tiles".to_owned(),
+			surface: Surface {
+				roughness: 0.1,
+				glow_uv2: true,
+				blend: Blend::Alpha,
+				opacity: 0.35,
+				unlit: true,
+				..Surface::DEFAULT
+			},
+			..Material::default()
 		}
 	}
 
@@ -742,7 +962,19 @@ mod tests {
 		let apart: usize =
 			data.materials
 				.iter()
-				.map(|coat| coat.name.len() + coat.albedo.len() + coat.normal.len() + 3)
+				.map(|coat| {
+					[
+						&coat.name,
+						&coat.albedo,
+						&coat.normal,
+						&coat.finish,
+						&coat.occlusion,
+						&coat.glow,
+					]
+					.iter()
+					.map(|name| name.len() + 1)
+					.sum::<usize>()
+				})
 				.chain(data.placements.iter().map(|stand| {
 					stand.name.len()
 						+ stand.mesh.len() + stand.material.len()
@@ -805,7 +1037,7 @@ mod tests {
 		let file =
 			ModelFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("it still reads");
 
-		assert_eq!(file.to_model_data().materials[0].wrap, Wrap::Repeat);
+		assert_eq!(file.to_model_data().materials[0].surface.wrap, Wrap::Repeat);
 	}
 
 	#[test]
@@ -897,5 +1129,110 @@ mod tests {
 		assert_eq!(version_of(&other), None);
 
 		drop(std::fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn the_sample_moves_every_number_a_material_has() {
+		// the round trip can only see a field the fixture moved off its
+		// default: a field the record forgot would come back as the default and
+		// compare equal to a fixture that left it there. So every number of the
+		// live record is off its default in one of the two, and a field the
+		// record grows later fails here until the fixture moves it too.
+		for field in Surface::FIELDS
+			.iter()
+			.filter(|field| !field.kind.is_reference())
+		{
+			assert!(
+				[brass(), glass()]
+					.iter()
+					.any(|material| field.get(&material.surface) != field.get(&Surface::DEFAULT)),
+				"neither material moves {}",
+				field.name
+			);
+		}
+	}
+
+	#[test]
+	fn a_flag_this_build_does_not_know_is_refused() {
+		let mut bytes = encode(&sample()).expect("it writes");
+		let at = HEADER_BYTES + offset_of!(Coat, flags);
+		// the lowest bit nothing has claimed, so this still tests what it says
+		// the day a fourth flag lands
+		let unknown = !KNOWN_COAT_FLAGS & KNOWN_COAT_FLAGS.wrapping_add(1);
+
+		bytes[at..at + 4].copy_from_slice(&unknown.to_le_bytes());
+
+		let refused = ModelFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("a flag nobody here has changes how the surface is drawn");
+
+		assert!(format!("{refused}").contains("feature"), "and it says so: {refused}");
+	}
+
+	/// The handle a test's registry gives a picture: which of `PICTURES` it is,
+	/// past the built-in ones, or nothing.
+	fn handle_of(name: &str) -> TextureId {
+		PICTURES
+			.iter()
+			.position(|known| *known == name)
+			.and_then(|at| u32::try_from(at).ok())
+			.map_or(TextureId::NONE, |at| TextureId::new(at + 10))
+	}
+
+	/// And back: a handle's name, or nothing for none and for the flat
+	/// stand-in.
+	fn name_of(id: TextureId) -> String {
+		usize::try_from(id.index())
+			.ok()
+			.and_then(|at| at.checked_sub(10))
+			.and_then(|at| PICTURES.get(at))
+			.map_or_else(String::new, |name| (*name).to_owned())
+	}
+
+	/// Every picture the two sample materials name.
+	const PICTURES: [&str; 4] = [
+		"models/lamp/tiles",
+		"models/lamp/tiles_normal",
+		"models/lamp/tiles_orm",
+		"models/lamp/embers",
+	];
+
+	#[test]
+	fn the_one_conversion_carries_every_picture_and_every_number() {
+		let brass = brass();
+		let live = brass.live(handle_of);
+
+		assert_eq!(live.albedo, handle_of("models/lamp/tiles"), "the color picture");
+		assert_eq!(live.normal, handle_of("models/lamp/tiles_normal"), "the normal map");
+		assert_eq!(live.finish, handle_of("models/lamp/tiles_orm"), "the finish");
+		assert_eq!(live.occlusion, handle_of("models/lamp/tiles_orm"), "the occlusion");
+		assert_eq!(live.glow, handle_of("models/lamp/embers"), "and the glow");
+
+		for field in Surface::FIELDS
+			.iter()
+			.filter(|field| !field.kind.is_reference())
+		{
+			assert_eq!(
+				field.get(&live),
+				field.get(&brass.surface),
+				"{} came across as it was",
+				field.name
+			);
+		}
+
+		assert_eq!(
+			Material::described(&brass.name, &live, name_of),
+			brass,
+			"and written down again it is the material it was"
+		);
+	}
+
+	#[test]
+	fn a_normal_map_nobody_named_is_the_flat_one_and_is_written_down_as_nothing() {
+		let glass = glass();
+		let live = glass.live(handle_of);
+
+		assert_eq!(live.normal, TextureId::FLAT_NORMAL, "the ABI's own rewrite, not a white one");
+		assert!(!live.finish.is_some(), "and a picture nobody named is nothing");
+		assert_eq!(Material::described(&glass.name, &live, name_of), glass);
 	}
 }

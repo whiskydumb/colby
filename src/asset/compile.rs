@@ -29,12 +29,13 @@
 //!
 //! **One thing here is decided by a file's name rather than by its contents**,
 //! and it is the only such rule in the project: a `.png` whose stem ends in
-//! [`NORMAL_SUFFIX`] is compiled as numbers rather than as a color - @ref
-//! [`texel_of`]. A PNG has no field that could say so, and the alternative is a
-//! manifest beside every texture, which is a parser and a second staleness
-//! input for a question that has one answer per file and never changes. When
-//! materials become assets of their own the declaration moves there and this
-//! rule goes.
+//! [`NORMAL_SUFFIX`] or [`ORM_SUFFIX`] is compiled as numbers rather than as a
+//! color - @ref [`texel_of`]. A PNG has no field that could say so, and the
+//! alternative is a manifest beside every texture, which is a parser and a
+//! second staleness input for a question that has one answer per file and
+//! never changes. A model says what each of its pictures is for, and one whose
+//! name disagrees is copied out of it in the layout its use asks for, so the
+//! rule decides only what a picture that nothing but its name describes is.
 //!
 //! This is a library first. `just assets` runs it through `colby_assetc`, and
 //! the runner calls [`compile_dir`] in-process on a timer - the same code, so
@@ -81,6 +82,16 @@ pub const OUTPUT_DIR: [&str; 2] = [".colby", "assets"];
 /// Matched against the stem, so `tiles_normal.png` is one and `normal_map.png`
 /// is not.
 pub const NORMAL_SUFFIX: &str = "_normal";
+
+/// The other name that does the same, for a picture of how occluded, how rough
+/// and how metal a surface is.
+///
+/// The three letters are its three channels in the order the exchange format
+/// reads them - occlusion in red, roughness in green, metal in blue - which is
+/// also why one picture can be a material's finish and its occlusion at once.
+/// Numbers for the reason a normal map is: an sRGB decode would bend a
+/// roughness of a half into a fifth.
+pub const ORM_SUFFIX: &str = "_orm";
 
 /// The source extensions the compiler knows.
 pub const SOURCE_EXTENSIONS: &[&str] = &[
@@ -357,7 +368,7 @@ pub enum Produced {
 
 	/// A surface: what it is made of, and the pictures it wears.
 	Material {
-		/// How many of its two pictures it names.
+		/// How many of its five pictures it names.
 		textures: usize,
 	},
 
@@ -556,7 +567,7 @@ pub fn asset_name(root: &Path, source: &Path) -> Result<String> {
 ///
 /// The whole of the naming rule, in one place so that there is one place to
 /// look for it and one place to change it. A stem ending in [`NORMAL_SUFFIX`]
-/// is numbers; everything else is a color.
+/// or [`ORM_SUFFIX`] is numbers; everything else is a color.
 ///
 /// @param source - the `.png` being compiled
 /// @return the layout to store and to build the mip chain with
@@ -565,7 +576,7 @@ pub fn texel_of(source: &Path) -> Texel {
 	let named = source
 		.file_stem()
 		.and_then(|stem| stem.to_str())
-		.is_some_and(|stem| stem.ends_with(NORMAL_SUFFIX));
+		.is_some_and(|stem| stem.ends_with(NORMAL_SUFFIX) || stem.ends_with(ORM_SUFFIX));
 
 	if named { Texel::Rgba8Unorm } else { Texel::Rgba8Srgb }
 }
@@ -919,20 +930,7 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 		materials: imported
 			.materials
 			.iter()
-			.map(|surface| model::Material {
-				name: format!("{stem}/{}", surface.name),
-				albedo: picture_name(surface.albedo.as_ref(), &stem, &imported, root),
-				normal: picture_name(surface.normal.as_ref(), &stem, &imported, root),
-				base_color: surface.base_color,
-				metallic: surface.metallic,
-				roughness: surface.roughness,
-				// one, and the exchange format is why: a texture transform
-				// lives in `KHR_texture_transform`, which nothing here reads.
-				uv_scale: colby_core::glam::Vec2::ONE,
-				wrap: surface.wrap,
-				blend: surface.blend,
-				opacity: surface.opacity,
-			})
+			.map(|surface| described(surface, &stem, &imported, root))
 			.filter(|surface| worn.contains(&surface.name.as_str()))
 			.collect(),
 		placements,
@@ -1032,6 +1030,32 @@ fn placed(
 
 /// What one compile hands back: the file, what is in it, and what it dropped.
 type Written = (Vec<u8>, Produced, Vec<String>);
+
+/// One of a model's materials as the record it is written down as.
+///
+/// @param surface - what the importer read
+/// @param stem - the model's own asset name, which its materials are named in
+/// @param imported - the whole import, for the pictures it took out
+/// @param root - the source tree, for a picture that is a file of its own
+fn described(
+	surface: &gltf::Surface,
+	stem: &str,
+	imported: &gltf::Model,
+	root: &Path,
+) -> model::Material {
+	let named =
+		|picture: &Option<gltf::Picture>| picture_name(picture.as_ref(), stem, imported, root);
+
+	model::Material {
+		name: format!("{stem}/{}", surface.name),
+		albedo: named(&surface.albedo),
+		normal: named(&surface.normal),
+		finish: named(&surface.finish),
+		occlusion: named(&surface.occlusion),
+		glow: named(&surface.glow),
+		surface: surface.numbers,
+	}
+}
 
 /// Where one of a model's own assets is written.
 fn beside(directory: &Path, name: &str, extension: &str) -> PathBuf {
@@ -1395,7 +1419,10 @@ fn compile_scene(source: &Path) -> Result<(Vec<u8>, Produced)> {
 fn compile_material(source: &Path) -> Result<(Vec<u8>, Produced)> {
 	let coat = material::import(&fs::read_to_string(source)?)
 		.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
-	let named = usize::from(!coat.albedo.is_empty()) + usize::from(!coat.normal.is_empty());
+	let named = [&coat.albedo, &coat.normal, &coat.finish, &coat.occlusion, &coat.glow]
+		.iter()
+		.filter(|name| !name.is_empty())
+		.count();
 
 	Ok((material::encode(&coat), Produced::Material { textures: named }))
 }
@@ -1908,10 +1935,11 @@ f 1 2 3 4
 		fs::create_dir_all(&textures).expect("the directory");
 		fs::write(textures.join("wall.png"), RGB_QUAD).expect("the color is written");
 		fs::write(textures.join("wall_normal.png"), RGB_QUAD).expect("the normal is written");
+		fs::write(textures.join("wall_orm.png"), RGB_QUAD).expect("the finish is written");
 
 		let report = run(&workspace, false);
 
-		assert!(report.failed.is_empty(), "both compile");
+		assert!(report.failed.is_empty(), "all three compile");
 
 		let texel_of_output = |name: &str| {
 			let compiled = report
@@ -1935,6 +1963,12 @@ f 1 2 3 4
 			texel_of_output("textures/wall_normal"),
 			Texel::Rgba8Unorm.code(),
 			"and one ending in the suffix is numbers"
+		);
+		assert_eq!(
+			texel_of_output("textures/wall_orm"),
+			Texel::Rgba8Unorm.code(),
+			"and so is one of how occluded, rough and metal it is, which an sRGB decode would \
+			 bend"
 		);
 	}
 
@@ -2866,14 +2900,86 @@ mod model_tests {
 
 		assert_eq!(data.materials[0].name, "models/lamp/brass", "the one that was asked");
 		assert_eq!(
-			data.materials[0].blend,
+			data.materials[0].surface.blend,
 			colby_core::abi::material::Blend::Alpha,
 			"and it blends on the far side"
 		);
 		assert_eq!(
-			data.materials[1].blend,
+			data.materials[1].surface.blend,
 			colby_core::abi::material::Blend::Opaque,
 			"while the one beside it, which said nothing, is solid"
+		);
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn the_rest_of_a_models_material_reaches_its_record() {
+		// the seam the alpha mode's test walks, walked for every field the rest
+		// of the exchange format's material brought: a finish picture whose name
+		// says color is worn as a numbers copy written beside the model, an
+		// occlusion picture whose name says numbers is the loose file itself,
+		// and the numbers land where the record keeps them.
+		let dir = workspace("the-rest");
+		let written = std::str::from_utf8(LOOSE).expect("the fixture is text");
+		let asked = written
+			.replace(
+				"\"name\":\"brass\",",
+				"\"name\":\"brass\",\"emissiveFactor\":[1,0.5,0],\"emissiveTexture\":{\"index\":\
+				 1},\"occlusionTexture\":{\"index\":0,\"strength\":0.5},\"extensions\":{\"\
+				 KHR_materials_emissive_strength\":{\"emissiveStrength\":4}},",
+			)
+			.replacen(
+				"\"pbrMetallicRoughness\":{",
+				"\"pbrMetallicRoughness\":{\"metallicRoughnessTexture\":{\"index\":1},",
+				1,
+			);
+
+		assert!(
+			asked.contains("emissiveStrength"),
+			"the lines this test edits are in the fixture"
+		);
+
+		put(&dir, "models/lamp.gltf", asked.as_bytes());
+		put(&dir, "models/model.bin", BUFFER);
+		put(&dir, "models/tiles.png", COLOR);
+		put(&dir, "models/tiles_normal.png", BUMP);
+
+		let report = run(&dir, false);
+
+		assert!(report.failed.is_empty(), "{:?}", report.failed);
+
+		let data = compiled(&dir);
+		let brass = &data.materials[0];
+
+		assert_eq!(
+			brass.finish, "models/lamp/tiles_orm",
+			"a copy, in the layout its use asks for"
+		);
+		assert!(
+			output_root(&dir)
+				.join("models")
+				.join("lamp")
+				.join("tiles_orm.ctex")
+				.is_file(),
+			"written beside the model's meshes"
+		);
+		assert_eq!(
+			brass.occlusion, "models/tiles_normal",
+			"and the loose file itself where its name agrees with its use"
+		);
+		assert_eq!(brass.glow, "models/tiles", "a color picture named as one");
+		assert!(
+			brass
+				.surface
+				.emissive
+				.abs_diff_eq(Vec3::new(1.0, 0.5, 0.0), 1e-6)
+		);
+		assert!((brass.surface.emissive_strength - 4.0).abs() < 1e-6, "its own number");
+		assert!((brass.surface.occlusion_strength - 0.5).abs() < 1e-6);
+		assert!(
+			data.materials[1].finish.is_empty() && data.materials[1].glow.is_empty(),
+			"and the material beside it, which said none of this, names none of it"
 		);
 
 		drop(fs::remove_dir_all(&dir));

@@ -41,7 +41,17 @@
 // surface's own before anything is lit, and an alpha, which multiplies the
 // picture's wherever the picture's is read - the cutout's edge and the pane's
 // see-through alike. A mesh nobody painted reads white and opaque at every
-// vertex, and multiplying by one is the identity.
+// vertex, and multiplying by one is the identity. It may carry a second set of
+// coordinates too, which a material's occlusion and glow may be read from.
+//
+// A material is more than the four numbers an instance carries: a picture of
+// how metal and how rough, one of how much light from everywhere reaches each
+// point, one of where it gives off light and how much, a turn and an offset of
+// its first set of coordinates, and whether it is lit at all. Those are a
+// uniform and three pictures of the material's own group, and every one of
+// them is the identity at a material's default - a white texel multiplies by
+// one, a turn of nought is the coordinates to the bit, and nought given off
+// adds nought - which is what leaves every picture drawn before them the same.
 //
 // The normal a pixel is shaded with is the geometry's, turned by whatever the
 // normal map says. The frame that turn happens in is built per vertex from the
@@ -223,6 +233,50 @@ const SPLIT_SIDE: f32 = 64.0;
 // layout so that the GPU does not bend the directions on the way in.
 @group(1) @binding(2) var normal_map: texture_2d<f32>;
 
+// What a material says beyond the four numbers its instances carry.
+//
+// Matched by `colby_engine::scene::Finish`, and by the same block in
+// `shadow.wgsl`, which reads the turn for a cutout's holes; a test holds the
+// three to one layout.
+struct Finish {
+    // rgb the light the surface gives off, its color already times its
+    // strength; a how much of the occlusion picture is applied.
+    glow: vec4<f32>,
+    // How the first set of coordinates is turned, as two rows: `u' = x u + y v`
+    // and `v' = z u + w v`, which is cos, sin, -sin and cos of the angle.
+    turn: vec4<f32>,
+    // xy where the first set's pictures start, added after the turn; zw unused.
+    shift: vec4<f32>,
+    // x the bits below; the rest unused.
+    flags: vec4<u32>,
+};
+
+// `Finish::flags`: drawn as its own color, with no light on it.
+const UNLIT: u32 = 1u;
+
+// `Finish::flags`: the occlusion picture is read from the second set.
+const OCCLUSION_UV2: u32 = 2u;
+
+// `Finish::flags`: the glow picture is read from the second set.
+const GLOW_UV2: u32 = 4u;
+
+// Seen by the vertex stage too, which turns and moves the coordinates by it.
+// At ten rather than three, because three to nine are the reflections' and the
+// air's, whose passes bind layouts of their own in this group's place.
+@group(1) @binding(10) var<uniform> finish: Finish;
+
+// How metal in blue and how rough in green, multiplying the instance's two
+// numbers: numbers, like the normal map, and the white texel for a material
+// with no picture, which multiplies both by one.
+@group(1) @binding(11) var finish_map: texture_2d<f32>;
+
+// How much of the light arriving from everywhere reaches each point, in red:
+// numbers too.
+@group(1) @binding(12) var occlusion_map: texture_2d<f32>;
+
+// Where the surface gives off light: a color, multiplying `finish.glow`.
+@group(1) @binding(13) var glow_map: texture_2d<f32>;
+
 // One layer per cascade. The comparison sampler answers "is this point behind
 // what the light saw" rather than handing back a depth, and blends the answers
 // rather than the depths - which is why one tap is already soft and why
@@ -242,6 +296,9 @@ struct VertexInput {
     // opaque where nobody painted it. From a buffer of its own, which is why
     // its location follows the skin's rather than the tangent's.
     @location(14) paint: vec4<f32>,
+    // The second set of coordinates, from the same buffer: nought where
+    // nobody laid one out.
+    @location(15) uv2: vec2<f32>,
 };
 
 struct InstanceInput {
@@ -328,6 +385,8 @@ struct VertexOutput {
     // How much of the picture the vertex's paint leaves, which multiplies the
     // picture's own alpha wherever that is read. One where nobody painted it.
     @location(7) paint_alpha: f32,
+    // The second set of coordinates, as the mesh laid it out: nothing moves it.
+    @location(8) uv2: vec2<f32>,
 };
 
 @vertex
@@ -385,12 +444,32 @@ fn place(vertex: VertexInput, instance: InstanceInput, model: mat4x4<f32>) -> Ve
     // reads, where the paint's alpha is the picture's and a cutout reads it too.
     output.tint = vec4<f32>(instance.tint.rgb * vertex.paint.rgb, instance.tint.a);
     output.paint_alpha = vertex.paint.a;
-    output.uv = vertex.uv * instance.surface.zw;
+    // scaled, turned, then moved, which is the exchange format's order
+    output.uv = finish.shift.xy + turned(vertex.uv * instance.surface.zw, finish.turn);
+    output.uv2 = vertex.uv2;
     output.world_position = world_position.xyz;
     output.surface = instance.surface.xy;
     output.flags = instance.skin.z;
 
     return output;
+}
+
+// A set of coordinates turned by a material's angle.
+//
+// **Two rows, not a matrix**: `u' = cos u + sin v` and `v' = -sin u + cos v`,
+// which turns the picture clockwise on a surface whose coordinates start at the
+// picture's top left. That is the sense of the exchange format's own example
+// and of the exporter that writes these files, where the format's code block,
+// read as the column-major matrix it is written as, turns the other way.
+// Written as two sums so that nothing reads which way a matrix is laid out.
+//
+// At an angle of nought this is `1 * u + -0 * v` and `0 * u + 1 * v`, which
+// are `u` and `v` to the bit whether or not a compiler fuses them.
+//
+// **The same text is in `shadow.wgsl`**, whose cutouts have to be turned the
+// way their pictures are, and a test holds the two to one text.
+fn turned(uv: vec2<f32>, turn: vec4<f32>) -> vec2<f32> {
+    return vec2<f32>(turn.x * uv.x + turn.y * uv.y, turn.z * uv.x + turn.w * uv.y);
 }
 
 // The shading normal: the geometry's, turned by the map.
@@ -1498,7 +1577,10 @@ fn fragment_reflections(input: SkyOutput) -> @location(0) vec4<f32> {
     let there = unprojected(place, textureLoad(prepared_depth, place, 0));
     let hit = textureLoad(prepared_surfaces, place, 0);
     let made = textureLoad(prepared_material, place, 0);
-    let surface = Surface(made.rgb, made.a, hit.w, hit.xyz);
+    // the pass before the scene has no room for the material's own occlusion
+    // or for the light it gives off, so a thing seen in a mirror is lit as if
+    // it had neither
+    let surface = Surface(made.rgb, made.a, hit.w, hit.xyz, 1.0, vec3<f32>(0.0));
     let slice = cascade_of(dot(there - globals.eye.xyz, globals.forward.xyz));
     // the share of the sky the thing met sees, read at its own texel: the one
     // texel a frame that asks for no occlusion binds says all of it
@@ -1971,11 +2053,17 @@ fn fragment_haze_apply(input: SkyOutput) -> @location(0) vec4<f32> {
 
 // What one point of a surface is made of, before it is lit: what its own
 // material says, and then whatever the decals over it painted.
+//
+// The last two are the material's alone, and no decal moves them: how much of
+// the light arriving from everywhere reaches the point, and the light it gives
+// off.
 struct Surface {
     color: vec3<f32>,
     metallic: f32,
     roughness: f32,
     normal: vec3<f32>,
+    occlusion: f32,
+    emission: vec3<f32>,
 };
 
 // A surface with every decal over this point painted onto it, in the order the
@@ -2112,12 +2200,21 @@ fn surface_at(input: VertexOutput, sampled: vec4<f32>) -> Surface {
     // together, and whether the decals are asked at all is up to the entity.
     let across = dpdx(input.world_position);
     let down = dpdy(input.world_position);
+    // the channels the exchange format puts them in: metal in blue and
+    // roughness in green, occlusion in red
+    let numbers = textureSample(finish_map, surface_sampler, input.uv);
+    let occluded = textureSample(occlusion_map, surface_sampler, set_of(input, OCCLUSION_UV2)).r;
+    let glowing = textureSample(glow_map, surface_sampler, set_of(input, GLOW_UV2)).rgb;
 
     var surface = Surface(
         input.tint.rgb * sampled.rgb,
-        input.surface.x,
-        input.surface.y,
+        input.surface.x * numbers.b,
+        input.surface.y * numbers.g,
         shading_normal(input),
+        // the exchange format's own arithmetic, which is one at a strength of
+        // nought and the picture at a strength of one
+        1.0 + finish.glow.a * (occluded - 1.0),
+        finish.glow.rgb * glowing,
     );
 
     if ((input.flags & UNDECALED) == 0u) {
@@ -2125,6 +2222,16 @@ fn surface_at(input: VertexOutput, sampled: vec4<f32>) -> Surface {
     }
 
     return surface;
+}
+
+// The coordinates a picture the material may lay out on either set is read at.
+//
+// A select rather than a branch, so that every pixel of a quad samples with
+// the same derivatives whichever set it is.
+//
+// @param bit - which of the two in `finish.flags` says the second set
+fn set_of(input: VertexOutput, bit: u32) -> vec2<f32> {
+    return select(input.uv, input.uv2, (finish.flags.x & bit) != 0u);
 }
 
 // Everything all three entry points do once the albedo has been sampled.
@@ -2138,10 +2245,24 @@ fn surface_at(input: VertexOutput, sampled: vec4<f32>) -> Surface {
 // entry point asks for because glass asks for none: @ref `found_at`
 fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32, found: vec4<f32>) -> vec3<f32> {
     let surface = surface_at(input, sampled);
+
+    // a surface drawn as its own color: no light on it and none given off, and
+    // the fog over it as over everything else. The same over the whole draw,
+    // so the branch costs a picture nothing.
+    if ((finish.flags.x & UNLIT) != 0u) {
+        return fogged(surface.color, input.world_position);
+    }
+
     let towards_eye = normalize(globals.eye.xyz - input.world_position);
     let view_depth = dot(input.world_position - globals.eye.xyz, globals.forward.xyz);
     let slice = cascade_of(view_depth);
-    let color = lit_at(surface, input.world_position, towards_eye, slice, lit, found);
+    // what the surface gives off, after everything that lights it and before
+    // the fog: exposed, bloomed and curved like any other light. Added last,
+    // so that a surface giving off nought is the lit one to the bit.
+    let color = min(
+        lit_at(surface, input.world_position, towards_eye, slice, lit, found) + surface.emission,
+        vec3<f32>(HDR_CEILING),
+    );
 
     if (globals.shadow.w > 0.5) {
         return color * cascade_color(slice);
@@ -2284,7 +2405,15 @@ fn lit_at(
     // holds one: every second factor in the field is a fit to something it
     // does not hold. After the branch rather than inside each side of it, so
     // that both are multiplied by the same thing the same way.
-    indirect *= lit;
+    //
+    // **And the material's own occlusion takes the share's place wherever it
+    // is smaller, rather than multiplying it.** Both are pictures of the same
+    // crease - one baked with the model, one worked out from the frame - and a
+    // product would darken the crease twice. At a material with no occlusion
+    // picture the smaller of the two is the share itself, to the bit.
+    let open = min(lit, surface.occlusion);
+
+    indirect *= open;
 
     // what the reflection found on the picture, in the place of the share of
     // what the environment sends along it that the found light stands for:
@@ -2307,7 +2436,7 @@ fn lit_at(
     // bit - where an add a compiler cannot see is nought, put anywhere else in a
     // sum, may have the add before it fused into its multiply and rounded a hair
     // apart.
-    let mixed = (found.rgb - stand_in * (found.a * lit)) * ambient_specular;
+    let mixed = (found.rgb - stand_in * (found.a * open)) * ambient_specular;
 
     // @ref `HDR_CEILING`: past it a smooth highlight would not fit the target.
     return min(direct + indirect + mixed, vec3<f32>(HDR_CEILING));

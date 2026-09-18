@@ -1501,7 +1501,7 @@ mod tests {
 		// a sun and a lamp too, so that a multiply that reached either would be
 		// in the picture as well
 		let mut world = lit_corner(0.6);
-		let unmultiplied = variant("indirect *= lit;", "");
+		let unmultiplied = variant("indirect *= open;", "");
 
 		for samples in ["1", "4"] {
 			asking(&mut world, samples, "0");

@@ -289,19 +289,97 @@ pub struct Material {
 	/// @ref `colby_asset::compile::NORMAL_SUFFIX` for how a file says so.
 	pub normal: TextureId,
 
+	/// How smooth and how metal the surface is from one point of it to the
+	/// next: a picture whose blue channel multiplies
+	/// [`metallic`](Self::metallic) and whose green multiplies
+	/// [`roughness`](Self::roughness), or [`TextureId::NONE`] for a surface
+	/// that is the same all over.
+	///
+	/// `NONE` samples the white texel, which multiplies both by one, so a
+	/// material with no picture goes through the same shader as one with a
+	/// picture and comes out exactly as its two numbers say. The two channels
+	/// are the ones the exchange format puts them in, which is also what lets
+	/// one picture carry this and [`occlusion`](Self::occlusion) at once. The
+	/// image has to have been compiled as numbers rather than as a color; @ref
+	/// `colby_asset::compile::ORM_SUFFIX` for how a file says so.
+	pub finish: TextureId,
+
+	/// How much of the light arriving from everywhere reaches each point: a
+	/// picture whose red channel is one where nothing is in the way and nought
+	/// where everything is, or [`TextureId::NONE`] for none.
+	///
+	/// **It darkens the ambient term and nothing a sun or a lamp sends**, the
+	/// exchange format's own rule, and it is taken together with the share of
+	/// the sky the frame worked out by the smaller of the two rather than by
+	/// their product: both see the same crease, and multiplying would count it
+	/// twice. Numbers, like the finish.
+	pub occlusion: TextureId,
+
+	/// How much of [`occlusion`](Self::occlusion) is applied, from nought for
+	/// none of it to one for all of it: a point is lit by `1 + strength *
+	/// (picture - 1)` of what arrives from everywhere.
+	pub occlusion_strength: f32,
+
+	/// Whether [`occlusion`](Self::occlusion) is read from the mesh's second
+	/// set of coordinates rather than its first.
+	///
+	/// The second set is what a baked picture is laid out over, and it is never
+	/// moved by [`uv_scale`](Self::uv_scale) or anything beside it: it is one
+	/// unwrap of the whole mesh, not a pattern to repeat.
+	pub occlusion_uv2: bool,
+
+	/// Where the surface gives off light: a color picture multiplied by
+	/// [`emissive`](Self::emissive), or [`TextureId::NONE`] for a surface that
+	/// gives off the same all over.
+	pub glow: TextureId,
+
+	/// Whether [`glow`](Self::glow) is read from the mesh's second set of
+	/// coordinates rather than its first.
+	pub glow_uv2: bool,
+
+	/// The light the surface gives off, linear RGB, before
+	/// [`emissive_strength`](Self::emissive_strength).
+	///
+	/// Added after everything that lights the surface and before the fog, so it
+	/// is exposed, bloomed and curved like any other light. Black gives off
+	/// nothing, which is every material until somebody says otherwise. A white
+	/// surface giving off light at a strength of one is as bright as a white
+	/// one the sun lights square on.
+	pub emissive: Vec3,
+
+	/// How bright [`emissive`](Self::emissive) is, as a plain multiplier.
+	///
+	/// **A number of its own rather than a color past one**, because a color
+	/// row is picked from nought to one, and a lamp's shade, a screen and a
+	/// burning coal differ by more than that.
+	pub emissive_strength: f32,
+
 	/// How many times the texture repeats across the mesh's own `0..1`.
 	///
 	/// Here rather than in the mesh because it is a property of the *surface*:
 	/// the same floor quad is one tile of marble or forty of brick depending on
 	/// what it is made of, and baking that into the geometry would mean a mesh
-	/// per material.
+	/// per material. It moves every picture read from the first set of
+	/// coordinates and none read from the second.
 	pub uv_scale: Vec2,
 
-	/// What happens past the edge of both of its textures.
+	/// Where the pictures on the first set of coordinates start, as a share of
+	/// the picture: added after the scale and the turn.
+	pub uv_offset: Vec2,
+
+	/// How far the pictures on the first set of coordinates are turned, in
+	/// radians, between the scale and the offset.
 	///
-	/// One setting for the pair rather than one each: they are the same surface
-	/// under the same unwrap, and a normal map that tiled differently from the
-	/// color over it would be a bug with no use.
+	/// The exchange format's sense: `u' = cos u + sin v` and `v' = -sin u + cos
+	/// v`, which turns the picture clockwise on a surface whose coordinates
+	/// start at the picture's top left.
+	pub uv_rotation: f32,
+
+	/// What happens past the edge of every one of its pictures.
+	///
+	/// One setting for all of them rather than one each: they are the same
+	/// surface under the same unwrap, and a normal map that tiled differently
+	/// from the color over it would be a bug with no use.
 	pub wrap: Wrap,
 
 	/// How the albedo's alpha is read.
@@ -324,6 +402,16 @@ pub struct Material {
 	/// here, which is what every renderer with an alpha mode does with the
 	/// number in its other modes.
 	pub opacity: f32,
+
+	/// Whether the surface is drawn as its own color alone, with no light on
+	/// it and none given off.
+	///
+	/// What is drawn is the color every other surface is lit from: the
+	/// material's, the entity's, the paint's and the picture's, with the decals
+	/// painted over. The fog is still laid over it. A flag rather than a mode
+	/// beside [`blend`](Self::blend), because it changes the arithmetic of one
+	/// draw and none of the fixed state a pipeline is built with.
+	pub unlit: bool,
 }
 
 impl Material {
@@ -334,10 +422,21 @@ impl Material {
 		roughness: DEFAULT_ROUGHNESS,
 		albedo: TextureId::NONE,
 		normal: TextureId::FLAT_NORMAL,
+		finish: TextureId::NONE,
+		occlusion: TextureId::NONE,
+		occlusion_strength: 1.0,
+		occlusion_uv2: false,
+		glow: TextureId::NONE,
+		glow_uv2: false,
+		emissive: Vec3::ZERO,
+		emissive_strength: 1.0,
 		uv_scale: Vec2::ONE,
+		uv_offset: Vec2::ZERO,
+		uv_rotation: 0.0,
 		wrap: Wrap::Repeat,
 		blend: Blend::Opaque,
 		opacity: 1.0,
+		unlit: false,
 	};
 	/// Its fields, for an inspector, a reader and a writer. @ref
 	/// [`field`](super::field).
@@ -345,7 +444,7 @@ impl Material {
 	/// **The whole record**, unlike every other table in this crate: a
 	/// material has no transform, no handle to itself and no counter the host
 	/// keeps, so there is nothing about it that is a moment rather than a
-	/// thing. The two textures are references, described here and named by
+	/// thing. The five pictures are references, described here and named by
 	/// hand beside the table, exactly as a body's entity is.
 	pub const FIELDS: &[Field<Self>] = &[
 		field!(Color, "base_color", base_color, "the surface's own color, linear RGB"),
@@ -359,10 +458,65 @@ impl Material {
 		field!(Texture, "albedo", albedo, "the color picture, or none for a flat color"),
 		field!(Texture, "normal", normal, "the normal map, or none for a flat surface"),
 		field!(
+			Texture,
+			"finish",
+			finish,
+			"how metal in blue and how rough in green, or none for the two numbers alone"
+		),
+		field!(
+			Texture,
+			"occlusion",
+			occlusion,
+			"how much light from everywhere reaches each point, in red, or none"
+		),
+		field!(
+			Float,
+			"occlusion_strength",
+			occlusion_strength,
+			"how much of the occlusion picture is applied, nought to one"
+		),
+		field!(
+			Bool,
+			"occlusion_uv2",
+			occlusion_uv2,
+			"whether the occlusion is read from the second set of coordinates"
+		),
+		field!(
+			Texture,
+			"glow",
+			glow,
+			"where the surface gives off light, or none for everywhere"
+		),
+		field!(
+			Bool,
+			"glow_uv2",
+			glow_uv2,
+			"whether the glow is read from the second set of coordinates"
+		),
+		field!(Color, "emissive", emissive, "the light the surface gives off, linear RGB"),
+		field!(
+			Float,
+			"emissive_strength",
+			emissive_strength,
+			"how bright the light it gives off is, as a multiplier"
+		),
+		field!(
 			Vec2,
 			"uv_scale",
 			uv_scale,
 			"how many times the textures repeat across the mesh's own nought to one"
+		),
+		field!(
+			Vec2,
+			"uv_offset",
+			uv_offset,
+			"where the pictures on the first set of coordinates start"
+		),
+		field!(
+			Float,
+			"uv_rotation",
+			uv_rotation,
+			"how far the pictures on the first set of coordinates are turned, in radians"
 		),
 		word!(
 			"wrap",
@@ -370,7 +524,7 @@ impl Material {
 			Wrap::WORDS,
 			Wrap::at,
 			Wrap::index,
-			"what happens past the edge of both textures"
+			"what happens past the edge of every picture"
 		),
 		word!(
 			"blend",
@@ -381,6 +535,7 @@ impl Material {
 			"how the albedo's alpha is read"
 		),
 		field!(Float, "opacity", opacity, "how much of the surface there is; alpha mode only"),
+		field!(Bool, "unlit", unlit, "drawn as its own color alone, with no light on it"),
 	];
 	/// What a fluid is drawn as: blue-green, smooth, and half see-through.
 	///
@@ -735,6 +890,7 @@ mod tests {
 			let written = match entry.kind {
 				| Kind::Word(words) =>
 					Value::Word(u32::try_from(words.len()).expect("a short list") - 1),
+				| Kind::Bool => Value::Bool(true),
 				| Kind::Float => Value::Float(0.75),
 				| Kind::Color => Value::Color(Vec3::new(0.25, 0.5, 0.75)),
 				| Kind::Vec2 => Value::Vec2(Vec2::new(3.0, 4.0)),
@@ -754,6 +910,35 @@ mod tests {
 
 		assert_eq!(material.wrap, Wrap::Clamp, "the last word is the last one");
 		assert_eq!(material.blend, Blend::Alpha, "for both of them");
+		assert!(
+			material.unlit && material.occlusion_uv2 && material.glow_uv2,
+			"and every flag took the truth it was handed"
+		);
+	}
+
+	#[test]
+	fn a_material_nobody_configured_gives_off_nothing_and_moves_no_picture() {
+		// every field the rest of the exchange format's material brought is at
+		// the value that changes nothing: the renderer's arithmetic is exact at
+		// these, which is what keeps every picture drawn before them the same.
+		let material = Material::DEFAULT;
+
+		for picture in [material.finish, material.occlusion, material.glow] {
+			assert!(!picture.is_some(), "no picture, which samples the white texel");
+		}
+
+		assert_eq!(material.emissive, Vec3::ZERO, "black gives off nothing");
+		assert!((material.emissive_strength - 1.0).abs() < f32::EPSILON, "at one");
+		assert!(
+			(material.occlusion_strength - 1.0).abs() < f32::EPSILON,
+			"all of an occlusion picture, which is the exchange format's own default"
+		);
+		assert_eq!(material.uv_offset, Vec2::ZERO, "the pictures start where the mesh says");
+		assert!(material.uv_rotation.abs() < f32::EPSILON, "unturned");
+		assert!(
+			!material.unlit && !material.occlusion_uv2 && !material.glow_uv2,
+			"lit, and every picture on the first set"
+		);
 	}
 
 	#[test]

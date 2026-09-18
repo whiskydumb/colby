@@ -472,18 +472,8 @@ fn material(world: &World, project: &Project, name: &str) -> Result {
 		.join(MATERIALS.trim_end_matches('/'))
 		.join(plain(stem)?)
 		.with_extension(material::SOURCE_EXTENSION);
-	let described = colby_asset::model::Material {
-		name: name.to_owned(),
-		albedo: pictured(world, held.albedo),
-		normal: pictured(world, held.normal),
-		base_color: held.base_color,
-		metallic: held.metallic,
-		roughness: held.roughness,
-		wrap: held.wrap,
-		blend: held.blend,
-		opacity: held.opacity,
-		uv_scale: held.uv_scale,
-	};
+	let described =
+		colby_asset::model::Material::described(name, &held, |id| pictured(world, id));
 	let text = material::export(&described)?;
 
 	if let Some(directory) = path.parent() {
@@ -612,7 +602,7 @@ fn blocks(world: &World, project: &Project, name: &str) -> Result {
 /// The directory a bake's meshes live in, under the asset tree.
 pub(crate) const MAPS: &str = "maps/";
 
-/// What to write down for one of a material's two pictures.
+/// What to write down for one of a material's pictures.
 ///
 /// **The built-in stand-in is written as nothing**, and that is the whole
 /// point of this being a function rather than a lookup: a material with no
@@ -767,9 +757,12 @@ mod tests {
 		let text = fs::read_to_string(&path).expect("the file is there");
 		let read = material::import(&text).expect("and reads back");
 
-		assert_eq!(read.base_color, brass.base_color, "the color survives the round trip");
-		assert!((read.metallic - 1.0).abs() < 1.0e-6, "and the metal");
-		assert!((read.roughness - 0.2).abs() < 1.0e-6, "and the roughness");
+		assert_eq!(
+			read.surface.base_color, brass.base_color,
+			"the color survives the round trip"
+		);
+		assert!((read.surface.metallic - 1.0).abs() < 1.0e-6, "and the metal");
+		assert!((read.surface.roughness - 0.2).abs() < 1.0e-6, "and the roughness");
 	}
 
 	#[test]

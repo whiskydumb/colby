@@ -356,11 +356,12 @@ struct Globals {
 
 /// One entity, flattened into what the vertex stage reads.
 ///
-/// The material's numbers ride along per instance rather than living in a
-/// uniform buffer of their own. They are four floats; a buffer per material
-/// would mean a binding per material for the sake of sixteen bytes, and the
-/// bind group that does exist is only there because a texture cannot travel in
-/// a vertex attribute.
+/// The material's first four numbers ride along per instance rather than
+/// living in a uniform buffer of their own: its color, how metal, how rough and
+/// how often its pictures repeat. **The rest of the material is in a uniform
+/// of its own**, a [`Finish`] in the material's group, because those numbers
+/// arrived after every picture before them had been drawn from these, and
+/// leaving these where they were is what keeps those pictures the same.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
@@ -536,14 +537,106 @@ struct Bound {
 
 /// One material's bind group.
 ///
-/// Three things it can go stale for, all unrelated: the material itself
-/// changed, or either of the two textures it names was re-uploaded.
+/// Six things it can go stale for, all unrelated: the material itself
+/// changed, or any of the five pictures it names was re-uploaded.
 struct GpuMaterial {
 	bindings: BindGroup,
 	material_revision: u32,
-	albedo: Bound,
-	normal: Bound,
+	/// The albedo, the normal map, the finish, the occlusion and the glow, in
+	/// that order: the order [`pictures_of`] hands them out in.
+	///
+	/// The buffer the group's uniform is in is not kept beside them: a group
+	/// holds what it binds, the way the cover's levels hold theirs.
+	pictures: [Bound; PICTURES],
 }
+
+/// How many pictures a material names.
+const PICTURES: usize = 5;
+
+/// What a material says beyond the four numbers each instance carries, in a
+/// uniform at binding ten of the material's group.
+///
+/// Read by the vertex stage for the turn and the offset of the first set of
+/// coordinates, and by the fragment stage for the rest. Matched by `Finish` in
+/// `shader.wgsl` and in `shadow.wgsl`; a test holds all three to one layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+struct Finish {
+	/// `[r, g, b, how much of the occlusion picture is applied]`: the light the
+	/// surface gives off, its color already times its strength.
+	glow: [f32; 4],
+	/// `[cos, sin, -sin, cos]` of the turn, read as two rows: `u' = x u + y v`
+	/// and `v' = z u + w v`.
+	turn: [f32; 4],
+	/// `[where the first set starts across, and down, unused, unused]`.
+	shift: [f32; 4],
+	/// `[the bits below, unused, unused, unused]`.
+	flags: [u32; 4],
+}
+
+/// [`Finish::flags`]: drawn as its own color, with no light on it.
+const FINISH_UNLIT: u32 = 1;
+
+/// [`Finish::flags`]: the occlusion picture is read from the second set.
+const FINISH_OCCLUSION_UV2: u32 = 2;
+
+/// [`Finish::flags`]: the glow picture is read from the second set.
+const FINISH_GLOW_UV2: u32 = 4;
+
+impl Finish {
+	/// A material's numbers, the way the shader reads them.
+	///
+	/// **Every one of them is the identity at the material's default**: a glow
+	/// of nought adds nought, a turn of nought multiplies by one and adds a
+	/// nought, which leaves both coordinates as they were to the bit however a
+	/// compiler fuses the two, and an offset of nought adds nought. That is
+	/// what keeps a picture drawn before these existed the same bytes after.
+	///
+	/// @param material - the record
+	fn of(material: &Material) -> Self {
+		let (sin, cos) = material.uv_rotation.sin_cos();
+		let flags = [
+			(material.unlit, FINISH_UNLIT),
+			(material.occlusion_uv2, FINISH_OCCLUSION_UV2),
+			(material.glow_uv2, FINISH_GLOW_UV2),
+		]
+		.iter()
+		.filter(|(set, _)| *set)
+		.fold(0, |held, (_, bit)| held | bit);
+
+		Self {
+			glow: (material.emissive * material.emissive_strength)
+				.extend(material.occlusion_strength)
+				.to_array(),
+			turn: [cos, sin, -sin, cos],
+			shift: [material.uv_offset.x, material.uv_offset.y, 0.0, 0.0],
+			flags: [flags, 0, 0, 0],
+		}
+	}
+}
+
+/// A material's five pictures, in [`GpuMaterial::pictures`]' order.
+fn pictures_of(material: &Material) -> [TextureId; PICTURES] {
+	[
+		material.albedo,
+		material.normal,
+		material.finish,
+		material.occlusion,
+		material.glow,
+	]
+}
+
+/// What each of those falls back to when it has not been uploaded: the flat
+/// normal map for the normal map, and the white texel, which multiplies by one,
+/// for everything else.
+const FALLBACKS: [TextureId; PICTURES] = [
+	TextureId::NONE,
+	TextureId::FLAT_NORMAL,
+	TextureId::NONE,
+	TextureId::NONE,
+	TextureId::NONE,
+];
 
 /// How finely a blended surface's distance is measured before it is sorted.
 ///
@@ -2974,28 +3067,24 @@ impl Scene {
 
 	/// The same, for the bind group each material needs.
 	///
-	/// Rebuilt when the material moved *or* when either texture it names did,
+	/// Rebuilt when the material moved *or* when any picture it names did,
 	/// because a bind group holds a view of one particular texture and
 	/// re-uploading an image makes a new one.
 	fn sync_materials(&mut self, world: &World) {
 		for (slot, entry) in world.materials.iter().enumerate() {
-			let bound = |id| Bound {
+			let pictures = pictures_of(entry.value()).map(|id| Bound {
 				slot: TextureId::index(id),
 				revision: world.textures.get(id).map_or(0, Entry::revision),
-			};
-
-			let (albedo, normal) = (bound(entry.value().albedo), bound(entry.value().normal));
+			});
 			let current = self.materials.get(slot).is_some_and(|uploaded| {
-				uploaded.material_revision == entry.revision()
-					&& uploaded.albedo == albedo
-					&& uploaded.normal == normal
+				uploaded.material_revision == entry.revision() && uploaded.pictures == pictures
 			});
 
 			if current {
 				continue;
 			}
 
-			let Some(uploaded) = self.build_material(entry, albedo, normal) else {
+			let Some(uploaded) = self.build_material(entry, pictures) else {
 				continue;
 			};
 
@@ -3006,63 +3095,81 @@ impl Scene {
 		}
 	}
 
-	/// Builds one material's bind group.
+	/// Builds one material's bind group, and the uniform in it.
 	///
 	/// A material naming a texture that has not been uploaded falls back to the
-	/// texture the *handle it should have held* points at: slot zero for an
-	/// albedo, which is the white texel, and the flat normal map for a normal.
-	/// So a material pointing at nothing draws its own color on a surface that
-	/// is as flat as its geometry, rather than failing to draw.
+	/// texture the *handle it should have held* points at: slot zero for every
+	/// picture but the normal map, which is the white texel, and the flat
+	/// normal map for a normal. So a material pointing at nothing draws its
+	/// own numbers on a surface that is as flat as its geometry, rather than
+	/// failing to draw.
 	fn build_material(
 		&self,
 		entry: &MaterialEntry,
-		albedo: Bound,
-		normal: Bound,
+		pictures: [Bound; PICTURES],
 	) -> Option<GpuMaterial> {
-		let uploaded = |bound: Bound, fallback: u32| {
-			usize::try_from(bound.slot)
-				.ok()
+		// the view of the picture at one place in the list, or of what that place
+		// falls back to
+		let view = |at: usize| {
+			let fallback = FALLBACKS.get(at)?;
+
+			pictures
+				.get(at)
+				.and_then(|bound| usize::try_from(bound.slot).ok())
 				.and_then(|slot| self.textures.get(slot))
 				.or_else(|| {
-					usize::try_from(fallback)
+					usize::try_from(fallback.index())
 						.ok()
 						.and_then(|slot| self.textures.get(slot))
 				})
+				.map(|texture| &texture.view)
 		};
-
-		let color = uploaded(albedo, TextureId::NONE.index())?;
-		let bumps = uploaded(normal, TextureId::FLAT_NORMAL.index())?;
+		let (color, bumps, finish, occlusion, glow) =
+			(view(0)?, view(1)?, view(2)?, view(3)?, view(4)?);
 		let sampler = self
 			.samplers
 			.get(usize::try_from(entry.value().wrap.code()).unwrap_or(0))
 			.or_else(|| self.samplers.first())?;
+		let numbers = self.device.create_buffer(&BufferDescriptor {
+			label: Some("material numbers"),
+			size: size_bytes::<Finish>(1).ok()?,
+			usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+			mapped_at_creation: false,
+		});
 
+		self.queue
+			.write_buffer(&numbers, 0, bytemuck::bytes_of(&Finish::of(entry.value())));
+
+		let picture = |binding, view| BindGroupEntry {
+			binding,
+			resource: BindingResource::TextureView(view),
+		};
 		let bindings = self
 			.device
 			.create_bind_group(&BindGroupDescriptor {
 				label: Some("material"),
 				layout: &self.material_layout,
 				entries: &[
-					BindGroupEntry {
-						binding: 0,
-						resource: BindingResource::TextureView(&color.view),
-					},
+					picture(0, color),
 					BindGroupEntry {
 						binding: 1,
 						resource: BindingResource::Sampler(sampler),
 					},
+					picture(2, bumps),
 					BindGroupEntry {
-						binding: 2,
-						resource: BindingResource::TextureView(&bumps.view),
+						binding: FINISH_NUMBERS,
+						resource: numbers.as_entire_binding(),
 					},
+					picture(FINISH_PICTURE, finish),
+					picture(OCCLUSION_PICTURE, occlusion),
+					picture(GLOW_PICTURE, glow),
 				],
 			});
 
 		Some(GpuMaterial {
 			bindings,
 			material_revision: entry.revision(),
-			albedo,
-			normal,
+			pictures,
 		})
 	}
 
@@ -3859,43 +3966,69 @@ fn decal_sampler(device: &Device) -> Sampler {
 /// creates two layouts, two pipelines, a depth buffer and three tables is a
 /// hundred lines of nothing, and this is the half of it with no logic at all.
 ///
+/// **Bindings three to nine are not here, and that is on purpose**: the passes
+/// that follow reflections and light the air are built out of the same shader
+/// module and bind group layouts of their own in this group's place, at those
+/// numbers, so the material's later entries start at ten and no two layouts are
+/// two names for one slot.
+///
 /// @param device - the device to build against
 fn material_layout(device: &Device) -> BindGroupLayout {
+	let picture = |binding| BindGroupLayoutEntry {
+		binding,
+		visibility: ShaderStages::FRAGMENT,
+		ty: BindingType::Texture {
+			sample_type: TextureSampleType::Float { filterable: true },
+			view_dimension: TextureViewDimension::D2,
+			multisampled: false,
+		},
+		count: None,
+	};
+
 	device.create_bind_group_layout(&BindGroupLayoutDescriptor {
 		label: Some("material"),
 		entries: &[
-			BindGroupLayoutEntry {
-				binding: 0,
-				visibility: ShaderStages::FRAGMENT,
-				ty: BindingType::Texture {
-					sample_type: TextureSampleType::Float { filterable: true },
-					view_dimension: TextureViewDimension::D2,
-					multisampled: false,
-				},
-				count: None,
-			},
+			picture(0),
 			BindGroupLayoutEntry {
 				binding: 1,
 				visibility: ShaderStages::FRAGMENT,
 				ty: BindingType::Sampler(SamplerBindingType::Filtering),
 				count: None,
 			},
-			// the normal map, sampled through the same sampler: it is the
-			// same surface under the same unwrap, so a second one could
-			// only ever disagree with the first.
+			// the normal map, and every picture after it, sampled through the
+			// same sampler: it is the same surface under the same unwrap, so a
+			// second one could only ever disagree with the first.
+			picture(2),
+			// seen by the vertex stage as well, which turns and moves the first
+			// set of coordinates by it
 			BindGroupLayoutEntry {
-				binding: 2,
-				visibility: ShaderStages::FRAGMENT,
-				ty: BindingType::Texture {
-					sample_type: TextureSampleType::Float { filterable: true },
-					view_dimension: TextureViewDimension::D2,
-					multisampled: false,
+				binding: FINISH_NUMBERS,
+				visibility: ShaderStages::VERTEX_FRAGMENT,
+				ty: BindingType::Buffer {
+					ty: BufferBindingType::Uniform,
+					has_dynamic_offset: false,
+					min_binding_size: None,
 				},
 				count: None,
 			},
+			picture(FINISH_PICTURE),
+			picture(OCCLUSION_PICTURE),
+			picture(GLOW_PICTURE),
 		],
 	})
 }
+
+/// Which binding of the material's group its [`Finish`] takes.
+const FINISH_NUMBERS: u32 = 10;
+
+/// Which binding the picture of how metal and how rough takes.
+const FINISH_PICTURE: u32 = 11;
+
+/// Which binding the occlusion picture takes.
+const OCCLUSION_PICTURE: u32 = 12;
+
+/// Which binding the picture of where it gives off light takes.
+const GLOW_PICTURE: u32 = 13;
 
 /// The buffer every frame's [`Globals`] is written into, the uniform at group
 /// nought's first entry.
@@ -5087,6 +5220,71 @@ mod tests {
 		}
 
 		world
+	}
+
+	#[test]
+	fn a_material_nobody_configured_is_the_identity_in_its_uniform() {
+		// what keeps every picture drawn before the uniform existed the same:
+		// nothing given off, a turn of nought, an offset of nought, no flag
+		let finish = Finish::of(&Material::DEFAULT);
+
+		// by their bits, because the identity is only the identity to the bit
+		let bits = |numbers: [f32; 4]| numbers.map(f32::to_bits);
+
+		assert_eq!(
+			bits(finish.glow),
+			bits([0.0, 0.0, 0.0, 1.0]),
+			"black, and all of an occlusion picture"
+		);
+		assert_eq!(bits(finish.turn), bits([1.0, 0.0, -0.0, 1.0]), "cos and sin of nought");
+		assert_eq!(bits(finish.shift), bits([0.0; 4]));
+		assert_eq!(finish.flags, [0; 4]);
+		assert_eq!(size_of::<Finish>(), 64, "four vectors, which is the shaders' block");
+		assert_eq!(
+			[
+				offset_of!(Finish, glow),
+				offset_of!(Finish, turn),
+				offset_of!(Finish, shift),
+				offset_of!(Finish, flags)
+			],
+			[0, 16, 32, 48],
+			"in the shaders' order"
+		);
+	}
+
+	#[test]
+	fn a_materials_uniform_carries_every_number_it_was_given() {
+		let material = Material {
+			emissive: Vec3::new(1.0, 0.5, 0.25),
+			emissive_strength: 4.0,
+			occlusion_strength: 0.75,
+			uv_rotation: core::f32::consts::FRAC_PI_2,
+			uv_offset: colby_core::glam::Vec2::new(0.25, -0.5),
+			..Material::DEFAULT
+		};
+		let finish = Finish::of(&material);
+
+		assert_eq!(
+			finish.glow.map(f32::to_bits),
+			[4.0_f32, 2.0, 1.0, 0.75].map(f32::to_bits),
+			"the color times its strength"
+		);
+		assert!(
+			(finish.turn[0]).abs() < 1e-6
+				&& (finish.turn[1] - 1.0).abs() < 1e-6
+				&& (finish.turn[2] + 1.0).abs() < 1e-6,
+			"cos, sin and minus sin of a quarter turn: {:?}",
+			finish.turn
+		);
+		assert_eq!(finish.shift[..2], [0.25, -0.5]);
+
+		for (material, bit) in [
+			(Material { unlit: true, ..Material::DEFAULT }, FINISH_UNLIT),
+			(Material { occlusion_uv2: true, ..Material::DEFAULT }, FINISH_OCCLUSION_UV2),
+			(Material { glow_uv2: true, ..Material::DEFAULT }, FINISH_GLOW_UV2),
+		] {
+			assert_eq!(Finish::of(&material).flags[0], bit, "each flag its own bit");
+		}
 	}
 
 	#[test]

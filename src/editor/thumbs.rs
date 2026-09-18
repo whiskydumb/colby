@@ -28,7 +28,7 @@ use colby_asset::{
 use colby_core::{
 	Err, Result,
 	abi::{
-		Camera, EntityId, Material, MaterialId, MeshId, Renderable, World,
+		Camera, EntityId, MaterialId, MeshId, Renderable, World,
 		texture::{self, Texel, TextureData},
 	},
 	debug,
@@ -62,8 +62,8 @@ pub(crate) struct Thumbs {
 	/// The compiled tree, for the pictures a material names.
 	///
 	/// A material is the one asset that points at *another* one, and a
-	/// thumbnail world has no loader watching a directory - so the two
-	/// textures are opened by hand, from here.
+	/// thumbnail world has no loader watching a directory - so its pictures
+	/// are opened by hand, from here.
 	compiled: PathBuf,
 
 	/// Every picture handed to egui so far, by asset name.
@@ -236,7 +236,7 @@ impl Thumbs {
 	/// is the one surface that shows a roughness and a metal at every
 	/// angle at once - a flat face shows one highlight or none.
 	///
-	/// The two pictures it may name are opened from the compiled tree by hand.
+	/// The pictures it may name are opened from the compiled tree by hand.
 	/// A material is the only asset that points at another, and a thumbnail
 	/// world has no loader watching a directory; one that cannot be read is
 	/// left out rather than refusing the picture, because a material with a
@@ -251,21 +251,8 @@ impl Thumbs {
 		};
 
 		let described = MaterialFile::open(output)?.to_material(name);
-		let albedo = self.picture_named(&described.albedo);
-		let normal = self.picture_named(&described.normal);
-		let material = self
-			.world
-			.materials
-			.insert(MATERIAL_NAME, Material {
-				base_color: described.base_color,
-				uv_scale: described.uv_scale,
-				wrap: described.wrap,
-				blend: described.blend,
-				opacity: described.opacity,
-				..Material::textured(albedo)
-					.bumped(normal)
-					.finished(described.metallic, described.roughness)
-			});
+		let live = described.live(|picture| self.picture_named(picture));
+		let material = self.world.materials.insert(MATERIAL_NAME, live);
 
 		self.world
 			.entities
@@ -297,7 +284,7 @@ impl Thumbs {
 	/// entity a mesh and a material use draws nothing while this runs.
 	///
 	/// Its meshes and its materials are opened from the compiled tree by
-	/// hand, the way a material's two pictures are, and for the same reason:
+	/// hand, the way a material's pictures are, and for the same reason:
 	/// a thumbnail world has no loader watching a directory. A piece whose
 	/// mesh is not there is left out rather than refusing the picture.
 	///
@@ -456,22 +443,12 @@ impl Thumbs {
 		let Some(described) = described else {
 			return MaterialId::DEFAULT;
 		};
-		let albedo = self.picture_named(&described.albedo);
-		let normal = self.picture_named(&described.normal);
+		let live = described.live(|picture| self.picture_named(picture));
 
-		self.world.materials.insert(name, Material {
-			base_color: described.base_color,
-			uv_scale: described.uv_scale,
-			wrap: described.wrap,
-			blend: described.blend,
-			opacity: described.opacity,
-			..Material::textured(albedo)
-				.bumped(normal)
-				.finished(described.metallic, described.roughness)
-		})
+		self.world.materials.insert(name, live)
 	}
 
-	/// One of a material's two pictures, put in the thumbnail world.
+	/// One of a material's pictures, put in the thumbnail world.
 	///
 	/// @param name - the texture's asset name, or empty for none
 	/// @return its handle, or [`texture::TextureId::NONE`] for a name that is
@@ -677,7 +654,7 @@ mod tests {
 		time::{Duration, SystemTime},
 	};
 
-	use colby_core::abi::mesh;
+	use colby_core::abi::{Material, mesh};
 	use colby_engine::gpu;
 
 	use super::*;
@@ -770,15 +747,13 @@ mod tests {
 	fn brass() -> colby_asset::model::Material {
 		colby_asset::model::Material {
 			name: "materials/brass".to_owned(),
-			albedo: String::new(),
-			normal: String::new(),
-			base_color: Vec3::new(0.85, 0.62, 0.22),
-			metallic: 1.0,
-			roughness: 0.2,
-			wrap: colby_core::abi::material::Wrap::Repeat,
-			blend: colby_core::abi::material::Blend::Opaque,
-			opacity: 1.0,
-			uv_scale: colby_core::glam::Vec2::ONE,
+			surface: Material {
+				base_color: Vec3::new(0.85, 0.62, 0.22),
+				metallic: 1.0,
+				roughness: 0.2,
+				..Material::DEFAULT
+			},
+			..colby_asset::model::Material::default()
 		}
 	}
 
@@ -814,9 +789,12 @@ mod tests {
 		// the same name, another material: the picture has to move, which is
 		// the registry's revision doing for a material what it does for a mesh
 		let pale = colby_asset::model::Material {
-			base_color: Vec3::new(0.15, 0.3, 0.9),
-			metallic: 0.0,
-			roughness: 0.9,
+			surface: Material {
+				base_color: Vec3::new(0.15, 0.3, 0.9),
+				metallic: 0.0,
+				roughness: 0.9,
+				..brass().surface
+			},
 			..brass()
 		};
 		fs::write(&output, colby_asset::material::encode(&pale)).expect("the second file");

@@ -5215,4 +5215,914 @@ f 1 4 5
 			 dome is nobody's idea of a sky"
 		);
 	}
+
+	// ---- the rest of a material: its pictures, its glow, its turn, unlit ----
+
+	/// Sets one of the frame's numbers, declared first the way its pass would.
+	fn asked(world: &mut World, name: &str, value: &str) {
+		world.cvars.var(name, Value::Float(1.0), "");
+		world.cvars.set(name, value);
+	}
+
+	/// A picture of one value all over, stored as numbers.
+	fn numbers_of(texel: [u8; 4]) -> TextureData {
+		TextureData {
+			width: 1,
+			height: 1,
+			faces: 1,
+			texel: Texel::Rgba8Unorm,
+			levels: vec![texel.to_vec()],
+		}
+	}
+
+	/// Eight texels on a side, in a layout, each what `texel` says of its
+	/// column and row.
+	fn eight_by_eight<F>(texel: Texel, of: F) -> TextureData
+	where
+		F: Fn(u8, u8) -> [u8; 4],
+	{
+		TextureData {
+			width: 8,
+			height: 8,
+			faces: 1,
+			texel,
+			levels: vec![
+				(0..8_u8)
+					.flat_map(|row| (0..8_u8).map(move |column| (column, row)))
+					.flat_map(|(column, row)| of(column, row))
+					.collect(),
+			],
+		}
+	}
+
+	/// Red squares on dark ones, as numbers: an occlusion picture of creases.
+	fn creased() -> TextureData {
+		eight_by_eight(Texel::Rgba8Unorm, |column, row| {
+			if (column + row).is_multiple_of(2) {
+				[255, 0, 0, 255]
+			} else {
+				[40, 0, 0, 255]
+			}
+		})
+	}
+
+	/// A picture whose red grows across it and whose green grows down it, so
+	/// that the color that comes back says where a coordinate landed.
+	fn ramps() -> TextureData {
+		eight_by_eight(Texel::Rgba8Srgb, |column, row| [column * 32 + 16, row * 32 + 16, 64, 255])
+	}
+
+	/// Four colors in four quarters: red at the top left, green at the top
+	/// right, blue at the bottom left and white at the bottom right, the top
+	/// being the first row, which is where coordinates start.
+	fn quarters() -> TextureData {
+		eight_by_eight(Texel::Rgba8Srgb, |column, row| match (column < 4, row < 4) {
+			| (true, true) => [255, 0, 0, 255],
+			| (false, true) => [0, 255, 0, 255],
+			| (true, false) => [0, 0, 255, 255],
+			| (false, false) => [255, 255, 255, 255],
+		})
+	}
+
+	/// A world looked at straight down, lit by the light from everywhere alone:
+	/// the sun travels straight up, which lights nothing facing the camera.
+	fn from_above() -> World {
+		let mut world = looking_world();
+		world.clear = Vec3::ZERO;
+		world.ambient = Vec3::splat(0.8);
+		world.light = Vec3::Y;
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+
+		world
+	}
+
+	/// A floor of a mesh and a material filling a square view from above.
+	fn spread(world: &mut World, mesh: MeshId, material: MaterialId) -> EntityId {
+		let across = view_across(world);
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(mesh, material, Vec3::ONE));
+
+		floor
+	}
+
+	/// A world with a ball over a floor, a sun at a slant, the light from
+	/// everywhere and the reflections and the share of the sky both on: every
+	/// path a surface's numbers are read on, in one picture.
+	fn showcase() -> World {
+		let mut world = World::new();
+		plainly(&mut world);
+		world.clear = rgb(0.05, 0.07, 0.11);
+		world.ambient = Vec3::splat(0.35);
+		world.light = Vec3::new(-0.35, -1.0, -0.55).normalize();
+		world.camera.position = Vec3::new(0.0, 2.5, 4.0);
+		world.camera.target = Vec3::new(0.0, 0.6, 0.0);
+
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::ZERO,
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(12.0, 1.0, 12.0),
+		});
+
+		world
+			.entities
+			.set_renderable(floor, Renderable::new(MeshId::QUAD, rgb(0.6, 0.6, 0.58)));
+
+		world
+	}
+
+	/// Stands a ball of a material in the middle of a showcase.
+	fn ball(world: &mut World, material: MaterialId) {
+		let ball = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, 0.8, 0.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::splat(1.4),
+		});
+
+		world
+			.entities
+			.set_renderable(ball, Renderable::of(MeshId::SPHERE, material, Vec3::ONE));
+	}
+
+	/// How far apart two pictures are: the largest difference in any channel
+	/// of any pixel, and how many pixels differ by more than one.
+	fn apart(one: &Image, other: &Image) -> (u8, usize) {
+		one.pixels
+			.chunks(4)
+			.zip(other.pixels.chunks(4))
+			.map(|(left, right)| {
+				left.iter()
+					.zip(right)
+					.map(|(a, b)| a.abs_diff(*b))
+					.max()
+					.unwrap_or(0)
+			})
+			.fold((0, 0), |(worst, many), off| (worst.max(off), many + usize::from(off > 1)))
+	}
+
+	/// A byte of the picture as the light it stands for.
+	fn linear(byte: u8) -> f32 {
+		let fraction = f32::from(byte) / 255.0;
+
+		if fraction <= 0.04045 {
+			fraction / 12.92
+		} else {
+			((fraction + 0.055) / 1.055).powf(2.4)
+		}
+	}
+
+	/// The byte a light comes out as, by the curve every screen reads.
+	fn encoded(light: f32) -> u8 {
+		let curved = if light <= 0.003_130_8 {
+			light * 12.92
+		} else {
+			1.055_f32.mul_add(light.powf(1.0 / 2.4), -0.055)
+		};
+
+		pixel((curved * 255.0).round(), 256.0)
+			.try_into()
+			.unwrap_or(u8::MAX)
+	}
+
+	#[test]
+	fn a_finish_picture_of_one_value_is_the_two_numbers_it_holds() {
+		// blue multiplies how metal the surface is and green how rough, so a
+		// picture holding one value all over draws what a material holding
+		// those two numbers draws - lit by the sun, by the light from
+		// everywhere, in the reflections, which read the roughness the pass
+		// before the scene wrote, and in the share of the sky. The two bytes are
+		// ones a division by 255 and a multiply by its inverse read back as the
+		// same float, which is every way a device turns a byte into a number.
+		let (green, blue) = (89_u8, 130_u8);
+		let (Some(mut first), Some(mut second), Some(mut third)) =
+			(capture(), capture(), capture())
+		else {
+			return;
+		};
+		let color = rgb(0.9, 0.6, 0.3);
+
+		let mut pictured = showcase();
+		let finish = pictured
+			.textures
+			.insert("test/finish", numbers_of([255, green, blue, 255]));
+		let material = pictured
+			.materials
+			.insert("test/finished", Material {
+				base_color: color,
+				metallic: 1.0,
+				roughness: 1.0,
+				finish,
+				..Material::DEFAULT
+			});
+		ball(&mut pictured, material);
+
+		let mut numbered = showcase();
+		let material = numbered
+			.materials
+			.insert("test/finished", Material {
+				base_color: color,
+				metallic: f32::from(blue) / 255.0,
+				roughness: f32::from(green) / 255.0,
+				..Material::DEFAULT
+			});
+		ball(&mut numbered, material);
+
+		let mut bare = showcase();
+		let material = bare.materials.insert("test/finished", Material {
+			base_color: color,
+			metallic: 1.0,
+			roughness: 1.0,
+			..Material::DEFAULT
+		});
+		ball(&mut bare, material);
+
+		let picture = first.shoot(&mut pictured).expect("it renders");
+		let numbers = second.shoot(&mut numbered).expect("it renders");
+		let neither = third.shoot(&mut bare).expect("it renders");
+
+		assert!(picture.pixels == numbers.pixels, "the picture is its two numbers, to the byte");
+		assert!(
+			apart(&picture, &neither).1 > 1000,
+			"and a picture that read nothing would be a picture of a rough metal: {:?}",
+			apart(&picture, &neither)
+		);
+	}
+
+	#[test]
+	fn an_occlusion_picture_at_a_strength_of_nought_is_no_picture() {
+		let (Some(mut first), Some(mut second), Some(mut third)) =
+			(capture(), capture(), capture())
+		else {
+			return;
+		};
+		let shoot = |capture: &mut Capture, strength: Option<f32>| {
+			let mut world = showcase();
+			let occlusion = world.textures.insert("test/creased", creased());
+			let material = world.materials.insert("test/creased", Material {
+				base_color: rgb(0.8, 0.8, 0.8),
+				occlusion: if strength.is_some() { occlusion } else { TextureId::NONE },
+				occlusion_strength: strength.unwrap_or(1.0),
+				..Material::DEFAULT
+			});
+			ball(&mut world, material);
+
+			capture.shoot(&mut world).expect("it renders")
+		};
+
+		let nought = shoot(&mut first, Some(0.0));
+		let none = shoot(&mut second, None);
+		let whole = shoot(&mut third, Some(1.0));
+
+		assert!(
+			nought.pixels == none.pixels,
+			"one plus nought times anything is one, to the byte"
+		);
+		assert!(apart(&whole, &none).1 > 100, "and at a strength of one the creases show");
+	}
+
+	#[test]
+	fn an_occlusion_picture_darkens_the_light_from_everywhere_by_its_own_value() {
+		// the light from everywhere as the only light, and the share of the sky
+		// the frame works out off, so that nothing but the picture occludes: a
+		// picture of a half, at a strength of one, leaves half of it.
+		let (Some(mut first), Some(mut second)) =
+			(capture_of(SQUARE, SQUARE), capture_of(SQUARE, SQUARE))
+		else {
+			return;
+		};
+		let value = 128_u8;
+		let shoot = |capture: &mut Capture, pictured: bool| {
+			let mut world = from_above();
+			asked(&mut world, crate::occlusion::STRENGTH, "0");
+
+			let occlusion = world
+				.textures
+				.insert("test/half", numbers_of([value, 0, 0, 255]));
+			let material = world.materials.insert("test/half", Material {
+				base_color: rgb(0.9, 0.9, 0.9),
+				occlusion: if pictured { occlusion } else { TextureId::NONE },
+				..Material::DEFAULT
+			});
+			spread(&mut world, MeshId::QUAD, material);
+
+			capture.shoot(&mut world).expect("it renders")
+		};
+
+		let dimmed = shoot(&mut first, true);
+		let open = shoot(&mut second, false);
+		let share = f32::from(value) / 255.0;
+
+		for (x, y) in
+			[(SQUARE / 2, SQUARE / 2), (SQUARE / 4, SQUARE / 3), (SQUARE * 3 / 4, SQUARE / 5)]
+		{
+			let (under, over) = (dimmed.pixel(x, y), open.pixel(x, y));
+
+			for channel in 0..3 {
+				let ratio = linear(under[channel]) / linear(over[channel]).max(1e-6);
+
+				assert!(
+					(ratio - share).abs() < 0.015,
+					"at {x},{y} the light from everywhere is {share} of what it was, and is \
+					 {ratio}: {under:?} against {over:?}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn an_occlusion_picture_leaves_what_a_sun_and_a_lamp_send_alone() {
+		// the exchange format's rule: what it darkens is the light arriving
+		// from everywhere, and nothing a light sends. With none of that light
+		// in the world, the picture changes nothing, to the byte.
+		let (Some(mut first), Some(mut second)) = (capture(), capture()) else {
+			return;
+		};
+		let shoot = |capture: &mut Capture, pictured: bool| {
+			let mut world = showcase();
+			world.ambient = Vec3::ZERO;
+
+			let lamp = world
+				.entities
+				.spawn_at(Transform::at(Vec3::new(1.2, 1.6, 1.2)));
+			world
+				.entities
+				.set_light(lamp, colby_core::abi::Light::point(rgb(1.0, 0.8, 0.6), 3.0, 6.0));
+
+			let occlusion = world.textures.insert("test/creased", creased());
+			let material = world.materials.insert("test/creased", Material {
+				occlusion: if pictured { occlusion } else { TextureId::NONE },
+				..Material::DEFAULT
+			});
+			ball(&mut world, material);
+
+			capture.shoot(&mut world).expect("it renders")
+		};
+
+		let pictured = shoot(&mut first, true);
+		let bare = shoot(&mut second, false);
+
+		assert!(pictured.pixels == bare.pixels, "a sun and a lamp are not occluded by it");
+	}
+
+	#[test]
+	fn a_surface_giving_off_light_in_the_dark_is_the_color_it_gives_off() {
+		// nothing lights the floor, so all it sends is what it gives off: which
+		// is what an unlit floor of that color sends whatever lights it, what
+		// half of it at twice the strength sends, and the byte the color is.
+		//
+		// Three colors whose bytes are nowhere near a half: the unlit color
+		// reaches the fragment stage interpolated and the glow out of a uniform,
+		// and a device may part the two by an ulp, which a color at 224.6 - three
+		// quarters - carries across the rounding on one of them.
+		let given = rgb(0.25, 0.328_125, 0.921_875);
+		let mut captures = [(); 4].map(|()| capture_of(SQUARE, SQUARE));
+		let shoot = |capture: &mut Option<Capture>, material: Material| {
+			let mut world = from_above();
+			world.ambient = Vec3::ZERO;
+			let material = world.materials.insert("test/lit", material);
+			spread(&mut world, MeshId::QUAD, material);
+
+			capture
+				.as_mut()
+				.map(|capture| capture.shoot(&mut world).expect("it renders"))
+		};
+
+		let [Some(glowing), Some(doubled), Some(unlit), Some(dark)] = [
+			shoot(&mut captures[0], Material {
+				base_color: Vec3::ZERO,
+				emissive: given,
+				..Material::DEFAULT
+			}),
+			shoot(&mut captures[1], Material {
+				base_color: Vec3::ZERO,
+				emissive: given * 0.5,
+				emissive_strength: 2.0,
+				..Material::DEFAULT
+			}),
+			shoot(&mut captures[2], Material {
+				base_color: given,
+				unlit: true,
+				..Material::DEFAULT
+			}),
+			shoot(&mut captures[3], Material {
+				base_color: Vec3::ZERO,
+				..Material::DEFAULT
+			}),
+		] else {
+			return;
+		};
+
+		assert!(glowing.pixels == unlit.pixels, "the light it gives off is its color, unlit");
+		assert!(glowing.pixels == doubled.pixels, "and the strength multiplies the color");
+		assert_ne!(glowing.pixel(SQUARE / 2, SQUARE / 2), dark.pixel(SQUARE / 2, SQUARE / 2));
+
+		let middle = glowing.pixel(SQUARE / 2, SQUARE / 2);
+
+		for (channel, light) in given.to_array().into_iter().enumerate() {
+			assert!(
+				middle[channel].abs_diff(encoded(light)) <= 1,
+				"channel {channel} is the byte {light} is, {} against {}",
+				middle[channel],
+				encoded(light)
+			);
+		}
+
+		// and in a fog: the light it gives off is fogged as the unlit color is,
+		// because both go into the one fog, after everything that lights them
+		let fogged = |material: Material| {
+			let mut capture = capture_of(SQUARE, SQUARE)?;
+			let mut world = from_above();
+			world.ambient = Vec3::ZERO;
+			world.post.fog = rgb(0.3, 0.4, 0.5);
+			world.post.fog_density = 0.15;
+			let material = world.materials.insert("test/fogged", material);
+			spread(&mut world, MeshId::QUAD, material);
+
+			Some(capture.shoot(&mut world).expect("it renders"))
+		};
+		let (Some(glowing), Some(unlit)) = (
+			fogged(Material {
+				base_color: Vec3::ZERO,
+				emissive: given,
+				..Material::DEFAULT
+			}),
+			fogged(Material {
+				base_color: given,
+				unlit: true,
+				..Material::DEFAULT
+			}),
+		) else {
+			return;
+		};
+
+		// within a level rather than to the byte: the fog puts every pixel at a
+		// value of its own, and at one of them the ulp the two may part by lands
+		// on a rounding
+		let (worst, _) = apart(&glowing, &unlit);
+
+		assert!(worst <= 1, "and in a fog, fogged alike: {worst}");
+		assert!(
+			glowing.pixel(SQUARE / 2, SQUARE / 2)[0].abs_diff(encoded(given.x)) > 3,
+			"by a fog thick enough to move the byte"
+		);
+	}
+
+	#[test]
+	fn the_share_of_the_sky_and_an_occlusion_picture_are_taken_by_the_smaller() {
+		// both are pictures of the same crease: where the frame's share is the
+		// smaller, a floor under an occlusion picture is the floor without one,
+		// and where the picture is, it is the floor with the share off, to the
+		// byte. A product would be darker than both under every crease.
+		let shoot = |share: bool, pictured: bool| {
+			let mut capture = capture()?;
+			let mut world = showcase();
+			asked(&mut world, crate::occlusion::STRENGTH, if share { "1" } else { "0" });
+			// one sample a pixel: at four, a pixel on the ball's edge mixes the
+			// ball, lit with the share in one picture and without it in the
+			// other, with the floor, and is rightly neither
+			asked(&mut world, MSAA, "1");
+
+			let occlusion = world
+				.textures
+				.insert("test/three-quarters", numbers_of([191, 0, 0, 255]));
+			let floor = world.materials.insert("test/floor", Material {
+				base_color: rgb(0.6, 0.6, 0.58),
+				occlusion: if pictured { occlusion } else { TextureId::NONE },
+				..Material::DEFAULT
+			});
+			let first = world.entities.iter().map(|(id, ..)| id).next();
+
+			if let Some(id) = first {
+				world
+					.entities
+					.set_renderable(id, Renderable::of(MeshId::QUAD, floor, Vec3::ONE));
+			}
+
+			// sitting on the floor rather than over it, for a crease at its foot
+			let ball = world.entities.spawn_at(Transform {
+				position: Vec3::new(0.0, 0.7, 0.0),
+				rotation: Quat::IDENTITY,
+				scale: Vec3::splat(1.4),
+			});
+
+			world
+				.entities
+				.set_renderable(ball, Renderable::new(MeshId::SPHERE, Vec3::ONE));
+
+			Some(capture.shoot(&mut world).expect("it renders"))
+		};
+		let (Some(both), Some(share), Some(picture)) =
+			(shoot(true, true), shoot(true, false), shoot(false, true))
+		else {
+			return;
+		};
+		let mut taken = (0, 0);
+
+		for ((one, left), right) in both
+			.pixels
+			.chunks(4)
+			.zip(share.pixels.chunks(4))
+			.zip(picture.pixels.chunks(4))
+		{
+			if one == left {
+				taken.0 += 1;
+			} else {
+				assert_eq!(one, right, "a pixel is the share's or the picture's, not darker");
+				taken.1 += 1;
+			}
+		}
+
+		assert!(taken.1 > 1000, "the picture is the smaller over the open floor: {taken:?}");
+		assert!(
+			apart(&both, &picture).1 > 100,
+			"and the share the smaller at the ball's foot, over enough of it to see: {taken:?}"
+		);
+	}
+
+	#[test]
+	fn an_unlit_surface_is_its_color_whatever_lights_it() {
+		// a ball against nothing: lit by a sun, a lamp and the light from
+		// everywhere, or by none of them, it is the same bytes, and those are
+		// its color's.
+		let color = rgb(0.2, 0.6, 0.35);
+		let (Some(mut first), Some(mut second)) = (capture(), capture()) else {
+			return;
+		};
+		let shoot = |capture: &mut Capture, lit: bool| {
+			let mut world = looking_world();
+			world.clear = Vec3::ZERO;
+			world.ambient = if lit { Vec3::splat(0.7) } else { Vec3::ZERO };
+			world.light = if lit { Vec3::NEG_Z } else { Vec3::Z };
+
+			if lit {
+				let lamp = world
+					.entities
+					.spawn_at(Transform::at(Vec3::new(0.6, 0.6, 1.5)));
+
+				world
+					.entities
+					.set_light(lamp, colby_core::abi::Light::point(Vec3::ONE, 4.0, 5.0));
+			}
+
+			let material = world.materials.insert("test/unlit", Material {
+				base_color: color,
+				unlit: true,
+				..Material::DEFAULT
+			});
+			let ball = world.entities.spawn_at(Transform::IDENTITY);
+
+			world
+				.entities
+				.set_renderable(ball, Renderable::of(MeshId::SPHERE, material, Vec3::ONE));
+
+			capture.shoot(&mut world).expect("it renders")
+		};
+
+		let lit = shoot(&mut first, true);
+		let dark = shoot(&mut second, false);
+		let middle = lit.pixel(SIZE.0 / 2, SIZE.1 / 2);
+
+		assert!(lit.pixels == dark.pixels, "no light reaches it and none is needed");
+
+		for (channel, light) in color.to_array().into_iter().enumerate() {
+			assert!(
+				middle[channel].abs_diff(encoded(light)) <= 1,
+				"channel {channel} is the byte {light} is, {} against {}",
+				middle[channel],
+				encoded(light)
+			);
+		}
+	}
+
+	/// A floor of a picture, looked at from above, its coordinates moved by a
+	/// material and by nothing else.
+	fn moved_floor(picture: TextureData, material: Material, mesh: MeshData) -> Option<Image> {
+		let mut capture = capture_of(SQUARE, SQUARE)?;
+		let mut world = from_above();
+		world.ambient = Vec3::ONE;
+
+		let albedo = world.textures.insert("test/moved", picture);
+		let mesh = world.meshes.insert("test/moved", mesh);
+		let material = world
+			.materials
+			.insert("test/moved", Material { albedo, ..material });
+		spread(&mut world, mesh, material);
+
+		Some(capture.shoot(&mut world).expect("it renders"))
+	}
+
+	#[test]
+	fn the_exchange_formats_own_example_shows_the_lower_left_quarter() {
+		// the specification's example: an offset of nought and one, a turn of a
+		// quarter and a scale of a half "utilizes only the lower left quadrant
+		// of the source image, rotated clockwise". Turned the other way the same
+		// numbers show the top right quarter, which is what the specification's
+		// own matrix read as it is written would do; this is the oracle that
+		// decides between the two.
+		let turn = core::f32::consts::FRAC_PI_2;
+		let example = |rotation: f32| {
+			moved_floor(
+				quarters(),
+				Material {
+					uv_offset: Vec2::new(0.0, 1.0),
+					uv_rotation: rotation,
+					uv_scale: Vec2::splat(0.5),
+					..Material::DEFAULT
+				},
+				mesh::quad(),
+			)
+		};
+		let (Some(asked), Some(other)) = (example(turn), example(-turn)) else {
+			return;
+		};
+
+		// by which channel is largest rather than by the byte: the light from
+		// everywhere sends a little of every color back off any surface
+		for x in (SQUARE / 5..SQUARE * 4 / 5).step_by(16) {
+			for y in (SQUARE / 5..SQUARE * 4 / 5).step_by(16) {
+				assert_eq!(dominant(asked.pixel(x, y)), 2, "blue at {x},{y}, the bottom left");
+				assert_eq!(dominant(other.pixel(x, y)), 1, "and green turned the other way");
+			}
+		}
+	}
+
+	/// Coordinates scaled, turned and moved on the way in, the three things the
+	/// shader does to them on the way through: the exchange format's order and
+	/// its sense of a turn.
+	fn turned_by_hand(uv: Vec2, scale: Vec2, rotation: f32, offset: Vec2) -> Vec2 {
+		let (sin, cos) = rotation.sin_cos();
+		let scaled = uv * scale;
+
+		offset
+			+ Vec2::new(
+				sin.mul_add(scaled.y, cos * scaled.x),
+				cos.mul_add(scaled.y, -sin * scaled.x),
+			)
+	}
+
+	/// The same grid with its coordinates moved on the way in.
+	fn grid_moved<F>(side: u16, moved: F) -> MeshData
+	where
+		F: Fn(Vec2) -> Vec2,
+	{
+		let mut data = grid(side);
+
+		// after the tangents, which stay the unmoved grid's, so that the two
+		// floors differ in their coordinates and in nothing else
+		for vertex in &mut data.vertices {
+			vertex.uv = moved(Vec2::from_array(vertex.uv)).to_array();
+		}
+
+		data
+	}
+
+	#[test]
+	fn a_turned_picture_is_the_picture_with_its_coordinates_turned_by_hand() {
+		// scaled, turned, then moved, in the shader, against a mesh whose
+		// coordinates were put through the same three on the way in: the two
+		// sums round a hair apart, and that is all, where the same numbers
+		// turned the other way are another picture.
+		// a stretch of 1.3 against 0.7: at 1.5 against 0.75 the two floors part by
+		// two levels at one pixel under one of the two APIs, on the steepest step
+		// of the ramp, and this one parts by one at most under both
+		let (scale, rotation, offset) = (Vec2::new(1.3, 0.7), 0.6_f32, Vec2::new(0.3, -0.2));
+		let by_hand =
+			|sign: f32| move |uv: Vec2| turned_by_hand(uv, scale, rotation * sign, offset);
+		let (Some(shader), Some(hand), Some(other)) = (
+			moved_floor(
+				ramps(),
+				Material {
+					uv_scale: scale,
+					uv_rotation: rotation,
+					uv_offset: offset,
+					..Material::DEFAULT
+				},
+				grid(4),
+			),
+			moved_floor(ramps(), Material::DEFAULT, grid_moved(4, by_hand(1.0))),
+			moved_floor(ramps(), Material::DEFAULT, grid_moved(4, by_hand(-1.0))),
+		) else {
+			return;
+		};
+
+		let (worst, many) = apart(&shader, &hand);
+
+		assert!(worst <= 1 && many == 0, "within a byte everywhere: {worst}, {many}");
+		assert!(apart(&shader, &other).1 > 1000, "and turned the other way is another picture");
+	}
+
+	#[test]
+	fn a_picture_on_the_second_set_laid_out_as_the_first_is_the_same_picture() {
+		// a mesh whose second set is its first, read by an occlusion and a glow
+		// on either set: one picture, to the byte. And the same mesh with its
+		// second set squeezed into a corner is another picture for each of the
+		// two read from it alone, or that one's flag is read by nothing.
+		let shoot = |occlusion_uv2: bool, glow_uv2: bool, squeezed: bool| {
+			let mut capture = capture_of(SQUARE, SQUARE)?;
+			let mut world = from_above();
+			let mut data = grid(4);
+			// a tenth of the first set, or all of it, which is the first set to
+			// the bit
+			let share = if squeezed { 0.1 } else { 1.0 };
+
+			data.paint = data
+				.vertices
+				.iter()
+				.map(|vertex| PaintVertex::new(Vec4::ONE, Vec2::from_array(vertex.uv) * share))
+				.collect();
+
+			let mesh = world.meshes.insert("test/second", data);
+			let occlusion = world.textures.insert("test/creased", creased());
+			let glow = world.textures.insert("test/ramps", ramps());
+			let material = world.materials.insert("test/second", Material {
+				occlusion,
+				occlusion_uv2,
+				glow,
+				glow_uv2,
+				emissive: Vec3::splat(0.3),
+				..Material::DEFAULT
+			});
+			spread(&mut world, mesh, material);
+
+			Some(capture.shoot(&mut world).expect("it renders"))
+		};
+
+		let (Some(first), Some(second), Some(occluded), Some(glowing)) = (
+			shoot(false, false, false),
+			shoot(true, true, false),
+			shoot(true, false, true),
+			shoot(false, true, true),
+		) else {
+			return;
+		};
+
+		assert!(first.pixels == second.pixels, "the same coordinates are the same picture");
+		assert!(apart(&first, &occluded).1 > 1000, "the occlusion on other coordinates");
+		assert!(apart(&first, &glowing).1 > 1000, "and the glow on other coordinates");
+	}
+
+	#[test]
+	fn a_turned_cutout_casts_the_shadow_of_the_cutout_turned_by_hand() {
+		// the pass that draws the shadows reads the same turn the picture does,
+		// or a fence's shadow would have holes where the fence has none
+		let (scale, rotation, offset) = (Vec2::new(2.0, 1.25), 0.9_f32, Vec2::new(0.1, 0.35));
+		let by_hand = move |uv: Vec2| turned_by_hand(uv, scale, rotation, offset);
+		// the arrangement a cutout's own shadow test uses: overhead, with the
+		// shadow its own width to one side of it
+		let shoot = |material: Material, mesh: MeshData| {
+			let mut capture = capture()?;
+			let mut world = shadowed_world();
+			world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+			world.camera.target = Vec3::ZERO;
+
+			let holes = world.textures.insert("test/holed", holed());
+			let mesh = world.meshes.insert("test/fence", mesh);
+			let material = world.materials.insert("test/fence", Material {
+				albedo: holes,
+				blend: Blend::Mask,
+				..material
+			});
+			let fence = world.entities.spawn_at(Transform {
+				position: Vec3::new(0.0, CASTER.0, 0.0),
+				rotation: Quat::IDENTITY,
+				scale: Vec3::new(CASTER.1, 1.0, CASTER.1),
+			});
+
+			world
+				.entities
+				.set_renderable(fence, Renderable::of(mesh, material, Vec3::ONE));
+
+			Some(capture.shoot(&mut world).expect("it renders"))
+		};
+		let turned = Material {
+			uv_scale: scale,
+			uv_rotation: rotation,
+			uv_offset: offset,
+			..Material::DEFAULT
+		};
+
+		let (Some(shader), Some(hand), Some(unmoved)) = (
+			shoot(turned, grid(4)),
+			shoot(Material::DEFAULT, grid_moved(4, by_hand)),
+			shoot(Material::DEFAULT, grid(4)),
+		) else {
+			return;
+		};
+
+		let (_, many) = apart(&shader, &hand);
+
+		assert!(many < 20, "the same holes in the fence and its shadow: {many} pixels apart");
+		assert!(apart(&shader, &unmoved).1 > 500, "where the unturned cutout is another picture");
+	}
+
+	#[test]
+	fn both_shaders_turn_a_picture_the_same_way_and_read_one_block() {
+		// the scene's shader and the shadows' each hold the turn and the block
+		// it is read from, because a module cannot include another one; a
+		// cutout turned one way whose shadow is turned another is the bug this
+		// stops.
+		let text = |source: &'static str, from: &str, to: &str| {
+			let start = source
+				.find(from)
+				.unwrap_or_else(|| panic!("`{from}` is in the shader"));
+			let rest = source.get(start..).unwrap_or_default();
+			let end = rest
+				.find(to)
+				.unwrap_or_else(|| panic!("and so is the `{to}` after it"));
+
+			rest.get(..end)
+				.unwrap_or_default()
+				.lines()
+				.map(str::trim)
+				.filter(|line| !line.starts_with("//"))
+				.collect::<Vec<_>>()
+				.join("\n")
+		};
+		let scene = include_str!("shader.wgsl");
+		let shadow = include_str!("shadow.wgsl");
+
+		assert_eq!(
+			text(scene, "fn turned(", "\n}"),
+			text(shadow, "fn turned(", "\n}"),
+			"one turn in both"
+		);
+		assert_eq!(
+			text(scene, "struct Finish {", "};"),
+			text(shadow, "struct Finish {", "};"),
+			"and one block"
+		);
+		assert!(
+			scene.contains("@group(1) @binding(10) var<uniform> finish: Finish;")
+				&& shadow.contains("@group(2) @binding(10) var<uniform> finish: Finish;"),
+			"at the binding the material's layout puts it"
+		);
+	}
+
+	#[test]
+	fn a_materials_numbers_changed_in_place_are_drawn_on_the_next_frame() {
+		// the uniform is written when the material's revision moves, the way
+		// its pictures are bound again when theirs do
+		let Some(mut capture) = capture_of(SQUARE, SQUARE) else {
+			return;
+		};
+		let mut world = from_above();
+		let material = world
+			.materials
+			.insert("test/moving", Material::DEFAULT);
+		spread(&mut world, MeshId::QUAD, material);
+
+		let before = capture.shoot(&mut world).expect("it renders");
+
+		if let Some(held) = world.materials.get_mut(material) {
+			held.emissive = rgb(0.5, 0.0, 0.0);
+		}
+
+		let glowing = capture.shoot(&mut world).expect("it renders");
+
+		if let Some(held) = world.materials.get_mut(material) {
+			held.emissive = Vec3::ZERO;
+		}
+
+		let after = capture.shoot(&mut world).expect("it renders");
+
+		assert_ne!(glowing.pixel(SQUARE / 2, SQUARE / 2), before.pixel(SQUARE / 2, SQUARE / 2));
+		assert!(after.pixels == before.pixels, "and put back, it is the picture it was");
+	}
+
+	#[test]
+	fn a_finish_picture_uploaded_again_is_read_again() {
+		// the group holds a view of one texture, and a picture reloaded under
+		// its name is a new one: every picture a material names is watched,
+		// not only the first two
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let mut world = showcase();
+		let finish = world
+			.textures
+			.insert("test/finish", numbers_of([255, 255, 255, 255]));
+		let material = world.materials.insert("test/finished", Material {
+			metallic: 1.0,
+			roughness: 1.0,
+			finish,
+			..Material::DEFAULT
+		});
+		ball(&mut world, material);
+
+		let rough = capture.shoot(&mut world).expect("it renders");
+
+		world
+			.textures
+			.insert("test/finish", numbers_of([255, 40, 255, 255]));
+
+		let smooth = capture.shoot(&mut world).expect("it renders");
+
+		assert!(apart(&rough, &smooth).1 > 500, "the new picture is read");
+	}
 }

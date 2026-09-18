@@ -627,10 +627,6 @@ fn number(entry: &Value, name: &str) -> usize {
 		.unwrap_or(0)
 }
 
-/// Splits a `.glb` into its document and its buffer.
-///
-/// @param bytes - the whole file
-/// @return the JSON chunk and the binary chunk, if there is one
 /// Every file a document names beside itself: its buffers and its pictures.
 ///
 /// What the compiler asks so that editing a `.bin` or a `.png` a model links
@@ -697,6 +693,10 @@ fn document_of(source: &Path) -> Option<String> {
 /// carries one.
 type Chunks<'a> = (&'a [u8], Option<&'a [u8]>);
 
+/// Splits a `.glb` into its document and its buffer.
+///
+/// @param bytes - the whole file
+/// @return the JSON chunk and the binary chunk, if there is one
 fn split_binary(bytes: &[u8]) -> Result<Chunks<'_>> {
 	let version = read_u32(bytes, 4);
 	let declared = read_u32(bytes, 8);
@@ -778,7 +778,16 @@ fn check_version(document: &Value) -> Result<()> {
 /// side. A position stored small is put back at its real size by the scale on
 /// the node above it, which the walk applies to every node anyway. Refusing it
 /// was one line and cost every file an exporter had quantized.
-pub const READ_EXTENSIONS: &[&str] = &["KHR_mesh_quantization"];
+///
+/// **The three material extensions are read into the material**: the strength
+/// the emitted light is given at, a transform of the pictures' coordinates, and
+/// a surface drawn with no light on it. @ref `material`.
+pub const READ_EXTENSIONS: &[&str] = &[
+	"KHR_mesh_quantization",
+	"KHR_materials_emissive_strength",
+	"KHR_texture_transform",
+	"KHR_materials_unlit",
+];
 
 /// Refuses a document that needs something this reader does not have.
 ///
@@ -811,8 +820,8 @@ fn check_extensions(document: &Value) -> Result<()> {
 /// Not a refusal and not a failure: a file that *uses* an extension reads
 /// without it, by the specification's own rule. What this is is the one moment
 /// anybody can be told that a thing the exporter wrote down is not in what came
-/// out - a punctual light, a texture transform, an unlit material - and before
-/// this it was passed over in silence.
+/// out - a punctual light, a clear coat, a sheen - and before this it was
+/// passed over in silence.
 ///
 /// @param document - the parsed file
 /// @return one line per extension, in the order the file wrote them
@@ -1440,16 +1449,38 @@ mod tests {
 		// down that does not come out the other end, and before this nobody
 		// was told
 		let text = "{ \"asset\": { \"version\": \"2.0\" }, \"extensionsUsed\": [ \
-		            \"KHR_materials_emissive_strength\", \"KHR_lights_punctual\" ] }";
+		            \"KHR_materials_clearcoat\", \"KHR_texture_transform\", \
+		            \"KHR_lights_punctual\" ] }";
 		let file = read(text).expect("a file that only uses one still reads");
 		let said = unread_extensions(file.document());
 
-		assert_eq!(said.len(), 2, "one line each: {said:?}");
+		assert_eq!(said.len(), 2, "one line each, and none for the one that is read: {said:?}");
 		assert!(
-			said[0].contains("KHR_materials_emissive_strength")
+			said[0].contains("KHR_materials_clearcoat")
 				&& said[1].contains("KHR_lights_punctual"),
 			"each named, in the order the file wrote them: {said:?}"
 		);
+	}
+
+	#[test]
+	fn a_file_that_requires_a_material_extension_colby_reads_is_read() {
+		for named in [
+			"KHR_materials_emissive_strength",
+			"KHR_texture_transform",
+			"KHR_materials_unlit",
+		] {
+			let text = format!(
+				"{{ \"asset\": {{ \"version\": \"2.0\" }}, \"extensionsRequired\": [ \
+				 \"{named}\" ], \"extensionsUsed\": [ \"{named}\" ] }}"
+			);
+
+			assert!(read(&text).is_ok(), "{named} is read, so a file may require it");
+			assert_eq!(
+				unread_extensions(read(&text).expect("it reads").document()),
+				Vec::<String>::new(),
+				"and nothing says {named} was passed over"
+			);
+		}
 	}
 
 	#[test]

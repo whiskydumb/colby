@@ -1,17 +1,23 @@
 //! colby's runtime material format: `.cmat`, and the `.material` it comes
 //! from.
 //!
-//! **A material is nine numbers and two names**, which is why this is the
-//! smallest format in the crate with a record in it at all: a header, one
-//! fixed record, and the blob the two names live in.
+//! **A material is one record and the names of its five pictures**, which is
+//! why this is the smallest format in the crate with a record in it at all: a
+//! header, one fixed record, and the blob the names live in.
 //!
 //! ```text
 //!   0  MAGIC                            8 bytes
 //!   8  version                          4 bytes
 //!  12  flags                            4 bytes
-//!  16  the record                      48 bytes
-//!  64  the names, NUL-terminated
+//!  16  the record                     100 bytes
+//! 116  the names, NUL-terminated
 //! ```
+//!
+//! **The record is a model's**, [`Coat`], with its own name at nought: a file
+//! of its own is named by its path. One material written down is one record
+//! whichever file it is in, so a field a material grows is one field in one
+//! place and not two records kept in step by hand, which is what the two were
+//! until the rest of the exchange format's material arrived.
 //!
 //! **It names no shader**, and that is a decision rather than an omission.
 //! Four of the six engines read for this put one in the file - Defold's
@@ -26,13 +32,12 @@
 //! the same file.
 //!
 //! **What a `.cmat` describes is [`Material`](crate::model::Material)**, the
-//! record a model has written its own materials down as since models existed.
-//! A material described is a material described whoever wrote it, and a second
-//! struct of the same nine fields would be a second thing to keep in step.
+//! form a model has written its own materials down as since models existed.
+//! A material described is a material described whoever wrote it.
 //!
 //! The source is a `.material`, one flat JSON object read through
 //! [`Material::FIELDS`](colby_core::abi::Material::FIELDS) the way a `.scene`
-//! is read through the tables of the records in it, plus the two texture names
+//! is read through the tables of the records in it, plus the five picture names
 //! by hand - a reference is described by a table and never spelled by one.
 //! @ref [`level`](crate::level).
 
@@ -40,27 +45,22 @@ use std::path::Path;
 
 use colby_core::{
 	Result,
-	abi::{
-		Material as Surface,
-		material::{Blend, Wrap},
-	},
-	bytemuck::{self, Pod, Zeroable},
-	err,
-	glam::{Vec2, Vec3},
+	abi::{Material as Surface, material::Wrap},
+	bytemuck, err,
 };
 
 use crate::{
 	bytes::Names,
 	json::Value,
 	level::{Rows, Writing, check, named_row, names, put_all, read},
-	model::Material,
+	model::{Coat, Material, unknown_in},
 };
 
 /// The eight bytes every `.cmat` starts with.
 pub const MAGIC: [u8; 8] = *b"COLBYMAT";
 
 /// The revision of everything in this module.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The extension a compiled material is written with.
 pub const EXTENSION: &str = "cmat";
@@ -73,44 +73,9 @@ pub const HEADER_BYTES: usize = 16;
 
 /// The largest name blob the reader will accept, in bytes.
 ///
-/// Two asset names. This is how wrong a file has to be before the reader stops
-/// rather than reading what it was handed.
+/// Five asset names. This is how wrong a file has to be before the reader
+/// stops rather than reading what it was handed.
 pub const MAX_NAMES: usize = 4 << 10;
-
-/// One material, as the file holds it.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
-#[bytemuck(crate = "::colby_core::bytemuck")]
-pub struct Coat {
-	/// Offset into the blob of the albedo's asset name, or zero for none.
-	pub albedo: u32,
-
-	/// The same for the normal map.
-	pub normal: u32,
-
-	/// What happens past the edge of both, as [`Wrap`] in declaration order.
-	pub wrap: u32,
-
-	/// How the alpha is read, as [`Blend`] in declaration order.
-	pub blend: u32,
-
-	/// Zero for a dielectric, one for a metal.
-	pub metallic: f32,
-
-	/// Nought is as smooth as a surface is drawn, and one is chalk.
-	pub roughness: f32,
-
-	/// How much of the surface there is, where the mode above reads it.
-	pub opacity: f32,
-
-	/// How many times the textures repeat across the mesh's own `0..1`.
-	pub uv_scale: [f32; 2],
-
-	/// Linear RGB.
-	pub base_color: [f32; 3],
-}
-
-const _: () = assert!(size_of::<Coat>() == 48, "the record has to stay forty-eight bytes");
 
 /// A `.cmat` read off disk and checked.
 #[derive(Clone, Debug)]
@@ -166,16 +131,14 @@ impl MaterialFile {
 			)));
 		}
 
+		// stricter than a model about the wrap, and on purpose: a file somebody
+		// wrote by hand is refused where it is wrong, rather than read as the
+		// nearest thing it could have meant. @ref `colby-scene-format`.
 		if Wrap::at(coat.wrap).is_none() {
 			return Err(err!(Asset("wraps in a way this build has no name for: {}", coat.wrap)));
 		}
 
-		if Blend::at(coat.blend).is_none() {
-			return Err(err!(Asset(
-				"blends in a way this build has no name for: {}",
-				coat.blend
-			)));
-		}
+		unknown_in(&coat).map_err(|what| err!(Asset("{what}")))?;
 
 		Ok(Self { coat, blob: blob.to_vec() })
 	}
@@ -184,24 +147,13 @@ impl MaterialFile {
 	#[must_use]
 	pub const fn coat(&self) -> &Coat { &self.coat }
 
-	/// The material this describes, with both its pictures named.
+	/// The material this describes, with its pictures named.
 	///
 	/// @param name - what it registers under, which is the asset's own name
 	/// and is therefore the caller's
 	#[must_use]
 	pub fn to_material(&self, name: &str) -> Material {
-		Material {
-			name: name.to_owned(),
-			albedo: self.name(self.coat.albedo).to_owned(),
-			normal: self.name(self.coat.normal).to_owned(),
-			base_color: Vec3::from_array(self.coat.base_color),
-			metallic: self.coat.metallic,
-			roughness: self.coat.roughness,
-			wrap: Wrap::at(self.coat.wrap).unwrap_or_default(),
-			blend: Blend::at(self.coat.blend).unwrap_or_default(),
-			opacity: self.coat.opacity,
-			uv_scale: Vec2::from_array(self.coat.uv_scale),
-		}
+		Material::of_coat(&self.coat, name.to_owned(), |at| self.name(at))
 	}
 
 	/// One name out of the blob, or nothing for offset zero.
@@ -227,17 +179,7 @@ impl MaterialFile {
 #[must_use]
 pub fn encode(material: &Material) -> Vec<u8> {
 	let mut names = Names::default();
-	let coat = Coat {
-		albedo: names.put(&material.albedo),
-		normal: names.put(&material.normal),
-		wrap: material.wrap.index(),
-		blend: material.blend.index(),
-		metallic: material.metallic,
-		roughness: material.roughness,
-		opacity: material.opacity,
-		uv_scale: material.uv_scale.to_array(),
-		base_color: material.base_color.to_array(),
-	};
+	let coat = material.coat(0, &mut names);
 
 	let mut out = Vec::with_capacity(HEADER_BYTES + size_of::<Coat>() + names.blob().len());
 	out.extend_from_slice(&MAGIC);
@@ -252,7 +194,7 @@ pub fn encode(material: &Material) -> Vec<u8> {
 /// Reads a `.material` source.
 ///
 /// @param text - the whole file
-/// @return the material, with its two pictures named
+/// @return the material, with its pictures named
 pub fn import(text: &str) -> Result<Material> {
 	let root = crate::json::parse(text)?;
 	let table = names(Surface::FIELDS, &REFERENCES);
@@ -262,7 +204,15 @@ pub fn import(text: &str) -> Result<Material> {
 	let mut surface = Surface::DEFAULT;
 	read(&mut surface, &root, Surface::FIELDS, "a material")?;
 
-	Ok(described(&surface, text_of(&root, "albedo")?, text_of(&root, "normal")?))
+	Ok(Material {
+		name: String::new(),
+		albedo: text_of(&root, "albedo")?,
+		normal: text_of(&root, "normal")?,
+		finish: text_of(&root, "finish")?,
+		occlusion: text_of(&root, "occlusion")?,
+		glow: text_of(&root, "glow")?,
+		surface,
+	})
 }
 
 /// Writes a `.material` source.
@@ -271,11 +221,10 @@ pub fn import(text: &str) -> Result<Material> {
 /// @return the text, or why it could not be written
 pub fn export(material: &Material) -> Result<String> {
 	let mut rows = Rows::default();
-	let surface = surface_of(material);
 
 	put_all(
 		&mut rows,
-		&surface,
+		&material.surface,
 		&Surface::DEFAULT,
 		Surface::FIELDS,
 		&Writing {
@@ -286,6 +235,9 @@ pub fn export(material: &Material) -> Result<String> {
 		|field| match field {
 			| "albedo" => named_row("albedo", &material.albedo),
 			| "normal" => named_row("normal", &material.normal),
+			| "finish" => named_row("finish", &material.finish),
+			| "occlusion" => named_row("occlusion", &material.occlusion),
+			| "glow" => named_row("glow", &material.glow),
 			| _ => None,
 		},
 	)?;
@@ -293,47 +245,8 @@ pub fn export(material: &Material) -> Result<String> {
 	Ok(rows.text())
 }
 
-/// The two fields a table describes and cannot spell.
-const REFERENCES: [&str; 2] = ["albedo", "normal"];
-
-/// A described material as the live record, so that one table serves both.
-///
-/// The two handles are left at what the default holds: nothing here can
-/// resolve a name, and the writer names them beside the table.
-///
-/// @param material - the described form
-fn surface_of(material: &Material) -> Surface {
-	Surface {
-		base_color: material.base_color,
-		metallic: material.metallic,
-		roughness: material.roughness,
-		wrap: material.wrap,
-		blend: material.blend,
-		opacity: material.opacity,
-		uv_scale: material.uv_scale,
-		..Surface::DEFAULT
-	}
-}
-
-/// The other half: a live record and two names as the described form.
-///
-/// @param surface - everything but the two pictures
-/// @param albedo - the color picture's asset name, or empty
-/// @param normal - the normal map's, or empty
-fn described(surface: &Surface, albedo: String, normal: String) -> Material {
-	Material {
-		name: String::new(),
-		albedo,
-		normal,
-		base_color: surface.base_color,
-		metallic: surface.metallic,
-		roughness: surface.roughness,
-		wrap: surface.wrap,
-		blend: surface.blend,
-		opacity: surface.opacity,
-		uv_scale: surface.uv_scale,
-	}
-}
+/// The five fields a table describes and cannot spell.
+const REFERENCES: [&str; 5] = ["albedo", "normal", "finish", "occlusion", "glow"];
 
 /// One name out of a JSON object, or empty for a key it does not have.
 fn text_of(root: &Value, key: &str) -> Result<String> {
@@ -382,21 +295,40 @@ fn word(head: &[u8], at: usize) -> Result<u32> {
 mod tests {
 	use core::mem::offset_of;
 
+	use colby_core::{
+		abi::material::Blend,
+		glam::{Vec2, Vec3},
+	};
+
 	use super::*;
 
-	/// A material with every field off its default and both pictures named.
+	/// A material with every field off its default and every picture named.
 	fn sample() -> Material {
 		Material {
 			name: "materials/brass".to_owned(),
 			albedo: "textures/brass".to_owned(),
 			normal: "textures/brass_normal".to_owned(),
-			base_color: Vec3::new(0.8, 0.6, 0.2),
-			metallic: 1.0,
-			roughness: 0.25,
-			wrap: Wrap::Clamp,
-			blend: Blend::Mask,
-			opacity: 0.75,
-			uv_scale: Vec2::new(4.0, 2.0),
+			finish: "textures/brass_orm".to_owned(),
+			occlusion: "textures/brass_ao".to_owned(),
+			glow: "textures/brass_embers".to_owned(),
+			surface: Surface {
+				base_color: Vec3::new(0.8, 0.6, 0.2),
+				metallic: 1.0,
+				roughness: 0.25,
+				occlusion_strength: 0.5,
+				occlusion_uv2: true,
+				glow_uv2: true,
+				emissive: Vec3::new(1.0, 0.5, 0.25),
+				emissive_strength: 4.0,
+				uv_scale: Vec2::new(4.0, 2.0),
+				uv_offset: Vec2::new(0.25, 0.5),
+				uv_rotation: 1.5,
+				wrap: Wrap::Clamp,
+				blend: Blend::Mask,
+				opacity: 0.75,
+				unlit: true,
+				..Surface::DEFAULT
+			},
 		}
 	}
 
@@ -411,18 +343,39 @@ mod tests {
 	}
 
 	#[test]
+	fn the_record_is_a_models_with_no_name_of_its_own() {
+		let written = encode(&sample());
+		let file = MaterialFile::from_bytes(&written).expect("readable");
+
+		assert_eq!(file.coat().name, 0, "a file of its own is named by its path");
+		assert_eq!(
+			written.len() - HEADER_BYTES - file.blob.len(),
+			size_of::<Coat>(),
+			"and the record between the header and the names is exactly one of a model's"
+		);
+	}
+
+	#[test]
 	fn a_material_naming_no_pictures_names_none() {
 		let bare = Material {
-			albedo: String::new(),
-			normal: String::new(),
-			..sample()
+			surface: sample().surface,
+			name: sample().name,
+			..Material::default()
 		};
 		let read = MaterialFile::from_bytes(&encode(&bare))
 			.expect("readable")
 			.to_material(&bare.name);
 
-		assert_eq!(read.albedo, "", "an empty name is offset zero");
-		assert_eq!(read.normal, "", "for both of them");
+		for (named, what) in [
+			(&read.albedo, "albedo"),
+			(&read.normal, "normal"),
+			(&read.finish, "finish"),
+			(&read.occlusion, "occlusion"),
+			(&read.glow, "glow"),
+		] {
+			assert_eq!(named, "", "an empty name is offset zero, for the {what} as well");
+		}
+
 		assert_eq!(read, bare, "and nothing else moved");
 	}
 
@@ -475,6 +428,18 @@ mod tests {
 	}
 
 	#[test]
+	fn a_flag_this_build_does_not_know_is_refused_as_a_model_refuses_it() {
+		let mut bytes = encode(&sample());
+		let field = HEADER_BYTES + offset_of!(Coat, flags);
+
+		bytes[field..field + 4].copy_from_slice(&(1_u32 << 20).to_le_bytes());
+
+		let refused = MaterialFile::from_bytes(&bytes).expect_err("a flag nobody here has");
+
+		assert!(format!("{refused}").contains("feature"), "and it says so: {refused}");
+	}
+
+	#[test]
 	fn a_source_reads_and_writes_back_the_same_material() {
 		let text = export(&sample()).expect("it can be written");
 		let read = import(&text).unwrap_or_else(|failure| {
@@ -501,7 +466,7 @@ mod tests {
 	fn a_source_that_says_nothing_is_the_default_material() {
 		let read = import("{}").expect("an empty object is a material");
 
-		assert_eq!(read, described(&Surface::DEFAULT, String::new(), String::new()));
+		assert_eq!(read, Material::default());
 	}
 
 	#[test]
@@ -526,7 +491,13 @@ mod tests {
 
 	#[test]
 	fn a_picture_that_is_not_a_name_is_refused() {
-		assert!(import(r#"{ "albedo": 7 }"#).is_err(), "a texture is named, not numbered");
+		for key in REFERENCES {
+			assert!(
+				import(&format!("{{ \"{key}\": 7 }}")).is_err(),
+				"a texture is named, not numbered, the {key} as well"
+			);
+		}
+
 		assert_eq!(
 			import(r#"{ "albedo": "textures/brass" }"#)
 				.expect("a name is a name")

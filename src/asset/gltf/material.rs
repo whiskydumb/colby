@@ -2,9 +2,13 @@
 //!
 //! glTF's material model is the metallic-roughness pair, which is the one
 //! `abi::material` was built around, so the numbers cross with no translation
-//! at all: a base color, how metallic, how rough, an albedo, a normal map. That
-//! is the whole of what arrives. Everything else a material may declare is
-//! named in a warning and dropped, because this renderer has nowhere to put it.
+//! at all: a base color, how metallic, how rough, the color picture, the normal
+//! map, the picture of how metal and how rough, the occlusion picture, and the
+//! light a surface gives off with the picture of where it gives it off. Three
+//! extensions finish the record - the strength that light is given at, a
+//! transform of the pictures' coordinates, and a surface drawn with no light on
+//! it - and what a material says beyond them is named in a warning and dropped,
+//! because this renderer has nowhere to put it.
 //!
 //! **A picture reaches colby one of two ways, and which one decides who
 //! compiles it.** An image written as a file beside the document is already an
@@ -13,14 +17,23 @@
 //! model has no such file, so it is decoded here and handed back to be written
 //! out beside the model's meshes.
 //!
-//! **That split is what decides the texel layout, and it is why the naming rule
-//! survives.** What a picture's channels mean is not in a PNG, so a loose one
-//! is judged by its name - the `_normal` suffix, the only such rule in the
-//! project. A material *says*, so an extracted picture needs no rule at all and
-//! is written with the layout its use asks for. What is left is the seam
-//! between the two, and it gets a warning: a file used as a normal map whose
-//! name does not say so is about to be compiled as a color, and the other way
-//! round.
+//! **That split is what decides the texel layout.** What a picture's channels
+//! mean is not in a PNG, so a loose one is judged by its name - the `_normal`
+//! and `_orm` suffixes, the only such rule in the project. A material *says*,
+//! so an extracted picture needs no rule at all and is written with the layout
+//! its use asks for. A loose picture whose name disagrees with its use is
+//! **copied out** the same way, in the layout its use asks for: its own file is
+//! still compiled by its name, and the model wears the copy.
+//!
+//! **One transform for the first set of coordinates, and none for the second.**
+//! The exchange format moves each picture's coordinates on its own; colby moves
+//! all of a material's pictures on the first set together, by the color
+//! picture's transform - or by the first other picture's when it has no color
+//! picture - and names in a warning any picture moved another way. The second
+//! set is one unwrap of the whole mesh, laid out for a baked picture, and
+//! nothing moves it. Which set a picture is read from is the file's to say for
+//! the occlusion and the glow, the two pictures a bake lays out; the others are
+//! read from the first set, with a warning when the file said otherwise.
 //!
 //! **One difference is deliberately not warned about: `doubleSided`.** colby
 //! culls back faces and always will, so a material that asks for both sides
@@ -37,10 +50,11 @@ use std::path::PathBuf;
 
 use colby_core::{
 	abi::{
+		Material,
 		material::{Blend, MASK_CUTOFF, Wrap},
 		texture::{Texel, TextureData},
 	},
-	glam::Vec3,
+	glam::{Vec2, Vec3},
 };
 
 use super::Gltf;
@@ -61,13 +75,23 @@ const PNG: &str = "image/png";
 /// And the other one the specification allows.
 const JPEG: &str = "image/jpeg";
 
+/// The extension that gives the emitted light a strength of its own.
+const EMISSIVE_STRENGTH: &str = "KHR_materials_emissive_strength";
+
+/// The extension that moves a picture's coordinates.
+const TRANSFORM: &str = "KHR_texture_transform";
+
+/// The extension that draws a surface with no light on it.
+const UNLIT: &str = "KHR_materials_unlit";
+
 /// Every material a file declares, and what came out with them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Coats {
 	/// One per material, in the file's own order.
 	pub surfaces: Vec<Surface>,
 
-	/// Pictures that were inside the file and now need writing out.
+	/// Pictures that were inside the file, or beside it under a name that says
+	/// otherwise, and now need writing out.
 	pub pictures: Vec<Extracted>,
 
 	/// What the materials said that could not be used.
@@ -76,22 +100,18 @@ pub(super) struct Coats {
 
 /// One of the file's materials, as colby's own numbers.
 ///
-/// Not an `abi::Material`, because that names its textures by handle and no
-/// handle exists until the host has registered them. This is the same thing
-/// with names in the two places a handle will go.
+/// **The numbers are the live record's**, an `abi::Material` with its five
+/// picture handles left at what the default holds: no handle exists until the
+/// host has registered the pictures. Where each picture comes from is beside
+/// it, in the five places a handle will go.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Surface {
 	/// What it registers under, inside the model's own name.
 	pub name: String,
 
-	/// Linear RGB, as the file wrote it.
-	pub base_color: Vec3,
-
-	/// Zero for a dielectric, one for a metal.
-	pub metallic: f32,
-
-	/// Nought is as smooth as a surface is drawn, and one is chalk.
-	pub roughness: f32,
+	/// Every number: the file's where it said one, the exchange format's
+	/// default where it did not.
+	pub numbers: Material,
 
 	/// The color picture, if it has one.
 	pub albedo: Option<Picture>,
@@ -99,28 +119,32 @@ pub struct Surface {
 	/// The normal map, if it has one.
 	pub normal: Option<Picture>,
 
-	/// What happens past the edge of both.
-	pub wrap: Wrap,
+	/// The picture of how metal and how rough, if it has one.
+	pub finish: Option<Picture>,
 
-	/// How its alpha is read.
-	pub blend: Blend,
+	/// The occlusion picture, if it has one.
+	pub occlusion: Option<Picture>,
 
-	/// How much of the surface there is, where the mode above reads it.
-	pub opacity: f32,
+	/// The picture of where it gives off light, if it has one.
+	pub glow: Option<Picture>,
 }
 
 impl Default for Surface {
 	fn default() -> Self {
 		Self {
 			name: String::new(),
-			base_color: Vec3::ONE,
-			metallic: 1.0,
-			roughness: 1.0,
-			blend: Blend::Opaque,
-			opacity: 1.0,
+			// metal and rough, which is what the exchange format says a factor
+			// the file leaves out is
+			numbers: Material {
+				metallic: 1.0,
+				roughness: 1.0,
+				..Material::DEFAULT
+			},
 			albedo: None,
 			normal: None,
-			wrap: Wrap::Repeat,
+			finish: None,
+			occlusion: None,
+			glow: None,
 		}
 	}
 }
@@ -132,7 +156,8 @@ pub enum Picture {
 	/// texture on its own walk. The material only has to name it.
 	Beside(PathBuf),
 
-	/// One that was inside the model, by its index in [`Coats::pictures`].
+	/// One that was taken out of the model, or copied out of a file beside it,
+	/// by its index in [`Coats::pictures`].
 	Inside(usize),
 }
 
@@ -173,6 +198,122 @@ pub(super) fn read(file: &Gltf) -> Coats {
 	coats
 }
 
+/// What a material uses one of its pictures for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Use {
+	/// The color.
+	Albedo,
+
+	/// Which way the surface faces.
+	Normal,
+
+	/// How metal, in blue, and how rough, in green.
+	Finish,
+
+	/// How much light from everywhere reaches it, in red.
+	Occlusion,
+
+	/// Where it gives off light.
+	Glow,
+}
+
+impl Use {
+	/// What a warning calls it.
+	const fn what(self) -> &'static str {
+		match self {
+			| Self::Albedo => "color picture",
+			| Self::Normal => "normal map",
+			| Self::Finish => "metal and roughness picture",
+			| Self::Occlusion => "occlusion picture",
+			| Self::Glow => "emissive picture",
+		}
+	}
+
+	/// How its channels are stored: a color is decoded out of sRGB, and
+	/// everything else is numbers.
+	const fn texel(self) -> Texel {
+		match self {
+			| Self::Albedo | Self::Glow => Texel::Rgba8Srgb,
+			| Self::Normal | Self::Finish | Self::Occlusion => Texel::Rgba8Unorm,
+		}
+	}
+
+	/// What a copy of it is named with, so that the layout shows in the tree.
+	const fn suffix(self) -> &'static str {
+		match self {
+			| Self::Albedo | Self::Glow => "",
+			| Self::Normal => compile::NORMAL_SUFFIX,
+			| Self::Finish | Self::Occlusion => compile::ORM_SUFFIX,
+		}
+	}
+
+	/// Whether colby reads it from the second set of coordinates when the file
+	/// asks: the two pictures a bake lays out over a mesh's own unwrap.
+	const fn takes_second(self) -> bool { matches!(self, Self::Occlusion | Self::Glow) }
+}
+
+/// How a picture's coordinates are moved before it is read: scaled, turned,
+/// then offset, as the exchange format says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Moved {
+	offset: Vec2,
+	rotation: f32,
+	scale: Vec2,
+}
+
+impl Moved {
+	/// Coordinates left where they are.
+	const NONE: Self = Self {
+		offset: Vec2::ZERO,
+		rotation: 0.0,
+		scale: Vec2::ONE,
+	};
+
+	/// What a picture's reference says about its coordinates, or nothing moved.
+	fn of(reference: &Value) -> Self {
+		let Some(written) = transform_of(reference) else {
+			return Self::NONE;
+		};
+
+		Self {
+			offset: pair(written.get("offset")).unwrap_or(Vec2::ZERO),
+			rotation: written
+				.get("rotation")
+				.and_then(Value::as_f32)
+				.unwrap_or(0.0),
+			scale: pair(written.get("scale")).unwrap_or(Vec2::ONE),
+		}
+	}
+
+	/// Whether two move a picture the same way, to a millionth.
+	fn agrees(self, other: Self) -> bool {
+		self.offset.abs_diff_eq(other.offset, 1.0e-6)
+			&& (self.rotation - other.rotation).abs() <= 1.0e-6
+			&& self.scale.abs_diff_eq(other.scale, 1.0e-6)
+	}
+}
+
+/// One of a material's pictures, as the material refers to it.
+struct Sampled {
+	/// Which picture, when there is one colby can use.
+	picture: Option<Picture>,
+
+	/// Which set of coordinates the file says it is read from.
+	set: usize,
+
+	/// How those coordinates are moved first.
+	moved: Moved,
+}
+
+impl Sampled {
+	/// A picture the material does not have.
+	const NONE: Self = Self {
+		picture: None,
+		set: 0,
+		moved: Moved::NONE,
+	};
+}
+
 /// One material being read.
 struct Reading<'a> {
 	file: &'a Gltf,
@@ -196,28 +337,170 @@ impl Reading<'_> {
 		let pbr = entry.get("pbrMetallicRoughness").cloned();
 		let pbr = pbr.unwrap_or_default();
 
-		self.complain(&entry, &pbr);
+		self.complain(&entry);
 
-		let albedo = self.picture(pbr.get("baseColorTexture"), Texel::Rgba8Srgb);
-		let normal = self.picture(entry.get("normalTexture"), Texel::Rgba8Unorm);
-		let wrap = self.wrap(pbr.get("baseColorTexture"));
+		let [albedo, normal, finish, occlusion, glow] = [
+			(pbr.get("baseColorTexture"), Use::Albedo),
+			(entry.get("normalTexture"), Use::Normal),
+			(pbr.get("metallicRoughnessTexture"), Use::Finish),
+			(entry.get("occlusionTexture"), Use::Occlusion),
+			(entry.get("emissiveTexture"), Use::Glow),
+		]
+		.map(|(reference, used)| self.sampled(reference, used));
+		// asked of all five, because the three colby reads from the first set
+		// alone have a word to say when the file said otherwise
+		let [_, _, _, occlusion_uv2, glow_uv2] = [
+			self.second(&albedo, Use::Albedo),
+			self.second(&normal, Use::Normal),
+			self.second(&finish, Use::Finish),
+			self.second(&occlusion, Use::Occlusion),
+			self.second(&glow, Use::Glow),
+		];
+		let moved = self.moved(&[
+			(&albedo, Use::Albedo, false),
+			(&normal, Use::Normal, false),
+			(&finish, Use::Finish, false),
+			(&occlusion, Use::Occlusion, occlusion_uv2),
+			(&glow, Use::Glow, glow_uv2),
+		]);
+		let extensions = entry.get("extensions");
 
 		Surface {
 			name: self.name(&entry),
-			base_color: color(pbr.get("baseColorFactor")),
-			metallic: number(&pbr, "metallicFactor"),
-			roughness: number(&pbr, "roughnessFactor"),
-			albedo,
-			normal,
-			wrap,
-			blend: self.blend(&entry),
-			// the fourth channel of the same factor the color came from. The
-			// exchange format says it is ignored outside the blended mode, and
-			// so does everything that reads it; it is carried across anyway,
-			// because a mode changed later should find the number already
-			// there rather than at one.
-			opacity: opacity(pbr.get("baseColorFactor")),
+			numbers: Material {
+				base_color: color(pbr.get("baseColorFactor")).unwrap_or(Vec3::ONE),
+				metallic: number(&pbr, "metallicFactor"),
+				roughness: number(&pbr, "roughnessFactor"),
+				occlusion_strength: entry
+					.get("occlusionTexture")
+					.and_then(|reference| reference.get("strength"))
+					.and_then(Value::as_f32)
+					.unwrap_or(1.0),
+				occlusion_uv2,
+				glow_uv2,
+				// black and at one where the file says nothing, which is what the
+				// exchange format and its extension say
+				emissive: color(entry.get("emissiveFactor")).unwrap_or(Vec3::ZERO),
+				emissive_strength: extensions
+					.and_then(|all| all.get(EMISSIVE_STRENGTH))
+					.and_then(|written| written.get("emissiveStrength"))
+					.and_then(Value::as_f32)
+					.unwrap_or(1.0),
+				uv_scale: moved.scale,
+				uv_offset: moved.offset,
+				uv_rotation: moved.rotation,
+				wrap: self.wrap(pbr.get("baseColorTexture")),
+				blend: self.blend(&entry),
+				// the fourth channel of the same factor the color came from. The
+				// exchange format says it is ignored outside the blended mode,
+				// and so does everything that reads it; it is carried across
+				// anyway, because a mode changed later should find the number
+				// already there rather than at one.
+				opacity: opacity(pbr.get("baseColorFactor")),
+				unlit: extensions
+					.and_then(|all| all.get(UNLIT))
+					.is_some(),
+				..Material::DEFAULT
+			},
+			albedo: albedo.picture,
+			normal: normal.picture,
+			finish: finish.picture,
+			occlusion: occlusion.picture,
+			glow: glow.picture,
 		}
+	}
+
+	/// One of a material's pictures, with the set it is read from and how its
+	/// coordinates are moved.
+	fn sampled(&mut self, reference: Option<&Value>, used: Use) -> Sampled {
+		let Some(reference) = reference else {
+			return Sampled::NONE;
+		};
+		// the transform's own set, when it names one, is the one the file means:
+		// that is how an exporter keeps a fallback for a reader that ignores it
+		let set = transform_of(reference)
+			.and_then(|written| written.get("texCoord"))
+			.or_else(|| reference.get("texCoord"))
+			.and_then(Value::as_usize)
+			.unwrap_or(0);
+
+		Sampled {
+			picture: self.picture(reference, used),
+			set,
+			moved: Moved::of(reference),
+		}
+	}
+
+	/// Whether a picture is read from the second set of coordinates, and a word
+	/// about a set colby does not read it from.
+	fn second(&mut self, sampled: &Sampled, used: Use) -> bool {
+		if sampled.picture.is_none() || sampled.set == 0 {
+			return false;
+		}
+
+		if sampled.set == 1 && used.takes_second() {
+			return true;
+		}
+
+		if sampled.set == 1 {
+			self.note(&format!(
+				"reads its {} from a second set of texture coordinates, and colby reads it from \
+				 the first",
+				used.what()
+			));
+		} else {
+			self.note(&format!(
+				"reads its {} from texture coordinates {}, and colby has two sets; it reads the \
+				 first",
+				used.what(),
+				sampled.set
+			));
+		}
+
+		false
+	}
+
+	/// How the first set of coordinates is moved: by the color picture's
+	/// transform, or the first other picture's when there is no color picture,
+	/// with a word about every picture moved another way.
+	///
+	/// @param pictures - each picture, what it is for, and whether it is read
+	/// from the second set
+	fn moved(&mut self, pictures: &[(&Sampled, Use, bool); 5]) -> Moved {
+		for (sampled, used, second) in pictures {
+			if *second && !sampled.moved.agrees(Moved::NONE) {
+				self.note(&format!(
+					"moves its {}, which it reads from the second set of texture coordinates, \
+					 and colby moves only the first",
+					used.what()
+				));
+			}
+		}
+
+		let first = || {
+			pictures
+				.iter()
+				.filter(|(sampled, _, second)| sampled.picture.is_some() && !*second)
+		};
+		let Some((moved, from)) = first()
+			.next()
+			.map(|(sampled, used, _)| (sampled.moved, *used))
+		else {
+			return Moved::NONE;
+		};
+
+		for (sampled, used, _) in first() {
+			if !sampled.moved.agrees(moved) {
+				self.note(&format!(
+					"moves its {} differently from its {}, and colby moves every picture on the \
+					 first set of coordinates one way",
+					used.what(),
+					from.what()
+				));
+			}
+		}
+
+		moved
 	}
 
 	/// How a material says its alpha should be read.
@@ -279,20 +562,7 @@ impl Reading<'_> {
 	}
 
 	/// One of a material's pictures, however it is stored.
-	fn picture(&mut self, reference: Option<&Value>, texel: Texel) -> Option<Picture> {
-		let reference = reference?;
-
-		if reference
-			.get("texCoord")
-			.and_then(Value::as_usize)
-			> Some(0)
-		{
-			self.note(
-				"reads a picture from a second set of texture coordinates, and colby reads \
-				 every picture from the first",
-			);
-		}
-
+	fn picture(&mut self, reference: &Value, used: Use) -> Option<Picture> {
 		let texture = reference.get("index").and_then(Value::as_usize)?;
 		let image = self
 			.file
@@ -303,14 +573,21 @@ impl Reading<'_> {
 		let entry = self.file.table("images").get(image)?.clone();
 
 		match entry.get("uri").and_then(Value::as_str) {
-			| Some(uri) if !uri.starts_with(super::DATA_PREFIX) => self.file_beside(uri, texel),
-			| _ => self.extract(image, &entry, texel),
+			| Some(uri) if !uri.starts_with(super::DATA_PREFIX) =>
+				self.file_beside(image, &entry, uri, used),
+			| _ => self.extract(image, &entry, used),
 		}
 	}
 
 	/// A picture that is a file of its own, which the compiler already knows
-	/// how to turn into a texture.
-	fn file_beside(&mut self, uri: &str, texel: Texel) -> Option<Picture> {
+	/// how to turn into a texture - unless its name says it is something else.
+	fn file_beside(
+		&mut self,
+		image: usize,
+		entry: &Value,
+		uri: &str,
+		used: Use,
+	) -> Option<Picture> {
 		let path = self.file.beside(uri).or_else(|| {
 			self.note("names a picture outside the asset tree, and it is left out");
 
@@ -318,29 +595,21 @@ impl Reading<'_> {
 		})?;
 
 		// the loose file will be compiled by the naming rule, which cannot see
-		// what this material says about it. When the two disagree the picture
-		// ends up bent one way or lit from the wrong side, and this is the only
-		// moment anybody can be told.
-		if compile::texel_of(&path) != texel {
-			let wanted = if texel.is_color() {
-				"a color"
-			} else {
-				"a set of directions"
-			};
-
-			self.note(&format!(
-				"uses {} as {wanted}, and its name says otherwise; the {} suffix is what \
-				 decides a loose picture",
-				path.display(),
-				compile::NORMAL_SUFFIX
-			));
+		// what this material says about it. When the two disagree the file
+		// would end up bent one way or lit from the wrong side, so the model
+		// wears a copy of it in the layout this material asks for instead,
+		// made the way a picture inside the model is.
+		if compile::texel_of(&path) != used.texel() {
+			return self.extract(image, entry, used);
 		}
 
 		Some(Picture::Beside(path))
 	}
 
-	/// A picture stored inside the model, decoded and kept to be written out.
-	fn extract(&mut self, image: usize, entry: &Value, texel: Texel) -> Option<Picture> {
+	/// A picture that has to be written out beside the model, decoded and kept.
+	fn extract(&mut self, image: usize, entry: &Value, used: Use) -> Option<Picture> {
+		let texel = used.texel();
+
 		if let Some((.., already)) = self
 			.pulled
 			.iter()
@@ -349,10 +618,13 @@ impl Reading<'_> {
 			return Some(Picture::Inside(*already));
 		}
 
+		let bytes = self.bytes(entry)?;
+		// what the document says the bytes are, or what they say they are: a
+		// picture beside the file has no type written down for it
 		let kind = entry
 			.get("mimeType")
 			.and_then(Value::as_str)
-			.unwrap_or(PNG);
+			.unwrap_or_else(|| if bytes.starts_with(&[0xFF, 0xD8]) { JPEG } else { PNG });
 
 		if kind != PNG && kind != JPEG {
 			self.note(&format!("holds a {kind} picture, which colby does not decode"));
@@ -360,7 +632,6 @@ impl Reading<'_> {
 			return None;
 		}
 
-		let bytes = self.bytes(entry)?;
 		let read = if kind == JPEG {
 			jpeg::import(&bytes, texel)
 		} else {
@@ -376,7 +647,7 @@ impl Reading<'_> {
 		};
 
 		let index = self.coats.pictures.len();
-		let name = self.picture_name(image, entry, texel);
+		let name = self.picture_name(image, entry, used);
 
 		self.coats.pictures.push(Extracted { name, data });
 		self.pulled.push((image, texel, index));
@@ -384,7 +655,7 @@ impl Reading<'_> {
 		Some(Picture::Inside(index))
 	}
 
-	/// The bytes of a picture that is inside the file.
+	/// The bytes of a picture, wherever the document keeps them.
 	fn bytes(&mut self, entry: &Value) -> Option<Vec<u8>> {
 		if let Some(view) = entry.get("bufferView").and_then(Value::as_usize) {
 			return match self.file.view(view) {
@@ -398,6 +669,23 @@ impl Reading<'_> {
 		}
 
 		let uri = entry.get("uri").and_then(Value::as_str)?;
+
+		if !uri.starts_with(super::DATA_PREFIX) {
+			let path = self.file.beside(uri)?;
+
+			return match std::fs::read(&path) {
+				| Ok(bytes) => Some(bytes),
+				| Err(error) => {
+					self.note(&format!(
+						"names {} and it cannot be read: {error}",
+						path.display()
+					));
+
+					None
+				},
+			};
+		}
+
 		let bytes = super::inline(uri);
 
 		if bytes.is_none() {
@@ -408,10 +696,19 @@ impl Reading<'_> {
 	}
 
 	/// The name an extracted picture registers under.
-	fn picture_name(&mut self, image: usize, entry: &Value, texel: Texel) -> String {
+	fn picture_name(&mut self, image: usize, entry: &Value, used: Use) -> String {
 		let written = entry
 			.get("name")
 			.and_then(Value::as_str)
+			.or_else(|| {
+				// a picture beside the file is called what the file is called
+				entry
+					.get("uri")
+					.and_then(Value::as_str)
+					.filter(|uri| !uri.starts_with(super::DATA_PREFIX))
+					.and_then(|uri| std::path::Path::new(uri).file_stem())
+					.and_then(|stem| stem.to_str())
+			})
 			.unwrap_or("");
 		let mut base = super::tidy(written);
 
@@ -419,11 +716,13 @@ impl Reading<'_> {
 			base = format!("picture{image}");
 		}
 
-		// the same suffix a loose file would carry, so that two layouts of one
-		// picture are two names and anybody reading the output tree can tell
-		// which is which.
-		if !texel.is_color() && !base.ends_with(compile::NORMAL_SUFFIX) {
-			base = format!("{base}{}", compile::NORMAL_SUFFIX);
+		// the suffix a loose file of that layout would carry, so that two
+		// layouts of one picture are two names and anybody reading the output
+		// tree can tell which is which.
+		let said = base.ends_with(compile::NORMAL_SUFFIX) || base.ends_with(compile::ORM_SUFFIX);
+
+		if !used.texel().is_color() && !said {
+			base = format!("{base}{}", used.suffix());
 		}
 
 		super::unique(self.taken, &base)
@@ -458,28 +757,12 @@ impl Reading<'_> {
 		if across == CLAMP { Wrap::Clamp } else { Wrap::Repeat }
 	}
 
-	/// Names everything the material declares that this renderer has nowhere to
-	/// put.
+	/// Names what the material declares that this renderer has nowhere to put.
 	///
-	/// One place for all of them so the list is readable as a list, which is
-	/// also what it is: the gap between glTF's material and colby's.
-	fn complain(&mut self, entry: &Value, pbr: &Value) {
-		let missing = [
-			(
-				pbr.get("metallicRoughnessTexture").is_some(),
-				"a metallic and roughness picture",
-			),
-			(entry.get("emissiveTexture").is_some(), "an emissive picture"),
-			(entry.get("occlusionTexture").is_some(), "an occlusion picture"),
-			(lit(entry.get("emissiveFactor")), "an emissive color"),
-		];
-
-		for (present, what) in missing {
-			if present {
-				self.note(&format!("has {what}, and colby has no slot for one"));
-			}
-		}
-
+	/// One place for it so the list is readable as a list, which is also what
+	/// it is: the gap between glTF's material and colby's, which is down to
+	/// one number since the rest of the material arrived.
+	fn complain(&mut self, entry: &Value) {
 		if entry.get("normalTexture").is_some_and(|texture| {
 			texture
 				.get("scale")
@@ -498,6 +781,13 @@ impl Reading<'_> {
 	}
 }
 
+/// A picture's `KHR_texture_transform`, when it has one.
+fn transform_of(reference: &Value) -> Option<&Value> {
+	reference
+		.get("extensions")
+		.and_then(|all| all.get(TRANSFORM))
+}
+
 /// A wrap mode, or the one a sampler that says nothing means.
 fn mode(sampler: &Value, name: &str) -> u32 {
 	sampler
@@ -513,7 +803,6 @@ fn number(pbr: &Value, name: &str) -> f32 {
 		.unwrap_or(1.0)
 }
 
-/// The first three of four numbers, or white.
 /// The fourth channel of a base color factor, or all of it.
 fn opacity(written: Option<&Value>) -> f32 {
 	written
@@ -522,29 +811,30 @@ fn opacity(written: Option<&Value>) -> f32 {
 		.unwrap_or(1.0)
 }
 
-fn color(written: Option<&Value>) -> Vec3 {
-	let Some(cells) = written.map(Value::as_array) else {
-		return Vec3::ONE;
-	};
+/// The first three of three or four numbers, or nothing for a factor the file
+/// did not write whole.
+fn color(written: Option<&Value>) -> Option<Vec3> {
+	let cells = written.map(Value::as_array)?;
 
 	if cells.len() < 3 {
-		return Vec3::ONE;
+		return None;
 	}
 
-	Vec3::new(
+	Some(Vec3::new(
 		cells[0].as_f32().unwrap_or(1.0),
 		cells[1].as_f32().unwrap_or(1.0),
 		cells[2].as_f32().unwrap_or(1.0),
-	)
+	))
 }
 
-/// Whether an emissive color is anything but black.
-fn lit(written: Option<&Value>) -> bool {
-	written.map(Value::as_array).is_some_and(|cells| {
-		cells
-			.iter()
-			.any(|cell| cell.as_f32().unwrap_or(0.0) > 0.0)
-	})
+/// Two numbers, or nothing for anything else.
+fn pair(written: Option<&Value>) -> Option<Vec2> {
+	let cells = written.map(Value::as_array)?;
+
+	match cells {
+		| [across, down] => Some(Vec2::new(across.as_f32()?, down.as_f32()?)),
+		| _ => None,
+	}
 }
 
 #[cfg(test)]
@@ -589,6 +879,14 @@ mod tests {
 		read(&file)
 	}
 
+	/// One material over the one picture, with its references written by the
+	/// test and a texture that names the picture.
+	fn material(references: &str) -> Coats {
+		document(&format!(
+			"\"textures\": [ {{ \"source\": 0 }} ], \"materials\": [ {{ {references} }} ]"
+		))
+	}
+
 	/// Whether any warning says a thing.
 	fn complained(coats: &Coats, about: &str) -> bool {
 		coats
@@ -606,13 +904,14 @@ mod tests {
 		assert_eq!(brass.name, "brass");
 		assert!(
 			brass
+				.numbers
 				.base_color
 				.abs_diff_eq(Vec3::new(0.8, 0.6, 0.2), 1e-6),
 			"the color it was given, in the space it was written in: {}",
-			brass.base_color
+			brass.numbers.base_color
 		);
-		assert!((brass.metallic - 0.0).abs() < 1e-6);
-		assert!((brass.roughness - 0.5).abs() < 1e-6);
+		assert!((brass.numbers.metallic - 0.0).abs() < 1e-6);
+		assert!((brass.numbers.roughness - 0.5).abs() < 1e-6);
 		assert_eq!(brass.albedo, None, "it wears no picture at all");
 	}
 
@@ -684,7 +983,10 @@ mod tests {
 	}
 
 	#[test]
-	fn a_loose_picture_whose_name_disagrees_with_its_use_is_named_in_a_warning() {
+	fn a_loose_picture_whose_name_disagrees_with_its_use_is_worn_as_a_copy_in_the_right_layout() {
+		// what used to be a warning and a picture bent the wrong way: the file
+		// beside the model is still compiled by its name, and the model wears
+		// a copy of it made the way a picture inside the model is.
 		let dir = std::env::temp_dir()
 			.join("colby-gltf-tests")
 			.join("disagree");
@@ -696,15 +998,35 @@ mod tests {
 
 		let text = "{ \"asset\": { \"version\": \"2.0\" }, \"images\": [ { \"uri\": \
 		            \"bumps.png\" } ], \"textures\": [ { \"source\": 0 } ], \"materials\": [ { \
-		            \"normalTexture\": { \"index\": 0 } } ] }";
+		            \"normalTexture\": { \"index\": 0 }, \"occlusionTexture\": { \"index\": 0 \
+		            }, \"pbrMetallicRoughness\": { \"baseColorTexture\": { \"index\": 0 } } } ] \
+		            }";
 
 		fs::write(dir.join("models").join("model.gltf"), text).expect("the document is written");
 
 		let file = Gltf::open(&dir.join("models").join("model.gltf"), &dir).expect("it reads");
 		let coats = read(&file);
+		let surface = &coats.surfaces[0];
 
-		assert!(complained(&coats, "_normal"), "got {:?}", coats.warnings);
-		assert!(complained(&coats, "bumps.png"), "and names the file");
+		assert_eq!(coats.warnings, Vec::<String>::new(), "nothing is wrong any more");
+		assert_eq!(
+			surface.albedo,
+			Some(Picture::Beside(dir.join("models").join("bumps.png"))),
+			"a color named as a color is the file itself"
+		);
+		assert_eq!(surface.normal, Some(Picture::Inside(0)), "a normal map is a copy");
+		assert_eq!(
+			surface.occlusion,
+			Some(Picture::Inside(0)),
+			"and the occlusion is the same copy: one layout, decoded once"
+		);
+		assert_eq!(coats.pictures.len(), 1);
+		assert_eq!(
+			coats.pictures[0].data.texel,
+			Texel::Rgba8Unorm,
+			"in the layout its use asks for"
+		);
+		assert_eq!(coats.pictures[0].name, "bumps_normal", "named after the file and the layout");
 
 		drop(fs::remove_dir_all(&dir));
 	}
@@ -744,10 +1066,25 @@ mod tests {
 		let coats = document("\"materials\": [ {} ]");
 		let only = &coats.surfaces[0];
 
-		assert!(only.base_color.abs_diff_eq(Vec3::ONE, 1e-6), "white");
-		assert!((only.metallic - 1.0).abs() < 1e-6, "and metal, which is glTF's default");
-		assert!((only.roughness - 1.0).abs() < 1e-6, "and rough");
+		assert!(
+			only.numbers
+				.base_color
+				.abs_diff_eq(Vec3::ONE, 1e-6),
+			"white"
+		);
+		assert!((only.numbers.metallic - 1.0).abs() < 1e-6, "and metal, which is glTF's default");
+		assert!((only.numbers.roughness - 1.0).abs() < 1e-6, "and rough");
+		assert_eq!(only.numbers.emissive, Vec3::ZERO, "giving off nothing");
+		assert!((only.numbers.emissive_strength - 1.0).abs() < 1e-6, "at a strength of one");
+		assert!((only.numbers.occlusion_strength - 1.0).abs() < 1e-6, "all of its occlusion");
+		assert!(!only.numbers.unlit, "lit");
+		assert_eq!(
+			(only.numbers.uv_scale, only.numbers.uv_offset),
+			(Vec2::ONE, Vec2::ZERO),
+			"and its pictures where the mesh puts them"
+		);
 		assert_eq!(only.name, "material0", "and numbered, having no name");
+		assert!(coats.warnings.is_empty(), "none of which is a complaint: {:?}", coats.warnings);
 	}
 
 	#[test]
@@ -758,7 +1095,7 @@ mod tests {
 			 \"baseColorTexture\": { \"index\": 0 } } } ]",
 		);
 
-		assert_eq!(clamped.surfaces[0].wrap, Wrap::Clamp);
+		assert_eq!(clamped.surfaces[0].numbers.wrap, Wrap::Clamp);
 
 		let mirrored = document(
 			"\"samplers\": [ { \"wrapS\": 33648, \"wrapT\": 33648 } ], \"textures\": [ { \
@@ -766,34 +1103,171 @@ mod tests {
 			 \"baseColorTexture\": { \"index\": 0 } } } ]",
 		);
 
-		assert_eq!(mirrored.surfaces[0].wrap, Wrap::Repeat, "the nearest thing colby has");
+		assert_eq!(
+			mirrored.surfaces[0].numbers.wrap,
+			Wrap::Repeat,
+			"the nearest thing colby has"
+		);
 		assert!(complained(&mirrored, "mirrored"), "got {:?}", mirrored.warnings);
 	}
 
 	#[test]
-	fn everything_this_renderer_has_no_slot_for_is_named_rather_than_dropped_in_silence() {
-		let coats = document(
-			"\"textures\": [ { \"source\": 0 } ], \"materials\": [ { \"emissiveFactor\": [ 1, \
-			 0, 0 ], \"occlusionTexture\": { \"index\": 0 }, \"alphaMode\": \"BLEND\", \
-			 \"normalTexture\": { \"index\": 0, \"scale\": 2 }, \"pbrMetallicRoughness\": { \
-			 \"metallicRoughnessTexture\": { \"index\": 0 }, \"baseColorTexture\": { \"index\": \
-			 0, \"texCoord\": 1 } } } ]",
+	fn the_rest_of_the_material_crosses_and_nothing_about_it_is_a_complaint() {
+		// every one of these was a warning and a dropped picture until this
+		// card: a metal and roughness picture, an occlusion picture and its
+		// strength, an emissive color, its picture and its strength, and a
+		// surface with no light on it.
+		let coats = material(
+			"\"emissiveFactor\": [ 1, 0.5, 0 ], \"emissiveTexture\": { \"index\": 0 }, \
+			 \"occlusionTexture\": { \"index\": 0, \"strength\": 0.25 }, \"extensions\": { \
+			 \"KHR_materials_emissive_strength\": { \"emissiveStrength\": 5 }, \
+			 \"KHR_materials_unlit\": {} }, \"pbrMetallicRoughness\": { \
+			 \"metallicRoughnessTexture\": { \"index\": 0 } }",
+		);
+		let only = &coats.surfaces[0];
+
+		assert_eq!(coats.warnings, Vec::<String>::new(), "nothing is dropped");
+		assert!(
+			only.numbers
+				.emissive
+				.abs_diff_eq(Vec3::new(1.0, 0.5, 0.0), 1e-6)
+		);
+		assert!(
+			(only.numbers.emissive_strength - 5.0).abs() < 1e-6,
+			"the strength is a number of its own and the factor is kept as it was written"
+		);
+		assert!((only.numbers.occlusion_strength - 0.25).abs() < 1e-6);
+		assert!(only.numbers.unlit, "and the surface is drawn as its color");
+
+		// the picture is the same image three times over: numbers for the finish
+		// and the occlusion, decoded once, and a color for the glow
+		assert_eq!(only.finish, only.occlusion, "one numbers copy for both");
+		assert_ne!(only.finish, only.glow, "and a color one for the glow");
+		assert_eq!(coats.pictures.len(), 2);
+
+		let layout = |picture: &Option<Picture>| match picture {
+			| Some(Picture::Inside(at)) => coats.pictures[*at].data.texel,
+			| other => panic!("an extracted picture was expected, not {other:?}"),
+		};
+
+		assert_eq!(layout(&only.finish), Texel::Rgba8Unorm, "a finish is numbers");
+		assert_eq!(layout(&only.glow), Texel::Rgba8Srgb, "and a glow is a color");
+		assert!(
+			coats
+				.pictures
+				.iter()
+				.any(|picture| picture.name == "picture_orm"),
+			"and the numbers are named the way a loose one would be: {:?}",
+			coats
+				.pictures
+				.iter()
+				.map(|picture| &picture.name)
+				.collect::<Vec<_>>()
+		);
+	}
+
+	#[test]
+	fn a_picture_on_the_second_set_is_read_from_it_where_colby_can() {
+		let baked = material(
+			"\"occlusionTexture\": { \"index\": 0, \"texCoord\": 1 }, \"emissiveTexture\": { \
+			 \"index\": 0, \"texCoord\": 1 }",
 		);
 
-		// what it says about its alpha is *not* in the list below any more, and
-		// that is the whole of this commit read from the other end: the file
-		// asks to be blended and colby now blends it.
-		assert_eq!(coats.surfaces[0].blend, Blend::Alpha, "the mode came across");
+		assert!(baked.surfaces[0].numbers.occlusion_uv2, "the occlusion, laid out by a bake");
+		assert!(baked.surfaces[0].numbers.glow_uv2, "and the glow");
+		assert_eq!(baked.warnings, Vec::<String>::new());
 
-		for about in [
-			"a metallic and roughness picture",
-			"an occlusion picture",
-			"an emissive color",
-			"scales its normal map",
-			"a second set of texture coordinates",
-		] {
-			assert!(complained(&coats, about), "nothing said {about}: {:?}", coats.warnings);
-		}
+		let elsewhere = material(
+			"\"normalTexture\": { \"index\": 0, \"texCoord\": 1 }, \"occlusionTexture\": { \
+			 \"index\": 0, \"texCoord\": 2 }, \"pbrMetallicRoughness\": { \"baseColorTexture\": \
+			 { \"index\": 0, \"texCoord\": 1 } }",
+		);
+
+		assert!(!elsewhere.surfaces[0].numbers.occlusion_uv2, "a third set is read as the first");
+		assert!(
+			complained(&elsewhere, "a second set of texture coordinates"),
+			"and the color and the normal map, which colby reads from the first, say so: {:?}",
+			elsewhere.warnings
+		);
+		assert!(complained(&elsewhere, "coordinates 2"), "as does the third set");
+		assert_eq!(elsewhere.warnings.len(), 3, "one line each: {:?}", elsewhere.warnings);
+	}
+
+	#[test]
+	fn a_transform_on_the_color_picture_moves_the_first_set() {
+		let coats = material(
+			"\"normalTexture\": { \"index\": 0, \"extensions\": { \"KHR_texture_transform\": { \
+			 \"offset\": [ 0.25, 0.5 ], \"rotation\": 0.5, \"scale\": [ 2, 3 ] } } }, \
+			 \"pbrMetallicRoughness\": { \"baseColorTexture\": { \"index\": 0, \"extensions\": \
+			 { \"KHR_texture_transform\": { \"offset\": [ 0.25, 0.5 ], \"rotation\": 0.5, \
+			 \"scale\": [ 2, 3 ] } } } }",
+		);
+		let only = &coats.surfaces[0].numbers;
+
+		assert_eq!(only.uv_offset, Vec2::new(0.25, 0.5));
+		assert!((only.uv_rotation - 0.5).abs() < 1e-6);
+		assert_eq!(only.uv_scale, Vec2::new(2.0, 3.0));
+		assert_eq!(coats.warnings, Vec::<String>::new(), "moved alike, so nothing to say");
+	}
+
+	#[test]
+	fn a_picture_moved_another_way_is_named_and_moved_with_the_rest() {
+		let coats = material(
+			"\"normalTexture\": { \"index\": 0, \"extensions\": { \"KHR_texture_transform\": { \
+			 \"scale\": [ 4, 4 ] } } }, \"occlusionTexture\": { \"index\": 0, \"texCoord\": 1, \
+			 \"extensions\": { \"KHR_texture_transform\": { \"offset\": [ 0.5, 0 ] } } }, \
+			 \"pbrMetallicRoughness\": { \"baseColorTexture\": { \"index\": 0 } }",
+		);
+
+		assert_eq!(
+			coats.surfaces[0].numbers.uv_scale,
+			Vec2::ONE,
+			"the color picture's transform, which is none"
+		);
+		assert!(complained(&coats, "normal map differently from its color picture"));
+		assert!(
+			complained(&coats, "reads from the second set"),
+			"and the second set is not moved at all: {:?}",
+			coats.warnings
+		);
+	}
+
+	#[test]
+	fn a_material_with_no_color_picture_is_moved_by_the_first_picture_it_has() {
+		let coats = material(
+			"\"normalTexture\": { \"index\": 0, \"extensions\": { \"KHR_texture_transform\": { \
+			 \"scale\": [ 4, 2 ] } } }",
+		);
+
+		assert_eq!(coats.surfaces[0].numbers.uv_scale, Vec2::new(4.0, 2.0));
+		assert_eq!(coats.warnings, Vec::<String>::new());
+	}
+
+	#[test]
+	fn a_transform_may_move_a_picture_to_the_second_set_by_itself() {
+		// the exchange format's fallback: the reference keeps a set a reader that
+		// ignores the transform can use, and the transform names the one it means
+		let coats = material(
+			"\"occlusionTexture\": { \"index\": 0, \"texCoord\": 0, \"extensions\": { \
+			 \"KHR_texture_transform\": { \"texCoord\": 1 } } }",
+		);
+
+		assert!(coats.surfaces[0].numbers.occlusion_uv2);
+	}
+
+	#[test]
+	fn only_the_normal_maps_scale_is_left_to_complain_about() {
+		let coats = material(
+			"\"normalTexture\": { \"index\": 0, \"scale\": 2 }, \"occlusionTexture\": { \
+			 \"index\": 0 }, \"emissiveFactor\": [ 1, 0, 0 ], \"alphaMode\": \"BLEND\", \
+			 \"pbrMetallicRoughness\": { \"metallicRoughnessTexture\": { \"index\": 0 } }",
+		);
+
+		// what it says about its alpha is *not* a complaint either, and has not
+		// been since colby blended: the file asks to be blended and is
+		assert_eq!(coats.surfaces[0].numbers.blend, Blend::Alpha, "the mode came across");
+		assert!(complained(&coats, "scales its normal map"));
+		assert_eq!(coats.warnings.len(), 1, "and that is all: {:?}", coats.warnings);
 	}
 
 	#[test]
@@ -805,7 +1279,7 @@ mod tests {
 		let modes: Vec<Blend> = coats
 			.surfaces
 			.iter()
-			.map(|surface| surface.blend)
+			.map(|surface| surface.numbers.blend)
 			.collect();
 
 		assert_eq!(
@@ -821,7 +1295,7 @@ mod tests {
 		let coats = document("\"materials\": [ { \"alphaMode\": \"STOCHASTIC\" } ]");
 
 		assert_eq!(
-			coats.surfaces[0].blend,
+			coats.surfaces[0].numbers.blend,
 			Blend::Opaque,
 			"drawing it solid is the answer that draws something"
 		);
@@ -836,18 +1310,22 @@ mod tests {
 			 \"baseColorFactor\": [ 1, 1, 1 ] } }, { } ]",
 		);
 
-		assert!((coats.surfaces[0].opacity - 0.25).abs() < 1e-6, "the alpha the file wrote");
+		assert!((coats.surfaces[0].numbers.opacity - 0.25).abs() < 1e-6, "the alpha written");
 		assert!(
 			coats.surfaces[0]
+				.numbers
 				.base_color
 				.abs_diff_eq(Vec3::new(0.2, 0.4, 0.6), 1e-6),
 			"and the three channels beside it are untouched by reading it"
 		);
 		assert!(
-			(coats.surfaces[1].opacity - 1.0).abs() < 1e-6,
+			(coats.surfaces[1].numbers.opacity - 1.0).abs() < 1e-6,
 			"a factor of three numbers has no alpha in it, so the surface is all there"
 		);
-		assert!((coats.surfaces[2].opacity - 1.0).abs() < 1e-6, "and so has no factor at all");
+		assert!(
+			(coats.surfaces[2].numbers.opacity - 1.0).abs() < 1e-6,
+			"and so has no factor at all"
+		);
 	}
 
 	#[test]
@@ -869,7 +1347,7 @@ mod tests {
 		let moved =
 			document("\"materials\": [ { \"alphaMode\": \"MASK\", \"alphaCutoff\": 0.9 } ]");
 
-		assert_eq!(moved.surfaces[0].blend, Blend::Mask, "it is still a mask");
+		assert_eq!(moved.surfaces[0].numbers.blend, Blend::Mask, "it is still a mask");
 		assert!(
 			complained(&moved, "0.9"),
 			"and the number it wanted is named: {:?}",
