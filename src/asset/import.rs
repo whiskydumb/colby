@@ -46,13 +46,18 @@
 //! wants fewer, or none - `"levels": 0` is a mesh that is only ever drawn
 //! whole.
 //!
-//! **A `.obj` takes two of the four.** It compiles to a `.cmesh`, which is
+//! **And a fifth, whether a mesh is given a second set to keep baked light
+//! in**, @ref [`colby_core::unwrap`]. Every mesh nothing moves is, unless its
+//! file brought one of its own; `"unwrap": false` is a mesh that is never
+//! baked and would rather not carry sixteen bytes a vertex for it.
+//!
+//! **A `.obj` takes three of the five.** It compiles to a `.cmesh`, which is
 //! one mesh with no names and no materials in it, so a sidecar beside one that
 //! says `skip` or `materials` is refused rather than half-obeyed. The
 //! transform is meaningful and is the one knob an OBJ most wants, the format
 //! carrying no unit at all: Unreal runs `.obj` through the same Interchange
 //! pipeline as everything else and hands it the same three offsets. The levels
-//! mean what they mean for any other mesh.
+//! and the second set mean what they mean for any other mesh.
 //!
 //! **Not here, and each for a reason**: attachment points, which nothing in
 //! this engine has; a physics shape, which a `.cmodel` has nowhere to put; clip
@@ -93,9 +98,9 @@ pub const EXTENSION: &str = "model";
 /// arithmetic as a node folded under its parent.
 const SQUARE_ENOUGH: f32 = 1e-4;
 
-/// The keys read by hand beside the transform's table: two lists of names and
-/// a count.
-const HAND: [&str; 3] = ["skip", "materials", "levels"];
+/// The keys read by hand beside the transform's table: two lists of names, a
+/// count and a switch.
+const HAND: [&str; 4] = ["skip", "materials", "levels", "unwrap"];
 
 /// What a sidecar says.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -113,6 +118,10 @@ pub struct Import {
 	/// The most coarser levels each mesh is compiled with, or nothing for as
 	/// many as it thins out to. @ref [`Import::levels`].
 	pub levels: Option<usize>,
+
+	/// Whether each mesh is given a second set to keep baked light in, or
+	/// nothing for yes. @ref [`Import::unwraps`].
+	pub unwrap: Option<bool>,
 }
 
 impl Import {
@@ -122,6 +131,7 @@ impl Import {
 		skip: Vec::new(),
 		materials: Vec::new(),
 		levels: None,
+		unwrap: None,
 	};
 
 	/// How many coarser levels a mesh of this source may be compiled with.
@@ -131,6 +141,12 @@ impl Import {
 	/// thinning out.
 	#[must_use]
 	pub fn levels(&self) -> usize { self.levels.unwrap_or(MAX_LEVELS).min(MAX_LEVELS) }
+
+	/// Whether a mesh of this source is given a second set to keep baked light
+	/// in: yes when the sidecar does not say, which is what a source with no
+	/// sidecar gets too.
+	#[must_use]
+	pub fn unwraps(&self) -> bool { self.unwrap.unwrap_or(true) }
 
 	/// Whether this one says anything at all.
 	///
@@ -275,6 +291,7 @@ pub fn import(text: &str) -> Result<Import> {
 		skip: skipped(&root)?,
 		materials: remapped(&root)?,
 		levels: counted(&root)?,
+		unwrap: switched(&root)?,
 	})
 }
 
@@ -320,6 +337,10 @@ pub fn export(sidecar: &Import) -> Result<String> {
 
 	if let Some(levels) = sidecar.levels {
 		rows.put("levels", levels.to_string());
+	}
+
+	if let Some(unwrap) = sidecar.unwrap {
+		rows.put("unwrap", unwrap.to_string());
 	}
 
 	Ok(rows.text())
@@ -397,6 +418,21 @@ fn counted(root: &Value) -> Result<Option<usize>> {
 		})
 }
 
+/// Whether each mesh is given a second set, when the sidecar says: `true` or
+/// `false`, refused otherwise.
+fn switched(root: &Value) -> Result<Option<bool>> {
+	let Some(value) = root.get("unwrap") else {
+		return Ok(None);
+	};
+
+	value.as_bool().map(Some).ok_or_else(|| {
+		err!(Asset(
+			"an import's unwrap is whether each mesh is given a second set to keep baked light \
+			 in, true or false"
+		))
+	})
+}
+
 /// What each of the file's materials is really made of.
 fn remapped(root: &Value) -> Result<Vec<(String, String)>> {
 	let Some(value) = root.get("materials") else {
@@ -440,6 +476,7 @@ mod tests {
 			skip: vec!["collision_proxy".to_owned(), "helper".to_owned()],
 			materials: vec![("brass".to_owned(), "materials/brass".to_owned())],
 			levels: Some(3),
+			unwrap: Some(false),
 		}
 	}
 
@@ -467,6 +504,7 @@ mod tests {
 		assert_eq!(read.skip, sample().skip, "the list, in order: {text}");
 		assert_eq!(read.materials, sample().materials, "and the map: {text}");
 		assert_eq!(read.levels, Some(3), "and the count: {text}");
+		assert_eq!(read.unwrap, Some(false), "and the switch: {text}");
 		assert!(
 			read.transform
 				.position
@@ -590,6 +628,40 @@ mod tests {
 	}
 
 	#[test]
+	fn a_mesh_is_given_a_second_set_unless_the_sidecar_says_not() {
+		assert!(Import::NONE.unwraps(), "no sidecar is a second set");
+		assert!(import("{}").expect("an empty sidecar").unwraps(), "and so is a silent one");
+		assert!(
+			!import(r#"{ "unwrap": false }"#)
+				.expect("a switch")
+				.unwraps(),
+			"no is no"
+		);
+		assert!(
+			import(r#"{ "unwrap": true }"#)
+				.expect("a switch")
+				.unwraps(),
+			"and yes is yes"
+		);
+		assert!(
+			!import(r#"{ "unwrap": true }"#)
+				.expect("a switch")
+				.is_silent(),
+			"and saying so is saying something"
+		);
+
+		for wrong in ["0", r#""no""#, "[false]"] {
+			let refused =
+				import(&format!(r#"{{ "unwrap": {wrong} }}"#)).expect_err("not a switch");
+
+			assert!(
+				format!("{refused}").contains("unwrap"),
+				"{wrong} is refused, naming the key: {refused}"
+			);
+		}
+	}
+
+	#[test]
 	fn a_remap_that_is_not_a_map_of_names_is_refused() {
 		assert!(import(r#"{ "materials": ["brass"] }"#).is_err(), "a map, not a list");
 		assert!(import(r#"{ "materials": { "brass": 7 } }"#).is_err(), "to a name");
@@ -679,6 +751,10 @@ mod tests {
 		assert!(
 			check_mesh_only(&Import { levels: Some(0), ..Import::NONE }).is_ok(),
 			"and a count of levels, which one mesh has as much as any"
+		);
+		assert!(
+			check_mesh_only(&Import { unwrap: Some(false), ..Import::NONE }).is_ok(),
+			"and the switch for its second set"
 		);
 
 		let refused = check_mesh_only(&sample()).expect_err("skip has nothing to act on");

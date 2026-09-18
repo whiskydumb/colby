@@ -19,7 +19,7 @@ use super::registry::{Entry, Registry};
 use crate::{
 	bytemuck::{Pod, Zeroable},
 	glam::{Vec2, Vec3, Vec4},
-	registry_handle,
+	registry_handle, unwrap,
 };
 
 /// The name [`MeshId::CUBE`] is registered under.
@@ -40,6 +40,15 @@ const SPHERE_RINGS: usize = 16;
 
 /// How many segments of longitude it has.
 const SPHERE_SEGMENTS: usize = 24;
+
+/// The sheet the built-in ball's second set is written onto: ten texels around
+/// it and eight from pole to pole, and the gutter.
+///
+/// What [`unwrap::second`] would lay a ball of radius a half out at, rounded up
+/// to whole texels: a unit of its first set carries two units around it on
+/// average and half of pi from pole to pole, and its area of pi is 78.5 texels
+/// at five a unit - ten by 7.85.
+pub const SPHERE_SHEET: [u32; 2] = [10 + unwrap::GUTTER, 8 + unwrap::GUTTER];
 
 /// How small a triangle's UV area has to be before it is treated as collapsed.
 ///
@@ -258,10 +267,14 @@ pub struct PaintVertex {
 	/// and opaque changes nothing.
 	pub color: [u16; 4],
 
-	/// Where this vertex samples a picture that reads the second set.
+	/// Where this vertex samples a picture that reads the second set, and where
+	/// it keeps the light a bake worked out for it.
 	///
-	/// Origin top left, like [`MeshVertex::uv`]; nought where the source had
-	/// no second set.
+	/// Origin top left, like [`MeshVertex::uv`]. The source's own second set
+	/// when it had one; otherwise the one [`unwrap::second`] laid out, and
+	/// nought in a mesh nobody laid one out for.
+	///
+	/// [`unwrap::second`]: crate::unwrap::second
 	pub uv2: [f32; 2],
 }
 
@@ -359,6 +372,20 @@ pub struct MeshData {
 	/// skin's rule and for the skin's reason: a vertex is one shape or the
 	/// other. @ref [`Self::paint_fits`], [`PaintVertex`].
 	pub paint: Vec<PaintVertex>,
+
+	/// How many texels across and down the second set was laid out for, or
+	/// nought and nought for a mesh with none.
+	///
+	/// At [`unwrap::TEXELS`] a unit, with [`unwrap::GUTTER`] texels between any
+	/// two of its charts: a bake draws the sheet at least this large, and then
+	/// no two charts read each other's light. A second set somebody made is
+	/// given the square that holds it at that density on average, and its
+	/// gutters are theirs. A sheet stands only beside a paint block to be read
+	/// from.
+	///
+	/// [`unwrap::TEXELS`]: crate::unwrap::TEXELS
+	/// [`unwrap::GUTTER`]: crate::unwrap::GUTTER
+	pub sheet: [u32; 2],
 }
 
 impl MeshData {
@@ -434,6 +461,17 @@ impl MeshData {
 	#[must_use]
 	pub const fn paint_fits(&self) -> bool {
 		self.paint.is_empty() || self.paint.len() == self.vertices.len()
+	}
+
+	/// Whether the sheet is one the second set can be laid on: none at all, or
+	/// both of its sides with a paint block beside it to hold the second set.
+	#[must_use]
+	pub const fn sheet_fits(&self) -> bool {
+		match self.sheet {
+			| [0, 0] => true,
+			| [0, _] | [_, 0] => false,
+			| _ => !self.paint.is_empty(),
+		}
 	}
 
 	/// Whether every bone a vertex names could be a bone.
@@ -707,7 +745,8 @@ const FACE_CORNERS: [(f32, f32); 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-
 ///
 /// Every face is wound counter-clockwise seen from outside, and every vertex
 /// carries the flat normal of the face it belongs to. Flat rather than smooth
-/// because a cube with averaged normals looks like a bad sphere.
+/// because a cube with averaged normals looks like a bad sphere. Its second
+/// set is laid out by [`unwrap::second`], a face a chart.
 #[must_use]
 pub fn cube() -> MeshData {
 	let mut mesh = MeshData {
@@ -716,6 +755,7 @@ pub fn cube() -> MeshData {
 		skin: Vec::new(),
 		levels: Vec::new(),
 		paint: Vec::new(),
+		sheet: [0, 0],
 	};
 
 	for (normal, right, up) in CUBE_FACES {
@@ -726,16 +766,19 @@ pub fn cube() -> MeshData {
 	}
 
 	tangents(&mut mesh);
+	unwrap::second(&mut mesh, Vec3::ONE);
 
 	mesh
 }
 
-/// A square one unit on a side in the xz plane, facing up.
+/// A square one unit on a side in the xz plane, facing up, its second set
+/// laid out by [`unwrap::second`].
 #[must_use]
 pub fn quad() -> MeshData {
 	let mut mesh = MeshData::default();
 	push_face(&mut mesh, Vec3::ZERO, Vec3::X * 0.5, Vec3::NEG_Z * 0.5, Vec3::Y);
 	tangents(&mut mesh);
+	unwrap::second(&mut mesh, Vec3::ONE);
 
 	mesh
 }
@@ -745,6 +788,12 @@ pub fn quad() -> MeshData {
 /// A plain latitude-longitude sphere: every ring but the poles is a band of
 /// quadrilaterals, and the normal at a point on a unit sphere is the point
 /// itself, which is what makes this shorter than a cube.
+///
+/// **Its second set is its first, written here onto [`SPHERE_SHEET`]** rather
+/// than laid out by [`unwrap::second`]: its place comes from each platform's
+/// own sine and cosine, which do not round alike everywhere, and a second set
+/// measured from it would not be the same bits everywhere either. What is
+/// written here is made of whole fractions only.
 #[must_use]
 pub fn sphere() -> MeshData {
 	let mut mesh = MeshData {
@@ -753,6 +802,7 @@ pub fn sphere() -> MeshData {
 		skin: Vec::new(),
 		levels: Vec::new(),
 		paint: Vec::new(),
+		sheet: [0, 0],
 	};
 
 	let rings = fraction(SPHERE_RINGS);
@@ -787,6 +837,19 @@ pub fn sphere() -> MeshData {
 	}
 
 	tangents(&mut mesh);
+
+	mesh.paint = mesh
+		.vertices
+		.iter()
+		.map(|vertex| PaintVertex {
+			uv2: [
+				unwrap::onto(vertex.uv[0], SPHERE_SHEET[0]),
+				unwrap::onto(vertex.uv[1], SPHERE_SHEET[1]),
+			],
+			..PaintVertex::PLAIN
+		})
+		.collect();
+	mesh.sheet = SPHERE_SHEET;
 
 	mesh
 }
@@ -860,6 +923,7 @@ mod tests {
 			skin: Vec::new(),
 			levels: Vec::new(),
 			paint: Vec::new(),
+			sheet: [0, 0],
 		}
 	}
 
@@ -960,6 +1024,7 @@ mod tests {
 			skin: Vec::new(),
 			levels: Vec::new(),
 			paint: Vec::new(),
+			sheet: [0, 0],
 		};
 
 		tangents(&mut mesh);
@@ -1266,6 +1331,54 @@ mod tests {
 				"and its normal is a unit vector, got {normal}"
 			);
 		}
+	}
+
+	#[test]
+	fn the_ball_wears_its_first_set_again_on_the_sheet_the_unwrap_would_give_it() {
+		let ball = sphere();
+
+		assert_eq!(ball.sheet, SPHERE_SHEET, "ten by eight and the gutter");
+		assert!(ball.sheet_fits(), "with a paint entry on every vertex to hold it");
+
+		for (vertex, entry) in ball.vertices.iter().zip(&ball.paint) {
+			let wanted = [
+				unwrap::onto(vertex.uv[0], SPHERE_SHEET[0]),
+				unwrap::onto(vertex.uv[1], SPHERE_SHEET[1]),
+			];
+
+			assert_eq!(
+				entry.uv2.map(f32::to_bits),
+				wanted.map(f32::to_bits),
+				"the first set, a texel in from every side"
+			);
+			assert_eq!(entry.color, PaintVertex::PLAIN.color, "and white");
+		}
+
+		let mut measured = MeshData {
+			paint: Vec::new(),
+			sheet: [0, 0],
+			..sphere()
+		};
+
+		unwrap::second(&mut measured, Vec3::ONE);
+
+		assert_eq!(measured.sheet, SPHERE_SHEET, "the sheet the unwrap measures the ball at");
+	}
+
+	#[test]
+	fn a_sheet_has_both_sides_or_neither_and_something_to_lay_on_it() {
+		assert!(MeshData::default().sheet_fits(), "no sheet at all");
+		assert!(quad().sheet_fits(), "a quad laid out");
+
+		let mut lopsided = quad();
+		lopsided.sheet = [7, 0];
+
+		assert!(!lopsided.sheet_fits(), "a sheet with one side");
+
+		let mut empty = quad();
+		empty.paint.clear();
+
+		assert!(!empty.sheet_fits(), "a sheet with no second set to lay on it");
 	}
 
 	#[test]

@@ -35,6 +35,7 @@ use colby_core::{
 	},
 	debug,
 	glam::{Vec2, Vec3},
+	unwrap,
 };
 
 use crate::select::{self, Pick};
@@ -300,6 +301,10 @@ fn grouped(sides: Vec<Side>) -> Vec<(MaterialId, MeshData)> {
 
 	for (_, data) in &mut out {
 		colby_core::abi::mesh::tangents(data);
+		// the second set the compiler gives the file this is written to, so
+		// that a room baked here can have its light baked before its files
+		// come back as meshes
+		unwrap::second(data, Vec3::ONE);
 	}
 
 	out
@@ -358,6 +363,75 @@ mod tests {
 		}
 
 		(world, picks)
+	}
+
+	#[test]
+	fn a_baked_room_has_the_second_set_its_file_will_come_back_with() {
+		let (mut world, picks) = row(3);
+
+		bake(&mut world, &picks, "room");
+
+		let baked = world
+			.meshes
+			.get(world.meshes.find("maps/room/default"))
+			.expect("the room is registered")
+			.value()
+			.clone();
+		let mut read = colby_asset::obj::import(&colby_asset::obj::export(&baked))
+			.expect("what the runner writes reads back");
+
+		unwrap::second(&mut read, Vec3::ONE);
+
+		assert!(baked.sheet != [0, 0], "a sheet laid out when it was baked: {:?}", baked.sheet);
+		assert_eq!(read.sheet, baked.sheet, "the one the compiler lays out from the file");
+		assert_eq!(read.indices, baked.indices, "over the same triangles");
+		assert_eq!(read.paint, baked.paint, "and every vertex in the same place on it");
+	}
+
+	#[test]
+	fn a_stretched_block_is_laid_out_as_long_as_it_is() {
+		let mut world = World::new();
+		let picks = select::block(&mut world, Vec3::ZERO, Some(1.0));
+		let [Pick::Entity(block)] = picks[..] else {
+			panic!("one block: {picks:?}");
+		};
+
+		assert!(
+			world.entities.set_placed(block, Transform {
+				scale: Vec3::new(4.0, 1.0, 1.0),
+				..Transform::IDENTITY
+			}),
+			"the block is stretched"
+		);
+		bake(&mut world, &picks, "long");
+
+		let baked = world
+			.meshes
+			.get(world.meshes.find("maps/long/default"))
+			.expect("the block is registered")
+			.value()
+			.clone();
+		let longest = (0..baked.triangles())
+			.map(|triangle| {
+				let spots: Vec<f32> = baked.indices[triangle * 3..triangle * 3 + 3]
+					.iter()
+					.map(|index| {
+						let vertex = usize::try_from(*index).expect("a small mesh");
+
+						baked.paint[vertex].uv2[0]
+							* f32::from(u16::try_from(baked.sheet[0]).expect("small"))
+					})
+					.collect();
+
+				spots.iter().copied().fold(f32::MIN, f32::max)
+					- spots.iter().copied().fold(f32::MAX, f32::min)
+			})
+			.fold(0.0_f32, f32::max);
+
+		assert!(
+			(longest - 20.0).abs() < 1.0e-3,
+			"a face four units long is twenty texels long, not laid square: {longest}"
+		);
 	}
 
 	#[test]

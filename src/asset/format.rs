@@ -8,8 +8,8 @@
 //! step.
 //!
 //! ```text
-//!   0  MeshHeader                       112 bytes
-//! 112  [MeshVertex;  vertex_count]       48 bytes each
+//!   0  MeshHeader                       128 bytes
+//! 128  [MeshVertex;  vertex_count]       48 bytes each
 //!   .  [u32;         index_count]         4 bytes each
 //!   .  [SkinVertex;  skin_count]         12 bytes each, and only sometimes
 //!   .  [MeshLevel;   level_count]        16 bytes each, and only sometimes
@@ -32,9 +32,9 @@
 //! that is not a picture reads - @ref
 //! [`MeshData::levels`](colby_core::abi::MeshData::levels).
 //!
-//! The header is a hundred and twelve bytes so that the vertex block inherits
-//! the buffer's sixteen-byte alignment, and every block is exactly the layout
-//! the GPU wants. Reading a mesh is therefore a file read into an
+//! The header is a hundred and twenty-eight bytes so that the vertex block
+//! inherits the buffer's sixteen-byte alignment, and every block is exactly the
+//! layout the GPU wants. Reading a mesh is therefore a file read into an
 //! [`AlignedBytes`](crate::AlignedBytes) and a few `bytemuck` casts -
 //! [`MeshFile::vertices`] and [`MeshFile::indices`] borrow straight out of the
 //! buffer and copy nothing.
@@ -68,11 +68,15 @@ pub const MAGIC: [u8; 8] = *b"COLBYMSH";
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
 ///
-/// Seven since a vertex can be painted: the header grew by four words, three
-/// saying where the paint block is and one kept spare so that the vertex block
-/// after it stays on a sixteen-byte boundary. Six was a mesh carrying coarser
-/// levels.
-pub const FORMAT_VERSION: u32 = 7;
+/// Eight since every mesh is given a second set to keep baked light in: the
+/// header grew by four words, two saying how many texels across and down that
+/// set was laid out for and two more kept spare beside the one there was, so
+/// that the vertex block after it stays on a sixteen-byte boundary. The version
+/// would have had to move without them: a mesh compiled before is up to date by
+/// every stamp the compiler keeps, and only a version it does not read makes it
+/// build that mesh again. Seven was a vertex that could be painted, six a mesh
+/// carrying coarser levels.
+pub const FORMAT_VERSION: u32 = 8;
 
 /// The extension a compiled mesh is written with.
 pub const EXTENSION: &str = "cmesh";
@@ -93,7 +97,7 @@ pub const GUIDED: u32 = 1 << 0;
 const KNOWN_FLAGS: u32 = GUIDED;
 
 /// How big [`MeshHeader`] is, and where the vertex block starts.
-pub const HEADER_BYTES: usize = 112;
+pub const HEADER_BYTES: usize = 128;
 
 /// The fixed head of a `.cmesh`.
 ///
@@ -182,10 +186,15 @@ pub struct MeshHeader {
 	/// Where the paint block starts, or zero when there is none.
 	pub paint_offset: u32,
 
+	/// How many texels across and down the second set was laid out for, or
+	/// nought and nought when there is none. @ref
+	/// [`MeshData::sheet`](colby_core::abi::MeshData::sheet).
+	pub sheet: [u32; 2],
+
 	/// Nothing yet, and a reader refuses a file that puts something here: the
-	/// rule [`MeshHeader::flags`] follows. It is here so that the header stays
-	/// a multiple of sixteen bytes.
-	pub spare: u32,
+	/// rule [`MeshHeader::flags`] follows. They are here so that the header
+	/// stays a multiple of sixteen bytes.
+	pub spare: [u32; 3],
 }
 
 /// One coarser level, as the file holds it.
@@ -290,6 +299,10 @@ impl MeshFile {
 		self.block(self.header.paint_offset, self.header.paint_count)
 	}
 
+	/// How many texels across and down the second set was laid out for.
+	#[must_use]
+	pub const fn sheet(&self) -> [u32; 2] { self.header.sheet }
+
 	/// The bounding box the compiler measured.
 	#[must_use]
 	pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -328,6 +341,7 @@ impl MeshFile {
 				})
 				.collect(),
 			paint: self.paint().to_vec(),
+			sheet: self.header.sheet,
 		}
 	}
 
@@ -438,7 +452,8 @@ fn encode_marked(data: &MeshData, flags: u32) -> Result<Vec<u8>> {
 		paint_stride: if paint_count == 0 { 0 } else { stride::<PaintVertex>() },
 		paint_count,
 		paint_offset: if paint_count == 0 { 0 } else { after_coarse },
-		spare: 0,
+		sheet: data.sheet,
+		spare: [0; 3],
 	};
 
 	let mut out = Vec::with_capacity(
@@ -529,6 +544,15 @@ fn sound(data: &MeshData) -> Result<()> {
 			 all the way through or not at all",
 			data.paint.len(),
 			data.vertices.len()
+		)));
+	}
+
+	if !data.sheet_fits() {
+		return Err(err!(Asset(
+			"the mesh says its second set was laid out on a sheet of {} by {} texels, and a \
+			 sheet has both sides or neither and stands beside a paint block to hold the set",
+			data.sheet[0],
+			data.sheet[1]
 		)));
 	}
 
@@ -664,6 +688,7 @@ fn check(bytes: &[u8]) -> std::result::Result<MeshHeader, String> {
 	check_skin(bytes, header)?;
 	check_levels(bytes, header)?;
 	check_paint(header)?;
+	check_sheet(header)?;
 
 	Ok(*header)
 }
@@ -977,8 +1002,8 @@ fn check_levels(bytes: &[u8], header: &MeshHeader) -> std::result::Result<(), St
 /// only the shape: absent, or one entry a vertex, and nothing in the spare
 /// word.
 fn check_paint(header: &MeshHeader) -> std::result::Result<(), String> {
-	if header.spare != 0 {
-		return Err(format!("puts {:#010X} in the header's spare word", header.spare));
+	if let Some(word) = header.spare.iter().find(|word| **word != 0) {
+		return Err(format!("puts {word:#010X} in one of the header's spare words"));
 	}
 
 	if header.paint_count == 0 {
@@ -1001,6 +1026,27 @@ fn check_paint(header: &MeshHeader) -> std::result::Result<(), String> {
 	}
 
 	Ok(())
+}
+
+/// Checks that a sheet, if there is one, is one the second set can be laid on:
+/// both of its sides, and a paint block beside it holding the set.
+///
+/// [`MeshData::sheet_fits`](colby_core::abi::MeshData::sheet_fits), asked of
+/// the bytes.
+fn check_sheet(header: &MeshHeader) -> std::result::Result<(), String> {
+	match header.sheet {
+		| [0, 0] => Ok(()),
+		| [0, _] | [_, 0] => Err(format!(
+			"says its second set was laid out on a sheet of {} by {} texels, which has one side",
+			header.sheet[0], header.sheet[1]
+		)),
+		| _ if header.paint_count == 0 => Err(format!(
+			"says its second set was laid out on a sheet of {} by {} texels, and has no paint \
+			 block to hold the set",
+			header.sheet[0], header.sheet[1]
+		)),
+		| _ => Ok(()),
+	}
 }
 
 /// The level records and the run of their indices, borrowed out of a file whose
@@ -1051,8 +1097,27 @@ mod tests {
 
 	use super::*;
 
-	/// A cube, encoded.
-	fn encoded() -> Vec<u8> { encode(&cube()).expect("a cube encodes") }
+	/// The cube as it was before every mesh had a second set: nobody painted it
+	/// and nothing was laid out on it.
+	fn plain_cube() -> MeshData {
+		MeshData {
+			paint: Vec::new(),
+			sheet: [0, 0],
+			..cube()
+		}
+	}
+
+	/// The quad the same way.
+	fn plain_quad() -> MeshData {
+		MeshData {
+			paint: Vec::new(),
+			sheet: [0, 0],
+			..quad()
+		}
+	}
+
+	/// A cube nobody painted, encoded.
+	fn encoded() -> Vec<u8> { encode(&plain_cube()).expect("a cube encodes") }
 
 	/// Where each of the fields after the bounds starts.
 	const SKIN_STRIDE_AT: usize = 64;
@@ -1066,7 +1131,8 @@ mod tests {
 	const PAINT_STRIDE_AT: usize = 96;
 	const PAINT_COUNT_AT: usize = 100;
 	const PAINT_OFFSET_AT: usize = 104;
-	const SPARE_AT: usize = 108;
+	const SHEET_AT: usize = 108;
+	const SPARE_AT: usize = 116;
 
 	/// A quad every vertex of which is pulled by bones, one of them by four.
 	fn skinned() -> MeshData {
@@ -1082,7 +1148,7 @@ mod tests {
 				weights: [64, 64, 64, 63],
 			},
 		];
-		let mut mesh = quad();
+		let mut mesh = plain_quad();
 		mesh.skin = pulls
 			.iter()
 			.copied()
@@ -1098,7 +1164,7 @@ mod tests {
 
 	/// The cube with two coarser levels: ten of its triangles, then four.
 	fn leveled() -> MeshData {
-		let mut mesh = cube();
+		let mut mesh = plain_cube();
 
 		mesh.levels = vec![
 			Level {
@@ -1192,7 +1258,11 @@ mod tests {
 
 	#[test]
 	fn the_header_is_the_size_the_layout_depends_on() {
-		assert_eq!(size_of::<MeshHeader>(), HEADER_BYTES, "a hundred and twelve bytes, exactly");
+		assert_eq!(
+			size_of::<MeshHeader>(),
+			HEADER_BYTES,
+			"a hundred and twenty-eight bytes, exactly"
+		);
 		assert_eq!(align_of::<MeshHeader>(), 4, "and no padding beyond its fields");
 		assert_eq!(HEADER_BYTES % ALIGNMENT, 0, "so the vertex block stays aligned");
 		assert_eq!(size_of::<MeshLevel>(), 16, "and a level record is four words");
@@ -1301,6 +1371,69 @@ mod tests {
 			.expect_err("it says where a block is and then that there is none");
 
 		assert!(error.to_string().contains("no entries"), "and says so: {error}");
+	}
+
+	#[test]
+	fn a_second_set_and_its_sheet_survive_the_trip_to_bytes_and_back() {
+		let laid = cube();
+		let bytes = encode(&laid).expect("a laid out cube encodes");
+		let file =
+			MeshFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("and reads back");
+
+		assert_eq!(file.sheet(), [14, 21], "the sheet it was laid out for");
+		assert_eq!(
+			[word(&bytes, SHEET_AT), word(&bytes, SHEET_AT + 4)],
+			[14, 21],
+			"in the header's own two words"
+		);
+		assert_eq!(file.to_mesh_data(), laid, "and every vertex's second set with it");
+		assert_eq!(
+			bytes.len(),
+			HEADER_BYTES + 24 * (size_of::<MeshVertex>() + size_of::<PaintVertex>()) + 36 * 4,
+			"a paint entry a vertex after the indices, and nothing else"
+		);
+	}
+
+	#[test]
+	fn a_sheet_that_holds_no_second_set_is_neither_written_nor_read() {
+		let mut lopsided = cube();
+		lopsided.sheet = [14, 0];
+
+		assert!(refused(&lopsided).contains("both sides"), "a sheet with one side");
+
+		let mut empty = plain_cube();
+		empty.sheet = [7, 7];
+
+		assert!(refused(&empty).contains("paint block"), "a sheet with nothing on it");
+
+		let read = |edit: &dyn Fn(&mut Vec<u8>), from: &MeshData| {
+			let mut bytes = encode(from).expect("it encodes");
+			edit(&mut bytes);
+
+			MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
+				.expect_err("the file is no longer valid")
+				.to_string()
+		};
+
+		assert!(
+			read(&|bytes| put(bytes, SHEET_AT + 4, 0), &cube()).contains("one side"),
+			"a file whose sheet has one side"
+		);
+		assert!(
+			read(
+				&|bytes| {
+					put(bytes, SHEET_AT, 9);
+					put(bytes, SHEET_AT + 4, 9);
+				},
+				&plain_cube()
+			)
+			.contains("no paint block"),
+			"a file with a sheet and nothing to hold what is on it"
+		);
+		assert!(
+			read(&|bytes| put(bytes, SPARE_AT + 8, 1), &cube()).contains("spare word"),
+			"the last of the three words that mean nothing yet"
+		);
 	}
 
 	#[test]
@@ -1629,7 +1762,7 @@ mod tests {
 
 	#[test]
 	fn a_truncated_file_is_refused_rather_than_read_short() {
-		for keep in [0, 8, 63, 64, 95, 96, 100, 111] {
+		for keep in [0, 8, 63, 64, 95, 96, 100, 111, 112, 127] {
 			let bytes = &encoded()[..keep];
 			let error = MeshFile::from_bytes(AlignedBytes::from_slice(bytes))
 				.expect_err("a truncated file is not a whole cube");

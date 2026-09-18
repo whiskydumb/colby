@@ -49,9 +49,12 @@
 
 use super::{
 	field::{Field, Kind, Value, field, word},
-	mesh::{MeshData, MeshVertex, tangents},
+	mesh::{MeshData, MeshVertex, PaintVertex, tangents},
 };
-use crate::glam::{Vec2, Vec3};
+use crate::{
+	glam::{Vec2, Vec3},
+	unwrap,
+};
 
 /// The fewest vertices a terrain may have on a side.
 ///
@@ -456,6 +459,10 @@ impl Terrain {
 	/// [`GpuMesh`]'s sort key and the solver's bounds both read as the middle
 	/// anyway.
 	///
+	/// Its second set is written here rather than laid out by
+	/// [`unwrap::second`]: the ground seen from above, on a square sheet at
+	/// [`unwrap::TEXELS`] a unit of its side.
+	///
 	/// @return the mesh, or an empty one for a terrain that is none
 	///
 	/// [`GpuMesh`]: https://docs.rs/colby_engine
@@ -477,12 +484,14 @@ impl Terrain {
 		};
 
 		let corners = usize::try_from(wide).unwrap_or(0);
+		let sheet = unwrap::square(span);
 		let mut mesh = MeshData {
 			vertices: Vec::with_capacity(corners * corners),
 			indices: Vec::with_capacity(corners.saturating_sub(1).pow(2) * 6),
 			skin: Vec::new(),
 			levels: Vec::new(),
-			paint: Vec::new(),
+			paint: Vec::with_capacity(corners * corners),
+			sheet: [sheet, sheet],
 		};
 
 		for row in 0..wide {
@@ -491,14 +500,20 @@ impl Terrain {
 			for column in 0..wide {
 				let x = step.mul_add(across(column), corner);
 				let flat = Vec2::new(x, z);
-				let uv = Vec2::new(across(column) / across(cells), across(row) / across(cells))
-					* repeat;
+				let share =
+					Vec2::new(across(column) / across(cells), across(row) / across(cells));
 
 				mesh.vertices.push(MeshVertex::new(
 					Vec3::new(x, self.height_at(flat), z),
 					self.normal_at(flat, step),
-					uv,
+					share * repeat,
 				));
+				// the second set is the ground seen from above, one chart the
+				// whole of the sheet: its heights never fold it over itself
+				mesh.paint.push(PaintVertex {
+					uv2: [unwrap::onto(share.x, sheet), unwrap::onto(share.y, sheet)],
+					..PaintVertex::PLAIN
+				});
 			}
 		}
 
@@ -770,6 +785,44 @@ mod tests {
 		let far = mesh.vertices.last().expect("a mesh with corners");
 
 		assert!((far.uv[0] - 8.0).abs() < 1.0e-4, "sixty-four units at eight is eight repeats");
+	}
+
+	#[test]
+	fn the_second_set_is_the_ground_seen_from_above_a_texel_in_from_every_side() {
+		let mesh = Terrain {
+			size: 64.0,
+			tiling: 8.0,
+			side: 3,
+			..Terrain::hills()
+		}
+		.build();
+		let side = unwrap::square(64.0);
+
+		assert_eq!(side, 322, "sixty-four units at five texels a unit, and the gutter");
+		assert_eq!(mesh.sheet, [side, side], "a square sheet");
+		assert!(mesh.sheet_fits(), "with a paint entry on every vertex to hold it");
+
+		let first = mesh.paint.first().expect("a mesh with corners");
+		let far = mesh.paint.last().expect("a mesh with corners");
+		let (near, whole) = (1.0 / 322.0_f32, 321.0 / 322.0_f32);
+
+		assert_eq!(first.uv2.map(f32::to_bits), [near.to_bits(); 2], "a texel in at one corner");
+		assert_eq!(
+			far.uv2.map(f32::to_bits),
+			[whole.to_bits(); 2],
+			"and a texel short at the other"
+		);
+		assert_eq!(
+			mesh.paint[1].uv2.map(f32::to_bits),
+			[161.0 / 322.0_f32, near].map(f32::to_bits),
+			"the next vertex along a row is halfway across and still at the top"
+		);
+		assert!(
+			mesh.paint
+				.iter()
+				.all(|entry| entry.color == PaintVertex::PLAIN.color),
+			"painted white"
+		);
 	}
 
 	#[test]

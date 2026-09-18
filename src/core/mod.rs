@@ -16,6 +16,7 @@ pub mod error;
 pub mod log;
 pub mod random;
 pub mod time;
+pub mod unwrap;
 pub mod utils;
 
 #[cfg(feature = "hot_reload")]

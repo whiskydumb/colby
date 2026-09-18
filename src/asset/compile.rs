@@ -56,6 +56,7 @@ use colby_core::{
 	},
 	err,
 	glam::Vec3,
+	unwrap,
 	utils::path::lexical,
 };
 
@@ -340,6 +341,10 @@ pub enum Produced {
 
 		/// How many coarser levels it was compiled with.
 		levels: usize,
+
+		/// How many texels across and down its second set was laid out for,
+		/// nought and nought for none.
+		sheet: [u32; 2],
 	},
 
 	/// Pixels.
@@ -760,9 +765,10 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 /// Its own function since a sidecar joined it: the arm above is a match over
 /// eleven kinds and this one now has a second input.
 ///
-/// **A sidecar beside an OBJ may only move it.** A `.cmesh` is one mesh with
-/// no names and no materials in it, so the other two answers have nothing to
-/// act on and are refused - @ref [`import::check_mesh_only`]. The transform is
+/// **A sidecar beside an OBJ may only move it**, and say how many levels and
+/// whether a second set it is compiled with. A `.cmesh` is one mesh with no
+/// names and no materials in it, so the other two answers have nothing to act
+/// on and are refused - @ref [`import::check_mesh_only`]. The transform is
 /// worth having on its own: the format carries no unit at all, and Unreal runs
 /// a `.obj` through the same import pipeline as everything else and hands it
 /// the same three offsets.
@@ -777,6 +783,13 @@ fn compile_mesh(source: &Path) -> Result<(Vec<u8>, Produced)> {
 		import::check_mesh_only(sidecar)
 			.map_err(|error| err!(Asset("{}: {error}", import::beside(source).display())))?;
 		moved(&mut data, sidecar);
+	}
+
+	// after the move, so that a chart is measured in the units the mesh is
+	// drawn in, and before the levels, which are indices over the vertices
+	// this may copy
+	if guide.as_ref().is_none_or(import::Import::unwraps) {
+		unwrap::second(&mut data, Vec3::ONE);
 	}
 
 	// after the move, so a level is thinned from the shape the mesh will have
@@ -798,6 +811,7 @@ fn compile_mesh(source: &Path) -> Result<(Vec<u8>, Produced)> {
 		triangles: data.triangles(),
 		bounds: data.bounds(),
 		levels: data.levels.len(),
+		sheet: data.sheet,
 	};
 
 	Ok((bytes, produced))
@@ -879,10 +893,15 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 			continue;
 		}
 
-		let data = MeshData {
-			levels: simplify::levels(&piece.data, sidecar.levels()),
-			..piece.data.clone()
-		};
+		let mut data = piece.data.clone();
+
+		// at the scale the piece stands at in its model, and before its levels
+		if sidecar.unwraps() {
+			unwrap::second(&mut data, smallest_scale(&placements, &name));
+		}
+
+		data.levels = simplify::levels(&data, sidecar.levels());
+
 		let bytes = format::encode(&data)
 			.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 
@@ -970,6 +989,23 @@ fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
 		model::encode(&data).map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 
 	Ok((bytes, produced, warnings))
+}
+
+/// The scale a piece stands at in its model, the smallest of all of its
+/// placements axis by axis: laid out at that, it has at least the density a
+/// second set is laid out at wherever it stands. A mirror counts as its size.
+///
+/// @param placements - every placement of the model
+/// @param name - the piece's asset name, as a placement names it
+fn smallest_scale(placements: &[model::Placement], name: &str) -> Vec3 {
+	placements
+		.iter()
+		.filter(|placement| placement.mesh == name)
+		.map(|placement| placement.transform.scale.abs())
+		.reduce(|least, scale| {
+			Vec3::new(least.x.min(scale.x), least.y.min(scale.y), least.z.min(scale.z))
+		})
+		.unwrap_or(Vec3::ONE)
 }
 
 /// Every piece of a model that survives its sidecar, where the sidecar puts it.
@@ -1955,6 +1991,7 @@ f 1 2 3 4
 				triangles: 12,
 				bounds: (Vec3::splat(-0.5), Vec3::splat(0.5)),
 				levels: 0,
+				sheet: [14, 21],
 			},
 			"six quads is twelve triangles, four vertices each because the shading is flat, and 			 nothing to thin out of twelve"
 		);
@@ -2625,6 +2662,76 @@ FORMAT=32-bit_rle_rgbe
 	}
 
 	#[test]
+	fn an_obj_is_given_a_second_set_unless_its_sidecar_says_not() {
+		let workspace = workspace("mesh-second-set");
+		let source = put(&workspace, "meshes/box.obj", CUBE_OBJ);
+		let output = output_root(&workspace)
+			.join("meshes")
+			.join("box.cmesh");
+
+		run(&workspace, false);
+
+		let laid = MeshFile::open(&output)
+			.expect("it reads")
+			.to_mesh_data();
+
+		assert_eq!(laid.sheet, [14, 21], "a face of a unit cube a chart, laid by its facing");
+		assert_eq!(laid.paint.len(), laid.vertices.len(), "and a second set on every vertex");
+		assert!(
+			laid.paint
+				.iter()
+				.all(|entry| entry.color == [colby_core::abi::PaintVertex::WHOLE; 4]),
+			"painted white"
+		);
+
+		let sidecar = import::beside(&source);
+
+		fs::write(&sidecar, r#"{ "unwrap": false }"#).expect("the sidecar is written");
+		dated(&sidecar, written(&output) + Duration::from_secs(1));
+		run(&workspace, false);
+
+		let bare = MeshFile::open(&output)
+			.expect("it reads")
+			.to_mesh_data();
+
+		assert_eq!(bare.sheet, [0, 0], "no second set when the sidecar says not");
+		assert!(bare.paint.is_empty(), "and no paint block to hold one");
+		assert_eq!(bare.vertices, laid.vertices, "while the mesh itself is the same");
+	}
+
+	#[test]
+	fn a_models_piece_is_laid_out_at_the_scale_it_stands_at() {
+		let placements =
+			[("box", 2.0), ("box", 0.5), ("rod", 3.0)].map(|(mesh, scale)| model::Placement {
+				name: mesh.to_owned(),
+				mesh: format!("models/kit/{mesh}"),
+				material: String::new(),
+				skeleton: String::new(),
+				transform: Transform {
+					scale: Vec3::new(scale, -scale, 1.0),
+					..Transform::IDENTITY
+				},
+				light: Light::NONE,
+			});
+
+		assert_eq!(
+			smallest_scale(&placements, "models/kit/box"),
+			Vec3::new(0.5, 0.5, 1.0),
+			"the smallest of its placements axis by axis, a mirror counted as its size"
+		);
+		assert_eq!(
+			smallest_scale(&placements, "models/kit/rod"),
+			Vec3::new(3.0, 3.0, 1.0),
+			"and only its own"
+		);
+		assert_eq!(
+			smallest_scale(&placements, "models/kit/none"),
+			Vec3::ONE,
+			"and one for a piece nothing stands"
+		);
+	}
+
+	#[test]
 	fn a_dense_obj_is_compiled_with_its_levels_and_a_sidecar_can_ask_for_fewer_or_none() {
 		let workspace = workspace("mesh-levels");
 		let text = bumpy_obj(32, 48);
@@ -2648,6 +2755,7 @@ FORMAT=32-bit_rle_rgbe
 		assert_eq!(triangles, 32 * 48 * 2, "every triangle of the ball in the mesh itself");
 		assert!(levels >= 3, "and a ball of three thousand triangles thins out: {levels}");
 		assert_eq!(read.levels.len(), levels, "the report counts what the file holds");
+		assert!(read.sheet != [0, 0], "and it was laid out before its levels were made");
 		assert_eq!(read.levels, chain, "which is the simplifier's own chain for that text");
 		assert_eq!(read.indices, whole.indices, "while the mesh itself is untouched");
 
@@ -2766,6 +2874,48 @@ mod model_tests {
 		)
 		.expect("the model reads")
 		.to_model_data()
+	}
+
+	#[test]
+	fn a_piece_is_laid_out_at_the_scale_its_model_stands_it_at() {
+		let dir = workspace("piece-scale");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		run(&dir, false);
+
+		let stands = compiled(&dir);
+		let scale = smallest_scale(&stands.placements, "models/lamp/column");
+		let column = at(&output_root(&dir), "models/lamp/column", format::EXTENSION);
+		let read = MeshFile::open(&column)
+			.expect("the column reads")
+			.to_mesh_data();
+		let bare = || MeshData {
+			paint: Vec::new(),
+			sheet: [0, 0],
+			levels: Vec::new(),
+			..read.clone()
+		};
+		let (mut stood, mut alone) = (bare(), bare());
+
+		unwrap::second(&mut stood, scale);
+		unwrap::second(&mut alone, Vec3::ONE);
+
+		assert_eq!(stood.paint, read.paint, "laid out at the scale it stands at, {scale}");
+		assert_eq!(stood.sheet, read.sheet, "on the sheet the file says");
+		assert_ne!(alone.sheet, read.sheet, "which its own units would not have given it");
+
+		let sidecar = import::beside(&source_root(&dir).join("models").join("lamp.glb"));
+
+		fs::write(&sidecar, r#"{ "unwrap": false }"#).expect("the sidecar is written");
+		dated(&sidecar, written(&column) + Duration::from_secs(1));
+		run(&dir, false);
+
+		let plain = MeshFile::open(&column)
+			.expect("the column reads")
+			.to_mesh_data();
+
+		assert_eq!(plain.sheet, [0, 0], "and none when its sidecar says not");
+		assert!(plain.paint.is_empty(), "with no paint block either");
 	}
 
 	#[test]

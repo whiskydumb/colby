@@ -429,6 +429,7 @@ impl Build<'_> {
 			skin: Vec::new(),
 			levels: Vec::new(),
 			paint: self.paint_of(attributes, count),
+			sheet: [0, 0],
 		};
 
 		if !data.indices.len().is_multiple_of(3) {

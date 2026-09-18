@@ -518,6 +518,7 @@ mod tests {
 			skin: Vec::new(),
 			levels: Vec::new(),
 			paint: Vec::new(),
+			sheet: [0, 0],
 		};
 
 		one.vertices.push(one.vertices[0]);
@@ -554,6 +555,7 @@ mod tests {
 			skin: Vec::new(),
 			levels: Vec::new(),
 			paint: Vec::new(),
+			sheet: [0, 0],
 		};
 		let text = export(&broken);
 
