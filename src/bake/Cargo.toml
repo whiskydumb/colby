@@ -1,0 +1,23 @@
+[package]
+name = "colby_bake"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+bench = false
+
+# @note: one dependency, the one every crate here has, and the whole reason the
+# baker is a crate of its own rather than a module of the renderer: it draws
+# nothing and opens no device. Rays are traced on the processor against a tree
+# built here, so a bake is the same bytes on every machine that runs it, runs in
+# a test with no graphics hardware at all, and can be asked for by a tool that
+# has no window.
+[dependencies]
+colby_core.workspace = true
+
+[lints]
+workspace = true
