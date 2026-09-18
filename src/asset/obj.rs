@@ -517,6 +517,7 @@ mod tests {
 			indices: Vec::new(),
 			skin: Vec::new(),
 			levels: Vec::new(),
+			paint: Vec::new(),
 		};
 
 		one.vertices.push(one.vertices[0]);
@@ -552,6 +553,7 @@ mod tests {
 			indices: vec![0, 1, 2],
 			skin: Vec::new(),
 			levels: Vec::new(),
+			paint: Vec::new(),
 		};
 		let text = export(&broken);
 

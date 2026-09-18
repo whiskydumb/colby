@@ -482,6 +482,7 @@ impl Terrain {
 			indices: Vec::with_capacity(corners.saturating_sub(1).pow(2) * 6),
 			skin: Vec::new(),
 			levels: Vec::new(),
+			paint: Vec::new(),
 		};
 
 		for row in 0..wide {

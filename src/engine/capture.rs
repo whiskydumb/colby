@@ -353,14 +353,15 @@ pub const fn rgb(red: f32, green: f32, blue: f32) -> Vec3 { Vec3::new(red, green
 mod tests {
 	use colby_core::{
 		abi::{
-			Decal, EntityId, Material, MeshData, MeshId, Pose, PoseId, Post, Renderable,
-			SkinVertex, Sky, SkyKind, Texel, TextureData, TextureId, ToneMap, Transform,
+			Decal, EntityId, Material, MeshData, MeshId, PaintVertex, Pose, PoseId, Post,
+			Renderable, SkinVertex, Sky, SkyKind, Texel, TextureData, TextureId, ToneMap,
+			Transform,
 			cvar::Value,
 			material::{Blend, MaterialId},
 			mesh,
 			skeleton::{Bone, SkeletonData},
 		},
-		glam::{Mat4, Quat},
+		glam::{Mat4, Quat, Vec2, Vec4},
 	};
 	use wgpu::Backends;
 
@@ -4003,6 +4004,349 @@ f 1 4 5
 			now_lit > still_dark * 2,
 			"so inside one frame the hole and the solid texel really do differ: {now_lit} \
 			 against {still_dark}"
+		);
+	}
+
+	/// The built-in quad with every vertex painted one color.
+	///
+	/// @param color - linear RGBA, as the paint holds it
+	fn painted_quad(color: Vec4) -> MeshData {
+		let mut quad = mesh::quad();
+		quad.paint = vec![PaintVertex::new(color, Vec2::ZERO); quad.vertices.len()];
+
+		quad
+	}
+
+	/// A flat square in the xz plane, facing up, cut into `side` by `side`
+	/// cells: the built-in quad with more vertices than it needs.
+	///
+	/// @param side - how many cells along each edge
+	fn grid(side: u16) -> MeshData {
+		let cells = f32::from(side);
+		let mut data = MeshData::default();
+
+		for row in 0..=side {
+			for column in 0..=side {
+				let (u, v) = (f32::from(column) / cells, f32::from(row) / cells);
+
+				data.vertices
+					.push(colby_core::abi::MeshVertex::new(
+						Vec3::new(u - 0.5, 0.0, v - 0.5),
+						Vec3::Y,
+						Vec2::new(u, v),
+					));
+			}
+		}
+
+		let wide = u32::from(side) + 1;
+
+		for row in 0..u32::from(side) {
+			for column in 0..u32::from(side) {
+				let corner = row * wide + column;
+
+				data.indices.extend([
+					corner,
+					corner + wide,
+					corner + 1,
+					corner + 1,
+					corner + wide,
+					corner + wide + 1,
+				]);
+			}
+		}
+
+		mesh::tangents(&mut data);
+
+		data
+	}
+
+	/// One overhead frame of whatever a caller stands in it, lit from
+	/// everywhere and by nothing else, with the frame's own size in the world
+	/// handed over so a floor can fill it.
+	///
+	/// The arrangement of [`shot_of`], opened up: the camera straight above,
+	/// the light traveling sideways so that a surface facing up is lit by the
+	/// ambient term alone, and a blue clear under everything.
+	///
+	/// @param dress - what stands in the world, given the world and how wide
+	/// the frame is at the floor
+	/// @return the frame, or `None` on a machine with no GPU
+	fn overhead<F>(dress: F) -> Option<Image>
+	where
+		F: FnOnce(&mut World, f32),
+	{
+		let mut capture = capture_of(SQUARE, SQUARE)?;
+		let mut world = looking_world();
+		world.ambient = Vec3::splat(1.0);
+		world.camera.position = Vec3::new(0.0, HEIGHT, 0.01);
+
+		let across = (world.camera.fov_y / 2.0).tan() * HEIGHT * 2.0;
+		dress(&mut world, across);
+
+		Some(
+			capture
+				.shoot(&mut world)
+				.expect("the capture renders"),
+		)
+	}
+
+	/// Stands a mesh in a material at a height, as wide as the frame.
+	fn stand(world: &mut World, across: f32, height: f32, mesh: MeshId, material: MaterialId) {
+		let floor = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, height, 0.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(across, 1.0, across),
+		});
+		world
+			.entities
+			.set_renderable(floor, Renderable::of(mesh, material, Vec3::ONE));
+	}
+
+	#[test]
+	fn a_vertex_painted_a_color_is_drawn_as_the_same_color_on_its_material_is() {
+		let color = Vec4::new(0.25, 0.5, 0.75, 1.0);
+		// the color as the paint holds it, sixteen bits a channel, which is what
+		// the material has to be given for the two to be one color
+		let held = PaintVertex::new(color, Vec2::ZERO)
+			.color()
+			.truncate();
+
+		let (Some(by_paint), Some(by_material), Some(white)) = (
+			overhead(|world, across| {
+				let mesh = world
+					.meshes
+					.insert("test/painted", painted_quad(color));
+
+				stand(world, across, 0.0, mesh, MaterialId::DEFAULT);
+			}),
+			overhead(|world, across| {
+				let material = world
+					.materials
+					.insert("test/colored", Material::colored(held));
+
+				stand(world, across, 0.0, MeshId::QUAD, material);
+			}),
+			overhead(|world, across| {
+				stand(world, across, 0.0, MeshId::QUAD, MaterialId::DEFAULT);
+			}),
+		) else {
+			return;
+		};
+
+		assert!(
+			by_paint.pixels == by_material.pixels,
+			"a floor painted a color and a floor made of it are one picture, to the byte"
+		);
+		// what makes that a measurement: a paint the shader never read would
+		// hand back the white floor, and the relation above would then fail
+		// only because the material half moved
+		assert!(
+			distance(by_paint.pixel(SQUARE / 2, SQUARE / 2), white.pixel(SQUARE / 2, SQUARE / 2))
+				> 40,
+			"and neither is the white floor: {:?} against {:?}",
+			by_paint.pixel(SQUARE / 2, SQUARE / 2),
+			white.pixel(SQUARE / 2, SQUARE / 2)
+		);
+	}
+
+	#[test]
+	fn a_cutout_painted_clear_leaves_nothing_of_itself_and_a_solid_one_ignores_it() {
+		let clear = Vec4::new(1.0, 1.0, 1.0, 0.0);
+		let dressed = |blend: Blend| {
+			overhead(move |world, across| {
+				let mesh = world
+					.meshes
+					.insert("test/clear", painted_quad(clear));
+				let material = world
+					.materials
+					.insert("test/mode", Material { blend, ..Material::DEFAULT });
+
+				stand(world, across, 0.0, mesh, material);
+			})
+		};
+
+		let (Some(cut), Some(solid), Some(nothing), Some(white)) = (
+			dressed(Blend::Mask),
+			dressed(Blend::Opaque),
+			overhead(|_, _| ()),
+			overhead(|world, across| {
+				stand(world, across, 0.0, MeshId::QUAD, MaterialId::DEFAULT);
+			}),
+		) else {
+			return;
+		};
+
+		assert!(
+			cut.pixels == nothing.pixels,
+			"a cutout painted clear at every vertex is a hole all the way across"
+		);
+		assert!(
+			solid.pixels == white.pixels,
+			"and a solid surface reads no alpha, painted or not, which leaves the white floor"
+		);
+		assert!(cut.pixels != solid.pixels, "so the two modes really do differ here");
+	}
+
+	/// One overhead frame of a red floor, with a pane of blue glass over it
+	/// painted to some alpha, or with none.
+	///
+	/// @param alpha - how much of the picture the pane's paint leaves, or
+	/// `None` for no pane at all
+	fn pane_over_red(alpha: Option<f32>) -> Option<Image> {
+		overhead(move |world, across| {
+			let red = world
+				.materials
+				.insert("test/red", Material::colored(Vec3::new(0.8, 0.1, 0.1)));
+			stand(world, across, 0.0, MeshId::QUAD, red);
+
+			let Some(alpha) = alpha else {
+				return;
+			};
+
+			let mesh = world
+				.meshes
+				.insert("test/pane", painted_quad(Vec4::new(1.0, 1.0, 1.0, alpha)));
+			let glass = world.materials.insert(
+				"test/glass",
+				Material::colored(Vec3::new(0.1, 0.1, 0.9)).translucent(1.0),
+			);
+
+			stand(world, across, 1.0, mesh, glass);
+		})
+	}
+
+	#[test]
+	fn glass_painted_clear_lets_through_everything_behind_it() {
+		let (Some(bare), Some(clear), Some(seen)) =
+			(pane_over_red(None), pane_over_red(Some(0.0)), pane_over_red(Some(1.0)))
+		else {
+			return;
+		};
+
+		assert!(
+			clear.pixels == bare.pixels,
+			"a pane painted clear is not there: the floor behind it, to the byte"
+		);
+		assert!(
+			distance(seen.pixel(SQUARE / 2, SQUARE / 2), bare.pixel(SQUARE / 2, SQUARE / 2)) > 40,
+			"and one painted whole is: {:?} against {:?}",
+			seen.pixel(SQUARE / 2, SQUARE / 2),
+			bare.pixel(SQUARE / 2, SQUARE / 2)
+		);
+	}
+
+	/// One frame of a white quad painted to some alpha hung over the floor, in
+	/// a mode: [`cast_by`] with the holes in the paint rather than the picture.
+	fn cast_painted(blend: Blend, alpha: f32) -> Option<(Image, World)> {
+		let mut capture = capture()?;
+		let mut world = shadowed_world();
+		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+		world.camera.target = Vec3::ZERO;
+
+		let mesh = world
+			.meshes
+			.insert("test/pane", painted_quad(Vec4::new(1.0, 1.0, 1.0, alpha)));
+		let material = world
+			.materials
+			.insert("test/pane", Material { blend, ..Material::DEFAULT });
+		let caster = world.entities.spawn_at(Transform {
+			position: Vec3::new(0.0, CASTER.0, 0.0),
+			rotation: Quat::IDENTITY,
+			scale: Vec3::new(CASTER.1, 1.0, CASTER.1),
+		});
+		world
+			.entities
+			.set_renderable(caster, Renderable::of(mesh, material, Vec3::ONE));
+
+		let image = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		Some((image, world))
+	}
+
+	#[test]
+	fn a_cutout_painted_clear_throws_no_shadow_and_a_solid_one_painted_clear_still_does() {
+		let (Some((cut, world)), Some((solid, _)), Some((kept, _))) = (
+			cast_painted(Blend::Mask, 0.0),
+			cast_painted(Blend::Opaque, 0.0),
+			cast_painted(Blend::Mask, 1.0),
+		) else {
+			return;
+		};
+
+		// under the middle of the caster, and far enough to its side that no
+		// shadow reaches
+		let under = on_screen(&world, beneath(&world, Vec3::new(0.0, CASTER.0, 0.0)), SIZE);
+		let beside = on_screen(
+			&world,
+			beneath(&world, Vec3::new(0.0, CASTER.0, 0.0)) + Vec3::new(0.0, 0.0, 4.0),
+			SIZE,
+		);
+		let lit = brightness(solid.pixel(beside.0, beside.1));
+
+		assert!(
+			brightness(solid.pixel(under.0, under.1)) * 2 < lit,
+			"a solid pane shades the floor whatever it was painted"
+		);
+		assert!(
+			brightness(kept.pixel(under.0, under.1)) * 2 < lit,
+			"and so does a cutout painted whole"
+		);
+		assert!(
+			brightness(cut.pixel(under.0, under.1)) * 10 > lit * 8,
+			"but a cutout painted clear lets the light through, because the cascade pass reads 			 the paint's alpha where the scene does: {} against {lit}",
+			brightness(cut.pixel(under.0, under.1))
+		);
+	}
+
+	#[test]
+	fn a_mesh_longer_than_the_plain_buffer_still_reads_white_at_every_vertex() {
+		// seventy cells a side is 5,041 vertices, past the 1,024 the plain
+		// buffer starts with: a buffer that did not grow would hand the far end
+		// of the mesh whatever lies past its own end
+		let side = 70;
+		let plainly_white = |painted: bool| {
+			overhead(move |world, across| {
+				let mut mesh = grid(side);
+				// a block of plain entries as long as the mesh, or none at all
+				mesh.paint = vec![PaintVertex::PLAIN; mesh.vertices.len() * usize::from(painted)];
+
+				let mesh = world.meshes.insert("test/grid", mesh);
+
+				stand(world, across, 0.0, mesh, MaterialId::DEFAULT);
+			})
+		};
+
+		let (Some(read_plain), Some(painted_plain)) = (plainly_white(false), plainly_white(true))
+		else {
+			return;
+		};
+
+		assert!(
+			read_plain.pixels == painted_plain.pixels,
+			"a long mesh nobody painted draws as one painted white at every vertex, to the byte"
+		);
+
+		let Some(gpu) = crate::gpu::shared() else {
+			return;
+		};
+		let mut capture = Capture::new(gpu, 8, 8).expect("a small capture builds");
+		let mut world = World::new();
+		let mesh = world.meshes.insert("test/grid", grid(side));
+		let floor = world.entities.spawn();
+		world
+			.entities
+			.set_renderable(floor, Renderable::new(mesh, Vec3::ONE));
+
+		capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+
+		assert!(
+			capture.scene_mut().plain_vertices() >= 71 * 71,
+			"and the buffer standing in for its paint grew to hold it: {}",
+			capture.scene_mut().plain_vertices()
 		);
 	}
 

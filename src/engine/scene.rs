@@ -24,8 +24,8 @@ use colby_core::{
 	Result,
 	abi::{
 		Camera, DRAWING, EntityId, Light, LightKind, MAX_ENTITIES, Material, MeshData,
-		MeshVertex, Meshes, Renderable, SkinVertex, Texel, TextureData, TextureId, Textures,
-		Transform, World,
+		MeshVertex, Meshes, PaintVertex, Renderable, SkinVertex, Texel, TextureData, TextureId,
+		Textures, Transform, World,
 		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
 	},
@@ -413,6 +413,15 @@ struct GpuMesh {
 	indices: Buffer,
 	/// The bones and weights, for a mesh that has them.
 	skin: Option<Buffer>,
+	/// What each vertex was painted with, for a mesh somebody painted.
+	///
+	/// A mesh nobody painted draws with the scene's [`Plain`] buffer in its
+	/// place, because every pipeline reads the paint and the buffer it reads
+	/// has to be there. @ref [`PaintVertex`].
+	paint: Option<Buffer>,
+	/// How many vertices it has, which is how long a plain buffer standing in
+	/// for its paint has to be.
+	vertex_count: usize,
 	/// How many of [`indices`](Self::indices) are the mesh itself.
 	index_count: u32,
 	revision: u32,
@@ -459,6 +468,51 @@ impl GpuMesh {
 			.checked_sub(1)
 			.and_then(|at| self.levels.get(at))
 			.map_or(0..self.index_count, |(run, _)| run.clone())
+	}
+}
+
+/// What every mesh nobody painted draws its paint from: one buffer of plain
+/// entries, white and at the corner of the picture, as long as the longest such
+/// mesh.
+///
+/// **One buffer rather than one a mesh, and it is read at every vertex.** A
+/// pipeline fixes the stride of each buffer it reads when it is built, so a
+/// mesh without paint cannot bind a buffer of one entry and have every vertex
+/// read it - that is a stride of nought, which would mean a second table of
+/// pipelines for the meshes that have none. It binds this instead, which holds
+/// the same entry at every index; the file and the mesh's own upload carry no
+/// paint at all, and a world of crates pays for one buffer rather than one
+/// each.
+struct Plain {
+	buffer: Buffer,
+	/// How many entries it holds, which is how many vertices a mesh reading it
+	/// may have.
+	vertices: usize,
+}
+
+impl Plain {
+	/// How many entries a scene starts with, before any mesh has asked for
+	/// more.
+	const FIRST: usize = 1024;
+
+	/// A buffer of plain entries for meshes of up to so many vertices.
+	///
+	/// @param device - the device to build against
+	/// @param queue - the queue to fill it through
+	/// @param vertices - how many entries it has to hold at least
+	fn new(device: &Device, queue: &Queue, vertices: usize) -> Self {
+		let vertices = vertices.max(Self::FIRST).next_power_of_two();
+
+		Self {
+			buffer: create_buffer(
+				device,
+				queue,
+				"plain paint",
+				bytemuck::cast_slice(&vec![PaintVertex::PLAIN; vertices]),
+				BufferUsages::VERTEX,
+			),
+			vertices,
+		}
 	}
 }
 
@@ -937,6 +991,9 @@ pub struct Scene {
 	joints: Joints,
 	/// One per registry slot, in the same order, filled on demand.
 	meshes: Vec<GpuMesh>,
+	/// What a mesh nobody painted reads its paint from, made at the first
+	/// upload of one and grown whenever a longer one arrives. @ref [`Plain`].
+	plain: Option<Plain>,
 	textures: Vec<GpuTexture>,
 	materials: Vec<GpuMaterial>,
 	instances: Buffer,
@@ -1069,8 +1126,7 @@ impl Scene {
 		let shaft = Shaft::new(&device, width, height)?;
 		let focus = Focus::new(&device, width, height)?;
 
-		let instances = placements(&device)?;
-		let covering = covering(gpu, (width, height))?;
+		let (instances, covering) = (placements(&device)?, covering(gpu, (width, height))?);
 
 		Ok(Self {
 			device,
@@ -1120,6 +1176,7 @@ impl Scene {
 			// registries belong to the host, and a scene built before the host
 			// has loaded its assets would only have to be rebuilt afterwards.
 			meshes: Vec::new(),
+			plain: None,
 			textures: Vec::new(),
 			materials: Vec::new(),
 			instances,
@@ -2099,6 +2156,9 @@ impl Scene {
 			else {
 				continue;
 			};
+			let Some(paint) = self.paint_of(mesh) else {
+				continue;
+			};
 
 			let wanted = (batch.blend, batch.skinned);
 			if bound != Some(wanted) {
@@ -2107,11 +2167,12 @@ impl Scene {
 			}
 
 			if let Some(skin) = mesh.skin.as_ref() {
-				pass.set_vertex_buffer(2, skin.slice(..));
+				pass.set_vertex_buffer(SKIN_SLOT, skin.slice(..));
 			}
 
 			pass.set_bind_group(1, &material.bindings, &[]);
 			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+			pass.set_vertex_buffer(PAINT_SLOT, paint.slice(..));
 			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
 
 			match through {
@@ -2432,6 +2493,9 @@ impl Scene {
 			else {
 				continue;
 			};
+			let Some(paint) = self.paint_of(mesh) else {
+				continue;
+			};
 
 			let Some(pipeline) = self.casting(local, batch.blend, batch.skinned) else {
 				continue;
@@ -2449,10 +2513,11 @@ impl Scene {
 			pass.set_bind_group(2, &material.bindings, &[]);
 
 			if let Some(skin) = mesh.skin.as_ref() {
-				pass.set_vertex_buffer(2, skin.slice(..));
+				pass.set_vertex_buffer(SKIN_SLOT, skin.slice(..));
 			}
 
 			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+			pass.set_vertex_buffer(PAINT_SLOT, paint.slice(..));
 			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
 			pass.draw_indexed(mesh.run(batch.level), 0, batch.first..batch.first + batch.count);
 		}
@@ -2823,11 +2888,56 @@ impl Scene {
 			}
 
 			let uploaded = upload_mesh(&self.device, &self.queue, mesh.value(), mesh.revision());
+
+			if uploaded.paint.is_none() {
+				self.fit_plain(uploaded.vertex_count);
+			}
+
 			match self.meshes.get_mut(slot) {
 				| Some(existing) => *existing = uploaded,
 				| None => self.meshes.push(uploaded),
 			}
 		}
+	}
+
+	/// Makes sure the plain buffer holds at least so many entries: made the
+	/// first time a mesh nobody painted is uploaded, and grown, never shrunk,
+	/// when a longer one arrives. Always before anything draws, because the
+	/// meshes are uploaded at the top of a frame.
+	///
+	/// @param vertices - how many vertices the mesh reading it has
+	fn fit_plain(&mut self, vertices: usize) {
+		if self
+			.plain
+			.as_ref()
+			.is_some_and(|plain| plain.vertices >= vertices)
+		{
+			return;
+		}
+
+		self.plain = Some(Plain::new(&self.device, &self.queue, vertices));
+	}
+
+	/// The buffer a mesh's paint is read from: its own, or the plain one.
+	///
+	/// Nothing only for a mesh drawn before any mesh nobody painted was ever
+	/// uploaded, which the order of a frame rules out; a draw that met it would
+	/// be skipped rather than bound to nothing.
+	///
+	/// @param mesh - the mesh being drawn
+	fn paint_of<'a>(&'a self, mesh: &'a GpuMesh) -> Option<&'a Buffer> {
+		mesh.paint
+			.as_ref()
+			.or_else(|| self.plain.as_ref().map(|plain| &plain.buffer))
+	}
+
+	/// How many vertices a mesh nobody painted may have before the plain
+	/// buffer has to grow, which is how a test shows that it did.
+	#[cfg(test)]
+	pub(crate) fn plain_vertices(&self) -> usize {
+		self.plain
+			.as_ref()
+			.map_or(0, |plain| plain.vertices)
 	}
 
 	/// The same, for textures.
@@ -3900,6 +4010,19 @@ fn upload_mesh(device: &Device, queue: &Queue, data: &MeshData, revision: u32) -
 				BufferUsages::VERTEX,
 			)
 		}),
+		// and nothing for a mesh nobody painted, for the skin's reason: the
+		// plain buffer stands in for it, and one buffer of white a mesh would be
+		// the very cost the block was kept out of the vertex to avoid
+		paint: data.is_painted().then(|| {
+			create_buffer(
+				device,
+				queue,
+				"mesh paint",
+				bytemuck::cast_slice(&data.paint),
+				BufferUsages::VERTEX,
+			)
+		}),
+		vertex_count: data.vertices.len(),
 		index_count: u32::try_from(data.indices.len()).unwrap_or(0),
 		revision,
 		errors: levels.iter().map(|(_, error)| *error).collect(),
@@ -4677,14 +4800,23 @@ fn build_pipeline(
 	})
 }
 
-/// The vertex buffers a pipeline that draws a batch reads: the geometry and the
-/// placements always, and the skin for a mesh bones move.
+/// Where the paint is bound, in every pipeline that draws a batch.
+pub(crate) const PAINT_SLOT: u32 = 2;
+
+/// Where the skin is bound, in the pipelines that read bones.
+pub(crate) const SKIN_SLOT: u32 = 3;
+
+/// The vertex buffers a pipeline that draws a batch reads: the geometry, the
+/// placements and the paint always, and the skin for a mesh bones move.
 ///
-/// The third buffer only where it is read. Declaring it on the static pipelines
-/// would mean binding one for every crate in the world, and there is nothing to
-/// bind. Shared by the scene's table, the shadows' and the pass before the
-/// scene, which all draw the same batches out of the same buffers and have to
-/// agree about how.
+/// The skin only where it is read. Declaring it on the static pipelines would
+/// mean binding one for every crate in the world, and there is nothing to bind.
+/// **The paint is declared everywhere**, because a mesh nobody painted still
+/// has something to bind - the scene's [`Plain`] buffer - and a shader that
+/// reads none of its attributes, as a shadow's plain entry point does, fetches
+/// none of them. Shared by the scene's table, the shadows' and the pass before
+/// the scene, which all draw the same batches out of the same buffers and have
+/// to agree about how.
 ///
 /// @param skinned - whether the pipeline reads bones
 pub(crate) fn vertex_buffers(skinned: bool) -> Vec<Option<VertexBufferLayout<'static>>> {
@@ -4699,6 +4831,11 @@ pub(crate) fn vertex_buffers(skinned: bool) -> Vec<Option<VertexBufferLayout<'st
 			array_stride: instance_stride,
 			step_mode: VertexStepMode::Instance,
 			attributes: &INSTANCE_ATTRIBUTES,
+		}),
+		Some(VertexBufferLayout {
+			array_stride: paint_stride(),
+			step_mode: VertexStepMode::Vertex,
+			attributes: &PAINT_ATTRIBUTES,
 		}),
 	];
 
@@ -4835,6 +4972,38 @@ pub(crate) const SKIN_ATTRIBUTES: [VertexAttribute; 2] = [
 	},
 ];
 
+/// What one [`PaintVertex`] hands the vertex stage: the color it was painted,
+/// normalized on the way in so the shader reads four fractions, and where it
+/// samples the second set.
+///
+/// @note: locations after the skin's rather than between the vertex's and the
+/// instance's, so that nothing that was numbered before it moved.
+pub(crate) const PAINT_ATTRIBUTES: [VertexAttribute; 2] = [
+	VertexAttribute {
+		format: VertexFormat::Unorm16x4,
+		offset: 0,
+		shader_location: 14,
+	},
+	VertexAttribute {
+		format: VertexFormat::Float32x2,
+		offset: 8,
+		shader_location: 15,
+	},
+];
+
+/// The stride of the paint buffer, asserted against the attributes above.
+pub(crate) const fn paint_stride() -> BufferAddress {
+	const {
+		assert!(
+			size_of::<PaintVertex>() == 16,
+			"PaintVertex is no longer four shorts and two floats"
+		);
+		assert!(align_of::<PaintVertex>() == 4, "PaintVertex gained padding");
+	}
+
+	16
+}
+
 /// The stride of the skin buffer, asserted against the attributes above.
 pub(crate) const fn skin_stride() -> BufferAddress {
 	const {
@@ -4918,6 +5087,33 @@ mod tests {
 		}
 
 		world
+	}
+
+	#[test]
+	fn the_slots_the_draws_bind_are_the_places_of_the_buffers_every_pipeline_declares() {
+		let paint = usize::try_from(PAINT_SLOT).expect("a small number");
+		let skin = usize::try_from(SKIN_SLOT).expect("a small number");
+		let still = vertex_buffers(false);
+		let bent = vertex_buffers(true);
+
+		assert_eq!(still.len(), paint + 1, "a static pipeline ends with the paint");
+		assert_eq!(bent.len(), skin + 1, "and a skinned one with the skin after it");
+
+		for (name, buffers) in [("static", &still), ("skinned", &bent)] {
+			assert!(
+				buffers[paint]
+					.as_ref()
+					.is_some_and(|layout| layout.attributes == PAINT_ATTRIBUTES),
+				"the {name} pipeline reads the paint where the draws bind it"
+			);
+		}
+
+		assert!(
+			bent[skin]
+				.as_ref()
+				.is_some_and(|layout| layout.attributes == SKIN_ATTRIBUTES),
+			"and the skinned one the skin where the draws bind that"
+		);
 	}
 
 	#[test]

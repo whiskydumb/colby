@@ -2726,9 +2726,8 @@ mod tests {
 			return;
 		};
 		let reading = variant(
-			"shade(input, sampled, 1.0, vec4<f32>(0.0)), sampled.a * input.tint.a",
-			"shade(input, sampled, 1.0, found_at(input.clip_position.xy)), sampled.a * \
-			 input.tint.a",
+			"shade(input, sampled, 1.0, vec4<f32>(0.0)),",
+			"shade(input, sampled, 1.0, found_at(input.clip_position.xy)),",
 		);
 
 		for samples in ["1", "4"] {

@@ -24,6 +24,11 @@ struct VertexInput {
     // declare it and ignore it, which costs nothing: the attribute is the
     // pipeline's and is supplied either way.
     @location(2) uv: vec2<f32>,
+    // The vertex's paint, read by the masked entry points for its alpha alone:
+    // a cutout's holes are where the picture's alpha times the paint's is
+    // under the cutoff, and a shadow with other holes than the thing casting
+    // it is the bug the shared cutoff below exists to prevent.
+    @location(14) paint: vec4<f32>,
 };
 
 struct InstanceInput {
@@ -91,6 +96,8 @@ fn vertex_skinned(
 struct MaskedOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    // How much of the picture the vertex's paint leaves. @ref `shader.wgsl`.
+    @location(1) paint_alpha: f32,
 };
 
 // The same as `vertex_main`, carrying the texture coordinate along.
@@ -104,6 +111,7 @@ fn vertex_masked(vertex: VertexInput, instance: InstanceInput) -> MaskedOutput {
     output.clip_position =
         cascade.light_view_projection * (model_of(instance) * vec4<f32>(vertex.position, 1.0));
     output.uv = vertex.uv * instance.surface.zw;
+    output.paint_alpha = vertex.paint.a;
 
     return output;
 }
@@ -121,6 +129,7 @@ fn vertex_masked_skinned(
     output.clip_position =
         cascade.light_view_projection * (model_of(instance) * (posed * vec4<f32>(vertex.position, 1.0)));
     output.uv = vertex.uv * instance.surface.zw;
+    output.paint_alpha = vertex.paint.a;
 
     return output;
 }
@@ -139,7 +148,9 @@ fn vertex_masked_skinned(
 // half of the same trade.
 @fragment
 fn fragment_masked(input: MaskedOutput) {
-    if (textureSampleLevel(albedo, surface_sampler, input.uv, 0.0).a < MASK_CUTOFF) {
+    let alpha = textureSampleLevel(albedo, surface_sampler, input.uv, 0.0).a;
+
+    if (alpha * input.paint_alpha < MASK_CUTOFF) {
         discard;
     }
 }

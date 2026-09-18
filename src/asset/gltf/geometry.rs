@@ -36,16 +36,18 @@
 //! **What is missing is computed.** No normals means flat shading, which the
 //! specification asks for and which costs the shared vertices; no texture
 //! coordinates means zeros; no tangents means the generator every other mesh in
-//! this engine already goes through.
+//! this engine already goes through. A vertex color or a second set of
+//! coordinates is a block of its own, written only when the file has either:
+//! the other is white or nought beside it.
 
 use colby_core::{
 	Result,
 	abi::{
 		Transform,
-		mesh::{self, BONES_PER_VERTEX, MeshData, MeshVertex, SkinVertex},
+		mesh::{self, BONES_PER_VERTEX, MeshData, MeshVertex, PaintVertex, SkinVertex},
 	},
 	err,
-	glam::{Mat4, Quat, Vec2, Vec3},
+	glam::{Mat4, Quat, Vec2, Vec3, Vec4},
 };
 
 use super::{Clip, Extracted, Gltf, Skin, Surface, clip, skin};
@@ -62,6 +64,8 @@ const READ_ATTRIBUTES: &[&str] = &[
 	"NORMAL",
 	"TANGENT",
 	"TEXCOORD_0",
+	"TEXCOORD_1",
+	"COLOR_0",
 	"JOINTS_0",
 	"WEIGHTS_0",
 	"JOINTS_1",
@@ -366,9 +370,16 @@ impl Build<'_> {
 
 		self.unread_attributes(mesh, primitive, attributes);
 
-		let normals = self.lanes(attributes, "NORMAL", 3, count);
-		let uvs = self.lanes(attributes, "TEXCOORD_0", 2, count);
-		let tangents = self.lanes(attributes, "TANGENT", 4, count);
+		let normals = self.lanes(attributes, "NORMAL", &[3], count);
+		let uvs = self.lanes(attributes, "TEXCOORD_0", &[2], count);
+		// the specification says a tangent means nothing without the normal it
+		// is measured against, and that one written beside no normals is to be
+		// ignored: the flat normals made below are not the ones it was made for
+		let tangents = if normals.is_some() {
+			self.lanes(attributes, "TANGENT", &[4], count)
+		} else {
+			None
+		};
 		let mut data = MeshData {
 			vertices: (0..count)
 				.map(|vertex| {
@@ -385,6 +396,7 @@ impl Build<'_> {
 			indices: self.indices(entry, count)?,
 			skin: Vec::new(),
 			levels: Vec::new(),
+			paint: self.paint_of(attributes, count),
 		};
 
 		if !data.indices.len().is_multiple_of(3) {
@@ -402,11 +414,13 @@ impl Build<'_> {
 			)));
 		}
 
+		// read before the flattening and carried through it, like the paint:
+		// every block is a vertex's, and a vertex is what flattening copies
+		data.skin = self.skin_of(mesh, primitive, attributes, count);
+
 		if normals.is_none() {
 			flatten(&mut data);
 		}
-
-		data.skin = self.skin_of(mesh, primitive, attributes, count);
 
 		match tangents {
 			| Some(read) =>
@@ -428,10 +442,10 @@ impl Build<'_> {
 	///
 	/// A rule rather than a list of the ones somebody thought of: whatever a
 	/// primitive names that is not in [`READ_ATTRIBUTES`] is said out loud, so
-	/// a mesh that arrives grey because it was painted into `COLOR_0`, or one
-	/// whose lightmap coordinates went into `TEXCOORD_1`, says why instead of
-	/// looking like an exporter bug. It catches an exporter's own `_SOMETHING`
-	/// too, which is the case nobody would have written a line for.
+	/// a mesh whose paint went into a second color set, or whose lightmap
+	/// coordinates went into a third, says why instead of looking like an
+	/// exporter bug. It catches an exporter's own `_SOMETHING` too, which is
+	/// the case nobody would have written a line for.
 	///
 	/// `JOINTS_1` is left out of the complaint although it is not read: it has
 	/// a warning of its own further down that says the useful thing - that a
@@ -529,7 +543,8 @@ impl Build<'_> {
 			},
 		};
 
-		let Some(weights) = self.lanes(attributes, "WEIGHTS_0", BONES_PER_VERTEX, count) else {
+		let Some(weights) = self.lanes(attributes, "WEIGHTS_0", &[BONES_PER_VERTEX], count)
+		else {
 			self.warnings.push(format!(
 				"mesh {mesh} primitive {primitive} names bones and says how much each pulls for \
 				 none of its vertices, and is left where it was"
@@ -563,12 +578,49 @@ impl Build<'_> {
 		out
 	}
 
-	/// One named attribute, when it is there and is the shape it should be.
+	/// What each vertex of one primitive was painted with and where it samples
+	/// the second set, when the file says either.
+	///
+	/// One block for the two, because the vertex stage reads them as one: a
+	/// file that has only a color gets the second set at nought beside it, and
+	/// one that has only a second set gets white. A color with three channels
+	/// is opaque, which is what the specification says it means.
+	///
+	/// @param attributes - the primitive's `attributes` object
+	/// @param count - how many vertices it has
+	/// @return one entry per vertex, or nothing for a primitive that has
+	/// neither
+	fn paint_of(&mut self, attributes: Option<&Value>, count: usize) -> Vec<PaintVertex> {
+		let colors = self.lanes(attributes, "COLOR_0", &[3, 4], count);
+		let seconds = self.lanes(attributes, "TEXCOORD_1", &[2], count);
+
+		if colors.is_none() && seconds.is_none() {
+			return Vec::new();
+		}
+
+		(0..count)
+			.map(|vertex| {
+				let color = colors.as_ref().map_or(Vec4::ONE, |read| {
+					let row = read.row(vertex);
+
+					Vec4::new(row[0], row[1], row[2], row.get(3).copied().unwrap_or(1.0))
+				});
+				let uv2 = seconds.as_ref().map_or(Vec2::ZERO, |read| {
+					Vec2::new(read.row(vertex)[0], read.row(vertex)[1])
+				});
+
+				PaintVertex::new(color, uv2)
+			})
+			.collect()
+	}
+
+	/// One named attribute, when it is there and is one of the shapes it
+	/// should be.
 	fn lanes(
 		&mut self,
 		attributes: Option<&Value>,
 		name: &str,
-		wanted: usize,
+		wanted: &[usize],
 		count: usize,
 	) -> Option<super::Floats> {
 		let index = attributes
@@ -576,7 +628,7 @@ impl Build<'_> {
 			.and_then(Value::as_usize)?;
 		let read = self.file.floats(index).ok()?;
 
-		if read.lanes() != wanted || read.rows() != count {
+		if !wanted.contains(&read.lanes()) || read.rows() != count {
 			self.warnings.push(format!(
 				"attribute {name} of accessor {index} does not match the positions beside it, \
 				 and is left out"
@@ -887,31 +939,32 @@ fn point(row: &[f32]) -> Vec3 {
 /// What the specification asks for when a primitive declares no normals, and it
 /// cannot be done any other way: a flat face needs a normal per face, and a
 /// shared vertex belongs to several.
+///
+/// **Every block goes with its vertex.** A corner copied for a face takes its
+/// bones and its paint along, because both are the vertex's and the copy is the
+/// vertex; leaving them behind would be a block as long as the vertices were
+/// before, which is no longer the mesh.
 fn flatten(data: &mut MeshData) {
 	let mut vertices = Vec::with_capacity(data.indices.len());
+	let mut skin = Vec::new();
+	let mut paint = Vec::new();
 
 	for triangle in data.indices.chunks_exact(3) {
-		let corners: Vec<MeshVertex> = triangle
-			.iter()
-			.filter_map(|index| {
-				usize::try_from(*index)
-					.ok()
-					.and_then(|index| data.vertices.get(index))
-					.copied()
-			})
-			.collect();
-
-		if corners.len() != 3 {
+		let Some(slots) = corners_of(triangle, data.vertices.len()) else {
 			continue;
-		}
+		};
 
-		let edge = Vec3::from_array(corners[1].position) - Vec3::from_array(corners[0].position);
-		let other = Vec3::from_array(corners[2].position) - Vec3::from_array(corners[0].position);
+		let [first, second, third] = slots.map(|slot| data.vertices[slot]);
+		let edge = Vec3::from_array(second.position) - Vec3::from_array(first.position);
+		let other = Vec3::from_array(third.position) - Vec3::from_array(first.position);
 		let normal = edge.cross(other).normalize_or_zero();
 
-		for mut corner in corners {
+		for slot in slots {
+			let mut corner = data.vertices[slot];
 			corner.normal = normal.to_array();
 			vertices.push(corner);
+			skin.extend(data.skin.get(slot).copied());
+			paint.extend(data.paint.get(slot).copied());
 		}
 	}
 
@@ -919,6 +972,21 @@ fn flatten(data: &mut MeshData) {
 		.map(|index| u32::try_from(index).unwrap_or(u32::MAX))
 		.collect();
 	data.vertices = vertices;
+	data.skin = skin;
+	data.paint = paint;
+}
+
+/// The three vertices one triangle names, when all three are there.
+fn corners_of(triangle: &[u32], vertices: usize) -> Option<[usize; 3]> {
+	let mut slots = [0_usize; 3];
+
+	for (slot, index) in slots.iter_mut().zip(triangle) {
+		*slot = usize::try_from(*index)
+			.ok()
+			.filter(|at| *at < vertices)?;
+	}
+
+	Some(slots)
 }
 
 /// One vertex's bones and weights, with the file's joint slots carried over.
@@ -1056,8 +1124,6 @@ fn primitives(file: &Gltf, mesh: usize) -> &[Value] {
 #[cfg(test)]
 mod tests {
 	use std::path::Path;
-
-	use colby_core::glam::Vec4;
 
 	use super::*;
 
@@ -1654,16 +1720,17 @@ mod tests {
 
 	#[test]
 	fn an_attribute_this_importer_does_not_read_is_named_rather_than_dropped() {
-		// COLOR_0 is the one that costs somebody an afternoon: a mesh painted
-		// in Blender arrives grey and nothing at all says why
+		// a second color set is the one that costs somebody an afternoon: the
+		// paint they meant went into it, and nothing at all says why the mesh
+		// arrived without it
 		let model = scene(
 			"\"meshes\": [ { \"name\": \"painted\", \"primitives\": [ { \"attributes\": { \
-			 \"POSITION\": 0, \"COLOR_0\": 0, \"TEXCOORD_1\": 0 } } ] } ]",
+			 \"POSITION\": 0, \"COLOR_1\": 0, \"TEXCOORD_2\": 0 } } ] } ]",
 		);
 
 		assert_eq!(model.warnings.len(), 1, "one line for the primitive: {:?}", model.warnings);
 		assert!(
-			model.warnings[0].contains("COLOR_0") && model.warnings[0].contains("TEXCOORD_1"),
+			model.warnings[0].contains("COLOR_1") && model.warnings[0].contains("TEXCOORD_2"),
 			"naming each of them: {:?}",
 			model.warnings
 		);
@@ -1675,6 +1742,316 @@ mod tests {
 			.is_empty(),
 			"and a primitive with nothing extra on it says nothing"
 		);
+	}
+
+	/// Bytes as the base64 a `data:` address carries.
+	fn base64(bytes: &[u8]) -> String {
+		const ALPHABET: &[u8; 64] =
+			b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+		let digit = |value: u32| char::from(ALPHABET[usize::try_from(value & 0x3F).unwrap_or(0)]);
+		let mut out = String::new();
+
+		for chunk in bytes.chunks(3) {
+			let word = chunk
+				.iter()
+				.enumerate()
+				.fold(0_u32, |word, (at, byte)| word | (u32::from(*byte) << (16 - 8 * at)));
+			let digits = chunk.len() + 1;
+			out.extend((0..digits).map(|place| digit(word >> (18 - 6 * place))));
+			out.extend(core::iter::repeat_n('=', 4 - digits));
+		}
+
+		out
+	}
+
+	/// Little-endian bytes of some numbers, each written as `T` writes itself.
+	fn bytes_of<const N: usize, T, F>(values: &[T], each: F) -> Vec<u8>
+	where
+		T: Copy,
+		F: Fn(T) -> [u8; N],
+	{
+		values
+			.iter()
+			.flat_map(|value| each(*value))
+			.collect()
+	}
+
+	/// A triangle with its paint in one of the three ways a file may store a
+	/// color, a second set of coordinates beside it, and normals or none.
+	///
+	/// @param color - the color accessor's component type and shape, and its
+	/// bytes; `None` for a triangle with no color at all
+	/// @param second - whether it has a second set of coordinates
+	/// @param normals - whether it declares normals
+	fn painted(color: Option<(u32, &str, Vec<u8>)>, second: bool, normals: bool) -> Model {
+		let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+		let pointing: [f32; 9] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+		let seconds: [f32; 6] = [0.5, 0.25, 0.75, 0.25, 0.5, 1.0];
+		let mut buffer = bytes_of(&positions, f32::to_le_bytes);
+		let mut views = vec![(0, 36)];
+		let mut accessors = vec![
+			"{ \"bufferView\": 0, \"componentType\": 5126, \"count\": 3, \"type\": \"VEC3\" }"
+				.to_owned(),
+		];
+		let mut attributes = vec!["\"POSITION\": 0".to_owned()];
+
+		let mut add = |bytes: Vec<u8>, accessor: String, attribute: &str| {
+			while buffer.len() % 4 != 0 {
+				buffer.push(0);
+			}
+
+			let view = views.len();
+			views.push((buffer.len(), bytes.len()));
+			buffer.extend(bytes);
+			attributes.push(format!("\"{attribute}\": {}", accessors.len()));
+			accessors.push(accessor.replace("VIEW", &view.to_string()));
+		};
+
+		if let Some((component, shape, bytes)) = color {
+			let normalized = component != 5126;
+
+			add(
+				bytes,
+				format!(
+					"{{ \"bufferView\": VIEW, \"componentType\": {component}, \"normalized\": \
+					 {normalized}, \"count\": 3, \"type\": \"{shape}\" }}"
+				),
+				"COLOR_0",
+			);
+		}
+
+		if second {
+			add(
+				bytes_of(&seconds, f32::to_le_bytes),
+				"{ \"bufferView\": VIEW, \"componentType\": 5126, \"count\": 3, \"type\": \
+				 \"VEC2\" }"
+					.to_owned(),
+				"TEXCOORD_1",
+			);
+		}
+
+		if normals {
+			add(
+				bytes_of(&pointing, f32::to_le_bytes),
+				"{ \"bufferView\": VIEW, \"componentType\": 5126, \"count\": 3, \"type\": \
+				 \"VEC3\" }"
+					.to_owned(),
+				"NORMAL",
+			);
+		}
+
+		let views: Vec<String> = views
+			.iter()
+			.map(|(start, length)| {
+				format!("{{ \"buffer\": 0, \"byteOffset\": {start}, \"byteLength\": {length} }}")
+			})
+			.collect();
+		let text = format!(
+			"{{ \"asset\": {{ \"version\": \"2.0\" }}, \"buffers\": [ {{ \"byteLength\": {}, \
+			 \"uri\": \"data:application/octet-stream;base64,{}\" }} ], \"bufferViews\": [ {} \
+			 ], \"accessors\": [ {} ], \"meshes\": [ {{ \"name\": \"painted\", \"primitives\": \
+			 [ {{ \"attributes\": {{ {} }} }} ] }} ], \"nodes\": [ {{ \"mesh\": 0 }} ] }}",
+			buffer.len(),
+			base64(&buffer),
+			views.join(", "),
+			accessors.join(", "),
+			attributes.join(", ")
+		);
+		let file = Gltf::read(text.as_bytes(), Path::new("painted.gltf"), Path::new(""))
+			.expect("the painted triangle reads");
+
+		import(&file).expect("and imports")
+	}
+
+	#[test]
+	fn a_vertex_color_is_read_whichever_of_the_three_ways_the_file_stored_it() {
+		// the same three colors, as floats with an alpha, as normalized bytes
+		// with none, and as normalized shorts with one
+		let floats: [f32; 12] = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.25];
+		let wanted = [
+			[PaintVertex::WHOLE, 0, 0, PaintVertex::WHOLE],
+			[0, PaintVertex::WHOLE, 0, 32768],
+			[0, 0, PaintVertex::WHOLE, 16384],
+		];
+		let bytes: [u8; 9] = [255, 0, 0, 0, 255, 0, 0, 0, 255];
+		let shorts: [u16; 12] = [65535, 0, 0, 65535, 0, 65535, 0, 32768, 0, 0, 65535, 16384];
+
+		let as_floats =
+			painted(Some((5126, "VEC4", bytes_of(&floats, f32::to_le_bytes))), false, true);
+		let as_bytes = painted(Some((5121, "VEC3", bytes.to_vec())), false, true);
+		let as_shorts =
+			painted(Some((5123, "VEC4", bytes_of(&shorts, u16::to_le_bytes))), false, true);
+
+		for (label, model) in
+			[("floats", &as_floats), ("bytes", &as_bytes), ("shorts", &as_shorts)]
+		{
+			let paint = &model.meshes[0].data.paint;
+
+			assert_eq!(model.warnings, Vec::<String>::new(), "{label}: nothing to say");
+			assert_eq!(paint.len(), 3, "{label}: one entry per vertex");
+			assert!(
+				paint.iter().all(|entry| entry.uv2 == [0.0, 0.0]),
+				"{label}: and no second set, so nought beside the color"
+			);
+
+			// three channels are opaque, whatever the other two said
+			let opaque = usize::from(label == "bytes");
+			let alpha = |at: usize| [wanted[at][3], PaintVertex::WHOLE][opaque];
+
+			for (at, entry) in paint.iter().enumerate() {
+				let color = [wanted[at][0], wanted[at][1], wanted[at][2], alpha(at)];
+
+				assert_eq!(entry.color, color, "{label}: vertex {at}");
+			}
+		}
+	}
+
+	#[test]
+	fn a_second_set_of_coordinates_comes_in_beside_a_white_vertex() {
+		let model = painted(None, true, true);
+		let paint = &model.meshes[0].data.paint;
+
+		assert_eq!(model.warnings, Vec::<String>::new(), "nothing to say about it");
+		assert_eq!(
+			paint
+				.iter()
+				.map(|entry| entry.uv2)
+				.collect::<Vec<_>>(),
+			vec![[0.5, 0.25], [0.75, 0.25], [0.5, 1.0]],
+			"each vertex's own second coordinates, as the file wrote them"
+		);
+		assert!(
+			paint
+				.iter()
+				.all(|entry| entry.color == PaintVertex::PLAIN.color),
+			"and white beside them, which changes nothing"
+		);
+	}
+
+	#[test]
+	fn a_tangent_written_beside_no_normals_is_left_out_as_the_specification_says() {
+		// the triangle in the xy plane, and a tangent along a direction no
+		// generator would pick for it: the flat normals made for it are not the
+		// normals the tangent was measured against, so it has to go
+		let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+		let written: [f32; 12] = [0.6, 0.8, 0.0, 1.0, 0.6, 0.8, 0.0, 1.0, 0.6, 0.8, 0.0, 1.0];
+		let mut buffer = bytes_of(&positions, f32::to_le_bytes);
+		buffer.extend(bytes_of(&written, f32::to_le_bytes));
+
+		let text = format!(
+			"{{ \"asset\": {{ \"version\": \"2.0\" }}, \"buffers\": [ {{ \"byteLength\": {}, \
+			 \"uri\": \"data:application/octet-stream;base64,{}\" }} ], \"bufferViews\": [ {{ \
+			 \"buffer\": 0, \"byteLength\": 36 }}, {{ \"buffer\": 0, \"byteOffset\": 36, \
+			 \"byteLength\": 48 }} ], \"accessors\": [ {{ \"bufferView\": 0, \"componentType\": \
+			 5126, \"count\": 3, \"type\": \"VEC3\" }}, {{ \"bufferView\": 1, \
+			 \"componentType\": 5126, \"count\": 3, \"type\": \"VEC4\" }} ], \"meshes\": [ {{ \
+			 \"primitives\": [ {{ \"attributes\": {{ \"POSITION\": 0, \"TANGENT\": 1 }} }} ] }} \
+			 ], \"nodes\": [ {{ \"mesh\": 0 }} ] }}",
+			buffer.len(),
+			base64(&buffer)
+		);
+		let file = Gltf::read(text.as_bytes(), Path::new("leaning.gltf"), Path::new(""))
+			.expect("the triangle reads");
+		let model = import(&file).expect("and imports");
+
+		for vertex in &model.meshes[0].data.vertices {
+			assert!(
+				!vertex
+					.tangent_axis()
+					.abs_diff_eq(Vec3::new(0.6, 0.8, 0.0), 1.0e-3),
+				"the file's tangent is not the one the vertex carries: {:?}",
+				vertex.tangent
+			);
+			assert!(
+				vertex
+					.tangent_axis()
+					.dot(Vec3::from_array(vertex.normal))
+					.abs() < 1.0e-5,
+				"and the one it carries lies in the flat face: {:?}",
+				vertex.tangent
+			);
+		}
+	}
+
+	#[test]
+	fn a_primitive_with_neither_carries_no_paint_at_all() {
+		let model = painted(None, false, true);
+
+		assert!(model.meshes[0].data.paint.is_empty(), "no block, rather than a white one");
+	}
+
+	#[test]
+	fn a_primitive_with_no_normals_still_imports_its_paint_whole() {
+		let floats: [f32; 12] = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+		let model =
+			painted(Some((5126, "VEC4", bytes_of(&floats, f32::to_le_bytes))), true, false);
+		let data = &model.meshes[0].data;
+
+		assert_eq!(model.warnings, Vec::<String>::new(), "nothing to say about it");
+		assert_eq!(data.paint.len(), data.vertices.len(), "a block as long as the vertices");
+		assert!(data.paint_fits(), "which is the only shape a block has");
+	}
+
+	#[test]
+	fn flattening_copies_every_block_of_a_vertex_with_it() {
+		// two triangles sharing an edge: four vertices, and the two on the edge
+		// belong to both, so flattening makes six and copies those two
+		let mut data = MeshData {
+			vertices: [Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::new(1.0, 1.0, 0.0)]
+				.iter()
+				.map(|at| MeshVertex::new(*at, Vec3::Z, Vec2::ZERO))
+				.collect(),
+			indices: vec![0, 1, 2, 2, 1, 3],
+			paint: (0..4_u8)
+				.map(|at| {
+					PaintVertex::new(Vec4::splat(f32::from(at) / 4.0), Vec2::splat(f32::from(at)))
+				})
+				.collect(),
+			skin: (0..4_u16).map(SkinVertex::rigid).collect(),
+			..MeshData::default()
+		};
+
+		flatten(&mut data);
+
+		let order = [0_u8, 1, 2, 2, 1, 3];
+
+		assert_eq!(data.vertices.len(), 6, "a vertex a corner");
+		assert_eq!(
+			data.paint
+				.iter()
+				.map(|entry| entry.uv2[0])
+				.collect::<Vec<_>>(),
+			order.map(f32::from).to_vec(),
+			"each corner's paint is the paint of the vertex it was copied from"
+		);
+		assert_eq!(
+			data.skin
+				.iter()
+				.map(|entry| entry.bones[0])
+				.collect::<Vec<_>>(),
+			order.map(u16::from).to_vec(),
+			"and so are its bones, which used to be read after the copying and fell out of step"
+		);
+		assert!(data.paint_fits() && data.skin_fits(), "both blocks as long as the vertices");
+	}
+
+	#[test]
+	fn a_mirrored_copy_keeps_the_paint_of_the_piece_it_was_copied_from() {
+		let data = MeshData {
+			vertices: vec![MeshVertex::default(); 3],
+			indices: vec![0, 1, 2],
+			paint: vec![
+				PaintVertex::new(Vec4::new(1.0, 0.0, 0.0, 1.0), Vec2::ZERO),
+				PaintVertex::PLAIN,
+				PaintVertex::new(Vec4::ZERO, Vec2::ONE),
+			],
+			..MeshData::default()
+		};
+
+		let turned = turn_around(&data);
+
+		assert_eq!(turned.indices, vec![0, 2, 1], "the winding turned");
+		assert_eq!(turned.paint, data.paint, "and the paint is still each vertex's own");
 	}
 
 	#[test]

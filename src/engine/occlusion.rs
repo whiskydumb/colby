@@ -1274,6 +1274,78 @@ mod tests {
 		assert!((away - 1.0).abs() < 1.0e-6, "and so does the floor out of reach: {away:.6}");
 	}
 
+	/// What the share of the sky the pass writes is, over a floor with a cutout
+	/// standing on it painted to some alpha, or with none.
+	///
+	/// **A capture of its own each time.** A scene keeps what it uploaded by
+	/// the registry's slot and revision, and a mesh inserted into a fresh
+	/// world takes the same slot at the same revision as the one inserted into
+	/// the world before it - so a capture shared between them would go on
+	/// drawing the first world's paint.
+	///
+	/// @param alpha - how much of the picture the cutout's paint leaves, or
+	/// `None` for no cutout at all
+	/// @return the share, or `None` on a machine with no GPU
+	fn beside_a_cutout(alpha: Option<f32>) -> Option<Vec<[f32; 2]>> {
+		let mut capture = capture()?;
+		let mut world = World::new();
+
+		world.camera.position = Vec3::new(0.0, 2.6, 3.2);
+		world.camera.target = Vec3::new(0.0, 0.3, 0.0);
+		slab(&mut world, Vec3::new(0.0, -0.5, 0.0), Vec3::new(40.0, 1.0, 40.0));
+		asking(&mut world, "1", "3");
+
+		if let Some(alpha) = alpha {
+			let mut standing = colby_core::abi::mesh::quad();
+			standing.paint = vec![
+				colby_core::abi::PaintVertex::new(
+					colby_core::glam::Vec4::new(1.0, 1.0, 1.0, alpha),
+					Vec2::ZERO,
+				);
+				standing.vertices.len()
+			];
+			let mesh = world.meshes.insert("test/standing", standing);
+			let cut = world
+				.materials
+				.insert("test/cut", Material::DEFAULT.masked());
+			let id = world.entities.spawn_at(Transform {
+				position: Vec3::new(0.0, 0.5, 0.0),
+				// the quad faces up; a quarter turn about x stands it up facing
+				// the camera
+				rotation: Quat::from_rotation_x(core::f32::consts::FRAC_PI_2),
+				scale: Vec3::ONE,
+			});
+
+			world
+				.entities
+				.set_renderable(id, Renderable::of(mesh, cut, Vec3::ONE));
+		}
+
+		Some(written(&mut capture, &mut world))
+	}
+
+	#[test]
+	fn a_cutout_painted_clear_hides_nothing_from_the_floor_it_stands_on() {
+		// the pass before the scene has to leave out what the picture leaves
+		// out, or the floor at the foot of a wall nobody can see loses the
+		// share of the sky the wall would have hidden
+		let (Some(bare), Some(clear), Some(whole)) =
+			(beside_a_cutout(None), beside_a_cutout(Some(0.0)), beside_a_cutout(Some(1.0)))
+		else {
+			return;
+		};
+
+		assert!(
+			clear == bare,
+			"a cutout painted clear is not in the buffer: the floor sees what it sees with \
+			 nothing 			 standing on it"
+		);
+		assert!(
+			whole != bare,
+			"and one painted whole is, which is what makes the first a measurement"
+		);
+	}
+
 	#[test]
 	fn a_strength_nobody_could_mean_lands_somewhere_definite() {
 		// no device: what a frame asks for is worked out before anything is drawn.
@@ -1779,8 +1851,8 @@ mod tests {
 			return;
 		};
 		let reading = variant(
-			"shade(input, sampled, 1.0, vec4<f32>(0.0)), sampled.a * input.tint.a",
-			"shade(input, sampled, seen(input), vec4<f32>(0.0)), sampled.a * input.tint.a",
+			"shade(input, sampled, 1.0, vec4<f32>(0.0)),",
+			"shade(input, sampled, seen(input), vec4<f32>(0.0)),",
 		);
 
 		for samples in ["1", "4"] {

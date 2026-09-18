@@ -89,7 +89,7 @@ pub use self::{
 	material::{Material, MaterialId, Materials},
 	mesh::{
 		BONES_PER_VERTEX, Level, MAX_LEVELS, Mesh, MeshData, MeshId, MeshVertex, Meshes,
-		SkinVertex,
+		PaintVertex, SkinVertex,
 	},
 	model::{Model, ModelData, ModelId, Models, Placement},
 	names::MAX_NAME,
@@ -126,7 +126,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 74;
+pub const ABI_VERSION: u32 = 75;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";

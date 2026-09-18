@@ -1,25 +1,27 @@
 //! colby's runtime mesh format: `.cmesh`.
 //!
 //! The whole file is a fixed [`MeshHeader`] followed by two `#[repr(C)]`
-//! blocks - vertices, then indices - and, for a mesh that needs them, three
+//! blocks - vertices, then indices - and, for a mesh that needs them, four
 //! more. Everything is little-endian, which is what every target the engine
 //! builds for already is; a big-endian port would byte-swap on load and pay for
 //! it there rather than making every loader on every machine pay for a decode
 //! step.
 //!
 //! ```text
-//!   0  MeshHeader                        96 bytes
-//!  96  [MeshVertex; vertex_count]        48 bytes each
-//!   .  [u32;        index_count]          4 bytes each
-//!   .  [SkinVertex; skin_count]          12 bytes each, and only sometimes
-//!   .  [MeshLevel;  level_count]         16 bytes each, and only sometimes
-//!   .  [u32;        coarse_count]         4 bytes each, and only sometimes
+//!   0  MeshHeader                       112 bytes
+//! 112  [MeshVertex;  vertex_count]       48 bytes each
+//!   .  [u32;         index_count]         4 bytes each
+//!   .  [SkinVertex;  skin_count]         12 bytes each, and only sometimes
+//!   .  [MeshLevel;   level_count]        16 bytes each, and only sometimes
+//!   .  [u32;         coarse_count]        4 bytes each, and only sometimes
+//!   .  [PaintVertex; paint_count]        16 bytes each, and only sometimes
 //! ```
 //!
 //! **An optional block is there when its own count says so, and nothing else
 //! says it.** The skin block was going to be a bit in [`MeshHeader::flags`],
 //! and that turned out to be redundant state: two fields that can disagree, and
-//! one of them would have had to win. The levels follow the skin's rule.
+//! one of them would have had to win. The levels and the paint follow the
+//! skin's rule.
 //!
 //! **A coarser level is a record and a run of indices, not a mesh of its own.**
 //! The triangles a level keeps are drawn over vertices the mesh already has, so
@@ -30,9 +32,9 @@
 //! that is not a picture reads - @ref
 //! [`MeshData::levels`](colby_core::abi::MeshData::levels).
 //!
-//! The header is ninety-six bytes so that the vertex block inherits the
-//! buffer's sixteen-byte alignment, and every block is exactly the layout the
-//! GPU wants. Reading a mesh is therefore a file read into an
+//! The header is a hundred and twelve bytes so that the vertex block inherits
+//! the buffer's sixteen-byte alignment, and every block is exactly the layout
+//! the GPU wants. Reading a mesh is therefore a file read into an
 //! [`AlignedBytes`](crate::AlignedBytes) and a few `bytemuck` casts -
 //! [`MeshFile::vertices`] and [`MeshFile::indices`] borrow straight out of the
 //! buffer and copy nothing.
@@ -48,7 +50,7 @@ use std::path::Path;
 use colby_core::{
 	Result,
 	abi::{
-		mesh::{Level, MAX_LEVELS, MeshData, MeshVertex, SkinVertex},
+		mesh::{Level, MAX_LEVELS, MeshData, MeshVertex, PaintVertex, SkinVertex},
 		skeleton::MAX_BONES,
 	},
 	bytemuck::{self, Pod, Zeroable},
@@ -66,10 +68,11 @@ pub const MAGIC: [u8; 8] = *b"COLBYMSH";
 /// Bump it whenever the header or either block changes shape. A file carrying a
 /// different number is refused with a message rather than read as if it agreed.
 ///
-/// Six since a mesh carries coarser levels: the header grew by four words to
-/// say where two more blocks are, and the word it had kept in reserve became
-/// the first of them.
-pub const FORMAT_VERSION: u32 = 6;
+/// Seven since a vertex can be painted: the header grew by four words, three
+/// saying where the paint block is and one kept spare so that the vertex block
+/// after it stays on a sixteen-byte boundary. Six was a mesh carrying coarser
+/// levels.
+pub const FORMAT_VERSION: u32 = 7;
 
 /// The extension a compiled mesh is written with.
 pub const EXTENSION: &str = "cmesh";
@@ -90,7 +93,7 @@ pub const GUIDED: u32 = 1 << 0;
 const KNOWN_FLAGS: u32 = GUIDED;
 
 /// How big [`MeshHeader`] is, and where the vertex block starts.
-pub const HEADER_BYTES: usize = 96;
+pub const HEADER_BYTES: usize = 112;
 
 /// The fixed head of a `.cmesh`.
 ///
@@ -166,6 +169,23 @@ pub struct MeshHeader {
 
 	/// Where those indices start, or zero when there are none.
 	pub coarse_offset: u32,
+
+	/// Bytes per paint entry. Must be `size_of::<PaintVertex>()`, or zero when
+	/// nobody painted the mesh.
+	pub paint_stride: u32,
+
+	/// How many paint entries there are: either zero or `vertex_count`.
+	///
+	/// The only thing that says whether the last block is here at all.
+	pub paint_count: u32,
+
+	/// Where the paint block starts, or zero when there is none.
+	pub paint_offset: u32,
+
+	/// Nothing yet, and a reader refuses a file that puts something here: the
+	/// rule [`MeshHeader::flags`] follows. It is here so that the header stays
+	/// a multiple of sixteen bytes.
+	pub spare: u32,
 }
 
 /// One coarser level, as the file holds it.
@@ -262,6 +282,14 @@ impl MeshFile {
 		self.block(self.header.coarse_offset, self.header.coarse_count)
 	}
 
+	/// The paint block, borrowed out of the buffer.
+	///
+	/// Empty for a mesh nobody painted, which is most of them.
+	#[must_use]
+	pub fn paint(&self) -> &[PaintVertex] {
+		self.block(self.header.paint_offset, self.header.paint_count)
+	}
+
 	/// The bounding box the compiler measured.
 	#[must_use]
 	pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -299,6 +327,7 @@ impl MeshFile {
 					error: level.error,
 				})
 				.collect(),
+			paint: self.paint().to_vec(),
 		}
 	}
 
@@ -360,6 +389,7 @@ fn encode_marked(data: &MeshData, flags: u32) -> Result<Vec<u8>> {
 	let skin_count = count(data.skin.len(), "skin entries")?;
 	let level_count = count(records.len(), "levels")?;
 	let coarse_count = count(coarse.len(), "indices of its levels")?;
+	let paint_count = count(data.paint.len(), "paint entries")?;
 	let too_large = || err!(Asset("the mesh is too large to address with 32-bit offsets"));
 	let index_offset = vertex_offset
 		.checked_add(vertex_count.saturating_mul(stride::<MeshVertex>()))
@@ -374,8 +404,12 @@ fn encode_marked(data: &MeshData, flags: u32) -> Result<Vec<u8>> {
 		.checked_add(level_count.saturating_mul(stride::<MeshLevel>()))
 		.ok_or_else(too_large)?;
 
-	after_levels
+	let after_coarse = after_levels
 		.checked_add(coarse_count.saturating_mul(stride::<u32>()))
+		.ok_or_else(too_large)?;
+
+	after_coarse
+		.checked_add(paint_count.saturating_mul(stride::<PaintVertex>()))
 		.ok_or_else(too_large)?;
 
 	// zero rather than "where it would have been", because the offset of a
@@ -401,6 +435,10 @@ fn encode_marked(data: &MeshData, flags: u32) -> Result<Vec<u8>> {
 		level_offset: if level_count == 0 { 0 } else { after_skin },
 		coarse_count,
 		coarse_offset: if coarse_count == 0 { 0 } else { after_levels },
+		paint_stride: if paint_count == 0 { 0 } else { stride::<PaintVertex>() },
+		paint_count,
+		paint_offset: if paint_count == 0 { 0 } else { after_coarse },
+		spare: 0,
 	};
 
 	let mut out = Vec::with_capacity(
@@ -409,7 +447,8 @@ fn encode_marked(data: &MeshData, flags: u32) -> Result<Vec<u8>> {
 			+ data.indices.len() * size_of::<u32>()
 			+ data.skin.len() * size_of::<SkinVertex>()
 			+ records.len() * size_of::<MeshLevel>()
-			+ coarse.len() * size_of::<u32>(),
+			+ coarse.len() * size_of::<u32>()
+			+ data.paint.len() * size_of::<PaintVertex>(),
 	);
 	out.extend_from_slice(bytemuck::bytes_of(&header));
 	out.extend_from_slice(bytemuck::cast_slice(&data.vertices));
@@ -417,6 +456,7 @@ fn encode_marked(data: &MeshData, flags: u32) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::cast_slice(&data.skin));
 	out.extend_from_slice(bytemuck::cast_slice(&records));
 	out.extend_from_slice(bytemuck::cast_slice(&coarse));
+	out.extend_from_slice(bytemuck::cast_slice(&data.paint));
 
 	Ok(out)
 }
@@ -480,6 +520,15 @@ fn sound(data: &MeshData) -> Result<()> {
 		return Err(err!(Asset(
 			"the mesh has a vertex whose bone weights do not add up to {}",
 			SkinVertex::WHOLE
+		)));
+	}
+
+	if !data.paint_fits() {
+		return Err(err!(Asset(
+			"the mesh has {} paint entries against {} vertices, and a mesh is either painted \
+			 all the way through or not at all",
+			data.paint.len(),
+			data.vertices.len()
 		)));
 	}
 
@@ -570,6 +619,10 @@ fn check(bytes: &[u8]) -> std::result::Result<MeshHeader, String> {
 			"SkinVertex is no longer four shorts and four bytes"
 		);
 		assert!(size_of::<MeshLevel>() == 16, "MeshLevel is no longer four words");
+		assert!(
+			size_of::<PaintVertex>() == 16,
+			"PaintVertex is no longer four shorts and two floats"
+		);
 	}
 
 	let head = bytes.get(..HEADER_BYTES).ok_or_else(|| {
@@ -610,6 +663,7 @@ fn check(bytes: &[u8]) -> std::result::Result<MeshHeader, String> {
 	check_indices(bytes, header)?;
 	check_skin(bytes, header)?;
 	check_levels(bytes, header)?;
+	check_paint(header)?;
 
 	Ok(*header)
 }
@@ -668,6 +722,20 @@ fn check_strides(header: &MeshHeader) -> std::result::Result<(), String> {
 		));
 	}
 
+	// and for a mesh nobody painted
+	let paint_stride = if header.paint_count == 0 {
+		0
+	} else {
+		stride::<PaintVertex>()
+	};
+
+	if header.paint_stride != paint_stride {
+		return Err(format!(
+			"has {}-byte paint entries, and this build reads {paint_stride}-byte ones",
+			header.paint_stride
+		));
+	}
+
 	Ok(())
 }
 
@@ -698,6 +766,11 @@ fn check_blocks(header: &MeshHeader, len: usize) -> std::result::Result<(), Stri
 			"coarse index",
 			header.coarse_offset,
 			span::<u32>(header.coarse_offset, header.coarse_count),
+		),
+		(
+			"paint",
+			header.paint_offset,
+			span::<PaintVertex>(header.paint_offset, header.paint_count),
 		),
 	];
 
@@ -897,6 +970,39 @@ fn check_levels(bytes: &[u8], header: &MeshHeader) -> std::result::Result<(), St
 	Ok(())
 }
 
+/// Checks that a paint block, if there is one, paints this mesh.
+///
+/// Nothing in an entry can be wrong the way a weight can - every color and
+/// every coordinate is one somebody could mean - so what is left to check is
+/// only the shape: absent, or one entry a vertex, and nothing in the spare
+/// word.
+fn check_paint(header: &MeshHeader) -> std::result::Result<(), String> {
+	if header.spare != 0 {
+		return Err(format!("puts {:#010X} in the header's spare word", header.spare));
+	}
+
+	if header.paint_count == 0 {
+		if header.paint_offset != 0 {
+			return Err(format!(
+				"says its paint block is at {} and then says it has no entries",
+				header.paint_offset
+			));
+		}
+
+		return Ok(());
+	}
+
+	if header.paint_count != header.vertex_count {
+		return Err(format!(
+			"has {} paint entries against {} vertices, and a mesh is either painted all the way \
+			 through or not at all",
+			header.paint_count, header.vertex_count
+		));
+	}
+
+	Ok(())
+}
+
 /// The level records and the run of their indices, borrowed out of a file whose
 /// blocks were already found to fit.
 fn level_blocks<'a>(
@@ -957,6 +1063,10 @@ mod tests {
 	const LEVEL_OFFSET_AT: usize = 84;
 	const COARSE_COUNT_AT: usize = 88;
 	const COARSE_OFFSET_AT: usize = 92;
+	const PAINT_STRIDE_AT: usize = 96;
+	const PAINT_COUNT_AT: usize = 100;
+	const PAINT_OFFSET_AT: usize = 104;
+	const SPARE_AT: usize = 108;
 
 	/// A quad every vertex of which is pulled by bones, one of them by four.
 	fn skinned() -> MeshData {
@@ -1007,6 +1117,37 @@ mod tests {
 	/// The leveled cube, encoded.
 	fn leveled_bytes() -> Vec<u8> { encode(&leveled()).expect("a leveled cube encodes") }
 
+	/// The leveled cube with every vertex painted a color of its own and given
+	/// a second set of coordinates that is not the first.
+	fn painted() -> MeshData {
+		let mut mesh = leveled();
+		mesh.paint = (0..mesh.vertices.len())
+			.map(|at| {
+				let step = f32::from(u8::try_from(at).expect("a cube is small")) / 24.0;
+
+				PaintVertex::new(
+					colby_core::glam::Vec4::new(step, 1.0 - step, 0.25, 0.5 + step * 0.5),
+					colby_core::glam::Vec2::new(step * 2.0, -step),
+				)
+			})
+			.collect();
+
+		mesh
+	}
+
+	/// The painted cube, encoded.
+	fn painted_bytes() -> Vec<u8> { encode(&painted()).expect("a painted cube encodes") }
+
+	/// What reading the painted cube went wrong with, after an edit.
+	fn misread_paint(edit: impl FnOnce(&mut Vec<u8>)) -> String {
+		let mut bytes = painted_bytes();
+		edit(&mut bytes);
+
+		MeshFile::from_bytes(AlignedBytes::from_slice(&bytes))
+			.expect_err("the file is no longer valid")
+			.to_string()
+	}
+
 	/// What encoding a mesh went wrong with.
 	fn refused(data: &MeshData) -> String {
 		encode(data)
@@ -1051,10 +1192,138 @@ mod tests {
 
 	#[test]
 	fn the_header_is_the_size_the_layout_depends_on() {
-		assert_eq!(size_of::<MeshHeader>(), HEADER_BYTES, "ninety-six bytes, exactly");
+		assert_eq!(size_of::<MeshHeader>(), HEADER_BYTES, "a hundred and twelve bytes, exactly");
 		assert_eq!(align_of::<MeshHeader>(), 4, "and no padding beyond its fields");
 		assert_eq!(HEADER_BYTES % ALIGNMENT, 0, "so the vertex block stays aligned");
 		assert_eq!(size_of::<MeshLevel>(), 16, "and a level record is four words");
+		assert_eq!(size_of::<PaintVertex>(), 16, "and a paint entry four shorts and two floats");
+		assert_eq!(align_of::<PaintVertex>(), 4, "which needs no padding either");
+	}
+
+	#[test]
+	fn a_mesh_nobody_painted_carries_no_paint_block_at_all() {
+		let bytes = leveled_bytes();
+		let file =
+			MeshFile::from_bytes(AlignedBytes::from_slice(&bytes)).expect("a leveled cube reads");
+		let header = file.header();
+
+		assert_eq!(header.paint_count, 0, "nobody painted a cube");
+		assert_eq!(header.paint_offset, 0, "so there is no offset to give");
+		assert_eq!(header.paint_stride, 0, "and no entry size either");
+		assert!(file.paint().is_empty(), "and nothing to read");
+		assert_eq!(
+			bytes.len(),
+			usize::try_from(header.coarse_offset + header.coarse_count * 4)
+				.expect("a cube is small"),
+			"and the file ends where the levels' indices do: not one byte of it is paint"
+		);
+	}
+
+	#[test]
+	fn a_painted_mesh_survives_the_trip_to_bytes_and_back() {
+		let original = painted();
+		let file = MeshFile::from_bytes(AlignedBytes::from_slice(&painted_bytes()))
+			.expect("a painted cube reads back");
+
+		assert_eq!(file.to_mesh_data(), original, "every vertex, level and color");
+		assert_eq!(
+			file.header().paint_count,
+			file.header().vertex_count,
+			"one entry per vertex, which is the only shape there is"
+		);
+		assert_eq!(file.header().paint_stride, 16, "four shorts and two floats");
+	}
+
+	#[test]
+	fn the_paint_block_comes_last_and_is_borrowed_in_place() {
+		let file = MeshFile::from_bytes(AlignedBytes::from_slice(&painted_bytes()))
+			.expect("it reads back");
+		let header = *file.header();
+		let base = file.bytes.as_slice().as_ptr().addr();
+		let paint = file.paint().as_ptr().addr();
+
+		assert_eq!(
+			paint,
+			base + usize::try_from(header.paint_offset).expect("a cube is small"),
+			"the paint is the file's own bytes"
+		);
+		assert_eq!(paint % align_of::<PaintVertex>(), 0, "aligned where it sits");
+		assert_eq!(
+			header.paint_offset,
+			header.coarse_offset + header.coarse_count * 4,
+			"and it comes after the levels' indices, so no block that was there before it moved"
+		);
+		assert_eq!(
+			file.bytes.as_slice().len(),
+			usize::try_from(header.paint_offset).expect("small") + 24 * 16,
+			"and the file ends where it does"
+		);
+	}
+
+	#[test]
+	fn a_mesh_painted_only_part_of_the_way_through_is_not_written() {
+		let mut half = painted();
+		half.paint.pop();
+
+		let message = refused(&half);
+
+		assert!(message.contains("painted all"), "and it says why: {message}");
+	}
+
+	#[test]
+	fn a_file_whose_paint_disagrees_with_itself_is_refused() {
+		assert!(
+			misread_paint(|bytes| put(bytes, PAINT_COUNT_AT, 23)).contains("23 paint entries"),
+			"a block shorter than the vertices"
+		);
+		assert!(
+			misread_paint(|bytes| put(bytes, PAINT_STRIDE_AT, 12)).contains("12-byte paint"),
+			"entries written by a build with a different entry"
+		);
+		assert!(
+			misread_paint(|bytes| put(bytes, SPARE_AT, 1)).contains("spare word"),
+			"a word that means nothing yet"
+		);
+		assert!(
+			misread_paint(|bytes| {
+				let near_the_end = u32::try_from(bytes.len() - 16).expect("a cube is small");
+
+				put(bytes, PAINT_OFFSET_AT, near_the_end);
+			})
+			.contains("paint block"),
+			"a block that runs past the end of the file"
+		);
+
+		let mut bare = leveled_bytes();
+		put(&mut bare, PAINT_OFFSET_AT, 16);
+
+		let error = MeshFile::from_bytes(AlignedBytes::from_slice(&bare))
+			.expect_err("it says where a block is and then that there is none");
+
+		assert!(error.to_string().contains("no entries"), "and says so: {error}");
+	}
+
+	#[test]
+	fn a_color_is_held_to_the_whole_and_read_back_as_the_fraction_it_stands_for() {
+		let written = PaintVertex::new(
+			colby_core::glam::Vec4::new(-0.5, 0.5, 2.0, f32::NAN),
+			colby_core::glam::Vec2::ONE,
+		);
+
+		assert_eq!(written.color, [0, 32768, 65535, 0], "held, rounded, and nought for a NaN");
+		assert!(
+			written
+				.color()
+				.abs_diff_eq(colby_core::glam::Vec4::new(0.0, 0.500_007_6, 1.0, 0.0), 1.0e-7),
+			"and read back as fractions: {}",
+			written.color()
+		);
+		assert_eq!(
+			PaintVertex::default(),
+			PaintVertex::PLAIN,
+			"a vertex nobody painted is plain"
+		);
+		assert_eq!(PaintVertex::PLAIN.color(), colby_core::glam::Vec4::ONE, "which is white");
 	}
 
 	#[test]
@@ -1360,7 +1629,7 @@ mod tests {
 
 	#[test]
 	fn a_truncated_file_is_refused_rather_than_read_short() {
-		for keep in [0, 8, 63, 64, 95, 96, 100] {
+		for keep in [0, 8, 63, 64, 95, 96, 100, 111] {
 			let bytes = &encoded()[..keep];
 			let error = MeshFile::from_bytes(AlignedBytes::from_slice(bytes))
 				.expect_err("a truncated file is not a whole cube");

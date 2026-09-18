@@ -78,6 +78,25 @@ mod tests {
 				.set_renderable(id, Renderable::of(MeshId::CUBE, material, Vec3::splat(0.5)));
 		}
 
+		// a painted cube beside them, so a mesh's own paint buffer is bound as
+		// well as the plain one every other mesh here reads
+		let mut painted = colby_core::abi::mesh::cube();
+		painted.paint = vec![
+			colby_core::abi::PaintVertex::new(
+				colby_core::glam::Vec4::new(1.0, 0.5, 0.25, 0.75),
+				colby_core::glam::Vec2::ONE,
+			);
+			painted.vertices.len()
+		];
+		let painted = world.meshes.insert("test/painted", painted);
+		let beside = world
+			.entities
+			.spawn_at(Transform::at(Vec3::new(-1.5, 0.0, 0.0)));
+
+		world
+			.entities
+			.set_renderable(beside, Renderable::new(painted, Vec3::ONE));
+
 		// a decal over the first of them, throwing a picture and a normal map, so
 		// the atlas is built, written and bound through both of its views; and
 		// the second of them refusing decals, so the flag reaches the shader

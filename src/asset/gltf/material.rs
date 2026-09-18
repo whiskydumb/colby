@@ -287,7 +287,10 @@ impl Reading<'_> {
 			.and_then(Value::as_usize)
 			> Some(0)
 		{
-			self.note("names a second set of texture coordinates, and colby has one");
+			self.note(
+				"reads a picture from a second set of texture coordinates, and colby reads \
+				 every picture from the first",
+			);
 		}
 
 		let texture = reference.get("index").and_then(Value::as_usize)?;

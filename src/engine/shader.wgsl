@@ -37,6 +37,12 @@
 // decal's box takes the decal's picture into its own color, normal,
 // roughness and how metal it is, and is then lit as whatever it has become.
 //
+// A vertex may carry paint: a color somebody gave it, which multiplies the
+// surface's own before anything is lit, and an alpha, which multiplies the
+// picture's wherever the picture's is read - the cutout's edge and the pane's
+// see-through alike. A mesh nobody painted reads white and opaque at every
+// vertex, and multiplying by one is the identity.
+//
 // The normal a pixel is shaded with is the geometry's, turned by whatever the
 // normal map says. The frame that turn happens in is built per vertex from the
 // normal and the tangent the mesh carries, and its third axis is the cross of
@@ -232,6 +238,10 @@ struct VertexInput {
     // xyz is the direction u grows in; w is +1 or -1, and says which way the
     // third axis of the frame turns.
     @location(3) tangent: vec4<f32>,
+    // The color the vertex was painted, linear, as four fractions; white and
+    // opaque where nobody painted it. From a buffer of its own, which is why
+    // its location follows the skin's rather than the tangent's.
+    @location(14) paint: vec4<f32>,
 };
 
 struct InstanceInput {
@@ -315,6 +325,9 @@ struct VertexOutput {
     @location(5) tangent: vec4<f32>,
     // The entity's own flags, the same across a whole triangle.
     @location(6) @interpolate(flat) flags: u32,
+    // How much of the picture the vertex's paint leaves, which multiplies the
+    // picture's own alpha wherever that is read. One where nobody painted it.
+    @location(7) paint_alpha: f32,
 };
 
 @vertex
@@ -365,7 +378,13 @@ fn place(vertex: VertexInput, instance: InstanceInput, model: mat4x4<f32>) -> Ve
         (model * vec4<f32>(vertex.tangent.xyz, 0.0)).xyz,
         vertex.tangent.w,
     );
-    output.tint = instance.tint;
+    // the paint multiplies the color once a vertex, here, so that the
+    // fragment stage multiplies nothing it did not multiply before: what it
+    // reads is the tint, whatever went into it. The alpha is left out of this
+    // on purpose - that channel is the material's opacity, which only glass
+    // reads, where the paint's alpha is the picture's and a cutout reads it too.
+    output.tint = vec4<f32>(instance.tint.rgb * vertex.paint.rgb, instance.tint.a);
+    output.paint_alpha = vertex.paint.a;
     output.uv = vertex.uv * instance.surface.zw;
     output.world_position = world_position.xyz;
     output.surface = instance.surface.xy;
@@ -958,7 +977,7 @@ fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
     // before anything decides to throw the fragment away, for the sample's
     // reason: @ref `seen`
     let lit = seen(input);
-    if (sampled.a < MASK_CUTOFF) {
+    if (sampled.a * input.paint_alpha < MASK_CUTOFF) {
         discard;
     }
 
@@ -983,7 +1002,10 @@ fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
 fn fragment_blended(input: VertexOutput) -> @location(0) vec4<f32> {
     let sampled = textureSample(albedo, surface_sampler, input.uv);
 
-    return vec4<f32>(shade(input, sampled, 1.0, vec4<f32>(0.0)), sampled.a * input.tint.a);
+    return vec4<f32>(
+        shade(input, sampled, 1.0, vec4<f32>(0.0)),
+        sampled.a * input.paint_alpha * input.tint.a,
+    );
 }
 
 // How much of the sky the point a fragment of the solid or the masked half is
@@ -1127,7 +1149,7 @@ fn fragment_prepass(input: VertexOutput) -> Prepared {
 @fragment
 fn fragment_prepass_masked(input: VertexOutput) -> Prepared {
     let sampled = textureSample(albedo, surface_sampler, input.uv);
-    if (sampled.a < MASK_CUTOFF) {
+    if (sampled.a * input.paint_alpha < MASK_CUTOFF) {
         discard;
     }
 

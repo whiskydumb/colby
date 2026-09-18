@@ -18,7 +18,7 @@
 use super::registry::{Entry, Registry};
 use crate::{
 	bytemuck::{Pod, Zeroable},
-	glam::{Vec2, Vec3},
+	glam::{Vec2, Vec3, Vec4},
 	registry_handle,
 };
 
@@ -51,8 +51,9 @@ const DEGENERATE_UV: f32 = 1.0e-10;
 
 /// One vertex of a mesh, as the vertex stage reads it.
 ///
-/// No color: that comes per entity, so one cube mesh serves every cube in the
-/// world.
+/// No color: an entity's comes per entity, so one cube mesh serves every cube
+/// in the world, and a color somebody painted onto the vertices themselves is a
+/// block of its own beside these, @ref [`PaintVertex`].
 ///
 /// @note: `#[repr(C)]` and `Pod` because this is exactly the layout the vertex
 /// buffer holds and exactly the layout the asset format stores. The three are
@@ -230,6 +231,95 @@ impl SkinVertex {
 	}
 }
 
+/// What a vertex adds when somebody gave it more than a shape and one unwrap: a
+/// color painted onto it, and a second set of texture coordinates.
+///
+/// A second, optional block rather than two more fields on [`MeshVertex`], for
+/// the reason [`SkinVertex`] is one: most meshes have neither, and a world of
+/// crates would carry sixteen bytes a vertex that nothing reads - in the file,
+/// in memory, and in every pass that reads a vertex, the shadows' included. A
+/// mesh with no block draws as though every vertex held [`Self::PLAIN`].
+///
+/// @note: `#[repr(C)]` and `Pod` for the reason the other two blocks are: these
+/// are the bytes the file holds and the bytes the vertex buffer holds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct PaintVertex {
+	/// The color painted onto it, linear RGBA, each channel a fraction of
+	/// [`Self::WHOLE`].
+	///
+	/// Sixteen bits a channel rather than eight, because the color is linear:
+	/// at eight bits the step between the two darkest levels is a thirteenth of
+	/// the way up an sRGB screen, and a shadow baked into the vertices would
+	/// band. It is also what the tool most models come from writes, so a
+	/// sixteen-bit color in a file arrives here to the bit.
+	///
+	/// It multiplies the surface's own color and its picture's alpha, so white
+	/// and opaque changes nothing.
+	pub color: [u16; 4],
+
+	/// Where this vertex samples a picture that reads the second set.
+	///
+	/// Origin top left, like [`MeshVertex::uv`]; nought where the source had
+	/// no second set.
+	pub uv2: [f32; 2],
+}
+
+impl PaintVertex {
+	/// What a vertex nobody painted holds: white, opaque, and the corner of the
+	/// picture.
+	pub const PLAIN: Self = Self { color: [Self::WHOLE; 4], uv2: [0.0; 2] };
+	/// The whole of one channel of [`color`](Self::color).
+	pub const WHOLE: u16 = u16::MAX;
+
+	/// A vertex painted a color, with a second set of coordinates.
+	///
+	/// @param color - linear RGBA, each held to nought and one first, which is
+	/// what the exchange format says a vertex color is
+	/// @param uv2 - where it samples the second set
+	#[must_use]
+	pub fn new(color: Vec4, uv2: Vec2) -> Self {
+		Self {
+			color: color.to_array().map(fraction_of_whole),
+			uv2: uv2.to_array(),
+		}
+	}
+
+	/// The color, as the linear fractions it stands for.
+	#[must_use]
+	pub fn color(&self) -> Vec4 {
+		let whole = f32::from(Self::WHOLE);
+
+		Vec4::from_array(
+			self.color
+				.map(|channel| f32::from(channel) / whole),
+		)
+	}
+}
+
+impl Default for PaintVertex {
+	/// Not the zeroed vertex: that one is black and cannot be seen.
+	fn default() -> Self { Self::PLAIN }
+}
+
+/// One channel of a color as the nearest fraction of [`PaintVertex::WHOLE`].
+///
+/// A value that is not a number is nought, which is what the clamp would make
+/// of it anyway.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "the value is held to nought and the whole and rounded on the line above the cast, \
+	          and try_from is not available for a float"
+)]
+fn fraction_of_whole(channel: f32) -> u16 {
+	let whole = f32::from(PaintVertex::WHOLE);
+	let held = if channel.is_nan() { 0.0 } else { channel.clamp(0.0, 1.0) };
+
+	(held * whole).round() as u16
+}
+
 /// A mesh as plain data, before it reaches the GPU.
 ///
 /// Indices are `u32` rather than `u16`. Sixteen bits is enough for everything
@@ -261,6 +351,14 @@ pub struct MeshData {
 	/// than that one did. @ref [`Level`], [`Self::levels_are_in_range`] and
 	/// [`Self::levels_thin_out`].
 	pub levels: Vec<Level>,
+
+	/// What each vertex was painted with and where it samples the second set,
+	/// or empty for a mesh that has neither.
+	///
+	/// Either empty or exactly as long as [`vertices`](Self::vertices), the
+	/// skin's rule and for the skin's reason: a vertex is one shape or the
+	/// other. @ref [`Self::paint_fits`], [`PaintVertex`].
+	pub paint: Vec<PaintVertex>,
 }
 
 impl MeshData {
@@ -324,6 +422,19 @@ impl MeshData {
 	/// therefore not wrong.
 	#[must_use]
 	pub fn weights_are_whole(&self) -> bool { self.skin.iter().all(SkinVertex::is_sound) }
+
+	/// Whether anybody painted this mesh or gave it a second unwrap.
+	#[must_use]
+	pub const fn is_painted(&self) -> bool { !self.paint.is_empty() }
+
+	/// Whether the paint block, if there is one, covers every vertex.
+	///
+	/// [`skin_fits`](Self::skin_fits)'s rule: a block is absent or exactly as
+	/// long as the vertices beside it.
+	#[must_use]
+	pub const fn paint_fits(&self) -> bool {
+		self.paint.is_empty() || self.paint.len() == self.vertices.len()
+	}
 
 	/// Whether every bone a vertex names could be a bone.
 	///
@@ -604,6 +715,7 @@ pub fn cube() -> MeshData {
 		indices: Vec::with_capacity(CUBE_FACES.len() * 6),
 		skin: Vec::new(),
 		levels: Vec::new(),
+		paint: Vec::new(),
 	};
 
 	for (normal, right, up) in CUBE_FACES {
@@ -640,6 +752,7 @@ pub fn sphere() -> MeshData {
 		indices: Vec::with_capacity(SPHERE_RINGS * SPHERE_SEGMENTS * 6),
 		skin: Vec::new(),
 		levels: Vec::new(),
+		paint: Vec::new(),
 	};
 
 	let rings = fraction(SPHERE_RINGS);
@@ -746,6 +859,7 @@ mod tests {
 			indices: (0..u32::try_from(corners.len()).expect("the fixture is small")).collect(),
 			skin: Vec::new(),
 			levels: Vec::new(),
+			paint: Vec::new(),
 		}
 	}
 
@@ -845,6 +959,7 @@ mod tests {
 			indices: vec![0, 1, 2, 0, 3, 4],
 			skin: Vec::new(),
 			levels: Vec::new(),
+			paint: Vec::new(),
 		};
 
 		tangents(&mut mesh);
