@@ -51,13 +51,16 @@
 //! - [`atlas`] - where each still thing's light goes on one picture;
 //! - [`texels`] - which point of which surface each texel of it stands for;
 //! - [`lightmap`] - the passes that work the picture out, and the filling of
-//!   what no surface stands for.
+//!   what no surface stands for;
+//! - [`probes`] - the light at points of the air, for what the picture keeps no
+//!   place for.
 
 pub mod atlas;
 pub mod gather;
 pub mod light;
 pub mod lightmap;
 pub mod picture;
+pub mod probes;
 pub mod scene;
 pub mod sky;
 pub mod texels;
@@ -68,6 +71,7 @@ pub use self::{
 	gather::{Gathered, Pattern, each, threads},
 	lightmap::{Baked, Report, Settings, bake},
 	picture::Picture,
+	probes::{MAX_PROBES, Probed},
 	scene::{Corner, Lamp, Look, Piece, Scene, Surface},
 	sky::Sky,
 	texels::{Sample, Texels},
@@ -277,6 +281,25 @@ mod tests {
 		assert_eq!(baked.placeless.len(), 1, "the ball, which has no second set");
 		// written down from the first run on one machine, as the gather's is
 		assert_eq!(answer, 0x6772_B35B_5C31_F6F6, "the digest of the whole bake: {answer:#018x}");
+
+		// and the probes, which read the picture the last gather read at every
+		// hit: every face of every probe and the grid they stand on, as bits
+		let found = baked
+			.probes
+			.as_ref()
+			.expect("the world has probes");
+		let probed = digest(
+			found
+				.faces
+				.iter()
+				.flatten()
+				.flat_map(|face| face.to_array().map(f32::to_bits))
+				.chain(found.grid.from.to_array().map(f32::to_bits))
+				.chain([found.grid.step.to_bits()])
+				.chain(found.grid.counts),
+		);
+
+		assert_eq!(probed, 0x7576_8CD5_BB4E_27FA, "the digest of the probes: {probed:#018x}");
 	}
 
 	#[test]

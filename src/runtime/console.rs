@@ -571,6 +571,34 @@ fn install_nav(world: &mut World) {
 	);
 }
 
+/// The renderer's switches for what a bake kept: the lightmap and the probes.
+///
+/// Apart from the rest of the renderer's for the length of that list alone.
+///
+/// @param world - the table to register into
+fn install_baked(world: &mut World) {
+	// whether what a bake kept takes the place of the sky's light on the still
+	// things it reached. On, and not saved, the environment's terms and for its
+	// reason: off is how what reading it costs is measured, and the picture a
+	// world nobody baked takes.
+	world.cvars.var(
+		colby_engine::lightmap::ENABLED,
+		Value::Bool(true),
+		"light the still things a bake reached by what it kept, when the world names a \
+		 lightmap; off, nothing a bake kept is read, the probes neither",
+	);
+	// whether what moves, and everything else a bake gave no place, is lit by
+	// the probes it kept rather than by the sky. On and not saved, for the
+	// lightmap's reasons; off is the picture a world with a lightmap and no
+	// probes takes.
+	world.cvars.var(
+		colby_engine::probes::ENABLED,
+		Value::Bool(true),
+		"light what has no place on the lightmap by the probes a bake kept, when the world \
+		 names them",
+	);
+}
+
 /// The renderer's variables: the shadows, the lights, and which graphics APIs
 /// to draw with.
 ///
@@ -619,15 +647,7 @@ fn install_render(world: &mut World) {
 		Value::Bool(true),
 		"reflect the world's environment map, when its sky names one",
 	);
-	// whether what a bake kept takes the place of the sky's light on the still
-	// things it reached. On, and not saved, the environment's terms and for its
-	// reason: off is how what reading it costs is measured, and the picture a
-	// world nobody baked takes.
-	world.cvars.var(
-		colby_engine::lightmap::ENABLED,
-		Value::Bool(true),
-		"light the still things a bake reached by what it kept, when the world names a lightmap",
-	);
+	install_baked(world);
 	// how much of the light arriving from everywhere a nearby wall or corner
 	// takes away. On, and not saved, like the shadows and for their reason; a
 	// strength rather than a switch, and nought records no pass at all, which

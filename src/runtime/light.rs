@@ -4,10 +4,11 @@
 //! Three ways in and one function behind them: `light.bake <name>` in a
 //! window, the editor's button, which types it, and `--bake [scene]` with no
 //! window, no device and no game module at all. Each bakes a world, keeps the
-//! picture as a source at `assets/lightmaps/<name>.hdr`, writes where each
-//! thing's light is on the picture into that thing's `baking` record, names
-//! the picture on the world, and **writes the scene out as
-//! `assets/scenes/<name>.scene` with it**.
+//! picture as a source at `assets/lightmaps/<name>.hdr` and the probes' at
+//! `assets/lightmaps/probes/<name>.hdr`, writes where each thing's light is on
+//! the picture into that thing's `baking` record, names both pictures on the
+//! world, and **writes the scene out as `assets/scenes/<name>.scene` with
+//! them**.
 //!
 //! **The scene is written with the picture, always, and that is not a
 //! convenience.** Where each thing's light is lives in the scene - a record on
@@ -23,11 +24,11 @@
 //! that no scene was loaded meanwhile - which is a mechanism of its own; an
 //! editor that stops for a bake is what the field's full bakers do.
 //!
-//! **Three settings, saved like the navmesh's**, because how finely a
-//! project's light is baked belongs to the project: [`TEXELS`], [`BOUNCES`] and
-//! [`RAYS`]. There is a command where the navmesh has none because this bake
-//! is not cheap enough to run every time something changes, and because it
-//! writes files.
+//! **Four settings, saved like the navmesh's**, because how finely a
+//! project's light is baked belongs to the project: [`TEXELS`], [`BOUNCES`],
+//! [`RAYS`] and [`PROBES`]. There is a command where the navmesh has none
+//! because this bake is not cheap enough to run every time something changes,
+//! and because it writes files.
 
 use std::{fs, path::Path, time::Instant};
 
@@ -35,7 +36,7 @@ use colby_asset::{Project, compile::LIGHTMAPS, radiance};
 use colby_bake::{Baked, Placeless, Rect, Scene, Settings};
 use colby_core::{
 	Result,
-	abi::{BAKING, EntityId, World, cvar::Value, scene},
+	abi::{BAKING, EntityId, Probes, TextureId, World, cvar::Value, scene},
 	err, error, info, warn,
 };
 
@@ -59,7 +60,15 @@ pub(crate) const BOUNCES: &str = "bake.bounces";
 /// How many rays a texel sends in each.
 pub(crate) const RAYS: &str = "bake.rays";
 
-/// Registers the command and the three settings.
+/// How many probes a unit a bake keeps the light at points of the air with.
+pub(crate) const PROBES: &str = "bake.probes";
+
+/// The folder under [`LIGHTMAPS`] a bake keeps its probes' pictures in: a
+/// folder rather than a suffix, so no scene's name can be another scene's
+/// probes, since a scene's name holds no slash.
+const PROBE_FOLDER: &str = "probes";
+
+/// Registers the command and the four settings.
 ///
 /// @param world - the table to register into
 pub(crate) fn install(world: &mut World) {
@@ -83,13 +92,19 @@ pub(crate) fn install(world: &mut World) {
 	world.cvars.saved(
 		RAYS,
 		Value::Int(i64::from(Settings::DEFAULT.rays)),
-		"how many rays each texel sends in each gather of a bake",
+		"how many rays each texel sends in each gather of a bake, and each face of a probe",
+	);
+	world.cvars.saved(
+		PROBES,
+		Value::Float(Settings::DEFAULT.probes),
+		"how many probes a unit a bake keeps the light at points of the air with, for what has \
+		 no place on the lightmap; nought for none",
 	);
 }
 
 /// What a bake is asked for, as the table says it.
 ///
-/// @param world - where the three settings live
+/// @param world - where the four settings live
 #[must_use]
 pub(crate) fn settings(world: &World) -> Settings {
 	let whole = |name: &str, fallback: u32| {
@@ -107,6 +122,10 @@ pub(crate) fn settings(world: &World) -> Settings {
 			.unwrap_or(Settings::DEFAULT.texels),
 		bounces: whole(BOUNCES, Settings::DEFAULT.bounces),
 		rays: whole(RAYS, Settings::DEFAULT.rays),
+		probes: world
+			.cvars
+			.float(PROBES)
+			.unwrap_or(Settings::DEFAULT.probes),
 	}
 	.sane()
 }
@@ -211,14 +230,17 @@ fn asked_settings(asked: &Asked, archive: &Path) -> Settings {
 			.unwrap_or(Settings::DEFAULT.texels),
 		bounces: whole(BOUNCES, Settings::DEFAULT.bounces),
 		rays: whole(RAYS, Settings::DEFAULT.rays),
+		probes: said(PROBES)
+			.and_then(|value| value.parse().ok())
+			.unwrap_or(Settings::DEFAULT.probes),
 	}
 	.sane()
 }
 
-/// Bakes a world, and writes the picture and the scene.
+/// Bakes a world, and writes the pictures and the scene.
 ///
-/// @param world - the world, which gets each thing's place and the picture's
-/// name
+/// @param world - the world, which gets each thing's place and both pictures'
+/// names
 /// @param project - whose asset tree
 /// @param name - what the picture and the scene are called
 /// @param settings - what is asked for
@@ -237,6 +259,7 @@ fn bake(world: &mut World, project: &Project, name: &str, settings: Settings) ->
 		texels = settings.texels,
 		bounces = settings.bounces,
 		rays = settings.rays,
+		probes = settings.probes,
 		threads = colby_bake::threads(),
 		"a bake starts"
 	);
@@ -245,8 +268,19 @@ fn bake(world: &mut World, project: &Project, name: &str, settings: Settings) ->
 
 	report(world, &baked);
 
+	if let Some(found) = &baked.probes
+		&& found.grid.step > settings.probes.recip()
+	{
+		warn!(
+			asked = settings.probes,
+			kept = found.grid.step.recip(),
+			"the probes were laid coarser than asked, so that they fit"
+		);
+	}
+
 	let picture = kept(world, project, name, &baked)?;
 
+	probed(world, project, name, &baked)?;
 	placed(world, &baked);
 
 	let source = saves::source(&project.assets(), name)?;
@@ -279,16 +313,63 @@ fn kept(
 	name: &str,
 	baked: &Baked,
 ) -> Result<std::path::PathBuf> {
-	let texels: Vec<[f32; 3]> = baked
-		.light
+	let (path, picture) = pictured(
+		world,
+		project,
+		&format!("{LIGHTMAPS}/{name}"),
+		[baked.width, baked.height],
+		&baked.light,
+	)?;
+
+	world.lightmap = picture;
+
+	Ok(path)
+}
+
+/// Writes the probes' picture as a source beside the lightmap, and names it and
+/// the grid on the world - or names none, for a bake that kept none.
+///
+/// A bake that keeps none leaves a picture an earlier one wrote where it was:
+/// the scene written with this bake names none, so nothing reads it.
+fn probed(world: &mut World, project: &Project, name: &str, baked: &Baked) -> Result {
+	let Some(found) = &baked.probes else {
+		world.probes = Probes::NONE;
+
+		return Ok(());
+	};
+	let (size, texels) = found
+		.picture()
+		.ok_or_else(|| err!(Asset("the probes' grid is too large for any picture")))?;
+	let (_, picture) =
+		pictured(world, project, &format!("{LIGHTMAPS}/{PROBE_FOLDER}/{name}"), size, &texels)?;
+
+	world.probes = Probes { picture, grid: found.grid };
+
+	Ok(())
+}
+
+/// Writes a picture of light as a source, and puts what the compiler will make
+/// of it in the registry under the name it will have.
+///
+/// @param asset - the name, which is also where under the asset tree it goes
+/// @param size - how many texels across and down
+/// @param light - the texels, row by row from the top
+/// @return where it was written, and the handle the registry gave it
+fn pictured(
+	world: &mut World,
+	project: &Project,
+	asset: &str,
+	[width, height]: [u32; 2],
+	light: &[colby_core::glam::Vec3],
+) -> Result<(std::path::PathBuf, TextureId)> {
+	let texels: Vec<[f32; 3]> = light
 		.iter()
 		.map(colby_core::glam::Vec3::to_array)
 		.collect();
-	let bytes = radiance::encode(baked.width, baked.height, &texels)?;
+	let bytes = radiance::encode(width, height, &texels)?;
 	let path = project
 		.assets()
-		.join(LIGHTMAPS)
-		.join(name)
+		.join(asset)
 		.with_extension(radiance::EXTENSION);
 
 	if let Some(directory) = path.parent() {
@@ -298,20 +379,17 @@ fn kept(
 	fs::write(&path, &bytes)?;
 
 	let data = radiance::lightmap(&radiance::import(&bytes)?)?;
-
-	world.lightmap = world
-		.textures
-		.insert(&format!("{LIGHTMAPS}/{name}"), data);
+	let picture = world.textures.insert(asset, data);
 
 	info!(
 		path = %path.display(),
-		width = baked.width,
-		height = baked.height,
+		width,
+		height,
 		bytes = bytes.len(),
-		"lightmap written"
+		"a picture of light written"
 	);
 
-	Ok(path)
+	Ok((path, picture))
 }
 
 /// Writes every thing's place on the picture into its record, and nought into
@@ -361,6 +439,21 @@ fn report(world: &World, baked: &Baked) {
 		height = baked.height,
 		"what was baked"
 	);
+
+	match &baked.probes {
+		| Some(found) => info!(
+			probes = report.probes,
+			buried = report.probes_buried,
+			rays = report.probe_rays,
+			across = found.grid.counts[0],
+			up = found.grid.counts[1],
+			deep = found.grid.counts[2],
+			step = found.grid.step,
+			"what the probes gathered"
+		),
+		| None =>
+			info!("no probes were kept: none were asked for, or every one stood inside something"),
+	}
 
 	let mut named: Vec<(String, Placeless)> = baked
 		.placeless
@@ -529,6 +622,58 @@ mod tests {
 
 		assert_eq!(scene.lightmap, "lightmaps/yard", "the picture's name is in the scene");
 		assert!(text.contains("\"baking\""), "and each thing's place is in its record: {text}");
+
+		// and the probes beside it: their picture, named on the world and in the
+		// scene with the grid they stand on
+		let probes = project
+			.assets()
+			.join("lightmaps")
+			.join("probes")
+			.join("yard.hdr");
+		let kept = radiance::import(&fs::read(&probes).expect("the probes' picture is there"))
+			.expect("and it is a picture");
+
+		assert!(world.probes.is_some(), "the world names its probes");
+		assert_eq!(
+			world
+				.textures
+				.get(world.probes.picture)
+				.map(|entry| entry.name().to_owned()),
+			Some("lightmaps/probes/yard".to_owned()),
+			"by the name the compiler gives them"
+		);
+		assert_eq!(
+			Some([kept.width, kept.height]),
+			world.probes.grid.picture(),
+			"a picture the size their grid says"
+		);
+		assert_eq!(scene.probes, "lightmaps/probes/yard", "named in the scene");
+		assert_eq!(scene.probe_grid, world.probes.grid, "with the grid, to the bit");
+	}
+
+	#[test]
+	fn a_bake_asked_for_no_probes_names_none() {
+		let project = project("unprobed", None);
+		let mut world = room();
+
+		world.cvars.set(PROBES, "0");
+		colby_core::abi::console::run(&mut world, "light.bake yard");
+		serve(&mut world, &project);
+
+		let text = fs::read_to_string(project.assets().join("scenes").join("yard.scene"))
+			.expect("the scene is written");
+
+		assert!(world.lightmap.is_some(), "the lightmap is baked");
+		assert_eq!(world.probes, Probes::NONE, "and no probes are named");
+		assert!(!text.contains("\"probes\""), "in the world or in the scene: {text}");
+		assert!(
+			!project
+				.assets()
+				.join("lightmaps")
+				.join("probes")
+				.exists(),
+			"and no picture of them is written"
+		);
 	}
 
 	#[test]
@@ -568,6 +713,22 @@ mod tests {
 			.to_scene_data();
 
 		assert_eq!(read.lightmap, "lightmaps/yard", "and the compiled scene names it");
+
+		let probes = report
+			.compiled
+			.iter()
+			.find(|compiled| compiled.name == "lightmaps/probes/yard")
+			.expect("the probes' picture compiled");
+		let file = TextureFile::open(&probes.output).expect("a texture");
+		let registered = world
+			.textures
+			.get(world.probes.picture)
+			.map(|entry| entry.value().clone())
+			.expect("the registry holds them");
+
+		assert_eq!(file.to_texture_data(), registered, "the same texels the bake put there");
+		assert_eq!(read.probes, "lightmaps/probes/yard", "and the compiled scene names them");
+		assert_eq!(read.probe_grid, world.probes.grid, "with their grid");
 	}
 
 	#[test]
@@ -622,13 +783,14 @@ mod tests {
 		let archive = project.settings();
 
 		fs::create_dir_all(archive.parent().expect("a directory")).expect("made");
-		fs::write(&archive, "bake.rays 64\nbake.bounces 2\n").expect("written");
+		fs::write(&archive, "bake.rays 64\nbake.bounces 2\nbake.probes 0.25\n").expect("written");
 
 		let line = Launch::parse(&["--set".to_owned(), "bake.rays=32".to_owned()]).asked;
 		let asked = asked_settings(&line, &archive);
 
 		assert_eq!(asked.rays, 32, "the line first");
 		assert_eq!(asked.bounces, 2, "then the project");
+		assert_eq!(asked.probes.to_bits(), 0.25_f32.to_bits(), "the probes too");
 		assert_eq!(
 			asked.texels.to_bits(),
 			Settings::DEFAULT.texels.to_bits(),

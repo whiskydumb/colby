@@ -1115,6 +1115,67 @@ mod tests {
 	}
 
 	#[test]
+	fn a_mesh_with_bones_reads_the_probes_round_it() {
+		// what the lightmap cannot hold the probes can: the bar, posed or not,
+		// with its bones or without them, is drawn by a pipeline that reads the
+		// probes over it, and probes of a bright red move it
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let grid = colby_core::abi::probes::Grid {
+			from: Vec3::splat(-8.0),
+			step: 4.0,
+			counts: [4, 4, 4],
+		};
+		let [width, height] = grid.picture().expect("a small grid");
+		let red: Vec<u8> = std::iter::repeat_n([4.0_f32, 0.0, 0.0, 1.0], 24 * 16)
+			.flatten()
+			.flat_map(|channel| half(channel).to_le_bytes())
+			.collect();
+
+		assert_eq!([width, height], [24, 16], "six faces of four, four layers of four");
+
+		for (posed, boned) in [(true, true), (false, true), (true, false)] {
+			let (mut world, ..) = armed(posed);
+
+			if !boned {
+				world
+					.meshes
+					.insert(BAR, MeshData { skin: Vec::new(), ..bar([0, 255, 0, 0]) });
+			}
+
+			let unprobed = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+			let picture = world
+				.textures
+				.insert("lightmaps/probes/test", TextureData {
+					width,
+					height,
+					faces: 1,
+					texel: Texel::Rgba16Float,
+					levels: vec![red.clone()],
+				});
+
+			world.probes = colby_core::abi::Probes { picture, grid };
+
+			let probed = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			assert_ne!(
+				unprobed.pixels, probed.pixels,
+				"posed {posed}, bones {boned}: red moves it"
+			);
+			assert_eq!(
+				capture.scene_mut().probed_drawn(),
+				1,
+				"posed {posed}, bones {boned}: through the pipeline that reads them"
+			);
+		}
+	}
+
+	#[test]
 	fn a_resting_pose_draws_the_shape_the_mesh_was_modeled_in() {
 		let Some(mut capture) = capture() else {
 			return;

@@ -34,6 +34,10 @@
 //!    texels and no other's, and the rest of each thing's place from whatever
 //!    is beside it, so a coarser level of a mesh drawn over its chart's gutter
 //!    reads a color rather than black.
+//! 5. **The probes**, for what has no place on the picture: six gathers at each
+//!    point of a grid over the world, reading the picture the last gather read,
+//!    so a probe carries the light off as many surfaces as the texel beside it.
+//!    @ref [`probes`](crate::probes).
 
 use std::time::{Duration, Instant};
 
@@ -48,6 +52,7 @@ use colby_core::{
 use crate::{
 	atlas::{Atlas, Placeless, Rect},
 	gather::{Gathered, Pattern, each, seed},
+	probes::{self, Probed},
 	scene::{BIAS, Scene},
 	texels::{NONE, Sample, Texels},
 	tree::{Hit, Ray},
@@ -64,22 +69,28 @@ pub struct Settings {
 	/// the sky's off one fewer.
 	pub bounces: u32,
 
-	/// How many rays a texel sends in each gather.
+	/// How many rays a texel sends in each gather, and a probe's face in its
+	/// one.
 	pub rays: u32,
+
+	/// How many probes a unit along each axis, or nought for none.
+	pub probes: f32,
 }
 
 impl Settings {
 	/// What a bake is asked for when nobody says otherwise: the density the
-	/// sheets were laid out at, three gathers, and a hundred and twenty-eight
-	/// rays a texel.
+	/// sheets were laid out at, three gathers, a hundred and twenty-eight rays
+	/// a texel, and a probe a unit.
 	pub const DEFAULT: Self = Self {
 		texels: unwrap::TEXELS,
 		bounces: 3,
 		rays: 128,
+		probes: 1.0,
 	};
 
 	/// The same, each held where a bake means something: a tenth of a texel a
-	/// unit to sixty-four, one gather to sixteen, sixteen rays to 8192.
+	/// unit to sixty-four, one gather to sixteen, sixteen rays to 8192, and no
+	/// probes, or a sixteenth of one a unit to four.
 	#[must_use]
 	pub fn sane(self) -> Self {
 		let texels = if self.texels.is_nan() {
@@ -87,11 +98,19 @@ impl Settings {
 		} else {
 			self.texels.clamp(0.1, 64.0)
 		};
+		let probes = if self.probes.is_nan() {
+			Self::DEFAULT.probes
+		} else if self.probes <= 0.0 {
+			0.0
+		} else {
+			self.probes.clamp(0.0625, 4.0)
+		};
 
 		Self {
 			texels,
 			bounces: self.bounces.clamp(1, 16),
 			rays: self.rays.clamp(16, 8192),
+			probes,
 		}
 	}
 }
@@ -118,6 +137,10 @@ pub struct Baked {
 
 	/// Every still thing that has none, the mesh it draws, and why.
 	pub placeless: Vec<(EntityId, MeshId, Placeless)>,
+
+	/// The probes, for everything that has no place on the picture: nothing
+	/// when none were asked for, and when every one stood inside something.
+	pub probes: Option<Probed>,
 
 	/// What was worked out, and how long each part took.
 	pub report: Report,
@@ -149,6 +172,15 @@ pub struct Report {
 
 	/// How many rays the gathers sent.
 	pub rays: u64,
+
+	/// How many probes stand on the grid, if there is one.
+	pub probes: usize,
+
+	/// How many of them were inside something.
+	pub probes_buried: usize,
+
+	/// How many rays they sent.
+	pub probe_rays: u64,
 
 	/// Each part, and how long it took.
 	pub parts: Vec<(String, Duration)>,
@@ -250,6 +282,18 @@ pub fn bake(scene: &Scene, settings: Settings, threads: usize) -> Result<Baked> 
 		});
 	}
 
+	// the picture the last gather read is what `arriving` still holds: the
+	// direct light and the gather before it, filled over the charts
+	let probes = probes::grid_of(scene, settings.probes).and_then(|grid| {
+		let read = Reading { scene, atlas: &atlas, picture: &arriving };
+
+		probes::probes(scene, grid, &pattern, threads, |hit| read.sent(hit))
+	});
+
+	if settings.probes > 0.0 {
+		clock.lap("the probes");
+	}
+
 	let (places, placeless) = places_of(scene, &atlas);
 	let lit = valid.iter().filter(|keep| **keep).count();
 
@@ -260,6 +304,11 @@ pub fn bake(scene: &Scene, settings: Settings, threads: usize) -> Result<Baked> 
 		places,
 		placeless,
 		report: Report {
+			probes: probes
+				.as_ref()
+				.map_or(0, |found| found.grid.len()),
+			probes_buried: probes.as_ref().map_or(0, |found| found.buried),
+			probe_rays: probes.as_ref().map_or(0, |found| found.rays),
 			pieces: scene.pieces().len(),
 			triangles: scene.triangles().len(),
 			lamps: scene.lamps().len(),
@@ -275,6 +324,7 @@ pub fn bake(scene: &Scene, settings: Settings, threads: usize) -> Result<Baked> 
 			.saturating_mul(u64::try_from(pattern.len()).unwrap_or(0)),
 			parts: clock.parts,
 		},
+		probes,
 	})
 }
 
@@ -846,6 +896,251 @@ mod tests {
 		assert_eq!(baked.report.pushed, 0, "and no texel is under anything");
 	}
 
+	/// Every probe of a bake whose whole cell lies inside a box, with where it
+	/// stands.
+	fn probes_within(baked: &Baked, low: Vec3, high: Vec3) -> Vec<(Vec3, [Vec3; 6])> {
+		let found = baked
+			.probes
+			.as_ref()
+			.expect("the bake kept probes");
+		let half = Vec3::splat(found.grid.step * 0.5);
+
+		found
+			.faces
+			.iter()
+			.enumerate()
+			.map(|(index, faces)| (found.grid.at(found.grid.place(index)), *faces))
+			.filter(|(at, _)| (*at - half).cmpge(low).all() && (*at + half).cmple(high).all())
+			.collect()
+	}
+
+	#[test]
+	fn every_probe_in_a_closed_room_of_glowing_walls_holds_the_series_its_walls_hold() {
+		let (glow, albedo) = (Vec3::new(0.5, 0.25, 0.75), Vec3::new(0.6, 0.3, 0.9));
+		let scene = Scene::of(&furnace(glow, albedo));
+		let settings = Settings {
+			bounces: 4,
+			rays: 32,
+			..Settings::DEFAULT
+		};
+		let baked = bake(&scene, settings, threads()).expect("a room bakes");
+		// a face's every ray lands on a wall, and a wall sends its glow and its
+		// share of what the *last* gather read: so a probe holds what the texel
+		// beside it holds - the series to as many terms - and not one more
+		let mut known = Vec3::ZERO;
+
+		for _ in 0..settings.bounces {
+			known = glow + albedo * known;
+		}
+
+		let inside = probes_within(&baked, Vec3::splat(-2.0), Vec3::splat(2.0));
+
+		assert_eq!(inside.len(), 64, "four a side inside the room");
+
+		for (at, faces) in inside {
+			for face in faces {
+				assert_eq!(
+					face.to_array().map(f32::to_bits),
+					known.to_array().map(f32::to_bits),
+					"the probe at {at}: {face} where the series is {known}"
+				);
+			}
+		}
+
+		// and the ring outside the walls sees their backs: inside something
+		let found = baked.probes.as_ref().expect("probes");
+
+		assert_eq!(found.grid.counts, [6, 6, 6], "a cell of air round the room");
+		assert!(baked.report.probes_buried > 0, "the ring outside the walls is buried");
+		assert_eq!(baked.report.probes, 216, "and the report counts them");
+	}
+
+	#[test]
+	fn an_open_floor_s_probes_see_the_sky_above_to_the_bit_and_the_floor_below() {
+		let sky = Vec3::new(0.2, 0.35, 0.8);
+		let mut world = open(sky);
+
+		world.light = Vec3::new(-0.3, -1.0, 0.2);
+		put(&mut world, MeshId::QUAD, MaterialId::DEFAULT, Transform {
+			scale: Vec3::new(12.0, 1.0, 12.0),
+			..Transform::IDENTITY
+		});
+
+		let scene = Scene::of(&world);
+		let baked = bake(&scene, Settings::DEFAULT, threads()).expect("a floor bakes");
+		let found = baked.probes.as_ref().expect("probes");
+		// what the floor sends up: its share of the sun and the sky, which is
+		// what every one of its texels holds, all of them alike
+		let floor = scene.direct(Vec3::ZERO, Vec3::Y) + sky;
+
+		assert_eq!(found.grid.counts, [14, 2, 14], "one layer under the floor, one over it");
+
+		for (index, faces) in found.faces.iter().enumerate() {
+			let place = found.grid.place(index);
+			let at = found.grid.at(place);
+
+			if place[1] == 1 {
+				// nothing above the floor but the sky
+				assert_eq!(
+					faces[2].to_array().map(f32::to_bits),
+					sky.to_array().map(f32::to_bits),
+					"the face up at {at} is the sky"
+				);
+
+				// and below it the floor, or the sky past its edge: near the middle
+				// the floor with every ray but a few that graze past its edge
+				let down = faces[3];
+				let middle = at.x.abs() < 2.0 && at.z.abs() < 2.0;
+
+				assert!(
+					(0..3).all(|channel| between(down[channel], floor[channel], sky[channel])),
+					"the face down at {at} lies between the floor and the sky: {down}"
+				);
+				assert!(
+					!middle || (down - floor).abs().max_element() <= 0.02 * floor.max_element(),
+					"near the middle the face down at {at} is the floor: {down} against {floor}"
+				);
+			} else if at.x.abs() < 4.0 && at.z.abs() < 4.0 {
+				// under the floor, which faces up, every probe sees its back with
+				// half of its rays: inside, and given the light of the probe above
+				let above = found.grid.index([place[0], 1, place[2]]);
+
+				assert_eq!(*faces, found.faces[above], "the probe under the floor at {at}");
+			}
+		}
+
+		assert!(baked.report.probes_buried >= 100, "the layer under the floor");
+	}
+
+	#[test]
+	fn a_probe_beside_a_black_wall_sees_as_much_of_the_sky_as_the_wall_leaves() {
+		let mut world = open(Vec3::ONE);
+		let black = world.materials.insert("black", Material {
+			base_color: Vec3::ZERO,
+			..Material::DEFAULT
+		});
+
+		// a black wall standing in the sky, one thick, four high, eight long
+		put(&mut world, MeshId::CUBE, black, Transform {
+			scale: Vec3::new(1.0, 4.0, 8.0),
+			..Transform::IDENTITY
+		});
+
+		let settings = Settings {
+			rays: 1024,
+			bounces: 1,
+			probes: 0.5,
+			..Settings::DEFAULT
+		};
+		let baked = bake(&Scene::of(&world), settings, threads()).expect("a wall bakes");
+		let found = baked.probes.as_ref().expect("probes");
+		let mut errors = Vec::new();
+
+		for (index, faces) in found.faces.iter().enumerate() {
+			let at = found.grid.at(found.grid.place(index));
+
+			// a probe two off the wall's face, looking at it, from where only
+			// that face of it can be seen: not above, below or past its ends
+			if (at.x - 2.5).abs() > 1.0e-6 || at.y.abs() > 2.0 || at.z.abs() > 4.0 {
+				continue;
+			}
+
+			let seen = 1.0 - wall_view(at, Vec3::NEG_X, 0.5, 2.0, 4.0);
+			let error = f64::from(faces[1].x) - seen;
+
+			errors.push(error);
+			assert_eq!(faces[0], Vec3::ONE, "the face away from the wall at {at} sees only sky");
+			assert!(
+				error.abs() < 0.03,
+				"the face toward the wall at {at}: {} against {seen:.4}",
+				faces[1].x
+			);
+		}
+
+		let count = f64::from(u32::try_from(errors.len()).expect("a few"));
+		let mean = errors.iter().sum::<f64>() / count;
+
+		assert_eq!(errors.len(), 8, "two rows of four beside the wall");
+		assert!(mean.abs() < 0.01, "and on average within a hundredth: {mean:.5}");
+	}
+
+	/// How much of what a point facing one way sees is a rectangle in the plane
+	/// `x = face`, facing along +x, `y` within `half_high` of nought and `z`
+	/// within `half_long`: the view factor, added up in double precision over a
+	/// fine grid of the rectangle.
+	fn wall_view(at: Vec3, facing: Vec3, face: f64, half_high: f64, half_long: f64) -> f64 {
+		let steps = 800_u32;
+		let (height, length) = (half_high * 2.0, half_long * 2.0);
+		let cell = height / f64::from(steps) * (length / f64::from(steps));
+		let [x, y, z] = at.to_array().map(f64::from);
+		let [fx, fy, fz] = facing.to_array().map(f64::from);
+		let mut total = 0.0;
+
+		for row in 0..steps {
+			let wy = -half_high + (f64::from(row) + 0.5) * height / f64::from(steps);
+
+			for column in 0..steps {
+				let wz = -half_long + (f64::from(column) + 0.5) * length / f64::from(steps);
+
+				total += seen_from([x, y, z], [fx, fy, fz], [face, wy, wz]) * cell;
+			}
+		}
+
+		total
+	}
+
+	/// Whether a number lies between two others, whichever is the larger.
+	fn between(value: f32, one: f32, other: f32) -> bool {
+		let (low, high) = if one < other { (one, other) } else { (other, one) };
+
+		(low..=high).contains(&value)
+	}
+
+	/// What one patch of that rectangle at `to` adds to the view factor from a
+	/// point at `from` facing `facing`, per unit of its area.
+	fn seen_from(from: [f64; 3], facing: [f64; 3], to: [f64; 3]) -> f64 {
+		let way = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+		let [across, up, deep] = way.map(|part| part * part);
+		let squared = across + up + deep;
+		let reach = squared.sqrt();
+		let [x, y, z] = [way[0] * facing[0], way[1] * facing[1], way[2] * facing[2]];
+		let toward = (x + y + z) / reach;
+		// the rectangle faces along +x, back towards the point
+		let back = -way[0] / reach;
+
+		if toward > 0.0 && back > 0.0 {
+			toward * back / (std::f64::consts::PI * squared)
+		} else {
+			0.0
+		}
+	}
+
+	#[test]
+	fn a_bake_asked_for_no_probes_keeps_none() {
+		let baked = bake(
+			&Scene::of(&furnace(Vec3::ONE, Vec3::splat(0.5))),
+			Settings {
+				rays: 16,
+				bounces: 1,
+				probes: 0.0,
+				..Settings::DEFAULT
+			},
+			threads(),
+		)
+		.expect("a room bakes");
+
+		assert!(baked.probes.is_none(), "none asked for, none kept");
+		assert_eq!(baked.report.probes, 0);
+		assert!(
+			baked
+				.report
+				.parts
+				.iter()
+				.all(|(part, _)| part != "the probes"),
+			"and no part of the bake was spent on them"
+		);
+	}
+
 	#[test]
 	fn an_open_floor_under_a_flat_sky_bakes_the_sky_to_the_bit_and_not_the_sun() {
 		let sky = Vec3::new(0.2, 0.35, 0.8);
@@ -1307,6 +1602,20 @@ mod tests {
 			assert_eq!(bits(&alone), bits(&many), "the number of threads changes nothing");
 			assert_eq!(bits(&many), bits(&again), "and a second bake is the first");
 			assert_eq!(alone.places, many.places, "nor where anything is");
+
+			let probed = |baked: &Baked| -> Vec<u32> {
+				baked
+					.probes
+					.iter()
+					.flat_map(|found| &found.faces)
+					.flatten()
+					.flat_map(|face| face.to_array().map(f32::to_bits))
+					.collect()
+			};
+
+			assert!(!probed(&alone).is_empty(), "there are probes to compare");
+			assert_eq!(probed(&alone), probed(&many), "nor what the probes hold");
+			assert_eq!(probed(&many), probed(&again), "twice");
 		}
 	}
 
@@ -1335,20 +1644,39 @@ mod tests {
 
 	#[test]
 	fn what_a_bake_is_asked_for_is_held_where_it_means_something() {
-		let wild = Settings { texels: f32::NAN, bounces: 0, rays: 1 }.sane();
+		let wild = Settings {
+			texels: f32::NAN,
+			bounces: 0,
+			rays: 1,
+			probes: f32::NAN,
+		}
+		.sane();
 		let wide = Settings {
 			texels: 1.0e9,
 			bounces: 99,
 			rays: 1_000_000,
+			probes: 1.0e9,
 		}
 		.sane();
 
 		assert_eq!(wild, Settings {
 			texels: Settings::DEFAULT.texels,
 			bounces: 1,
-			rays: 16
+			rays: 16,
+			probes: Settings::DEFAULT.probes,
 		});
-		assert_eq!(wide, Settings { texels: 64.0, bounces: 16, rays: 8192 });
+		assert_eq!(wide, Settings {
+			texels: 64.0,
+			bounces: 16,
+			rays: 8192,
+			probes: 4.0
+		});
+
+		for (asked, held) in [(0.0_f32, 0.0_f32), (-3.0, 0.0), (0.001, 0.0625), (0.5, 0.5)] {
+			let settings = Settings { probes: asked, ..Settings::DEFAULT }.sane();
+
+			assert_eq!(settings.probes.to_bits(), held.to_bits(), "{asked} probes a unit");
+		}
 	}
 
 	#[test]

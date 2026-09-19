@@ -69,10 +69,11 @@ use crate::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, Decal, Emitter, EntityId, Entry, Joint, JointId,
-		JointKind, Layers, Light, MaterialId, MeshId, Pose, PoseId, Post, Registry, Renderable,
-		Shape, ShapeKind, Sky, Terrain, TextureId, Transform, Water, World,
+		JointKind, Layers, Light, MaterialId, MeshId, Pose, PoseId, Post, Probes, Registry,
+		Renderable, Shape, ShapeKind, Sky, Terrain, TextureId, Transform, Water, World,
 		field::{Field, field},
 		net::MAX_PEERS,
+		probes::Grid,
 		record::{self, Noted},
 		state::STATE_BYTES,
 	},
@@ -699,6 +700,17 @@ pub struct SceneData {
 	/// which travels with the entity.
 	pub lightmap: String,
 
+	/// The asset name of the picture a bake kept the light arriving at points
+	/// of the air in, or empty for a world with no probes.
+	///
+	/// A name for the lightmap's reason, and beside it the grid the probes
+	/// stand on, which is numbers and the same whatever the run.
+	/// @ref [`probes`](super::probes).
+	pub probes: String,
+
+	/// Where those probes stand: [`Grid::NONE`] where no picture is named.
+	pub probe_grid: Grid,
+
 	/// Every entity that was alive.
 	pub things: Vec<Thing>,
 
@@ -995,6 +1007,8 @@ impl SceneData {
 			stage: self.stage,
 			sky_cubemap: self.sky_cubemap.clone(),
 			lightmap: self.lightmap.clone(),
+			probes: self.probes.clone(),
+			probe_grid: self.probe_grid,
 			thing_generations: vec![1; things.len()],
 			solid_generations: vec![1; kept.len()],
 			link_generations: vec![1; links.len()],
@@ -1171,6 +1185,8 @@ pub fn capture(world: &World) -> SceneData {
 		}
 	}
 
+	let (probes, probe_grid) = probes_named(world);
+
 	SceneData {
 		stage: settings(world),
 		// the name back out of the registry, the way an emitter's sprite is
@@ -1184,6 +1200,8 @@ pub fn capture(world: &World) -> SceneData {
 			.textures
 			.get(world.lightmap)
 			.map_or_else(String::new, |entry| entry.name().to_owned()),
+		probes,
+		probe_grid,
 		links: links(world, &solid_of),
 		posed,
 		pose_generations: (0..world.poses.slots())
@@ -1495,6 +1513,8 @@ static EMPTY: SceneData = SceneData {
 	stage: Stage::DEFAULT,
 	sky_cubemap: String::new(),
 	lightmap: String::new(),
+	probes: String::new(),
+	probe_grid: Grid::NONE,
 	things: Vec::new(),
 	solids: Vec::new(),
 	links: Vec::new(),
@@ -1650,6 +1670,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 
 	stage_world(world, scene.stage, &scene.sky_cubemap);
 	world.lightmap = lightmap(world, &scene.lightmap);
+	world.probes = probes(world, &scene.probes, scene.probe_grid);
 
 	Ok(Restored {
 		things: things.iter().filter(|id| id.is_some()).count(),
@@ -2223,6 +2244,49 @@ fn lightmap(world: &World, name: &str) -> TextureId {
 	}
 
 	found
+}
+
+/// A world's probes as a description names them: the picture's name and the
+/// grid, or nothing and no grid for a world with none - and for a world whose
+/// probes name nothing the registry holds, since a handle nothing answers to
+/// has no name to write.
+fn probes_named(world: &World) -> (String, Grid) {
+	if !world.probes.is_some() {
+		return (String::new(), Grid::NONE);
+	}
+
+	world
+		.textures
+		.get(world.probes.picture)
+		.map_or_else(
+			|| (String::new(), Grid::NONE),
+			|entry| (entry.name().to_owned(), world.probes.grid),
+		)
+}
+
+/// A description's probes put in place: the picture resolved by name, the
+/// sky's rule - a warning and none when nothing answers - and none for a grid
+/// that holds no probe, which no picture can be read through.
+fn probes(world: &World, name: &str, grid: Grid) -> Probes {
+	if name.is_empty() {
+		return Probes::NONE;
+	}
+
+	if !grid.is_some() {
+		warn!(name, "a scene names probes on a grid that holds none");
+
+		return Probes::NONE;
+	}
+
+	let picture = world.textures.find(name);
+
+	if !picture.is_some() {
+		warn!(name, "a scene names probes nothing answers to");
+
+		return Probes::NONE;
+	}
+
+	Probes { picture, grid }
 }
 
 fn material(world: &World, name: &str) -> MaterialId {
@@ -6032,6 +6096,71 @@ mod tests {
 		restore(&mut world, &SceneData::default()).expect("a world nobody baked");
 
 		assert!(!world.lightmap.is_some(), "a description with no name has no lightmap");
+	}
+
+	#[test]
+	fn a_world_names_its_probes_and_a_load_turns_that_into_a_handle_and_a_grid() {
+		let mut world = World::new();
+		let grid = Grid {
+			from: Vec3::new(-3.0, -1.0, 2.5),
+			step: 0.5,
+			counts: [4, 3, 2],
+		};
+		let kept = world
+			.textures
+			.insert("lightmaps/probes/yard", TextureData::white());
+		let described = SceneData {
+			probes: "lightmaps/probes/yard".to_owned(),
+			probe_grid: grid,
+			..SceneData::default()
+		};
+
+		restore(&mut world, &described).expect("a world with probes");
+
+		assert_eq!(world.probes, Probes { picture: kept, grid }, "resolved, the grid as it was");
+
+		let captured = capture(&world);
+
+		assert_eq!(captured.probes, "lightmaps/probes/yard", "and they come back out");
+		assert_eq!(captured.probe_grid, grid, "with their grid");
+
+		restore(&mut world, &SceneData::default()).expect("a world nobody baked");
+
+		assert_eq!(world.probes, Probes::NONE, "a description with no name has no probes");
+		assert_eq!(capture(&world).probe_grid, Grid::NONE, "and writes no grid");
+	}
+
+	#[test]
+	fn probes_nothing_answers_to_or_on_no_grid_are_no_probes() {
+		let mut world = World::new();
+
+		world
+			.textures
+			.insert("lightmaps/probes/yard", TextureData::white());
+
+		for (name, grid) in [
+			("lightmaps/probes/absent", Grid {
+				step: 1.0,
+				counts: [1, 1, 1],
+				..Grid::NONE
+			}),
+			("lightmaps/probes/yard", Grid::NONE),
+		] {
+			let described = SceneData {
+				probes: name.to_owned(),
+				probe_grid: grid,
+				..SceneData::default()
+			};
+
+			restore(&mut world, &described).expect("a world is not lost over its probes");
+
+			assert_eq!(world.probes, Probes::NONE, "{name} on {grid:?} is none");
+			assert_eq!(
+				capture(&world).probes,
+				"",
+				"so nothing is named when it is written again"
+			);
+		}
 	}
 
 	#[test]

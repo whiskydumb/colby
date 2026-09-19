@@ -33,6 +33,7 @@ pub mod occlusion;
 pub mod overlay;
 mod post;
 pub mod prepass;
+pub mod probes;
 pub mod reflection;
 pub mod renderer;
 pub mod scene;

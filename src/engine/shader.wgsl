@@ -9,6 +9,11 @@
 // built, so none of the three can be a branch. Six pipelines come out of the
 // six pairs.
 //
+// A surface a bake reached is drawn by entry points of their own: two for what
+// reads its light off the lightmap and three for what reads it off the probes,
+// each handing the arithmetic below a constant that says which, so that what
+// reads neither is compiled exactly as it was before there were bakes.
+//
 // Two more fragment entry points draw nothing anybody sees. The pass before the
 // scene runs the same two vertex entry points into a target of its own and
 // writes down, for every pixel of the solid and the masked half, the normal the
@@ -102,6 +107,12 @@ struct Globals {
     // x is how many of the lamps below are real and y how many of the decals;
     // the rest is unused.
     counts: vec4<u32>,
+    // xyz is the corner of the probes' grid with the least of every axis and w
+    // how wide one of its cells is; nought in a frame that reads no probes,
+    // which no entry point that draws such a frame reads. @ref `probed_radiance`.
+    probe_grid: vec4<f32>,
+    // xyz is how many probes the grid has along each axis; w is unused.
+    probe_counts: vec4<u32>,
     // The local lights, nearest first. Everything from `counts.x` up is
     // whatever was in the buffer last frame and is never read.
     lamps: array<Lamp, MAX_LAMPS>,
@@ -242,6 +253,16 @@ const SPLIT_SIDE: f32 = 64.0;
 // spans and zw where on the picture it starts, both as fractions of it. An
 // instance carries the index of its own entry in `skin.w`. @ref `place`.
 @group(0) @binding(12) var<storage, read> places: array<vec4<f32>>;
+
+// The world's probes: what a bake kept of the light arriving at the middle of
+// each cell of a grid over the world from each of six half-spaces, in the unit
+// the ambient color is in - or one texel of nothing in a frame that reads none,
+// which no entry point that draws such a frame samples. One flat picture, read
+// through the lightmap's sampler: the six faces side by side in the order +x,
+// -x, +y, -y, +z, -z, each as wide as the grid is along x, and the grid's layers
+// along y one under another, each as tall as the grid is along z. @ref
+// `colby_engine::probes`, and `probed_radiance` for how it is read.
+@group(0) @binding(13) var probe_light: texture_2d<f32>;
 
 @group(1) @binding(0) var albedo: texture_2d<f32>;
 @group(1) @binding(1) var surface_sampler: sampler;
@@ -1124,6 +1145,45 @@ fn fragment_masked_baked(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     return vec4<f32>(shade_baked(input, sampled, lit, found_at(input.clip_position.xy)), 1.0);
+}
+
+// The solid half again, for a surface that reads the probes: what the probes
+// round it kept takes the place of the sky's light on its diffuse half.
+//
+// An entry point of its own for the lightmap's reason, and the three of them are
+// every mode there is, since what reads the probes is everything a bake gave no
+// place: a thing a body moves, a thing bones bend, glass. @ref `shade_probed`.
+@fragment
+fn fragment_probed(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+
+    return vec4<f32>(shade_probed(input, sampled, seen(input), found_at(input.clip_position.xy)), 1.0);
+}
+
+// And the half with holes in it, for a surface that reads the probes.
+@fragment
+fn fragment_masked_probed(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+    // before anything decides to throw the fragment away, for the sample's
+    // reason: @ref `seen`
+    let lit = seen(input);
+    if (sampled.a * input.paint_alpha < MASK_CUTOFF) {
+        discard;
+    }
+
+    return vec4<f32>(shade_probed(input, sampled, lit, found_at(input.clip_position.xy)), 1.0);
+}
+
+// And glass that reads the probes, for `fragment_blended`'s reasons: all of the
+// sky, whatever is around it, and no reflection found.
+@fragment
+fn fragment_blended_probed(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+
+    return vec4<f32>(
+        shade_probed(input, sampled, 1.0, vec4<f32>(0.0)),
+        sampled.a * input.paint_alpha * input.tint.a,
+    );
 }
 
 // And for a surface what is behind still shows through.
@@ -2337,10 +2397,19 @@ fn shade_baked(input: VertexOutput, sampled: vec4<f32>, lit: f32, found: vec4<f3
     return shaded(input, sampled, lit, found, baked_at(input));
 }
 
+// What `lit_at` is handed to say it reads the probes where it stands, along the
+// normal it lights with: an alpha of two, and nothing else. @ref `lit_at`.
+const PROBED: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 2.0);
+
+// The same for a thing that reads the probes.
+fn shade_probed(input: VertexOutput, sampled: vec4<f32>, lit: f32, found: vec4<f32>) -> vec3<f32> {
+    return shaded(input, sampled, lit, found, PROBED);
+}
+
 // What both of those do.
 //
-// @param baked - what a bake kept of the light arriving at the point, a one
-// where it kept any: @ref `lit_at`
+// @param baked - what a bake kept of the light arriving at the point, and in its
+// alpha where it was kept: @ref `lit_at`
 fn shaded(
     input: VertexOutput,
     sampled: vec4<f32>,
@@ -2399,8 +2468,11 @@ fn shaded(
 // already multiplied by a and a how much of the reflection it stands for:
 // nought for a point nothing was followed from, @ref `found_at`
 // @param baked - what a bake kept of the light arriving at the point from
-// everywhere at once, rgb in the ambient color's unit and a one where it kept
-// any: nought for a point with no place on the lightmap, @ref `baked_at`
+// everywhere at once: an alpha of one and the light in rgb, in the ambient
+// color's unit, for a point with a place on the lightmap, @ref `baked_at`; an
+// alpha of two for a point that reads the probes where it stands, @ref
+// `PROBED`; and nought for a point that reads neither. A constant in every
+// entry point, so that two of the three branches below fold away in each.
 fn lit_at(
     surface: Surface,
     world_position: vec3<f32>,
@@ -2525,6 +2597,17 @@ fn lit_at(
         indirect = baked.rgb * indirect_diffuse + stand_in * ambient_specular;
     }
 
+    // **And the probes take the same place**, read where the point stands along
+    // the normal the environment's diffuse half is read along - the normal
+    // map's and every decal's turn in it - which is the one thing they can do
+    // that the lightmap's one color a texel cannot. A branch of its own after
+    // the lightmap's rather than one arm of it, so that the text every picture
+    // with a lightmap was drawn with is the text it is drawn with.
+    if (baked.a > 1.5) {
+        indirect = probed_radiance(world_position, normal) * indirect_diffuse
+            + stand_in * ambient_specular;
+    }
+
     // how much of the sky this point can see, and it multiplies this term and
     // nothing else, for the shadows' reason turned round: a sun or a lamp is
     // taken away by its own shadow, and what stands in for the light arriving
@@ -2568,6 +2651,72 @@ fn lit_at(
 
     // @ref `HDR_CEILING`: past it a smooth highlight would not fit the target.
     return min(direct + indirect + mixed, vec3<f32>(HDR_CEILING));
+}
+
+// What the probes round a point send it from every way at once, along a normal:
+// the light arriving from the three half-spaces the normal leans into, each
+// weighed by the square of the normal's part along its axis - which add to one
+// for a normal of unit length, so a probe that keeps one value on every face
+// reads as that value whatever the normal: an ambient cube.
+//
+// **Between the eight probes round the point**: the four in each of the two
+// layers along y it stands between are read by the sampler, which blends a
+// layer's four the way a picture is read, and the two layers are blended here.
+// The point is held inside the grid first, so a point beyond its outermost
+// probes reads theirs - and so that no read reaches past a face's block of the
+// picture into the next face's, or past a layer's block into the next layer's.
+//
+// **Outside the grid's box the sky's diffuse half**, as a world with no probes
+// reads it: a thing only partly inside is lit by the probes where it is inside
+// and by the sky where it is not.
+//
+// @param at - the point, in the world
+// @param normal - the normal it is lit with, of unit length
+fn probed_radiance(at: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    let counts = vec3<f32>(globals.probe_counts.xyz);
+    // where the point is, in cells from the grid's corner
+    let cells = (at - globals.probe_grid.xyz) / globals.probe_grid.w;
+
+    if (any(cells < vec3<f32>(0.0)) || any(cells > counts)) {
+        if (globals.sky_horizon.w > 0.5) {
+            return ambient_radiance(normal);
+        }
+
+        return globals.ambient.rgb;
+    }
+
+    // a probe stands at the middle of its cell
+    let held = clamp(cells - 0.5, vec3<f32>(0.0), counts - 1.0);
+    let lower = floor(held.y);
+    let layers = vec2<f32>(lower, min(lower + 1.0, counts.y - 1.0));
+    let up = held.y - lower;
+    let squared = normal * normal;
+    let across = probe_face(held, select(0.0, 1.0, normal.x < 0.0), layers, up);
+    let along = probe_face(held, select(2.0, 3.0, normal.y < 0.0), layers, up);
+    let deep = probe_face(held, select(4.0, 5.0, normal.z < 0.0), layers, up);
+
+    return across * squared.x + along * squared.y + deep * squared.z;
+}
+
+// One face of the probes round a point, between the two layers it stands
+// between.
+//
+// @param held - where the point is, in probes from the first, held inside the
+// grid
+// @param face - which face, in the order the picture keeps them
+// @param layers - the layer below the point and the one above it
+// @param up - how far from the one to the other the point is, nought to one
+fn probe_face(held: vec3<f32>, face: f32, layers: vec2<f32>, up: f32) -> vec3<f32> {
+    let counts = vec3<f32>(globals.probe_counts.xyz);
+    let size = vec2<f32>(6.0 * counts.x, counts.y * counts.z);
+    // a texel's middle is its index and a half
+    let column = face * counts.x + held.x + 0.5;
+    let below = vec2<f32>(column, layers.x * counts.z + held.z + 0.5) / size;
+    let above = vec2<f32>(column, layers.y * counts.z + held.z + 0.5) / size;
+    let low = textureSampleLevel(probe_light, lightmap_sampler, below, 0.0).rgb;
+    let high = textureSampleLevel(probe_light, lightmap_sampler, above, 0.0).rgb;
+
+    return low + (high - low) * up;
 }
 
 // A surface faded towards the fog by how far away it is.

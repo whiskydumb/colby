@@ -47,6 +47,7 @@ pub mod particles;
 pub mod physics;
 pub mod pose;
 pub mod post;
+pub mod probes;
 pub mod ragdoll;
 pub mod record;
 pub mod registry;
@@ -102,6 +103,7 @@ pub use self::{
 	},
 	pose::{MAX_POSES, Pose, PoseId, Poses},
 	post::{Post, ToneMap},
+	probes::Probes,
 	ragdoll::{Build, MAX_PARTS, NO_PART, Part, Ragdoll, Segment},
 	record::{Declared, Draw, Noted, Record, Records, Refused, Row, Spelled},
 	registry::{Entry, Registry},
@@ -126,7 +128,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 79;
+pub const ABI_VERSION: u32 = 80;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -367,6 +369,15 @@ pub struct World {
 	/// when a scene is put in place, the way the sky's environment is; a bake
 	/// writes it, and so may a game.
 	pub lightmap: TextureId,
+
+	/// Where a bake kept the light arriving at points of the air, for what has
+	/// no place on the lightmap, or [`Probes::NONE`] for a world with none.
+	///
+	/// Beside [`lightmap`](Self::lightmap), which it answers for everything
+	/// that picture cannot hold: a thing that moves, a thing bones bend, glass.
+	/// A handle and a grid, the handle resolved by name when a scene is put in
+	/// place; a bake writes both. @ref [`probes`](crate::abi::probes).
+	pub probes: Probes,
 
 	/// What every dynamic body accelerates by, in units a second squared.
 	///
@@ -702,6 +713,7 @@ impl World {
 			light: Vec3::new(-0.4, -1.0, -0.3),
 			ambient: Vec3::splat(0.25),
 			lightmap: TextureId::NONE,
+			probes: Probes::NONE,
 			gravity: Vec3::new(0.0, -9.81, 0.0),
 			quit: false,
 			owed_steps: 0,

@@ -326,7 +326,7 @@ fn sampler(device: &Device) -> Sampler {
 ///
 /// Written rather than left to the device's own clearing, so that what it holds
 /// is said here and not somewhere else.
-fn nothing(device: &Device, queue: &Queue) -> TextureView {
+pub(crate) fn nothing(device: &Device, queue: &Queue) -> TextureView {
 	let one = Extent3d {
 		width: 1,
 		height: 1,

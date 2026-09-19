@@ -68,6 +68,7 @@ use crate::{
 	occlusion::{self, Occlusion},
 	post,
 	prepass::{self, Prepass},
+	probes::{self, Probes},
 	reflection::{self, Reflection},
 	shader::Shader,
 	shadow::{self, CASCADES, Cascades, LOCAL_TILES, Maps, Slots, Tile},
@@ -346,6 +347,14 @@ struct Globals {
 
 	/// `[how many lamps are real, how many decals are, unused, unused]`.
 	counts: [u32; 4],
+
+	/// `[x, y, z of the corner of the probes' grid, how wide one of its cells
+	/// is]`, and nought in all four in a frame that reads no probes, which no
+	/// pipeline that draws such a frame reads. @ref [`probes`].
+	probe_grid: [f32; 4],
+
+	/// `[how many probes along x, y and z, unused]`, the same way.
+	probe_counts: [u32; 4],
 
 	/// The local lights, nearest first; the rest is [`Lamp::DARK`].
 	lamps: [Lamp; MAX_LAMPS],
@@ -788,14 +797,14 @@ struct Sorted {
 	/// be two different answers.
 	blend: Blend,
 
-	/// Whether it reads its light off the lightmap this frame, which is a
-	/// pipeline of its own. @ref [`Way::baked`].
+	/// What it reads the light arriving from everywhere at once off this frame,
+	/// which is a pipeline of its own for each. @ref [`Way::ambient`].
 	///
 	/// In the key between the material and whether it is small, so the things
-	/// of one mesh at one level in one material that read the lightmap are a
-	/// batch apart from the ones that do not. False in the maps' lists, which
-	/// draw both alike and are not cut on it.
-	baked: bool,
+	/// of one mesh at one level in one material that read the lightmap, the
+	/// probes or the sky are batches apart. [`Ambient::Sky`] in the maps'
+	/// lists, which draw all three alike and are not cut on it.
+	ambient: Ambient,
 
 	/// Where its placement is in [`Scene::staged`], which is worked out once
 	/// however many of the frame's lists the entity is in.
@@ -815,14 +824,14 @@ impl Sorted {
 	///
 	/// The mode is not in it and does not have to be: `pass` is a function of
 	/// it and comes first, so the two halves are already apart.
-	const fn key(&self) -> (u8, i32, u32, u8, u32, bool, bool, usize) {
+	const fn key(&self) -> (u8, i32, u32, u8, u32, Ambient, bool, usize) {
 		(
 			self.pass,
 			self.depth,
 			self.mesh,
 			self.level,
 			self.material,
-			self.baked,
+			self.ambient,
 			self.small,
 			self.entity.slot(),
 		)
@@ -913,10 +922,29 @@ struct Batch {
 	/// half another either.
 	blend: Blend,
 
-	/// Whether its things read their light off the lightmap, which picks the
-	/// table's baked pipelines: true of every thing in the run, because it is
-	/// in the key the runs are cut on. @ref [`Sorted::baked`].
-	baked: bool,
+	/// What its things read the light arriving from everywhere off, which picks
+	/// the table's baked or probed pipelines: the same for every thing in the
+	/// run, because it is in the key the runs are cut on. @ref
+	/// [`Sorted::ambient`].
+	ambient: Ambient,
+}
+
+/// What a thing reads the light arriving at it from everywhere at once off,
+/// which is the one thing a bake changes about how it is drawn.
+///
+/// Ordered in the order the batches of one mesh and material are drawn in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Ambient {
+	/// The environment, or the ambient color for a world with none: a world
+	/// nobody baked, and anything a bake's light does not reach.
+	#[default]
+	Sky,
+
+	/// Its place on the lightmap. @ref [`lightmap`].
+	Lightmap,
+
+	/// The probes round it. @ref [`probes`].
+	Probes,
 }
 
 /// Which of the scene's pipelines draws a batch.
@@ -928,16 +956,17 @@ struct Way {
 	/// Whether bones move its mesh.
 	skinned: bool,
 
-	/// Whether its things read their light off the lightmap.
+	/// What its things read the light arriving from everywhere at once off.
 	///
 	/// **A pipeline of its own rather than a word the shader branches on**: a
 	/// compiler handed the sum that reads a lightmap and the sum that does not
 	/// in one function may rewrite the second to share work with the first,
 	/// and that rewrite was measured moving pictures that read no lightmap at
-	/// all. The baked pipelines' entry points are the only ones that read it;
-	/// every other hands in a constant nought, which folds the reading away.
-	/// Never with bones and never for glass, which no bake reaches.
-	baked: bool,
+	/// all. Each entry point hands the shader a constant that says which of the
+	/// three it reads, and the other two fold away. The lightmap never with
+	/// bones and never for glass, which no bake lays out; the probes with
+	/// either.
+	ambient: Ambient,
 }
 
 /// One pipeline per way of drawing the scene.
@@ -946,12 +975,16 @@ struct Way {
 /// not care how the alpha is read - and one of them grows, so a pair of named
 /// fields would mean two more of them and a new arm at every call site the next
 /// time a mode is added. The baked pipelines are a short row beside it: they
-/// are a solid and a masked one, for a still thing only.
+/// are a solid and a masked one, for a still thing only. The probed ones are
+/// the whole table again, since what reads probes is everything else.
 struct Pipelines {
 	entries: [RenderPipeline; Blend::COUNT * 2],
 	/// The solid and the masked pipelines for things that read the lightmap.
-	/// @ref [`Way::baked`].
+	/// @ref [`Ambient::Lightmap`].
 	baked: [RenderPipeline; 2],
+	/// The table again, for things that read the probes. @ref
+	/// [`Ambient::Probes`].
+	probed: [RenderPipeline; Blend::COUNT * 2],
 	/// The one that draws what is behind the world.
 	///
 	/// Not in the table, because it is not a point on the table's two axes: it
@@ -988,27 +1021,34 @@ impl Pipelines {
 		source: &str,
 		samples: u32,
 	) -> Result<Self> {
-		let at = |blend, skinned, baked| {
+		let at = |blend, skinned, ambient| {
 			compile_pipeline(
 				device,
 				format,
 				layouts,
 				source,
-				Way { blend, skinned, baked },
+				Way { blend, skinned, ambient },
 				samples,
 			)
 		};
+		let table = |ambient| -> Result<[RenderPipeline; Blend::COUNT * 2]> {
+			Ok([
+				at(Blend::Opaque, false, ambient)?,
+				at(Blend::Opaque, true, ambient)?,
+				at(Blend::Mask, false, ambient)?,
+				at(Blend::Mask, true, ambient)?,
+				at(Blend::Alpha, false, ambient)?,
+				at(Blend::Alpha, true, ambient)?,
+			])
+		};
 
 		Ok(Self {
-			entries: [
-				at(Blend::Opaque, false, false)?,
-				at(Blend::Opaque, true, false)?,
-				at(Blend::Mask, false, false)?,
-				at(Blend::Mask, true, false)?,
-				at(Blend::Alpha, false, false)?,
-				at(Blend::Alpha, true, false)?,
+			entries: table(Ambient::Sky)?,
+			baked: [
+				at(Blend::Opaque, false, Ambient::Lightmap)?,
+				at(Blend::Mask, false, Ambient::Lightmap)?,
 			],
-			baked: [at(Blend::Opaque, false, true)?, at(Blend::Mask, false, true)?],
+			probed: table(Ambient::Probes)?,
 			sky: compile_sky(device, format, layouts, source, samples)?,
 			samples,
 		})
@@ -1017,23 +1057,26 @@ impl Pipelines {
 	/// Which one draws a batch.
 	///
 	/// Indexed rather than looked up: [`Blend::row`] is a match over the whole
-	/// enum and the array is exactly [`Blend::COUNT`] pairs long, so there is
+	/// enum and the arrays are exactly [`Blend::COUNT`] pairs long, so there is
 	/// no pair this can miss. A baked way that has no pipeline of its own -
 	/// glass, or a thing bones move - is drawn by the table's own, which is
 	/// what the scene never asks for anyway.
 	fn get(&self, way: Way) -> &RenderPipeline {
+		let at = way.blend.row() * 2 + usize::from(way.skinned);
+
 		match way {
 			| Way {
 				blend: Blend::Opaque,
 				skinned: false,
-				baked: true,
+				ambient: Ambient::Lightmap,
 			} => &self.baked[0],
 			| Way {
 				blend: Blend::Mask,
 				skinned: false,
-				baked: true,
+				ambient: Ambient::Lightmap,
 			} => &self.baked[1],
-			| Way { blend, skinned, .. } => &self.entries[blend.row() * 2 + usize::from(skinned)],
+			| Way { ambient: Ambient::Probes, .. } => &self.probed[at],
+			| Way { .. } => &self.entries[at],
 		}
 	}
 }
@@ -1144,6 +1187,9 @@ pub struct Scene {
 	/// The picture a bake kept every still thing's light in, and where each
 	/// thing's is on it. @ref [`lightmap`].
 	lightmap: Lightmap,
+	/// The picture a bake kept the light at points of the air in, for what has
+	/// no place on the lightmap, and where they stand. @ref [`probes`].
+	probes: Probes,
 	/// This frame's light matrices, fitted in `upload` and drawn in `render`.
 	cascades: Cascades,
 	/// Whether the console left the shadow passes switched on this frame.
@@ -1246,16 +1292,14 @@ impl Scene {
 		let (device, queue) = (gpu.device().clone(), gpu.queue().clone());
 
 		let globals = globals_uniform(&device)?;
-		let globals_layout = frame_layout(&device);
-		let material_layout = material_layout(&device);
+		let (globals_layout, material_layout) = (frame_layout(&device), material_layout(&device));
 		// empty until a decal exists, and whole all the same: the group it is
 		// bound in has to be, for every pipeline that reads group nought.
-		let atlas = Atlas::new(&device);
-		let decal_sampler = decal_sampler(&device);
+		let (atlas, decal_sampler) = (Atlas::new(&device), decal_sampler(&device));
 		// before group nought, because the cube, the table and the lightmap are
 		// among its entries: there is no fifth group to put them in. @ref
 		// [`everywhere`].
-		let (environment, split, lightmap) = everywhere(gpu)?;
+		let (environment, split, lightmap, probes) = everywhere(gpu)?;
 		// and before group nought too, for the cube's reason: what the share of
 		// the sky and what the reflections found are read out of are its ninth
 		// and tenth entries, and a scene that has asked for nothing yet binds the
@@ -1268,6 +1312,7 @@ impl Scene {
 			occlusion: occlusion.bound(),
 			reflection: reflection.bound(),
 			lightmap: &lightmap,
+			probes: &probes,
 		});
 
 		let samplers = wraps(&device);
@@ -1330,6 +1375,7 @@ impl Scene {
 			environment,
 			split,
 			lightmap,
+			probes,
 			cascades: Cascades::NONE,
 			shadowing: false,
 			lines,
@@ -2063,6 +2109,19 @@ impl Scene {
 	#[cfg(test)]
 	pub(crate) fn places_handed(&self) -> usize { self.lightmap.written().len() }
 
+	/// How many things the picture's lists drew last frame through the
+	/// pipelines that read the probes, which is what a test counts to show
+	/// what reads them and what does not.
+	#[cfg(test)]
+	pub(crate) fn probed_drawn(&self) -> u32 {
+		self.batches
+			.iter()
+			.chain(&self.blended)
+			.filter(|batch| batch.ambient == Ambient::Probes)
+			.map(|batch| batch.count)
+			.sum()
+	}
+
 	/// What this frame cost, for whoever asked to be told.
 	///
 	/// Blocks on the queue. @ref [`Timings::settle`] for why, and for why the
@@ -2289,7 +2348,7 @@ impl Scene {
 			Some(self.pipelines.get(Way {
 				blend: batch.blend,
 				skinned: batch.skinned,
-				baked: batch.baked,
+				ambient: batch.ambient,
 			}))
 		});
 	}
@@ -2759,6 +2818,20 @@ impl Scene {
 		}
 	}
 
+	/// What the frame's uniform says of the shadows: one texel of the atlas in
+	/// map coordinates, whether they are drawn at all, and whether every pixel
+	/// is tinted by the cascade it read. @ref [`Globals::shadow`].
+	fn shadow_words(&self, world: &World) -> [f32; 4] {
+		let tinted = world.cvars.bool(shadow::TINT).unwrap_or(false);
+
+		[
+			1.0 / shadow::resolution(),
+			0.0,
+			if self.shadowing { 1.0 } else { 0.0 },
+			if tinted { 1.0 } else { 0.0 },
+		]
+	}
+
 	/// Puts the world's lightmap in group nought, and rebuilds the group when
 	/// what is bound moved.
 	///
@@ -2800,6 +2873,42 @@ impl Scene {
 		}
 	}
 
+	/// Puts the world's probes in group nought, and rebuilds the group when
+	/// what is bound moved.
+	///
+	/// After [`sync_textures`](Self::sync_textures), for the lightmap's
+	/// reason, and read only while the lightmap may be: `r.lightmap` off is a
+	/// frame that reads nothing a bake kept, and `r.probes` off is one that
+	/// reads the lightmap alone. The handle is asked whether it names anything
+	/// first, for the lightmap's reason too.
+	fn sync_probes(&mut self, world: &World) {
+		let wanted = [lightmap::ENABLED, probes::ENABLED]
+			.iter()
+			.all(|name| world.cvars.bool(name).unwrap_or(true));
+		let named = world.probes;
+		let slot = named.picture.index();
+		let picture = Some(named)
+			.filter(colby_core::abi::Probes::is_some)
+			.and_then(|named| world.textures.get(named.picture))
+			.filter(|entry| !entry.value().is_cube())
+			.and_then(|entry| {
+				let uploaded = usize::try_from(slot)
+					.ok()
+					.and_then(|at| self.textures.get(at))
+					.filter(|uploaded| uploaded.revision == entry.revision())?;
+
+				Some(Picture {
+					view: &uploaded.view,
+					source: (slot, entry.revision()),
+					size: [entry.value().width, entry.value().height],
+				})
+			});
+
+		if self.probes.update(picture, named.grid, wanted) {
+			self.rebind();
+		}
+	}
+
 	/// Everything the frame reads that lives in a registry rather than in the
 	/// uniform.
 	///
@@ -2811,6 +2920,7 @@ impl Scene {
 		self.sync_meshes(&world.meshes);
 		self.sync_textures(&world.textures);
 		self.sync_lightmap(world);
+		self.sync_probes(world);
 		self.sync_materials(world);
 		self.lines
 			.upload(&self.device, &self.queue, world);
@@ -2859,6 +2969,7 @@ impl Scene {
 				occlusion: self.occlusion.bound(),
 				reflection: self.reflection.bound(),
 				lightmap: &self.lightmap,
+				probes: &self.probes,
 			},
 		);
 		self.occluded = self.occlusion.epoch();
@@ -2933,6 +3044,7 @@ impl Scene {
 		// after every reader of the pass before the scene has said whether it
 		// reads: the test reads that pass's depth and does not ask for it
 		let sight = self.ask_cover(world, &sight);
+		let (probe_grid, probe_counts) = self.probes.words();
 
 		self.queue.write_buffer(
 			&self.globals,
@@ -2950,16 +3062,7 @@ impl Scene {
 				cascade_tiles: shadow::cascade_tiles(),
 				lamp_tiles: self.lamp_tiles,
 				lamp_views: self.lamp_views,
-				shadow: [
-					1.0 / shadow::resolution(),
-					0.0,
-					if self.shadowing { 1.0 } else { 0.0 },
-					if world.cvars.bool(shadow::TINT).unwrap_or(false) {
-						1.0
-					} else {
-						0.0
-					},
-				],
+				shadow: self.shadow_words(world),
 				fog: world
 					.post
 					.fog
@@ -2977,6 +3080,8 @@ impl Scene {
 					.to_array(),
 				sky_ground: world.sky.ground.extend(0.0).to_array(),
 				counts: [count, painted, 0, 0],
+				probe_grid,
+				probe_counts,
 				lamps,
 				decals,
 			}),
@@ -3501,7 +3606,8 @@ impl Scene {
 			return;
 		}
 
-		let Some((at, baked)) = self.stage(world, id, renderable, transform, place) else {
+		let Some((at, ambient)) = self.stage(world, id, (renderable, transform, &placed), place)
+		else {
 			return;
 		};
 
@@ -3547,7 +3653,7 @@ impl Scene {
 			small,
 			entity: id,
 			blend,
-			baked,
+			ambient,
 			at,
 			casts,
 		};
@@ -3558,8 +3664,11 @@ impl Scene {
 
 		// a map draws large and small alike, so its batches are not cut on it
 		if casts != 0 {
-			self.casters
-				.push(Sorted { small: false, baked: false, ..entry });
+			self.casters.push(Sorted {
+				small: false,
+				ambient: Ambient::Sky,
+				..entry
+			});
 		}
 	}
 
@@ -3629,19 +3738,18 @@ impl Scene {
 	///
 	/// @param world - the world being drawn, for the material and the pose
 	/// @param id - the entity, for its own flags
-	/// @param renderable - what the entity draws
-	/// @param transform - where it is drawn this frame
+	/// @param (renderable, transform, placed) - what the entity draws, where it
+	/// is drawn this frame, and its box there
 	/// @param place - where a bake put its light, if anywhere
-	/// @return where in [`staged`](Self::staged) it went, and whether it reads
-	/// its light off the lightmap this frame
+	/// @return where in [`staged`](Self::staged) it went, and what it reads the
+	/// light arriving from everywhere off this frame
 	fn stage(
 		&mut self,
 		world: &World,
 		id: EntityId,
-		renderable: &Renderable,
-		transform: Transform,
+		(renderable, transform, placed): (&Renderable, Transform, &Placed),
 		place: Baking,
-	) -> Option<(u32, bool)> {
+	) -> Option<(u32, Ambient)> {
 		let surface = world
 			.materials
 			.get(renderable.material)
@@ -3673,6 +3781,19 @@ impl Scene {
 			skin[3] = index;
 		}
 
+		// and everything else reads the probes, in a frame that reads them: a
+		// thing a body moves, a thing bones bend, glass, a thing a bake left out
+		// or could not lay out - as long as it is lit at all and its box reaches
+		// into the grid's. A thing wholly outside the grid is drawn as a world
+		// nobody baked draws it. @ref [`probes`].
+		let ambient = if index.is_some() {
+			Ambient::Lightmap
+		} else if !surface.unlit && self.probes.covers(placed) {
+			Ambient::Probes
+		} else {
+			Ambient::Sky
+		};
+
 		self.staged.push(Placement {
 			model: transform.matrix().to_cols_array_2d(),
 			// the fourth channel is the material's opacity, which only the
@@ -3693,7 +3814,7 @@ impl Scene {
 			skin,
 		});
 
-		Some((at, index.is_some()))
+		Some((at, ambient))
 	}
 
 	/// Writes one cascade's list: everything solid its box can see, in the
@@ -3771,7 +3892,7 @@ impl Scene {
 				if batch.mesh == mesh
 					&& batch.level == entry.level
 					&& batch.material == material
-					&& batch.baked == entry.baked
+					&& batch.ambient == entry.ambient
 					&& batch.small == entry.small =>
 				batch.count += 1,
 			| _ => batches.push(Batch {
@@ -3783,7 +3904,7 @@ impl Scene {
 				small: entry.small,
 				skinned,
 				blend: entry.blend,
-				baked: entry.baked,
+				ambient: entry.ambient,
 			}),
 		}
 
@@ -3864,18 +3985,20 @@ impl Scene {
 }
 
 /// What the light arriving from everywhere is read out of, in the frame's own
-/// group: the environment's cube and the lightmap, both blank until a world
-/// names one, and the table that says how much of either a surface sends back.
+/// group: the environment's cube, the lightmap and the probes, all blank until
+/// a world names one, and the table that says how much of any of them a surface
+/// sends back.
 ///
 /// @param gpu - the device to build against, and the table it keeps
-/// @return the cube, the table and the lightmap
-fn everywhere(gpu: &Gpu) -> Result<(Environment, Arc<Split>, Lightmap)> {
+/// @return the cube, the table, the lightmap and the probes
+fn everywhere(gpu: &Gpu) -> Result<(Environment, Arc<Split>, Lightmap, Probes)> {
 	Ok((
 		Environment::new(gpu.device(), gpu.queue())?,
 		// taken from the device rather than built here: the table is the same
 		// one for every scene this device draws. @ref [`Gpu::split`].
 		Arc::clone(gpu.split()),
 		Lightmap::new(gpu.device(), gpu.queue())?,
+		Probes::new(gpu.device(), gpu.queue()),
 	))
 }
 
@@ -3930,8 +4053,9 @@ fn drawing(
 /// The layout of group nought: the frame's uniform; the decals' atlas read two
 /// ways with the sampler that reads it; the environment and the split-sum
 /// table, each with its own; how much of the sky each pixel sees; what each
-/// pixel's reflection found; and the lightmap with its sampler and its table of
-/// places.
+/// pixel's reflection found; the lightmap with its sampler and its table of
+/// places; and the probes' picture, which is read through the lightmap's
+/// sampler.
 ///
 /// **One group for all of it**, rather than a fifth for the atlas: a device
 /// need only allow four, and all four are spoken for. The atlas belongs with
@@ -3986,6 +4110,7 @@ fn frame_layout(device: &Device) -> BindGroupLayout {
 			baked[0],
 			baked[1],
 			baked[2],
+			probes::layout_entry(PROBES_TEXTURE),
 		],
 	})
 }
@@ -4047,6 +4172,15 @@ const LIGHTMAP_SAMPLER: u32 = 11;
 /// Which binding the table of where each thing's light is on it takes: read by
 /// the vertex stage, which carries a second set onto the picture.
 const LIGHTMAP_PLACES: u32 = 12;
+
+/// Which binding the probes' picture takes.
+///
+/// Beside the lightmap and for its reason, and bound in every frame for the
+/// same one: a frame that reads no probes binds one texel of nothing, and no
+/// pipeline that draws such a frame samples it. Read through the lightmap's
+/// sampler, which is clamped and bilinear and at one level, as this wants.
+/// @ref [`probes`](crate::probes).
+const PROBES_TEXTURE: u32 = 13;
 
 /// Group nought, over this frame's uniform and the atlas as it stands.
 ///
@@ -4121,6 +4255,10 @@ fn frame_bindings(
 				binding: LIGHTMAP_PLACES,
 				resource: held.lightmap.places().as_entire_binding(),
 			},
+			BindGroupEntry {
+				binding: PROBES_TEXTURE,
+				resource: BindingResource::TextureView(held.probes.view()),
+			},
 		],
 	})
 }
@@ -4150,6 +4288,9 @@ struct Held<'a> {
 	/// The world's lightmap or one texel of nothing, its sampler and this
 	/// frame's places on it. @ref [`Lightmap`].
 	lightmap: &'a Lightmap,
+
+	/// The world's probes' picture or one texel of nothing. @ref [`Probes`].
+	probes: &'a Probes,
 }
 
 /// The sampler every decal's picture is read through.
@@ -5029,15 +5170,39 @@ fn build_sky(
 /// length of the call and building one would mean a `String` per pipeline for
 /// the sake of a name nothing reads at run time.
 const fn label_of(way: Way) -> &'static str {
-	match (way.blend, way.skinned, way.baked) {
-		| (Blend::Opaque, false, false) => "scene",
-		| (Blend::Opaque, false, true) => "scene baked",
+	match (way.blend, way.skinned, way.ambient) {
+		| (Blend::Opaque, false, Ambient::Lightmap) => "scene baked",
+		| (Blend::Mask, false, Ambient::Lightmap) => "scene masked baked",
+		| (Blend::Opaque, false, Ambient::Probes) => "scene probed",
+		| (Blend::Opaque, true, Ambient::Probes) => "scene skinned probed",
+		| (Blend::Mask, false, Ambient::Probes) => "scene masked probed",
+		| (Blend::Mask, true, Ambient::Probes) => "scene masked skinned probed",
+		| (Blend::Alpha, false, Ambient::Probes) => "scene blended probed",
+		| (Blend::Alpha, true, Ambient::Probes) => "scene blended skinned probed",
+		| (Blend::Opaque, false, _) => "scene",
 		| (Blend::Opaque, true, _) => "scene skinned",
-		| (Blend::Mask, false, false) => "scene masked",
-		| (Blend::Mask, false, true) => "scene masked baked",
+		| (Blend::Mask, false, _) => "scene masked",
 		| (Blend::Mask, true, _) => "scene masked skinned",
 		| (Blend::Alpha, false, _) => "scene blended",
 		| (Blend::Alpha, true, _) => "scene blended skinned",
+	}
+}
+
+/// Which fragment entry point one of the table's pipelines runs.
+///
+/// A thing bones move is never baked, so the baked entry points are for the
+/// static vertex stage only, and a baked way with bones or glass is drawn as it
+/// would be without the bake; the probed ones are for every way there is.
+const fn fragment_of(way: Way) -> &'static str {
+	match (way.blend, way.ambient, way.skinned) {
+		| (Blend::Opaque, Ambient::Lightmap, false) => "fragment_baked",
+		| (Blend::Mask, Ambient::Lightmap, false) => "fragment_masked_baked",
+		| (Blend::Opaque, Ambient::Probes, _) => "fragment_probed",
+		| (Blend::Mask, Ambient::Probes, _) => "fragment_masked_probed",
+		| (Blend::Alpha, Ambient::Probes, _) => "fragment_blended_probed",
+		| (Blend::Opaque, ..) => "fragment_main",
+		| (Blend::Mask, ..) => "fragment_masked",
+		| (Blend::Alpha, ..) => "fragment_blended",
 	}
 }
 
@@ -5057,7 +5222,7 @@ fn build_pipeline(
 	way: Way,
 	samples: u32,
 ) -> RenderPipeline {
-	let Way { blend, skinned, baked } = way;
+	let Way { blend, skinned, .. } = way;
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
 		label: Some("scene"),
 		source: ShaderSource::Wgsl(source.into()),
@@ -5122,16 +5287,7 @@ fn build_pipeline(
 		},
 		fragment: Some(FragmentState {
 			module: &shader,
-			// a thing bones move is never baked, so the baked entry points are
-			// for the static vertex stage only; a baked way with bones is drawn as
-			// it would be without the bake
-			entry_point: Some(match (blend, baked && !skinned) {
-				| (Blend::Opaque, false) => "fragment_main",
-				| (Blend::Opaque, true) => "fragment_baked",
-				| (Blend::Mask, false) => "fragment_masked",
-				| (Blend::Mask, true) => "fragment_masked_baked",
-				| (Blend::Alpha, _) => "fragment_blended",
-			}),
+			entry_point: Some(fragment_of(way)),
 			compilation_options: PipelineCompilationOptions::default(),
 			targets: &[Some(ColorTargetState {
 				format,
@@ -5391,12 +5547,13 @@ pub(crate) const fn strides() -> (BufferAddress, BufferAddress) {
 		assert!(size_of::<Lamp>().is_multiple_of(16), "and a uniform array's stride is not it");
 		assert!(
 			size_of::<Globals>()
-				== 576
+				== 608
 					+ size_of::<Tile>() * CASCADES
 					+ (size_of::<Tile>() + 64) * LOCAL_TILES
 					+ size_of::<Lamp>() * MAX_LAMPS
 					+ size_of::<Paint>() * MAX_DECALS,
-			"the camera, the cascades and their tiles, the lamps' tiles and views, the sky and 			 the lamps"
+			"the camera, the cascades and their tiles, the lamps' tiles and views, the sky, the \
+			 probes' grid and the lamps"
 		);
 		assert!(size_of::<Globals>().is_multiple_of(16), "and a uniform struct has to be");
 		assert!(size_of::<Paint>() == 112, "a decal is no longer seven vec4s");

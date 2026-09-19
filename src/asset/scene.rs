@@ -10,7 +10,7 @@
 //!
 //! ```text
 //!    0  SceneHeader                      224 bytes
-//!  224  Setting                          232 bytes, one of them
+//!  224  Setting                          272 bytes, one of them
 //!    .  [Stood; stood_count]              84 bytes each
 //!    .  [Lit;   lit_count]                40 bytes each
 //!    .  [Shed;  shed_count]               88 bytes each
@@ -58,6 +58,7 @@ use colby_core::{
 		LightKind, Noted, Post, ShapeKind, Sky, SkyKind, SparkBlend, Spelled, Terrain,
 		TerrainKind, TextureId, ToneMap, Transform, Water, WaterKind,
 		net::MAX_PEERS,
+		probes::Grid,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
 	},
@@ -94,7 +95,12 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// Eighteen since an entity carries records: a block of [`Jot`]s, one a value
 /// that differs from its record's default, each naming the record and the
 /// field. The header had no spare words left and grew by four.
-pub const FORMAT_VERSION: u32 = 18;
+///
+/// Nineteen since a bake keeps probes: the settings record names their picture
+/// and says where their grid stands - eight words, where the lightmap's name
+/// had spent the last spare - and two spare words after them, so the next word
+/// the record needs is free again. @ref [`Setting::probes`].
+pub const FORMAT_VERSION: u32 = 19;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
@@ -509,9 +515,36 @@ pub struct Setting {
 	/// entity's place on the lightmap is kept in keeps that record by name
 	/// without reading it, @ref `jots_of`. Graceful rather than wrong.
 	///
-	/// There is no spare after it: the next field to arrive pays four bytes of
-	/// itself, four of a new spare, and the version.
+	/// There was no spare after it, and the next field to arrive paid for
+	/// itself and the version: that was [`probes`](Self::probes).
 	pub lightmap: u32,
+
+	/// Offset into the blob of the name of the picture a bake kept its probes'
+	/// light in, or zero for a world with none.
+	///
+	/// **Eight words with the grid after it, and they moved
+	/// [`FORMAT_VERSION`]**: the record had no spare left. The grid is numbers,
+	/// not a name, and none of it means anything without the picture; a world
+	/// with none writes nought in all eight. @ref
+	/// [`probes`](colby_core::abi::probes).
+	pub probes: u32,
+
+	/// The corner of the probes' box with the least of every axis.
+	pub probe_from: [f32; 3],
+
+	/// How far apart two probes beside each other stand.
+	pub probe_step: f32,
+
+	/// How many probes along x, y and z.
+	pub probe_counts: [u32; 3],
+
+	/// Two words nothing reads, written as nought.
+	///
+	/// Two rather than one because the record is eight-aligned: a word the
+	/// record needs next takes one of them and moves no version, the way
+	/// [`shafts`](Self::shafts) and [`sky_cubemap`](Self::sky_cubemap) took
+	/// theirs.
+	pub spare: [u32; 2],
 }
 
 // a record with padding in it is not `Pod`, so this would already have failed
@@ -1326,9 +1359,11 @@ impl SceneFile {
 		}
 
 		SceneData {
-			stage: stage_of(self.setting()),
+			stage: stage_of(&self.setting()),
 			sky_cubemap: self.name(self.setting().sky_cubemap).to_owned(),
 			lightmap: self.name(self.setting().lightmap).to_owned(),
+			probes: self.name(self.setting().probes).to_owned(),
+			probe_grid: grid_of(&self.setting()),
 			things,
 			solids,
 			links: self
@@ -1652,6 +1687,11 @@ const EMPTY_SETTING: Setting = Setting {
 	sky_cubemap: 0,
 	haze: 0.0,
 	lightmap: 0,
+	probes: 0,
+	probe_from: [0.0; 3],
+	probe_step: 0.0,
+	probe_counts: [0; 3],
+	spare: [0; 2],
 };
 
 /// Writes a world out as a `.cscene`.
@@ -2208,10 +2248,17 @@ fn tie_of(link: &Link, names: &mut Names) -> Tie {
 	}
 }
 
-/// The settings record, from the description, with its two names put in the
+/// The settings record, from the description, with its three names put in the
 /// blob.
 fn setting_of(data: &SceneData, names: &mut Names) -> Setting {
 	let stage = data.stage;
+	// no grid is written without the picture it is read through: nought in
+	// all eight words, which is what a world with no probes reads as
+	let grid = if data.probes.is_empty() {
+		Grid::NONE
+	} else {
+		data.probe_grid
+	};
 
 	Setting {
 		steps: stage.steps,
@@ -2249,11 +2296,25 @@ fn setting_of(data: &SceneData, names: &mut Names) -> Setting {
 		sky_cubemap: names.put(&data.sky_cubemap),
 		haze: stage.post.haze,
 		lightmap: names.put(&data.lightmap),
+		probes: names.put(&data.probes),
+		probe_from: grid.from.to_array(),
+		probe_step: grid.step,
+		probe_counts: grid.counts,
+		spare: [0; 2],
+	}
+}
+
+/// Where a settings record says its probes stand.
+fn grid_of(setting: &Setting) -> Grid {
+	Grid {
+		from: Vec3::from_array(setting.probe_from),
+		step: setting.probe_step,
+		counts: setting.probe_counts,
 	}
 }
 
 /// The description's settings, from the record.
-fn stage_of(setting: Setting) -> Stage {
+fn stage_of(setting: &Setting) -> Stage {
 	Stage {
 		camera: Camera {
 			position: Vec3::from_array(setting.camera_position),
@@ -3057,6 +3118,8 @@ mod tests {
 			solids: sample_solids(),
 			sky_cubemap: String::new(),
 			lightmap: String::new(),
+			probes: String::new(),
+			probe_grid: Grid::NONE,
 			posed: vec![Posed {
 				name: "hero".to_owned(),
 				slot: 1,
@@ -3438,11 +3501,12 @@ mod tests {
 	}
 
 	#[test]
-	fn the_lightmap_s_name_is_the_last_word_of_the_settings_record() {
+	fn the_lightmap_s_name_is_where_it_was_and_the_probes_follow_it() {
 		// the claim that let it cost no version, collected: the name that spent
 		// the spare before it is where it was, the haze after it, and the
-		// lightmap's name in the word the haze left - still the last word of a
-		// record that has not grown. @ref [`Setting::lightmap`].
+		// lightmap's name in the word the haze left - and after it the eight
+		// words the probes paid a version for, then two spare. @ref
+		// [`Setting::lightmap`], [`Setting::probes`].
 		let data = SceneData {
 			sky_cubemap: "skies/dusk".to_owned(),
 			lightmap: "lightmaps/yard".to_owned(),
@@ -3462,12 +3526,18 @@ mod tests {
 			offset_of!(Setting, sky_cubemap) + 4,
 			"the haze is the word after the sky's name"
 		);
+		assert_eq!(named, start + 228, "the lightmap's name is where it was");
 		assert_eq!(
-			named + 4,
-			start + size_of::<Setting>(),
-			"and the lightmap's name is the last word of the record"
+			offset_of!(Setting, probes),
+			offset_of!(Setting, lightmap) + 4,
+			"the probes' name the word after it"
 		);
-		assert_eq!(size_of::<Setting>(), 232, "which is as long as it was");
+		assert_eq!(
+			offset_of!(Setting, spare) + 8,
+			size_of::<Setting>(),
+			"and two spare words close the record"
+		);
+		assert_eq!(size_of::<Setting>(), 272, "which grew by ten words");
 
 		let read = SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
 			.expect("a scene naming a sky and a lightmap")
@@ -3478,6 +3548,45 @@ mod tests {
 		assert!(
 			(read.stage.post.haze - data.stage.post.haze).abs() < 1.0e-9,
 			"and the haze between them is still where it was"
+		);
+	}
+
+	#[test]
+	fn a_scene_s_probes_come_back_with_their_grid_and_none_are_written_without_a_name() {
+		let grid = Grid {
+			from: Vec3::new(-40.0, -1.0, -95.0),
+			step: 1.0,
+			counts: [80, 15, 135],
+		};
+		let named = SceneData {
+			probes: "lightmaps/probes/street".to_owned(),
+			probe_grid: grid,
+			..sample()
+		};
+		let read = SceneFile::from_bytes(AlignedBytes::from_slice(
+			&encode(&named).expect("it fits in one file"),
+		))
+		.expect("a scene with probes")
+		.to_scene_data();
+
+		assert_eq!(read.probes, "lightmaps/probes/street", "the name came back");
+		assert_eq!(read.probe_grid, grid, "and the grid, to the bit");
+
+		// a grid with no picture to read it through is not written at all
+		let unnamed = SceneData { probe_grid: grid, ..sample() };
+		let bytes = encode(&unnamed).expect("it fits in one file");
+		let header: SceneHeader = *bytemuck::from_bytes(&bytes[..HEADER_BYTES]);
+		let start = usize::try_from(header.setting_offset).expect("it is an offset");
+		let words = &bytes[start + offset_of!(Setting, probes)..start + size_of::<Setting>()];
+
+		assert!(words.iter().all(|byte| *byte == 0), "nought in every word after the lightmap");
+		assert_eq!(
+			SceneFile::from_bytes(AlignedBytes::from_slice(&bytes))
+				.expect("a scene with no probes")
+				.to_scene_data()
+				.probe_grid,
+			Grid::NONE,
+			"and it reads back as none"
 		);
 	}
 

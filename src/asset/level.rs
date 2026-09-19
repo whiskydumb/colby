@@ -88,6 +88,7 @@ use colby_core::{
 		Body, BodyId, BodyKind, Camera, Decal, Emitter, EntityId, Field, Joint, JointKind,
 		Layers, Light, MeshId, Noted, Post, Renderable, Shape, Sky, Spelled, Terrain, Transform,
 		field::{self, Kind},
+		probes::Grid,
 		record,
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
 	},
@@ -164,12 +165,20 @@ pub fn import(text: &str) -> Result<SceneData> {
 	let solids = bodies(root.get("bodies"), &things)?;
 	let links = joints(root.get("joints"), &solids)?;
 
-	let (stage, sky_cubemap, lightmap) = stage(root.get("stage"))?;
+	let Staged {
+		stage,
+		sky_cubemap,
+		lightmap,
+		probes,
+		probe_grid,
+	} = stage(root.get("stage"))?;
 
 	Ok(SceneData {
 		stage,
 		sky_cubemap,
 		lightmap,
+		probes,
+		probe_grid,
 		thing_generations: vec![1; things.len()],
 		solid_generations: vec![1; solids.len()],
 		link_generations: vec![1; links.len()],
@@ -207,20 +216,46 @@ pub(crate) fn fields(value: &Value, known: &[&str], what: &str) -> Result<()> {
 	Ok(())
 }
 
+/// A stage as a source spells it: the settings, and beside them what the
+/// settings' table has no row for.
+struct Staged {
+	/// The settings.
+	stage: Stage,
+
+	/// The sky's environment, by name.
+	sky_cubemap: String,
+
+	/// The world's lightmap, by name.
+	lightmap: String,
+
+	/// The picture its probes are kept in, by name.
+	probes: String,
+
+	/// And where they stand.
+	probe_grid: Grid,
+}
+
 /// The world's own settings, or the ones a world starts with.
 ///
-/// @return the settings, the sky's environment name and the world's lightmap
-/// name, which are *names* and therefore beside the table rather than in it -
-/// the same arrangement a material's two pictures have. @ref [`REFERENCES`].
-fn stage(value: Option<&Value>) -> Result<(Stage, String, String)> {
+/// @return the settings, and the sky's environment name, the world's lightmap
+/// name and its probes, which are *names* - and a grid that means nothing
+/// without its picture - and therefore beside the table rather than in it: the
+/// same arrangement a material's two pictures have. @ref [`REFERENCES`].
+fn stage(value: Option<&Value>) -> Result<Staged> {
 	let Some(value) = value else {
-		return Ok((Stage::DEFAULT, String::new(), String::new()));
+		return Ok(Staged {
+			stage: Stage::DEFAULT,
+			sky_cubemap: String::new(),
+			lightmap: String::new(),
+			probes: String::new(),
+			probe_grid: Grid::NONE,
+		});
 	};
 
 	check(
 		value,
 		&[names(Stage::FIELDS, &[])],
-		&["camera", "sky", "post", LIGHTMAP],
+		&["camera", "sky", "post", LIGHTMAP, PROBES],
 		"a stage",
 	)?;
 
@@ -251,13 +286,85 @@ fn stage(value: Option<&Value>) -> Result<(Stage, String, String)> {
 		read(&mut stage.post, after, Post::FIELDS, "the post-processing")?;
 	}
 
-	Ok((stage, cubemap, text(value.get(LIGHTMAP))))
+	let (probes, probe_grid) = probes_of(value.get(PROBES))?;
+
+	Ok(Staged {
+		stage,
+		sky_cubemap: cubemap,
+		lightmap: text(value.get(LIGHTMAP)),
+		probes,
+		probe_grid,
+	})
 }
 
 /// The stage's one field that is read by hand because it is a name: the
 /// picture a bake kept the world's light in. The sky's environment is the
 /// other name a stage holds, and it is under the sky. @ref [`REFERENCES`].
 const LIGHTMAP: &str = "lightmap";
+
+/// The stage's record of its probes, read by hand for the lightmap's reason:
+/// the picture is a name, and the grid beside it is written by a bake rather
+/// than by a person, so it has no row a table would offer anybody to type
+/// into.
+const PROBES: &str = "probes";
+
+/// The four fields of [`PROBES`].
+const PROBE_FIELDS: [&str; 4] = ["picture", "from", "step", "counts"];
+
+/// A stage's probes: the picture's name and where they stand, or nothing and
+/// no grid for a stage that names none.
+///
+/// # Errors
+///
+/// If the record holds a field it should not, or a field is not the numbers
+/// it should be.
+fn probes_of(value: Option<&Value>) -> Result<(String, Grid)> {
+	let Some(value) = value else {
+		return Ok((String::new(), Grid::NONE));
+	};
+
+	fields(value, &PROBE_FIELDS, "the probes")?;
+
+	let step = match value.get("step") {
+		| Some(step) => step
+			.as_f32()
+			.ok_or_else(|| err!(Asset("the probes' step should be a number")))?,
+		| None => 0.0,
+	};
+
+	Ok((text(value.get("picture")), Grid {
+		from: triple(value.get("from"), Vec3::ZERO, "the probes", "from")?,
+		step,
+		counts: counts(value.get("counts"))?,
+	}))
+}
+
+/// How many probes a grid has along each axis: three whole numbers, none of
+/// them below nought.
+fn counts(value: Option<&Value>) -> Result<[u32; 3]> {
+	let Some(value) = value else {
+		return Ok([0; 3]);
+	};
+
+	let wrong = || err!(Asset("the probes' counts should be three whole numbers"));
+	let Value::Array(parts) = value else {
+		return Err(wrong());
+	};
+
+	if parts.len() != 3 {
+		return Err(wrong());
+	}
+
+	let mut out = [0_u32; 3];
+
+	for (slot, part) in out.iter_mut().zip(parts) {
+		*slot = whole(part)
+			.and_then(|number| u32::try_from(number).ok())
+			.ok_or_else(wrong)?;
+	}
+
+	Ok(out)
+}
 
 /// The sky's fields that are read by hand because they are names.
 ///
@@ -1294,12 +1401,41 @@ fn stage_of(scene: &SceneData) -> Result<Option<String>> {
 	if let Some((name, written)) = named_row(LIGHTMAP, &scene.lightmap) {
 		rows.put(name, written);
 	}
+	put_probes(&mut rows, scene)?;
 
 	if rows.is_empty() {
 		return Ok(None);
 	}
 
 	Ok(Some(format!("\t\"stage\": {}", rows.text())))
+}
+
+/// A world's probes as a stage's rows, or nothing for a world with none: a grid
+/// with no picture named is not written, as the settings record does not write
+/// one either.
+///
+/// # Errors
+///
+/// If the grid holds a number JSON cannot spell.
+fn put_probes(rows: &mut Rows, scene: &SceneData) -> Result<()> {
+	let grid = scene.probe_grid;
+
+	if scene.probes.is_empty() {
+		return Ok(());
+	}
+
+	if !grid.from.is_finite() || !grid.step.is_finite() {
+		return Err(err!(Asset("the probes' grid holds a number JSON cannot write")));
+	}
+
+	let [x, y, z] = grid.counts;
+
+	rows.put("probes.picture", as_text(&scene.probes));
+	rows.put("probes.from", as_vector(grid.from));
+	rows.put("probes.step", as_number(grid.step));
+	rows.put("probes.counts", format!("[{x}, {y}, {z}]"));
+
+	Ok(())
 }
 
 /// One entity, with what it hangs off named rather than numbered.
@@ -3109,6 +3245,51 @@ mod tests {
 		let unbaked = export(&import("{}").expect("a scene of nothing")).expect("it writes");
 
 		assert!(!unbaked.contains("lightmap"), "a world nobody baked writes no row: {unbaked}");
+	}
+
+	#[test]
+	fn a_world_s_probes_and_their_grid_survive_a_round_trip() {
+		let scene = import(
+			r#"{ "stage": { "probes": { "picture": "lightmaps/probes/yard", "from": [-4.5, -1, 2],
+				"step": 0.5, "counts": [18, 9, 20] } } }"#,
+		)
+		.expect("a scene");
+
+		assert_eq!(scene.probes, "lightmaps/probes/yard", "the name beside the table");
+		assert_eq!(
+			scene.probe_grid,
+			Grid {
+				from: Vec3::new(-4.5, -1.0, 2.0),
+				step: 0.5,
+				counts: [18, 9, 20],
+			},
+			"and the grid"
+		);
+
+		let text = export(&scene).expect("it writes back");
+
+		assert!(text.contains(r#""probes": { "picture": "lightmaps/probes/yard""#), "{text}");
+		assert_eq!(import(&text).expect("it reads back"), scene, "and the text is the scene");
+
+		let unbaked = export(&import("{}").expect("a scene of nothing")).expect("it writes");
+
+		assert!(!unbaked.contains("probes"), "a world with none writes no row: {unbaked}");
+	}
+
+	#[test]
+	fn probes_that_are_not_what_a_bake_writes_are_refused_by_name() {
+		for (source, said) in [
+			(r#"{ "stage": { "probes": { "picture": "p", "lamp": 1 } } }"#, "lamp"),
+			(r#"{ "stage": { "probes": { "counts": [1, 2] } } }"#, "counts"),
+			(r#"{ "stage": { "probes": { "counts": [1, -2, 3] } } }"#, "counts"),
+			(r#"{ "stage": { "probes": { "counts": [1, 2.5, 3] } } }"#, "counts"),
+			(r#"{ "stage": { "probes": { "step": "one" } } }"#, "step"),
+			(r#"{ "stage": { "probes": { "from": [1, 2, 3, 4] } } }"#, "from"),
+		] {
+			let error = import(source).expect_err(source).to_string();
+
+			assert!(error.contains(said), "{source} is refused naming {said}: {error}");
+		}
 	}
 
 	#[test]

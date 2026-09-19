@@ -60,8 +60,9 @@ pub const MAGIC: u16 = u16::from_le_bytes(*b"CN");
 /// grew what it shines, six since the settings record grew a sky, seven since
 /// it grew what happens to the picture afterwards, eight since an entity record
 /// grew a word of flags, the first saying it is hidden, nine since a decal
-/// became a block of its own, and ten since what an entity's records hold
-/// became one. Nothing in a *snapshot* moved any of those times: a snapshot
+/// became a block of its own, ten since what an entity's records hold became
+/// one, and eleven since the settings record grew the probes a bake keeps.
+/// Nothing in a *snapshot* moved any of those times: a snapshot
 /// carries bodies, and a light, a sky, a tonemap, a hidden entity, a decal and
 /// a record's values all cross inside the described piece a `Parcel::Scene`
 /// holds, which is a `.cscene`.
@@ -70,7 +71,7 @@ pub const MAGIC: u16 = u16::from_le_bytes(*b"CN");
 /// protocol and two `.cscene` versions connect, and the far end then refuses
 /// every piece of the world that crosses, one warning each, and draws none of
 /// it; a refusal at the first datagram says the same thing once and early.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 const MAGIC_AT: usize = 0;
 const VERSION_AT: usize = 2;
@@ -478,7 +479,7 @@ mod tests {
 		assert_eq!(
 			head,
 			[
-				b'C', b'N', 10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+				b'C', b'N', 11, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
 				0x10
 			],
 			"the magic, the protocol, then the six fields little-endian in order"
