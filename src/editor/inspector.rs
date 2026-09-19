@@ -1611,11 +1611,17 @@ mod tests {
 	/// the row of the label in front of it, past the label's end.
 	fn checkbox(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<Pos2> {
 		let flat = flat(shapes);
-		let words = flat.iter().find_map(|shape| match shape {
-			| egui::Shape::Text(text) if text.galley.text() == label =>
-				Some(text.visual_bounding_rect()),
-			| _ => None,
-		})?;
+		// the one nearest the top of the panel, as it is read: two sections may
+		// name a field alike, and what egui hands back is not in the order it is
+		// laid out
+		let words = flat
+			.iter()
+			.filter_map(|shape| match shape {
+				| egui::Shape::Text(text) if text.galley.text() == label =>
+					Some(text.visual_bounding_rect()),
+				| _ => None,
+			})
+			.min_by(|one, two| one.min.y.total_cmp(&two.min.y))?;
 
 		if label.contains(' ') {
 			return Some(words.center());

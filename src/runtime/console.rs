@@ -1013,13 +1013,13 @@ unsafe extern "C-unwind" fn list_sounds(world: *mut World, _args: *const Args) {
 	}
 }
 
-/// The four that read or write a file.
+/// The eight that read or write a file.
 ///
 /// Split off for the lint rather than for the shape, and the shape is better
 /// for it: putting a world back replaces every table in it and needs the
 /// solver, which a command cannot reach, so every one of these waits for the
 /// frame loop rather than answering inside the line. @ref [`crate::saves`],
-/// which takes them up and is where the seven names are written down.
+/// which takes them up and is where the eight names are written down.
 ///
 /// @param world - the table to register into
 fn install_scenes(world: &mut World) {
@@ -1057,6 +1057,11 @@ fn install_scenes(world: &mut World) {
 		crate::saves::BLOCKS,
 		console::defer,
 		"write the meshes baked under maps/<name>/ into assets/ as .obj sources",
+	);
+	world.cvars.command(
+		crate::saves::STREWN,
+		console::defer,
+		"write every copy every strewing laid, and its ground, into saves/<name>.strewn",
 	);
 }
 

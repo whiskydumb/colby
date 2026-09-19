@@ -57,6 +57,7 @@ mod screenshot;
 mod shot;
 mod sparks;
 mod step;
+mod strew;
 mod terrain;
 #[cfg(feature = "hot_reload")]
 mod watch;

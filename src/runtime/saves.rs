@@ -112,8 +112,19 @@ pub(crate) const MODEL: &str = "model.write";
 /// on a surface both sides already share. @ref `colby_editor::bake`.
 pub(crate) const BLOCKS: &str = "blocks.write";
 
-/// The seven names this module answers for, as they wait on the world.
-const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP, MATERIAL, MODEL, BLOCKS];
+/// `strew.write <name>` - writes what every strewing laid as text.
+///
+/// The eighth, and the only one whose file is read by a script rather than by
+/// the engine: the ground each strewing stood on, its rule and every copy it
+/// laid, beside the saves because it is the world as it stood. Nothing reads
+/// it back. @ref `crate::strew::written`.
+pub(crate) const STREWN: &str = "strew.write";
+
+/// What a strewing's text is called on disk.
+const STREWN_EXTENSION: &str = "strewn";
+
+/// The eight names this module answers for, as they wait on the world.
+const NAMES: &[&str] = &[SAVE, LOAD, WRITE, PROP, MATERIAL, MODEL, BLOCKS, STREWN];
 
 /// One thing to do with a scene.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +171,9 @@ pub(crate) enum Request {
 	/// that writes geometry. What it takes from the world is the mesh registry,
 	/// which is where the editor left what it built.
 	Blocks(String),
+
+	/// Write what every strewing laid out as text, for a script.
+	Strewn(String),
 }
 
 impl Request {
@@ -178,6 +192,7 @@ impl Request {
 			| MATERIAL => Some(Self::Material(name)),
 			| MODEL => Some(Self::Model(name)),
 			| BLOCKS => Some(Self::Blocks(name)),
+			| STREWN => Some(Self::Strewn(name)),
 			| _ => None,
 		}
 	}
@@ -213,6 +228,7 @@ pub(crate) fn serve(world: &mut World, simulation: &mut Simulation, project: &Pr
 		| Request::Material(name) => material(world, project, name),
 		| Request::Model(name) => model(project, name),
 		| Request::Blocks(name) => blocks(world, project, name),
+		| Request::Strewn(name) => strewn(world, project, name),
 	};
 
 	if let Err(failure) = outcome {
@@ -634,6 +650,39 @@ fn pictured(world: &World, id: colby_core::abi::TextureId) -> String {
 /// `assets/materials/brass.material` is `materials/brass` and there is nowhere
 /// else it could be while keeping that name.
 pub(crate) const MATERIALS: &str = "materials/";
+
+/// Writes what every strewing laid out as text a script reads.
+///
+/// @param world - whose strewings
+/// @param project - whose saves
+/// @param name - what to call it, without an extension
+///
+/// # Errors
+///
+/// If the name is not a plain file name, or the directory or the file cannot
+/// be written.
+fn strewn(world: &World, project: &Project, name: &str) -> Result {
+	let path = project
+		.saves()
+		.join(plain(name)?)
+		.with_extension(STREWN_EXTENSION);
+	let text = crate::strew::written(world);
+
+	if let Some(directory) = path.parent() {
+		fs::create_dir_all(directory)?;
+	}
+
+	fs::write(&path, text.as_bytes())?;
+	info!(
+		path = %path.display(),
+		bytes = text.len(),
+		strewings = world.strewn.iter().count(),
+		pieces = world.strewn.pieces(),
+		"what the strewings laid written as text"
+	);
+
+	Ok(())
+}
 
 /// Where a save by that name is.
 ///

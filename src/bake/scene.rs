@@ -9,13 +9,15 @@
 //!
 //! **What stands still, and nothing else.** A bake is light worked out once for
 //! things that will be where they are now when the light is read. So a thing
-//! is baked when it is drawn - alive, shown, with a mesh and not glass - and
-//! nothing that moves it: no body the solver or a game moves drives it or
-//! anything it hangs off, no pose bends it, and its [`Baking`] record does not
-//! say to leave it out. The same rule picks the lamps, so that a lamp a
-//! character carries lights the room each frame and throws nothing into the
-//! bake. Glass is left out because what passes through it is not a surface's
-//! to keep, which is the same reason the pass before the scene leaves it out.
+//! is baked when it is drawn - alive, shown, with a mesh drawn where it stands
+//! rather than strewn, and not glass - and nothing that moves it: no body the
+//! solver or a game moves drives it or anything it hangs off, no pose bends it,
+//! and its [`Baking`] record does not say to leave it out. The same rule picks
+//! the lamps, so that a lamp a character carries lights the room each frame and
+//! throws nothing into the bake. Glass is left out because what passes through
+//! it is not a surface's to keep, which is the same reason the pass before the
+//! scene leaves it out. What a strewing lays over its ground is not in a bake
+//! either: its copies are not entities.
 //!
 //! **What a surface is made of, to a ray, is the material the picture draws it
 //! with**: its color times the thing's own tint times the paint on its
@@ -37,6 +39,7 @@ use colby_core::{
 		material::{Blend, Material, Wrap},
 		mesh::{MeshData, PaintVertex},
 		physics::BodyKind,
+		strew,
 		texture::TextureId,
 	},
 	glam::{Vec2, Vec3, Vec4},
@@ -217,9 +220,12 @@ impl Scene {
 		let mut gathering = Gathering::default();
 
 		for (id, _, renderable) in world.entities.iter() {
+			// a thing that strews its mesh has nothing standing where it stands:
+			// its copies are laid over its ground and no bake sees them
 			if !world.entities.shown(id)
 				|| renderable.pose.is_some()
 				|| left_out(world, id)
+				|| strew::strews(&world.entities, id)
 				|| !still(world, id, &moving)
 			{
 				continue;
@@ -720,6 +726,32 @@ mod tests {
 		assert!(!baked(&scene).contains(&nothing), "and not an entity with no mesh");
 		assert_eq!(scene.triangles().len(), 24, "two cubes of twelve triangles");
 		assert_eq!(scene.tree().len(), 24, "every one of them in the tree");
+	}
+
+	#[test]
+	fn a_thing_that_strews_its_mesh_is_not_baked_where_it_stands() {
+		let mut world = World::new();
+		let ground = thing(&mut world, MeshId::CUBE, MaterialId::DEFAULT, Transform::IDENTITY);
+		let strewing = thing(
+			&mut world,
+			MeshId::CUBE,
+			MaterialId::DEFAULT,
+			Transform::at(Vec3::new(3.0, 0.0, 0.0)),
+		);
+
+		world.entities.set_parent(strewing, ground);
+		if let Some(rule) = world
+			.entities
+			.record_mut(&strew::STREWING, strewing)
+		{
+			rule.strews = 1;
+		}
+
+		assert_eq!(
+			baked(&Scene::of(&world)),
+			vec![ground],
+			"the ground is baked, and nothing stands where the strewing does"
+		);
 	}
 
 	#[test]

@@ -134,7 +134,8 @@ impl Scene {
 	) -> Gathered {
 		let start = at + normal * BIAS;
 		let (first, second) = basis(normal);
-		let turn = turn(&mut Random::new(seed));
+		// a turn by an angle the generator picks, a point on the unit circle
+		let turn = Random::new(seed).circle();
 		let mut total = [0.0_f64; 3];
 		let mut behind = 0_u32;
 
@@ -313,37 +314,6 @@ fn basis(normal: Vec3) -> (Vec3, Vec3) {
 		Vec3::new(1.0 + first_x, sign * shared, -sign * normal.x),
 		Vec3::new(shared, sign + second_y, -normal.y),
 	)
-}
-
-/// A turn by an angle the generator picks: a point on the unit circle, found
-/// by drawing points in the square about the middle until one falls inside the
-/// circle and outside a small one round the middle, and dividing it by its
-/// length.
-fn turn(random: &mut Random) -> Vec2 {
-	for _ in 0..64 {
-		let place = Vec2::new(signed(random), signed(random));
-		let squared = place.length_squared();
-
-		if squared > 1.0e-4 && squared <= 1.0 {
-			return place / squared.sqrt();
-		}
-	}
-
-	Vec2::X
-}
-
-/// A number from minus one up to one, from the top twenty-four bits of a draw,
-/// which a float holds exactly: two to the twenty-fourth steps over a span of
-/// two, so each step is two to the minus twenty-three.
-#[expect(
-	clippy::as_conversions,
-	clippy::cast_precision_loss,
-	reason = "a whole number below two to the twenty-fourth, which a float holds exactly"
-)]
-fn signed(random: &mut Random) -> f32 {
-	let top = random.draw() >> 40;
-
-	(top as f32) / 8_388_608.0 - 1.0
 }
 
 #[cfg(test)]
@@ -694,7 +664,7 @@ mod tests {
 		let mut random = Random::new(5);
 
 		for _ in 0..2000 {
-			let normal = Vec3::new(signed(&mut random), signed(&mut random), signed(&mut random))
+			let normal = Vec3::new(random.signed(), random.signed(), random.signed())
 				.normalize_or(Vec3::Y);
 			let (first, second) = basis(normal);
 

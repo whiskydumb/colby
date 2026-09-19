@@ -24,8 +24,8 @@ use colby_core::{
 	Result,
 	abi::{
 		BAKING, Baking, Camera, DRAWING, EntityId, Light, LightKind, MAX_ENTITIES, Material,
-		MeshData, MeshVertex, Meshes, PaintVertex, Renderable, SkinVertex, Texel, TextureData,
-		TextureId, Textures, Transform, World,
+		MeshData, MeshVertex, Meshes, PaintVertex, Renderable, STREWING, SkinVertex, Texel,
+		TextureData, TextureId, Textures, Transform, World,
 		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
 	},
@@ -3441,8 +3441,18 @@ impl Scene {
 		// and where its light is of every thing that is drawn
 		let drawing = world.entities.column(&DRAWING);
 		let baking = world.entities.column(&BAKING);
+		let strewing = world.entities.column(&STREWING);
 
 		for (id, _, renderable) in world.entities.iter() {
+			// a thing that strews its mesh draws nothing where it stands: what
+			// is drawn of it is what it laid over its ground
+			if strewing
+				.and_then(|column| column.get(id.slot()))
+				.is_some_and(|rule| rule.strews())
+			{
+				continue;
+			}
+
 			let covers = drawing
 				.and_then(|column| column.get(id.slot()))
 				.is_some_and(|drawing| drawing.covers());

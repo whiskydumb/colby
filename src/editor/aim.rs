@@ -26,7 +26,7 @@
 //! truth here and the camera is written from it.
 
 use colby_core::{
-	abi::{Camera, Transform, World},
+	abi::{Camera, Transform, World, strew},
 	glam::{Vec2, Vec3},
 };
 
@@ -207,7 +207,8 @@ impl View {
 /// box pick as the box it looks like instead of as the larger box around it.
 /// An entity drawing nothing is not tested at all: there is nothing on screen
 /// to have been clicked. Nor is a hidden one, for the same reason; it is picked
-/// from the hierarchy, where it can be seen.
+/// from the hierarchy, where it can be seen. Nor one that strews its mesh,
+/// which draws nothing where it stands.
 ///
 /// @param world - what to look through
 /// @param from - where the ray starts, in world space
@@ -222,7 +223,7 @@ pub(crate) fn under(world: &World, from: Vec3, along: Vec3) -> Pick {
 			continue;
 		};
 
-		if !world.entities.shown(id) {
+		if !world.entities.shown(id) || strew::strews(&world.entities, id) {
 			continue;
 		}
 
@@ -564,6 +565,26 @@ mod tests {
 			under(&world, Vec3::Z * 10.0, Vec3::NEG_Z),
 			far,
 			"the ray goes through where the hidden one stands and finds the one behind it"
+		);
+	}
+
+	#[test]
+	fn something_that_strews_is_not_there_to_be_clicked_and_what_is_behind_it_is() {
+		let mut world = cubed();
+		let far = stood(&mut world, Transform::at(Vec3::ZERO));
+		let near = stood(&mut world, Transform::at(Vec3::Z * 4.0));
+		let Pick::Entity(id) = near else {
+			panic!("stood makes an entity");
+		};
+
+		if let Some(rule) = world.entities.record_mut(&strew::STREWING, id) {
+			rule.strews = 1;
+		}
+
+		assert_eq!(
+			under(&world, Vec3::Z * 10.0, Vec3::NEG_Z),
+			far,
+			"the ray goes through where the strewing stands and finds the one behind it"
 		);
 	}
 

@@ -354,8 +354,8 @@ mod tests {
 	use colby_core::{
 		abi::{
 			BAKING, Decal, EntityId, Material, MeshData, MeshId, PaintVertex, Pose, PoseId, Post,
-			Renderable, SkinVertex, Sky, SkyKind, Texel, TextureData, TextureId, ToneMap,
-			Transform,
+			Renderable, STREWING, SkinVertex, Sky, SkyKind, Texel, TextureData, TextureId,
+			ToneMap, Transform,
 			cvar::Value,
 			material::{Blend, MaterialId},
 			mesh,
@@ -3749,6 +3749,52 @@ f 1 4 5
 			.set_renderable(id, Renderable::new(MeshId::CUBE, color));
 
 		id
+	}
+
+	#[test]
+	fn a_thing_that_strews_draws_nothing_where_it_stands_nor_a_shadow() {
+		let Some(mut capture) = capture() else {
+			return;
+		};
+
+		// the caster and the red cube of the test below, and the green one on
+		// its own; the two strew and hang off nothing, so nothing is laid for
+		// them to draw either
+		let mut world = shadowed_world();
+		world.camera.position = Vec3::new(0.0, 9.0, 0.01);
+		world.camera.target = Vec3::ZERO;
+
+		let caster = cube_at(&mut world, Vec3::new(-12.0, 6.0, 0.0), Vec3::ONE);
+		let red = cube_at(&mut world, Vec3::new(3.0, 1.0, -2.0), rgb(0.9, 0.1, 0.1));
+		cube_at(&mut world, Vec3::new(0.0, 1.0, 3.0), rgb(0.1, 0.9, 0.1));
+
+		for id in [caster, red] {
+			if let Some(rule) = world.entities.record_mut(&STREWING, id) {
+				rule.strews = 1;
+			}
+		}
+
+		let strewing = capture
+			.shoot(&mut world)
+			.expect("the capture renders");
+		let counted = capture.scene_mut().drawn();
+
+		assert!(world.entities.despawn(caster) && world.entities.despawn(red));
+
+		let without = capture
+			.shoot(&mut world)
+			.expect("the second capture renders");
+		let left = capture.scene_mut().drawn();
+
+		assert_eq!(
+			(counted.meshes, counted.seen, counted.cast),
+			(left.meshes, left.seen, left.cast),
+			"neither is a mesh, a thing in view or a caster: {counted:?} against {left:?}"
+		);
+		assert!(
+			strewing.pixels == without.pixels,
+			"the picture is the one without them, shadow and all"
+		);
 	}
 
 	#[test]

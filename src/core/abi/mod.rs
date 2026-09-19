@@ -56,6 +56,7 @@ pub mod script;
 pub mod skeleton;
 pub mod sky;
 pub mod state;
+pub mod strew;
 pub mod terrain;
 pub mod texture;
 pub mod ui;
@@ -117,6 +118,7 @@ pub use self::{
 	},
 	sky::{Sky, SkyKind},
 	state::{GameState, Players},
+	strew::{Layout, Patch, Piece, STREWING, Strewing, Strewn},
 	terrain::{Terrain, TerrainKind},
 	texture::{CUBE_FACES, Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},
@@ -128,7 +130,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 80;
+pub const ABI_VERSION: u32 = 81;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
@@ -424,6 +426,15 @@ pub struct World {
 	/// [`particles`](crate::abi::particles).
 	pub sparks: Sparks,
 
+	/// Every copy every strewing entity laid over its ground. Host-written.
+	///
+	/// The copies, where [`Strewing`] on an entity is the rule that lays them:
+	/// kept in line with the records by the host once a step, on both sides of
+	/// the edit-mode guard as a terrain's geometry is, and not written down by
+	/// a save for the reason the particle pool is not - it follows from what
+	/// is. A game may read it. @ref [`strew`](crate::abi::strew).
+	pub strewn: Strewn,
+
 	/// Every joint holding two bodies together, reached by handle.
 	///
 	/// Host-owned plain data beside the bodies, and for the same reasons. @ref
@@ -664,8 +675,8 @@ impl World {
 	///
 	/// Nothing but the engine's own records, which every world declares before
 	/// anything is put in it: a scene restored into a world has somewhere for
-	/// what it says about [`Drawing`], [`Editing`] and [`Baking`] to land. @ref
-	/// [`record`].
+	/// what it says about [`Drawing`], [`Editing`], [`Baking`] and [`Strewing`]
+	/// to land. @ref [`record`].
 	#[must_use]
 	pub fn new() -> Self {
 		let mut world = Self::bare();
@@ -683,6 +694,10 @@ impl World {
 		world
 			.entities
 			.declare(&BAKING)
+			.expect("the engine's own records are ones a world holds");
+		world
+			.entities
+			.declare(&STREWING)
 			.expect("the engine's own records are ones a world holds");
 
 		world
@@ -720,6 +735,7 @@ impl World {
 			contacts: 0,
 			entities: Entities::new(),
 			sparks: Sparks::new(),
+			strewn: Strewn::new(),
 			bodies: Bodies::new(),
 			nav: Navmesh::new(),
 			joints: Joints::new(),

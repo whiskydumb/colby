@@ -243,6 +243,7 @@ pub const ENGINE: &[Shape] = &[
 	super::entity::DRAWING.shape(),
 	super::entity::EDITING.shape(),
 	super::entity::BAKING.shape(),
+	super::strew::STREWING.shape(),
 ];
 
 /// Checks that a field is stored as the type its kind is held in.
@@ -2339,6 +2340,9 @@ mod tests {
 		records
 			.declare(&super::super::entity::BAKING)
 			.expect("baking is a record a world holds");
+		records
+			.declare(&super::super::strew::STREWING)
+			.expect("strewing is a record a world holds");
 
 		assert_eq!(ENGINE.len(), records.tables().len(), "every engine record, and only them");
 

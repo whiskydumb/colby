@@ -22,6 +22,15 @@
 //! has with its gains, and for the same reason: the arithmetic that decides
 //! something happens where it can be looked at rather than in the middle of a
 //! loop.
+//!
+//! **A number and a turn are made without a sine.** [`Random::unit`],
+//! [`Random::signed`] and [`Random::circle`] use nothing but a shift, a
+//! division by a power of two and a square root, which every machine answers
+//! alike; a sine is a library's, and two libraries were measured answering one
+//! differently. The bake and the strewing both lay things out that must come
+//! out the same bytes on every machine, which is why the three live here.
+
+use crate::glam::Vec2;
 
 /// What a seed of nil is replaced with.
 ///
@@ -136,6 +145,58 @@ impl Random {
 	///
 	/// @param threshold - what [`threshold`] made of a probability
 	pub const fn chance(&mut self, threshold: u64) -> bool { happens(self.share(), threshold) }
+
+	/// A number from nought up to but not including one, from the top
+	/// twenty-four bits of a draw, which a float holds exactly: two to the
+	/// twenty-fourth steps over a span of one.
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_precision_loss,
+		reason = "a whole number below two to the twenty-fourth, which a float holds exactly"
+	)]
+	pub const fn unit(&mut self) -> f32 {
+		let top = self.draw() >> 40;
+
+		(top as f32) / 16_777_216.0
+	}
+
+	/// A number from minus one up to but not including one, from the same
+	/// twenty-four bits: two to the twenty-fourth steps over a span of two, so
+	/// each step is two to the minus twenty-three.
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_precision_loss,
+		reason = "a whole number below two to the twenty-fourth, which a float holds exactly"
+	)]
+	pub const fn signed(&mut self) -> f32 {
+		let top = self.draw() >> 40;
+
+		(top as f32) / 8_388_608.0 - 1.0
+	}
+
+	/// A point on the unit circle, which is a turn by an angle the generator
+	/// picks: points are drawn in the square about the middle until one falls
+	/// inside the circle and outside a small one round the middle, and that one
+	/// is divided by its length.
+	///
+	/// @note: how many draws it takes depends on the draws and on nothing else,
+	/// so a stream that asks for a circle is the same stream on every machine.
+	/// The small circle keeps a point so near the middle that dividing by its
+	/// length would magnify its rounding out of the answer; the sixty-fourth
+	/// miss in a row, at a chance of about a fifth each, is not something any
+	/// stream will meet, and the answer then is a turn by nothing.
+	pub fn circle(&mut self) -> Vec2 {
+		for _ in 0..64 {
+			let place = Vec2::new(self.signed(), self.signed());
+			let squared = place.length_squared();
+
+			if squared > 1.0e-4 && squared <= 1.0 {
+				return place / squared.sqrt();
+			}
+		}
+
+		Vec2::X
+	}
 }
 
 /// Whether a share of the space falls below a threshold.

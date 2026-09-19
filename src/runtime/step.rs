@@ -196,6 +196,14 @@ pub(crate) fn run(
 	// which is every world but one. @ref `crate::terrain`.
 	crate::terrain::sync(world, ground);
 
+	// and what is strewn over the ground right after it, on the same side of the
+	// guard and for the same reason: a density dragged in a panel is a field that
+	// has to thicken while the world is stopped, and a copy stands on ground
+	// built this step rather than on last step's. Before the navmesh, which a
+	// solid strewing's body is in the way of. It does nothing at all in a world
+	// where nothing strews. @ref `crate::strew`.
+	crate::strew::sync(world);
+
 	// and the navmesh after the ground and before everything else, because it
 	// is baked *from* the ground: a terrain built this step is walkable this
 	// step rather than next. Outside the guard for the terrain's reason, and
