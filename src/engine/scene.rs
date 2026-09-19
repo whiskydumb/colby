@@ -23,9 +23,9 @@ use std::sync::Arc;
 use colby_core::{
 	Result,
 	abi::{
-		Camera, DRAWING, EntityId, Light, LightKind, MAX_ENTITIES, Material, MeshData,
-		MeshVertex, Meshes, PaintVertex, Renderable, SkinVertex, Texel, TextureData, TextureId,
-		Textures, Transform, World,
+		BAKING, Baking, Camera, DRAWING, EntityId, Light, LightKind, MAX_ENTITIES, Material,
+		MeshData, MeshVertex, Meshes, PaintVertex, Renderable, SkinVertex, Texel, TextureData,
+		TextureId, Textures, Transform, World,
 		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
 	},
@@ -63,6 +63,7 @@ use crate::{
 	focus::{self, Focus},
 	gpu::Gpu,
 	haze::{self, Haze},
+	lightmap::{self, Lightmap, Picture},
 	lines::Lines,
 	occlusion::{self, Occlusion},
 	post,
@@ -388,16 +389,22 @@ struct Placement {
 	/// infinities.
 	normal_scale: [f32; 4],
 
-	/// `[where this instance's joint matrices start, how many, flags, 0]`.
+	/// `[where this instance's joint matrices start, how many, flags, where its
+	/// light is]`.
 	///
 	/// The flags are the entity's own, and the one bit there is says decals
 	/// leave it alone - @ref
-	/// [`Entities::takes_decals`](colby_core::abi::Entities::takes_decals).
-	/// Here rather than in an attribute of its own because this word was spare.
+	/// [`Entities::takes_decals`](colby_core::abi::Entities::takes_decals). The
+	/// fourth word is which entry of the frame's table of places is its
+	/// light's, for a thing a bake gave a place: every static vertex stage
+	/// carries the second set through it, and only the pipelines that draw a
+	/// baked thing read what comes out, @ref [`lightmap`]. Here rather than in
+	/// attributes of their own because these words were spare and every
+	/// location a device has to offer is taken.
 	///
-	/// Read by the skinned pipeline and by nothing else; the static one
-	/// declares the attribute and never looks at it, which a pipeline allows.
-	/// Zero and zero is a thing bones do not move - @ref
+	/// The first two are read by the skinned pipeline and by nothing else; the
+	/// static one never looks at them, which a pipeline allows. Zero and zero
+	/// is a thing bones do not move - @ref
 	/// [`NO_JOINTS`](crate::skin::NO_JOINTS).
 	skin: [u32; 4],
 }
@@ -781,6 +788,15 @@ struct Sorted {
 	/// be two different answers.
 	blend: Blend,
 
+	/// Whether it reads its light off the lightmap this frame, which is a
+	/// pipeline of its own. @ref [`Way::baked`].
+	///
+	/// In the key between the material and whether it is small, so the things
+	/// of one mesh at one level in one material that read the lightmap are a
+	/// batch apart from the ones that do not. False in the maps' lists, which
+	/// draw both alike and are not cut on it.
+	baked: bool,
+
 	/// Where its placement is in [`Scene::staged`], which is worked out once
 	/// however many of the frame's lists the entity is in.
 	at: u32,
@@ -799,13 +815,14 @@ impl Sorted {
 	///
 	/// The mode is not in it and does not have to be: `pass` is a function of
 	/// it and comes first, so the two halves are already apart.
-	const fn key(&self) -> (u8, i32, u32, u8, u32, bool, usize) {
+	const fn key(&self) -> (u8, i32, u32, u8, u32, bool, bool, usize) {
 		(
 			self.pass,
 			self.depth,
 			self.mesh,
 			self.level,
 			self.material,
+			self.baked,
 			self.small,
 			self.entity.slot(),
 		)
@@ -895,6 +912,32 @@ struct Batch {
 	/// half of what a batch is keyed on, so a batch is never half one mode and
 	/// half another either.
 	blend: Blend,
+
+	/// Whether its things read their light off the lightmap, which picks the
+	/// table's baked pipelines: true of every thing in the run, because it is
+	/// in the key the runs are cut on. @ref [`Sorted::baked`].
+	baked: bool,
+}
+
+/// Which of the scene's pipelines draws a batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Way {
+	/// How its material's alpha is read.
+	blend: Blend,
+
+	/// Whether bones move its mesh.
+	skinned: bool,
+
+	/// Whether its things read their light off the lightmap.
+	///
+	/// **A pipeline of its own rather than a word the shader branches on**: a
+	/// compiler handed the sum that reads a lightmap and the sum that does not
+	/// in one function may rewrite the second to share work with the first,
+	/// and that rewrite was measured moving pictures that read no lightmap at
+	/// all. The baked pipelines' entry points are the only ones that read it;
+	/// every other hands in a constant nought, which folds the reading away.
+	/// Never with bones and never for glass, which no bake reaches.
+	baked: bool,
 }
 
 /// One pipeline per way of drawing the scene.
@@ -902,9 +945,13 @@ struct Batch {
 /// A table rather than a field each. The two axes are independent - bones do
 /// not care how the alpha is read - and one of them grows, so a pair of named
 /// fields would mean two more of them and a new arm at every call site the next
-/// time a mode is added.
+/// time a mode is added. The baked pipelines are a short row beside it: they
+/// are a solid and a masked one, for a still thing only.
 struct Pipelines {
 	entries: [RenderPipeline; Blend::COUNT * 2],
+	/// The solid and the masked pipelines for things that read the lightmap.
+	/// @ref [`Way::baked`].
+	baked: [RenderPipeline; 2],
 	/// The one that draws what is behind the world.
 	///
 	/// Not in the table, because it is not a point on the table's two axes: it
@@ -941,19 +988,27 @@ impl Pipelines {
 		source: &str,
 		samples: u32,
 	) -> Result<Self> {
-		let at = |blend, skinned| {
-			compile_pipeline(device, format, layouts, source, blend, skinned, samples)
+		let at = |blend, skinned, baked| {
+			compile_pipeline(
+				device,
+				format,
+				layouts,
+				source,
+				Way { blend, skinned, baked },
+				samples,
+			)
 		};
 
 		Ok(Self {
 			entries: [
-				at(Blend::Opaque, false)?,
-				at(Blend::Opaque, true)?,
-				at(Blend::Mask, false)?,
-				at(Blend::Mask, true)?,
-				at(Blend::Alpha, false)?,
-				at(Blend::Alpha, true)?,
+				at(Blend::Opaque, false, false)?,
+				at(Blend::Opaque, true, false)?,
+				at(Blend::Mask, false, false)?,
+				at(Blend::Mask, true, false)?,
+				at(Blend::Alpha, false, false)?,
+				at(Blend::Alpha, true, false)?,
 			],
+			baked: [at(Blend::Opaque, false, true)?, at(Blend::Mask, false, true)?],
 			sky: compile_sky(device, format, layouts, source, samples)?,
 			samples,
 		})
@@ -963,9 +1018,23 @@ impl Pipelines {
 	///
 	/// Indexed rather than looked up: [`Blend::row`] is a match over the whole
 	/// enum and the array is exactly [`Blend::COUNT`] pairs long, so there is
-	/// no pair this can miss.
-	fn get(&self, blend: Blend, skinned: bool) -> &RenderPipeline {
-		&self.entries[blend.row() * 2 + usize::from(skinned)]
+	/// no pair this can miss. A baked way that has no pipeline of its own -
+	/// glass, or a thing bones move - is drawn by the table's own, which is
+	/// what the scene never asks for anyway.
+	fn get(&self, way: Way) -> &RenderPipeline {
+		match way {
+			| Way {
+				blend: Blend::Opaque,
+				skinned: false,
+				baked: true,
+			} => &self.baked[0],
+			| Way {
+				blend: Blend::Mask,
+				skinned: false,
+				baked: true,
+			} => &self.baked[1],
+			| Way { blend, skinned, .. } => &self.entries[blend.row() * 2 + usize::from(skinned)],
+		}
 	}
 }
 
@@ -1072,6 +1141,9 @@ pub struct Scene {
 	environment: Environment,
 	/// How much of whatever it reflects a surface sends back. @ref [`brdf`].
 	split: Arc<Split>,
+	/// The picture a bake kept every still thing's light in, and where each
+	/// thing's is on it. @ref [`lightmap`].
+	lightmap: Lightmap,
 	/// This frame's light matrices, fitted in `upload` and drawn in `render`.
 	cascades: Cascades,
 	/// Whether the console left the shadow passes switched on this frame.
@@ -1171,8 +1243,7 @@ impl Scene {
 	/// @param width - the target's width in pixels
 	/// @param height - the target's height in pixels
 	pub fn new(gpu: &Gpu, format: TextureFormat, width: u32, height: u32) -> Result<Self> {
-		let device = gpu.device().clone();
-		let queue = gpu.queue().clone();
+		let (device, queue) = (gpu.device().clone(), gpu.queue().clone());
 
 		let globals = globals_uniform(&device)?;
 		let globals_layout = frame_layout(&device);
@@ -1181,13 +1252,10 @@ impl Scene {
 		// bound in has to be, for every pipeline that reads group nought.
 		let atlas = Atlas::new(&device);
 		let decal_sampler = decal_sampler(&device);
-		// before group nought, because the cube is one of its entries: there is
-		// no fifth group to put it in. @ref [`env`].
-		let environment = Environment::new(&device, &queue)?;
-		// and beside it, taken from the device rather than built here: the
-		// table is the same one for every scene this device draws. @ref
-		// [`Gpu::split`].
-		let split = Arc::clone(gpu.split());
+		// before group nought, because the cube, the table and the lightmap are
+		// among its entries: there is no fifth group to put them in. @ref
+		// [`everywhere`].
+		let (environment, split, lightmap) = everywhere(gpu)?;
 		// and before group nought too, for the cube's reason: what the share of
 		// the sky and what the reflections found are read out of are its ninth
 		// and tenth entries, and a scene that has asked for nothing yet binds the
@@ -1199,6 +1267,7 @@ impl Scene {
 			split: &split,
 			occlusion: occlusion.bound(),
 			reflection: reflection.bound(),
+			lightmap: &lightmap,
 		});
 
 		let samplers = wraps(&device);
@@ -1260,6 +1329,7 @@ impl Scene {
 			shadows,
 			environment,
 			split,
+			lightmap,
 			cascades: Cascades::NONE,
 			shadowing: false,
 			lines,
@@ -1987,6 +2057,12 @@ impl Scene {
 	#[cfg(test)]
 	pub(crate) const fn rebinds(&self) -> u32 { self.rebound }
 
+	/// How many things the last frame gave a place on the lightmap, for a test:
+	/// what glass and a mesh with bones must never take, since no pipeline that
+	/// draws them reads one.
+	#[cfg(test)]
+	pub(crate) fn places_handed(&self) -> usize { self.lightmap.written().len() }
+
 	/// What this frame cost, for whoever asked to be told.
 	///
 	/// Blocks on the queue. @ref [`Timings::settle`] for why, and for why the
@@ -2210,7 +2286,11 @@ impl Scene {
 		);
 
 		self.draw_through(pass, (batches, through), |batch| {
-			Some(self.pipelines.get(batch.blend, batch.skinned))
+			Some(self.pipelines.get(Way {
+				blend: batch.blend,
+				skinned: batch.skinned,
+				baked: batch.baked,
+			}))
 		});
 	}
 
@@ -2239,7 +2319,12 @@ impl Scene {
 		// The solid half is ordered by mesh and material, so a world of crates
 		// with one character in it changes pipeline twice however many crates
 		// there are.
-		let mut bound = None;
+		//
+		// @note: the pipeline itself is what is compared, not what picked it:
+		// two batches of one blend and one skin can want two pipelines, one of
+		// them the lightmap's, and a key that left that out drew a baked batch
+		// after a plain one with the plain one's.
+		let mut bound: Option<&RenderPipeline> = None;
 		#[cfg(test)]
 		let mut drew = (0, 0);
 
@@ -2253,10 +2338,9 @@ impl Scene {
 				continue;
 			};
 
-			let wanted = (batch.blend, batch.skinned);
-			if bound != Some(wanted) {
+			if !bound.is_some_and(|last| core::ptr::eq(last, pipeline)) {
 				pass.set_pipeline(pipeline);
-				bound = Some(wanted);
+				bound = Some(pipeline);
 			}
 
 			if let Some(skin) = mesh.skin.as_ref() {
@@ -2675,16 +2759,58 @@ impl Scene {
 		}
 	}
 
+	/// Puts the world's lightmap in group nought, and rebuilds the group when
+	/// what is bound moved.
+	///
+	/// After [`sync_textures`](Self::sync_textures), which is what uploaded it:
+	/// the picture is a flat texture in the registry like any other, and the
+	/// view bound here is that upload's, not a second one. A cube named as a
+	/// lightmap is not a picture of anything a second set can land on, so a
+	/// world naming one reads none.
+	///
+	/// @note: the handle is asked whether it names anything before the
+	/// registry is asked for it. Nought is the white texel's slot, which the
+	/// registry answers like any other: asked straight, a world nobody baked
+	/// would read every place off one texel of white.
+	fn sync_lightmap(&mut self, world: &World) {
+		let wanted = world
+			.cvars
+			.bool(lightmap::ENABLED)
+			.unwrap_or(true);
+		let slot = world.lightmap.index();
+		let picture = Some(world.lightmap)
+			.filter(|named| named.is_some())
+			.and_then(|named| world.textures.get(named))
+			.filter(|entry| !entry.value().is_cube())
+			.and_then(|entry| {
+				let uploaded = usize::try_from(slot)
+					.ok()
+					.and_then(|at| self.textures.get(at))
+					.filter(|uploaded| uploaded.revision == entry.revision())?;
+
+				Some(Picture {
+					view: &uploaded.view,
+					source: (slot, entry.revision()),
+					size: [entry.value().width, entry.value().height],
+				})
+			});
+
+		if self.lightmap.update(picture, wanted) {
+			self.rebind();
+		}
+	}
+
 	/// Everything the frame reads that lives in a registry rather than in the
 	/// uniform.
 	///
-	/// Geometry, pictures, materials, the debug pen's lines, the particles'
-	/// groups and the environment: all of them are "what is on the device
-	/// matching what the world holds", and none of them depends on where the
-	/// camera is this frame.
+	/// Geometry, pictures, the lightmap, materials, the debug pen's lines, the
+	/// particles' groups and the environment: all of them are "what is on the
+	/// device matching what the world holds", and none of them depends on
+	/// where the camera is this frame.
 	fn sync_tables(&mut self, world: &World) {
 		self.sync_meshes(&world.meshes);
 		self.sync_textures(&world.textures);
+		self.sync_lightmap(world);
 		self.sync_materials(world);
 		self.lines
 			.upload(&self.device, &self.queue, world);
@@ -2713,13 +2839,13 @@ impl Scene {
 	}
 
 	/// Group nought, rebuilt around whatever the atlas, the environment, the
-	/// share of the sky and what the reflections found are now.
+	/// lightmap, the share of the sky and what the reflections found are now.
 	///
-	/// Four things make it stale. Two are rare, the decals' atlas growing and
-	/// the world naming a different environment; the other two are the share's
-	/// buffers and the reflections' being made or let go, which is a frame that
-	/// starts or stops asking for one of them and a picture that changes size.
-	/// @ref [`frame_bindings`].
+	/// Five things make it stale. Three are rare, the decals' atlas growing and
+	/// the world naming a different environment or a different lightmap, a bake
+	/// among them; the other two are the share's buffers and the reflections'
+	/// being made or let go, which is a frame that starts or stops asking for
+	/// one of them and a picture that changes size. @ref [`frame_bindings`].
 	fn rebind(&mut self) {
 		self.bindings = frame_bindings(
 			&self.device,
@@ -2732,6 +2858,7 @@ impl Scene {
 				split: &self.split,
 				occlusion: self.occlusion.bound(),
 				reflection: self.reflection.bound(),
+				lightmap: &self.lightmap,
 			},
 		);
 		self.occluded = self.occlusion.epoch();
@@ -2874,6 +3001,7 @@ impl Scene {
 		self.queue
 			.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.placements));
 		self.joints.upload(&self.queue);
+		self.lightmap.upload(&self.queue);
 	}
 
 	/// Whether this frame runs the test for what is behind something nearer,
@@ -3196,22 +3324,29 @@ impl Scene {
 		self.casters.clear();
 		self.staged.clear();
 		self.joints.begin(world);
+		self.lightmap.begin();
 		self.culling = sight.culling;
 		self.drawn = Drawn::default();
 		self.covering.reached.clear();
 		self.covering.reaches.clear();
 		self.covering.commands.clear();
 
-		// one lookup of the record for the whole walk, rather than one a thing:
-		// the question is asked of every thing in view in a frame the test runs
+		// one lookup of each record for the whole walk, rather than one a thing:
+		// the question is asked of every thing in view in a frame the test runs,
+		// and where its light is of every thing that is drawn
 		let drawing = world.entities.column(&DRAWING);
+		let baking = world.entities.column(&BAKING);
 
 		for (id, _, renderable) in world.entities.iter() {
 			let covers = drawing
 				.and_then(|column| column.get(id.slot()))
 				.is_some_and(|drawing| drawing.covers());
+			let place = baking
+				.and_then(|column| column.get(id.slot()))
+				.copied()
+				.unwrap_or(Baking::NONE);
 
-			self.consider(world, sight, id, renderable, covers);
+			self.consider(world, sight, id, renderable, (covers, place));
 		}
 
 		// a frame whose solid things are all small has nothing ahead of the test
@@ -3298,15 +3433,17 @@ impl Scene {
 	/// @param sight - what this frame can see
 	/// @param id - the entity
 	/// @param renderable - what it draws
-	/// @param covers - whether its record says it is drawn ahead of the test
-	/// for what is hidden whatever its size. @ref `colby_core::abi::Drawing`
+	/// @param records - what its records say: whether it is drawn ahead of the
+	/// test for what is hidden whatever its size, @ref
+	/// `colby_core::abi::Drawing`, and where a bake put its light, @ref
+	/// `colby_core::abi::Baking`
 	fn consider(
 		&mut self,
 		world: &World,
 		sight: &Sight,
 		id: EntityId,
 		renderable: &Renderable,
-		covers: bool,
+		(covers, place): (bool, Baking),
 	) {
 		let mesh = renderable.mesh.slot();
 		if mesh == 0 || mesh >= world.meshes.len() {
@@ -3364,7 +3501,7 @@ impl Scene {
 			return;
 		}
 
-		let Some(at) = self.stage(world, id, renderable, transform) else {
+		let Some((at, baked)) = self.stage(world, id, renderable, transform, place) else {
 			return;
 		};
 
@@ -3410,6 +3547,7 @@ impl Scene {
 			small,
 			entity: id,
 			blend,
+			baked,
 			at,
 			casts,
 		};
@@ -3421,7 +3559,7 @@ impl Scene {
 		// a map draws large and small alike, so its batches are not cut on it
 		if casts != 0 {
 			self.casters
-				.push(Sorted { small: false, ..entry });
+				.push(Sorted { small: false, baked: false, ..entry });
 		}
 	}
 
@@ -3493,14 +3631,17 @@ impl Scene {
 	/// @param id - the entity, for its own flags
 	/// @param renderable - what the entity draws
 	/// @param transform - where it is drawn this frame
-	/// @return where in [`staged`](Self::staged) it went
+	/// @param place - where a bake put its light, if anywhere
+	/// @return where in [`staged`](Self::staged) it went, and whether it reads
+	/// its light off the lightmap this frame
 	fn stage(
 		&mut self,
 		world: &World,
 		id: EntityId,
 		renderable: &Renderable,
 		transform: Transform,
-	) -> Option<u32> {
+		place: Baking,
+	) -> Option<(u32, bool)> {
 		let surface = world
 			.materials
 			.get(renderable.material)
@@ -3513,6 +3654,24 @@ impl Scene {
 		// third word is the entity's own flags, which the joints leave alone.
 		let mut skin = self.joints.take(world, renderable.pose);
 		skin[2] = u32::from(!world.entities.takes_decals(id));
+
+		// and where its light is on the lightmap, for a thing a bake gave a
+		// place to in a frame that reads it - never for glass, which no bake
+		// lights, nor for a mesh with bones, whose second set no bake laid out
+		// and whose pipelines read no lightmap, whatever the record says: a
+		// place is a number anybody may type. The mesh's own block of bones is
+		// asked, as the pipeline that draws it is chosen. @ref [`lightmap`].
+		let boned = self
+			.meshes
+			.get(renderable.mesh.slot())
+			.is_some_and(|uploaded| uploaded.skin.is_some());
+		let index = (surface.blend != Blend::Alpha && !boned)
+			.then_some(place)
+			.and_then(|place| self.lightmap.take(place));
+
+		if let Some(index) = index {
+			skin[3] = index;
+		}
 
 		self.staged.push(Placement {
 			model: transform.matrix().to_cols_array_2d(),
@@ -3534,7 +3693,7 @@ impl Scene {
 			skin,
 		});
 
-		Some(at)
+		Some((at, index.is_some()))
 	}
 
 	/// Writes one cascade's list: everything solid its box can see, in the
@@ -3612,6 +3771,7 @@ impl Scene {
 				if batch.mesh == mesh
 					&& batch.level == entry.level
 					&& batch.material == material
+					&& batch.baked == entry.baked
 					&& batch.small == entry.small =>
 				batch.count += 1,
 			| _ => batches.push(Batch {
@@ -3623,6 +3783,7 @@ impl Scene {
 				small: entry.small,
 				skinned,
 				blend: entry.blend,
+				baked: entry.baked,
 			}),
 		}
 
@@ -3702,6 +3863,22 @@ impl Scene {
 	}
 }
 
+/// What the light arriving from everywhere is read out of, in the frame's own
+/// group: the environment's cube and the lightmap, both blank until a world
+/// names one, and the table that says how much of either a surface sends back.
+///
+/// @param gpu - the device to build against, and the table it keeps
+/// @return the cube, the table and the lightmap
+fn everywhere(gpu: &Gpu) -> Result<(Environment, Arc<Split>, Lightmap)> {
+	Ok((
+		Environment::new(gpu.device(), gpu.queue())?,
+		// taken from the device rather than built here: the table is the same
+		// one for every scene this device draws. @ref [`Gpu::split`].
+		Arc::clone(gpu.split()),
+		Lightmap::new(gpu.device(), gpu.queue())?,
+	))
+}
+
 /// The two things that read what the pass before the scene writes, and the
 /// haze, which reads the depth after it: none of them has made a buffer yet.
 ///
@@ -3752,8 +3929,9 @@ fn drawing(
 
 /// The layout of group nought: the frame's uniform; the decals' atlas read two
 /// ways with the sampler that reads it; the environment and the split-sum
-/// table, each with its own; how much of the sky each pixel sees; and what each
-/// pixel's reflection found.
+/// table, each with its own; how much of the sky each pixel sees; what each
+/// pixel's reflection found; and the lightmap with its sampler and its table of
+/// places.
 ///
 /// **One group for all of it**, rather than a fifth for the atlas: a device
 /// need only allow four, and all four are spoken for. The atlas belongs with
@@ -3766,6 +3944,7 @@ fn drawing(
 fn frame_layout(device: &Device) -> BindGroupLayout {
 	let environment = env::layout_entries(ENVIRONMENT_TEXTURE, ENVIRONMENT_SAMPLER);
 	let split = brdf::layout_entries(SPLIT_TEXTURE, SPLIT_SAMPLER);
+	let baked = lightmap::layout_entries(LIGHTMAP_TEXTURE, LIGHTMAP_SAMPLER, LIGHTMAP_PLACES);
 	let picture = |binding| BindGroupLayoutEntry {
 		binding,
 		visibility: ShaderStages::FRAGMENT,
@@ -3804,6 +3983,9 @@ fn frame_layout(device: &Device) -> BindGroupLayout {
 			split[1],
 			occlusion::entry(OCCLUSION_TEXTURE),
 			prepass::entry(REFLECTION_TEXTURE),
+			baked[0],
+			baked[1],
+			baked[2],
 		],
 	})
 }
@@ -3850,6 +4032,21 @@ const OCCLUSION_TEXTURE: u32 = 8;
 /// branching. Read with `textureLoad`, so it needs no sampler. @ref
 /// [`reflection`](crate::reflection).
 const REFLECTION_TEXTURE: u32 = 9;
+
+/// Which binding the world's lightmap takes.
+///
+/// Beside the reflections for their reason, and bound in every frame for the
+/// same one: a frame that reads no lightmap binds one texel of nothing, and the
+/// fragment stage asks the frame's uniform before it reads anything. @ref
+/// [`lightmap`](crate::lightmap).
+const LIGHTMAP_TEXTURE: u32 = 10;
+
+/// Which binding its sampler takes.
+const LIGHTMAP_SAMPLER: u32 = 11;
+
+/// Which binding the table of where each thing's light is on it takes: read by
+/// the vertex stage, which carries a second set onto the picture.
+const LIGHTMAP_PLACES: u32 = 12;
 
 /// Group nought, over this frame's uniform and the atlas as it stands.
 ///
@@ -3912,6 +4109,18 @@ fn frame_bindings(
 				binding: REFLECTION_TEXTURE,
 				resource: BindingResource::TextureView(held.reflection),
 			},
+			BindGroupEntry {
+				binding: LIGHTMAP_TEXTURE,
+				resource: BindingResource::TextureView(held.lightmap.view()),
+			},
+			BindGroupEntry {
+				binding: LIGHTMAP_SAMPLER,
+				resource: BindingResource::Sampler(held.lightmap.sampler()),
+			},
+			BindGroupEntry {
+				binding: LIGHTMAP_PLACES,
+				resource: held.lightmap.places().as_entire_binding(),
+			},
 		],
 	})
 }
@@ -3937,6 +4146,10 @@ struct Held<'a> {
 	/// What each pixel's reflection found, or one texel that says nothing was.
 	/// @ref [`Reflection::bound`].
 	reflection: &'a TextureView,
+
+	/// The world's lightmap or one texel of nothing, its sampler and this
+	/// frame's places on it. @ref [`Lightmap`].
+	lightmap: &'a Lightmap,
 }
 
 /// The sampler every decal's picture is read through.
@@ -4686,12 +4899,11 @@ fn compile_pipeline(
 	format: TextureFormat,
 	layouts: &[&BindGroupLayout],
 	source: &str,
-	blend: Blend,
-	skinned: bool,
+	way: Way,
 	samples: u32,
 ) -> Result<RenderPipeline> {
 	let scope = device.push_error_scope(ErrorFilter::Validation);
-	let pipeline = build_pipeline(device, format, layouts, source, blend, skinned, samples);
+	let pipeline = build_pipeline(device, format, layouts, source, way, samples);
 
 	match pollster::block_on(scope.pop()) {
 		| Some(complaint) => Err(err!(Graphics("{complaint}"))),
@@ -4816,14 +5028,16 @@ fn build_sky(
 /// Written out rather than formatted, because a label is borrowed for the
 /// length of the call and building one would mean a `String` per pipeline for
 /// the sake of a name nothing reads at run time.
-const fn label_of(blend: Blend, skinned: bool) -> &'static str {
-	match (blend, skinned) {
-		| (Blend::Opaque, false) => "scene",
-		| (Blend::Opaque, true) => "scene skinned",
-		| (Blend::Mask, false) => "scene masked",
-		| (Blend::Mask, true) => "scene masked skinned",
-		| (Blend::Alpha, false) => "scene blended",
-		| (Blend::Alpha, true) => "scene blended skinned",
+const fn label_of(way: Way) -> &'static str {
+	match (way.blend, way.skinned, way.baked) {
+		| (Blend::Opaque, false, false) => "scene",
+		| (Blend::Opaque, false, true) => "scene baked",
+		| (Blend::Opaque, true, _) => "scene skinned",
+		| (Blend::Mask, false, false) => "scene masked",
+		| (Blend::Mask, false, true) => "scene masked baked",
+		| (Blend::Mask, true, _) => "scene masked skinned",
+		| (Blend::Alpha, false, _) => "scene blended",
+		| (Blend::Alpha, true, _) => "scene blended skinned",
 	}
 }
 
@@ -4840,10 +5054,10 @@ fn build_pipeline(
 	format: TextureFormat,
 	layouts: &[&BindGroupLayout],
 	source: &str,
-	blend: Blend,
-	skinned: bool,
+	way: Way,
 	samples: u32,
 ) -> RenderPipeline {
+	let Way { blend, skinned, baked } = way;
 	let shader = device.create_shader_module(ShaderModuleDescriptor {
 		label: Some("scene"),
 		source: ShaderSource::Wgsl(source.into()),
@@ -4859,7 +5073,7 @@ fn build_pipeline(
 	let buffers = vertex_buffers(skinned);
 
 	device.create_render_pipeline(&RenderPipelineDescriptor {
-		label: Some(label_of(blend, skinned)),
+		label: Some(label_of(way)),
 		layout: Some(&layout),
 		vertex: VertexState {
 			module: &shader,
@@ -4908,10 +5122,15 @@ fn build_pipeline(
 		},
 		fragment: Some(FragmentState {
 			module: &shader,
-			entry_point: Some(match blend {
-				| Blend::Opaque => "fragment_main",
-				| Blend::Mask => "fragment_masked",
-				| Blend::Alpha => "fragment_blended",
+			// a thing bones move is never baked, so the baked entry points are
+			// for the static vertex stage only; a baked way with bones is drawn as
+			// it would be without the bake
+			entry_point: Some(match (blend, baked && !skinned) {
+				| (Blend::Opaque, false) => "fragment_main",
+				| (Blend::Opaque, true) => "fragment_baked",
+				| (Blend::Mask, false) => "fragment_masked",
+				| (Blend::Mask, true) => "fragment_masked_baked",
+				| (Blend::Alpha, _) => "fragment_blended",
 			}),
 			compilation_options: PipelineCompilationOptions::default(),
 			targets: &[Some(ColorTargetState {

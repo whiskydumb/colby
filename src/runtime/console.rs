@@ -619,6 +619,15 @@ fn install_render(world: &mut World) {
 		Value::Bool(true),
 		"reflect the world's environment map, when its sky names one",
 	);
+	// whether what a bake kept takes the place of the sky's light on the still
+	// things it reached. On, and not saved, the environment's terms and for its
+	// reason: off is how what reading it costs is measured, and the picture a
+	// world nobody baked takes.
+	world.cvars.var(
+		colby_engine::lightmap::ENABLED,
+		Value::Bool(true),
+		"light the still things a bake reached by what it kept, when the world names a lightmap",
+	);
 	// how much of the light arriving from everywhere a nearby wall or corner
 	// takes away. On, and not saved, like the shadows and for their reason; a
 	// strength rather than a switch, and nought records no pass at all, which

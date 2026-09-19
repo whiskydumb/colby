@@ -353,7 +353,7 @@ pub const fn rgb(red: f32, green: f32, blue: f32) -> Vec3 { Vec3::new(red, green
 mod tests {
 	use colby_core::{
 		abi::{
-			Decal, EntityId, Material, MeshData, MeshId, PaintVertex, Pose, PoseId, Post,
+			BAKING, Decal, EntityId, Material, MeshData, MeshId, PaintVertex, Pose, PoseId, Post,
 			Renderable, SkinVertex, Sky, SkyKind, Texel, TextureData, TextureId, ToneMap,
 			Transform,
 			cvar::Value,
@@ -362,6 +362,7 @@ mod tests {
 			skeleton::{Bone, SkeletonData},
 		},
 		glam::{Mat4, Quat, Vec2, Vec4},
+		utils::half::half,
 	};
 	use wgpu::Backends;
 
@@ -1041,6 +1042,76 @@ mod tests {
 		assert_ne!(before.pixels, after.pixels, "the bent one really did move");
 		assert!(anything, "there is a bar down there to be sure about");
 		assert!(same, "and bending one pose left the geometry of the other exactly where it was");
+	}
+
+	#[test]
+	fn a_mesh_with_bones_reads_no_lightmap_whatever_its_record_says() {
+		// no bake lays out a second set for a mesh with bones, and the pipelines
+		// that draw one read no lightmap: a place is a number anybody may type,
+		// and the bar given one draws as the bar given none, posed or not. The
+		// control is the same bar with its bones taken off, which a place does
+		// move - its second set is nought everywhere, so it reads the corner of
+		// its place, and the corner is a bright red
+		let Some(mut capture) = capture() else {
+			return;
+		};
+		let red: Vec<u8> = std::iter::repeat_n([4.0_f32, 0.0, 0.0, 1.0], 16 * 8)
+			.flatten()
+			.flat_map(|channel| half(channel).to_le_bytes())
+			.collect();
+
+		for (posed, boned) in [(true, true), (false, true), (true, false)] {
+			let (mut world, ..) = armed(posed);
+
+			// the same slot again, so the upload is made anew rather than the
+			// first world's kept
+			if !boned {
+				world
+					.meshes
+					.insert(BAR, MeshData { skin: Vec::new(), ..bar([0, 255, 0, 0]) });
+			}
+
+			let bar = world
+				.entities
+				.iter()
+				.map(|(id, ..)| id)
+				.next()
+				.expect("the bar is the one entity");
+
+			world.lightmap = world
+				.textures
+				.insert("lightmaps/test", TextureData {
+					width: 16,
+					height: 8,
+					faces: 1,
+					texel: Texel::Rgba16Float,
+					levels: vec![red.clone()],
+				});
+
+			let unplaced = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			if let Some(baking) = world.entities.record_mut(&BAKING, bar) {
+				baking.width = 16;
+				baking.height = 8;
+			}
+
+			let placed = capture
+				.shoot(&mut world)
+				.expect("the capture renders");
+
+			assert_eq!(
+				unplaced.pixels == placed.pixels,
+				boned,
+				"posed {posed}, bones {boned}: a place moves the bar only where it has none"
+			);
+			assert_eq!(
+				capture.scene_mut().places_handed(),
+				usize::from(!boned),
+				"posed {posed}, bones {boned}: and takes an entry in the table only then"
+			);
+		}
 	}
 
 	#[test]

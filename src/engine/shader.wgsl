@@ -227,6 +227,22 @@ const SPLIT_SIDE: f32 = 64.0;
 // mixed.
 @group(0) @binding(9) var reflections: texture_2d<f32>;
 
+// The world's lightmap: what a bake kept of the light arriving at every still
+// thing from everywhere at once, one picture for all of them, in the unit the
+// ambient color is in - or one texel of nothing in a frame that reads none, which
+// no entry point that draws such a frame samples. One level, read at it through
+// a clamped, bilinear sampler. Beside the reflections for their reason: the
+// frame reads it and no draw changes it. @ref `colby_engine::lightmap`, and
+// `baked_at` for how it is read.
+@group(0) @binding(10) var lightmap: texture_2d<f32>;
+@group(0) @binding(11) var lightmap_sampler: sampler;
+
+// Where each thing's light is on that picture: one entry for every thing this
+// frame drew that a bake gave a place to, xy how much of the picture its sheet
+// spans and zw where on the picture it starts, both as fractions of it. An
+// instance carries the index of its own entry in `skin.w`. @ref `place`.
+@group(0) @binding(12) var<storage, read> places: array<vec4<f32>>;
+
 @group(1) @binding(0) var albedo: texture_2d<f32>;
 @group(1) @binding(1) var surface_sampler: sampler;
 // Sampled as numbers rather than as a color: the compiler stores it in a linear
@@ -319,7 +335,9 @@ struct InstanceInput {
     // x is where this instance's joint matrices start in the buffer below and
     // y is how many there are. Zero and zero is a thing bones do not move; the
     // static entry point never reads those two. z is the entity's own flags,
-    // which both entry points hand on to the fragment stage.
+    // which both entry points hand on to the fragment stage, and w which entry
+    // of `places` is where its light is - meaningless for a thing a bake gave
+    // no place, which is drawn by an entry point that never reads it.
     @location(11) skin: vec4<u32>,
 };
 
@@ -387,6 +405,13 @@ struct VertexOutput {
     @location(7) paint_alpha: f32,
     // The second set of coordinates, as the mesh laid it out: nothing moves it.
     @location(8) uv2: vec2<f32>,
+    // The same carried onto the lightmap by the thing's own place on it,
+    // meaningless for a thing with none. Centroid: at four samples a pixel
+    // on a triangle's edge can have its middle off the triangle, and a
+    // coordinate taken there reaches past the ring a bake filled round the
+    // chart into the next place's; the picture is read at a level named rather
+    // than found from derivatives, so nothing else minds.
+    @location(9) @interpolate(perspective, centroid) lightmap: vec2<f32>,
 };
 
 @vertex
@@ -447,6 +472,10 @@ fn place(vertex: VertexInput, instance: InstanceInput, model: mat4x4<f32>) -> Ve
     // scaled, turned, then moved, which is the exchange format's order
     output.uv = finish.shift.xy + turned(vertex.uv * instance.surface.zw, finish.turn);
     output.uv2 = vertex.uv2;
+    // one multiply and one add from the thing's own sheet onto the one picture
+    // every still thing's light is on
+    let kept = places[instance.skin.w];
+    output.lightmap = kept.zw + vertex.uv2 * kept.xy;
     output.world_position = world_position.xyz;
     output.surface = instance.surface.xy;
     output.flags = instance.skin.z;
@@ -1063,6 +1092,40 @@ fn fragment_masked(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(shade(input, sampled, lit, found_at(input.clip_position.xy)), 1.0);
 }
 
+// The solid half again, for a surface a bake gave a place: what the bake kept
+// takes the place of the sky's light on its diffuse half.
+//
+// **An entry point of its own rather than a word the solid one branches on.**
+// The arithmetic that reads a lightmap and the arithmetic that does not are two
+// sums over the same terms, and a compiler handed both in one function may
+// rewrite the second to share work with the first - a rewrite that is not the
+// same float, and was measured moving a picture that reads no lightmap at all.
+// Split this way, every entry point that draws a thing with no place hands the
+// baked light in as a constant nought, the branch that reads it folds away when
+// the shader is compiled, and what is left is the arithmetic every picture was
+// drawn with before there were lightmaps. @ref `shade_baked`.
+@fragment
+fn fragment_baked(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+
+    return vec4<f32>(shade_baked(input, sampled, seen(input), found_at(input.clip_position.xy)), 1.0);
+}
+
+// And the half with holes in it, for a surface a bake gave a place, for the
+// reason above.
+@fragment
+fn fragment_masked_baked(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sampled = textureSample(albedo, surface_sampler, input.uv);
+    // before anything decides to throw the fragment away, for the sample's
+    // reason: @ref `seen`
+    let lit = seen(input);
+    if (sampled.a * input.paint_alpha < MASK_CUTOFF) {
+        discard;
+    }
+
+    return vec4<f32>(shade_baked(input, sampled, lit, found_at(input.clip_position.xy)), 1.0);
+}
+
 // And for a surface what is behind still shows through.
 //
 // The alpha is the picture's times the material's, so frosted glass is a
@@ -1586,7 +1649,11 @@ fn fragment_reflections(input: SkyOutput) -> @location(0) vec4<f32> {
     // texel a frame that asks for no occlusion binds says all of it
     let last = vec2<i32>(textureDimensions(occlusion)) - vec2<i32>(1);
     let lit = textureLoad(occlusion, min(place / 2, last), 0).r;
-    let light = lit_at(surface, there, normalize(here - there), slice, lit, vec4<f32>(0.0));
+    // and no baked light either: the pass before the scene has no room for
+    // where a thing's light is on the lightmap, so what a mirror finds is lit
+    // by the sky
+    let unbaked = vec4<f32>(0.0);
+    let light = lit_at(surface, there, normalize(here - there), slice, lit, vec4<f32>(0.0), unbaked);
     let fade = 1.0 - smoothstep(MIRROR_FADE, MIRROR_CUTOFF, roughness);
 
     return vec4<f32>(light * fade, fade) * mirror.size.w;
@@ -2224,6 +2291,19 @@ fn surface_at(input: VertexOutput, sampled: vec4<f32>) -> Surface {
     return surface;
 }
 
+// What a bake kept of the light arriving at the point a fragment shades, from
+// everywhere at once: rgb in the unit the ambient color is in, and a one.
+//
+// Asked only by the entry points that draw a thing a bake gave a place, in a
+// frame that reads the lightmap: the scene draws everything else with the ones
+// that hand in a nought instead. @ref `fragment_baked`.
+//
+// The level is named, so the read asks nothing of the derivatives and is
+// allowed where only some pixels of a quad take it.
+fn baked_at(input: VertexOutput) -> vec4<f32> {
+    return vec4<f32>(textureSampleLevel(lightmap, lightmap_sampler, input.lightmap, 0.0).rgb, 1.0);
+}
+
 // The coordinates a picture the material may lay out on either set is read at.
 //
 // A select rather than a branch, so that every pixel of a quad samples with
@@ -2234,16 +2314,40 @@ fn set_of(input: VertexOutput, bit: u32) -> vec2<f32> {
     return select(input.uv, input.uv2, (finish.flags.x & bit) != 0u);
 }
 
-// Everything all three entry points do once the albedo has been sampled.
+// Everything the three entry points that draw a thing with no baked light do
+// once the albedo has been sampled.
 //
 // Returns the color alone. What goes in the alpha channel is the one thing the
 // three disagree about, so it is theirs rather than this function's.
+//
+// **The baked light is a constant nought here, and that is the point**: the
+// branch in `lit_at` that reads it folds away when the shader is compiled.
+// @ref `fragment_baked` for why that matters.
 //
 // @param lit - how much of the sky the point sees, which the entry point asks
 // for because the masked one has to ask before its discard: @ref `seen`
 // @param found - what the point's reflection found on the picture, which the
 // entry point asks for because glass asks for none: @ref `found_at`
 fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32, found: vec4<f32>) -> vec3<f32> {
+    return shaded(input, sampled, lit, found, vec4<f32>(0.0));
+}
+
+// The same for a thing a bake gave a place, which reads what the bake kept.
+fn shade_baked(input: VertexOutput, sampled: vec4<f32>, lit: f32, found: vec4<f32>) -> vec3<f32> {
+    return shaded(input, sampled, lit, found, baked_at(input));
+}
+
+// What both of those do.
+//
+// @param baked - what a bake kept of the light arriving at the point, a one
+// where it kept any: @ref `lit_at`
+fn shaded(
+    input: VertexOutput,
+    sampled: vec4<f32>,
+    lit: f32,
+    found: vec4<f32>,
+    baked: vec4<f32>,
+) -> vec3<f32> {
     let surface = surface_at(input, sampled);
 
     // a surface drawn as its own color: no light on it and none given off, and
@@ -2260,7 +2364,8 @@ fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32, found: vec4<f32>) ->
     // the fog: exposed, bloomed and curved like any other light. Added last,
     // so that a surface giving off nought is the lit one to the bit.
     let color = min(
-        lit_at(surface, input.world_position, towards_eye, slice, lit, found) + surface.emission,
+        lit_at(surface, input.world_position, towards_eye, slice, lit, found, baked)
+            + surface.emission,
         vec3<f32>(HDR_CEILING),
     );
 
@@ -2293,6 +2398,9 @@ fn shade(input: VertexOutput, sampled: vec4<f32>, lit: f32, found: vec4<f32>) ->
 // @param found - what the point's reflection found on the picture, rgb light
 // already multiplied by a and a how much of the reflection it stands for:
 // nought for a point nothing was followed from, @ref `found_at`
+// @param baked - what a bake kept of the light arriving at the point from
+// everywhere at once, rgb in the ambient color's unit and a one where it kept
+// any: nought for a point with no place on the lightmap, @ref `baked_at`
 fn lit_at(
     surface: Surface,
     world_position: vec3<f32>,
@@ -2300,6 +2408,7 @@ fn lit_at(
     slice: i32,
     lit: f32,
     found: vec4<f32>,
+    baked: vec4<f32>,
 ) -> vec3<f32> {
     let base_color = surface.color;
 
@@ -2395,6 +2504,25 @@ fn lit_at(
     } else {
         indirect = globals.ambient.rgb * (indirect_diffuse + ambient_specular);
         stand_in = globals.ambient.rgb;
+    }
+
+    // what a bake kept takes the place of what the environment sends the
+    // diffuse half, and of nothing else. The reflection keeps what the
+    // environment sends along it, which is `stand_in` on both sides of the
+    // branch above, and everything below reads the one sum as it did: the
+    // share of the sky multiplies a baked light as it multiplied the sky it
+    // stands in for - it is a radiance, not a third share - and what a
+    // reflection found is mixed over the reflection's half as before.
+    //
+    // **Written over the sum above rather than folded into it.** Where the
+    // lightmap holds exactly the ambient color, `L * d + a * s` is not `a * (d
+    // + s)` to the last bit, and a thing with no place has to draw the bytes it
+    // drew before there were lightmaps: so the sum above is left as it was, a
+    // baked point's is written again, and a thing with no place is drawn by an
+    // entry point that hands in a constant nought, which folds this away.
+    // @ref `fragment_baked`.
+    if (baked.a > 0.5) {
+        indirect = baked.rgb * indirect_diffuse + stand_in * ambient_specular;
     }
 
     // how much of the sky this point can see, and it multiplies this term and

@@ -2988,8 +2988,8 @@ mod tests {
 		capture
 			.scene_mut()
 			.set_shader(&variant(
-				"slice, lit, vec4<f32>(0.0));",
-				"slice, lit, textureLoad(reflections, place, 0));",
+				"slice, lit, vec4<f32>(0.0), unbaked);",
+				"slice, lit, textureLoad(reflections, place, 0), unbaked);",
 			))
 			.expect("the shader that lights what it meets with what was found there builds");
 		capture.draw(&mut world, &mut []);

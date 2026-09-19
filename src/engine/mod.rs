@@ -25,6 +25,7 @@ pub mod gpu;
 mod haze;
 mod headless;
 pub mod image;
+pub mod lightmap;
 mod lines;
 #[cfg(test)]
 mod lobe;
