@@ -70,6 +70,7 @@ mod history;
 mod inspector;
 pub mod launcher;
 pub mod loading;
+mod paint;
 mod profiler;
 mod select;
 mod session;
@@ -301,6 +302,22 @@ pub(crate) enum Change {
 
 	/// Switch the gizmo to one of its three things.
 	Tool(Tool),
+
+	/// Put the brush out, or away.
+	///
+	/// Its own press rather than a fourth [`Tool`]: while the brush is out
+	/// there are no handles at all, and a gizmo with no handles is not one of
+	/// the three things the gizmo does. @ref `viewport::Viewport::stroke`.
+	Brush(bool),
+
+	/// Make the brush this wide and this hard.
+	Stroke {
+		/// How wide, in the ground's own units.
+		radius: f32,
+
+		/// How hard, a share of a whole cell a dab.
+		strength: f32,
+	},
 
 	/// Edit the world, or play it.
 	Edit(bool),
@@ -735,7 +752,12 @@ impl Panels {
 		// is left over at the end of the frame
 		let whole = ui.max_rect();
 		let mut changes = Vec::new();
-		let tool = self.viewport.tool();
+		let tool = (
+			self.viewport.tool(),
+			self.viewport
+				.brushing()
+				.then(|| self.viewport.stroke_of()),
+		);
 		let scene = self.tabs.current().name.clone();
 		let history = self.tabs.history();
 		let steps = Steps {
@@ -1034,6 +1056,8 @@ impl Panels {
 				}
 			},
 			| Change::Tool(tool) => self.viewport.set_tool(tool),
+			| Change::Brush(out) => self.viewport.set_brushing(out),
+			| Change::Stroke { radius, strength } => self.viewport.set_stroke(radius, strength),
 			| Change::Edit(editing) => self.set_mode(world, editing),
 			| Change::Write(name) => {
 				// the scene the tab is, from now on: a write under a new name
@@ -1921,6 +1945,20 @@ mod tests {
 
 		panels.apply(&mut world, Change::Tool(Tool::Turn));
 		assert_eq!(panels.viewport.tool(), Tool::Turn);
+
+		panels.apply(&mut world, Change::Brush(true));
+		assert!(panels.viewport.brushing(), "the brush is out");
+		panels.apply(&mut world, Change::Tool(Tool::Move));
+		assert!(!panels.viewport.brushing(), "and asking for the gizmo puts it away");
+
+		panels.apply(&mut world, Change::Stroke { radius: 9.0, strength: 0.5 });
+		assert_eq!(panels.viewport.stroke_of(), (9.0, 0.5), "the brush takes both numbers");
+		panels.apply(&mut world, Change::Stroke { radius: 1.0e9, strength: 4.0 });
+		assert_eq!(
+			panels.viewport.stroke_of(),
+			(paint::RANGE.1, 1.0),
+			"and holds each inside what it may be"
+		);
 
 		world.cvars.var(EDIT, Value::Bool(false), "");
 		panels.apply(&mut world, Change::Edit(true));

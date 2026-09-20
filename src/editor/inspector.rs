@@ -450,6 +450,8 @@ fn records(
 		record(ui, world, id, others, table, history);
 	}
 
+	painted(ui, world, id, history);
+
 	let mut waiting: Vec<(&str, usize)> = Vec::new();
 
 	for one in world.entities.waiting(id) {
@@ -478,6 +480,58 @@ fn records(
 ///
 /// @param others - every other entity selected, which a changed field is
 /// written to as well
+/// What a brush painted over an entity's ground, and a press that puts the
+/// whole field back.
+///
+/// **Shown only for an entity somebody has painted**, and not for one that
+/// merely strews: a mask is made by the first stroke, so a row saying "no mask"
+/// would be a row on every entity in the world saying nothing. What is here is
+/// what the panel cannot get from the record's own table - the grid is not a
+/// record and has no rows - and the numbers are the two anybody asks: how fine
+/// it is, and how much of the field has gone.
+///
+/// @param history - where the press is written down: putting a field back is
+/// one step back, exactly as a number typed into a row is
+fn painted(ui: &mut Ui, world: &mut World, id: EntityId, history: &mut History) {
+	let Some(mask) = world.entities.mask(id) else {
+		return;
+	};
+	let [wide, deep] = mask.counts();
+	let share = mask.painted() * 100.0;
+	let mut pressed = false;
+
+	ui.label(RichText::new("mask").strong())
+		.on_hover_text("where a brush said this entity's copies may stand");
+
+	Grid::new("mask").num_columns(2).show(ui, |ui| {
+		ui.label("cells");
+		ui.label(format!("{wide} by {deep}, {} wide each", mask.step()))
+			.on_hover_text("in the ground's own units");
+		ui.end_row();
+
+		ui.label("painted away");
+		ui.label(format!("{share:.1}%"));
+		ui.end_row();
+
+		ui.label("");
+
+		if ui
+			.button("put the field back")
+			.on_hover_text("take the whole mask away, so the rule lays its whole field again")
+			.clicked()
+		{
+			pressed = true;
+		}
+
+		ui.end_row();
+	});
+
+	if pressed {
+		history.begin("unpaint", world);
+		world.entities.set_mask(id, None);
+	}
+}
+
 /// @param table - the record's place in the declared records
 fn record(
 	ui: &mut Ui,
@@ -1693,6 +1747,53 @@ mod tests {
 		output.textures_delta.clear();
 
 		output.shapes
+	}
+
+	#[test]
+	fn a_painted_entity_shows_what_its_mask_holds_and_the_press_puts_the_field_back() {
+		let mut world = World::new();
+		// a record is only opened while the world is being edited, which is
+		// the one state a panel is ever drawn in
+		world.editing = true;
+
+		let id = world.entities.spawn_at(Transform::IDENTITY);
+		let mut history = History::default();
+		let mut mask =
+			colby_core::abi::Mask::over((Vec3::splat(-8.0), Vec3::splat(8.0))).expect("a box");
+
+		assert!(mask.paint(Vec2::ZERO, 4.0, 1.0), "a stroke lands on it");
+		world.entities.set_mask(id, Some(mask));
+
+		// the two numbers the panel is for: how fine the grid is and how much
+		// of the field has gone
+		let shapes = painted_frame(&Context::default(), Vec::new(), &mut |ui| {
+			detail(ui, &mut world, Pick::Entity(id), &[], &mut history, false, None);
+		});
+		let words: Vec<String> = flat(&shapes)
+			.iter()
+			.filter_map(|shape| match shape {
+				| egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+				| _ => None,
+			})
+			.collect();
+
+		assert!(words.iter().any(|word| word == "mask"), "the block is there: {words:?}");
+		assert!(
+			words.iter().any(|word| word.contains("16 by 16")),
+			"and says how fine the grid is: {words:?}"
+		);
+
+		pressed(&mut world, Pick::Entity(id), &[], &mut history, "put the field back");
+
+		assert!(world.entities.mask(id).is_none(), "the press took the whole mask away");
+
+		// a record closes on the first frame that writes *nothing*, which is the
+		// rule every gesture in this editor is one step back by: the first of
+		// these is the frame that wrote, and the second is the one after it
+		history.settle(&world);
+		history.settle(&world);
+
+		assert_eq!(history.undoable(), Some("unpaint"), "and it is one step back");
 	}
 
 	/// The checkbox beside a label in the inspector over what is picked,

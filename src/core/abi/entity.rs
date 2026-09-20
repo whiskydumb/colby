@@ -46,6 +46,7 @@ use super::{
 	particles::Emitter,
 	pose::PoseId,
 	record::{Declared, Noted, Record, Records, Refused},
+	strew::Mask,
 	terrain::Terrain,
 };
 use crate::{
@@ -597,6 +598,15 @@ pub struct Entities {
 	/// is the slot's own transform and the picture its own material. @ref
 	/// [`decal`](super::decal).
 	decals: Vec<Decal>,
+	/// What share of a strewing's copies may stand where over each slot's
+	/// ground, or nothing for a slot nobody has painted. The same slots again,
+	/// and the one array here that is not a plain record: a mask is a grid of
+	/// cells and the only thing an entity carries that a person draws rather
+	/// than types. It is here, beside the light and the ground, because it is
+	/// something an entity *has* - it is written down with the entity, cleared
+	/// with its slot, and carried by a copy of it. @ref
+	/// [`Mask`](super::strew::Mask).
+	masks: Vec<Option<Mask>>,
 	/// What each slot hangs off, or [`EntityId::NONE`] for a thing standing
 	/// on its own. The same slots again. A handle rather than a slot number,
 	/// so that a parent which died and whose slot something else took is a
@@ -647,6 +657,7 @@ impl Entities {
 			emitters: Vec::new(),
 			terrains: Vec::new(),
 			decals: Vec::new(),
+			masks: Vec::new(),
 			parents: Vec::new(),
 			hidden: Vec::new(),
 			undecaled: Vec::new(),
@@ -697,6 +708,9 @@ impl Entities {
 		// back, by the rule the hidden word below keeps: each way a slot is
 		// handed out clears it once, and nothing reads a dead slot.
 		self.decals[slot] = Decal::NONE;
+		// and nothing painted over it, by the name's rule above: a slot handed
+		// out carries no stroke the last occupant's brush made.
+		self.masks[slot] = None;
 		// and it hangs off nothing, whatever the previous occupant did.
 		self.parents[slot] = EntityId::NONE;
 		// and it is shown, whatever the previous occupant was. Cleared where a
@@ -956,6 +970,41 @@ impl Entities {
 		};
 
 		self.decals[slot] = decal;
+
+		true
+	}
+
+	/// What share of a strewing's copies may stand where, or nothing for an
+	/// entity nobody has painted.
+	///
+	/// It means something only on an entity that strews, and it is kept on
+	/// every entity all the same, for the terrain record's reason: what a slot
+	/// carries does not depend on what else the slot carries. @ref
+	/// [`Mask`](super::strew::Mask).
+	#[must_use]
+	pub fn mask(&self, id: EntityId) -> Option<&Mask> {
+		self.slot(id)
+			.and_then(|slot| self.masks[slot].as_ref())
+	}
+
+	/// What it has painted, to paint on.
+	pub fn mask_mut(&mut self, id: EntityId) -> Option<&mut Mask> {
+		self.slot(id)
+			.and_then(|slot| self.masks[slot].as_mut())
+	}
+
+	/// Puts a mask on an entity, or takes the one it had away.
+	///
+	/// @param id - which entity
+	/// @param mask - what it has painted; nothing takes the mask away, and a
+	/// strewing with no mask lays its whole field
+	/// @return `true` if the handle resolved
+	pub fn set_mask(&mut self, id: EntityId, mask: Option<Mask>) -> bool {
+		let Some(slot) = self.slot(id) else {
+			return false;
+		};
+
+		self.masks[slot] = mask;
 
 		true
 	}
@@ -1514,6 +1563,8 @@ impl Entities {
 		self.hidden.resize(slots, false);
 		self.decals.clear();
 		self.decals.resize(slots, Decal::NONE);
+		self.masks.clear();
+		self.masks.resize(slots, None);
 		self.undecaled.clear();
 		self.undecaled.resize(slots, false);
 		self.names.reset(slots);
@@ -1576,6 +1627,7 @@ impl Entities {
 			self.emitters.push(Emitter::NONE);
 			self.terrains.push(Terrain::NONE);
 			self.decals.push(Decal::NONE);
+			self.masks.push(None);
 			self.parents.push(EntityId::NONE);
 			self.hidden.push(false);
 			self.undecaled.push(false);
@@ -1633,6 +1685,9 @@ impl Entities {
 		self.emitters[slot] = Emitter::NONE;
 		self.terrains[slot] = Terrain::NONE;
 		self.decals[slot] = Decal::NONE;
+		// and nothing painted over it, by the name's rule above: a slot handed
+		// out carries no stroke the last occupant's brush made.
+		self.masks[slot] = None;
 		// off nothing until whoever put it back says otherwise, which a
 		// restore does once every record has landed. @ref `scene::restore`.
 		self.parents[slot] = EntityId::NONE;
@@ -1714,6 +1769,7 @@ impl Entities {
 		self.emitters.push(Emitter::NONE);
 		self.terrains.push(Terrain::NONE);
 		self.decals.push(Decal::NONE);
+		self.masks.push(None);
 		self.parents.push(EntityId::NONE);
 		self.hidden.push(false);
 		self.undecaled.push(false);

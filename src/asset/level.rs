@@ -86,11 +86,13 @@ use colby_core::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, Decal, Emitter, EntityId, Field, Joint, JointKind,
-		Layers, Light, MeshId, Noted, Post, Renderable, Shape, Sky, Spelled, Terrain, Transform,
+		Layers, Light, Mask, MeshId, Noted, Post, Renderable, Shape, Sky, Spelled, Terrain,
+		Transform,
 		field::{self, Kind},
 		probes::Grid,
 		record,
 		scene::{Link, NO_INDEX, Posed, SceneData, Solid, Stage, Thing},
+		strew::MOST_CELLS,
 	},
 	err,
 	glam::{Quat, Vec2, Vec3},
@@ -339,6 +341,154 @@ fn probes_of(value: Option<&Value>) -> Result<(String, Grid)> {
 	}))
 }
 
+/// The keys a mask is written with.
+const MASK_FIELDS: [&str; 4] = ["from", "step", "counts", "cells"];
+
+/// What a brush painted over an entity's ground, or nothing for an entity
+/// nobody painted.
+///
+/// **Read by hand, the way the sky's environment and the probes' grid are**: a
+/// mask is a grid and a run of cells, and none of it has a row in any record's
+/// table. A grid that is not one is an error naming what is wrong, which is the
+/// rule a source is read by and the opposite of the file's - the file reads a
+/// grid it cannot make sense of as an entity nobody painted. A source is
+/// written by a person and a file by this compiler, and only one of the two is
+/// worth telling.
+///
+/// @param value - what stood under the `mask` key
+fn mask_of(value: Option<&Value>) -> Result<Option<Mask>> {
+	let Some(value) = value else {
+		return Ok(None);
+	};
+
+	fields(value, &MASK_FIELDS, "a mask")?;
+
+	let step = value
+		.get("step")
+		.and_then(Value::as_f32)
+		.ok_or_else(|| err!(Asset("a mask's step should be a number")))?;
+	let from = corner(value.get("from"))?;
+	let counts = spread(value.get("counts"))?;
+	let cells = cells_of(value.get("cells"))?;
+
+	Mask::new(from, step, counts, cells)
+		.map(Some)
+		.ok_or_else(|| {
+			err!(Asset(
+				"a mask wants a step above nought and as many cells as its counts multiply to"
+			))
+		})
+}
+
+/// Two numbers: where a mask's cells start.
+fn corner(value: Option<&Value>) -> Result<[f32; 2]> {
+	let wrong = || err!(Asset("a mask's from should be two numbers"));
+	let Some(Value::Array(parts)) = value else {
+		return Err(wrong());
+	};
+
+	if parts.len() != 2 {
+		return Err(wrong());
+	}
+
+	let mut out = [0.0_f32; 2];
+
+	for (slot, part) in out.iter_mut().zip(parts) {
+		*slot = part.as_f32().ok_or_else(wrong)?;
+	}
+
+	Ok(out)
+}
+
+/// Two whole numbers: how many cells a mask has each way.
+fn spread(value: Option<&Value>) -> Result<[u32; 2]> {
+	let wrong = || err!(Asset("a mask's counts should be two whole numbers"));
+	let Some(Value::Array(parts)) = value else {
+		return Err(wrong());
+	};
+
+	if parts.len() != 2 {
+		return Err(wrong());
+	}
+
+	let mut out = [0_u32; 2];
+
+	for (slot, part) in out.iter_mut().zip(parts) {
+		*slot = whole(part)
+			.and_then(|number| u32::try_from(number).ok())
+			.ok_or_else(wrong)?;
+	}
+
+	Ok(out)
+}
+
+/// A mask's cells, out of the runs they are written as.
+///
+/// **Runs and not one number a cell**: a mask is sixteen thousand cells and a
+/// painted one is mostly open or mostly shut, so a field of numbers would bury
+/// the two lines somebody opened the file to change under a screenful of
+/// nothing. `255x90 0x36 128` is ninety open cells, thirty-six shut and one
+/// half open; a run of one may be written as the number alone. It is the
+/// shortest thing that stays a text file, which is what the rest of this format
+/// is.
+///
+/// @param value - what stood under the `cells` key
+fn cells_of(value: Option<&Value>) -> Result<Vec<u8>> {
+	let written = value
+		.and_then(Value::as_str)
+		.ok_or_else(|| err!(Asset("a mask's cells should be text")))?;
+	let mut cells: Vec<u8> = Vec::new();
+
+	for run in written.split_whitespace() {
+		let (held, many) = run.split_once('x').unwrap_or((run, "1"));
+		let held: u8 = held
+			.parse()
+			.map_err(|_| err!(Asset("a mask's cell `{held}` is not a number from 0 to 255")))?;
+		let many: usize = many
+			.parse()
+			.map_err(|_| err!(Asset("a mask's run `{many}` is not a count")))?;
+		let grown = cells.len().saturating_add(many);
+
+		// before the cells are made rather than after, so that a count
+		// somebody typed is refused rather than reserved
+		if grown > MOST_CELLS {
+			return Err(err!(Asset("a mask holds more than {MOST_CELLS} cells")));
+		}
+
+		cells.resize(grown, held);
+	}
+
+	Ok(cells)
+}
+
+/// A mask's cells as the runs they are written as. @ref `cells_of`.
+fn runs_of(cells: &[u8]) -> String {
+	let mut written: Vec<String> = Vec::new();
+	let mut run: Option<(u8, usize)> = None;
+	let spelled = |(held, many): (u8, usize)| {
+		if many == 1 {
+			held.to_string()
+		} else {
+			format!("{held}x{many}")
+		}
+	};
+
+	for cell in cells {
+		run = match run {
+			| Some((held, many)) if held == *cell => Some((held, many.saturating_add(1))),
+			| held => {
+				written.extend(held.map(spelled));
+
+				Some((*cell, 1))
+			},
+		};
+	}
+
+	written.extend(run.map(spelled));
+
+	written.join(" ")
+}
+
 /// How many probes a grid has along each axis: three whole numbers, none of
 /// them below nought.
 fn counts(value: Option<&Value>) -> Result<[u32; 3]> {
@@ -420,6 +570,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 				"emitter",
 				"terrain",
 				"decal",
+				"mask",
 				"records",
 			],
 			"an entity",
@@ -502,6 +653,11 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			read(&mut decal, painting, Decal::FIELDS, "a decal")?;
 		}
 
+		// and the mask under a key of its own, read by hand from end to end: it
+		// is a grid and a run of cells rather than a record with a table, so
+		// there is nothing for `read` to walk. @ref `mask_of`.
+		let mask = mask_of(entry.get("mask"))?;
+
 		things.push(Thing {
 			name,
 			slot: count(index, "a scene's records")?,
@@ -515,6 +671,7 @@ fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 			emitter_texture: picture,
 			terrain,
 			decal,
+			mask,
 			pose,
 			parent: NO_INDEX,
 			hidden,
@@ -1438,6 +1595,26 @@ fn put_probes(rows: &mut Rows, scene: &SceneData) -> Result<()> {
 	Ok(())
 }
 
+/// What a brush painted over an entity's ground.
+///
+/// @param rows - the entity's rows
+/// @param mask - what was painted
+fn put_mask(rows: &mut Rows, mask: &Mask) -> Result<()> {
+	let [east, south] = mask.from();
+	let [wide, deep] = mask.counts();
+
+	if !east.is_finite() || !south.is_finite() || !mask.step().is_finite() {
+		return Err(err!(Asset("a mask holds a number JSON cannot write")));
+	}
+
+	rows.put("mask.from", format!("[{}, {}]", as_number(east), as_number(south)));
+	rows.put("mask.step", as_number(mask.step()));
+	rows.put("mask.counts", format!("[{wide}, {deep}]"));
+	rows.put("mask.cells", as_text(&runs_of(mask.cells())));
+
+	Ok(())
+}
+
 /// One entity, with what it hangs off named rather than numbered.
 fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> Result<String> {
 	let mut rows = Rows::default();
@@ -1529,6 +1706,14 @@ fn thing_of(thing: &Thing, name: &str, things: &[String], poses: &[String]) -> R
 		},
 		|_| None,
 	)?;
+	// and the mask under its own key, by hand from end to end for the reason
+	// `mask_of` reads it by hand. **A mask every cell of which is open is
+	// still written**: the rule that a field equal to its default is left out
+	// is about fields, and what is left out here is the whole object, for an
+	// entity nobody has painted at all. An open mask is a grid somebody made.
+	if let Some(mask) = thing.mask.as_ref() {
+		put_mask(&mut rows, mask)?;
+	}
 	// and the decal under its own key, on the ground's terms: nothing by hand,
 	// because a decal names no asset, and no object at all for an entity that
 	// paints nothing.
@@ -2078,6 +2263,126 @@ mod tests {
 		assert_eq!(scene.things[0].pose, 0, "the body wears it");
 		assert_eq!(scene.things[1].pose, 0, "so does the eyes, and it is the same one");
 		assert_eq!(scene.things[2].pose, NO_INDEX, "the crate wears nothing");
+	}
+
+	/// A scene source with a mask on its one entity.
+	const PAINTED: &str = r#"{ "entities": [ {
+		"name": "grass", "mesh": "meshes/blade",
+		"records": { "strewing": { "strews": true } },
+		"mask": { "from": [-8, -8], "step": 2, "counts": [8, 4],
+		          "cells": "255x9 0x3 128 255x19" }
+	} ] }"#;
+
+	#[test]
+	fn a_mask_is_read_out_of_its_runs_and_written_back_as_runs() {
+		let once = import(PAINTED).expect("it is a scene");
+		let mask = once.things[0]
+			.mask
+			.as_ref()
+			.expect("the entity is painted");
+
+		assert_eq!(mask.counts(), [8, 4], "eight cells by four");
+		assert_eq!(mask.cells().len(), 32, "which is thirty-two of them");
+		assert_eq!(mask.from().map(f32::to_bits), [(-8.0_f32).to_bits(); 2], "at its corner");
+		assert_eq!(mask.step().to_bits(), 2.0_f32.to_bits(), "two units to a cell");
+		assert_eq!(mask.cells()[9], 0, "the tenth is shut");
+		assert_eq!(mask.cells()[12], 128, "the thirteenth is half open");
+
+		let text = export(&once).expect("it writes");
+		let twice = import(&text).expect("and reads back");
+
+		assert_eq!(twice, once, "exactly, which is the only test a writer and a reader share");
+		assert!(text.contains("\"mask\""), "and the block is really in the text: {text}");
+		assert!(text.contains("255x9 0x3 128 255x19"), "written as the runs it was read as");
+	}
+
+	#[test]
+	fn a_mask_every_cell_of_which_is_open_is_still_written() {
+		// the one place the rule that a default is left out does not reach: a
+		// mask nobody has painted is a grid somebody made, and an entity with
+		// no mask at all is the other statement
+		let open = r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 1,
+			"counts": [4, 4], "cells": "255x16" } } ] }"#;
+		let scene = import(open).expect("it is a scene");
+		let text = export(&scene).expect("it writes");
+
+		assert!(text.contains("255x16"), "got {text}");
+		assert_eq!(import(&text).expect("it reads back"), scene);
+		assert!(
+			!export(&import(r#"{ "entities": [ {} ] }"#).expect("a bare entity"))
+				.expect("it writes")
+				.contains("mask"),
+			"and an entity nobody painted writes no mask at all"
+		);
+	}
+
+	#[test]
+	fn a_mask_that_is_not_a_grid_is_refused_by_name() {
+		let refuse = |source: &str, what: &str| {
+			let refused = import(source).expect_err("it is not a scene");
+
+			let said = refused.to_string();
+
+			assert!(said.contains(what), "`{said}` should name {what}");
+		};
+
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 1, "counts": [4, 4],
+			     "cells": "255x9" } } ] }"#,
+			"as many cells as its counts multiply to",
+		);
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 0, "counts": [1, 1],
+			     "cells": "255" } } ] }"#,
+			"step above nought",
+		);
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0], "step": 1, "counts": [1, 1],
+			     "cells": "255" } } ] }"#,
+			"from should be two numbers",
+		);
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 1, "counts": [1],
+			     "cells": "255" } } ] }"#,
+			"counts should be two whole numbers",
+		);
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 1, "counts": [1, 1],
+			     "cells": 255 } } ] }"#,
+			"cells should be text",
+		);
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 1, "counts": [1, 1],
+			     "cells": "300" } } ] }"#,
+			"is not a number from 0 to 255",
+		);
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 1, "counts": [1, 1],
+			     "cells": "255xlots" } } ] }"#,
+			"is not a count",
+		);
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 1, "counts": [1, 1],
+			     "cells": "255x99999999" } } ] }"#,
+			"more than",
+		);
+		refuse(
+			r#"{ "entities": [ { "mask": { "from": [0, 0], "step": 1, "counts": [1, 1],
+			     "cells": "255", "splat": 2 } } ] }"#,
+			"splat",
+		);
+	}
+
+	#[test]
+	fn runs_are_the_shortest_spelling_of_a_row_of_cells() {
+		assert_eq!(runs_of(&[]), "", "nothing at all");
+		assert_eq!(runs_of(&[7]), "7", "one cell is the number alone");
+		assert_eq!(runs_of(&[7, 7]), "7x2", "two are a run");
+		assert_eq!(runs_of(&[1, 2, 2, 3]), "1 2x2 3", "and a row is the runs in it");
+		assert_eq!(
+			cells_of(Some(&Value::String("1 2x2 3".to_owned()))).expect("it reads"),
+			vec![1, 2, 2, 3]
+		);
 	}
 
 	#[test]

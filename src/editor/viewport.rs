@@ -29,11 +29,20 @@
 //! - **middle drag** slides what it is looking at across the view;
 //! - **the wheel** moves closer and further;
 //! - **left drag on a handle** moves, turns or stretches what is selected;
-//! - **left click on anything else** selects whatever is under the pointer.
+//! - **left click on anything else** selects whatever is under the pointer;
+//! - **left drag while the brush is out** paints the ground under the pointer,
+//!   and holds the gizmo back for as long as it is out.
 //!
 //! The order of those last two matters: a press that lands on a handle starts a
 //! drag and is *not* also a selection, or grabbing the arm of the thing you
 //! have selected would immediately select whatever is behind it.
+//!
+//! **The brush is a mode and not a fourth thing the gizmo does**, which is what
+//! the one engine in the field with a foliage brush does too: while it is out
+//! there are no handles to grab and a click selects nothing, because every
+//! gesture in the middle of the screen belongs to the stroke. `b` puts it out
+//! and away again, and it is only ever out while something that strews is
+//! selected. @ref [`paint`](crate::paint) for the arithmetic and the tests.
 //!
 //! The camera is the editor's **only while the world is being edited**. While
 //! it is being played the game owns it and this holds nothing at all, so that
@@ -58,6 +67,7 @@ use crate::{
 	gizmo::{self, Axis, Tool},
 	helper::{self, Drawn, Handle, Kind, Knob, MARK, Mark, Outline},
 	history::History,
+	paint::{self, Brush},
 	select::{self, Pick, Selection},
 };
 
@@ -88,6 +98,16 @@ const GROUPED: Color32 = Color32::from_rgb(120, 150, 190);
 /// Its own hue, because a tie, a lamp's reach and a group's box can all be on
 /// screen at once and the eye has to tell them apart.
 const TIE: Color32 = Color32::from_rgb(110, 190, 200);
+
+/// What the ring showing where the brush is is drawn in.
+///
+/// Its own hue again, and bright like [`LIT`] rather than dim like the facts
+/// about the scene: it is where the pointer is, which is the one thing on
+/// screen that answers to the hand.
+const BRUSH: Color32 = Color32::from_rgb(230, 130, 200);
+
+/// How many straight pieces the brush's ring is drawn as.
+const BRUSH_STEPS: usize = 48;
 
 /// What a body nobody draws is outlined in.
 const SOLID: Color32 = Color32::from_rgb(145, 145, 155);
@@ -136,7 +156,7 @@ const BOX_EDGES: [(usize, usize); 12] = [
 ];
 
 /// What the pointer does outside every window.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Viewport {
 	/// The editor's camera, while it has one.
 	view: Option<View>,
@@ -146,6 +166,28 @@ pub(crate) struct Viewport {
 
 	/// The drag in progress, if one is.
 	grab: Option<Grab>,
+
+	/// Whether the brush is out, and the stroke in progress if one is.
+	brush: Option<Brush>,
+
+	/// How wide the brush is, in the ground's own units.
+	radius: f32,
+
+	/// How hard it paints, a share of a whole cell per dab.
+	strength: f32,
+}
+
+impl Default for Viewport {
+	fn default() -> Self {
+		Self {
+			view: None,
+			tool: Tool::default(),
+			grab: None,
+			brush: None,
+			radius: paint::RADIUS,
+			strength: paint::STRENGTH,
+		}
+	}
 }
 
 /// A drag in progress: the gizmo moving everything selected, or one of the
@@ -217,7 +259,13 @@ impl Viewport {
 
 	/// Switches the gizmo to one of its three things, from a panel rather
 	/// than a key.
-	pub(crate) const fn set_tool(&mut self, tool: Tool) { self.tool = tool; }
+	/// Switches the gizmo, which is also what puts the brush away: they are two
+	/// modes and not four tools, so asking for one is saying no to the other.
+	pub(crate) fn set_tool(&mut self, tool: Tool) {
+		self.tool = tool;
+		self.brush = None;
+		self.grab = None;
+	}
 
 	/// Drives the camera and the gizmo, and answers what was clicked.
 	///
@@ -253,9 +301,14 @@ impl Viewport {
 		self.pick_tool(context);
 		self.fly(world, busy, held);
 
-		let dragging = self.gizmo(context, world, selection, busy, held, view, history);
+		// the brush before the gizmo and instead of it: while it is out there
+		// are no handles to grab, so there is nothing for the two of them to
+		// disagree about
+		let painting = self.stroke(context, world, selection, busy, held, view, history);
+		let dragging =
+			painting || self.gizmo(context, world, selection, busy, held, view, history);
 
-		let found = if busy || dragging || !held.clicked {
+		let found = if busy || dragging || painting || !held.clicked {
 			None
 		} else {
 			held.at.map(|at| picked(world, at, size(view)))
@@ -289,8 +342,36 @@ impl Viewport {
 		});
 
 		if let Some(tool) = asked {
-			self.tool = tool;
+			self.set_tool(tool);
 		}
+
+		if context.input(|input| input.key_pressed(Key::B)) {
+			self.set_brushing(self.brush.is_none());
+		}
+	}
+
+	/// Whether the brush is out.
+	pub(crate) const fn brushing(&self) -> bool { self.brush.is_some() }
+
+	/// Puts the brush out, or away.
+	pub(crate) fn set_brushing(&mut self, out: bool) {
+		self.brush = out.then(Brush::default);
+		// a gesture in the middle of the screen belongs to one of the two, and
+		// changing which of them halfway through a drag would apply the first
+		// half to the other one
+		self.grab = None;
+	}
+
+	/// How wide the brush is, and how hard it paints.
+	pub(crate) const fn stroke_of(&self) -> (f32, f32) { (self.radius, self.strength) }
+
+	/// Makes the brush this wide and this hard.
+	///
+	/// @param radius - how wide, held inside [`paint::RANGE`]
+	/// @param strength - how hard, held between nought and one
+	pub(crate) const fn set_stroke(&mut self, radius: f32, strength: f32) {
+		self.radius = radius.clamp(paint::RANGE.0, paint::RANGE.1);
+		self.strength = strength.clamp(0.0, 1.0);
 	}
 
 	/// Moves the camera by whatever the pointer did.
@@ -337,6 +418,15 @@ impl Viewport {
 		view: Rect,
 		history: &mut History,
 	) -> bool {
+		// **Asked twice on purpose.** `run` above stops short of calling this at
+		// all while the brush is out, so taking this out changes nothing today;
+		// what it is for is that a gesture in the middle of the screen belongs
+		// to one of the two, and a caller rearranged must not be able to let
+		// the gizmo draw handles a stroke would then fight over.
+		if self.brush.is_some() {
+			return false;
+		}
+
 		let pick = selection.at();
 		let camera = world.render_camera();
 		let viewport = size(view);
@@ -522,6 +612,113 @@ impl Viewport {
 		} else if matches!(self.grab, Some(Grab::Field(_))) {
 			self.pull_field(world, camera, point, viewport, history);
 		}
+	}
+
+	/// Paints with the brush, and draws where it is.
+	///
+	/// **A stroke is one step back, and nothing here arranges that**: a record
+	/// opens on the first frame that writes and closes on the first frame that
+	/// does not, so a drag from the moment the button goes down to the moment
+	/// it comes up is one record by the rule every gesture in this editor
+	/// already follows. @ref [`History::begin`].
+	///
+	/// @return whether the brush is out, which holds the gizmo and a click back
+	#[expect(
+		clippy::too_many_arguments,
+		reason = "one frame of what the pointer did against what it did it to, which is the \
+		          gizmo's own signature"
+	)]
+	fn stroke(
+		&mut self,
+		context: &Context,
+		world: &mut World,
+		selection: &Selection,
+		busy: bool,
+		held: Gestures,
+		view: Rect,
+		history: &mut History,
+	) -> bool {
+		let Some(mut brush) = self.brush else {
+			return false;
+		};
+		let camera = world.render_camera();
+		let viewport = size(view);
+		let painting = strewings(world, selection);
+		// where the brush is, which is a place on the *first* one's ground:
+		// every strewing painted at once hangs off some ground, and what is
+		// drawn has to be one ring rather than one a strewing
+		let over = held
+			.at
+			.zip(painting.first().copied())
+			.and_then(|(point, id)| {
+				let (from, along) = aim::ray(&camera, point, viewport);
+
+				paint::ground_under(world, id, from, along).map(|at| (id, at))
+			});
+
+		if held.released {
+			brush.lift();
+		}
+
+		if held.down
+			&& !busy && let Some((_, at)) = over
+		{
+			// **Written down before the first cell moves, and written every
+			// frame the button is down.** Both halves were found by driving a
+			// window and neither by a test. Before, because `begin` keeps the
+			// world it is first handed, and a call after the paint would keep
+			// one that already had a dab in it - an undo would then leave that
+			// dab standing. Every frame, because a stroke dabs by *distance*:
+			// a hand that slows down writes nothing for a frame or two, and a
+			// record closes on the first frame in which nothing writes, so one
+			// stroke would be several steps back. Every other gesture in this
+			// editor writes every frame it lasts and needs neither.
+			history.begin("paint", world);
+
+			if brush.dab(Vec2::new(at.x, at.z), self.radius) {
+				self.dab(context, world, Vec2::new(at.x, at.z), &painting);
+			}
+		}
+
+		self.brush = Some(brush);
+		paint_brush(context, world, &camera, over, (self.radius, viewport, view));
+
+		true
+	}
+
+	/// Lands one dab of the brush on every strewing being painted.
+	///
+	/// A call of its own rather than the body of the stroke's own `if`, because
+	/// two questions and a loop inside them is one level of nesting past what
+	/// this workspace allows.
+	///
+	/// @param at - where the dab lands, east and south in the ground's space
+	/// @param painting - every strewing selected that strews something
+	fn dab(&self, context: &Context, world: &mut World, at: Vec2, painting: &[EntityId]) {
+		// ctrl puts a field back where a plain stroke takes one away. Which way
+		// round is not a preference: a rule lays its whole field until somebody
+		// paints, so the stroke that does anything to a strewing nobody has
+		// painted is the one that thins it.
+		let back = context.input(|input| input.modifiers.command);
+		let strength = if back { -self.strength } else { self.strength };
+		let mut moved = false;
+
+		for id in painting {
+			// each in its own grid and each from the same place on the ground:
+			// they hang off one ground, so one stroke is one clearing in every
+			// field over it
+			moved |= paint::paint(world, *id, at, self.radius, strength);
+		}
+
+		trace!(
+			strewings = painting.len(),
+			east = at.x,
+			south = at.y,
+			radius = self.radius,
+			strength,
+			moved,
+			"a dab of the brush"
+		);
 	}
 
 	/// Applies a drag of one of the gizmo's handles.
@@ -802,6 +999,69 @@ fn segment(
 	};
 
 	painter.line_segment([spot(start + corner), spot(end + corner)], stroke);
+}
+
+/// Every entity selected that strews something, in the order they were
+/// selected.
+fn strewings(world: &World, selection: &Selection) -> Vec<EntityId> {
+	selection
+		.picks()
+		.into_iter()
+		.filter_map(|pick| match pick {
+			| Pick::Entity(id) => Some(id),
+			| _ => None,
+		})
+		.filter(|id| colby_core::abi::strew::strews(&world.entities, *id))
+		.collect()
+}
+
+/// The ring that shows where the brush is.
+///
+/// Drawn from a circle in the *ground's* own space, so that a ground turned or
+/// scaled unevenly shows the oval the stroke really paints rather than a circle
+/// it does not. What it does not follow is a hillside: every point of the ring
+/// is at the height of the place under the pointer, so a ring on a steep slope
+/// cuts into it. A ring that followed the ground would be a ray a point, which
+/// is a hundred traces a frame for a line somebody is not looking at.
+///
+/// **The mask itself is not drawn**, and that is the card's one deliberate
+/// gap: showing it wants a pass over the ground's own surface. What a person
+/// needs while painting is where the brush is and what it did, and the second
+/// of those is the field thinning under the stroke.
+///
+/// @param over - the strewing being painted and where the ray met its ground,
+/// in the ground's own space
+fn paint_brush(
+	context: &Context,
+	world: &World,
+	camera: &Camera,
+	over: Option<(EntityId, Vec3)>,
+	(radius, viewport, view): (f32, Vec2, Rect),
+) {
+	let Some((id, at)) = over else {
+		return;
+	};
+
+	let Some(ground) = paint::ground_of(world, id) else {
+		return;
+	};
+	let painter = context.layer_painter(LayerId::background());
+	let projection = camera.view_projection(viewport.x / viewport.y.max(1.0e-4));
+	let corner = view.min.to_vec2();
+	let mut last: Option<Vec2> = None;
+
+	for point in paint::ring(at, radius, BRUSH_STEPS) {
+		let now = gizmo::project(projection, ground.transform_point3(point), viewport);
+
+		if let (Some(from), Some(to)) = (last, now) {
+			painter.line_segment(
+				[Pos2::new(from.x, from.y) + corner, Pos2::new(to.x, to.y) + corner],
+				Stroke::new(INK.0, BRUSH),
+			);
+		}
+
+		last = now;
+	}
 }
 
 /// The handles a selected thing's own fields offer, drawn as blocks.
@@ -1463,6 +1723,277 @@ mod tests {
 		for tool in [Tool::Move, Tool::Turn, Tool::Size] {
 			assert_eq!(held(put, tool, None), put, "{tool:?} is left alone with no grid");
 		}
+	}
+
+	/// The meadow in miniature: a ground an entity strews cubes over, with the
+	/// camera looking straight down at it.
+	fn strewn_world() -> (World, EntityId) {
+		use colby_core::abi::{
+			MaterialId, MeshData, MeshVertex, Renderable, STREWING, Strewing, mesh,
+		};
+
+		let mut world = World::new();
+		world
+			.entities
+			.declare(&STREWING)
+			.expect("a world with nothing declared takes the record");
+		world.meshes.insert("meshes/cube", mesh::cube());
+
+		let corner = |x: f32, z: f32| MeshVertex::new(Vec3::new(x, 0.0, z), Vec3::Y, Vec2::ZERO);
+		let floor = world.meshes.insert("meshes/floor", MeshData {
+			vertices: vec![
+				corner(-16.0, -16.0),
+				corner(16.0, -16.0),
+				corner(16.0, 16.0),
+				corner(-16.0, 16.0),
+			],
+			indices: vec![0, 2, 1, 0, 3, 2],
+			..MeshData::default()
+		});
+		let ground = world.entities.spawn();
+		world
+			.entities
+			.set_renderable(ground, Renderable::of(floor, MaterialId::DEFAULT, Vec3::ONE));
+
+		let grass = world.entities.spawn();
+		world.entities.set_renderable(
+			grass,
+			Renderable::of(colby_core::abi::MeshId::CUBE, MaterialId::DEFAULT, Vec3::ONE),
+		);
+		world.entities.set_parent(grass, ground);
+
+		if let Some(rule) = world.entities.record_mut(&STREWING, grass) {
+			*rule = Strewing { strews: 1, ..Strewing::NONE };
+		}
+
+		// straight down the middle, so that the pointer in the middle of the
+		// picture is the middle of the ground
+		world.camera.position = Vec3::new(0.0, 20.0, 0.0);
+		world.camera.target = Vec3::ZERO;
+		world.camera.up = Vec3::NEG_Z;
+		world.editing = true;
+
+		(world, grass)
+	}
+
+	/// One frame of a viewport over a world, with whatever the pointer did.
+	fn frame(
+		context: &Context,
+		viewport: &mut Viewport,
+		world: &mut World,
+		selection: &Selection,
+		history: &mut History,
+		events: Vec<egui::Event>,
+	) {
+		let view = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+		let mut output = context.run_ui(
+			egui::RawInput {
+				screen_rect: Some(view),
+				events,
+				..Default::default()
+			},
+			// nothing is laid out in the middle of the screen: what the
+			// viewport reads is what no panel wanted
+			|_| {},
+		);
+
+		viewport.run(context, world, selection, view, history);
+		// **the frame is over for the history**, exactly as `Panels::frame`
+		// ends it: a gesture nothing wrote to this frame is a record now. A
+		// helper that left this out would make every frame of a test one
+		// gesture however long it rested, which is the one thing a stroke has
+		// to be driven against.
+		let _wrote = history.settle(world);
+		output.textures_delta.clear();
+	}
+
+	/// What the pointer does over one place in the picture.
+	fn pointing(at: Pos2, pressed: Option<bool>) -> Vec<egui::Event> {
+		let mut events = vec![egui::Event::PointerMoved(at)];
+
+		if let Some(down) = pressed {
+			events.push(egui::Event::PointerButton {
+				pos: at,
+				button: PointerButton::Primary,
+				pressed: down,
+				modifiers: egui::Modifiers::NONE,
+			});
+		}
+
+		events
+	}
+
+	#[test]
+	fn a_stroke_over_the_ground_paints_the_selected_strewing_and_is_one_step_back() {
+		let (mut world, grass) = strewn_world();
+		let context = Context::default();
+		let mut viewport = Viewport::default();
+		let mut selection = Selection::default();
+		let mut history = History::default();
+
+		selection.set(&world, Pick::Entity(grass));
+		viewport.set_brushing(true);
+
+		// down in the middle of the picture, dragged a little, and up
+		frame(
+			&context,
+			&mut viewport,
+			&mut world,
+			&selection,
+			&mut history,
+			pointing(Pos2::new(400.0, 300.0), Some(true)),
+		);
+
+		for step in 1..=6 {
+			let along = f32::from(u8::try_from(step).expect("six steps")) * 12.0;
+
+			frame(
+				&context,
+				&mut viewport,
+				&mut world,
+				&selection,
+				&mut history,
+				pointing(Pos2::new(400.0 + along, 300.0), None),
+			);
+
+			// **and a frame in which the pointer does not move**, which is
+			// what a hand resting halfway through a stroke does. A stroke dabs
+			// by distance, so a frame like this writes nothing at all - and a
+			// record closes on the first frame in which nothing writes.
+			frame(&context, &mut viewport, &mut world, &selection, &mut history, Vec::new());
+		}
+
+		frame(
+			&context,
+			&mut viewport,
+			&mut world,
+			&selection,
+			&mut history,
+			pointing(Pos2::new(472.0, 300.0), Some(false)),
+		);
+
+		let mask = world
+			.entities
+			.mask(grass)
+			.expect("the stroke made one");
+
+		assert!(mask.painted() > 0.0, "the stroke took some of the field away");
+		assert!(mask.at(0.0, 0.0) < 1.0, "the middle of the picture is where it started");
+		assert_eq!(mask.at(15.0, 15.0).to_bits(), 1.0_f32.to_bits(), "the far corner is open");
+
+		// a record opens on the first frame that writes and closes on the
+		// first frame that does not, so the whole drag is one step back
+		history.settle(&world);
+		history.settle(&world);
+
+		assert_eq!(history.undoable(), Some("paint"), "the whole stroke is one step");
+
+		// and **one** step whose world is the one before the stroke, with
+		// nothing painted at all. Until a driven window said otherwise, a
+		// stroke whose hand slowed down was several records, and each record's
+		// world already had a dab in it - both of which pass every assertion
+		// above.
+		let back = history
+			.undo(&world)
+			.expect("there is a step to take");
+
+		assert!(
+			back.things
+				.iter()
+				.all(|thing| thing.mask.is_none()),
+			"the step back is the world before the stroke, not one part way through it"
+		);
+		assert_eq!(history.undoable(), None, "and there is nothing behind it");
+	}
+
+	#[test]
+	fn a_stroke_with_the_brush_away_moves_nothing_and_the_gizmo_takes_it_back() {
+		let (mut world, grass) = strewn_world();
+		let context = Context::default();
+		let mut viewport = Viewport::default();
+		let mut selection = Selection::default();
+		let mut history = History::default();
+
+		selection.set(&world, Pick::Entity(grass));
+
+		for events in [
+			pointing(Pos2::new(400.0, 300.0), Some(true)),
+			pointing(Pos2::new(430.0, 300.0), None),
+			pointing(Pos2::new(430.0, 300.0), Some(false)),
+		] {
+			frame(&context, &mut viewport, &mut world, &selection, &mut history, events);
+		}
+
+		assert!(world.entities.mask(grass).is_none(), "nothing painted with the brush away");
+
+		// and the brush put out and taken back again paints nothing either
+		viewport.set_brushing(true);
+		viewport.set_tool(Tool::Move);
+
+		for events in [
+			pointing(Pos2::new(400.0, 300.0), Some(true)),
+			pointing(Pos2::new(430.0, 300.0), None),
+			pointing(Pos2::new(430.0, 300.0), Some(false)),
+		] {
+			frame(&context, &mut viewport, &mut world, &selection, &mut history, events);
+		}
+
+		assert!(world.entities.mask(grass).is_none(), "and none after the gizmo took it back");
+	}
+
+	#[test]
+	fn nothing_is_grabbed_while_the_brush_is_out() {
+		// the other half of the brush being a mode: a drag in the middle of
+		// the screen belongs to the stroke, so the gizmo's own handles are not
+		// drawn and cannot be held. The ground is what is selected here,
+		// because a strewing draws nothing where it stands and so has no
+		// handles of its own to be sure about.
+		let (mut world, grass) = strewn_world();
+		let ground = world.entities.parent(grass);
+		let context = Context::default();
+		let mut viewport = Viewport::default();
+		let mut selection = Selection::default();
+		let mut history = History::default();
+
+		selection.set(&world, Pick::Entity(ground));
+
+		let stood = world
+			.entities
+			.transform(ground)
+			.copied()
+			.expect("it stands somewhere");
+
+		// the gizmo stands where the thing does, which is the middle of the
+		// picture, and its arms reach out from there
+		let drag = |viewport: &mut Viewport, world: &mut World, history: &mut History| {
+			for events in [
+				pointing(Pos2::new(440.0, 300.0), Some(true)),
+				pointing(Pos2::new(500.0, 300.0), None),
+				pointing(Pos2::new(500.0, 300.0), Some(false)),
+			] {
+				frame(&context, viewport, world, &selection, history, events);
+			}
+		};
+
+		viewport.set_brushing(true);
+		drag(&mut viewport, &mut world, &mut history);
+
+		assert_eq!(
+			world.entities.transform(ground).copied(),
+			Some(stood),
+			"the ground did not move: there was no handle to grab"
+		);
+
+		// and the same drag with the brush away does move it, which is what
+		// says the drag was on a handle at all
+		viewport.set_brushing(false);
+		drag(&mut viewport, &mut world, &mut history);
+
+		assert_ne!(
+			world.entities.transform(ground).copied(),
+			Some(stood),
+			"the same drag with the gizmo out moves it"
+		);
 	}
 
 	#[test]

@@ -804,11 +804,12 @@ mod tests {
 				.get(renderable.mesh)
 				.map_or(&nothing, Entry::value),
 		);
-		let laid = lay_out(floor, &rule, &local, mesh.bounds());
+		let laid = lay_out(floor, &rule, &local, mesh.bounds(), None);
 
 		world.strewn.put(strewn.slot(), Layout {
 			entity: strewn,
 			key: Key {
+				mask: 0,
 				rule,
 				ground: (ground, 0),
 				mesh: (renderable.mesh, 0),

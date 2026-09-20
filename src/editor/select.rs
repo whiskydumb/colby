@@ -827,6 +827,14 @@ fn copy_entities(world: &mut World, sources: &[EntityId]) -> Vec<(EntityId, Enti
 		let takes = world.entities.takes_decals(source);
 		world.entities.set_takes_decals(copy, takes);
 
+		// and what a brush painted over its ground, cloned: the grid is in the
+		// ground's own space, so a copy hung off the same ground is painted
+		// where the original was. Here rather than nowhere for the reason
+		// every line above it is here - a copy without it is a copy of part of
+		// the thing, and this path does not go through a description.
+		let painted = world.entities.mask(source).cloned();
+		world.entities.set_mask(copy, painted);
+
 		// and what its records hold, by name, the way a save carries it: the copy
 		// is the same thing to every record the world declares, and to a record
 		// nobody has declared yet it waits the way the original's value does
@@ -2435,14 +2443,15 @@ mod tests {
 		assert_eq!(world.entities.noted(copy), world.entities.noted(car), "every value, by name");
 	}
 
-	#[test]
-	fn a_duplicate_is_described_as_its_original_is_but_for_the_slot_it_took() {
-		// every word an entity carries, each away from its default, and the copy
-		// described beside the original. The description is taken apart field by
-		// field on purpose: a word added to it is a word this test has to be told
-		// about, which is what a hand-written copy needs, since this one carried
-		// no decal, `hidden` or `takes_decals` for as long as those three existed
-		let (mut world, lamp, ..) = peopled();
+	/// Puts every word an entity carries on one of them, each away from its
+	/// default: a light, a thrower and its picture, ground, a decal, a mask, a
+	/// record's value, hidden and refusing decals.
+	///
+	/// Lifted out of the test below, which counts its lines. What it is for is
+	/// that a word added to an entity is a word that test has to be told
+	/// about, and a setup that already says "every one of them" is where it
+	/// has to be told.
+	fn peculiar(world: &mut World, lamp: EntityId) {
 		let texture = world
 			.textures
 			.insert("textures/spark", colby_core::abi::TextureData::white());
@@ -2463,12 +2472,28 @@ mod tests {
 		world.entities.set_hidden(lamp, true);
 		world.entities.set_takes_decals(lamp, false);
 
+		let mut painted = colby_core::abi::Mask::over((Vec3::splat(-4.0), Vec3::splat(4.0)))
+			.expect("a box is a box");
+		assert!(painted.paint(Vec2::new(1.0, 2.0), 2.0, 1.0), "and a stroke lands on it");
+		world.entities.set_mask(lamp, Some(painted));
+
 		if let Some(drawing) = world
 			.entities
 			.record_mut(&colby_core::abi::DRAWING, lamp)
 		{
 			drawing.covers = 1;
 		}
+	}
+
+	#[test]
+	fn a_duplicate_is_described_as_its_original_is_but_for_the_slot_it_took() {
+		// every word an entity carries, each away from its default, and the copy
+		// described beside the original. The description is taken apart field by
+		// field on purpose: a word added to it is a word this test has to be told
+		// about, which is what a hand-written copy needs, since this one carried
+		// no decal, `hidden` or `takes_decals` for as long as those three existed
+		let (mut world, lamp, ..) = peopled();
+		peculiar(&mut world, lamp);
 
 		let copies = duplicate(&mut world, &[Pick::Entity(lamp)]);
 		let Some(Pick::Entity(copy)) = copies.first().copied() else {
@@ -2498,6 +2523,7 @@ mod tests {
 			emitter_texture,
 			terrain,
 			decal,
+			mask,
 			pose,
 			parent,
 			hidden,
@@ -2511,6 +2537,7 @@ mod tests {
 				&& !emitter_texture.is_empty()
 				&& terrain.is_ground()
 				&& decal.paints()
+				&& mask.as_ref().is_some_and(|it| it.painted() > 0.0)
 				&& hidden && !takes_decals
 				&& !records.is_empty(),
 			"every word of the original is away from its default, or the comparison proves \
@@ -2536,6 +2563,7 @@ mod tests {
 				emitter_texture,
 				terrain,
 				decal,
+				mask,
 				pose,
 				parent,
 				hidden,

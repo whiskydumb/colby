@@ -24,13 +24,24 @@ use std::time::Instant;
 
 use colby_core::{
 	abi::{
-		Body, BodyId, BodyKind, EntityId, Entry, MeshId, STREWING, Shape, ShapeKind, Strewing,
-		Transform, World,
+		Body, BodyId, BodyKind, EntityId, Entry, Mask, MeshId, STREWING, Shape, ShapeKind,
+		Strewing, Transform, World,
 		mesh::MeshData,
 		strew::{self, Key, Layout},
 	},
 	trace, warn,
 };
+
+/// The variable that says whether a strewing reads what a brush painted over
+/// its ground.
+///
+/// On, and not saved, on the terms the five variables that say what a frame
+/// leaves out are on: what it is for is measuring what painting took away and
+/// showing that a field laid with it off is the field a build from before the
+/// brush laid. It is not one of those five, because this one is not about a
+/// frame - it changes what is laid, and a layout laid without it is laid again
+/// when it comes back. @ref `colby_core::abi::strew::Mask`.
+pub(crate) const MASKED: &str = "strew.mask";
 
 /// What a name begins with, for every mesh a solid strewing's body collides
 /// with.
@@ -95,6 +106,7 @@ fn wanted(world: &World) -> Vec<Wanted> {
 	let Some(rules) = world.entities.column(&STREWING) else {
 		return Vec::new();
 	};
+	let masking = world.cvars.bool(MASKED).unwrap_or(true);
 
 	world
 		.entities
@@ -119,6 +131,14 @@ fn wanted(world: &World) -> Vec<Wanted> {
 					ground: (ground, revision(world, ground)),
 					mesh: (renderable.mesh, revision(world, renderable.mesh)),
 					local: *local,
+					// the digest of what somebody painted, and nought both for
+					// a strewing nobody has painted and for a world whose
+					// masks are switched off - which is what makes the switch
+					// a control: a painted field laid with it off is the field
+					// the build before the brush laid.
+					mask: masking
+						.then(|| world.entities.mask(id).map_or(0, Mask::digest))
+						.unwrap_or(0),
 				},
 			})
 		})
@@ -159,7 +179,14 @@ fn lay(world: &mut World, want: &Wanted) {
 		);
 	}
 
-	let laid = strew::lay_out(ground, &rule, &want.key.local, mesh.bounds());
+	// the mask the key says it was laid through, so that what is laid and what
+	// it was laid from cannot come apart: a key holding nought was made with
+	// the masks switched off or by a strewing nobody has painted, and either
+	// way this is laid without one.
+	let mask = (want.key.mask != 0)
+		.then(|| world.entities.mask(want.id))
+		.flatten();
+	let laid = strew::lay_out(ground, &rule, &want.key.local, mesh.bounds(), mask);
 	let solid = rule
 		.solid()
 		.then(|| strew::solid(&laid, mesh, &want.key.local))
@@ -178,6 +205,7 @@ fn lay(world: &mut World, want: &Wanted) {
 		pieces = laid.pieces.len(),
 		patches = laid.patches.len(),
 		drawn = laid.drawn,
+		masked = laid.masked,
 		digest = format!("{:#018X}", laid.digest),
 		took_us = began.elapsed().as_micros(),
 		"strewn"
@@ -337,11 +365,12 @@ pub(crate) fn written(world: &World) -> String {
 			.map_or_else(|| nothing.bounds(), |mesh| mesh.value().bounds());
 
 		lines.push(format!(
-			"strewn {slot} {} pieces={} patches={} drawn={} thinned={} digest={:#018X}",
+			"strewn {slot} {} pieces={} patches={} drawn={} masked={} thinned={} digest={:#018X}",
 			world.entities.name(layout.entity),
 			laid.pieces.len(),
 			laid.patches.len(),
 			laid.drawn,
+			laid.masked,
 			u8::from(laid.thinned),
 			laid.digest
 		));
@@ -374,6 +403,32 @@ pub(crate) fn written(world: &World) -> String {
 					.chain([&piece.size, &piece.shade]),
 			)
 		}));
+		// the mask the copies were laid through, cell for cell: an oracle
+		// works out what share of each triangle the rule may put a copy on,
+		// and it cannot do it from a count. A strewing laid with no mask
+		// writes a grid of nothing.
+		match world
+			.entities
+			.mask(layout.entity)
+			.filter(|_| layout.key.mask != 0)
+		{
+			| Some(mask) => {
+				let [wide, deep] = mask.counts();
+
+				lines.push(format!(
+					"mask {wide} {deep} {}",
+					floats([mask.from()[0], mask.from()[1], mask.step()].iter())
+				));
+				lines.extend(mask.cells().chunks(64).map(|run| {
+					run.iter()
+						.map(u8::to_string)
+						.collect::<Vec<_>>()
+						.join(" ")
+				}));
+			},
+			| None => lines.push("mask 0 0 0 0 0".to_owned()),
+		}
+
 		lines.push(format!("patches {}", laid.patches.len()));
 		lines.extend(laid.patches.iter().map(|patch| {
 			format!(
@@ -448,7 +503,7 @@ fn floats<'a>(numbers: impl Iterator<Item = &'a f32>) -> String {
 mod tests {
 	use colby_core::{
 		abi::{MaterialId, Renderable, Terrain, mesh::cube},
-		glam::Vec3,
+		glam::{Vec2, Vec3},
 	};
 
 	use super::*;
@@ -486,6 +541,82 @@ mod tests {
 			density: 0.25,
 			..Strewing::NONE
 		}
+	}
+
+	#[test]
+	fn a_stroke_of_a_brush_lays_the_field_again_and_the_switch_lays_the_whole_of_it() {
+		let (mut world, _, strewn) = meadow(sparse());
+
+		sync(&mut world);
+
+		let whole = world
+			.strewn
+			.get(strewn.slot())
+			.map(|layout| (layout.laid.pieces.len(), layout.laid.digest))
+			.expect("it is laid");
+		let mut mask =
+			Mask::over((Vec3::splat(-64.0), Vec3::splat(64.0))).expect("a box is a box");
+
+		for _ in 0..8 {
+			mask.paint(Vec2::ZERO, 20.0, 1.0);
+		}
+
+		world.entities.set_mask(strewn, Some(mask));
+		sync(&mut world);
+
+		let painted = world
+			.strewn
+			.get(strewn.slot())
+			.map(|layout| (layout.laid.pieces.len(), layout.laid.masked))
+			.expect("it is laid again");
+
+		assert!(painted.0 < whole.0, "the stroke took copies away: {painted:?} of {whole:?}");
+		assert!(painted.1 > 0, "and they are counted as the mask's");
+
+		// and the switch lays the field the build before the brush would have
+		world
+			.cvars
+			.var(MASKED, colby_core::abi::cvar::Value::Bool(false), "");
+		sync(&mut world);
+
+		let without = world
+			.strewn
+			.get(strewn.slot())
+			.map(|layout| (layout.laid.pieces.len(), layout.laid.digest, layout.laid.masked))
+			.expect("it is laid a third time");
+
+		assert_eq!((without.0, without.1), whole, "every copy of it, to the bit");
+		assert_eq!(without.2, 0, "and nothing was masked");
+	}
+
+	#[test]
+	fn a_mask_put_back_by_a_load_is_the_mask_it_was_and_is_not_laid_again() {
+		let (mut world, _, strewn) = meadow(sparse());
+		let mut mask =
+			Mask::over((Vec3::splat(-64.0), Vec3::splat(64.0))).expect("a box is a box");
+
+		mask.paint(Vec2::ZERO, 20.0, 1.0);
+		world.entities.set_mask(strewn, Some(mask));
+		sync(&mut world);
+
+		let was = world
+			.strewn
+			.get(strewn.slot())
+			.map(|layout| (layout.revision, layout.laid.digest))
+			.expect("it is laid");
+		let described = colby_core::abi::scene::capture(&world);
+
+		colby_core::abi::scene::restore(&mut world, &described).expect("it goes back");
+		sync(&mut world);
+
+		let now = world
+			.strewn
+			.get(strewn.slot())
+			.map(|layout| (layout.revision, layout.laid.digest))
+			.expect("it is still laid");
+
+		assert_eq!(now.1, was.1, "the same copies after a world is put back");
+		assert_eq!(now.0, was.0, "and it was not laid again to get them");
 	}
 
 	#[test]

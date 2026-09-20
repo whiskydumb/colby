@@ -9,7 +9,7 @@
 //! behind.
 //!
 //! ```text
-//!    0  SceneHeader                      224 bytes
+//!    0  SceneHeader                      240 bytes
 //!  224  Setting                          272 bytes, one of them
 //!    .  [Stood; stood_count]              84 bytes each
 //!    .  [Lit;   lit_count]                40 bytes each
@@ -17,6 +17,7 @@
 //!    .  [Sod;   sod_count]                44 bytes each
 //!    .  [Daub;  daub_count]               16 bytes each
 //!    .  [Jot;   jot_count]                32 bytes each
+//!    .  [Sown;  sown_count]               32 bytes each
 //!    .  [Bulk;  bulk_count]              132 bytes each
 //!    .  [Wet;   wet_count]                36 bytes each
 //!    .  [Tie;   tie_count]               100 bytes each
@@ -25,6 +26,7 @@
 //!    .  [u32; stood_slots + bulk_slots + tie_slots + bent_slots + kept_slots]
 //!    .  [Kept; kept_count]                20 bytes each
 //!    .  every peer's arena, back to back
+//!    .  every mask's cells, back to back
 //!    .  the game's own arena, if there is one
 //!    .  the string blob, NUL-separated UTF-8
 //! ```
@@ -55,12 +57,13 @@ use colby_core::{
 	Result,
 	abi::{
 		BodyKind, Camera, Decal, DecalKind, Emitter, EmitterKind, JointKind, Layers, Light,
-		LightKind, Noted, Post, ShapeKind, Sky, SkyKind, SparkBlend, Spelled, Terrain,
+		LightKind, Mask, Noted, Post, ShapeKind, Sky, SkyKind, SparkBlend, Spelled, Terrain,
 		TerrainKind, TextureId, ToneMap, Transform, Water, WaterKind,
 		net::MAX_PEERS,
 		probes::Grid,
 		scene::{Arena, Form, Link, Posed, SceneData, Solid, Stage, Thing},
 		state::STATE_BYTES,
+		strew::MOST_CELLS,
 	},
 	bytemuck::{self, Pod, Zeroable},
 	err,
@@ -100,13 +103,19 @@ pub const MAGIC: [u8; 8] = *b"COLBYSCN";
 /// and says where their grid stands - eight words, where the lightmap's name
 /// had spent the last spare - and two spare words after them, so the next word
 /// the record needs is free again. @ref [`Setting::probes`].
-pub const FORMAT_VERSION: u32 = 19;
+///
+/// Twenty since a brush paints where a strewing's copies may stand: a block of
+/// [`Sown`], one a strewing somebody has painted, and a blob of their cells -
+/// the first thing in this file that is neither a record of fixed width nor a
+/// name. It cost five header words where one was spare, so the header grew by
+/// four and has nothing to spare again. @ref [`Sown`].
+pub const FORMAT_VERSION: u32 = 20;
 
 /// The extension a compiled or saved scene is written with.
 pub const EXTENSION: &str = "cscene";
 
 /// How big [`SceneHeader`] is, and where the first block starts.
-pub const HEADER_BYTES: usize = 224;
+pub const HEADER_BYTES: usize = 240;
 
 /// The bit in [`SceneHeader::flags`] that says the file carries a game's arena.
 ///
@@ -342,15 +351,37 @@ pub struct SceneHeader {
 	/// per entity: a world of a thousand crates at every default writes none.
 	pub jot_count: u32,
 
-	/// Nought. The first word the next block takes.
-	pub spare: u32,
+	/// Bytes per mask record. Must be `size_of::<Sown>()`.
+	///
+	/// This and the four after it are the mask block's five words: the spare
+	/// the record block left, and four more that grew the header to two hundred
+	/// and forty. It takes five where every block before it took three, because
+	/// the cells are a run of bytes and a run of bytes is an offset and a
+	/// length of its own.
+	pub sown_stride: u32,
+
+	/// Where the mask records start.
+	pub sown_offset: u32,
+
+	/// How many masks there are.
+	///
+	/// One per entity somebody has painted, rather than one per entity: almost
+	/// nothing strews, and almost nothing that strews is painted.
+	pub sown_count: u32,
+
+	/// Where every mask's cells start, all of them back to back.
+	pub sown_bytes_offset: u32,
+
+	/// How many of those bytes there are.
+	pub sown_bytes_length: u32,
 }
 
 // the light block took the header's last three spare words, the water block
 // grew it by four and left one over, the emitter block took that one and three
 // more, the terrain block took the two those left and two more, the decal block
-// took the three that left, and the record block grew it by four again and
-// kept one - two hundred and twenty-four bytes with one word to spare.
+// took the three that left, the record block grew it by four again and kept
+// one, and the mask block took that one and four more - two hundred and forty
+// bytes with nothing to spare. The next block grows it by four words again.
 //
 // the blocks after the header inherit the buffer's alignment only because the
 // header is a multiple of it, and a field added without shrinking the spare
@@ -359,7 +390,7 @@ pub struct SceneHeader {
 // the first one whose length a game chooses. @ref `Places::of`.
 const _: () = assert!(
 	size_of::<SceneHeader>() == HEADER_BYTES,
-	"the header has to stay two hundred and twenty-four bytes"
+	"the header has to stay two hundred and forty bytes"
 );
 
 /// The world's own settings: where it looks from, what lights it, how hard it
@@ -753,6 +784,41 @@ pub struct Jot {
 
 	/// The value, in the words its spelling says.
 	pub value: [u32; 4],
+}
+
+/// One entity's mask, as the file holds it: the grid, and where its cells are.
+///
+/// Keyed by the entity's place in the entity block the way a [`Lit`] is, and
+/// written only for an entity somebody has painted - a world of a thousand
+/// crates and one meadow writes one. **The cells are not here**: they are a run
+/// of bytes of whatever length the grid is, and every block before this one is
+/// a record of fixed width, so they live in a blob of their own at the end
+/// beside the peers' arenas and this names a span of it. That is the same
+/// arrangement a name has, for the same reason.
+///
+/// @ref [`Mask`](colby_core::abi::strew::Mask) for what a cell means.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[bytemuck(crate = "::colby_core::bytemuck")]
+pub struct Sown {
+	/// Which entry of the entity block this belongs to.
+	pub thing: u32,
+
+	/// Where its cells start in the blob of cells.
+	pub first: u32,
+
+	/// How many of them there are: the grid's two counts multiplied, and
+	/// refused when it is not.
+	pub count: u32,
+
+	/// How wide one cell is, in the ground's own units.
+	pub step: f32,
+
+	/// The corner the cells start at, east and south, in the ground's space.
+	pub from: [f32; 2],
+
+	/// How many cells there are east and south.
+	pub counts: [u32; 2],
 }
 
 /// One entity's light, as the file holds it.
@@ -1208,6 +1274,10 @@ impl SceneFile {
 	#[must_use]
 	pub fn daub(&self) -> &[Daub] { self.block(self.header.daub_offset, self.header.daub_count) }
 
+	/// Every mask, one an entity somebody painted.
+	#[must_use]
+	pub fn sown(&self) -> &[Sown] { self.block(self.header.sown_offset, self.header.sown_count) }
+
 	/// Every record value, over every entity.
 	#[must_use]
 	pub fn jot(&self) -> &[Jot] { self.block(self.header.jot_offset, self.header.jot_count) }
@@ -1482,7 +1552,39 @@ impl SceneFile {
 			}
 		}
 
+		// and what a brush painted over each strewing's ground, in the file's
+		// own order a sixth time. A grid this build cannot make sense of -
+		// cells that are not the grid's two counts multiplied, a step that is
+		// not a width - reads as an entity nobody painted rather than as a
+		// refusal: it is `Lit`'s rule for an unknown kind, and a field laid
+		// whole is the answer a build before the brush would have given.
+		for record in self.sown() {
+			if let Some(thing) = usize::try_from(record.thing)
+				.ok()
+				.and_then(|index| things.get_mut(index))
+			{
+				thing.mask = self.mask_of(record);
+			}
+		}
+
 		things
+	}
+
+	/// One entity's mask, with its cells read out of the blob.
+	///
+	/// @param sown - the record naming them
+	/// @return nothing for a grid that is not one
+	fn mask_of(&self, sown: &Sown) -> Option<Mask> {
+		// checked rather than saturating, the rule a peer's arena is read by: a
+		// saturated offset still reads somewhere, and somewhere is worse than
+		// nowhere.
+		let start = self
+			.header
+			.sown_bytes_offset
+			.checked_add(sown.first)?;
+		let cells = self.block::<u8>(start, sown.count).to_vec();
+
+		Mask::new(sown.from, sown.step, sown.counts, cells)
 	}
 
 	/// One record value, with its names read out.
@@ -1537,6 +1639,8 @@ impl SceneFile {
 			terrain: Terrain::NONE,
 			// and the same a fourth time, out of the decal block.
 			decal: Decal::NONE,
+			// and the same a fifth time, out of the mask block.
+			mask: None,
 			pose: stood.pose,
 			parent: stood.parent,
 			hidden: stood.flags & STOOD_HIDDEN != 0,
@@ -1752,6 +1856,17 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		.map(|(slot, arena)| kept_of(*slot, arena, &mut kept_bytes))
 		.collect();
 
+	// and the masks beside the peers' arenas, because both are records naming
+	// a run of a blob and the blobs are written back to back at the end
+	let mut sown_bytes = Vec::new();
+	let sown: Vec<Sown> = data
+		.things
+		.iter()
+		.enumerate()
+		.filter_map(|(index, thing)| Some((index, thing.mask.as_ref()?)))
+		.map(|(index, mask)| sown_of(index, mask, &mut sown_bytes))
+		.collect::<Result<Vec<_>>>()?;
+
 	let blocks = Blocks {
 		stood: &stood,
 		lit: &carried.lit,
@@ -1759,6 +1874,8 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 		sod: &carried.sod,
 		daub: &carried.daub,
 		jot: &jot,
+		sown: &sown,
+		sown_bytes: sown_bytes.len(),
 		bulk: &bulk,
 		wet: &wet,
 		tie: &tie,
@@ -1779,6 +1896,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::cast_slice(&carried.sod));
 	out.extend_from_slice(bytemuck::cast_slice(&carried.daub));
 	out.extend_from_slice(bytemuck::cast_slice(&jot));
+	out.extend_from_slice(bytemuck::cast_slice(&sown));
 	out.extend_from_slice(bytemuck::cast_slice(&bulk));
 	out.extend_from_slice(bytemuck::cast_slice(&wet));
 	out.extend_from_slice(bytemuck::cast_slice(&tie));
@@ -1787,6 +1905,7 @@ pub fn encode(data: &SceneData) -> Result<Vec<u8>> {
 	out.extend_from_slice(bytemuck::cast_slice(&generations));
 	out.extend_from_slice(bytemuck::cast_slice(&kept));
 	out.extend_from_slice(&kept_bytes);
+	out.extend_from_slice(&sown_bytes);
 	if let Some(arena) = data.arena.as_ref() {
 		out.extend_from_slice(&arena.bytes);
 	}
@@ -1924,6 +2043,7 @@ struct Places {
 	sod: usize,
 	daub: usize,
 	jot: usize,
+	sown: usize,
 	bulk: usize,
 	wet: usize,
 	tie: usize,
@@ -1933,6 +2053,7 @@ struct Places {
 	arena: usize,
 	kept: usize,
 	kept_bytes: usize,
+	sown_bytes: usize,
 	names: usize,
 }
 
@@ -1946,6 +2067,8 @@ impl Places {
 			sod,
 			daub,
 			jot,
+			sown,
+			sown_bytes,
 			bulk,
 			wet,
 			tie,
@@ -1969,7 +2092,10 @@ impl Places {
 		let daub_at = sod_at + size_of_val(sod);
 		// and the records' values beside the decals, a fifth time.
 		let jot_at = daub_at + size_of_val(daub);
-		let bulk_at = jot_at + size_of_val(jot);
+		// and the masks beside the values, a sixth time. Their *cells* are not
+		// here: bytes go after everything that has to be aligned.
+		let sown_at = jot_at + size_of_val(jot);
+		let bulk_at = sown_at + size_of_val(sown);
 		let wet_at = bulk_at + size_of_val(bulk);
 		let tie_at = wet_at + size_of_val(wet);
 		let bent_at = tie_at + size_of_val(tie);
@@ -1983,7 +2109,8 @@ impl Places {
 		// all.
 		let kept_at = generations_at + size_of_val(generations);
 		let kept_bytes_at = kept_at + size_of_val(kept);
-		let arena_at = kept_bytes_at + kept_bytes;
+		let sown_bytes_at = kept_bytes_at + kept_bytes;
+		let arena_at = sown_bytes_at + sown_bytes;
 		let names_at = arena_at + arena.map_or(0, |it| it.bytes.len());
 
 		Self {
@@ -1994,6 +2121,7 @@ impl Places {
 			sod: sod_at,
 			daub: daub_at,
 			jot: jot_at,
+			sown: sown_at,
 			bulk: bulk_at,
 			wet: wet_at,
 			tie: tie_at,
@@ -2003,6 +2131,7 @@ impl Places {
 			arena: arena_at,
 			kept: kept_at,
 			kept_bytes: kept_bytes_at,
+			sown_bytes: sown_bytes_at,
 			names: names_at,
 		}
 	}
@@ -2016,6 +2145,8 @@ struct Blocks<'a> {
 	sod: &'a [Sod],
 	daub: &'a [Daub],
 	jot: &'a [Jot],
+	sown: &'a [Sown],
+	sown_bytes: usize,
 	bulk: &'a [Bulk],
 	wet: &'a [Wet],
 	tie: &'a [Tie],
@@ -2039,6 +2170,8 @@ fn head(
 		sod,
 		daub,
 		jot,
+		sown,
+		sown_bytes,
 		bulk,
 		wet,
 		tie,
@@ -2115,7 +2248,11 @@ fn head(
 		jot_stride: width::<Jot>("a scene's records")?,
 		jot_offset: count(places.jot, "a scene's records")?,
 		jot_count: count(jot.len(), "a scene's records")?,
-		spare: 0,
+		sown_stride: width::<Sown>("a scene's masks")?,
+		sown_offset: count(places.sown, "a scene's masks")?,
+		sown_count: count(sown.len(), "a scene's masks")?,
+		sown_bytes_offset: count(places.sown_bytes, "a scene's masks")?,
+		sown_bytes_length: count(sown_bytes, "a scene's masks")?,
 	})
 }
 
@@ -2136,6 +2273,27 @@ fn kept_of(slot: u32, arena: &Arena, bytes: &mut Vec<u8>) -> Kept {
 		first,
 		count: u32::try_from(arena.bytes.len()).unwrap_or(0),
 	}
+}
+
+/// One entity's mask, as the file holds it, with its cells appended to the
+/// blob of cells.
+///
+/// @param index - the entity's place in the entity block
+/// @param mask - what was painted over its ground
+/// @param bytes - the blob its cells go into
+fn sown_of(index: usize, mask: &Mask, bytes: &mut Vec<u8>) -> Result<Sown> {
+	let first = count(bytes.len(), "a scene's masks")?;
+
+	bytes.extend_from_slice(mask.cells());
+
+	Ok(Sown {
+		thing: count(index, "a scene's masks")?,
+		first,
+		count: count(mask.cells().len(), "a scene's masks")?,
+		step: mask.step(),
+		from: mask.from(),
+		counts: mask.counts(),
+	})
 }
 
 /// One pose, as the file holds it, with its bones appended to the run block.
@@ -2749,6 +2907,115 @@ fn codes(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String> 
 	Ok(())
 }
 
+/// Whether what a file says about the peers' arenas is true of the file.
+///
+/// Lifted out of [`blocks`], which counts its lines: what is left there is the
+/// bounds every block is held to, and this and [`cells`] are the two blocks
+/// whose *records* name runs of a blob and have to be walked one at a time.
+///
+/// @return an error naming what does not fit
+fn arenas(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String> {
+	// a file that does not say it carries peers may not describe any either.
+	// Without this a single word of `kept_slots` on a file with the bit clear
+	// reaches into the block after the generations, comes back as a peer
+	// table, and empties every block in the world it is loaded into.
+	if header.flags & FLAG_PLAYERS == 0
+		&& (header.kept_slots != 0 || header.kept_count != 0 || header.kept_bytes_length != 0)
+	{
+		return Err("this scene describes peers it says it does not carry".to_owned());
+	}
+
+	if header.flags & FLAG_PLAYERS != 0 {
+		fits::<Kept>(bytes, HEADER_BYTES, (header.kept_offset, header.kept_count), "peers")?;
+		fits::<u8>(
+			bytes,
+			HEADER_BYTES,
+			(header.kept_bytes_offset, header.kept_bytes_length),
+			"peer state",
+		)?;
+
+		// and each record's own run has to be inside the block the two fields
+		// above just proved is inside the file. Without this a record naming a
+		// run past the end reads as an empty arena rather than as a refusal,
+		// which is a world quietly missing what somebody was holding.
+		//
+		// @note: read a record at a time rather than cast as a slice. This
+		// takes a plain `&[u8]` and a cast wants the alignment the buffer has
+		// and the argument does not promise.
+		let records = span::<Kept>(header.kept_offset, header.kept_count)
+			.and_then(|range| bytes.get(range))
+			.unwrap_or_default();
+
+		for chunk in records.chunks_exact(size_of::<Kept>()) {
+			let one: Kept = bytemuck::pod_read_unaligned(chunk);
+			let end = one
+				.first
+				.checked_add(one.count)
+				.ok_or_else(|| "a peer's state runs past what a count holds".to_owned())?;
+
+			if end > header.kept_bytes_length {
+				return Err(format!(
+					"a peer's state ends at {end} and the block is {} bytes",
+					header.kept_bytes_length
+				));
+			}
+
+			if usize::try_from(one.count).unwrap_or(usize::MAX) > STATE_BYTES {
+				return Err(format!(
+					"a peer's state is {} bytes and an arena is {STATE_BYTES}",
+					one.count
+				));
+			}
+
+			// refused here rather than dropped four layers down, where a slot
+			// nobody has is silently no peer at all.
+			if usize::try_from(one.slot).unwrap_or(usize::MAX) >= MAX_PEERS {
+				return Err(format!(
+					"a peer's state is for slot {} and a world holds {MAX_PEERS}",
+					one.slot
+				));
+			}
+		}
+	}
+
+	Ok(())
+}
+
+/// Whether every mask's cells are inside the blob of cells.
+///
+/// The rule a peer's arena is read by and for its reason: a record naming a run
+/// past the end would read as a mask of nothing rather than as a refusal, which
+/// is a field quietly laid whole.
+///
+/// @note: read a record at a time rather than cast as a slice, for the
+/// alignment a plain `&[u8]` does not promise.
+fn cells(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String> {
+	let masks = span::<Sown>(header.sown_offset, header.sown_count)
+		.and_then(|range| bytes.get(range))
+		.unwrap_or_default();
+
+	for chunk in masks.chunks_exact(size_of::<Sown>()) {
+		let one: Sown = bytemuck::pod_read_unaligned(chunk);
+		let end = one
+			.first
+			.checked_add(one.count)
+			.ok_or_else(|| "a mask's cells run past what a count holds".to_owned())?;
+
+		if end > header.sown_bytes_length {
+			return Err(format!(
+				"a mask's cells end at {end} and the block is {} bytes",
+				header.sown_bytes_length
+			));
+		}
+
+		if usize::try_from(one.count).unwrap_or(usize::MAX) > MOST_CELLS {
+			return Err(format!("a mask holds {} cells and one holds {MOST_CELLS}", one.count));
+		}
+	}
+
+	Ok(())
+}
+
 /// Whether every record is the size this build reads.
 fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 	let widths = [
@@ -2759,6 +3026,7 @@ fn strides(header: &SceneHeader) -> std::result::Result<(), String> {
 		(header.sod_stride, size_of::<Sod>(), "terrains"),
 		(header.daub_stride, size_of::<Daub>(), "decals"),
 		(header.jot_stride, size_of::<Jot>(), "record values"),
+		(header.sown_stride, size_of::<Sown>(), "masks"),
 		(header.bulk_stride, size_of::<Bulk>(), "bodies"),
 		(header.wet_stride, size_of::<Wet>(), "waters"),
 		(header.tie_stride, size_of::<Tie>(), "joints"),
@@ -2834,6 +3102,13 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 	fits::<Sod>(bytes, HEADER_BYTES, (header.sod_offset, header.sod_count), "terrains")?;
 	fits::<Daub>(bytes, HEADER_BYTES, (header.daub_offset, header.daub_count), "decals")?;
 	fits::<Jot>(bytes, HEADER_BYTES, (header.jot_offset, header.jot_count), "record values")?;
+	fits::<Sown>(bytes, HEADER_BYTES, (header.sown_offset, header.sown_count), "masks")?;
+	fits::<u8>(
+		bytes,
+		HEADER_BYTES,
+		(header.sown_bytes_offset, header.sown_bytes_length),
+		"mask cells",
+	)?;
 	fits::<Bulk>(bytes, HEADER_BYTES, (header.bulk_offset, header.bulk_count), "bodies")?;
 	fits::<Wet>(bytes, HEADER_BYTES, (header.wet_offset, header.wet_count), "waters")?;
 	fits::<Tie>(bytes, HEADER_BYTES, (header.tie_offset, header.tie_count), "joints")?;
@@ -2851,70 +3126,9 @@ fn blocks(bytes: &[u8], header: &SceneHeader) -> std::result::Result<(), String>
 		)?;
 	}
 
-	// a file that does not say it carries peers may not describe any either.
-	// Without this a single word of `kept_slots` on a file with the bit clear
-	// reaches into the block after the generations, comes back as a peer
-	// table, and empties every block in the world it is loaded into.
-	if header.flags & FLAG_PLAYERS == 0
-		&& (header.kept_slots != 0 || header.kept_count != 0 || header.kept_bytes_length != 0)
-	{
-		return Err("this scene describes peers it says it does not carry".to_owned());
-	}
+	cells(bytes, header)?;
 
-	if header.flags & FLAG_PLAYERS != 0 {
-		fits::<Kept>(bytes, HEADER_BYTES, (header.kept_offset, header.kept_count), "peers")?;
-		fits::<u8>(
-			bytes,
-			HEADER_BYTES,
-			(header.kept_bytes_offset, header.kept_bytes_length),
-			"peer state",
-		)?;
-
-		// and each record's own run has to be inside the block the two fields
-		// above just proved is inside the file. Without this a record naming a
-		// run past the end reads as an empty arena rather than as a refusal,
-		// which is a world quietly missing what somebody was holding.
-		//
-		// @note: read a record at a time rather than cast as a slice. This
-		// takes a plain `&[u8]` and a cast wants the alignment the buffer has
-		// and the argument does not promise.
-		let records = span::<Kept>(header.kept_offset, header.kept_count)
-			.and_then(|range| bytes.get(range))
-			.unwrap_or_default();
-
-		for chunk in records.chunks_exact(size_of::<Kept>()) {
-			let one: Kept = bytemuck::pod_read_unaligned(chunk);
-			let end = one
-				.first
-				.checked_add(one.count)
-				.ok_or_else(|| "a peer's state runs past what a count holds".to_owned())?;
-
-			if end > header.kept_bytes_length {
-				return Err(format!(
-					"a peer's state ends at {end} and the block is {} bytes",
-					header.kept_bytes_length
-				));
-			}
-
-			if usize::try_from(one.count).unwrap_or(usize::MAX) > STATE_BYTES {
-				return Err(format!(
-					"a peer's state is {} bytes and an arena is {STATE_BYTES}",
-					one.count
-				));
-			}
-
-			// refused here rather than dropped four layers down, where a slot
-			// nobody has is silently no peer at all.
-			if usize::try_from(one.slot).unwrap_or(usize::MAX) >= MAX_PEERS {
-				return Err(format!(
-					"a peer's state is for slot {} and a world holds {MAX_PEERS}",
-					one.slot
-				));
-			}
-		}
-	}
-
-	Ok(())
+	arenas(bytes, header)
 }
 
 #[cfg(test)]
@@ -2953,6 +3167,16 @@ mod tests {
 				// and refusing decals, so its word of flags carries both bits
 				takes_decals: false,
 				decal: Decal::NONE,
+				// painted on *both*, and differently: two masks is what makes
+				// the second one's run of cells start anywhere but nought, so
+				// a reader taking every mask's cells from the first one's
+				// place comes back with the wrong bytes
+				mask: Mask::new([1.0, -2.0], 0.5, [2, 2], vec![
+					9,
+					200,
+					0,
+					colby_core::abi::strew::OPEN,
+				]),
 				records: Vec::new(),
 			},
 			Thing {
@@ -3016,12 +3240,28 @@ mod tests {
 				// on the second one for the light's reason, with both numbers off
 				// their defaults and the order below nought
 				decal: Decal { fade: 0.25, order: -7, ..Decal::BOX },
+				// on the second one for the light's reason, over a grid whose
+				// corner, step and two counts all differ, and with a cell
+				// painted at each end of its run so a blob read at the wrong
+				// offset comes back wrong
+				mask: sample_mask(),
 				// on the second one for the light's reason, one of every spelling
 				// and two records, with a whole number no single-precision number
 				// holds, so a value read at the wrong width comes back wrong
 				records: sample_records(),
 			},
 		]
+	}
+
+	/// What a brush painted over the second entity's ground.
+	fn sample_mask() -> Option<Mask> {
+		let mut cells = vec![colby_core::abi::strew::OPEN; 5 * 3];
+
+		cells[0] = 0;
+		cells[7] = 128;
+		cells[14] = 1;
+
+		Mask::new([-3.5, 2.25], 1.5, [5, 3], cells)
 	}
 
 	/// One value of every spelling, over two records.
@@ -4084,8 +4324,9 @@ mod tests {
 
 		assert!(header.daub_offset > header.sod_offset, "the decals after the ground");
 		assert!(header.jot_offset > header.daub_offset, "the record values after the decals");
-		assert!(header.bulk_offset > header.jot_offset, "and the bodies after the record values");
-		assert_eq!(header.spare, 0, "with a spare word holding nought");
+
+		assert!(header.sown_offset > header.jot_offset, "and the masks after the values");
+		assert!(header.bulk_offset > header.sown_offset, "and the bodies after the masks");
 		assert!(
 			header.shed_offset > header.lit_offset,
 			"the emitters are written after the lights"

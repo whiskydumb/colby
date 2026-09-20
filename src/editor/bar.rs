@@ -8,9 +8,9 @@
 //! without a window and keeps the world written in one place.
 
 use colby_core::abi::World;
-use egui::{Align, Button, Layout, Rect, RichText, TextEdit, Ui};
+use egui::{Align, Button, DragValue, Layout, Rect, RichText, TextEdit, Ui};
 
-use crate::{Change, KEEP, gizmo::Tool};
+use crate::{Change, KEEP, gizmo::Tool, paint};
 
 /// The strip's own state.
 #[derive(Debug, Default)]
@@ -34,7 +34,8 @@ impl Bar {
 	///
 	/// @param ui - the panel
 	/// @param world - for which mode it is in
-	/// @param tool - what the gizmo is doing
+	/// @param tool - what the gizmo is doing, and how wide the brush is and how
+	/// hard it paints while it is out instead of the gizmo
 	/// @param steps - what an undo would undo and what a redo would do again,
 	/// for the two buttons
 	/// @param changes - where a press is written down
@@ -43,7 +44,7 @@ impl Bar {
 		&mut self,
 		ui: &mut Ui,
 		world: &World,
-		tool: Tool,
+		tool: (Tool, Option<(f32, f32)>),
 		steps: Steps<'_>,
 		scene: &str,
 		changes: &mut Vec<Change>,
@@ -77,7 +78,7 @@ pub(crate) struct Steps<'a> {
 fn strip(
 	ui: &mut Ui,
 	world: &World,
-	tool: Tool,
+	tool: (Tool, Option<(f32, f32)>),
 	steps: Steps<'_>,
 	filed: &mut String,
 	typed: &mut bool,
@@ -152,15 +153,61 @@ fn stepping(ui: &mut Ui, steps: Steps<'_>, changes: &mut Vec<Change>) {
 	}
 }
 
-/// The three things the gizmo does, with the key that picks each.
-fn tools(ui: &mut Ui, tool: Tool, changes: &mut Vec<Change>) {
+/// The three things the gizmo does and the brush, with the key that picks
+/// each.
+///
+/// The brush is beside the three and is not one of them: it is a mode, and
+/// while it is out the gizmo has no handles at all. Its own two numbers are
+/// shown only while it is, because they mean nothing when it is away.
+///
+/// @param tool - which of the three, and the brush's two numbers while it is
+/// out instead of them: they mean nothing while it is away, which is what
+/// makes one argument of the two
+fn tools(ui: &mut Ui, tool: (Tool, Option<(f32, f32)>), changes: &mut Vec<Change>) {
+	let (held, stroke) = tool;
+	let brushing = stroke.is_some();
+
 	for (candidate, key) in [(Tool::Move, "w"), (Tool::Turn, "e"), (Tool::Size, "r")] {
 		if ui
-			.selectable_label(tool == candidate, format!("{} ({key})", candidate.word()))
+			.selectable_label(
+				!brushing && held == candidate,
+				format!("{} ({key})", candidate.word()),
+			)
 			.clicked()
 		{
 			changes.push(Change::Tool(candidate));
 		}
+	}
+
+	if ui
+		.selectable_label(brushing, "paint (b)")
+		.on_hover_text("paint where a selected strewing's copies may stand; ctrl puts them back")
+		.clicked()
+	{
+		changes.push(Change::Brush(!brushing));
+	}
+
+	let Some((mut radius, mut strength)) = stroke else {
+		return;
+	};
+	let moved = ui
+		.add(
+			DragValue::new(&mut radius)
+				.speed(0.1)
+				.range(paint::RANGE.0..=paint::RANGE.1),
+		)
+		.on_hover_text("how wide the brush is, in the ground's own units")
+		.changed()
+		| ui.add(
+			DragValue::new(&mut strength)
+				.speed(0.01)
+				.range(0.0..=1.0),
+		)
+		.on_hover_text("how hard it paints, a share of a whole cell a dab")
+		.changed();
+
+	if moved {
+		changes.push(Change::Stroke { radius, strength });
 	}
 }
 
@@ -291,7 +338,7 @@ mod tests {
 					pool = bar.show(
 						ui,
 						&world,
-						Tool::Move,
+						(Tool::Move, None),
 						Steps::default(),
 						"scenes/one",
 						&mut changes,

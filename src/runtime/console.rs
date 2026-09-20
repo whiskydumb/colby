@@ -571,6 +571,25 @@ fn install_nav(world: &mut World) {
 	);
 }
 
+/// Whether a strewing reads what a brush painted over its ground.
+///
+/// One variable and a function all the same, beside the navmesh's and the
+/// bake's: what it switches is not a frame but a laying, so it does not belong
+/// among the five that say what a frame leaves out.
+///
+/// @param world - the table to register into
+fn install_strew(world: &mut World) {
+	// on, and not saved, the terms every negative control here is on: off,
+	// every strewing lays the field it would have laid before anybody painted
+	// it, which is how what a brush took away is measured.
+	world.cvars.var(
+		crate::strew::MASKED,
+		Value::Bool(true),
+		"lay a strewing's copies through what a brush painted over its ground; off, every \
+		 strewing lays its whole field",
+	);
+}
+
 /// The renderer's switches for what a bake kept: the lightmap and the probes.
 ///
 /// Apart from the rest of the renderer's for the length of that list alone.
@@ -727,6 +746,7 @@ fn install_render(world: &mut World) {
 		"how much of what a smooth surface's reflection finds on the picture takes the place of \
 		 the sky's reflection: one is all of it, nought is none",
 	);
+	install_strew(world);
 	install_leaving_out(world);
 	// how many point and cone lights one frame may carry. A ceiling rather
 	// than a switch: the array is the frame's whole budget for them, so the

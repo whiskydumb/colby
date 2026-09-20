@@ -31,10 +31,16 @@
 //! own triangle: laying the ground's other triangles differently moves none of
 //! it. And **every number a copy needs is drawn, whether or not it is kept** -
 //! where on the triangle, the turn, the lean, the size, the sinking, the shade,
-//! its place in its patch and a draw kept for a mask - so that raising the
-//! density adds copies after the ones there were, and a band, a size, a lean or
-//! a slope changed in a panel takes away or reshapes the copies it is about and
-//! moves no other.
+//! its place in its patch and the draw a [`Mask`] is read against - so that
+//! raising the density adds copies after the ones there were, and a band, a
+//! size, a lean, a slope or a stroke of a brush takes away or reshapes the
+//! copies it is about and moves no other.
+//!
+//! **Where a copy may stand is painted**, @ref [`Mask`]: a grid over the ground
+//! seen from above, one cell holding what share of the copies over it stand.
+//! A strewing nobody has painted has no mask and lays its whole field, and so
+//! does one whose cells are all open - the same copies, byte for byte, which is
+//! what the draw above is for.
 //!
 //! **The same copies on every machine.** From the rule to a copy there is
 //! nothing but adding, multiplying, dividing and square roots, which every
@@ -100,6 +106,29 @@ pub const FADE: f32 = 0.25;
 
 /// The furthest a copy leans at random, in degrees: lying flat.
 pub const MAX_TILT: f32 = 90.0;
+
+/// The most cells one [`Mask`] holds.
+///
+/// Sixteen thousand three hundred and eighty-four, which is sixteen kilobytes
+/// of it. Three things are measured against this number and it is the smallest
+/// of the three: a mask is written into every step back the editor keeps, it
+/// travels inside the piece of a world that crosses the wire - where a whole
+/// message is seventy-five kilobytes - and it is in the scene file. A ground
+/// wider than the mask is fine grained is laid out with wider cells, @ref
+/// [`Mask::over`].
+pub const MOST_CELLS: usize = 1 << 14;
+
+/// How wide one cell of a [`Mask`] is over a small ground, in the ground's own
+/// units.
+///
+/// One, so that a mask over a ground a person can see the whole of is about as
+/// fine as the brush that paints it. A wider ground doubles it until the cells
+/// fit [`MOST_CELLS`].
+pub const CELL: f32 = 1.0;
+
+/// What a cell holds where nothing has been painted away: every copy the rule
+/// would lay there stands.
+pub const OPEN: u8 = u8::MAX;
 
 /// How the copies are strewn, and whether they are at all.
 ///
@@ -447,6 +476,13 @@ pub struct Laid {
 	/// density's own answer, which is what a count is checked against.
 	pub drawn: u64,
 
+	/// How many of those a [`Mask`] took away.
+	///
+	/// Its own count and not part of [`drawn`](Self::drawn), so that what the
+	/// band left out is what is left over: a rule's copies are the ones it
+	/// drew, less the ones the band left out, less these.
+	pub masked: u64,
+
 	/// Whether the rule would have laid more than [`MOST`] and was laid at a
 	/// lower density that fits.
 	pub thinned: bool,
@@ -472,6 +508,16 @@ pub struct Key {
 	/// every copy is held, and its place is where the body a solid strewing
 	/// makes stands.
 	pub local: Transform,
+
+	/// The digest of the mask it was laid through, or nought for a layout laid
+	/// with no mask at all.
+	///
+	/// The digest rather than a count of how many times one has been painted,
+	/// and for the fault the renderer's own key was found to have: a world put
+	/// back brings a mask whose history did not happen here, so the only thing
+	/// that says two masks are the same mask is the cells. @ref
+	/// [`Mask::digest`].
+	pub mask: u64,
 }
 
 impl Key {
@@ -500,6 +546,7 @@ impl Key {
 		self.rule.same(&other.rule)
 			&& self.ground == other.ground
 			&& self.mesh == other.mesh
+			&& self.mask == other.mask
 			&& bits(&self.local) == bits(&other.local)
 	}
 }
@@ -607,6 +654,505 @@ impl Strewn {
 	pub const fn revision(&self) -> u32 { self.revision }
 }
 
+/// What share of a rule's copies may stand where: the ground painted a cell at
+/// a time.
+///
+/// **What a brush paints is the rule's input and never its output.** A cell
+/// holds how much of what the rule would lay over it stands - [`OPEN`] for all
+/// of it, nought for none, and anything between for that share - and no copy is
+/// written down here or anywhere else. Painting therefore *thins* a field: the
+/// draw a copy is kept or dropped by is drawn for every copy whether it is kept
+/// or not, so a cell painted takes its own copies away and moves nobody else's.
+/// @ref [`Laying::copy`].
+///
+/// **A grid over the ground seen from above, in the ground's own space**, and
+/// not a picture on a second unwrap of the ground or a weight on its vertices.
+/// The first reason is the strongest: a density here is already a count per
+/// square unit of ground *seen from above*, so this is the projection the rule
+/// is measured in and not a second one. The others are that a ground's mesh is
+/// shared by whatever draws it and is built again whenever a terrain's numbers
+/// change, which makes a weight on a vertex a weight on something that comes
+/// and goes; and that a ground somebody modeled need have no second unwrap at
+/// all.
+///
+/// **It outlives the ground it was painted over.** Heights that move, a mesh
+/// built again, a ground scaled or turned: the cells say nothing about any of
+/// them, and a copy reads the cell it stands over. Ground outside the grid
+/// reads [`OPEN`], so a ground that has grown carries its whole field over the
+/// new part rather than a bare one, and @ref [`Mask::fitted`] is what lays a
+/// wider grid when somebody paints there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mask {
+	/// The corner the cells start at, east and south, in the ground's space.
+	from: [f32; 2],
+
+	/// How wide one cell is.
+	step: f32,
+
+	/// How many cells there are east and south.
+	counts: [u32; 2],
+
+	/// One byte a cell, a row of east cells at a time.
+	cells: Vec<u8>,
+
+	/// Sixty-four bits of every cell and of the grid they stand on, never
+	/// nought: what a layout is laid again when it changes.
+	digest: u64,
+}
+
+impl Mask {
+	/// A mask covering a ground, with nothing painted away yet.
+	///
+	/// The cells are [`CELL`] wide, doubled until there are no more than
+	/// [`MOST_CELLS`] of them - so a ground somebody can see the whole of is
+	/// painted about as finely as the brush that paints it, and a landscape is
+	/// painted more coarsely rather than not at all.
+	///
+	/// @param bounds - the ground's box in its own space
+	/// @return nothing for a box that is not a box
+	#[must_use]
+	pub fn over(bounds: (Vec3, Vec3)) -> Option<Self> {
+		let (low, high) = bounds;
+
+		if !low.is_finite() || !high.is_finite() {
+			return None;
+		}
+
+		let from = [low.x.min(high.x), low.z.min(high.z)];
+		let to = [low.x.max(high.x), low.z.max(high.z)];
+		let mut step = CELL;
+
+		// a doubling that cannot run away: sixty-four of them is every step a
+		// float has room for, and a ground that wide has no copies on it
+		for _ in 0..64 {
+			let counts = [across(from[0], to[0], step)?, across(from[1], to[1], step)?];
+
+			if cells_in(counts).is_some_and(|many| many <= MOST_CELLS) {
+				let many = cells_in(counts)?;
+
+				return Self::new(from, step, counts, vec![OPEN; many]);
+			}
+
+			step *= 2.0;
+		}
+
+		None
+	}
+
+	/// A mask read back from somewhere that wrote one down.
+	///
+	/// @param from - the corner the cells start at, east and south
+	/// @param step - how wide one cell is
+	/// @param counts - how many cells east and south
+	/// @param cells - one byte a cell, a row of east cells at a time
+	/// @return nothing for a grid that is not one, or for a number of cells
+	/// that is not the grid's
+	#[must_use]
+	pub fn new(from: [f32; 2], step: f32, counts: [u32; 2], cells: Vec<u8>) -> Option<Self> {
+		let many = cells_in(counts)?;
+
+		if !from[0].is_finite()
+			|| !from[1].is_finite()
+			|| step.is_nan()
+			|| step <= 0.0
+			|| many > MOST_CELLS
+			|| cells.len() != many
+		{
+			return None;
+		}
+
+		let mut mask = Self { from, step, counts, cells, digest: 0 };
+
+		mask.restamp();
+
+		Some(mask)
+	}
+
+	/// The corner the cells start at, east and south.
+	#[must_use]
+	pub const fn from(&self) -> [f32; 2] { self.from }
+
+	/// How wide one cell is.
+	#[must_use]
+	pub const fn step(&self) -> f32 { self.step }
+
+	/// How many cells there are east and south.
+	#[must_use]
+	pub const fn counts(&self) -> [u32; 2] { self.counts }
+
+	/// Every cell, a row of east cells at a time.
+	#[must_use]
+	pub fn cells(&self) -> &[u8] { &self.cells }
+
+	/// Sixty-four bits of the whole of it, and never nought.
+	///
+	/// Nought is what a key holds for a layout laid with no mask at all, so a
+	/// mask may not answer it. @ref [`Key::mask`].
+	#[must_use]
+	pub const fn digest(&self) -> u64 { self.digest }
+
+	/// What share of the field has been painted away, from nought for none of
+	/// it to one for all.
+	#[must_use]
+	pub fn painted(&self) -> f32 {
+		let open = self.cells.len().saturating_mul(usize::from(OPEN));
+		let held: usize = self
+			.cells
+			.iter()
+			.map(|cell| usize::from(*cell))
+			.sum();
+
+		if open == 0 { 0.0 } else { 1.0 - share_of(held, open) }
+	}
+
+	/// What share of a rule's copies stands at a place on the ground.
+	///
+	/// Read between the four cells around the place rather than out of the one
+	/// it falls in, so that a grid coarser than the copies are dense reads as a
+	/// slope and not as squares. A place outside the grid reads as [`OPEN`],
+	/// and so does every place on a mask whose cells are all open - which is
+	/// what makes a mask nobody has painted the same field, copy for copy, as
+	/// no mask at all.
+	///
+	/// @param east - where it stands along the ground's first axis
+	/// @param south - and along its third
+	#[must_use]
+	pub fn at(&self, east: f32, south: f32) -> f32 {
+		let reach = self.reach();
+
+		if east < self.from[0] || east > reach[0] || south < self.from[1] || south > reach[1] {
+			return 1.0;
+		}
+
+		// the cells' own middles are half a cell in, which is where reading
+		// between them starts from
+		let (left, right, along) =
+			cell_at((east - self.from[0]) / self.step - 0.5, self.counts[0]);
+		let (near, far, across) =
+			cell_at((south - self.from[1]) / self.step - 0.5, self.counts[1]);
+		let wide = usize::try_from(self.counts[0]).unwrap_or(0);
+		let corner = |x: usize, z: usize| {
+			self.cells
+				.get(z.saturating_mul(wide).saturating_add(x))
+				.map_or(OPEN, |cell| *cell)
+		};
+		let row =
+			|z: usize| between(f32::from(corner(left, z)), f32::from(corner(right, z)), along);
+
+		between(row(near), row(far), across) / f32::from(OPEN)
+	}
+
+	/// Paints a round patch of it.
+	///
+	/// @param at - where the middle of the patch is, east and south, in the
+	/// ground's space
+	/// @param radius - how far it reaches
+	/// @param strength - how hard, from minus one for putting a whole field
+	/// back to one for taking one away
+	/// @return whether any cell changed
+	pub fn paint(&mut self, at: Vec2, radius: f32, strength: f32) -> bool {
+		if !at.is_finite() || radius.is_nan() || radius <= 0.0 || !strength.is_finite() {
+			return false;
+		}
+
+		let mut moved = false;
+		let low = self.cell_of(Vec2::new(at.x - radius, at.y - radius));
+		let high = self.cell_of(Vec2::new(at.x + radius, at.y + radius));
+
+		for row in low.1..=high.1 {
+			for column in low.0..=high.0 {
+				moved |= self.dab(column, row, at, radius, strength);
+			}
+		}
+
+		if moved {
+			self.restamp();
+		}
+
+		moved
+	}
+
+	/// Paints one cell of a patch, and says whether it moved.
+	///
+	/// A call of its own rather than the body of two loops, because two loops
+	/// and a question inside them is one level of nesting past what this
+	/// workspace allows - and because what it decides, how far into the patch
+	/// a cell's own middle is, is the whole of a stroke's softness.
+	///
+	/// @param column - which cell east
+	/// @param row - which cell south
+	/// @param at - the middle of the patch
+	/// @param radius - how far it reaches
+	/// @param strength - how hard
+	fn dab(&mut self, column: usize, row: usize, at: Vec2, radius: f32, strength: f32) -> bool {
+		let middle = Vec2::new(
+			along(self.from[0], self.step, place_of(column) + 0.5),
+			along(self.from[1], self.step, place_of(row) + 0.5),
+		);
+		// one at the middle of the patch and nought at its edge, which is the
+		// softness a stroke's edge has
+		let reach = (middle - at).length() / radius;
+
+		if reach > 1.0 {
+			return false;
+		}
+
+		let wide = usize::try_from(self.counts[0]).unwrap_or(0);
+		let into = 1.0 - reach * reach;
+		let Some(cell) = self
+			.cells
+			.get_mut(row.saturating_mul(wide).saturating_add(column))
+		else {
+			return false;
+		};
+		let painted = stepped(*cell, strength * into * f32::from(OPEN));
+		let moved = painted != *cell;
+
+		*cell = painted;
+
+		moved
+	}
+
+	/// Puts every cell back to [`OPEN`].
+	///
+	/// @return whether any cell changed
+	pub fn clear(&mut self) -> bool {
+		let moved = self.cells.iter().any(|cell| *cell != OPEN);
+
+		if moved {
+			self.cells.fill(OPEN);
+			self.restamp();
+		}
+
+		moved
+	}
+
+	/// The same mask over a wider grid, when a ground has grown past this one.
+	///
+	/// Cells are carried over by which cell of the new grid each one falls in,
+	/// and ground the old grid never covered is [`OPEN`]. What this is for is
+	/// the moment a brush is put to ground that was not there when the mask was
+	/// made - a terrain widened, a ground swapped for a bigger one - and it is
+	/// done there rather than every step, so that the grid is a fact about the
+	/// mask rather than about whatever the ground is doing this frame.
+	///
+	/// @param bounds - the ground's box now, in its own space
+	/// @return a wider mask, or nothing when this one already covers it
+	#[must_use]
+	pub fn fitted(&self, bounds: (Vec3, Vec3)) -> Option<Self> {
+		let (low, high) = bounds;
+
+		if !low.is_finite() || !high.is_finite() {
+			return None;
+		}
+
+		let reach = self.reach();
+		let wanted = (
+			Vec3::new(low.x.min(high.x), 0.0, low.z.min(high.z)),
+			Vec3::new(low.x.max(high.x), 0.0, low.z.max(high.z)),
+		);
+
+		if wanted.0.x >= self.from[0]
+			&& wanted.0.z >= self.from[1]
+			&& wanted.1.x <= reach[0]
+			&& wanted.1.z <= reach[1]
+		{
+			return None;
+		}
+
+		let held =
+			(Vec3::new(self.from[0], 0.0, self.from[1]), Vec3::new(reach[0], 0.0, reach[1]));
+		let mut grown = Self::over((wanted.0.min(held.0), wanted.1.max(held.1)))?;
+		let wide = usize::try_from(grown.counts[0]).unwrap_or(0);
+
+		for (place, cell) in grown.cells.iter_mut().enumerate() {
+			let (column, row) = (place % wide.max(1), place / wide.max(1));
+			let middle = Vec2::new(
+				along(grown.from[0], grown.step, place_of(column) + 0.5),
+				along(grown.from[1], grown.step, place_of(row) + 0.5),
+			);
+			let taken = self.cell_of(middle);
+
+			if middle.x >= self.from[0]
+				&& middle.x <= reach[0]
+				&& middle.y >= self.from[1]
+				&& middle.y <= reach[1]
+			{
+				*cell = self
+					.cells
+					.get(
+						taken
+							.1
+							.saturating_mul(usize::try_from(self.counts[0]).unwrap_or(0))
+							.saturating_add(taken.0),
+					)
+					.map_or(OPEN, |cell| *cell);
+			}
+		}
+
+		grown.restamp();
+
+		Some(grown)
+	}
+
+	/// The far corner of the grid, east and south.
+	fn reach(&self) -> [f32; 2] {
+		[
+			along(self.from[0], self.step, span_of(self.counts[0])),
+			along(self.from[1], self.step, span_of(self.counts[1])),
+		]
+	}
+
+	/// Which cell a place falls in, held inside the grid.
+	fn cell_of(&self, at: Vec2) -> (usize, usize) {
+		let held = |along: f32, from: f32, count: u32| -> usize {
+			let last = usize::try_from(count.saturating_sub(1)).unwrap_or(0);
+
+			floored((along - from) / self.step).min(last)
+		};
+
+		(
+			held(at.x, self.from[0], self.counts[0]),
+			held(at.y, self.from[1], self.counts[1]),
+		)
+	}
+
+	/// Works the digest out again, after anything about the cells has changed.
+	fn restamp(&mut self) {
+		let grid = [
+			self.from[0].to_bits(),
+			self.from[1].to_bits(),
+			self.step.to_bits(),
+			self.counts[0],
+			self.counts[1],
+		];
+		let stamped = fnv(grid
+			.into_iter()
+			.flat_map(u32::to_le_bytes)
+			.chain(self.cells.iter().copied()));
+
+		// nought is what a key says for a layout laid with no mask, so a mask
+		// may not answer it. One collision in eighteen million million million
+		// is not something to leave a hole for.
+		self.digest = if stamped == 0 { 1 } else { stamped };
+	}
+}
+
+/// How many cells a grid holds, or nothing for one too big to count.
+fn cells_in(counts: [u32; 2]) -> Option<usize> {
+	let wide = usize::try_from(counts[0]).ok()?;
+	let deep = usize::try_from(counts[1]).ok()?;
+	let many = wide.checked_mul(deep)?;
+
+	(many > 0).then_some(many)
+}
+
+/// How many cells of a width cover a span, at least one.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "a ceiling held below what the ceiling on cells allows before it is cast"
+)]
+fn across(from: f32, to: f32, step: f32) -> Option<u32> {
+	let cells = ((to - from) / step).ceil();
+
+	if !cells.is_finite() || cells > 65_536.0 {
+		return None;
+	}
+
+	Some((cells.max(1.0) as u32).max(1))
+}
+
+/// A count of cells as a number to measure with.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_precision_loss,
+	reason = "a count below the ceiling on cells, which a float holds exactly"
+)]
+fn span_of(count: u32) -> f32 { count as f32 }
+
+/// A place in a row of cells as a number to measure with.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_precision_loss,
+	reason = "a place below the ceiling on cells, which a float holds exactly"
+)]
+fn place_of(place: usize) -> f32 { place as f32 }
+
+/// The whole number a number floors to, at least nought.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "floored and held above nought and below what the type holds before it is cast"
+)]
+fn floored(along: f32) -> usize {
+	let floored = along.floor();
+
+	if floored.is_finite() {
+		floored.clamp(0.0, 65_536.0) as usize
+	} else {
+		0
+	}
+}
+
+/// A cell with some paint taken out of it, held inside what a byte holds.
+///
+/// The subtraction is here and not at the call site so that it is a difference
+/// of two numbers rather than a product added to a sum, which the workspace's
+/// lints push towards a fused multiply-add - and a mask decides which copies
+/// stand, so it is one of the places that may not have one. @ref [`along`].
+///
+/// @param cell - what it holds now
+/// @param by - how much to take out of it, of nought to [`OPEN`]
+fn stepped(cell: u8, by: f32) -> u8 {
+	let value = f32::from(cell) - by;
+
+	#[expect(
+		clippy::as_conversions,
+		clippy::cast_possible_truncation,
+		clippy::cast_sign_loss,
+		reason = "rounded and held inside what a byte holds before it is cast"
+	)]
+	if value.is_finite() {
+		value.clamp(0.0, f32::from(OPEN)).round() as u8
+	} else {
+		OPEN
+	}
+}
+
+/// One whole number over another.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_precision_loss,
+	reason = "two sums of bytes, each below what a float counts exactly"
+)]
+fn share_of(held: usize, whole: usize) -> f32 { held as f32 / whole as f32 }
+
+/// The two cells a place falls between, and how far it is from the first.
+///
+/// Held inside the grid at either end, so that a place in the outer half of an
+/// outer cell reads that cell and not past it.
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "held inside the grid before it is cast"
+)]
+fn cell_at(along: f32, count: u32) -> (usize, usize, f32) {
+	if !along.is_finite() {
+		return (0, 0, 0.0);
+	}
+
+	let last = span_of(count.saturating_sub(1));
+	let floored = along.floor();
+	let low = floored.clamp(0.0, last) as usize;
+	let high = (floored + 1.0).clamp(0.0, last) as usize;
+
+	(low, high, (along - floored).clamp(0.0, 1.0))
+}
+
 /// Lays a rule's copies out over a ground.
 ///
 /// @param ground - the mesh the copies stand on, in its own space; its own
@@ -615,6 +1161,11 @@ impl Strewn {
 /// @param local - the strewing entity's own transform, whose turn and scale
 /// are how every copy is held
 /// @param bounds - the box of what is strewn, in its own space
+/// @param mask - what share of the copies may stand where, or nothing for a
+/// rule nobody has painted. **The ceiling on copies is about the rule and not
+/// about the painting**: a rule that would lay more than [`MOST`] is laid at a
+/// density that fits whether or not a mask would have taken those copies away,
+/// so that what a person paints does not change how thickly the rest is laid.
 /// @return every copy, in patches
 #[must_use]
 pub fn lay_out(
@@ -622,6 +1173,7 @@ pub fn lay_out(
 	rule: &Strewing,
 	local: &Transform,
 	bounds: (Vec3, Vec3),
+	mask: Option<&Mask>,
 ) -> Laid {
 	let rule = rule.sane();
 	let faces = faces(ground, rule.slope);
@@ -646,7 +1198,9 @@ pub fn lay_out(
 		rule,
 		local: *local,
 		cosine,
+		mask,
 		drawn: 0,
+		masked: 0,
 		found: Vec::new(),
 	};
 
@@ -665,6 +1219,7 @@ pub fn lay_out(
 		pieces,
 		patches,
 		drawn: laying.drawn,
+		masked: laying.masked,
 		thinned,
 		digest,
 	}
@@ -800,7 +1355,7 @@ fn corners_of(mesh: &MeshData, triangle: &[u32]) -> Option<[Vec3; 3]> {
 }
 
 /// What laying copies over one ground keeps as it goes.
-struct Laying {
+struct Laying<'a> {
 	/// The rule, made sane.
 	rule: Strewing,
 
@@ -810,11 +1365,30 @@ struct Laying {
 	/// The cosine of the rule's lean at random.
 	cosine: f32,
 
+	/// What share of the copies may stand where, or nothing for a rule nobody
+	/// has painted.
+	mask: Option<&'a Mask>,
+
 	/// How many copies the rule has drawn.
 	drawn: u64,
 
+	/// How many of them the mask has taken away.
+	masked: u64,
+
 	/// What has been kept so far, each with its patch and its place in it.
 	found: Vec<Found>,
+}
+
+/// What became of one copy the rule drew.
+enum Drew {
+	/// It stands.
+	Kept(Found),
+
+	/// The band left it out.
+	Banded,
+
+	/// The mask left it out.
+	Masked,
 }
 
 /// One copy kept, before the copies are put in their patches.
@@ -829,7 +1403,7 @@ struct Found {
 	piece: Piece,
 }
 
-impl Laying {
+impl Laying<'_> {
 	/// Lays one triangle's copies.
 	///
 	/// @param face - the triangle
@@ -850,8 +1424,12 @@ impl Laying {
 
 			self.drawn = self.drawn.saturating_add(1);
 
-			if let Some(found) = self.copy(face, &mut random) {
-				self.found.push(found);
+			let drew = self.copy(face, &mut random);
+
+			match drew {
+				| Drew::Kept(found) => self.found.push(found),
+				| Drew::Masked => self.masked = self.masked.saturating_add(1),
+				| Drew::Banded => {},
 			}
 		}
 	}
@@ -865,8 +1443,8 @@ impl Laying {
 	///
 	/// @param face - the triangle it stands on
 	/// @param random - the triangle's stream
-	/// @return the copy, or nothing for one the band leaves out
-	fn copy(&self, face: &Face, random: &mut Random) -> Option<Found> {
+	/// @return the copy, or which of the two reasons left it out
+	fn copy(&self, face: &Face, random: &mut Random) -> Drew {
 		let (mut along, mut across) = (random.unit(), random.unit());
 		let yaw = random.circle();
 		let lean = random.unit();
@@ -875,9 +1453,10 @@ impl Laying {
 		let sunk = random.unit();
 		let dark = random.unit();
 		let rank = u32::try_from(random.draw() >> 32).unwrap_or(0);
-		// kept for a mask the strewing may one day be painted with, so that
-		// painting one moves nothing it does not paint away
-		let _mask = random.unit();
+		// the draw the mask is read against, and it is drawn here whether the
+		// strewing has ever been painted or not, so that painting one takes
+		// copies away and moves none of the ones it leaves
+		let painted = random.unit();
 
 		// a point in the parallelogram the triangle is half of, folded back
 		// into the triangle when it lands in the other half
@@ -890,7 +1469,23 @@ impl Laying {
 		let point = first + (second - first) * along + (third - first) * across;
 
 		if point.y < self.rule.band[0] || point.y > self.rule.band[1] {
-			return None;
+			return Drew::Banded;
+		}
+
+		// and then what somebody painted, which is the second and last reason
+		// a copy the rule drew does not stand. After the band rather than
+		// before it because both are asked of a copy that has already been
+		// drawn whole, and in this order because the band is a comparison and
+		// this is four cells read out of a grid.
+		//
+		// **A cell reading open keeps every copy**: a share of one is above
+		// every draw `unit` hands out, which is what makes a mask nobody has
+		// painted the same field as no mask at all.
+		if self
+			.mask
+			.is_some_and(|mask| painted >= mask.at(point.x, point.z))
+		{
+			return Drew::Masked;
 		}
 
 		let rule = &self.rule;
@@ -921,7 +1516,7 @@ impl Laying {
 		let sink = between(rule.sink[0], rule.sink[1], sunk);
 		let at = point - standing * Vec3::Y * sink;
 
-		Some(Found {
+		Drew::Kept(Found {
 			patch: patch_of(at),
 			rank,
 			piece: Piece {
@@ -1044,6 +1639,18 @@ fn patched(mut found: Vec<Found>, held: Vec3, bounds: (Vec3, Vec3)) -> (Vec<Piec
 	(pieces, patches)
 }
 
+/// How far along an axis a whole number of cells reaches from a corner.
+///
+/// Written as a product added to a sum and deliberately not fused, for
+/// [`between`]'s reason and with as much riding on it: which cell a copy reads
+/// is what decides whether the copy stands, so it has to be the same bits on
+/// every machine.
+#[expect(
+	clippy::suboptimal_flops,
+	reason = "a fused multiply and add is not the same bits on every machine"
+)]
+fn along(from: f32, step: f32, cells: f32) -> f32 { from + step * cells }
+
 /// A number part of the way from one to another.
 ///
 /// Written as a product added to a sum, and on purpose not fused into one
@@ -1079,11 +1686,12 @@ fn cosine_of(degrees: f32) -> f32 { f64::from(degrees).to_radians().cos() as f32
 fn narrowed(value: f64) -> f32 { value as f32 }
 
 /// Sixty-four bits of FNV over a run of words.
-fn digest(words: impl Iterator<Item = u32>) -> u64 {
-	words.fold(0xCBF2_9CE4_8422_2325, |held, word| {
-		word.to_le_bytes()
-			.iter()
-			.fold(held, |held, byte| (held ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01B3))
+fn digest(words: impl Iterator<Item = u32>) -> u64 { fnv(words.flat_map(u32::to_le_bytes)) }
+
+/// Sixty-four bits of FNV over a run of bytes.
+fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
+	bytes.fold(0xCBF2_9CE4_8422_2325, |held, byte| {
+		(held ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3)
 	})
 }
 
@@ -1152,7 +1760,7 @@ mod tests {
 
 	#[test]
 	fn a_flat_ground_carries_its_density_to_within_what_the_last_draws_settle() {
-		let laid = lay_out(&floor(32), &rule(3.0), &Transform::IDENTITY, UNIT);
+		let laid = lay_out(&floor(32), &rule(3.0), &Transform::IDENTITY, UNIT, None);
 
 		// a thousand and twenty-four square units, three to each: every
 		// triangle covers half a unit and is owed one and a half copies, so its
@@ -1167,7 +1775,7 @@ mod tests {
 	#[test]
 	fn every_copy_stands_on_the_ground_and_inside_it() {
 		let ground = hills(1971);
-		let laid = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT);
+		let laid = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT, None);
 		let terrain = Terrain::of(1971);
 
 		assert!(laid.pieces.len() > 20_000, "{} copies on the default hills", laid.pieces.len());
@@ -1188,10 +1796,15 @@ mod tests {
 	#[test]
 	fn the_same_rule_lays_the_same_copies_and_another_seed_others() {
 		let ground = hills(7);
-		let one = lay_out(&ground, &rule(1.0), &Transform::IDENTITY, UNIT);
-		let two = lay_out(&ground, &rule(1.0), &Transform::IDENTITY, UNIT);
-		let other =
-			lay_out(&ground, &Strewing { seed: 1, ..rule(1.0) }, &Transform::IDENTITY, UNIT);
+		let one = lay_out(&ground, &rule(1.0), &Transform::IDENTITY, UNIT, None);
+		let two = lay_out(&ground, &rule(1.0), &Transform::IDENTITY, UNIT, None);
+		let other = lay_out(
+			&ground,
+			&Strewing { seed: 1, ..rule(1.0) },
+			&Transform::IDENTITY,
+			UNIT,
+			None,
+		);
 
 		assert_eq!(one, two, "one rule, one ground, one answer");
 		assert_ne!(one.digest, other.digest, "a seed is a real knob");
@@ -1229,6 +1842,7 @@ mod tests {
 				..Transform::IDENTITY
 			},
 			UNIT,
+			None,
 		);
 
 		assert_eq!(laid.pieces.len(), 7815, "{}", laid.pieces.len());
@@ -1238,9 +1852,14 @@ mod tests {
 	#[test]
 	fn a_slope_leaves_out_what_is_steeper_and_moves_nothing_it_keeps() {
 		let ground = hills(1971);
-		let everywhere = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT);
-		let gentle =
-			lay_out(&ground, &Strewing { slope: 8.0, ..rule(2.0) }, &Transform::IDENTITY, UNIT);
+		let everywhere = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT, None);
+		let gentle = lay_out(
+			&ground,
+			&Strewing { slope: 8.0, ..rule(2.0) },
+			&Transform::IDENTITY,
+			UNIT,
+			None,
+		);
 		let level = cosine_of(8.0);
 
 		assert!(
@@ -1317,8 +1936,8 @@ mod tests {
 	#[test]
 	fn raising_the_density_adds_copies_after_the_ones_there_were() {
 		let ground = floor(16);
-		let sparse = lay_out(&ground, &rule(1.0), &Transform::IDENTITY, UNIT);
-		let dense = lay_out(&ground, &rule(4.0), &Transform::IDENTITY, UNIT);
+		let sparse = lay_out(&ground, &rule(1.0), &Transform::IDENTITY, UNIT, None);
+		let dense = lay_out(&ground, &rule(4.0), &Transform::IDENTITY, UNIT, None);
 
 		let every: Vec<[f32; 3]> = dense
 			.pieces
@@ -1338,12 +1957,13 @@ mod tests {
 	#[test]
 	fn a_band_keeps_only_the_ground_inside_it() {
 		let ground = hills(1971);
-		let everywhere = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT);
+		let everywhere = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT, None);
 		let banded = lay_out(
 			&ground,
 			&Strewing { band: [-1.0, 1.0], ..rule(2.0) },
 			&Transform::IDENTITY,
 			UNIT,
+			None,
 		);
 
 		assert!(banded.pieces.len() < everywhere.pieces.len(), "some ground is outside it");
@@ -1380,7 +2000,7 @@ mod tests {
 
 	#[test]
 	fn a_rule_that_lays_too_many_is_thinned_to_fit_and_says_so() {
-		let laid = lay_out(&floor(64), &rule(100.0), &Transform::IDENTITY, UNIT);
+		let laid = lay_out(&floor(64), &rule(100.0), &Transform::IDENTITY, UNIT, None);
 
 		assert!(laid.thinned, "409,600 asked of a ceiling of {MOST}");
 		assert!(laid.pieces.len() <= MOST, "{}", laid.pieces.len());
@@ -1404,8 +2024,13 @@ mod tests {
 
 	#[test]
 	fn upright_copies_stand_upright_whatever_the_ground_does() {
-		let laid =
-			lay_out(&hills(3), &Strewing { turns: 0, ..rule(0.5) }, &Transform::IDENTITY, UNIT);
+		let laid = lay_out(
+			&hills(3),
+			&Strewing { turns: 0, ..rule(0.5) },
+			&Transform::IDENTITY,
+			UNIT,
+			None,
+		);
 
 		for piece in &laid.pieces {
 			assert_eq!(
@@ -1424,8 +2049,13 @@ mod tests {
 		let face = Vec3::new(0.0, 1.0, -1.0).normalize();
 
 		for (align, aimed) in [(1.0, face), (0.5, (Vec3::Y + face).normalize()), (0.0, Vec3::Y)] {
-			let laid =
-				lay_out(&ground, &Strewing { align, ..rule(1.0) }, &Transform::IDENTITY, UNIT);
+			let laid = lay_out(
+				&ground,
+				&Strewing { align, ..rule(1.0) },
+				&Transform::IDENTITY,
+				UNIT,
+				None,
+			);
 
 			assert!(!laid.pieces.is_empty());
 
@@ -1446,7 +2076,7 @@ mod tests {
 		// a floor lifted into a slope of one: its surface is the square root of
 		// two times what it covers seen from above, and the count follows the
 		// covering - two a unit over two hundred and fifty-six units
-		let laid = lay_out(&sloped(16), &rule(2.0), &Transform::IDENTITY, UNIT);
+		let laid = lay_out(&sloped(16), &rule(2.0), &Transform::IDENTITY, UNIT, None);
 
 		assert!(
 			laid.pieces.len().abs_diff(512) < 60,
@@ -1468,6 +2098,7 @@ mod tests {
 			},
 			&Transform::IDENTITY,
 			UNIT,
+			None,
 		);
 
 		assert!(!laid.pieces.is_empty());
@@ -1491,6 +2122,7 @@ mod tests {
 			&Strewing { tilt: 30.0, ..rule(2.0) },
 			&Transform::IDENTITY,
 			UNIT,
+			None,
 		);
 		let cone = cosine_of(30.0);
 		let mut leanest: f32 = 1.0;
@@ -1517,6 +2149,7 @@ mod tests {
 			},
 			&Transform::IDENTITY,
 			UNIT,
+			None,
 		);
 
 		for piece in &laid.pieces {
@@ -1539,7 +2172,7 @@ mod tests {
 		// what a renderer thinning a patch by drawing the first part of its run
 		// counts on: the leading quarter stands all over the square, not in the
 		// first triangles laid
-		let laid = lay_out(&floor(32), &rule(8.0), &Transform::IDENTITY, UNIT);
+		let laid = lay_out(&floor(32), &rule(8.0), &Transform::IDENTITY, UNIT, None);
 
 		for patch in &laid.patches {
 			let run = &laid.pieces[patch.run()];
@@ -1573,6 +2206,7 @@ mod tests {
 				position: Vec3::new(50.0, 50.0, 50.0),
 			},
 			UNIT,
+			None,
 		);
 
 		for piece in &laid.pieces {
@@ -1595,6 +2229,7 @@ mod tests {
 			},
 			&Transform { scale: held, ..Transform::IDENTITY },
 			UNIT,
+			None,
 		);
 		let mut next = 0;
 
@@ -1629,7 +2264,7 @@ mod tests {
 	#[test]
 	fn a_ground_with_no_faces_up_lays_nothing() {
 		assert!(
-			lay_out(&MeshData::default(), &rule(4.0), &Transform::IDENTITY, UNIT)
+			lay_out(&MeshData::default(), &rule(4.0), &Transform::IDENTITY, UNIT, None)
 				.pieces
 				.is_empty()
 		);
@@ -1640,7 +2275,7 @@ mod tests {
 		}
 
 		assert!(
-			lay_out(&upside, &rule(4.0), &Transform::IDENTITY, UNIT)
+			lay_out(&upside, &rule(4.0), &Transform::IDENTITY, UNIT, None)
 				.pieces
 				.is_empty(),
 			"a floor facing down covers no ground seen from above"
@@ -1662,7 +2297,7 @@ mod tests {
 			},
 		];
 
-		let laid = lay_out(&floor(4), &rule(1.0), &Transform::IDENTITY, UNIT);
+		let laid = lay_out(&floor(4), &rule(1.0), &Transform::IDENTITY, UNIT, None);
 		let merged = solid(&laid, &mesh, &Transform::IDENTITY);
 
 		assert!(!laid.pieces.is_empty());
@@ -1681,7 +2316,7 @@ mod tests {
 			rotation: Quat::from_rotation_y(0.4),
 			scale: Vec3::new(0.5, 2.0, 0.5),
 		};
-		let laid = lay_out(&floor(4), &rule(1.0), &local, UNIT);
+		let laid = lay_out(&floor(4), &rule(1.0), &local, UNIT, None);
 		let merged = solid(&laid, &mesh, &local);
 
 		assert_eq!(merged.vertices.len(), mesh.vertices.len() * laid.pieces.len());
@@ -1728,6 +2363,7 @@ mod tests {
 	fn the_table_counts_a_laying_and_a_taking_away() {
 		let mut strewn = Strewn::new();
 		let key = Key {
+			mask: 0,
 			rule: Strewing::NONE,
 			ground: (MeshId::NONE, 0),
 			mesh: (MeshId::NONE, 0),
@@ -1755,6 +2391,7 @@ mod tests {
 	#[test]
 	fn a_key_is_the_same_as_itself_even_holding_a_number_that_is_not_one() {
 		let key = Key {
+			mask: 0,
 			rule: Strewing { density: f32::NAN, ..Strewing::NONE },
 			ground: (MeshId::new(4), 2),
 			mesh: (MeshId::new(5), 1),
@@ -1804,6 +2441,313 @@ mod tests {
 			(together / spread).abs() < 0.06,
 			"neighbors correlated by {}",
 			together / spread
+		);
+	}
+	/// Whether two shares are the same number to the bit, which is what every
+	/// answer a mask gives has to be: a cell reading open by a hair less than
+	/// one would take away a copy whose own draw came out at that hair.
+	fn same(held: f32, wanted: f32) -> bool { held.to_bits() == wanted.to_bits() }
+
+	/// A count as the number a laying reports.
+	fn counted(many: usize) -> u64 { u64::try_from(many).expect("a count of copies") }
+
+	/// A place as the bits it is written down as, for an exact comparison the
+	/// workspace's lints allow.
+	fn bits(at: [f32; 3]) -> [u32; 3] { at.map(f32::to_bits) }
+
+	/// A mask over a ground, every cell open.
+	fn open(side: f32) -> Mask {
+		Mask::over((Vec3::splat(-side * 0.5), Vec3::splat(side * 0.5))).expect("a box is a box")
+	}
+
+	#[test]
+	fn a_mask_nobody_painted_lays_the_field_no_mask_lays_byte_for_byte() {
+		let ground = hills(1971);
+		let bare = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT, None);
+		let open = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT, Some(&open(64.0)));
+
+		assert_eq!(bare.digest, open.digest, "every copy of it, to the bit");
+		assert_eq!(bare.pieces, open.pieces, "and the same copies in the same order");
+		assert_eq!(open.masked, 0, "nothing was taken away");
+		assert_eq!(bare.drawn, open.drawn, "and the rule drew what it would have drawn");
+	}
+
+	#[test]
+	fn a_mask_painted_shut_lays_nothing_where_it_is_shut_and_moves_nothing_elsewhere() {
+		let ground = hills(1971);
+		let bare = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT, None);
+		let mut mask = open(64.0);
+
+		// a patch of it shut, hard enough to reach nought at the middle
+		for _ in 0..4 {
+			mask.paint(Vec2::new(4.0, 4.0), 6.0, 1.0);
+		}
+
+		let laid = lay_out(&ground, &rule(2.0), &Transform::IDENTITY, UNIT, Some(&mask));
+
+		assert!(laid.pieces.len() < bare.pieces.len(), "some of the field has gone");
+		assert_eq!(laid.drawn, bare.drawn, "and the rule drew every one of them anyway");
+		assert_eq!(
+			laid.masked,
+			counted(bare.pieces.len()) - counted(laid.pieces.len()),
+			"what is missing is what the mask took"
+		);
+
+		for piece in &laid.pieces {
+			let reach = Vec2::new(piece.at[0] - 4.0, piece.at[2] - 4.0).length();
+
+			assert!(reach > 1.0, "a copy at {reach} from the middle of a stroke that shut it");
+		}
+
+		// and every copy that is still there is exactly where it was
+		let held: Vec<&Piece> = bare
+			.pieces
+			.iter()
+			.filter(|piece| {
+				laid.pieces
+					.iter()
+					.any(|kept| bits(kept.at) == bits(piece.at))
+			})
+			.collect();
+
+		assert_eq!(held.len(), laid.pieces.len(), "every copy kept was already laid there");
+
+		for (kept, was) in laid.pieces.iter().zip(&held) {
+			assert_eq!(&kept, was, "and it is the same copy, turn, size and shade");
+		}
+	}
+
+	#[test]
+	fn a_cell_half_open_keeps_about_half_of_what_stood_on_it() {
+		let ground = floor(64);
+		let mut mask = open(64.0);
+
+		mask.cells.fill(OPEN / 2);
+		mask.restamp();
+
+		let bare = lay_out(&ground, &rule(4.0), &Transform::IDENTITY, UNIT, None);
+		let half = lay_out(&ground, &rule(4.0), &Transform::IDENTITY, UNIT, Some(&mask));
+		let share = share_of(half.pieces.len(), bare.pieces.len().max(1));
+
+		assert!((share - 0.5).abs() < 0.03, "half a cell kept {share} of the field");
+		assert_eq!(
+			half.masked + counted(half.pieces.len()),
+			bare.drawn,
+			"and what is not standing was masked"
+		);
+	}
+
+	#[test]
+	fn painting_one_corner_of_a_ground_moves_no_copy_in_another() {
+		let ground = hills(7);
+		let bare = lay_out(&ground, &rule(1.0), &Transform::IDENTITY, UNIT, None);
+		let mut mask = open(64.0);
+
+		for _ in 0..6 {
+			mask.paint(Vec2::new(-20.0, -20.0), 8.0, 1.0);
+		}
+
+		let laid = lay_out(&ground, &rule(1.0), &Transform::IDENTITY, UNIT, Some(&mask));
+		let far = |piece: &Piece| piece.at[0] > 0.0 && piece.at[2] > 0.0;
+		let before: Vec<&Piece> = bare.pieces.iter().filter(|it| far(it)).collect();
+		let after: Vec<&Piece> = laid.pieces.iter().filter(|it| far(it)).collect();
+
+		assert!(!before.is_empty(), "there is a far corner to compare");
+		assert_eq!(before.len(), after.len(), "the far corner kept every copy");
+
+		for (was, is) in before.iter().zip(&after) {
+			assert_eq!(was, is, "and each is the copy it was, to the bit");
+		}
+	}
+
+	#[test]
+	fn a_place_outside_the_grid_is_open_and_a_shut_grid_lays_nothing() {
+		let mut mask = open(8.0);
+
+		assert!(same(mask.at(100.0, 0.0), 1.0), "east of the grid");
+		assert!(same(mask.at(0.0, -100.0), 1.0), "and north of it");
+
+		mask.cells.fill(0);
+		mask.restamp();
+
+		assert!(same(mask.at(0.0, 0.0), 0.0), "and nothing stands inside a shut one");
+		assert_eq!(
+			lay_out(&floor(8), &rule(8.0), &Transform::IDENTITY, UNIT, Some(&mask))
+				.pieces
+				.len(),
+			0,
+			"a rule laid through it lays nothing at all"
+		);
+	}
+
+	#[test]
+	fn a_mask_reads_between_its_cells_rather_than_out_of_the_one_underneath() {
+		// two cells, one shut and one open, over four units: read at the two
+		// middles it is nought and one, and halfway between them a half
+		let mask = Mask::new([0.0, 0.0], 2.0, [2, 1], vec![0, OPEN]).expect("a grid of two");
+
+		assert!(same(mask.at(1.0, 1.0), 0.0), "the middle of the shut cell");
+		assert!(same(mask.at(3.0, 1.0), 1.0), "the middle of the open one");
+		assert!((mask.at(2.0, 1.0) - 0.5).abs() < 1.0e-6, "and a half between them");
+		assert!(same(mask.at(0.5, 1.0), 0.0), "outside the first middle it holds the first cell");
+		assert!(same(mask.at(3.5, 1.0), 1.0), "and outside the last, the last");
+	}
+
+	#[test]
+	fn a_mask_reads_its_two_axes_apart_and_slopes_along_both() {
+		// four cells east by two south, each a different number, so that a
+		// read with the two axes the wrong way round lands on another cell -
+		// and a slope along each axis, so that reading out of one cell rather
+		// than between four is another answer
+		let cells = vec![0, 85, 170, 255, 255, 170, 85, 0];
+		let mask = Mask::new([0.0, 0.0], 2.0, [4, 2], cells).expect("a grid of eight");
+		let share = |cell: u8| f32::from(cell) / f32::from(OPEN);
+
+		assert!(same(mask.at(1.0, 1.0), share(0)), "the first cell east, the first south");
+		assert!(same(mask.at(7.0, 1.0), share(255)), "the last cell east, the first south");
+		assert!(same(mask.at(1.0, 3.0), share(255)), "and the first east, the last south");
+		assert!(same(mask.at(7.0, 3.0), share(0)), "and the last of both");
+
+		// halfway between two cells is halfway between their two numbers,
+		// along each axis and along both at once
+		assert!(same(mask.at(2.0, 1.0), share(42) + 0.5 / f32::from(OPEN)), "halfway east");
+		assert!(same(mask.at(1.0, 2.0), share(127) + 0.5 / f32::from(OPEN)), "halfway south");
+		// the middle of the four in the middle: halfway along a row that runs
+		// up and halfway along one that runs down, which is the middle of both
+		assert!(same(mask.at(4.0, 2.0), 0.5), "the middle of the four in the middle");
+	}
+
+	#[test]
+	fn a_grid_is_as_fine_as_it_can_be_and_never_holds_more_cells_than_one_holds() {
+		let small = open(8.0);
+		assert!(same(small.step(), CELL), "a small ground has cells of a unit");
+		assert_eq!(small.counts(), [8, 8], "one a unit");
+
+		let big = Mask::over((Vec3::splat(-2048.0), Vec3::splat(2048.0))).expect("a box");
+		let cells = usize::try_from(big.counts()[0]).expect("a count of cells")
+			* usize::try_from(big.counts()[1]).expect("a count of cells");
+
+		assert!(cells <= MOST_CELLS, "{cells} cells, and a mask holds {MOST_CELLS}");
+		assert!(big.step() > CELL, "a ground that wide is painted more coarsely");
+		assert!(
+			big.step() * f32::from(u8::try_from(big.counts()[0] / 64).unwrap_or(1)) > 0.0,
+			"and the grid still reaches across it"
+		);
+	}
+
+	#[test]
+	fn a_grid_that_is_not_one_is_refused() {
+		assert!(Mask::new([0.0, 0.0], 1.0, [2, 2], vec![OPEN; 3]).is_none(), "too few cells");
+		assert!(Mask::new([0.0, 0.0], 1.0, [2, 2], vec![OPEN; 5]).is_none(), "too many");
+		assert!(Mask::new([0.0, 0.0], 0.0, [2, 2], vec![OPEN; 4]).is_none(), "a step of nought");
+		assert!(Mask::new([0.0, 0.0], -1.0, [2, 2], vec![OPEN; 4]).is_none(), "or below it");
+		assert!(
+			Mask::new([f32::NAN, 0.0], 1.0, [1, 1], vec![OPEN]).is_none(),
+			"a corner nowhere"
+		);
+		assert!(Mask::new([0.0, 0.0], 1.0, [0, 4], vec![]).is_none(), "a grid of no cells");
+		assert!(
+			Mask::new([0.0, 0.0], 1.0, [1024, 1024], vec![OPEN; 1024 * 1024]).is_none(),
+			"and one past the ceiling"
+		);
+	}
+
+	#[test]
+	fn a_digest_follows_every_cell_and_is_never_nought() {
+		let mut mask = open(8.0);
+		let was = mask.digest();
+
+		assert_ne!(was, 0, "nought is what a key says for no mask at all");
+		mask.cells[3] = 7;
+		mask.restamp();
+
+		assert_ne!(mask.digest(), was, "a cell changed is another mask");
+		assert_ne!(mask.digest(), 0, "and it is still not nought");
+
+		let moved = Mask::new([1.0, 0.0], 1.0, mask.counts(), mask.cells.clone())
+			.expect("the same cells over another corner");
+
+		assert_ne!(moved.digest(), mask.digest(), "the grid is part of it, not only the cells");
+	}
+
+	#[test]
+	fn a_stroke_and_the_share_it_took_agree() {
+		let mut mask = open(16.0);
+
+		assert!(same(mask.painted(), 0.0), "nothing painted");
+		assert!(mask.paint(Vec2::ZERO, 4.0, 1.0), "a stroke lands");
+		assert!(mask.painted() > 0.0, "and some of the field has gone");
+		assert!(mask.painted() < 1.0, "though not all of it");
+
+		assert!(mask.clear(), "and it can be put back");
+		assert!(same(mask.painted(), 0.0), "all of it");
+		assert!(!mask.clear(), "a mask already open does not move");
+		assert!(!mask.paint(Vec2::ZERO, 0.0, 1.0), "nor does a brush of no width");
+		assert!(!mask.paint(Vec2::ZERO, 4.0, 0.0), "nor one that paints nothing");
+	}
+
+	#[test]
+	fn a_wider_ground_grows_the_grid_and_keeps_what_was_painted() {
+		let mut mask = open(16.0);
+
+		for _ in 0..8 {
+			mask.paint(Vec2::new(-4.0, -4.0), 3.0, 1.0);
+		}
+
+		assert!(same(mask.at(-4.0, -4.0), 0.0), "shut where it was painted");
+		assert!(
+			mask.fitted((Vec3::splat(-8.0), Vec3::splat(8.0)))
+				.is_none(),
+			"ground it already covers wants no new grid"
+		);
+
+		let grown = mask
+			.fitted((Vec3::splat(-64.0), Vec3::splat(64.0)))
+			.expect("ground past it does");
+
+		assert!(grown.counts()[0] > mask.counts()[0], "the grid reaches further");
+		assert!(same(grown.at(-4.0, -4.0), 0.0), "and what was painted is where it was");
+		assert!(same(grown.at(60.0, 60.0), 1.0), "with the new ground open");
+	}
+
+	#[test]
+	fn a_mask_is_read_in_the_grounds_own_space_whatever_holds_the_copies() {
+		// the strewing's own turn and scale hold every copy, and they must not
+		// reach the mask: a cell is a place on the ground, not on a copy.
+		//
+		// **The patch is painted somewhere whose two numbers differ**, and the
+		// place across the diagonal from it is asked for copies: a laying that
+		// read a cell with the ground's two axes the wrong way round would
+		// clear the wrong corner, and every round patch at a place like (4, 4)
+		// hides that exactly.
+		let ground = floor(16);
+		let mut mask = open(16.0);
+		let (shut, mirrored) = (Vec2::new(6.0, -3.0), Vec2::new(-3.0, 6.0));
+
+		for _ in 0..8 {
+			mask.paint(shut, 3.0, 1.0);
+		}
+
+		let held = Transform {
+			position: Vec3::new(50.0, 9.0, -3.0),
+			rotation: Quat::from_rotation_y(1.0),
+			scale: Vec3::new(2.0, 0.5, 3.0),
+		};
+		let laid = lay_out(&ground, &rule(4.0), &held, UNIT, Some(&mask));
+		let near = |piece: &Piece, at: Vec2| {
+			Vec2::new(piece.at[0] - at.x, piece.at[2] - at.y).length() < 1.0
+		};
+
+		assert!(!laid.pieces.is_empty(), "the rest of the ground is still laid");
+		assert!(
+			!laid.pieces.iter().any(|piece| near(piece, shut)),
+			"nothing stands where the mask is shut"
+		);
+		assert!(
+			laid.pieces
+				.iter()
+				.any(|piece| near(piece, mirrored)),
+			"and the place across the diagonal from it is as full as ever"
 		);
 	}
 }

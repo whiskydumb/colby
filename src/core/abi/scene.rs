@@ -69,7 +69,7 @@ use crate::{
 	Result,
 	abi::{
 		Body, BodyId, BodyKind, Camera, Decal, Emitter, EntityId, Entry, Joint, JointId,
-		JointKind, Layers, Light, MaterialId, MeshId, Pose, PoseId, Post, Probes, Registry,
+		JointKind, Layers, Light, Mask, MaterialId, MeshId, Pose, PoseId, Post, Probes, Registry,
 		Renderable, Shape, ShapeKind, Sky, Terrain, TextureId, Transform, Water, World,
 		field::{Field, field},
 		net::MAX_PEERS,
@@ -266,6 +266,18 @@ pub struct Thing {
 	/// [`Entities::takes_decals`](crate::abi::Entities::takes_decals).
 	pub takes_decals: bool,
 
+	/// What share of its copies a brush has left standing where, or nothing
+	/// for an entity nobody has painted.
+	///
+	/// Inline beside the light, the ground and the decal, and for their
+	/// reason: a mask has no existence apart from the entity carrying it. It
+	/// is the one thing here that is not a fixed number of words, which is why
+	/// the *file* keeps a record a mask and its cells in a blob of their own
+	/// rather than widening the entity record. @ref
+	/// [`Mask`](crate::abi::strew::Mask) for what it is, and
+	/// `colby_asset::scene::Daubed` for how it is written down.
+	pub mask: Option<Mask>,
+
 	/// What its records hold that is worth writing down, by record and field
 	/// name.
 	///
@@ -295,6 +307,7 @@ impl Default for Thing {
 			emitter_texture: String::new(),
 			terrain: Terrain::NONE,
 			decal: Decal::NONE,
+			mask: None,
 			pose: NO_INDEX,
 			parent: NO_INDEX,
 			hidden: false,
@@ -1342,6 +1355,10 @@ fn things(world: &World, pose_of: &[u32]) -> Vec<Thing> {
 				.copied()
 				.unwrap_or(Decal::NONE),
 			takes_decals: world.entities.takes_decals(id),
+			// and what a brush painted over its ground, cloned: it is the one
+			// thing an entity carries that is not a handful of words, and a
+			// description holding a reference to the world would not be one.
+			mask: world.entities.mask(id).cloned(),
 			records: world.entities.noted(id),
 			name: world.entities.name(id).to_owned(),
 			slot: u32::try_from(id.slot()).unwrap_or(0),
@@ -1629,6 +1646,7 @@ pub fn restore(world: &mut World, scene: &SceneData) -> Result<Restored> {
 		world.entities.set_terrain(*id, thing.terrain);
 		world.entities.set_hidden(*id, thing.hidden);
 		world.entities.set_decal(*id, thing.decal);
+		world.entities.set_mask(*id, thing.mask.clone());
 		world
 			.entities
 			.set_takes_decals(*id, thing.takes_decals);
@@ -1822,6 +1840,11 @@ fn grafted_things(world: &mut World, piece: &SceneData) -> Vec<EntityId> {
 			world.entities.set_terrain(id, thing.terrain);
 			world.entities.set_hidden(id, thing.hidden);
 			world.entities.set_decal(id, thing.decal);
+			// and what was painted over its ground, which a copy of a strewing
+			// carries the way it carries the rule: the grid is in the ground's
+			// own space, so a copy laid over the same ground is painted where
+			// the original was.
+			world.entities.set_mask(id, thing.mask.clone());
 			world
 				.entities
 				.set_takes_decals(id, thing.takes_decals);
@@ -2576,6 +2599,7 @@ fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> 
 	world.entities.set_terrain(id, thing.terrain);
 	world.entities.set_hidden(id, thing.hidden);
 	world.entities.set_decal(id, thing.decal);
+	world.entities.set_mask(id, thing.mask.clone());
 	world
 		.entities
 		.set_takes_decals(id, thing.takes_decals);

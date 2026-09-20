@@ -118,7 +118,7 @@ pub use self::{
 	},
 	sky::{Sky, SkyKind},
 	state::{GameState, Players},
-	strew::{Layout, Patch, Piece, STREWING, Strewing, Strewn},
+	strew::{Layout, Mask, Patch, Piece, STREWING, Strewing, Strewn},
 	terrain::{Terrain, TerrainKind},
 	texture::{CUBE_FACES, Texel, Texture, TextureData, TextureId, Textures},
 	ui::{DocumentData, DocumentId, Event, EventKind, Length, PanelId, Ui},
@@ -130,7 +130,7 @@ pub use self::{
 /// The host refuses a module reporting a different value. Bump it whenever a
 /// signature or a layout below changes; forgetting to is a crash rather than an
 /// error message.
-pub const ABI_VERSION: u32 = 81;
+pub const ABI_VERSION: u32 = 82;
 
 /// The C symbol every game module exports, NUL-terminated for `GetProcAddress`.
 pub const GAME_API_SYMBOL: &[u8] = b"colby_game_api\0";
