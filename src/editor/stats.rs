@@ -67,6 +67,15 @@ fn numbers(ui: &mut Ui, world: &World, clock: &Clock, frames: u64, drawn: Drawn)
 	row(ui, "stalls", &clock.stalls().to_string());
 	row(ui, "entities", &world.entities.len().to_string());
 	row(ui, "drawn", &seen(drawn));
+
+	// and the copies on their own row, because they are not entities and there
+	// are a hundred of them for every one of those. Said only in a world that
+	// strews something, the rule the two bounded rows keep: a project with no
+	// field in it reads the way it always did. @ref `colby_engine::strew`.
+	if drawn.strewn > 0 {
+		row(ui, "strewn", &strewn(drawn));
+	}
+
 	row(
 		ui,
 		"bodies",
@@ -159,6 +168,24 @@ fn seen(drawn: Drawn) -> String {
 	}
 }
 
+/// How many of the copies the world's strewings laid the last frame drew, as
+/// one line.
+///
+/// The entity line's shape, with the same two questions asked of copies: how
+/// many of what there is the picture drew, and how many times a shadow map drew
+/// one. The second is said only when the world's strewings throw shadows at
+/// all, the rule the line above keeps. @ref `colby_engine::strew`.
+///
+/// @param drawn - the last frame's counts
+fn strewn(drawn: Drawn) -> String {
+	let strewn = format!("{} of {}", drawn.strewn_drawn, drawn.strewn);
+
+	match drawn.strewn_cast {
+		| 0 => strewn,
+		| cast => format!("{strewn}, {cast} into the shadows"),
+	}
+}
+
 /// One name and one value.
 fn row(ui: &mut Ui, name: &str, value: &str) {
 	ui.label(name);
@@ -205,6 +232,22 @@ mod tests {
 			seen(Drawn { covered: 64, lowered: 200, ..drawn }),
 			"277 of 1000, 1303 into the shadows, 64 behind, 200 lowered",
 			"and how many were drawn coarser than their mesh, when any were"
+		);
+	}
+
+	#[test]
+	fn what_a_frame_strewed_reads_as_so_many_of_so_many_too() {
+		let drawn = Drawn {
+			strewn: 99_989,
+			strewn_drawn: 8_912,
+			..Drawn::default()
+		};
+
+		assert_eq!(strewn(drawn), "8912 of 99989");
+		assert_eq!(
+			strewn(Drawn { strewn_cast: 3204, ..drawn }),
+			"8912 of 99989, 3204 into the shadows",
+			"and how many times a map drew one, when any did"
 		);
 	}
 

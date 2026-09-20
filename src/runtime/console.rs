@@ -599,6 +599,66 @@ fn install_baked(world: &mut World) {
 	);
 }
 
+/// The four variables that say what a frame leaves out, and the one that says
+/// how coarsely it draws what it keeps.
+///
+/// A function of its own rather than five more paragraphs in the middle of the
+/// renderer's: every one of them is a negative control before it is a setting -
+/// what each is for is measuring what it saves and showing that the picture
+/// does not depend on it - and they are read by four different modules.
+///
+/// @param world - the table to register into
+fn install_leaving_out(world: &mut World) {
+	// what a frame cannot see is left out of it: the view for the picture and
+	// each cascade's box for its shadows. On, and not saved, like the shadows:
+	// what the switch is for is measuring what the test saves, and showing
+	// that the picture does not depend on it.
+	world.cvars.var(
+		colby_engine::cull::ENABLED,
+		Value::Bool(true),
+		"leave out of a frame what its view and its shadows cannot reach",
+	);
+	// whether what the strewings laid is drawn at all. On and not saved, the
+	// frustum test's terms and for its reason: off, every copy is still laid,
+	// none is drawn, and the picture is the one a build from before the copies
+	// would have taken.
+	world.cvars.var(
+		colby_engine::strew::ENABLED,
+		Value::Bool(true),
+		"draw the copies every strewing laid over the ground it hangs off",
+	);
+	// what is wholly behind what the pass before the scene drew is left out of
+	// the scene's own pass: on and not saved, the frustum test's terms, and for
+	// its reason - off is how what it saves is measured and how the picture is
+	// shown not to depend on it.
+	world.cvars.var(
+		colby_engine::cover::ENABLED,
+		Value::Bool(true),
+		"leave out of the picture what is wholly behind something nearer",
+	);
+	// how many pixels across a solid thing has to stand to be drawn into the
+	// pass before the scene ahead of that test: thirty-two, and not saved, for
+	// the test's reason - nought draws everything ahead of it, which is how what
+	// drawing the small things after it saves is measured
+	world.cvars.var(
+		colby_engine::cover::SIZE,
+		Value::Float(colby_engine::cover::DEFAULT_SIZE),
+		"how many pixels across a solid thing has to stand to be drawn before the test for what \
+		 is behind something nearer; a smaller thing is drawn after it, only if it is not \
+		 hidden; nought draws everything before it",
+	);
+	// how many pixels a coarser level of a mesh may be off before the mesh
+	// itself is drawn instead: one, and not saved, like the tests above and for
+	// their reason - nought draws every mesh whole, which is how what the
+	// levels save is measured and the picture a build from before them took.
+	world.cvars.var(
+		colby_engine::detail::THRESHOLD,
+		Value::Float(colby_engine::detail::DEFAULT_THRESHOLD),
+		"how many pixels a coarser level of a mesh may be off from the mesh: a thing far enough \
+		 away is drawn at the coarsest level within it; nought draws every mesh whole",
+	);
+}
+
 /// The renderer's variables: the shadows, the lights, and which graphics APIs
 /// to draw with.
 ///
@@ -667,45 +727,7 @@ fn install_render(world: &mut World) {
 		"how much of what a smooth surface's reflection finds on the picture takes the place of \
 		 the sky's reflection: one is all of it, nought is none",
 	);
-	// what a frame cannot see is left out of it: the view for the picture and
-	// each cascade's box for its shadows. On, and not saved, like the shadows:
-	// what the switch is for is measuring what the test saves, and showing
-	// that the picture does not depend on it.
-	world.cvars.var(
-		colby_engine::cull::ENABLED,
-		Value::Bool(true),
-		"leave out of a frame what its view and its shadows cannot reach",
-	);
-	// what is wholly behind what the pass before the scene drew is left out of
-	// the scene's own pass: on and not saved, the frustum test's terms, and for
-	// its reason - off is how what it saves is measured and how the picture is
-	// shown not to depend on it.
-	world.cvars.var(
-		colby_engine::cover::ENABLED,
-		Value::Bool(true),
-		"leave out of the picture what is wholly behind something nearer",
-	);
-	// how many pixels across a solid thing has to stand to be drawn into the
-	// pass before the scene ahead of that test: thirty-two, and not saved, for
-	// the test's reason - nought draws everything ahead of it, which is how what
-	// drawing the small things after it saves is measured
-	world.cvars.var(
-		colby_engine::cover::SIZE,
-		Value::Float(colby_engine::cover::DEFAULT_SIZE),
-		"how many pixels across a solid thing has to stand to be drawn before the test for what \
-		 is behind something nearer; a smaller thing is drawn after it, only if it is not \
-		 hidden; nought draws everything before it",
-	);
-	// how many pixels a coarser level of a mesh may be off before the mesh
-	// itself is drawn instead: one, and not saved, like the tests above and for
-	// their reason - nought draws every mesh whole, which is how what the
-	// levels save is measured and the picture a build from before them took.
-	world.cvars.var(
-		colby_engine::detail::THRESHOLD,
-		Value::Float(colby_engine::detail::DEFAULT_THRESHOLD),
-		"how many pixels a coarser level of a mesh may be off from the mesh: a thing far enough \
-		 away is drawn at the coarsest level within it; nought draws every mesh whole",
-	);
+	install_leaving_out(world);
 	// how many point and cone lights one frame may carry. A ceiling rather
 	// than a switch: the array is the frame's whole budget for them, so the
 	// number a machine can afford is the thing worth being able to say.
@@ -1502,6 +1524,7 @@ mod tests {
 			Value::Float(colby_engine::shadow::DEFAULT_LOCAL_LAMPS),
 		),
 		(colby_engine::cull::ENABLED, Value::Bool(true)),
+		(colby_engine::strew::ENABLED, Value::Bool(true)),
 		(colby_engine::cover::ENABLED, Value::Bool(true)),
 		(colby_engine::cover::SIZE, Value::Float(colby_engine::cover::DEFAULT_SIZE)),
 		(

@@ -412,6 +412,17 @@ struct Table {
 	/// the level it was drawn at.
 	triangles: usize,
 
+	/// The most copies the world's strewings had laid between them, drawn or
+	/// not. @ref `colby_engine::strew`.
+	strewn: usize,
+
+	/// The most of them any measured frame's picture drew.
+	strewn_drawn: usize,
+
+	/// The most times any measured frame's shadow maps drew one, every map
+	/// added together.
+	strewn_cast: usize,
+
 	/// The most lamps any measured frame carried to the shader.
 	lamps: usize,
 
@@ -512,6 +523,9 @@ impl Table {
 			small: 0,
 			lowered: 0,
 			triangles: 0,
+			strewn: 0,
+			strewn_drawn: 0,
+			strewn_cast: 0,
 			lamps: 0,
 			decals: 0,
 			passes: None,
@@ -542,6 +556,9 @@ impl Table {
 		self.small = self.small.max(counts.drawn.small);
 		self.lowered = self.lowered.max(counts.drawn.lowered);
 		self.triangles = self.triangles.max(counts.drawn.triangles);
+		self.strewn = self.strewn.max(counts.drawn.strewn);
+		self.strewn_drawn = self.strewn_drawn.max(counts.drawn.strewn_drawn);
+		self.strewn_cast = self.strewn_cast.max(counts.drawn.strewn_cast);
 		self.lamps = self.lamps.max(counts.drawn.lamps);
 		self.decals = self.decals.max(counts.drawn.decals);
 
@@ -625,6 +642,9 @@ impl Table {
 			small = self.small,
 			lowered = self.lowered,
 			triangles = self.triangles,
+			strewn = self.strewn,
+			strewn_drawn = self.strewn_drawn,
+			strewn_cast = self.strewn_cast,
 			lamps = self.lamps,
 			decals = self.decals,
 			steady = self.steady,
@@ -988,6 +1008,9 @@ mod tests {
 				small: 9,
 				lowered: 3,
 				triangles: 4096,
+				strewn: 5000,
+				strewn_drawn: 1200,
+				strewn_cast: 3400,
 			},
 		});
 
@@ -1024,6 +1047,11 @@ mod tests {
 			(table.lowered, table.triangles),
 			(3, 4096),
 			"and how much of it was drawn coarser, and in how many triangles"
+		);
+		assert_eq!(
+			(table.strewn, table.strewn_drawn, table.strewn_cast),
+			(5000, 1200, 3400),
+			"and how many copies the strewings laid, drew and cast"
 		);
 		assert_eq!(
 			table.rows[under + 5].mean(),

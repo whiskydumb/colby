@@ -42,6 +42,7 @@ pub mod shadow;
 mod shaft;
 mod skin;
 mod sparks;
+pub mod strew;
 pub mod timing;
 
 pub use ::wgpu;

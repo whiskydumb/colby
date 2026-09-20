@@ -439,6 +439,28 @@ pub struct Drawn {
 	/// drawn at: what the two passes draw before what is behind something
 	/// nearer is left out of them.
 	pub triangles: usize,
+
+	/// How many copies the world's strewings have laid between them.
+	///
+	/// Beside the entity counts rather than inside them: a copy is not an
+	/// entity and there are a hundred thousand of them where there are a
+	/// thousand of those, so adding the two would drown every number above.
+	/// What a rule laid is here whether or not any of it is drawn, which is
+	/// what makes the two below readable. @ref
+	/// [`strew`](colby_core::abi::strew).
+	pub strewn: usize,
+
+	/// How many of them the picture drew: what the view holds, after the reach
+	/// has thinned each patch.
+	pub strewn_drawn: usize,
+
+	/// How many times a shadow map drew one, the cascades and the lamps' tiles
+	/// added together.
+	///
+	/// Beside [`strewn_drawn`](Self::strewn_drawn) for the reason `cast` is
+	/// beside `seen`: one strewing can be in four cascades and sixteen tiles at
+	/// once, so this counts draws rather than copies.
+	pub strewn_cast: usize,
 }
 
 #[cfg(test)]

@@ -28,6 +28,7 @@ use colby_core::{
 		TextureData, TextureId, Textures, Transform, World,
 		material::{Blend, MaterialEntry, Wrap},
 		registry::Entry,
+		strew::Layout,
 	},
 	bytemuck::{self, Pod, Zeroable},
 	err, error,
@@ -75,6 +76,7 @@ use crate::{
 	shaft::{self, Asking, Shaft},
 	skin::Joints,
 	sparks::Sparks,
+	strew::{self, Strew},
 	timing::{Ends, Pass, Timings, Work},
 };
 
@@ -375,7 +377,7 @@ struct Globals {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[bytemuck(crate = "::colby_core::bytemuck")]
-struct Placement {
+pub(crate) struct Placement {
 	model: [[f32; 4]; 4],
 	/// The material's base color times the entity's own tint.
 	tint: [f32; 4],
@@ -416,6 +418,39 @@ struct Placement {
 	/// is a thing bones do not move - @ref
 	/// [`NO_JOINTS`](crate::skin::NO_JOINTS).
 	skin: [u32; 4],
+}
+
+impl Placement {
+	/// One copy a strewing laid, as the vertex stage reads it.
+	///
+	/// The same five fields [`Scene::stage`] writes for an entity, and that is
+	/// the point: a copy standing where an entity stands, in the same mesh and
+	/// the same material, is the same hundred and twenty-eight bytes, so it is
+	/// drawn as the same pixels.
+	///
+	/// No pose bends a copy and no bake keeps a place for one, so the first,
+	/// second and fourth words of the skin block are nought - @ref
+	/// [`NO_JOINTS`](crate::skin::NO_JOINTS) for the first two.
+	///
+	/// @param placed - where the copy stands in the world
+	/// @param tint - its material's color times the entity's tint times its own
+	/// shade, with the material's opacity in the fourth channel
+	/// @param surface - `[metallic, roughness, uv scale x, uv scale y]`
+	/// @param unpainted - whether decals leave it alone
+	pub(crate) fn strewn(
+		placed: &Transform,
+		tint: [f32; 4],
+		surface: [f32; 4],
+		unpainted: bool,
+	) -> Self {
+		Self {
+			model: placed.matrix().to_cols_array_2d(),
+			tint,
+			surface,
+			normal_scale: normal_scale(placed.scale).extend(0.0).to_array(),
+			skin: [0, 0, u32::from(unpainted), 0],
+		}
+	}
 }
 
 /// One mesh, uploaded.
@@ -680,7 +715,7 @@ const LISTS: usize = 1 + MAPS;
 ///
 /// A list index past the picture's is one of these, in the same order the
 /// atlas's slots are: the cascades first, the lamps' tiles after them.
-const MAPS: usize = CASCADES + LOCAL_TILES;
+pub(crate) const MAPS: usize = CASCADES + LOCAL_TILES;
 
 /// What one frame can see, worked out once in [`Scene::upload`] and asked of
 /// everything that might be drawn.
@@ -712,6 +747,10 @@ struct Sight {
 
 	/// Whether to ask at all. @ref [`cull::ENABLED`].
 	culling: bool,
+
+	/// Whether what the strewings laid is drawn at all this frame. @ref
+	/// [`strew::ENABLED`].
+	strewing: bool,
 
 	/// What every thing's level is asked against. @ref [`detail`].
 	detail: detail::Eye,
@@ -1236,6 +1275,10 @@ pub struct Scene {
 	/// first, the lamps' tiles after them. @ref [`culling`](Self::culling).
 	casting: [Vec<Batch>; MAPS],
 
+	/// What every strewing laid, as buffers of placements of its own, and the
+	/// runs of them this frame's lists draw. @ref [`strew`].
+	strew: Strew,
+
 	/// Where each local map this frame draws sits in the atlas.
 	lamp_tiles: [Tile; LOCAL_TILES],
 
@@ -1323,12 +1366,10 @@ impl Scene {
 		let joints = Joints::new(&device)?;
 		let shadows = Maps::new(&device, joints.layout(), &material_layout)?;
 		let shader = Shader::new("shader.wgsl", include_str!("shader.wgsl"));
-		let (pipelines, depth, lines, sparks) = drawing(
-			&device,
-			[&globals_layout, &material_layout, shadows.sample_layout(), joints.layout()],
-			shader.source(),
-			(width, height),
-		)?;
+		let groups =
+			[&globals_layout, &material_layout, shadows.sample_layout(), joints.layout()];
+		let (pipelines, depth, lines, sparks) =
+			drawing(&device, groups, shader.source(), (width, height))?;
 		let post = post::Chain::new(&device, format, width, height)?;
 		let shaft = Shaft::new(&device, width, height)?;
 		let focus = Focus::new(&device, width, height)?;
@@ -1396,6 +1437,7 @@ impl Scene {
 			staged: Vec::with_capacity(MAX_ENTITIES),
 			casters: Vec::with_capacity(MAX_ENTITIES),
 			casting: core::array::from_fn(|_| Vec::new()),
+			strew: Strew::new(),
 			lamp_tiles: [Tile::local(0); LOCAL_TILES],
 			lamp_views: [[[0.0; 4]; 4]; LOCAL_TILES],
 			lamp_maps: 0,
@@ -1711,6 +1753,23 @@ impl Scene {
 		pass.set_vertex_buffer(1, self.instances.slice(..));
 
 		self.draw(&mut pass, &self.batches, 0);
+
+		// and every copy every strewing laid, after the things that stand where
+		// an entity stands and before the sky: solid geometry against the same
+		// depth, so which of the two is drawn first decides nothing about the
+		// picture. @ref [`strew`].
+		self.draw_strewn(&mut pass, self.strew.drawn(), 1, |run| {
+			Some(self.pipelines.get(Way {
+				blend: blending(run.masked),
+				skinned: false,
+				ambient: if run.probed { Ambient::Probes } else { Ambient::Sky },
+			}))
+		});
+
+		// and the frame's own placements bound again, because each of those
+		// runs bound a strewing's and the blended half below draws out of this
+		// one
+		pass.set_vertex_buffer(1, self.instances.slice(..));
 
 		// after everything opaque and before everything else. Every pixel a
 		// wall covered is thrown away by the depth test before it is shaded,
@@ -2440,6 +2499,67 @@ impl Scene {
 		self.drew.borrow_mut().push(drew);
 	}
 
+	/// Draws a list of runs of copies, each out of the buffer of the strewing
+	/// that laid it.
+	///
+	/// The batches' own draw binds one instance buffer for the whole pass; this
+	/// binds one per strewing, because a strewing's copies are a buffer of
+	/// their own and a run is a range of it. Everything else about drawing a
+	/// run - its geometry, its paint, its material's group and the range - is
+	/// what a batch does.
+	///
+	/// @param pass - the pass to record into, with the groups the pipelines
+	/// declare already bound
+	/// @param runs - the runs to draw, in order
+	/// @param surfaces - which group a material's bindings go in: the scene's
+	/// pass and the pass before it say one, and a shadow map's says two
+	/// @param pick - the pipeline for a run, or nothing for one this pass does
+	/// not draw
+	fn draw_strewn<'a, F>(
+		&'a self,
+		pass: &mut RenderPass<'_>,
+		runs: &[strew::Run],
+		surfaces: u32,
+		pick: F,
+	) where
+		F: Fn(&strew::Run) -> Option<&'a RenderPipeline>,
+	{
+		let mut bound: Option<&RenderPipeline> = None;
+		let mut reading: Option<usize> = None;
+
+		for run in runs {
+			let (Some(mesh), Some(material), Some(pipeline), Some(copies)) = (
+				self.meshes.get(run.mesh),
+				self.materials.get(run.material),
+				pick(run),
+				self.strew.buffer(run.slot),
+			) else {
+				continue;
+			};
+			let Some(paint) = self.paint_of(mesh) else {
+				continue;
+			};
+
+			if !bound.is_some_and(|last| core::ptr::eq(last, pipeline)) {
+				pass.set_pipeline(pipeline);
+				bound = Some(pipeline);
+			}
+
+			// swapped when a run wants another strewing's copies, which for a
+			// world of one field is once
+			if reading != Some(run.slot) {
+				pass.set_vertex_buffer(1, copies.slice(..));
+				reading = Some(run.slot);
+			}
+
+			pass.set_bind_group(surfaces, &material.bindings, &[]);
+			pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+			pass.set_vertex_buffer(PAINT_SLOT, paint.slice(..));
+			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
+			pass.draw_indexed(mesh.run(run.level), 0, run.first..run.first + run.count);
+		}
+	}
+
 	/// Records the pass before the scene, or lets what it writes into go.
 	///
 	/// The solid half of the picture's own list, through the rectangle the
@@ -2503,6 +2623,15 @@ impl Scene {
 			self.prepass
 				.pipeline(batch.blend, batch.skinned)
 				.filter(|_| !batch.small)
+		});
+
+		// and every copy, ahead of the test whatever a blade of grass measures
+		// across: what the test keeps is one run of placements a *batch*, and
+		// the copies are not in the frame's placements at all. So they are in
+		// the depth the test reads - a dense strewing can hide what stands
+		// behind it - and nothing hides them. @ref [`cover::SIZE`].
+		self.draw_strewn(&mut pass, self.strew.drawn(), 1, |run| {
+			self.prepass.pipeline(blending(run.masked), false)
 		});
 
 		true
@@ -2717,6 +2846,10 @@ impl Scene {
 		};
 
 		pass.set_bind_group(0, slot, &[]);
+		// bound per map rather than once for the pass: the copies below bind
+		// buffers of their own, and the atlas's layer draws sixteen maps into
+		// one pass
+		pass.set_vertex_buffer(1, self.instances.slice(..));
 
 		// the same swap the scene pass makes, and it has to be made here too:
 		// a character whose shadow were cast from its bind pose would stand in
@@ -2757,6 +2890,14 @@ impl Scene {
 			pass.set_index_buffer(mesh.indices.slice(..), IndexFormat::Uint32);
 			pass.draw_indexed(mesh.run(batch.level), 0, batch.first..batch.first + batch.count);
 		}
+
+		// and this map's copies, out of each strewing's own buffer: a list of
+		// its own rather than the picture's, so a strewing that throws no
+		// shadow throws none however the console is set. @ref
+		// [`strewn_casts`](Self::strewn_casts).
+		self.draw_strewn(pass, self.strew.cast(map), 2, |run| {
+			Some(self.shadows.casting(local, run.masked, false))
+		});
 	}
 
 	/// The batches one cascade draws.
@@ -2984,6 +3125,8 @@ impl Scene {
 	fn upload(&mut self, world: &World, view: Option<Viewport>) {
 		self.sync_tables(world);
 
+		let strewing = self.sync_strewings(world);
+
 		// asked for once and used twice on purpose. This is where the frame
 		// stops being the simulation's and becomes the picture's: the camera
 		// the world holds is where the last step left it, and this one is
@@ -3020,6 +3163,7 @@ impl Scene {
 			faces: [Frustum::of(Mat4::IDENTITY); LOCAL_TILES],
 			maps: 0,
 			culling: world.cvars.bool(cull::ENABLED).unwrap_or(true),
+			strewing,
 			detail: self.eye_of(world, &camera, view),
 			// filled in below, once whether the test runs this frame is known
 			small_under: None,
@@ -3107,6 +3251,32 @@ impl Scene {
 			.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.placements));
 		self.joints.upload(&self.queue);
 		self.lightmap.upload(&self.queue);
+	}
+
+	/// Brings every strewing's copies in line with what its rule laid.
+	///
+	/// After the tables and before anything is grouped: what a copy is made of
+	/// comes out of them, and whether a strewing's mesh has bones is something
+	/// only the uploaded geometry knows. Nothing at all in a frame with the
+	/// copies switched off, so the negative control costs no buffer and no
+	/// walk. @ref [`strew`].
+	///
+	/// @param world - the world being drawn
+	/// @return whether the copies are drawn at all this frame
+	fn sync_strewings(&mut self, world: &World) -> bool {
+		if !world.cvars.bool(strew::ENABLED).unwrap_or(true) {
+			return false;
+		}
+
+		let Self { strew, meshes, device, queue, .. } = self;
+
+		strew.sync(world, (device, queue), &|slot| {
+			meshes
+				.get(slot)
+				.is_some_and(|uploaded| uploaded.skin.is_some())
+		});
+
+		true
 	}
 
 	/// Whether this frame runs the test for what is behind something nearer,
@@ -3494,6 +3664,8 @@ impl Scene {
 			self.place_casters(map);
 		}
 
+		self.strew_lists(world, sight);
+
 		self.drawn.seen = self.order.len();
 		self.drawn.small = self
 			.order
@@ -3847,6 +4019,108 @@ impl Scene {
 			};
 
 			self.place(entry, Some(map));
+		}
+	}
+
+	/// Every strewing's patches asked of this frame's volumes, and what is left
+	/// laid out as runs to draw.
+	///
+	/// The same questions [`consider`](Self::consider) asks of an entity, asked
+	/// of a square of ground eight units across rather than of one thing: the
+	/// view, the cascades, the lamps' tiles, which level of the mesh and
+	/// whether the probes reach it. And one an entity is never asked - how far
+	/// its rule draws a copy, which thins a patch rather than dropping it.
+	///
+	/// @param world - the world being drawn, for what its strewings laid
+	/// @param sight - what this frame can see
+	fn strew_lists(&mut self, world: &World, sight: &Sight) {
+		let (mut picture, mut casts) = self.strew.lists();
+
+		// what the world laid, drawn or not and whatever the switch says: it is
+		// the denominator the other two are read against
+		self.drawn.strewn = world.strewn.pieces();
+
+		if sight.strewing {
+			for (slot, layout) in world.strewn.iter() {
+				self.strew_one(world, sight, (slot, layout), (&mut picture, &mut casts));
+			}
+		}
+
+		self.drawn.strewn_drawn = copies(&picture);
+		self.drawn.strewn_cast = casts.iter().map(|list| copies(list)).sum();
+		self.strew.keep(picture, casts);
+	}
+
+	/// One strewing's patches into the frame's lists.
+	///
+	/// @param world - the world being drawn, for whether it is shown
+	/// @param sight - what this frame can see
+	/// @param (slot, layout) - the strewing entity's slot, and what it laid
+	/// @param (picture, casts) - the lists to add to
+	fn strew_one(
+		&self,
+		world: &World,
+		sight: &Sight,
+		(slot, layout): (usize, &Layout),
+		(picture, casts): (&mut Vec<strew::Run>, &mut [Vec<strew::Run>; MAPS]),
+	) {
+		// asked here and not only where the buffers are built: one hidden after
+		// it was built still holds its copies, and what a frame draws is
+		// decided here. The question `consider` asks of an entity. @ref
+		// `Entities::shown`.
+		if !world.entities.shown(layout.entity) {
+			return;
+		}
+
+		let Some(drawing) = self.strew.drawing(slot) else {
+			return;
+		};
+		let Some(uploaded) = self
+			.meshes
+			.get(drawing.mesh)
+			.filter(|_| drawing.mesh > 0)
+		else {
+			return;
+		};
+		let rule = layout.key.rule.sane();
+		// the largest a copy is drawn along any axis, which its level is chosen
+		// by: the patch carries how the entity holds the biggest copy in it,
+		// and the ground it stands on stretches that again
+		let stretched = strew::stretch(drawing.ground);
+
+		for patch in &layout.laid.patches {
+			let placed = strew::boxed(patch, drawing.ground);
+			let count = strew::thinned(patch, &placed, sight.eye, (rule.reach, rule.fade));
+
+			if count == 0 {
+				continue;
+			}
+
+			let run = strew::Run {
+				slot,
+				mesh: drawing.mesh,
+				level: u8::try_from(sight.detail.level(
+					&placed,
+					patch.largest * stretched,
+					&uploaded.errors,
+				))
+				.unwrap_or(u8::MAX),
+				material: drawing.material,
+				masked: drawing.masked,
+				// never the lightmap, which keeps no place for a copy: a copy
+				// is in no bake. @ref [`Ambient`].
+				probed: drawing.lit && self.probes.covers(&placed),
+				first: patch.first,
+				count,
+			};
+
+			if !sight.culling || sight.view.holds(&placed) {
+				strew::pushed(picture, run);
+			}
+
+			if rule.shadows() {
+				strew_casts(sight, &placed, run, casts);
+			}
 		}
 	}
 
@@ -4823,6 +5097,63 @@ fn volumes<'a>(over: impl Iterator<Item = &'a Frustum>, placed: &Placed, from: u
 			mask
 		}
 	})
+}
+
+/// One patch's run into every shadow map that can see it.
+///
+/// @param sight - what this frame can see
+/// @param placed - the patch's box, in the world
+/// @param run - what to add
+/// @param casts - the maps' lists
+fn strew_casts(
+	sight: &Sight,
+	placed: &Placed,
+	run: strew::Run,
+	casts: &mut [Vec<strew::Run>; MAPS],
+) {
+	for (map, list) in casts.iter_mut().enumerate() {
+		if sees(sight, map, placed) {
+			strew::pushed(list, run);
+		}
+	}
+}
+
+/// How a strewn run's material reads its picture's alpha.
+///
+/// Two of the three, because the third is refused: a strewing whose material is
+/// blended draws nothing at all. @ref [`strew`].
+const fn blending(masked: bool) -> Blend { if masked { Blend::Mask } else { Blend::Opaque } }
+
+/// Whether one of the frame's shadow maps can see a box.
+///
+/// A map that is not this frame's - a cascade in a frame with the shadows off,
+/// a tile no lamp asked for - can see nothing. @ref
+/// [`strewn_casts`](Scene::strewn_casts) for why a frame that is not culling
+/// still asks.
+///
+/// @param sight - what this frame can see
+/// @param map - which of the frame's maps: a cascade, then a lamp's tile
+/// @param placed - the box, in the world
+fn sees(sight: &Sight, map: usize, placed: &Placed) -> bool {
+	let volume = match map.checked_sub(CASCADES) {
+		| Some(tile) => sight
+			.faces
+			.get(tile)
+			.filter(|_| tile < sight.maps),
+		| None => sight
+			.cascades
+			.as_ref()
+			.and_then(|boxes| boxes.get(map)),
+	};
+
+	volume.is_some_and(|volume| !sight.culling || volume.holds(placed))
+}
+
+/// How many copies a list of runs draws.
+fn copies(runs: &[strew::Run]) -> usize {
+	runs.iter()
+		.map(|run| usize::try_from(run.count).unwrap_or(0))
+		.sum()
 }
 
 /// How many instances a list of batches draws.
