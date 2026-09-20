@@ -37,7 +37,7 @@ use std::{
 use colby_core::{Result, err, warn};
 
 use crate::{
-	compile,
+	compile, ident,
 	json::{self, Value},
 	level,
 };
@@ -251,9 +251,41 @@ impl Project {
 	#[must_use]
 	pub fn module(&self) -> String { format!("{}_game", self.id) }
 
-	/// The scene the world starts as, if the file names one.
+	/// The scene the world starts as, exactly as the file spells it.
+	///
+	/// Which may be an identity rather than a name. @ref
+	/// [`startup_name`](Self::startup_name) for the one a registry answers to.
 	#[must_use]
 	pub fn startup_scene(&self) -> Option<&str> { self.startup_scene.as_deref() }
+
+	/// The name of the scene the world starts as.
+	///
+	/// The one field of a project file that names an asset, and so the one that
+	/// takes an `id://` - @ref [`ident`](crate::ident). Resolved here rather
+	/// than at the moment the file is read, because a fresh checkout has no
+	/// compiled tree to resolve against yet and the answer is wanted later,
+	/// after a compile has run.
+	///
+	/// An identity nothing answers to comes back as it was written, which is
+	/// then a scene the registry has no entry for and is reported as one. The
+	/// alternative - nothing at all - would start an empty world and say the
+	/// file named no scene, which is not what happened.
+	#[must_use]
+	pub fn startup_name(&self) -> Option<String> {
+		let written = self.startup_scene()?;
+
+		if !ident::Id::spelled(written) {
+			return Some(written.to_owned());
+		}
+
+		let ids = ident::Ids::read(&self.output());
+
+		Some(
+			ident::Id::parse(written)
+				.and_then(|id| ids.name(id))
+				.map_or_else(|| written.to_owned(), str::to_owned),
+		)
+	}
 
 	/// Where an engine mounts this project to build its game crate.
 	///

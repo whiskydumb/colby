@@ -65,8 +65,10 @@ use colby_core::{
 };
 
 use crate::{
-	anim, cube, document, font, format, gltf, html, import, jpeg, level, loc, lua, material,
-	model, obj, png, radiance, scene, script, simplify, skeleton, sound,
+	anim, cube, document, font, format, gltf, html,
+	ident::{self, Ids},
+	import, jpeg, json, level, loc, lua, material, model, obj, png, radiance, scene, script,
+	simplify, skeleton, sound,
 	stamp::{self, Input, Stamps},
 	texture, ttf, wav,
 };
@@ -677,7 +679,7 @@ pub fn source_of(root: &Path, name: &str) -> Option<PathBuf> {
 /// @param output - the file to write; its directory is created
 /// @param root - the source tree, which a document's `<link>` may not leave
 /// @return what the output turned out to be
-pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compiled> {
+pub fn compile_file(source: &Path, output: &Path, root: &Path, ids: &Ids) -> Result<Compiled> {
 	let kind = Kind::of(source)
 		.ok_or_else(|| err!(Asset("{} is not a format the compiler knows", source.display())))?;
 
@@ -758,10 +760,10 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path) -> Result<Compile
 		},
 		| Kind::Script => compile_script(source)?,
 		| Kind::Translation => compile_translation(source)?,
-		| Kind::Material => compile_material(source)?,
-		| Kind::Scene => compile_scene(source)?,
+		| Kind::Material => compile_material(source, ids)?,
+		| Kind::Scene => compile_scene(source, ids)?,
 		| Kind::Model => {
-			let (bytes, produced, said) = compile_model(source, output, root)?;
+			let (bytes, produced, said) = compile_model(source, output, root, ids)?;
 
 			warnings = said;
 
@@ -898,14 +900,19 @@ fn moved(data: &mut MeshData, sidecar: &import::Import) {
 /// @param output - where the `.cmodel` goes; its stem names the directory
 /// @param root - the source tree, which nothing it names may leave
 /// @return the file to write, what is in it, and what could not be used
-fn compile_model(source: &Path, output: &Path, root: &Path) -> Result<Written> {
+fn compile_model(source: &Path, output: &Path, root: &Path, ids: &Ids) -> Result<Written> {
 	let file = gltf::Gltf::open(source, root)?;
 	let imported = gltf::import(&file)?;
 	let stem = asset_name(root, source)?;
 	let directory = output.with_extension("");
 	let guide = import::read_beside(source)?;
-	let sidecar = guide.clone().unwrap_or(import::Import::NONE);
+	let mut sidecar = guide.clone().unwrap_or(import::Import::NONE);
 	let mut warnings = imported.warnings.clone();
+
+	// the one place a sidecar names an asset: what a surface of the file is
+	// really made of. Resolved here rather than where it is read, so that
+	// everything downstream sees the name it always saw.
+	worn(&mut sidecar, source, ids)?;
 
 	drop(fs::remove_dir_all(&directory));
 	fs::create_dir_all(&directory)?;
@@ -1207,6 +1214,135 @@ fn picture_name(
 	}
 }
 
+/// What the pass before a compile worked out about a tree's identities.
+struct Identified {
+	/// Every identity in the tree, both ways round.
+	ids: Ids,
+
+	/// Sources that may not be compiled, because two of them claim one
+	/// identity between them.
+	refused: BTreeSet<PathBuf>,
+}
+
+/// Gives every source in a tree an identity, before anything is compiled.
+///
+/// The pass that has to run first, because what a `.scene` or a `.material`
+/// names by id cannot be resolved until every id in the tree is known - and
+/// because a source compiled in this pass may be the one an earlier source
+/// refers to. @ref [`ident`](crate::ident) for what an identity is for.
+///
+/// **Four things can happen to a source here.** It carries a sidecar nobody
+/// else does, and that is the ordinary case. It carries one somebody else does
+/// too, and it is refused - two files claiming one identity is what copying a
+/// source together with its sidecar looks like, and quietly letting the first
+/// win would leave the second loading as the first for anything that asked by
+/// id. It carries none and the last pass knew one for this exact name, and that
+/// one is written back - a sidecar somebody deleted is restored rather than
+/// replaced, because a new identity would break every file that named the old
+/// one. Or it carries none and nothing remembers it, and one is born - @ref
+/// [`ident::born`].
+///
+/// **A sidecar that cannot be written is said out loud and nothing else.** The
+/// identity still stands for this pass and the tree still compiles; what is
+/// lost is that it will not survive being renamed, since a birth is only
+/// repeatable while the name is the one it was born under. A tree nothing may
+/// be written into therefore works, and works the same way on every machine,
+/// which is what makes a read-only checkout usable at all.
+///
+/// @param root - the source tree
+/// @param found - every source in it, sorted, which is what makes a collision
+/// settle the same way twice
+/// @param before - the table the last pass wrote, for a sidecar that is gone
+/// @param report - where a clash or an unwritable sidecar is put
+fn identify(root: &Path, found: &[PathBuf], before: &Ids, report: &mut Report) -> Identified {
+	let salt = ident::salt(root);
+	let mut ids = Ids::new();
+	let mut refused = BTreeSet::new();
+
+	for source in found {
+		let Ok(name) = asset_name(root, source) else {
+			// no name to register under, which the compile loop reports
+			continue;
+		};
+
+		let carried = match ident::read_beside(source) {
+			| Ok(carried) => carried,
+			| Err(error) => {
+				report
+					.failed
+					.push(Failure { error, source: source.clone() });
+				refused.insert(source.clone());
+
+				continue;
+			},
+		};
+
+		let id =
+			match carried {
+				| Some(id) => id,
+				| None => {
+					let id = restored(&salt, &name, before, &ids);
+
+					if let Err(error) = ident::write_beside(source, id) {
+						report.failed.push(Failure {
+							error: err!(Asset(
+								"{}: {name} could not be given a durable identity: {error}; it \
+								 has 							 one for as long as this tree is not renamed",
+								ident::beside(source).display()
+							)),
+							source: source.clone(),
+						});
+					}
+
+					id
+				},
+			};
+
+		if let Some(held) = ids.put(id, &name) {
+			report.failed.push(Failure {
+				error: err!(
+					Asset(
+						"{id} is carried by {name} and by {held} both; two files cannot share \
+						 one 					 identity, and deleting one of the two {} files gives that \
+						 asset a new one",
+						ident::EXTENSION
+					)
+				),
+				source: source.clone(),
+			});
+			refused.insert(source.clone());
+		}
+	}
+
+	Identified { ids, refused }
+}
+
+/// The identity a source with no sidecar gets.
+///
+/// The last pass's table first, and only for a name that is still the same one:
+/// that is a sidecar deleted or never checked in, and the table remembers what
+/// it held. A name the table does not know, or one whose identity something
+/// else in this tree already carries, is born instead.
+///
+/// @param salt - the project's id
+/// @param name - the asset name
+/// @param before - the table the last pass wrote
+/// @param taken - what this pass has handed out so far
+fn restored(salt: &str, name: &str, before: &Ids, taken: &Ids) -> ident::Id {
+	if let Some(id) = before.id(name)
+		&& !taken.holds(id)
+	{
+		return id;
+	}
+
+	// nought means "no identity", so it is taken by definition; it comes up as
+	// often as any other draw and costs one more attempt when it does.
+	(0..u32::MAX)
+		.map(|attempt| ident::born(salt, name, attempt))
+		.find(|id| !id.is_none() && !taken.holds(*id))
+		.unwrap_or_default()
+}
+
 /// Compiles a whole source tree.
 ///
 /// One source that cannot be read lands in [`Report::failed`] and the rest are
@@ -1234,7 +1370,32 @@ pub fn compile_dir(root: &Path, out: &Path, force: bool) -> Result<Report> {
 	let mut stamps = Stamps::read(out);
 	let mut filed = BTreeSet::new();
 
-	for source in sources(root)? {
+	let found = sources(root)?;
+	let before = Ids::read(out);
+	let Identified { ids, refused } = identify(root, &found, &before, &mut report);
+
+	// only when it moved, because this runs four times a second under the
+	// runner and a file rewritten that often is a file whose time says nothing.
+	// The same care the stamps beside it take, and for the same reason.
+	if ids != before
+		&& let Err(error) = ids.write(out)
+	{
+		let file = out.join(ident::FILE);
+
+		report.failed.push(Failure {
+			error: err!(Asset(
+				"{}: the identities could not be written down: {error}",
+				file.display()
+			)),
+			source: file,
+		});
+	}
+
+	for source in found {
+		if refused.contains(&source) {
+			continue;
+		}
+
 		let output = output_path(root, out, &source)?;
 
 		// two pictures under one name would quietly overwrite each other, and a
@@ -1256,7 +1417,7 @@ pub fn compile_dir(root: &Path, out: &Path, force: bool) -> Result<Report> {
 
 		let name = stamp::key(out, &output);
 
-		if !force && !is_stale(&source, &output, root, &stamps, &name) {
+		if !force && !is_stale(&source, &output, root, &stamps, &name, &ids) {
 			report.unchanged += 1;
 			filed.insert(name);
 
@@ -1267,9 +1428,9 @@ pub fn compile_dir(root: &Path, out: &Path, force: bool) -> Result<Report> {
 		// edited while it is being compiled then carries a time that is not
 		// the one written down, and the next pass builds it again; taking the
 		// times afterwards would file the new time against the old contents.
-		let read = inputs(&source, root);
+		let read = inputs(&source, root, &ids);
 
-		match compile_file(&source, &output, root) {
+		match compile_file(&source, &output, root, &ids) {
 			| Ok(mut compiled) => {
 				compiled.name = asset_name(root, &source)?;
 				report.compiled.push(compiled);
@@ -1365,7 +1526,15 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
 /// @param root - the source tree
 /// @param stamps - what the pass that built it wrote down
 /// @param filed - the output's name in those stamps, from @ref [`stamp::key`]
-fn is_stale(source: &Path, output: &Path, root: &Path, stamps: &Stamps, filed: &str) -> bool {
+/// @param ids - every identity in the tree, for what a source names by one
+fn is_stale(
+	source: &Path,
+	output: &Path,
+	root: &Path,
+	stamps: &Stamps,
+	filed: &str,
+	ids: &Ids,
+) -> bool {
 	if !output.is_file() {
 		return true;
 	}
@@ -1382,7 +1551,7 @@ fn is_stale(source: &Path, output: &Path, root: &Path, stamps: &Stamps, filed: &
 		return true;
 	}
 
-	!stamps.matches(filed, &inputs(source, root))
+	!stamps.matches(filed, &inputs(source, root, ids))
 }
 
 /// Every file compiling one source reads.
@@ -1396,12 +1565,12 @@ fn is_stale(source: &Path, output: &Path, root: &Path, stamps: &Stamps, filed: &
 /// @param source - the file to compile
 /// @param root - the source tree
 /// @return what to write down beside whatever it compiles to
-fn inputs(source: &Path, root: &Path) -> Vec<Input> {
+fn inputs(source: &Path, root: &Path, ids: &Ids) -> Vec<Input> {
 	let mut read = vec![Input::of(source, root)];
 
 	if let Some(kind) = Kind::of(source) {
 		read.extend(
-			extra_inputs(source, kind, root)
+			extra_inputs(source, kind, root, ids)
 				.iter()
 				.map(|path| Input::of(path, root)),
 		);
@@ -1450,7 +1619,7 @@ fn beside_is_stale(output: &Path) -> bool {
 /// whole answer - the `GUIDED` mark in the output is the file's own record of
 /// how it was built and nothing in the sweep reads it. @ref
 /// [`crate::format::GUIDED`].
-fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
+fn extra_inputs(source: &Path, kind: Kind, root: &Path, ids: &Ids) -> Vec<PathBuf> {
 	let mut found = match kind {
 		| Kind::Document => {
 			let Ok(text) = fs::read_to_string(source) else {
@@ -1463,7 +1632,14 @@ fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
 			// what making it one bought.
 			document::stylesheets(source, &text, root)
 		},
-		| Kind::Model => gltf::linked(source, root),
+		| Kind::Model => {
+			let mut linked = gltf::linked(source, root);
+
+			linked.extend(named_by_id(&import::beside(source), root, ids));
+
+			linked
+		},
+		| Kind::Scene | Kind::Material => named_by_id(source, root, ids),
 		| _ => Vec::new(),
 	};
 
@@ -1476,6 +1652,69 @@ fn extra_inputs(source: &Path, kind: Kind, root: &Path) -> Vec<PathBuf> {
 	}
 
 	found
+}
+
+/// Resolves the materials an import sidecar names, from identities to names.
+///
+/// The `.model` beside a `.gltf` maps the name the file gave a surface to the
+/// asset name of a material to wear instead, and that second half is a
+/// reference like any other - so it takes either spelling, and a rename carries
+/// it. The block a scene may have is not offered here: a sidecar holds at most
+/// a handful of these and a table of ids above a table of names would be two
+/// tables for four lines.
+///
+/// @param sidecar - what the file beside the model said, to change in place
+/// @param source - the model, for the message
+/// @param ids - every identity in the tree
+fn worn(sidecar: &mut import::Import, source: &Path, ids: &Ids) -> Result<()> {
+	let by = ident::Resolve::over(ids);
+
+	for (_, wears) in &mut sidecar.materials {
+		*wears = by
+			.name(wears)
+			.map_err(|error| err!(Asset("{}: {error}", import::beside(source).display())))?;
+	}
+
+	Ok(())
+}
+
+/// The id sidecars of everything a source names by identity.
+///
+/// **This is how a rename reaches the scenes that have to be built again.** A
+/// scene naming `meshes/crystal` by id has that mesh's `.id` in its input list;
+/// rename the mesh and the list holds a different path, which is a change by
+/// the one rule the sweep has - @ref [`extra_inputs`] for the same argument
+/// made about an import sidecar. So the scene is compiled again, the id
+/// resolves to the new name, and the `.cscene` comes out naming it.
+///
+/// The **sidecar** rather than the source it stands beside, and that is the
+/// point: a sidecar's contents change only when somebody edits an identity by
+/// hand, so editing the mesh itself does not drag every scene that draws it
+/// through the compiler. Its *path* is what carries the rename.
+///
+/// A file that cannot be read or is not JSON gives nothing. Both are a source
+/// that is about to fail to compile for a better reason, and saying so twice
+/// would put a parse error in the staleness sweep, which runs four times a
+/// second and has nowhere to report one.
+///
+/// @param source - the `.scene` or `.material`
+/// @param root - the source tree
+/// @param ids - every identity in the tree, as the pass before this worked out
+fn named_by_id(source: &Path, root: &Path, ids: &Ids) -> Vec<PathBuf> {
+	let Ok(text) = fs::read_to_string(source) else {
+		return Vec::new();
+	};
+
+	let Ok(parsed) = json::parse(&text) else {
+		return Vec::new();
+	};
+
+	ident::referenced(&parsed)
+		.into_iter()
+		.filter_map(|id| ids.name(id))
+		.filter_map(|name| source_of(root, name))
+		.map(|path| ident::beside(&path))
+		.collect()
 }
 
 /// Turns one `.lua` into the bytes of a `.clua`.
@@ -1517,8 +1756,8 @@ fn compile_translation(source: &Path) -> Result<(Vec<u8>, Produced)> {
 ///
 /// @param source - the `.scene`, in the source tree
 /// @return the file to write and what to report about it
-fn compile_scene(source: &Path) -> Result<(Vec<u8>, Produced)> {
-	let data = level::import(&fs::read_to_string(source)?)
+fn compile_scene(source: &Path, ids: &Ids) -> Result<(Vec<u8>, Produced)> {
+	let data = level::import_with(&fs::read_to_string(source)?, ids)
 		.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 	let bytes =
 		scene::encode(&data).map_err(|error| err!(Asset("{}: {error}", source.display())))?;
@@ -1539,8 +1778,8 @@ fn compile_scene(source: &Path) -> Result<(Vec<u8>, Produced)> {
 ///
 /// @param source - the `.material`, in the source tree
 /// @return the file to write and what to report about it
-fn compile_material(source: &Path) -> Result<(Vec<u8>, Produced)> {
-	let coat = material::import(&fs::read_to_string(source)?)
+fn compile_material(source: &Path, ids: &Ids) -> Result<(Vec<u8>, Produced)> {
+	let coat = material::import_with(&fs::read_to_string(source)?, ids)
 		.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 	let named = [&coat.albedo, &coat.normal, &coat.finish, &coat.occlusion, &coat.glow]
 		.iter()
@@ -2896,6 +3135,273 @@ FORMAT=32-bit_rle_rgbe
 
 		drop(fs::remove_dir_all(&workspace));
 	}
+
+	/// The compiled scene of a fixture, as bytes.
+	fn cscene(workspace: &Path, name: &str) -> Vec<u8> {
+		let path = output_root(workspace)
+			.join(name)
+			.with_extension(scene::EXTENSION);
+
+		fs::read(&path).unwrap_or_else(|error| panic!("{} is there: {error}", path.display()))
+	}
+
+	/// What the one entity of a compiled scene says it is made of.
+	fn drawn(workspace: &Path, name: &str) -> String {
+		let path = output_root(workspace)
+			.join(name)
+			.with_extension(scene::EXTENSION);
+		let file = scene::SceneFile::open(&path).expect("it reads back");
+
+		file.to_scene_data().things[0].mesh.clone()
+	}
+
+	/// A fixture with a mesh and two scenes drawing it - one naming it by
+	/// identity and one by name - with the identity read off the first pass.
+	fn two_ways(name: &str) -> (PathBuf, ident::Id) {
+		let workspace = workspace(name);
+		let source = put(&workspace, "meshes/crystal.obj", CUBE_OBJ);
+
+		put(
+			&workspace,
+			"scenes/by_name.scene",
+			r#"{ "entities": [ { "name": "it", "mesh": "meshes/crystal" } ] }"#,
+		);
+		run(&workspace, false);
+
+		let id = ident::read_beside(&source)
+			.expect("the sidecar reads")
+			.expect("and there is one");
+
+		put(
+			&workspace,
+			"scenes/by_id.scene",
+			&format!(r#"{{ "entities": [ {{ "name": "it", "mesh": "{id}" }} ] }}"#),
+		);
+		run(&workspace, false);
+
+		(workspace, id)
+	}
+
+	/// Renames a source, and its id sidecar with it or not.
+	fn rename(workspace: &Path, from: &str, to: &str, sidecar: bool) {
+		let root = source_root(workspace);
+		let was = root.join(from);
+		let now = root.join(to);
+
+		if sidecar {
+			fs::rename(ident::beside(&was), ident::beside(&now)).expect("the sidecar moves");
+		} else {
+			fs::remove_file(ident::beside(&was)).expect("the sidecar is dropped");
+		}
+
+		fs::rename(&was, &now).expect("the source moves");
+	}
+
+	#[test]
+	fn every_source_is_given_an_identity_on_the_first_pass() {
+		let workspace = workspace("ident-born");
+		let source = put(&workspace, "meshes/crystal.obj", CUBE_OBJ);
+
+		assert!(!ident::beside(&source).is_file(), "it has none to start");
+
+		run(&workspace, false);
+
+		let id = ident::read_beside(&source)
+			.expect("the sidecar reads")
+			.expect("and one was written");
+		let ids = Ids::read(&output_root(&workspace));
+
+		assert_eq!(ids.name(id), Some("meshes/crystal"), "and the table knows what it is");
+		assert_eq!(ids.len(), 1, "one source, one line");
+	}
+
+	#[test]
+	fn two_passes_over_one_fresh_tree_agree_about_every_identity() {
+		let first = workspace("ident-twice-a");
+		let second = workspace("ident-twice-b");
+
+		for workspace in [&first, &second] {
+			put(workspace, "meshes/crystal.obj", CUBE_OBJ);
+			put(workspace, "meshes/wall.obj", QUAD_OBJ);
+			run(workspace, false);
+		}
+
+		let table = |workspace: &Path| {
+			fs::read_to_string(output_root(workspace).join(ident::FILE)).expect("it is written")
+		};
+
+		assert_eq!(table(&first), table(&second), "two trees, the same identities");
+		assert!(table(&first).lines().count() > 2, "and there are some to compare");
+	}
+
+	#[test]
+	fn a_scene_naming_a_mesh_by_identity_compiles_naming_it_by_name() {
+		let (workspace, _) = two_ways("ident-by-id");
+
+		assert_eq!(drawn(&workspace, "scenes/by_id"), "meshes/crystal", "the id resolved");
+		assert_eq!(
+			cscene(&workspace, "scenes/by_id"),
+			cscene(&workspace, "scenes/by_name"),
+			"and the two scenes are byte for byte one scene"
+		);
+	}
+
+	#[test]
+	fn renaming_a_source_with_its_sidecar_carries_every_scene_that_named_it() {
+		let (workspace, id) = two_ways("ident-rename");
+		let before = cscene(&workspace, "scenes/by_id");
+
+		rename(&workspace, "meshes/crystal.obj", "meshes/gem.obj", true);
+		run(&workspace, false);
+
+		assert_eq!(
+			Ids::read(&output_root(&workspace)).name(id),
+			Some("meshes/gem"),
+			"the identity followed the file"
+		);
+		assert_eq!(drawn(&workspace, "scenes/by_id"), "meshes/gem", "and so did the scene");
+		assert_ne!(cscene(&workspace, "scenes/by_id"), before, "which is a scene that moved");
+	}
+
+	#[test]
+	fn renaming_a_source_leaves_a_scene_that_named_it_by_name_pointing_at_nothing() {
+		let (workspace, _) = two_ways("ident-rename-control");
+		let before = cscene(&workspace, "scenes/by_name");
+
+		rename(&workspace, "meshes/crystal.obj", "meshes/gem.obj", true);
+		run(&workspace, false);
+
+		assert_eq!(
+			cscene(&workspace, "scenes/by_name"),
+			before,
+			"a name does not follow anything: byte for byte the scene it was"
+		);
+		assert_eq!(
+			drawn(&workspace, "scenes/by_name"),
+			"meshes/crystal",
+			"and it still names the mesh that is no longer there"
+		);
+	}
+
+	#[test]
+	fn renaming_a_source_without_its_sidecar_loses_the_identity_and_the_scene_with_it() {
+		let (workspace, id) = two_ways("ident-rename-blind");
+
+		rename(&workspace, "meshes/crystal.obj", "meshes/gem.obj", false);
+
+		let report = run(&workspace, false);
+		let failed = report
+			.failed
+			.iter()
+			.find(|failure| failure.source.ends_with("by_id.scene"))
+			.expect("the scene naming it cannot be compiled");
+
+		assert!(
+			failed.error.to_string().contains(&id.to_string()),
+			"and the message says which identity is gone: {}",
+			failed.error
+		);
+		assert_eq!(
+			Ids::read(&output_root(&workspace)).name(id),
+			None,
+			"nothing carries it any more"
+		);
+	}
+
+	#[test]
+	fn two_sources_carrying_one_identity_are_refused_rather_than_one_of_them_winning() {
+		let workspace = workspace("ident-clash");
+		let first = put(&workspace, "meshes/crystal.obj", CUBE_OBJ);
+
+		run(&workspace, false);
+
+		let id = ident::read_beside(&first)
+			.expect("the sidecar reads")
+			.expect("and there is one");
+		let second = put(&workspace, "meshes/gem.obj", QUAD_OBJ);
+
+		ident::write_beside(&second, id).expect("the sidecar is copied with the file");
+
+		let report = run(&workspace, false);
+		let failed = report
+			.failed
+			.iter()
+			.find(|failure| failure.source.ends_with("gem.obj"))
+			.expect("the second is refused");
+
+		assert!(
+			failed
+				.error
+				.to_string()
+				.contains("meshes/crystal"),
+			"and the message names who holds it: {}",
+			failed.error
+		);
+		assert!(
+			!output_root(&workspace)
+				.join("meshes/gem.cmesh")
+				.is_file(),
+			"and it did not compile"
+		);
+	}
+
+	#[test]
+	fn a_deleted_sidecar_is_restored_rather_than_replaced() {
+		// **after a rename, and that is the whole test.** A sidecar deleted
+		// under the name its id was born with is restored by a birth just as
+		// well as by the table, because a birth is a function of the name - so
+		// a fixture that only deletes one proves nothing. This one renames
+		// first, which leaves the file carrying an id no birth would ever draw
+		// for it again.
+		let (workspace, id) = two_ways("ident-restored");
+
+		rename(&workspace, "meshes/crystal.obj", "meshes/gem.obj", true);
+		run(&workspace, false);
+
+		let source = source_root(&workspace).join("meshes/gem.obj");
+
+		assert_ne!(
+			ident::born(&ident::salt(&source_root(&workspace)), "meshes/gem", 0),
+			id,
+			"nothing would give this file this identity twice"
+		);
+
+		fs::remove_file(ident::beside(&source)).expect("the sidecar is deleted");
+		run(&workspace, false);
+
+		assert_eq!(
+			ident::read_beside(&source).expect("it reads"),
+			Some(id),
+			"the table remembered what the file lost"
+		);
+		assert_eq!(drawn(&workspace, "scenes/by_id"), "meshes/gem", "and the scene still has it");
+	}
+
+	#[test]
+	fn a_material_names_its_pictures_by_identity_too() {
+		let workspace = workspace("ident-material");
+		let picture = source_root(&workspace).join("maps/brass.png");
+
+		fs::create_dir_all(picture.parent().expect("it has one")).expect("the directory is made");
+		fs::write(&picture, RGB_QUAD).expect("a picture is written");
+		run(&workspace, false);
+
+		let id = ident::read_beside(&picture)
+			.expect("the sidecar reads")
+			.expect("and there is one");
+
+		put(&workspace, "materials/brass.material", &format!(r#"{{ "albedo": "{id}" }}"#));
+		run(&workspace, false);
+
+		let path = output_root(&workspace).join("materials/brass.cmat");
+		let file = material::MaterialFile::open(&path).expect("it is there and reads");
+
+		assert_eq!(
+			file.to_material("materials/brass").albedo,
+			"maps/brass",
+			"the id resolved to the picture's name"
+		);
+	}
 }
 
 #[cfg(test)]
@@ -3812,6 +4318,55 @@ mod model_tests {
 		// a mesh of several primitives is numbered, so the panel is two
 		assert!(piece(&dir, "panel_0").is_file(), "and the rest of the model still is");
 		assert!(piece(&dir, "arm_mirrored").is_file(), "the mirrored copy among it");
+
+		drop(fs::remove_dir_all(&dir));
+	}
+
+	#[test]
+	fn a_remapped_material_may_be_named_by_identity_and_is_carried_by_a_rename() {
+		let dir = workspace("guide-material-id");
+
+		put(&dir, "models/lamp.glb", PACKED);
+		put(&dir, "materials/brass.material", br#"{ "roughness": 0.2 }"#);
+		run(&dir, false);
+
+		let source = source_root(&dir).join("materials/brass.material");
+		let id = ident::read_beside(&source)
+			.expect("the sidecar reads")
+			.expect("and there is one");
+
+		guide(&dir, "models/lamp.glb", &format!(r#"{{ "materials": {{ "brass": "{id}" }} }}"#));
+		run(&dir, false);
+
+		let wears = |dir: &Path| {
+			compiled(dir)
+				.placements
+				.iter()
+				.map(|placement| placement.material.clone())
+				.collect::<Vec<String>>()
+		};
+
+		assert!(
+			wears(&dir)
+				.iter()
+				.any(|worn| worn == "materials/brass"),
+			"the id resolved"
+		);
+
+		// and the material is renamed, its identity with it
+		let now = source_root(&dir).join("materials/latten.material");
+
+		fs::rename(ident::beside(&source), ident::beside(&now)).expect("the sidecar moves");
+		fs::rename(&source, &now).expect("and the source");
+		run(&dir, false);
+
+		assert!(
+			wears(&dir)
+				.iter()
+				.any(|worn| worn == "materials/latten"),
+			"and the model was built again, wearing what the identity is now called: {:?}",
+			wears(&dir)
+		);
 
 		drop(fs::remove_dir_all(&dir));
 	}

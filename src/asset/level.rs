@@ -100,6 +100,7 @@ use colby_core::{
 
 use crate::{
 	bytes::count,
+	ident::{self, Ids, Resolve},
 	json::{self, Value},
 };
 
@@ -150,6 +151,10 @@ const RENAMED: &[(&str, &str)] = &[
 
 /// Reads a scene out of the text somebody wrote.
 ///
+/// Every asset it names is taken as written, which is what a file outside a
+/// project means: an `id://` in one is an error, because nothing here can say
+/// what it stands for. @ref [`import_with`] for the way the compiler reads one.
+///
 /// @param text - the whole `.scene` file
 /// @return the description, ready to be written as a `.cscene`
 ///
@@ -158,10 +163,31 @@ const RENAMED: &[(&str, &str)] = &[
 /// If the text is not JSON, holds a field this build does not know or a value
 /// of the wrong kind, names something nothing answers to, or names one thing
 /// twice.
-pub fn import(text: &str) -> Result<SceneData> {
-	let root = json::parse(text)?;
-	fields(&root, &["stage", "entities", "bodies", "joints", "poses"], "the scene")?;
+pub fn import(text: &str) -> Result<SceneData> { import_with(text, &Ids::new()) }
 
+/// Reads a scene, resolving every asset it names by identity.
+///
+/// The compiler's way in. What comes back holds **names** wherever the file
+/// held an id, so nothing downstream of here - the `.cscene`, the registries,
+/// the world - learns that identities exist at all. @ref
+/// [`ident`](crate::ident).
+///
+/// @param text - the whole `.scene` file
+/// @param ids - every id in the project
+/// @return the description, ready to be written as a `.cscene`
+///
+/// # Errors
+///
+/// Everything [`import`] refuses, and an id nothing in the project carries.
+pub fn import_with(text: &str, ids: &Ids) -> Result<SceneData> {
+	let root = json::parse(text)?;
+	fields(
+		&root,
+		&[ident::BLOCK, "stage", "entities", "bodies", "joints", "poses"],
+		"the scene",
+	)?;
+
+	let by = Resolve::with(ids, ident::block(&root)?);
 	let posed = poses(root.get("poses"))?;
 	let things = entities(root.get("entities"), &posed)?;
 	let solids = bodies(root.get("bodies"), &things)?;
@@ -175,7 +201,7 @@ pub fn import(text: &str) -> Result<SceneData> {
 		probe_grid,
 	} = stage(root.get("stage"))?;
 
-	Ok(SceneData {
+	let mut data = SceneData {
 		stage,
 		sky_cubemap,
 		lightmap,
@@ -196,7 +222,49 @@ pub fn import(text: &str) -> Result<SceneData> {
 		arena: None,
 		player_arenas: Vec::new(),
 		peer_generations: Vec::new(),
-	})
+	};
+
+	resolved(&mut data, &by)?;
+
+	Ok(data)
+}
+
+/// Turns every asset a scene refers to into the name it stands for.
+///
+/// **The seven places a scene names an asset**, and the list is worth having in
+/// one function rather than spread through the readers: what an entity is made
+/// of and what it wears, the picture an emitter throws, the mesh a body is
+/// shaped like, the skeleton behind a pose, and the three the settings hold -
+/// the sky's environment, the light a bake kept and the picture its probes are
+/// in. Everything else a scene holds either names nothing or names something
+/// inside the file.
+///
+/// A record's field cannot name an asset at all: a reference has no spelling of
+/// its own and is left out of what a record writes down, so nothing here has to
+/// walk the jots. @ref `colby_core::abi::field::Kind::is_reference`.
+///
+/// @param data - the scene as it was read
+/// @param by - the file's block over the project's table
+fn resolved(data: &mut SceneData, by: &Resolve<'_>) -> Result<()> {
+	for thing in &mut data.things {
+		thing.mesh = by.name(&thing.mesh)?;
+		thing.material = by.name(&thing.material)?;
+		thing.emitter_texture = by.name(&thing.emitter_texture)?;
+	}
+
+	for solid in &mut data.solids {
+		solid.shape.mesh = by.name(&solid.shape.mesh)?;
+	}
+
+	for posed in &mut data.posed {
+		posed.skeleton = by.name(&posed.skeleton)?;
+	}
+
+	data.sky_cubemap = by.name(&data.sky_cubemap)?;
+	data.lightmap = by.name(&data.lightmap)?;
+	data.probes = by.name(&data.probes)?;
+
+	Ok(())
 }
 
 /// Refuses a field this build does not know, in a flat object.
@@ -1096,7 +1164,7 @@ pub(crate) fn check(
 }
 
 /// The error for a key nothing knows, with the new word beside an old one.
-fn unknown(what: &str, key: &str) -> colby_core::Error {
+pub(crate) fn unknown(what: &str, key: &str) -> colby_core::Error {
 	match RENAMED.iter().find(|(old, _)| *old == key) {
 		| Some((_, now)) => err!(Asset("{what} has no field called {key}; it is {now} now")),
 		| None => err!(Asset("{what} has no field called {key}")),
@@ -1381,7 +1449,28 @@ fn number(value: Option<&Value>, default: f32) -> f32 {
 ///
 /// If the description holds a number JSON has no spelling for - an infinity or
 /// a nan, which is what a world that has blown up is full of.
-pub fn export(scene: &SceneData) -> Result<String> {
+pub fn export(scene: &SceneData) -> Result<String> { export_with(scene, &Ids::new()) }
+
+/// Writes a scene source, naming the identity behind every asset it refers to.
+///
+/// The block goes at the top and the body keeps naming things by name - @ref
+/// [`ident::block`](crate::ident::block) for why round that way. What comes out
+/// reads exactly as it did before identities existed, and survives every one of
+/// its assets being renamed.
+///
+/// An asset the table knows nothing about is left out of the block, which is a
+/// reference by name and the behavior of every file written before this
+/// existed. That covers a name nothing answers to and a world captured from a
+/// running game whose assets came from somewhere the compiler never walked.
+///
+/// @param scene - the world to write down
+/// @param ids - every identity in the project
+/// @return the text, or why it could not be written
+///
+/// # Errors
+///
+/// Everything [`export`] refuses.
+pub fn export_with(scene: &SceneData, ids: &Ids) -> Result<String> {
 	let thing_names = named(
 		&scene.things,
 		|thing| thing.name.as_str(),
@@ -1439,6 +1528,7 @@ pub fn export(scene: &SceneData) -> Result<String> {
 	// written by whatever knows there is a next one. A trailing one is the
 	// single thing JSON refuses that is easy to write by accident.
 	let parts: Vec<String> = [
+		carried(scene, ids),
 		stage_of(scene)?,
 		block("entities", &things),
 		block("bodies", &solids),
@@ -2147,6 +2237,69 @@ fn at_index(names: &[String], index: u32) -> String {
 }
 
 /// A list of records under a name, one to a line, or nothing if there are none.
+/// The block naming the identity behind every asset the scene refers to.
+///
+/// The seven places a scene names one - the same list [`resolved`] reads - each
+/// looked up in the project's table, sorted, and written as a table of its own
+/// at the top of the file. Nothing at all when none of them is an asset the
+/// table knows, which is what a scene written outside a project comes to.
+///
+/// @param scene - the world being written down
+/// @param ids - every identity in the project
+fn carried(scene: &SceneData, ids: &Ids) -> Option<String> {
+	let mut named: Vec<(&str, ident::Id)> = scene
+		.things
+		.iter()
+		.flat_map(|thing| {
+			[thing.mesh.as_str(), thing.material.as_str(), thing.emitter_texture.as_str()]
+		})
+		.chain(
+			scene
+				.solids
+				.iter()
+				.map(|solid| solid.shape.mesh.as_str()),
+		)
+		.chain(
+			scene
+				.posed
+				.iter()
+				.map(|posed| posed.skeleton.as_str()),
+		)
+		.chain([scene.sky_cubemap.as_str(), scene.lightmap.as_str(), scene.probes.as_str()])
+		.filter_map(|name| Some((name, ids.id(name)?)))
+		.collect();
+
+	named.sort_unstable();
+	named.dedup();
+
+	if named.is_empty() {
+		return None;
+	}
+
+	let mut out = String::new();
+
+	out.push_str("\t\"");
+	out.push_str(ident::BLOCK);
+	out.push_str("\": {\n");
+
+	for (index, (name, id)) in named.iter().enumerate() {
+		out.push_str("\t\t");
+		out.push_str(&as_text(name));
+		out.push_str(": ");
+		out.push_str(&as_text(&id.to_string()));
+
+		if index + 1 < named.len() {
+			out.push(',');
+		}
+
+		out.push('\n');
+	}
+
+	out.push_str("\t}");
+
+	Some(out)
+}
+
 fn block(name: &str, records: &[String]) -> Option<String> {
 	if records.is_empty() {
 		return None;
@@ -4024,5 +4177,110 @@ mod tests {
 				field.name
 			);
 		}
+	}
+
+	/// A table holding one mesh, under whatever name it is asked for.
+	fn table(name: &str) -> (Ids, ident::Id) {
+		let id = ident::born("yard", "meshes/crystal", 0);
+		let mut ids = Ids::new();
+
+		ids.put(id, name);
+
+		(ids, id)
+	}
+
+	#[test]
+	fn a_source_written_with_a_block_reads_back_as_the_same_world() {
+		let (ids, id) = table("meshes/crystal");
+		let text = r#"{ "entities": [ { "name": "it", "mesh": "meshes/crystal" } ] }"#;
+		let data = import_with(text, &ids).expect("it reads");
+		let written = export_with(&data, &ids).expect("and writes");
+
+		assert!(written.contains(&id.to_string()), "the block names the identity: {written}");
+		assert!(
+			written.contains(r#""mesh": "meshes/crystal""#),
+			"and the body still names the name: {written}"
+		);
+		assert_eq!(
+			import_with(&written, &ids).expect("it reads back"),
+			data,
+			"as the same world"
+		);
+	}
+
+	#[test]
+	fn a_block_written_before_a_rename_finds_the_asset_after_one() {
+		let (ids, _) = table("meshes/crystal");
+		let text = r#"{ "entities": [ { "name": "it", "mesh": "meshes/crystal" } ] }"#;
+		let data = import_with(text, &ids).expect("it reads");
+		let written = export_with(&data, &ids).expect("and writes");
+
+		// the file is not touched again; the asset is renamed under it
+		let (moved, _) = table("meshes/gem");
+		let after = import_with(&written, &moved).expect("and reads with the table it has now");
+
+		assert_eq!(after.things[0].mesh, "meshes/gem", "the block carried the reference");
+		assert_ne!(after, data, "which is a world that changed without the file changing");
+	}
+
+	#[test]
+	fn a_scene_whose_assets_nothing_knows_is_written_without_a_block() {
+		let text = r#"{ "entities": [ { "name": "it", "mesh": "meshes/crystal" } ] }"#;
+		let data = import(text).expect("it reads");
+		let written = export(&data).expect("and writes");
+
+		assert!(
+			!written.contains(ident::BLOCK),
+			"a source written outside a project is the source it always was: {written}"
+		);
+		assert_eq!(import(&written).expect("and reads back"), data, "as the same world");
+	}
+
+	#[test]
+	fn a_body_a_pose_and_the_settings_name_assets_by_identity_too() {
+		let mut ids = Ids::new();
+		let mesh = ident::born("yard", "meshes/floor", 0);
+		let rig = ident::born("yard", "models/hero/rig", 0);
+		let sky = ident::born("yard", "skies/dusk", 0);
+
+		ids.put(mesh, "meshes/floor");
+		ids.put(rig, "models/hero/rig");
+		ids.put(sky, "skies/dusk");
+
+		let text = format!(
+			r#"{{
+				"stage": {{ "sky": {{ "cubemap": "{sky}" }} }},
+				"poses": [ {{ "name": "hero", "skeleton": "{rig}" }} ],
+				"entities": [ {{ "name": "it" }} ],
+				"bodies": [ {{ "name": "it", "entity": "it",
+				               "shape": {{ "kind": "mesh", "mesh": "{mesh}" }} }} ]
+			}}"#
+		);
+		let data = import_with(&text, &ids).expect("it reads");
+
+		assert_eq!(data.solids[0].shape.mesh, "meshes/floor", "a body's shape resolved");
+		assert_eq!(data.posed[0].skeleton, "models/hero/rig", "a pose's skeleton resolved");
+		assert_eq!(data.sky_cubemap, "skies/dusk", "and the sky's environment");
+	}
+
+	#[test]
+	fn an_identity_nothing_carries_stops_a_scene_being_read() {
+		let id = ident::born("yard", "meshes/crystal", 0);
+		let text = format!(r#"{{ "entities": [ {{ "mesh": "{id}" }} ] }}"#);
+		let error = import_with(&text, &Ids::new()).expect_err("it is refused");
+
+		assert!(error.to_string().contains(&id.to_string()), "and says which: {error}");
+	}
+
+	#[test]
+	fn the_block_is_a_key_a_scene_may_have_and_nothing_else_is() {
+		let (ids, id) = table("meshes/crystal");
+		let good = format!(r#"{{ "{}": {{ "meshes/crystal": "{id}" }} }}"#, ident::BLOCK);
+
+		assert!(import_with(&good, &ids).is_ok(), "the block is known");
+
+		let error = import(r#"{ "bits": {} }"#).expect_err("and nothing else is");
+
+		assert!(error.to_string().contains("bits"), "the message names it: {error}");
 	}
 }

@@ -783,11 +783,11 @@ impl Opening {
 /// obligation every restore leaves and here nothing yet
 /// @param project - whose file may name a scene
 fn start(world: &mut World, simulation: &mut Simulation, project: &Project) -> Result {
-	let Some(name) = project.startup_scene() else {
+	let Some(name) = project.startup_name() else {
 		return Ok(());
 	};
 
-	let id = world.scenes.find(name);
+	let id = world.scenes.find(&name);
 
 	if !id.is_some() {
 		return Err(err!(Asset(

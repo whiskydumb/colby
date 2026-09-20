@@ -39,7 +39,7 @@ use std::{
 
 #[cfg(test)]
 use colby_asset::AlignedBytes;
-use colby_asset::{Project, import, level, material, obj, scene as file};
+use colby_asset::{Project, ident::Ids, import, level, material, obj, scene as file};
 use colby_core::{
 	Result,
 	abi::{Asked, World, scene},
@@ -323,7 +323,7 @@ fn load(world: &mut World, simulation: &mut Simulation, project: &Project, name:
 fn write(world: &World, project: &Project, name: &str) -> Result {
 	let path = source(&project.assets(), name)?;
 	let existed = path.exists();
-	let bytes = written(world, &path)?;
+	let bytes = written(world, &path, &Ids::read(&project.output()))?;
 
 	info!(
 		path = %path.display(),
@@ -370,7 +370,7 @@ fn prop(world: &World, project: &Project, name: &str) -> Result {
 
 	let existed = path.exists();
 	let piece = world.scenes.data(id);
-	let text = level::export(piece)?;
+	let text = level::export_with(piece, &Ids::read(&project.output()))?;
 
 	if let Some(directory) = path.parent() {
 		fs::create_dir_all(directory)?;
@@ -403,14 +403,16 @@ fn prop(world: &World, project: &Project, name: &str) -> Result {
 ///
 /// @param world - what to write
 /// @param path - where to put it
+/// @param ids - every identity in the project, for the block at the top of the
+/// file; an empty table writes a source that names everything by name
 /// @return how many bytes were written
 ///
 /// # Errors
 ///
 /// If the world holds a number JSON cannot write, or the directory or the file
 /// cannot be written.
-pub(crate) fn written(world: &World, path: &Path) -> Result<usize> {
-	let text = level::export(&scene::capture(world))?;
+pub(crate) fn written(world: &World, path: &Path, ids: &Ids) -> Result<usize> {
+	let text = level::export_with(&scene::capture(world), ids)?;
 
 	if let Some(directory) = path.parent() {
 		fs::create_dir_all(directory)?;
@@ -924,7 +926,7 @@ mod tests {
 		// anything. What is under test includes making the directory.
 		drop(fs::remove_dir_all(&inside));
 
-		let bytes = written(&world, &path).expect("it is written");
+		let bytes = written(&world, &path, &Ids::new()).expect("it is written");
 		let text = fs::read_to_string(&path).expect("and read back");
 
 		assert_eq!(bytes, text.len(), "what was reported is what landed");
@@ -953,11 +955,11 @@ mod tests {
 		drop(fs::remove_dir_all(&inside));
 
 		assert!(!path.exists(), "there is nothing there to start with");
-		written(&world, &path).expect("it is written");
+		written(&world, &path, &Ids::new()).expect("it is written");
 		assert!(path.exists(), "and now there is");
 
 		let once = fs::read_to_string(&path).expect("read back");
-		written(&world, &path).expect("and written over");
+		written(&world, &path, &Ids::new()).expect("and written over");
 		let twice = fs::read_to_string(&path).expect("read back again");
 
 		assert_eq!(once, twice, "the same world writes the same file");

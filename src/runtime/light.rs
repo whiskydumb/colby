@@ -32,7 +32,7 @@
 
 use std::{fs, path::Path, time::Instant};
 
-use colby_asset::{Project, compile::LIGHTMAPS, radiance};
+use colby_asset::{Project, compile::LIGHTMAPS, ident::Ids, radiance};
 use colby_bake::{Baked, Placeless, Rect, Scene, Settings};
 use colby_core::{
 	Result,
@@ -177,9 +177,11 @@ pub(crate) fn run(project: &Project, scene: Option<&str>, asked: &Asked) -> Resu
 	let name = match scene {
 		| Some(name) => name.to_owned(),
 		| None => project
-			.startup_scene()
-			.and_then(|name| name.strip_prefix(&format!("{SOURCES}/")))
-			.map(str::to_owned)
+			.startup_name()
+			.and_then(|name| {
+				name.strip_prefix(&format!("{SOURCES}/"))
+					.map(str::to_owned)
+			})
 			.ok_or_else(|| {
 				err!(Asset(
 					"--bake names no scene and the project starts as none under {SOURCES}/; \
@@ -284,7 +286,7 @@ fn bake(world: &mut World, project: &Project, name: &str, settings: Settings) ->
 	placed(world, &baked);
 
 	let source = saves::source(&project.assets(), name)?;
-	let bytes = saves::written(world, &source)?;
+	let bytes = saves::written(world, &source, &Ids::read(&project.output()))?;
 
 	info!(
 		picture = %picture.display(),
@@ -752,7 +754,7 @@ mod tests {
 
 		// the scene written the way an editor writes it, then baked from the
 		// command line with no window and no game
-		saves::written(&world, &project.assets().join("scenes").join("yard.scene"))
+		saves::written(&world, &project.assets().join("scenes").join("yard.scene"), &Ids::new())
 			.expect("the scene is written");
 		world.cvars.set(RAYS, "16");
 

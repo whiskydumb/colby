@@ -51,6 +51,7 @@ use colby_core::{
 
 use crate::{
 	bytes::Names,
+	ident::{self, Ids, Resolve},
 	json::Value,
 	level::{Rows, Writing, check, named_row, names, put_all, read},
 	model::{Coat, Material, unknown_in},
@@ -193,24 +194,46 @@ pub fn encode(material: &Material) -> Vec<u8> {
 
 /// Reads a `.material` source.
 ///
+/// Every picture it names is taken as written. @ref [`import_with`] for the
+/// way the compiler reads one.
+///
 /// @param text - the whole file
 /// @return the material, with its pictures named
-pub fn import(text: &str) -> Result<Material> {
+pub fn import(text: &str) -> Result<Material> { import_with(text, &Ids::new()) }
+
+/// Reads a `.material` source, resolving every picture it names by identity.
+///
+/// The five names are the whole of what a material refers to, so this is the
+/// same shape a scene's reader has and half the size. @ref
+/// [`ident`](crate::ident).
+///
+/// @param text - the whole file
+/// @param ids - every id in the project
+/// @return the material, with its pictures named
+///
+/// # Errors
+///
+/// Everything [`import`] refuses, and an id nothing in the project carries.
+pub fn import_with(text: &str, ids: &Ids) -> Result<Material> {
 	let root = crate::json::parse(text)?;
 	let table = names(Surface::FIELDS, &REFERENCES);
 
-	check(&root, &[table], &REFERENCES, "a material")?;
+	check(&root, &[table], &HAND, "a material")?;
 
+	let by = Resolve::with(ids, ident::block(&root)?);
 	let mut surface = Surface::DEFAULT;
+
 	read(&mut surface, &root, Surface::FIELDS, "a material")?;
+
+	let named = |key: &str| -> Result<String> { by.name(&text_of(&root, key)?) };
 
 	Ok(Material {
 		name: String::new(),
-		albedo: text_of(&root, "albedo")?,
-		normal: text_of(&root, "normal")?,
-		finish: text_of(&root, "finish")?,
-		occlusion: text_of(&root, "occlusion")?,
-		glow: text_of(&root, "glow")?,
+		albedo: named("albedo")?,
+		normal: named("normal")?,
+		finish: named("finish")?,
+		occlusion: named("occlusion")?,
+		glow: named("glow")?,
 		surface,
 	})
 }
@@ -247,6 +270,10 @@ pub fn export(material: &Material) -> Result<String> {
 
 /// The five fields a table describes and cannot spell.
 const REFERENCES: [&str; 5] = ["albedo", "normal", "finish", "occlusion", "glow"];
+
+/// Those five and the block of ids, which is what a file may hold beside the
+/// table's own keys. @ref [`ident::BLOCK`](crate::ident::BLOCK).
+const HAND: [&str; 6] = ["albedo", "normal", "finish", "occlusion", "glow", ident::BLOCK];
 
 /// One name out of a JSON object, or empty for a key it does not have.
 fn text_of(root: &Value, key: &str) -> Result<String> {

@@ -704,9 +704,10 @@ impl App {
 		// scene the project starts with, which is already the world.
 		editor.remember(
 			&self.runtime.project,
-			self.runtime
+			&self
+				.runtime
 				.project
-				.startup_scene()
+				.startup_name()
 				.unwrap_or_default(),
 		);
 		self.editor = Some(editor);

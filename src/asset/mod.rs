@@ -33,6 +33,7 @@ pub mod font;
 pub mod format;
 pub mod gltf;
 pub mod html;
+pub mod ident;
 pub mod import;
 pub mod jpeg;
 pub mod json;
