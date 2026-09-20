@@ -214,6 +214,9 @@ pub fn unescape(text: &str) -> &str {
 	}
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Translations, LangId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::*;

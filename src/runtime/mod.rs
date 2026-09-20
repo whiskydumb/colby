@@ -51,6 +51,7 @@ mod nav;
 mod net;
 mod profile;
 mod record;
+mod rename;
 mod runtime;
 mod saves;
 mod screenshot;

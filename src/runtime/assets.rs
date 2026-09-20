@@ -26,10 +26,21 @@ use std::{
 };
 
 use colby_asset::{
-	MeshFile, Project, TextureFile, anim::ClipFile, compile, compile::Kind,
-	document::DocumentFile, font::FontFile, loc::LangFile, material::MaterialFile,
-	model::ModelFile, scene::SceneFile, script::ScriptFile, skeleton::SkeletonFile,
-	sound::SoundFile, stamp::Input,
+	MeshFile, Project, TextureFile,
+	anim::ClipFile,
+	compile,
+	compile::Kind,
+	document::DocumentFile,
+	font::FontFile,
+	ident::{Id, Ids},
+	loc::LangFile,
+	material::MaterialFile,
+	model::ModelFile,
+	scene::SceneFile,
+	script::ScriptFile,
+	skeleton::SkeletonFile,
+	sound::SoundFile,
+	stamp::Input,
 };
 use colby_core::{
 	abi::{
@@ -102,8 +113,9 @@ impl Assets {
 	///
 	/// @param world - the host state whose registry is filled
 	pub(crate) fn sync(&mut self, world: &mut World) {
-		self.build();
-		self.load(world);
+		let ids = self.build();
+
+		self.load(world, &ids);
 	}
 
 	/// The same, but at most once every [`POLL_INTERVAL`].
@@ -129,9 +141,9 @@ impl Assets {
 	/// One source that will not compile is a warning naming the file and the
 	/// line; the rest are compiled anyway, and the bad one is retried the next
 	/// time it is written.
-	fn build(&self) {
+	fn build(&self) -> Ids {
 		if !self.source.is_dir() {
-			return;
+			return Ids::new();
 		}
 
 		let report = match compile::compile_dir(&self.source, &self.output, false) {
@@ -139,7 +151,11 @@ impl Assets {
 			| Err(error) => {
 				warn!(%error, "compiling the asset tree failed");
 
-				return;
+				// the tree still has the identities the last pass wrote down,
+				// and a pass that fell over is no reason to take every entry's
+				// away - that would make a rename of one source look like a
+				// rename of all of them.
+				return Ids::read(&self.output);
 			},
 		};
 
@@ -148,7 +164,7 @@ impl Assets {
 		}
 
 		if report.is_quiet() {
-			return;
+			return report.ids;
 		}
 
 		for compiled in &report.compiled {
@@ -172,16 +188,18 @@ impl Assets {
 		for removed in &report.removed {
 			debug!(path = ?removed, "compiled asset removed, its source is gone");
 		}
+
+		report.ids
 	}
 
 	/// Brings the world's mesh registry level with the compiled tree.
-	fn load(&mut self, world: &mut World) {
+	fn load(&mut self, world: &mut World, ids: &Ids) {
 		let Ok(present) = compile::outputs(&self.output) else {
 			return;
 		};
 
 		for path in &present {
-			self.load_one(world, path);
+			self.load_one(world, path, ids);
 		}
 
 		self.forget_missing(world, &present);
@@ -202,11 +220,27 @@ impl Assets {
 	/// the filesystem's clock, and one restored from a backup, as "the one I
 	/// already have", and the world would go on holding what was replaced with
 	/// nothing anywhere to say so.
-	fn load_one(&mut self, world: &mut World, path: &Path) {
+	fn load_one(&mut self, world: &mut World, path: &Path, ids: &Ids) {
 		let seen = Input::of(path, &self.output);
 		if seen.found.is_none() {
 			return;
 		}
+
+		let (Ok(name), Some(kind)) =
+			(compile::asset_name(&self.output, path), Kind::of_output(path))
+		else {
+			return;
+		};
+
+		// before anything is read, and on every pass rather than only when
+		// something moved: this is what carries a rename into a world that is
+		// already running. A table that already holds this identity under the
+		// old name moves its entry here, so the handle every entity is holding
+		// goes on resolving and the compiled file lands in the slot it always
+		// had. @ref `colby_core::abi::registry::Registry::adopt`.
+		let id = ids.id(&name).unwrap_or_default();
+
+		adopt(world, kind, &name, id);
 
 		let known = self
 			.loaded
@@ -216,12 +250,6 @@ impl Assets {
 		if known.is_some_and(|index| self.loaded[index].seen == seen) {
 			return;
 		}
-
-		let (Ok(name), Some(kind)) =
-			(compile::asset_name(&self.output, path), Kind::of_output(path))
-		else {
-			return;
-		};
 
 		// recorded whether or not the read works. A file that cannot be read
 		// will not become readable on its own, and re-reading it four times a
@@ -251,6 +279,13 @@ impl Assets {
 			| Kind::Script => load_script(world, path, &name),
 			| Kind::Translation => load_translation(world, path, &name),
 		}
+
+		// and again, for the one thing the call above cannot do: an asset
+		// loaded for the first time had no entry to file an identity against,
+		// and now it has one. Making the entry up there instead would make a
+		// first load read as a replacement, which is a re-upload of something
+		// nobody had.
+		adopt(world, kind, &name, id);
 	}
 
 	/// Empties the registry entries whose file has been deleted.
@@ -271,6 +306,16 @@ impl Assets {
 		});
 
 		for (name, kind) in gone {
+			// its identity goes first, and whether there was an entry at all
+			// is the answer to a question this loop could not otherwise ask: a
+			// **rename** takes the old name away before this runs, so the file
+			// that is gone is one whose entry is already being drawn under
+			// another name. Emptying it here would append a second entry under
+			// the old name and unload an asset nobody lost.
+			if !adopt(world, kind, &name, Id::NONE) {
+				continue;
+			}
+
 			match kind {
 				| Kind::Mesh => drop(world.meshes.insert(&name, MeshData::default())),
 				| Kind::Texture => drop(world.textures.insert(&name, TextureData::white())),
@@ -296,6 +341,35 @@ impl Assets {
 
 			info!(name, ?kind, "asset unloaded; its file is gone");
 		}
+	}
+}
+
+/// Files a name against an identity, in whichever table the kind belongs to.
+///
+/// The third list of the twelve kinds in this module, beside the one that loads
+/// and the one that unloads, and it is a list rather than a trait for their
+/// reason: each table is a type of its own with a handle of its own, and the
+/// match is what turns a [`Kind`] into one.
+///
+/// @param world - whose tables
+/// @param kind - which table
+/// @param name - the asset name it is known by now
+/// @param id - its identity, or nothing for an asset the tree has none for
+/// @return whether there was an entry to file it against at all
+fn adopt(world: &mut World, kind: Kind, name: &str, id: Id) -> bool {
+	match kind {
+		| Kind::Mesh => world.meshes.adopt(name, id).is_some(),
+		| Kind::Texture => world.textures.adopt(name, id).is_some(),
+		| Kind::Font => world.fonts.adopt(name, id).is_some(),
+		| Kind::Sound => world.sounds.adopt(name, id).is_some(),
+		| Kind::Document => world.ui.adopt(name, id).is_some(),
+		| Kind::Model => world.models.adopt(name, id).is_some(),
+		| Kind::Scene => world.scenes.adopt(name, id).is_some(),
+		| Kind::Material => world.materials.adopt(name, id).is_some(),
+		| Kind::Skeleton => world.skeletons.adopt(name, id).is_some(),
+		| Kind::Clip => world.clips.adopt(name, id).is_some(),
+		| Kind::Script => world.scripts.adopt(name, id).is_some(),
+		| Kind::Translation => world.translations.adopt(name, id).is_some(),
 	}
 }
 
@@ -1045,6 +1119,95 @@ mod tests {
 			world.meshes.get(after).map(Mesh::revision),
 			Some(1),
 			"which is what the renderer compares against to know it must re-upload"
+		);
+	}
+
+	#[test]
+	fn renaming_a_source_moves_its_entry_rather_than_making_a_second_one() {
+		// **the whole of what an identity in a registry is for.** A world that
+		// is already running holds handles, not names: rename the file behind
+		// one and a table keyed only by name appends a second entry and leaves
+		// every entity in the world pointing at the first, which goes on
+		// resolving and draws nothing.
+		let (source, output) = trees("renamed");
+		put(&source, "meshes/thing.obj", &triangle(1.0));
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+		assets.sync(&mut world);
+
+		let before = world.meshes.find("meshes/thing");
+		let entries = world.meshes.len();
+
+		assert!(before.is_some(), "it loaded");
+
+		let id = world
+			.meshes
+			.get(before)
+			.map(Mesh::id)
+			.expect("the entry is there");
+
+		assert!(!id.is_none(), "and the tree gave it an identity");
+
+		// the rename a person makes in the browser: the source and the sidecar
+		// beside it, which is what `asset.rename` moves
+		for (was, now) in [
+			("meshes/thing.obj", "meshes/gem.obj"),
+			("meshes/thing.obj.id", "meshes/gem.obj.id"),
+		] {
+			fs::rename(source.join(was), source.join(now)).expect("it moves");
+		}
+
+		assets.sync(&mut world);
+
+		let after = world.meshes.find("meshes/gem");
+
+		assert_eq!(after, before, "the handle survives the file being called something else");
+		assert_eq!(world.meshes.len(), entries, "and no second entry was made for it");
+		assert_eq!(world.meshes.find("meshes/thing"), MeshId::NONE, "the old name is nobody's");
+		assert_eq!(world.meshes.find_by_id(id), after, "the identity is still that entry's");
+		assert_eq!(
+			world
+				.meshes
+				.get(after)
+				.map(|mesh| mesh.value().triangles()),
+			Some(1),
+			"and the geometry behind it is what it always was"
+		);
+	}
+
+	#[test]
+	fn a_rename_that_loses_the_sidecar_is_a_second_asset_and_the_first_is_emptied() {
+		// the negative control, and the reason the editor has a rename at all:
+		// move the source with a file manager and its identity stays behind, so
+		// there is nothing to tie the new name to the old entry - which is
+		// `IDENT-4` in as few words as it can be put.
+		let (source, output) = trees("renamed-badly");
+		put(&source, "meshes/thing.obj", &triangle(1.0));
+
+		let mut world = World::new();
+		let mut assets = Assets::at(source.clone(), output);
+		assets.sync(&mut world);
+
+		let before = world.meshes.find("meshes/thing");
+		let entries = world.meshes.len();
+
+		fs::rename(source.join("meshes/thing.obj"), source.join("meshes/gem.obj"))
+			.expect("it moves");
+		fs::remove_file(source.join("meshes/thing.obj.id")).expect("and its identity is lost");
+		assets.sync(&mut world);
+
+		let after = world.meshes.find("meshes/gem");
+
+		assert_ne!(after, before, "a different handle, so nothing holding the old one follows");
+		assert_eq!(world.meshes.len(), entries + 1, "a second entry was made");
+		assert_eq!(
+			world
+				.meshes
+				.get(before)
+				.map(|mesh| mesh.value().triangles()),
+			Some(0),
+			"and the one every entity is holding draws nothing at all"
 		);
 	}
 

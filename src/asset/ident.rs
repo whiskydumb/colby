@@ -42,31 +42,36 @@
 //! behind the names in their body - @ref [`block`]. Compiled files do not: the
 //! compiler resolves every id to the name it stands for and writes the name, so
 //! `.cscene`, `.cmat` and `.cmodel` are exactly what they were, and so are the
-//! registries, the console, the scripting API and the wire. An id is a thing
-//! that lives between a person's files, and it stops at the compiler.
+//! console, the scripting API and the wire.
+//!
+//! **The registries are the one thing past the compiler that carries one**, and
+//! it is not addressing - nothing looks an asset up by id to draw it. It is so
+//! that a rename can be *followed*: the asset loop hands each table the
+//! identity of what it just loaded, a table that already holds that identity
+//! under the old name moves the entry rather than appending a second one, and
+//! every handle the live world is holding goes on resolving. @ref
+//! [`Registry::adopt`](colby_core::abi::registry::Registry::adopt).
 //!
 //! @ref [`stamp`](crate::stamp) for how a rename reaches the outputs that have
 //! to be built again.
 
 use std::{
 	collections::BTreeMap,
-	fmt::{self, Write as _},
 	fs,
 	path::{Path, PathBuf},
 };
 
+/// Where a source keeps its identity, and what the whole tree's table says.
+///
+/// The spelling itself - the scheme, the thirteen digits, [`Id`] - lives in
+/// [`colby_core::abi::ident`] and is re-exported here, because a registry entry
+/// carries one and the engine has no compiler in it. What is below is what only
+/// a compiler has any use for: where an identity comes from, where it is kept
+/// beside a source, and how a tree of them is read back.
+pub use colby_core::abi::ident::{DIGITS, Id, SCHEME};
 use colby_core::{Result, err};
 
 use crate::{json::Value, project};
-
-/// What an id is spelled with, in a file a person writes.
-///
-/// A scheme rather than a second key beside every reference: one field then
-/// takes either spelling, a name cannot be mistaken for an id, and an id cannot
-/// be mistaken for a name - an asset name is built out of path components, and
-/// a colon is not a character a file name may hold on the platform this is
-/// developed on.
-pub const SCHEME: &str = "id://";
 
 /// The extension a sidecar is written with, after the source's whole name.
 ///
@@ -87,108 +92,6 @@ pub const MARK: &str = "colby ids 1";
 
 /// The key a source writes its block of ids under.
 pub const BLOCK: &str = "assets";
-
-/// The digits an id is spelled with: lowercase letters and the digits that no
-/// letter is easily read as.
-///
-/// Thirty-two of them, so each stands for five bits and the whole of an id is
-/// thirteen of them.
-const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-
-/// How many digits there are, as an id is read and written with.
-const RADIX: u64 = 32;
-
-/// How many digits an id is spelled with.
-///
-/// Thirteen at five bits each is sixty-five, which covers the sixty-three an id
-/// holds with room to spare in the first digit. Fixed width rather than the
-/// shortest that fits, so that ids sort and compare as text exactly as they do
-/// as numbers.
-const DIGITS: usize = 13;
-
-/// Every bit an id may use: all but the topmost.
-///
-/// The top bit is left clear so that an id is a positive number in every
-/// language that may one day have to read the table, and so that the spelling
-/// never needs a fourteenth digit.
-const MASK: u64 = u64::MAX >> 1;
-
-/// An asset's identity.
-///
-/// Sixty-three bits, of which zero means "no id at all" - the same convention
-/// the registries use for slot zero, and for the same reason: something that
-/// was never set resolves to a value that is harmless rather than to an
-/// absence that has to be spelled everywhere.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Id(u64);
-
-impl Id {
-	/// No asset at all.
-	pub const NONE: Self = Self(0);
-
-	/// The number behind it.
-	#[must_use]
-	pub const fn number(self) -> u64 { self.0 }
-
-	/// Whether this names nothing.
-	#[must_use]
-	pub const fn is_none(self) -> bool { self.0 == 0 }
-
-	/// Whether a written reference is spelled as an id rather than as a name.
-	///
-	/// Asked before parsing, because a reference that means to be an id and is
-	/// misspelled has to be an error rather than a name nothing answers to.
-	///
-	/// @param written - what the file said
-	#[must_use]
-	pub fn spelled(written: &str) -> bool { written.starts_with(SCHEME) }
-
-	/// Reads one back from the way it is written down.
-	///
-	/// @param written - the whole reference, scheme and all
-	/// @return the id, or nothing when it is not one this build can read
-	#[must_use]
-	pub fn parse(written: &str) -> Option<Self> {
-		let body = written.strip_prefix(SCHEME)?;
-
-		if body.len() != DIGITS {
-			return None;
-		}
-
-		let mut held: u64 = 0;
-
-		for byte in body.bytes() {
-			let digit = ALPHABET.iter().position(|it| *it == byte)?;
-
-			held = held
-				.checked_mul(RADIX)?
-				.checked_add(u64::try_from(digit).ok()?)?;
-		}
-
-		(held != 0 && held <= MASK).then_some(Self(held))
-	}
-
-	/// Which digit stands at a place, counting up from the last.
-	fn digit(self, place: usize) -> char {
-		let shifted = (self.0 >> (place * 5)) % RADIX;
-		let index = usize::try_from(shifted).unwrap_or_default();
-
-		char::from(ALPHABET[index])
-	}
-}
-
-impl fmt::Display for Id {
-	/// The way an id is written down: the scheme and thirteen digits.
-	fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-		out.write_str(SCHEME)?;
-
-		for place in (0..DIGITS).rev() {
-			out.write_char(self.digit(place))?;
-		}
-
-		Ok(())
-	}
-}
 
 /// The id a name is born with, on the given attempt.
 ///
@@ -223,7 +126,7 @@ pub fn born(salt: &str, name: &str, attempt: u32) -> Id {
 	// `b/c` cannot be spelled the same way as a project `a/b` with an asset `c`
 	let seeded = fnv(salt.bytes().chain([0]).chain(lowered.bytes()));
 
-	Id(mix(seeded.wrapping_add(u64::from(attempt))) & MASK)
+	Id::from_bits(mix(seeded.wrapping_add(u64::from(attempt))))
 }
 
 /// Sixty-four bits of FNV-1a over a run of bytes.
@@ -689,43 +592,13 @@ mod tests {
 	}
 
 	#[test]
-	fn an_id_reads_back_the_way_it_was_written() {
+	fn a_born_id_reads_back_the_way_it_was_written() {
 		for name in ["meshes/crystal", "a", "scenes/yard/floor", ""] {
 			let id = born("yard", name, 0);
 			let written = id.to_string();
 
 			assert_eq!(written.len(), SCHEME.len() + DIGITS, "{written} is the width it is");
-			assert!(written.starts_with(SCHEME), "{written} carries the scheme");
 			assert_eq!(Id::parse(&written), Some(id), "{written} reads back");
-		}
-	}
-
-	#[test]
-	fn a_spelling_this_build_does_not_read_is_refused() {
-		let good = born("yard", "meshes/crystal", 0).to_string();
-
-		assert!(Id::parse(&good).is_some(), "the one it writes itself is read");
-
-		let bare = good.trim_start_matches(SCHEME).to_owned();
-		let shouted = good.to_uppercase();
-
-		for bad in [
-			"meshes/crystal",
-			"id://",
-			"id://abcdefghijkl",
-			"id://abcdefghijklmn",
-			"id://abcdefghijkl!",
-			// 0, 1, 8 and 9 are not digits an id is spelled with
-			"id://abcdefghijkl0",
-			"id://abcdefghijkl9",
-			// nought is no identity, and every bit set is one more than
-			// sixty-three bits hold
-			"id://aaaaaaaaaaaaa",
-			"id://7777777777777",
-			shouted.as_str(),
-			bare.as_str(),
-		] {
-			assert_eq!(Id::parse(bad), None, "{bad} is not an id");
 		}
 	}
 

@@ -328,6 +328,7 @@ pub(crate) fn install(world: &mut World) {
 	install_scenes(world);
 	crate::light::install(world);
 	install_code(world);
+	install_rename(world);
 	install_audio(world);
 	install_net(world);
 	install_scripts(world);
@@ -1104,6 +1105,21 @@ fn install_scenes(world: &mut World) {
 		crate::saves::STREWN,
 		console::defer,
 		"write every copy every strewing laid, and its ground, into saves/<name>.strewn",
+	);
+}
+
+/// The one command that renames an asset, sidecars and all.
+///
+/// Deferred like every other command that touches the project's tree: finding
+/// the file needs the project, and a command is handed a world and nothing
+/// else. @ref [`crate::rename`] for why a rename is a command at all.
+///
+/// @param world - the table to register into
+fn install_rename(world: &mut World) {
+	world.cvars.command(
+		crate::rename::RENAME,
+		console::defer,
+		"rename the source that compiles to <name>, and its sidecars, to <to>",
 	);
 }
 

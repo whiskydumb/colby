@@ -10,6 +10,12 @@
 //! by the editor itself or by somebody else shows up; the asset loop polls
 //! four times a second and this need not keep up with it.
 //!
+//! A right click on a row opens a menu with the two things that are about the
+//! *asset* rather than about the world: renaming it, and copying its identity.
+//! Neither is done here - the editor holds no path, and the runner is the half
+//! that owns the project - so both go out as a [`Change`](crate::Change) and
+//! come back as a console line, exactly as opening a source does.
+//!
 //! Nothing here changes the world: what is dragged is carried as a payload,
 //! and the frame that sees it dropped over the picture hands back a
 //! [`Change`](crate::Change).
@@ -19,11 +25,12 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use colby_asset::{Project, compile::Kind};
+use colby_asset::{Project, compile::Kind, ident::Ids};
+use colby_core::{abi::ident, info};
 use colby_engine::Gpu;
 use egui::{
-	Align2, Button, Id, LayerId, Order, RichText, ScrollArea, Sense, TextEdit, TextStyle, Ui,
-	vec2,
+	Align2, Button, Id, Key, LayerId, Order, RichText, ScrollArea, Sense, TextEdit, TextStyle,
+	Ui, vec2,
 };
 
 use crate::{
@@ -65,6 +72,31 @@ pub(crate) struct Browser {
 
 	/// Which project the pictures and the entries are of.
 	root: Option<PathBuf>,
+
+	/// Every identity in the tree, as last read.
+	///
+	/// Read off the output tree with the walk rather than out of the world's
+	/// tables: a row is a *source file*, and a source that has never compiled
+	/// is in no table and still has an identity.
+	ids: Ids,
+
+	/// Which row has the keyboard, by asset name.
+	renaming: Option<String>,
+
+	/// What is in that row's field.
+	typed: String,
+}
+
+/// The one row that is being renamed, and what is in it.
+///
+/// Handed to [`row`] rather than read off the browser, because a row is drawn
+/// by a free function so that a test can press one without a project.
+struct Naming<'a> {
+	/// Which asset the field is open on.
+	on: &'a mut Option<String>,
+
+	/// What has been typed into it.
+	typed: &'a mut String,
 }
 
 impl Browser {
@@ -125,6 +157,7 @@ impl Browser {
 			.is_none_or(|then| then.elapsed() >= RESCAN)
 		{
 			self.entries = catalog::scan(&project.assets(), &project.output());
+			self.ids = Ids::read(&project.output());
 			self.scanned = Some(Instant::now());
 		}
 	}
@@ -148,33 +181,77 @@ impl Browser {
 				.thumbs
 				.as_mut()
 				.and_then(|thumbs| thumbs.get(ui.ctx(), gpu, entry, made));
+			let mut naming = Naming {
+				on: &mut self.renaming,
+				typed: &mut self.typed,
+			};
 
-			row(ui, entry, thumb, changes);
+			row(
+				ui,
+				entry,
+				thumb,
+				self.ids.id(&entry.name).unwrap_or_default(),
+				&mut naming,
+				changes,
+			);
 		}
 	}
 }
 
 /// One asset: its picture or the room for one, a row that can be dragged,
 /// and a word about its state when there is something to say.
-fn row(ui: &mut Ui, entry: &Entry, thumb: Option<egui::TextureId>, changes: &mut Vec<Change>) {
+///
+/// @param id - the asset's identity, for the hover and the menu
+/// @param naming - which row has the keyboard, and what is in it
+fn row(
+	ui: &mut Ui,
+	entry: &Entry,
+	thumb: Option<egui::TextureId>,
+	id: ident::Id,
+	naming: &mut Naming<'_>,
+	changes: &mut Vec<Change>,
+) {
 	ui.horizontal(|ui| {
 		match thumb {
-			| Some(id) => {
-				ui.image((id, vec2(THUMB, THUMB)));
+			| Some(held) => {
+				ui.image((held, vec2(THUMB, THUMB)));
 			},
 			| None => {
 				ui.add_space(THUMB + ui.spacing().item_spacing.x);
 			},
 		}
 
-		let response = ui.add(
-			Button::selectable(false, format!("{}  {}", catalog::word(entry.kind), entry.name))
+		if naming.on.as_deref() == Some(entry.name.as_str()) {
+			naming_row(ui, entry, naming, changes);
+
+			return;
+		}
+
+		let response = ui
+			.add(
+				Button::selectable(
+					false,
+					format!("{}  {}", catalog::word(entry.kind), entry.name),
+				)
 				.sense(Sense::click_and_drag()),
-		);
+			)
+			.on_hover_text(match id.is_none() {
+				| true => format!(
+					"{}
+no identity yet; it gets one when it compiles",
+					entry.name
+				),
+				| false => format!(
+					"{}
+{id}",
+					entry.name
+				),
+			});
 		response.dnd_set_drag_payload(Dropped {
 			name: entry.name.clone(),
 			kind: entry.kind,
 		});
+		response.context_menu(|ui| menu(ui, entry, id, naming));
 
 		if response.dragged() {
 			ghost(ui, &entry.name);
@@ -207,6 +284,78 @@ fn row(ui: &mut Ui, entry: &Entry, thumb: Option<egui::TextureId>, changes: &mut
 		}
 	});
 }
+
+/// The two things a right click offers, both about the asset and not the world.
+///
+/// @param id - the asset's identity, or nothing when it has none yet
+/// @param naming - which row has the keyboard, to open the field on this one
+fn menu(ui: &mut Ui, entry: &Entry, id: ident::Id, naming: &mut Naming<'_>) {
+	if ui.button("rename").clicked() {
+		// the last part of the name, which is the only part a rename changes:
+		// where an asset stands is a different question with different
+		// consequences. @ref `colby_runtime`'s `rename` module.
+		last(&entry.name).clone_into(naming.typed);
+		*naming.on = Some(entry.name.clone());
+		ui.close();
+	}
+
+	if ui
+		.add_enabled(!id.is_none(), Button::new("copy identity"))
+		.on_hover_text("the thirteen letters a source names this asset by, whatever it is called")
+		.clicked()
+	{
+		ui.ctx().copy_text(id.to_string());
+		info!(name = entry.name, %id, "the identity is in the clipboard");
+		ui.close();
+	}
+}
+
+/// The row while it is being renamed: a field with the last part of the name.
+///
+/// Enter asks for the rename, escape puts it away, and so does pressing
+/// anywhere else - which is what losing the keyboard means and is the one
+/// gesture nobody has to be taught.
+fn naming_row(ui: &mut Ui, entry: &Entry, naming: &mut Naming<'_>, changes: &mut Vec<Change>) {
+	let id = Id::new(("browser rename", &entry.name));
+	let response = ui.add(
+		TextEdit::singleline(naming.typed)
+			.id(id)
+			.desired_width(160.0),
+	);
+
+	// the frame it opens on and no other. Asking again on the frame it *loses*
+	// the keyboard would put the focus straight back, and losing the keyboard
+	// is the whole of how this row knows enter was pressed.
+	if !response.has_focus() && !response.lost_focus() {
+		response.request_focus();
+	}
+
+	ui.label(RichText::new(catalog::word(entry.kind)).weak());
+
+	if ui.input(|input| input.key_pressed(Key::Escape)) {
+		*naming.on = None;
+
+		return;
+	}
+
+	if response.lost_focus() {
+		let typed = naming.typed.trim().to_owned();
+
+		*naming.on = None;
+
+		// the same name is not a rename, and neither is an empty field: both
+		// are what pressing enter on a field nobody edited means.
+		if ui.input(|input| input.key_pressed(Key::Enter))
+			&& !typed.is_empty()
+			&& typed != last(&entry.name)
+		{
+			changes.push(Change::RenameAsset { name: entry.name.clone(), to: typed });
+		}
+	}
+}
+
+/// The last part of an asset name, which is the part a rename changes.
+fn last(name: &str) -> &str { name.rsplit('/').next().unwrap_or(name) }
 
 /// The name of the row being dragged, beside the pointer.
 fn ghost(ui: &Ui, name: &str) {
@@ -251,6 +400,22 @@ mod tests {
 		entry: &Entry,
 		events: Vec<egui::Event>,
 	) -> (Vec<Change>, Rect) {
+		let mut on = None;
+
+		typing(context, entry, events, &mut on, &mut String::new())
+	}
+
+	/// The same, with the field's state held by the caller across frames.
+	///
+	/// @param on - which row has the keyboard, which a test opens by hand
+	/// @param typed - what is in the field
+	fn typing(
+		context: &Context,
+		entry: &Entry,
+		events: Vec<egui::Event>,
+		on: &mut Option<String>,
+		typed: &mut String,
+	) -> (Vec<Change>, Rect) {
 		let mut changes = Vec::new();
 		let mut drawn = Rect::NOTHING;
 		let mut once = false;
@@ -266,7 +431,14 @@ mod tests {
 			|ui| {
 				if !once {
 					once = true;
-					row(ui, entry, None, &mut changes);
+					row(
+						ui,
+						entry,
+						None,
+						ident::Id::NONE,
+						&mut Naming { on, typed },
+						&mut changes,
+					);
 					drawn = ui.min_rect();
 				}
 			},
@@ -433,6 +605,122 @@ mod tests {
 		]);
 
 		assert!(changes.is_empty());
+	}
+
+	/// What a key press and its release look like to egui.
+	fn key(which: Key) -> Vec<egui::Event> {
+		[true, false]
+			.into_iter()
+			.map(|pressed| egui::Event::Key {
+				key: which,
+				physical_key: None,
+				pressed,
+				repeat: false,
+				modifiers: Modifiers::NONE,
+			})
+			.collect()
+	}
+
+	#[test]
+	fn a_row_being_renamed_asks_for_the_rename_when_enter_is_pressed() {
+		let context = Context::default();
+		let row = entry("meshes/crystal", Kind::Mesh);
+		let mut on = Some("meshes/crystal".to_owned());
+		let mut typed = "gem".to_owned();
+
+		// one frame for the field to take the keyboard, and a second for the
+		// key: a widget that was not focused cannot lose focus.
+		let (waiting, _) = typing(&context, &row, Vec::new(), &mut on, &mut typed);
+		let (changes, _) = typing(&context, &row, key(Key::Enter), &mut on, &mut typed);
+
+		assert!(waiting.is_empty(), "a field that is merely open asks for nothing");
+		assert_eq!(changes, vec![Change::RenameAsset {
+			name: "meshes/crystal".to_owned(),
+			to: "gem".to_owned(),
+		}]);
+		assert_eq!(on, None, "and the field is put away");
+	}
+
+	#[test]
+	fn escape_puts_the_field_away_and_renames_nothing() {
+		let context = Context::default();
+		let row = entry("meshes/crystal", Kind::Mesh);
+		let mut on = Some("meshes/crystal".to_owned());
+		let mut typed = "gem".to_owned();
+
+		typing(&context, &row, Vec::new(), &mut on, &mut typed);
+		let (changes, _) = typing(&context, &row, key(Key::Escape), &mut on, &mut typed);
+
+		assert!(changes.is_empty(), "nothing was asked for");
+		assert_eq!(on, None, "and the field is gone");
+	}
+
+	#[test]
+	fn a_field_nobody_edited_is_not_a_rename() {
+		// the two ways to press enter on a field that says nothing new, and
+		// neither is a rename: the compiler would refuse the first as a name
+		// something already has, and the second as no name at all.
+		let context = Context::default();
+		let row = entry("meshes/crystal", Kind::Mesh);
+
+		for said in ["crystal", "   "] {
+			let mut on = Some("meshes/crystal".to_owned());
+			let mut typed = said.to_owned();
+
+			typing(&context, &row, Vec::new(), &mut on, &mut typed);
+			let (changes, _) = typing(&context, &row, key(Key::Enter), &mut on, &mut typed);
+
+			assert!(changes.is_empty(), "{said:?} is not a rename");
+			assert_eq!(on, None, "and the field is put away either way");
+		}
+	}
+
+	#[test]
+	fn a_field_that_loses_the_keyboard_without_enter_renames_nothing() {
+		// pressing anywhere else puts the field away and asks for nothing,
+		// which is the one gesture nobody has to be taught - and the thing
+		// that tells this row's enter from any other way of losing the
+		// keyboard.
+		let context = Context::default();
+		let row = entry("meshes/crystal", Kind::Mesh);
+		let mut on = Some("meshes/crystal".to_owned());
+		let mut typed = "gem".to_owned();
+
+		typing(&context, &row, Vec::new(), &mut on, &mut typed);
+		// a press on nothing, which is what clicking away from a field is
+		let away = Pos2::new(560.0, 50.0);
+		let (changes, _) = typing(
+			&context,
+			&row,
+			vec![
+				egui::Event::PointerMoved(away),
+				egui::Event::PointerButton {
+					pos: away,
+					button: PointerButton::Primary,
+					pressed: true,
+					modifiers: Modifiers::NONE,
+				},
+				egui::Event::PointerButton {
+					pos: away,
+					button: PointerButton::Primary,
+					pressed: false,
+					modifiers: Modifiers::NONE,
+				},
+			],
+			&mut on,
+			&mut typed,
+		);
+
+		assert!(changes.is_empty(), "a field left alone is not a rename");
+		assert_eq!(on, None, "and it is put away all the same");
+	}
+
+	#[test]
+	fn the_part_of_a_name_a_rename_changes_is_the_last_one() {
+		assert_eq!(last("meshes/crystal"), "crystal");
+		assert_eq!(last("meshes/props/small/crystal"), "crystal");
+		assert_eq!(last("crystal"), "crystal", "a name with no directory is all last part");
+		assert_eq!(last(""), "");
 	}
 
 	#[test]

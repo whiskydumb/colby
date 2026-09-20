@@ -513,6 +513,14 @@ pub struct Report {
 
 	/// Sources that could not be compiled. One bad file does not stop the run.
 	pub failed: Vec<Failure>,
+
+	/// Every identity in the tree, as the zeroth pass settled them.
+	///
+	/// Here rather than read back off disk by whoever wants it: the pass has
+	/// just worked it out, the file it writes is only written when it moved,
+	/// and the host's asset loop asks for this four times a second. @ref
+	/// [`identify`].
+	pub ids: Ids,
 }
 
 impl Report {
@@ -1277,37 +1285,33 @@ fn identify(root: &Path, found: &[PathBuf], before: &Ids, report: &mut Report) -
 			},
 		};
 
-		let id =
-			match carried {
-				| Some(id) => id,
-				| None => {
-					let id = restored(&salt, &name, before, &ids);
+		let id = match carried {
+			| Some(id) => id,
+			| None => {
+				let id = restored(&salt, &name, before, &ids);
 
-					if let Err(error) = ident::write_beside(source, id) {
-						report.failed.push(Failure {
-							error: err!(Asset(
-								"{}: {name} could not be given a durable identity: {error}; it \
-								 has 							 one for as long as this tree is not renamed",
-								ident::beside(source).display()
-							)),
-							source: source.clone(),
-						});
-					}
+				if let Err(error) = ident::write_beside(source, id) {
+					report.failed.push(Failure {
+						error: err!(Asset(
+							"{}: {name} could not be given a durable identity: {error}; it has \
+							 one for as long as this tree is not renamed",
+							ident::beside(source).display()
+						)),
+						source: source.clone(),
+					});
+				}
 
-					id
-				},
-			};
+				id
+			},
+		};
 
 		if let Some(held) = ids.put(id, &name) {
 			report.failed.push(Failure {
-				error: err!(
-					Asset(
-						"{id} is carried by {name} and by {held} both; two files cannot share \
-						 one 					 identity, and deleting one of the two {} files gives that \
-						 asset a new one",
-						ident::EXTENSION
-					)
-				),
+				error: err!(Asset(
+					"{id} is carried by {name} and by {held} both; two files cannot share one \
+					 identity, and deleting one of the two {} files gives that asset a new one",
+					ident::EXTENSION
+				)),
 				source: source.clone(),
 			});
 			refused.insert(source.clone());
@@ -1390,6 +1394,8 @@ pub fn compile_dir(root: &Path, out: &Path, force: bool) -> Result<Report> {
 			source: file,
 		});
 	}
+
+	report.ids = ids.clone();
 
 	for source in found {
 		if refused.contains(&source) {

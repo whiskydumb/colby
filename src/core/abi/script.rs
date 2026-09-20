@@ -157,6 +157,9 @@ impl Default for Scripts {
 	fn default() -> Self { Self::new() }
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Scripts, ScriptId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::*;

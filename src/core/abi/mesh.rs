@@ -882,6 +882,9 @@ fn push_face(mesh: &mut MeshData, center: Vec3, right: Vec3, up: Vec3, normal: V
 		.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Meshes, MeshId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::*;

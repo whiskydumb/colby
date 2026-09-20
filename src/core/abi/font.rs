@@ -420,6 +420,9 @@ fn lines_as_f32(lines: u32) -> f32 {
 	u16::try_from(lines).map_or_else(|_| f32::from(u16::MAX), f32::from)
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Fonts, FontId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::*;

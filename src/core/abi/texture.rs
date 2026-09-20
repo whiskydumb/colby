@@ -367,6 +367,9 @@ impl Default for Textures {
 	fn default() -> Self { Self::new() }
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Textures, TextureId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::*;

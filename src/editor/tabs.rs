@@ -114,6 +114,23 @@ impl Tabs {
 		}
 	}
 
+	/// Renames whichever tab is open on an asset name, if one is.
+	///
+	/// Unlike [`rename`](Self::rename), which is about the tab on screen: an
+	/// asset renamed in the browser may be a scene open in a tab that is not
+	/// the current one, and a tab claiming to be a source that is no longer
+	/// there is a tab whose next write makes a second file.
+	///
+	/// @param was - the scene source's asset name before
+	/// @param now - what it is called now
+	pub(crate) fn rename_named(&mut self, was: &str, now: &str) {
+		for tab in &mut self.open {
+			if tab.name == was {
+				now.clone_into(&mut tab.name);
+			}
+		}
+	}
+
 	/// Moves to another tab, if it is not the one already on screen.
 	///
 	/// @param world - the world being left, which is written down

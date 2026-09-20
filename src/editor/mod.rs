@@ -359,6 +359,21 @@ pub(crate) enum Change {
 		name: String,
 	},
 
+	/// Rename an asset's source, and every sidecar standing beside it.
+	///
+	/// A name and a name, for the reason [`Inspect`](Self::Inspect) carries
+	/// one: the browser knows what a row is called and the runner is the half
+	/// that owns the project. @ref `colby_runtime`'s `rename` module for why a
+	/// rename is a command rather than a file-manager gesture, and why there
+	/// is no undo of one.
+	RenameAsset {
+		/// The asset name as it stands, `meshes/crystal`.
+		name: String,
+
+		/// What the last part of it is to become, `gem`.
+		to: String,
+	},
+
 	/// Open an asset's source in whatever editor this person uses.
 	///
 	/// A name rather than a path, for the reason
@@ -1072,6 +1087,7 @@ impl Panels {
 			| Change::Show { which } => self.restore = self.tabs.switch(world, which),
 			| Change::Shut { which } => self.restore = self.tabs.close(which),
 			| Change::Inspect { name } => self.inspect(world, &name),
+			| Change::RenameAsset { name, to } => self.rename_asset(world, &name, &to),
 			| Change::Code { name } => {
 				// straight to the console, as a write is: the runner is what
 				// holds the project and the two variables, and the editor's
@@ -1134,6 +1150,39 @@ impl Panels {
 		let name = self.waiting.remove(index);
 
 		vec![Change::Open { name }]
+	}
+
+	/// Asks the runner to rename an asset, and follows it in the tabs.
+	///
+	/// Straight to the console, as a write and an open are: the runner is what
+	/// holds the project, and the editor's half of this is knowing which row
+	/// was pressed and what was typed into it.
+	///
+	/// **The tab moves with the file.** Renaming a scene that is open would
+	/// otherwise leave a tab claiming to be a source that is not there, and the
+	/// next write under that name would make a second one. Every other kind
+	/// needs nothing: the asset loop hands the table the identity and the table
+	/// moves the entry, so every handle this world is holding goes on
+	/// resolving. @ref `colby_core::abi::registry::Registry::adopt`.
+	///
+	/// **There is no record of it.** The history is a stack of worlds, and a
+	/// rename happens outside every world there is; the undo of a rename is a
+	/// rename back.
+	///
+	/// @param world - where the line waits for the runner
+	/// @param name - the asset name as it stands
+	/// @param to - what the last part of it is to become
+	fn rename_asset(&mut self, world: &mut World, name: &str, to: &str) {
+		colby_core::abi::console::run(world, &format!("asset.rename {name} {to}"));
+
+		let Some((held, _)) = name.rsplit_once('/') else {
+			self.tabs.rename_named(name, to);
+
+			return;
+		};
+
+		self.tabs
+			.rename_named(name, &format!("{held}/{to}"));
 	}
 
 	/// Opens a scene by name, or moves to it if it is already open.
@@ -1822,6 +1871,33 @@ mod tests {
 		assert_eq!(world.asked.len(), 1, "one line waiting for the frame loop");
 		assert_eq!(world.asked[0].name, "code.open");
 		assert_eq!(world.asked[0].words, vec!["scripts/thruster".to_owned()]);
+	}
+
+	#[test]
+	fn renaming_an_asset_leaves_a_console_line_and_moves_the_tab_that_was_open_on_it() {
+		// the same seam a source opening uses, and one thing besides: a tab
+		// open on a scene has to follow the file, or its next write makes a
+		// second one under the name that is gone.
+		let mut world = World::new();
+		world
+			.cvars
+			.command("asset.rename", colby_core::abi::console::defer, "");
+		let mut panels = Panels::default();
+		panels.tabs.rename("scenes/yard");
+
+		panels.apply(&mut world, Change::RenameAsset {
+			name: "scenes/yard".to_owned(),
+			to: "court".to_owned(),
+		});
+
+		assert_eq!(world.asked.len(), 1, "one line waiting for the frame loop");
+		assert_eq!(world.asked[0].name, "asset.rename");
+		assert_eq!(world.asked[0].words, vec!["scenes/yard".to_owned(), "court".to_owned()]);
+		assert_eq!(
+			panels.tabs.names().collect::<Vec<&str>>(),
+			vec!["scenes/court"],
+			"and the tab is called what the file is called"
+		);
 	}
 
 	#[test]

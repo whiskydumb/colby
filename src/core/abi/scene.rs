@@ -1816,7 +1816,7 @@ fn grafted_things(world: &mut World, piece: &SceneData) -> Vec<EntityId> {
 		.iter()
 		.map(|thing| {
 			let renderable = Renderable {
-				mesh: world.meshes.find(&thing.mesh),
+				mesh: mesh(world, &thing.mesh),
 				material: material(world, &thing.material),
 				color: thing.color,
 				// deliberately none. @ref `graft`, which says why.
@@ -2053,7 +2053,7 @@ fn placed(
 		.iter()
 		.map(|thing| {
 			let renderable = Renderable {
-				mesh: world.meshes.find(&thing.mesh),
+				mesh: mesh(world, &thing.mesh),
 				material: material(world, &thing.material),
 				color: thing.color,
 				pose: at(poses, thing.pose).unwrap_or(PoseId::NONE),
@@ -2109,7 +2109,7 @@ fn solid_bodies(world: &World, scene: &SceneData, things: &[EntityId]) -> Vec<(u
 		.iter()
 		.map(|solid| {
 			let body = solid.body(
-				world.meshes.find(&solid.shape.mesh),
+				mesh(world, &solid.shape.mesh),
 				at(things, solid.thing).unwrap_or(EntityId::NONE),
 			);
 
@@ -2194,13 +2194,6 @@ fn hang(world: &mut World, landed: &[EntityId], standing: &[EntityId], things: &
 	}
 }
 
-/// A material by name, falling back to the default rather than to nothing.
-///
-/// The two branches produce the same handle and differ only in whether
-/// anything is said about it, which is the point: a name nothing answers to is
-/// worth a line in the log, and an entity that simply never chose a material
-/// is not. Without the first branch every unnamed entity in a hand-written
-/// scene would warn, which is how a warning stops being read.
 /// One description's emitter, with its picture looked up by name.
 ///
 /// The mirror of what [`things`] does on the way out, and the one place a
@@ -2312,6 +2305,45 @@ fn probes(world: &World, name: &str, grid: Grid) -> Probes {
 	Probes { picture, grid }
 }
 
+/// A mesh by name, which until now was the one reference nobody was told about.
+///
+/// The material's rule, a kind late: an empty name is an entity that never
+/// chose a mesh and says nothing, and a name nothing answers to is a line in
+/// the log. Without it `world.meshes.find(name)` hands back slot zero, the
+/// entity draws nothing, and the only thing to go on is that it is not there -
+/// which is the word "silently" the debt this closes was written with.
+///
+/// It says something at most once per reference per load, which is the same
+/// footing a material has been on since scenes existed. A body's shape names
+/// one only when the shape is a mesh, and the other two kinds carry an empty
+/// name - so a world of boxes says nothing at all.
+///
+/// @param world - whose mesh registry answers
+/// @param name - the mesh's asset name, or empty
+fn mesh(world: &World, name: &str) -> MeshId {
+	if name.is_empty() {
+		return MeshId::NONE;
+	}
+
+	let found = world.meshes.find(name);
+
+	if !found.is_some() {
+		warn!(name, "a scene names a mesh nothing answers to");
+	}
+
+	found
+}
+
+/// A material by name, falling back to the default rather than to nothing.
+///
+/// The two branches produce the same handle and differ only in whether
+/// anything is said about it, which is the point: a name nothing answers to is
+/// worth a line in the log, and an entity that simply never chose a material
+/// is not. Without the first branch every unnamed entity in a hand-written
+/// scene would warn, which is how a warning stops being read.
+///
+/// @param world - whose material registry answers
+/// @param name - the material's asset name, or empty
 fn material(world: &World, name: &str) -> MaterialId {
 	if name.is_empty() {
 		return MaterialId::DEFAULT;
@@ -2583,7 +2615,7 @@ fn spawn_thing(world: &mut World, thing: &Thing, poses: &[PoseId], at: Vec3) -> 
 		.unwrap_or(PoseId::NONE);
 
 	world.entities.set_renderable(id, Renderable {
-		mesh: world.meshes.find(&thing.mesh),
+		mesh: mesh(world, &thing.mesh),
 		material: material(world, &thing.material),
 		color: thing.color,
 		pose,
@@ -2615,7 +2647,7 @@ fn spawn_solid(
 	at: Vec3,
 ) -> BodyId {
 	let mut body = solid.body(
-		world.meshes.find(&solid.shape.mesh),
+		mesh(world, &solid.shape.mesh),
 		handle(things, solid.thing).unwrap_or(EntityId::NONE),
 	);
 	body.transform.position += at;
@@ -2668,6 +2700,9 @@ fn spawn_link(world: &mut World, link: &Link, solids: &[(String, BodyId)], at: V
 	id
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Scenes, SceneId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -2699,6 +2734,27 @@ mod tests {
 			.insert("brass", Material::colored(Vec3::new(0.7, 0.5, 0.2)));
 
 		world
+	}
+
+	#[test]
+	fn a_mesh_a_scene_names_and_nothing_answers_to_is_the_null_one_and_is_said_out_loud() {
+		// **The line itself has no oracle in this crate** - nothing here reads
+		// the log back - so what is pinned here is the contract around it, and
+		// the warning is checked by a live run with `COLBY_LOG` turned up. @ref
+		// the memory of this card's verification.
+		let world = furnished();
+
+		assert_eq!(mesh(&world, ""), MeshId::NONE, "an entity that chose no mesh says nothing");
+		assert_eq!(
+			mesh(&world, "meshes/nowhere"),
+			MeshId::NONE,
+			"and one that named a mesh nobody has still draws nothing"
+		);
+		assert_eq!(
+			mesh(&world, "meshes/crystal"),
+			world.meshes.find("meshes/crystal"),
+			"while a name something answers to is the handle it always was"
+		);
 	}
 
 	/// The body called this, or `BodyId::NONE`.

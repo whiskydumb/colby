@@ -35,6 +35,7 @@ use colby_core::{
 		Body, BodyId, Decal, Emitter, EntityId, Field, Joint, JointId, Light, Material,
 		MaterialId, MeshId, ModelId, Post, Renderable, Sky, Terrain, TextureId, Transform, World,
 		field::Value,
+		ident,
 		scene::{self, Stage},
 	},
 	glam::{EulerRot, Quat, Vec2, Vec3},
@@ -883,7 +884,7 @@ fn counted(many: usize, noun: &str) -> String {
 }
 
 /// What a reference row says when hovered, after the field's own help.
-const BY_NAME: &str = "by asset name, or empty for none";
+const BY_NAME: &str = "by asset name or id://, or empty for none";
 
 /// The name of the thing a handle points at, or nothing when it points at
 /// nothing.
@@ -921,13 +922,27 @@ fn spelled(world: &World, value: &Value) -> String {
 fn resolve(world: &World, typed: &str, value: &mut Value) -> bool {
 	let wanted = typed.trim();
 
+	// an identity is a second spelling the same field takes, and what the
+	// browser's own menu puts in the clipboard: copy one off a row and paste it
+	// here. A half-typed identity resolves to nothing and is left alone, which
+	// is the rule a half-typed name already follows.
+	let by_id = ident::Id::spelled(wanted).then(|| ident::Id::parse(wanted).unwrap_or_default());
+
 	let found = match *value {
 		| Value::Mesh(_) if wanted.is_empty() => Value::Mesh(MeshId::NONE),
-		| Value::Mesh(_) => Value::Mesh(world.meshes.find(wanted)),
+		| Value::Mesh(_) => Value::Mesh(
+			by_id.map_or_else(|| world.meshes.find(wanted), |id| world.meshes.find_by_id(id)),
+		),
 		| Value::Material(_) if wanted.is_empty() => Value::Material(MaterialId::DEFAULT),
-		| Value::Material(_) => Value::Material(world.materials.find(wanted)),
+		| Value::Material(_) =>
+			Value::Material(by_id.map_or_else(
+				|| world.materials.find(wanted),
+				|id| world.materials.find_by_id(id),
+			)),
 		| Value::Texture(_) if wanted.is_empty() => Value::Texture(TextureId::NONE),
-		| Value::Texture(_) => Value::Texture(world.textures.find(wanted)),
+		| Value::Texture(_) => Value::Texture(
+			by_id.map_or_else(|| world.textures.find(wanted), |id| world.textures.find_by_id(id)),
+		),
 		| _ => return false,
 	};
 
@@ -2290,6 +2305,33 @@ mod tests {
 			!drawn.iter().any(|text| text == "cub"),
 			"and the half-typed name is gone: {drawn:?}"
 		);
+	}
+
+	#[test]
+	fn a_reference_row_takes_an_identity_where_it_takes_a_name() {
+		// what the browser's "copy identity" is for: the thirteen letters go in
+		// the clipboard and land here, and the row shows what the asset is
+		// called. The handle is the one the name would have given.
+		let mut world = World::new();
+		world
+			.meshes
+			.insert("meshes/crystal", colby_core::abi::MeshData::default());
+		let id = ident::Id::from_bits(0x0123_4567);
+		world.meshes.adopt("meshes/crystal", id);
+		let wanted = world.meshes.find("meshes/crystal");
+
+		let mut value = Value::Mesh(MeshId::NONE);
+
+		assert!(resolve(&world, &id.to_string(), &mut value), "the identity resolved");
+		assert_eq!(value, Value::Mesh(wanted), "to the very handle the name gives");
+
+		// and the three ways it can fail to, none of which touches the handle
+		for bad in ["id://abcdefghijklm", "id://abc", "id://"] {
+			let mut held = Value::Mesh(wanted);
+
+			assert!(!resolve(&world, bad, &mut held), "{bad} answers to nothing here");
+			assert_eq!(held, Value::Mesh(wanted), "so the row is left alone");
+		}
 	}
 
 	/// A reference row is drawn where a reference field is, and only where the

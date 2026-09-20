@@ -931,6 +931,9 @@ static SILENCE: SoundData = SoundData {
 	channels: 1,
 };
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Sounds, SoundId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::*;

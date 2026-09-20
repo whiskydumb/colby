@@ -1386,6 +1386,9 @@ fn pinned(local: Transform, rest: Transform) -> Transform {
 	}
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Clips, ClipId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::{

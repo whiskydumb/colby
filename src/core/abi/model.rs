@@ -193,6 +193,9 @@ impl Default for Models {
 	fn default() -> Self { Self::new() }
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Models, ModelId, entries);
+
 #[cfg(test)]
 mod tests {
 	use super::*;

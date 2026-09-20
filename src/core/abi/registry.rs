@@ -15,6 +15,55 @@
 //! cross the ABI as `#[repr(C)]` plain data, and a `MeshId` that could be
 //! passed where a `TextureId` belongs is a bug this costs nothing to make
 //! impossible. Only the storage is shared.
+//!
+//! An entry also carries the **identity** of the asset in it, and that is what
+//! makes a rename survivable. Rename a source and it compiles under a new name,
+//! so a table keyed only by name appends a second entry and leaves every handle
+//! the world is holding pointing at the first - which goes on resolving and
+//! draws nothing, because the file behind it is gone. @ref [`Registry::adopt`],
+//! and [`ident`](super::ident) for what an identity is and is not.
+
+use super::ident::Id;
+
+/// Gives one of the wrapper tables the two methods an identity needs.
+///
+/// Not a general-purpose macro, and here for the reason
+/// [`registry_handle!`](crate::registry_handle) is: twelve tables wrap a
+/// [`Registry`] behind a handle type of their own, and the two forwards below
+/// are identical in every one of them but the handle. Written out twelve times
+/// they would drift, and a table that quietly lost `adopt` would be a table
+/// whose assets stop drawing when somebody renames one.
+///
+/// The handle must be one [`registry_handle!`](crate::registry_handle) made,
+/// and the field is named because one table calls its storage something else.
+#[macro_export]
+macro_rules! registry_identity {
+	($table:ty, $handle:ty, $held:ident) => {
+		impl $table {
+			/// Which of these an identity belongs to, or nothing.
+			///
+			/// @param id - the identity
+			#[must_use]
+			pub fn find_by_id(&self, id: $crate::abi::ident::Id) -> $handle {
+				<$handle>::new(self.$held.find_by_id(id))
+			}
+
+			/// Files a name against an identity, moving an entry that already
+			/// has it.
+			///
+			/// @ref [`Registry::adopt`](
+			/// $crate::abi::registry::Registry::adopt) for the whole of what
+			/// this means; it is called by the host's asset loop and by
+			/// nothing else.
+			///
+			/// @param name - the asset name it is known by now
+			/// @param id - its identity
+			pub fn adopt(&mut self, name: &str, id: $crate::abi::ident::Id) -> $handle {
+				<$handle>::new(self.$held.adopt(name, id))
+			}
+		}
+	};
+}
 
 /// Declares a `#[repr(C)]` handle into one of these tables.
 ///
@@ -70,10 +119,12 @@ macro_rules! registry_handle {
 	};
 }
 
-/// One entry: what it is called, what it is, and how many times it has changed.
+/// One entry: what it is called, what it *is*, what it holds, and how many
+/// times it has changed.
 #[derive(Clone, Debug)]
 pub struct Entry<T> {
 	name: String,
+	id: Id,
 	value: T,
 	revision: u32,
 }
@@ -82,6 +133,15 @@ impl<T> Entry<T> {
 	/// The name this entry is registered under.
 	#[must_use]
 	pub fn name(&self) -> &str { &self.name }
+
+	/// The identity of the asset in it, or [`Id::NONE`].
+	///
+	/// Filled by whoever loads the table - for a project's assets that is the
+	/// host's asset loop, out of the tree's own table of identities - and left
+	/// as nothing for a table filled by hand, which is what a test and a bake
+	/// do. @ref [`Registry::adopt`].
+	#[must_use]
+	pub const fn id(&self) -> Id { self.id }
 
 	/// What is in it.
 	#[must_use]
@@ -191,6 +251,90 @@ impl<T> Registry<T> {
 	/// Every entry, in slot order, starting with the null one.
 	pub fn iter(&self) -> impl Iterator<Item = &Entry<T>> { self.entries.iter() }
 
+	/// Looks an entry up by the identity of the asset in it.
+	///
+	/// A linear scan, as [`find`](Self::find) is and for its reason. Nothing
+	/// resolves an asset this way to *draw* it - a scene, the console, a
+	/// program and the wire all name things - so this is asked once by a person
+	/// pasting an identity into a panel, and by the loop that moves an entry
+	/// when its file is renamed.
+	///
+	/// @param id - the identity
+	/// @return its index, or zero when nothing here carries it
+	#[must_use]
+	pub fn find_by_id(&self, id: Id) -> u32 {
+		if id.is_none() {
+			return 0;
+		}
+
+		self.entries
+			.iter()
+			.position(|entry| entry.id == id)
+			.and_then(|index| u32::try_from(index).ok())
+			.unwrap_or(0)
+	}
+
+	/// Files a name against an identity, moving an entry that already has it.
+	///
+	/// **This is how a rename reaches a world that is already running.** Called
+	/// by whoever loads the table, both before the value goes in and after:
+	///
+	/// - an entry already carries this identity under a **different** name, so
+	///   the file behind it was renamed. The entry is renamed in place, which
+	///   is the whole point - it keeps its slot, so every handle the world is
+	///   holding goes on resolving, and the value compiled under the new name
+	///   lands in the entry it always had;
+	/// - an entry under this name carries it already, or takes it now;
+	/// - neither, and nothing happens. An asset nothing has loaded yet has no
+	///   entry to file anything against, which is why this is called a second
+	///   time once the value is in.
+	///
+	/// **Nothing is ever made here**, and that is not tidiness: an entry made
+	/// empty and filled an instant later would be an entry *replaced*, which
+	/// moves its revision, and a revision that moves is a re-upload. A first
+	/// load has to read as a first load.
+	///
+	/// [`Id::NONE`] takes the identity away from the entry under this name, if
+	/// there is one. That is an asset whose file has gone.
+	///
+	/// @param name - the asset name it is known by now
+	/// @param id - its identity
+	/// @return the entry's index, or zero when there was nothing to do
+	pub fn adopt(&mut self, name: &str, id: Id) -> u32 {
+		if id.is_none() {
+			let index = self.find(name);
+
+			if index != 0
+				&& let Some(entry) = self.entry_mut(index)
+			{
+				entry.id = Id::NONE;
+			}
+
+			return index;
+		}
+
+		let index = match self.find_by_id(id) {
+			| 0 => self.find(name),
+			| held => held,
+		};
+
+		// slot zero is the null entry and belongs to nobody: renaming it would
+		// give "nothing" a name and an identity, and every handle that was
+		// never set points at it.
+		if index == 0 {
+			return 0;
+		}
+
+		let Some(entry) = self.entry_mut(index) else {
+			return 0;
+		};
+
+		name.clone_into(&mut entry.name);
+		entry.id = id;
+
+		index
+	}
+
 	/// Appends a new entry.
 	fn push(&mut self, name: &str, value: T) -> u32 {
 		let Ok(index) = u32::try_from(self.entries.len()) else {
@@ -199,6 +343,7 @@ impl<T> Registry<T> {
 
 		self.entries.push(Entry {
 			name: name.to_owned(),
+			id: Id::NONE,
 			value,
 			revision: 0,
 		});
@@ -280,6 +425,98 @@ mod tests {
 			.collect();
 
 		assert_eq!(seen, vec![0, 1, 2], "the null entry first, then the order they arrived");
+	}
+
+	#[test]
+	fn an_entry_carries_no_identity_until_one_is_filed() {
+		let mut registry = Registry::new(0_u32);
+		let index = registry.insert("thing", 1);
+
+		assert_eq!(registry.entry(index).map(Entry::id), Some(Id::NONE), "nobody said one");
+		assert_eq!(registry.find_by_id(Id::NONE), 0, "and nothing is not something to find");
+
+		let id = Id::from_bits(7);
+		registry.adopt("thing", id);
+
+		assert_eq!(registry.entry(index).map(Entry::id), Some(id), "now it has one");
+		assert_eq!(registry.find_by_id(id), index, "and it answers to it");
+		assert_eq!(registry.len(), 2, "with nothing appended");
+	}
+
+	#[test]
+	fn a_name_that_is_not_there_yet_is_left_alone_and_takes_its_identity_after() {
+		// what a first load looks like, and why nothing is made here: an entry
+		// made empty and filled an instant later would be an entry replaced,
+		// and a replaced entry's revision moves, and a revision that moves is
+		// a re-upload of something nobody had.
+		let mut registry = Registry::new(0_u32);
+		let id = Id::from_bits(3);
+
+		assert_eq!(registry.adopt("thing", id), 0, "there is nothing to file it against");
+		assert_eq!(registry.len(), 1, "and nothing was made");
+
+		let index = registry.insert("thing", 5);
+
+		assert_eq!(registry.adopt("thing", id), index, "the second call finds it");
+		assert_eq!(registry.find_by_id(id), index);
+		assert_eq!(
+			registry.entry(index).map(Entry::revision),
+			Some(0),
+			"and it is still a first load"
+		);
+	}
+
+	#[test]
+	fn slot_zero_takes_no_name_and_no_identity() {
+		// every handle that was never set points at it, so a table that let it
+		// be renamed would let "nothing" become an asset.
+		let mut registry = Registry::new(0_u32);
+		let id = Id::from_bits(9);
+
+		assert_eq!(registry.adopt("", id), 0, "the empty name is not a name");
+		assert_eq!(registry.adopt("nobody", id), 0, "and neither is one nothing answers to");
+		assert_eq!(registry.entry(0).map(Entry::id), Some(Id::NONE), "so it has none");
+		assert_eq!(registry.entry(0).map(Entry::name), Some(""), "and is still called nothing");
+	}
+
+	#[test]
+	fn an_entry_whose_file_was_renamed_moves_rather_than_being_appended_to() {
+		// the whole reason an entry carries an identity. A handle the world is
+		// holding has to go on resolving to the thing it resolved to, and a
+		// table keyed only by name would leave it pointing at the old entry.
+		let mut registry = Registry::new(0_u32);
+		let id = Id::from_bits(11);
+		let held = registry.insert("meshes/crystal", 1);
+		registry.adopt("meshes/crystal", id);
+
+		let moved = registry.adopt("meshes/gem", id);
+		registry.insert("meshes/gem", 2);
+
+		assert_eq!(moved, held, "the same slot, so the same handle");
+		assert_eq!(registry.len(), 2, "and nothing was appended");
+		assert_eq!(registry.find("meshes/gem"), held, "the new name answers");
+		assert_eq!(registry.find("meshes/crystal"), 0, "and the old one does not");
+		assert_eq!(
+			registry.entry(held).map(|entry| *entry.value()),
+			Some(2),
+			"holding what was compiled under the new name"
+		);
+	}
+
+	#[test]
+	fn nothing_filed_against_a_name_takes_its_identity_away() {
+		// what an asset whose file has gone looks like: the entry stays, so a
+		// handle still resolves, and it answers to nobody's identity.
+		let mut registry = Registry::new(0_u32);
+		let id = Id::from_bits(5);
+		registry.adopt("thing", id);
+		let index = registry.insert("thing", 1);
+
+		assert_eq!(registry.adopt("thing", Id::NONE), index, "the same entry");
+		assert_eq!(registry.entry(index).map(Entry::id), Some(Id::NONE));
+		assert_eq!(registry.find_by_id(id), 0, "and the identity is nobody's");
+		assert_eq!(registry.adopt("nowhere", Id::NONE), 0, "a name nobody knows makes nothing");
+		assert_eq!(registry.len(), 2);
 	}
 
 	#[test]

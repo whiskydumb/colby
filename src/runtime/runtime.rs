@@ -247,6 +247,7 @@ impl Runtime {
 		crate::saves::serve(&mut self.world, &mut self.simulation, &self.project);
 		crate::light::serve(&mut self.world, &self.project);
 		crate::code::serve(&mut self.world, &self.project);
+		crate::rename::serve(&mut self.world, &self.project);
 		crate::net::serve(&mut self.world, self.net.as_mut());
 
 		// and everything the socket is holding, before any step: what a step

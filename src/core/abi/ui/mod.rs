@@ -673,6 +673,9 @@ impl Default for Ui {
 	fn default() -> Self { Self::new() }
 }
 
+// the two an identity needs, for the table above. @ref `registry_identity!`
+crate::registry_identity!(Ui, DocumentId, documents);
+
 #[cfg(test)]
 mod tests {
 	use super::*;
