@@ -769,7 +769,7 @@ pub fn compile_file(source: &Path, output: &Path, root: &Path, ids: &Ids) -> Res
 		| Kind::Script => compile_script(source)?,
 		| Kind::Translation => compile_translation(source)?,
 		| Kind::Material => compile_material(source, ids)?,
-		| Kind::Scene => compile_scene(source, ids)?,
+		| Kind::Scene => compile_scene(source, root, ids)?,
 		| Kind::Model => {
 			let (bytes, produced, said) = compile_model(source, output, root, ids)?;
 
@@ -1645,7 +1645,17 @@ fn extra_inputs(source: &Path, kind: Kind, root: &Path, ids: &Ids) -> Vec<PathBu
 
 			linked
 		},
-		| Kind::Scene | Kind::Material => named_by_id(source, root, ids),
+		| Kind::Scene => {
+			// the sidecars of everything it names by identity, so a rename
+			// rebuilds it, and the sources of every scene it lays inside
+			// itself, so editing a prefab rebuilds what was laid out of it
+			let mut linked = named_by_id(source, root, ids);
+
+			instanced(source, root, ids, &mut linked);
+
+			linked
+		},
+		| Kind::Material => named_by_id(source, root, ids),
 		| _ => Vec::new(),
 	};
 
@@ -1682,6 +1692,102 @@ fn worn(sidecar: &mut import::Import, source: &Path, ids: &Ids) -> Result<()> {
 	}
 
 	Ok(())
+}
+
+/// Where a scene that lays another scene inside itself gets that other file.
+///
+/// The compiler's answer to [`level::Sources`], and the only thing on this
+/// side of it: the reader is a pure function of its text everywhere else, and
+/// this is the one place it has to be handed another file. A name that would
+/// leave the tree resolves to nothing, by the containment
+/// [`source_of`](crate::compile::source_of) already applies to every name.
+struct Tree<'a> {
+	/// The source tree.
+	root: &'a Path,
+}
+
+impl level::Sources for Tree<'_> {
+	fn text(&self, name: &str) -> Option<String> {
+		fs::read_to_string(scene_source(self.root, name)?).ok()
+	}
+}
+
+/// The `.scene` an asset name stands for, if it is inside the tree.
+///
+/// Not [`source_of`], which tries every source extension in turn and would
+/// hand back the `.obj` beside a `.scene` of the same name. A scene is named
+/// and a scene source has exactly one extension, so this asks for that one.
+///
+/// @param root - the source tree
+/// @param name - the asset name, `props/lamp`
+fn scene_source(root: &Path, name: &str) -> Option<PathBuf> {
+	let joined = name
+		.split('/')
+		.fold(root.to_path_buf(), |path, part| path.join(part));
+	let stem = within(&joined, root)?;
+
+	if stem == root {
+		return None;
+	}
+
+	let path = stem.with_extension(level::EXTENSION);
+
+	path.is_file().then_some(path)
+}
+
+/// Every scene source a scene is built out of, however deep they nest.
+///
+/// **Transitively, and that is the whole point of it.** A room lays in a desk
+/// and the desk lays in a lamp; editing the lamp changes what the room
+/// compiles to, and the room's own text does not move when it does. Listing
+/// only what a file names directly would rebuild the desk and leave the room
+/// holding last week's lamp - which is the shape of the staleness bug this
+/// project already fixed once for outputs.
+///
+/// A file that cannot be read or is not JSON contributes nothing: the sweep is
+/// not the place a broken source is reported, and the compiler will say so
+/// properly when it comes to it.
+///
+/// @param source - the `.scene` to walk
+/// @param root - the source tree
+/// @param ids - every id in the project, for an instance naming one
+/// @param found - the paths so far, which is also the visited set that stops
+/// a loop; the compiler refuses one by name when it reads the file
+fn instanced(source: &Path, root: &Path, ids: &Ids, found: &mut Vec<PathBuf>) {
+	let Ok(text) = fs::read_to_string(source) else {
+		return;
+	};
+
+	let Ok(parsed) = json::parse(&text) else {
+		return;
+	};
+
+	let by = ident::Resolve::with(ids, ident::block(&parsed).unwrap_or_default());
+
+	for entry in parsed
+		.get("instances")
+		.map(json::Value::as_array)
+		.unwrap_or_default()
+	{
+		let Some(named) = entry.get("scene").and_then(json::Value::as_str) else {
+			continue;
+		};
+
+		let Ok(name) = by.name(named) else {
+			continue;
+		};
+
+		let Some(path) = scene_source(root, &name) else {
+			continue;
+		};
+
+		if found.contains(&path) {
+			continue;
+		}
+
+		found.push(path.clone());
+		instanced(&path, root, ids, found);
+	}
 }
 
 /// The id sidecars of everything a source names by identity.
@@ -1762,8 +1868,8 @@ fn compile_translation(source: &Path) -> Result<(Vec<u8>, Produced)> {
 ///
 /// @param source - the `.scene`, in the source tree
 /// @return the file to write and what to report about it
-fn compile_scene(source: &Path, ids: &Ids) -> Result<(Vec<u8>, Produced)> {
-	let data = level::import_with(&fs::read_to_string(source)?, ids)
+fn compile_scene(source: &Path, root: &Path, ids: &Ids) -> Result<(Vec<u8>, Produced)> {
+	let data = level::import_over(&fs::read_to_string(source)?, ids, &Tree { root })
 		.map_err(|error| err!(Asset("{}: {error}", source.display())))?;
 	let bytes =
 		scene::encode(&data).map_err(|error| err!(Asset("{}: {error}", source.display())))?;
@@ -3238,6 +3344,242 @@ FORMAT=32-bit_rle_rgbe
 
 		assert_eq!(table(&first), table(&second), "two trees, the same identities");
 		assert!(table(&first).lines().count() > 2, "and there are some to compare");
+	}
+
+	/// The entity names of a compiled scene, in the order the file holds them.
+	fn standing(workspace: &Path, name: &str) -> Vec<String> {
+		let path = output_root(workspace)
+			.join(name)
+			.with_extension(scene::EXTENSION);
+		let file = scene::SceneFile::open(&path).expect("it reads back");
+
+		file.to_scene_data()
+			.things
+			.iter()
+			.map(|thing| thing.name.clone())
+			.collect()
+	}
+
+	/// A fixture with a lamp, a desk laying the lamp in, and a room laying the
+	/// desk in - so that a change to the lamp has two files to reach through.
+	fn nested(name: &str) -> PathBuf {
+		let workspace = workspace(name);
+
+		put(
+			&workspace,
+			"props/lamp.scene",
+			r#"{ "entities": [ { "name": "bulb", "mesh": "cube" } ] }"#,
+		);
+		put(
+			&workspace,
+			"props/desk.scene",
+			r#"{ "entities": [ { "name": "top", "mesh": "cube" } ],
+			     "instances": [ { "name": "reading", "scene": "props/lamp" } ] }"#,
+		);
+		put(
+			&workspace,
+			"scenes/room.scene",
+			r#"{ "instances": [ { "name": "corner", "scene": "props/desk" } ] }"#,
+		);
+		run(&workspace, false);
+
+		workspace
+	}
+
+	#[test]
+	fn a_scene_that_lays_another_in_compiles_to_the_copies_of_it() {
+		let workspace = nested("prefab-nested");
+
+		assert_eq!(
+			standing(&workspace, "scenes/room"),
+			["corner", "corner/top", "corner/reading", "corner/reading/bulb"],
+			"the whole chain is in the compiled file, and nothing names a scene"
+		);
+	}
+
+	#[test]
+	fn an_instance_reaches_the_compiled_file_as_a_group() {
+		let workspace = nested("prefab-group");
+		let path = output_root(&workspace)
+			.join("scenes/room")
+			.with_extension(scene::EXTENSION);
+		let data = scene::SceneFile::open(&path)
+			.expect("it reads back")
+			.to_scene_data();
+		let marked: Vec<&str> = data
+			.things
+			.iter()
+			.filter(|thing| {
+				thing
+					.records
+					.iter()
+					.any(|noted| noted.record == "editing" && noted.field == "group")
+			})
+			.map(|thing| thing.name.as_str())
+			.collect();
+
+		// the whole of what the editor knows about an instance, and it is
+		// carried by a record rather than by a field, so the file did not move
+		assert_eq!(
+			marked,
+			["corner", "corner/reading"],
+			"both instances are groups in the compiled world, the nested one included"
+		);
+	}
+
+	#[test]
+	fn editing_a_prefab_rebuilds_every_scene_that_lays_it_in_however_deep() {
+		let workspace = nested("prefab-stale");
+		let before = cscene(&workspace, "scenes/room");
+
+		put(
+			&workspace,
+			"props/lamp.scene",
+			r#"{ "entities": [ { "name": "bulb", "mesh": "meshes/globe" } ] }"#,
+		);
+
+		let report = run(&workspace, false);
+
+		assert_ne!(
+			cscene(&workspace, "scenes/room"),
+			before,
+			"the room is two files away from the lamp and it was built again anyway"
+		);
+		assert!(
+			report
+				.compiled
+				.iter()
+				.any(|built| built.name == "scenes/room"),
+			"and the sweep is what noticed, rather than a forced pass"
+		);
+	}
+
+	#[test]
+	fn a_scene_that_lays_nothing_in_is_left_alone_when_a_prefab_moves() {
+		let workspace = nested("prefab-stale-control");
+
+		put(
+			&workspace,
+			"scenes/plain.scene",
+			r#"{ "entities": [ { "name": "it", "mesh": "cube" } ] }"#,
+		);
+		run(&workspace, false);
+
+		let before = cscene(&workspace, "scenes/plain");
+
+		put(
+			&workspace,
+			"props/lamp.scene",
+			r#"{ "entities": [ { "name": "bulb", "mesh": "meshes/globe" } ] }"#,
+		);
+		run(&workspace, false);
+
+		assert_eq!(
+			cscene(&workspace, "scenes/plain"),
+			before,
+			"a scene that names no prefab does not move when one does"
+		);
+	}
+
+	#[test]
+	fn a_scene_may_lay_a_prefab_in_by_identity_and_a_rename_carries_it() {
+		let workspace = workspace("prefab-by-id");
+		let source = put(
+			&workspace,
+			"props/lamp.scene",
+			r#"{ "entities": [ { "name": "bulb", "mesh": "cube" } ] }"#,
+		);
+
+		run(&workspace, false);
+
+		let id = ident::read_beside(&source)
+			.expect("the sidecar reads")
+			.expect("and there is one");
+
+		put(
+			&workspace,
+			"scenes/room.scene",
+			&format!(
+				r#"{{ "assets": {{ "props/lamp": "{id}" }},
+				      "instances": [ {{ "name": "corner", "scene": "props/lamp" }} ] }}"#
+			),
+		);
+		run(&workspace, false);
+
+		assert_eq!(
+			standing(&workspace, "scenes/room"),
+			["corner", "corner/bulb"],
+			"the identity resolved to the scene it stands for"
+		);
+
+		rename(&workspace, "props/lamp.scene", "props/lantern.scene", true);
+		run(&workspace, false);
+
+		assert_eq!(
+			standing(&workspace, "scenes/room"),
+			["corner", "corner/bulb"],
+			"and renaming the prefab left the room standing"
+		);
+	}
+
+	#[test]
+	fn a_scene_laying_a_prefab_in_by_name_breaks_when_the_prefab_is_renamed() {
+		let workspace = workspace("prefab-by-name");
+
+		put(
+			&workspace,
+			"props/lamp.scene",
+			r#"{ "entities": [ { "name": "bulb", "mesh": "cube" } ] }"#,
+		);
+		put(
+			&workspace,
+			"scenes/room.scene",
+			r#"{ "instances": [ { "name": "corner", "scene": "props/lamp" } ] }"#,
+		);
+		run(&workspace, false);
+		rename(&workspace, "props/lamp.scene", "props/lantern.scene", true);
+
+		let report = run(&workspace, false);
+		let failed = report
+			.failed
+			.iter()
+			.find(|failure| failure.source.ends_with("room.scene"))
+			.expect("the room cannot be compiled without the lamp");
+
+		assert!(
+			failed.error.to_string().contains("props/lamp"),
+			"and it says which scene is gone: {}",
+			failed.error
+		);
+	}
+
+	#[test]
+	fn a_ring_of_scenes_is_refused_by_the_compiler_naming_the_chain() {
+		let workspace = workspace("prefab-ring");
+
+		put(
+			&workspace,
+			"props/first.scene",
+			r#"{ "instances": [ { "name": "b", "scene": "props/second" } ] }"#,
+		);
+		put(
+			&workspace,
+			"props/second.scene",
+			r#"{ "instances": [ { "name": "a", "scene": "props/first" } ] }"#,
+		);
+
+		let report = run(&workspace, false);
+
+		assert_eq!(report.failed.len(), 2, "neither of the two can be compiled");
+
+		for failure in &report.failed {
+			let said = failure.error.to_string();
+
+			assert!(
+				said.contains("props/first") && said.contains("props/second"),
+				"and each message names both links: {said}"
+			);
+		}
 	}
 
 	#[test]

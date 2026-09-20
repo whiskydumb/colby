@@ -81,13 +81,50 @@
 //! was drawn in; whatever an animation does to it afterwards belongs to a
 //! save, not to a level. Writing thirty-five transforms per character into a
 //! file a person edits would bury the two lines they came to change.
+//!
+//! **A source may lay another scene inside itself, and that is the whole of
+//! what a prefab is here.** An `"instances"` entry names a scene, stands
+//! somewhere, and may say what it wants different about what is inside:
+//!
+//! ```text
+//! "instances": [ { "name": "left lamp", "scene": "props/lamp",
+//!                  "position": [0, 0, -4],
+//!                  "overrides": { "bulb": { "color": [1, 0.2, 0.2] } } } ]
+//! ```
+//!
+//! **What comes out is copies, and the reference stops here.** The named
+//! scene is read whole, its entities, bodies, joints and poses are laid into
+//! this one under an entity of their own, and the `.cscene` that comes out
+//! holds no reference at all - it is the same flat list of things standing in
+//! the same places it would be if somebody had typed them twice. So no
+//! version moves, a save and a piece of the world on the wire are what they
+//! were, and nothing at run time has to load one file before another.
+//!
+//! Four consequences worth knowing, each of which is the point of one of the
+//! rules below:
+//!
+//! - **the copies are named after the instance**, `left lamp/bulb`, because a
+//!   name used twice is an error here and two lamps hold the same names;
+//! - **an override names something inside the prefab** and is read exactly as
+//!   an entity entry is, onto the copy rather than onto the defaults, so a key
+//!   left out is the prefab's answer and a key written is this instance's;
+//! - **the instance's entity is a group**, which is what makes the editor treat
+//!   what came out as one thing - a click takes the whole of it, alt goes
+//!   inside, and releasing it is the gesture that breaks the copy off;
+//! - **editing the prefab rebuilds what named it**, because the compiler lists
+//!   the scenes a source instances among the files it was built from, and the
+//!   sweep already rebuilds anything whose inputs moved.
+//!
+//! **A loop is refused naming the whole chain**, and so is a nesting deeper
+//! than [`MOST_NESTING`] or a splice that would overrun a table the world has
+//! room for.
 
 use colby_core::{
 	Result,
 	abi::{
-		Body, BodyId, BodyKind, Camera, Decal, Emitter, EntityId, Field, Joint, JointKind,
-		Layers, Light, Mask, MeshId, Noted, Post, Renderable, Shape, Sky, Spelled, Terrain,
-		Transform,
+		Body, BodyId, BodyKind, Camera, Decal, EDITING, Emitter, EntityId, Field, Joint,
+		JointKind, Layers, Light, MAX_BODIES, MAX_ENTITIES, MAX_JOINTS, MAX_POSES, Mask, MeshId,
+		Noted, Post, Renderable, Shape, Sky, Spelled, Terrain, Transform,
 		field::{self, Kind},
 		probes::Grid,
 		record,
@@ -106,6 +143,45 @@ use crate::{
 
 /// The extension a scene source is written with.
 pub const EXTENSION: &str = "scene";
+
+/// How deep one scene may lay another inside itself.
+///
+/// A prefab in a prefab in a prefab is a thing people build; eight of them is
+/// not, and the number is here so that a chain that is somehow not a loop and
+/// still does not end is refused with a message rather than by running out of
+/// stack. A loop proper is caught by name and says so, @ref [`Nesting`].
+pub const MOST_NESTING: usize = 8;
+
+/// Where the text of a scene a source names comes from.
+///
+/// The one thing this module cannot do for itself: reading a source is a pure
+/// function of its text everywhere else here, and a source that lays another
+/// scene inside itself needs that other file. So the file system comes in
+/// through this rather than through a path, which keeps the reader testable
+/// against a table in memory and keeps the compiler the only thing that knows
+/// where an asset tree is.
+///
+/// @ref [`import_over`] for the way in that takes one.
+pub trait Sources {
+	/// The whole text of the scene called this, or nothing.
+	///
+	/// @param name - the asset name, `props/lamp`, already resolved from
+	/// whatever identity the file may have written
+	fn text(&self, name: &str) -> Option<String>;
+}
+
+/// The answer a reader with no tree behind it gives: nothing is there.
+///
+/// What [`import`] and [`import_with`] read through, so that a source outside
+/// a project still round-trips exactly - and one that lays another scene
+/// inside itself is refused naming the scene, rather than quietly coming back
+/// without it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Alone;
+
+impl Sources for Alone {
+	fn text(&self, _name: &str) -> Option<String> { None }
+}
 
 /// The body a source describes when it says nothing about one.
 ///
@@ -179,17 +255,102 @@ pub fn import(text: &str) -> Result<SceneData> { import_with(text, &Ids::new()) 
 /// # Errors
 ///
 /// Everything [`import`] refuses, and an id nothing in the project carries.
-pub fn import_with(text: &str, ids: &Ids) -> Result<SceneData> {
+pub fn import_with(text: &str, ids: &Ids) -> Result<SceneData> { import_over(text, ids, &Alone) }
+
+/// Reads a scene, resolving identities and laying in every scene it instances.
+///
+/// The compiler's way in, and the only one that can read a source which lays
+/// another scene inside itself: the other file comes from `sources`, and what
+/// comes back holds its **copies** rather than any reference to it. @ref
+/// [`Sources`] and the module's own paragraph on what a prefab is here.
+///
+/// @param text - the whole `.scene` file
+/// @param ids - every id in the project
+/// @param sources - where the text of a scene it names comes from
+/// @return the description, ready to be written as a `.cscene`
+///
+/// # Errors
+///
+/// Everything [`import_with`] refuses, and: a scene nothing answers to, a
+/// chain of instances that comes back to itself or runs deeper than
+/// [`MOST_NESTING`], an override naming nothing inside the prefab, a copy
+/// whose name something in the file already has, and a splice the world would
+/// have no room for.
+pub fn import_over(text: &str, ids: &Ids, sources: &dyn Sources) -> Result<SceneData> {
+	read_scene(text, ids, sources, &mut Nesting::new())
+}
+
+/// What is being read, outermost first, and how deep it is.
+///
+/// A loop is a name that is on this already, and the message names the whole
+/// chain rather than only the two ends: `scenes/room -> props/desk ->
+/// props/desk` is what somebody needs to see to know which link to cut.
+struct Nesting {
+	/// The scenes being read, in the order they were entered.
+	chain: Vec<String>,
+}
+
+impl Nesting {
+	/// Nothing entered yet.
+	const fn new() -> Self { Self { chain: Vec::new() } }
+
+	/// Enters a scene, or refuses the chain it would make.
+	///
+	/// @param name - the asset name of the scene about to be read
+	fn enter(&mut self, name: &str) -> Result<()> {
+		if self.chain.iter().any(|it| it == name) {
+			return Err(err!(Asset(
+				"the scene {name} lays itself inside itself: {} -> {name}",
+				self.chain.join(" -> ")
+			)));
+		}
+
+		if self.chain.len() >= MOST_NESTING {
+			return Err(err!(Asset(
+				"scenes are laid inside one another more than {MOST_NESTING} deep: {} -> 				 \
+				 {name}",
+				self.chain.join(" -> ")
+			)));
+		}
+
+		self.chain.push(name.to_owned());
+
+		Ok(())
+	}
+
+	/// Leaves the scene most recently entered.
+	fn leave(&mut self) { self.chain.pop(); }
+}
+
+/// One scene, with whatever it lays inside itself laid in.
+///
+/// @param text - the whole `.scene` file
+/// @param ids - every id in the project
+/// @param sources - where the text of a scene it names comes from
+/// @param nesting - what is being read already, for the loop
+fn read_scene(
+	text: &str,
+	ids: &Ids,
+	sources: &dyn Sources,
+	nesting: &mut Nesting,
+) -> Result<SceneData> {
 	let root = json::parse(text)?;
 	fields(
 		&root,
-		&[ident::BLOCK, "stage", "entities", "bodies", "joints", "poses"],
+		&[ident::BLOCK, "stage", "entities", "bodies", "joints", "poses", "instances"],
 		"the scene",
 	)?;
 
 	let by = Resolve::with(ids, ident::block(&root)?);
 	let posed = poses(root.get("poses"))?;
-	let things = entities(root.get("entities"), &posed)?;
+	let mut things = entities(root.get("entities"), &posed)?;
+	let laid = instances(root.get("instances"), &mut things, &by)?;
+
+	// once the instances' own entities are in the list, because either may
+	// hang off the other and a person is not going to care which list a name
+	// came out of
+	hang(&mut things, root.get("entities"), root.get("instances"))?;
+
 	let solids = bodies(root.get("bodies"), &things)?;
 	let links = joints(root.get("joints"), &solids)?;
 
@@ -224,7 +385,17 @@ pub fn import_with(text: &str, ids: &Ids) -> Result<SceneData> {
 		peer_generations: Vec::new(),
 	};
 
+	// before anything is laid in, and this is the one ordering that matters:
+	// what a child names was resolved against the child's own block by the
+	// call that read it, and running this over the whole list afterwards would
+	// put the parent's block over names that are already answers.
 	resolved(&mut data, &by)?;
+
+	for instance in &laid {
+		lay(&mut data, instance, ids, sources, nesting, &by)?;
+	}
+
+	renumber(&mut data);
 
 	Ok(data)
 }
@@ -625,132 +796,218 @@ fn poses(value: Option<&Value>) -> Result<Vec<Posed>> {
 fn entities(value: Option<&Value>, posed: &[Posed]) -> Result<Vec<Thing>> {
 	let mut things: Vec<Thing> = Vec::new();
 
-	for (index, entry) in listed(value).iter().enumerate() {
-		check(
-			entry,
-			&[names(Transform::FIELDS, &[]), names(Renderable::FIELDS, &[])],
-			&[
-				"name",
-				"parent",
-				"hidden",
-				"takes_decals",
-				"light",
-				"emitter",
-				"terrain",
-				"decal",
-				"mask",
-				"records",
-			],
-			"an entity",
-		)?;
+	for entry in listed(value) {
+		let thing = read_thing(entry, posed, blank_thing(), true)?;
 
-		let name = text(entry.get("name"));
-		once(things.iter().any(|it| it.name == name), &name, "entity")?;
-
-		let moved = text(entry.get("pose"));
-		let pose = if moved.is_empty() {
-			NO_INDEX
-		} else {
-			count(
-				posed
-					.iter()
-					.position(|it| it.name == moved)
-					.ok_or_else(|| {
-						err!(Asset("an entity is moved by {moved}, and no pose is that"))
-					})?,
-				"a scene's records",
-			)?
-		};
-
-		// by hand beside the name and the parent, for their reason: it is the
-		// entity's own, and no record's table has a row for it
-		let hidden = said(entry, "hidden", false)?;
-		// and whether decals paint it, the same way and for the same reason,
-		// though it is the one whose usual answer is `true`
-		let takes_decals = said(entry, "takes_decals", true)?;
-
-		let mut transform = Transform::IDENTITY;
-		read(&mut transform, entry, Transform::FIELDS, "an entity")?;
-
-		let mut look = Renderable::NOTHING;
-		read(&mut look, entry, Renderable::FIELDS, "an entity")?;
-
-		// nested rather than folded in beside the other two tables, because a
-		// light has a `color` and so does a renderable, and one flat namespace
-		// would have to rename one of them. The stage's camera is nested for
-		// the same reason and by the same two calls.
-		let mut lamp = Light::NONE;
-		if let Some(shining) = entry.get("light") {
-			check(shining, &[names(Light::FIELDS, &[])], &[], "a light")?;
-			read(&mut lamp, shining, Light::FIELDS, "a light")?;
-		}
-
-		// and the emitter under a key of its own, for the light's reason and
-		// with one more of its own: an emitter has a `color` *and* a `size`
-		// and a `blend`, all three of which are words something else here
-		// already uses.
-		let mut emitter = Emitter::NONE;
-		let picture = if let Some(throwing) = entry.get("emitter") {
-			// `texture` by hand: it is a reference, so `read` steps over it
-			// and the name is taken beside the numbers - the same two calls a
-			// mesh and a material get.
-			check(throwing, &[names(Emitter::FIELDS, &[])], &["texture"], "an emitter")?;
-			read(&mut emitter, throwing, Emitter::FIELDS, "an emitter")?;
-
-			text(throwing.get("texture"))
-		} else {
-			String::new()
-		};
-
-		// and the ground under a key of its own, for the emitter's reason: a
-		// terrain has a `size` and a `height`, and both words are spoken for
-		// elsewhere in this file. Nothing by hand here at all - a terrain
-		// names no asset, so every field goes through the table.
-		let mut terrain = Terrain::NONE;
-		if let Some(ground) = entry.get("terrain") {
-			check(ground, &[names(Terrain::FIELDS, &[])], &[], "a terrain")?;
-			read(&mut terrain, ground, Terrain::FIELDS, "a terrain")?;
-		}
-
-		// and the decal under a key of its own, for the terrain's reason and
-		// with nothing by hand: a decal names no asset either, because what it
-		// throws is the entity's own material.
-		let mut decal = Decal::NONE;
-		if let Some(painting) = entry.get("decal") {
-			check(painting, &[names(Decal::FIELDS, &[])], &[], "a decal")?;
-			read(&mut decal, painting, Decal::FIELDS, "a decal")?;
-		}
-
-		// and the mask under a key of its own, read by hand from end to end: it
-		// is a grid and a run of cells rather than a record with a table, so
-		// there is nothing for `read` to walk. @ref `mask_of`.
-		let mask = mask_of(entry.get("mask"))?;
-
-		things.push(Thing {
-			name,
-			slot: count(index, "a scene's records")?,
-			generation: 1,
-			transform,
-			mesh: text(entry.get("mesh")),
-			material: text(entry.get("material")),
-			color: look.color,
-			light: lamp,
-			emitter,
-			emitter_texture: picture,
-			terrain,
-			decal,
-			mask,
-			pose,
-			parent: NO_INDEX,
-			hidden,
-			takes_decals,
-			records: records(entry.get("records"))?,
-		});
+		once(things.iter().any(|it| it.name == thing.name), &thing.name, "entity")?;
+		things.push(thing);
 	}
 
-	hang(&mut things, value)?;
-
 	Ok(things)
+}
+
+/// The entity a source describes when it says nothing about one.
+///
+/// [`BLANK_BODY`]'s opposite number, and it exists for one reason: a white
+/// tint. A [`Thing`] of no fields is black, because that is what a description
+/// nobody filled in holds, and an entity a *source* says nothing about is
+/// drawn in its material's own colors - which is a tint of one. The rest is
+/// the description's own defaults.
+fn blank_thing() -> Thing {
+	Thing {
+		color: Renderable::NOTHING.color,
+		..Thing::default()
+	}
+}
+
+/// One entity entry, read onto what it is changing.
+///
+/// **The base is the whole of what makes an override work.** A key a record
+/// leaves out keeps whatever the base holds, so reading an entry over
+/// [`blank_thing`] is an entity as a source spells one, and reading the same
+/// entry over a copy laid in by an instance is that copy with the two lines
+/// somebody wrote about it changed. There is no second reader and no list of
+/// which fields may be overridden: whatever a source may say about an entity,
+/// an instance may say about one inside it.
+///
+/// @param entry - the entity's object
+/// @param posed - the poses read so far, for a `pose` naming one
+/// @param base - what it is changing, or a blank entity
+/// @param whole - whether this is an entity of its own, which may be called
+/// something and may hang off something; an override may do neither, because
+/// its name is the key it stands under and what it hangs off is the prefab's
+/// business
+fn read_thing(entry: &Value, posed: &[Posed], base: Thing, whole: bool) -> Result<Thing> {
+	let what = if whole { "an entity" } else { "an override" };
+	let mut hand = vec![
+		"hidden",
+		"takes_decals",
+		"light",
+		"emitter",
+		"terrain",
+		"decal",
+		"mask",
+		"records",
+	];
+
+	if whole {
+		hand.extend_from_slice(&["name", "parent"]);
+	}
+
+	check(
+		entry,
+		&[
+			names(Transform::FIELDS, &[]),
+			// an override may not say which pose moves the thing, and it is
+			// refused rather than ignored: a pose is a record of the prefab and
+			// the copies' poses are named after the instance, so a key written
+			// here would either name nothing or have to be spelled in terms the
+			// person writing it cannot see. Which of a prefab's poses moves what
+			// is a thing about the prefab.
+			names(Renderable::FIELDS, if whole { &[] } else { &["pose"] }),
+		],
+		&hand,
+		what,
+	)?;
+
+	let moved = text(entry.get("pose"));
+	let pose = if entry.get("pose").is_none() {
+		base.pose
+	} else if moved.is_empty() {
+		NO_INDEX
+	} else {
+		count(
+			posed
+				.iter()
+				.position(|it| it.name == moved)
+				.ok_or_else(|| {
+					err!(Asset("an entity is moved by {moved}, and no pose is that"))
+				})?,
+			"a scene's records",
+		)?
+	};
+
+	// by hand beside the name and the parent, for their reason: it is the
+	// entity's own, and no record's table has a row for it
+	let hidden = said(entry, "hidden", base.hidden)?;
+	// and whether decals paint it, the same way and for the same reason,
+	// though it is the one whose usual answer is `true`
+	let takes_decals = said(entry, "takes_decals", base.takes_decals)?;
+
+	let mut transform = base.transform;
+	read(&mut transform, entry, Transform::FIELDS, what)?;
+
+	let mut look = Renderable { color: base.color, ..Renderable::NOTHING };
+	read(&mut look, entry, Renderable::FIELDS, what)?;
+
+	// nested rather than folded in beside the other two tables, because a
+	// light has a `color` and so does a renderable, and one flat namespace
+	// would have to rename one of them. The stage's camera is nested for
+	// the same reason and by the same two calls.
+	let mut lamp = base.light;
+	if let Some(shining) = entry.get("light") {
+		check(shining, &[names(Light::FIELDS, &[])], &[], "a light")?;
+		read(&mut lamp, shining, Light::FIELDS, "a light")?;
+	}
+
+	// and the emitter under a key of its own, for the light's reason and
+	// with one more of its own: an emitter has a `color` *and* a `size`
+	// and a `blend`, all three of which are words something else here
+	// already uses.
+	let mut emitter = base.emitter;
+	let picture = if let Some(throwing) = entry.get("emitter") {
+		// `texture` by hand: it is a reference, so `read` steps over it
+		// and the name is taken beside the numbers - the same two calls a
+		// mesh and a material get.
+		check(throwing, &[names(Emitter::FIELDS, &[])], &["texture"], "an emitter")?;
+		read(&mut emitter, throwing, Emitter::FIELDS, "an emitter")?;
+
+		said_of(throwing.get("texture"), &base.emitter_texture)
+	} else {
+		base.emitter_texture
+	};
+
+	// and the ground under a key of its own, for the emitter's reason: a
+	// terrain has a `size` and a `height`, and both words are spoken for
+	// elsewhere in this file. Nothing by hand here at all - a terrain
+	// names no asset, so every field goes through the table.
+	let mut terrain = base.terrain;
+	if let Some(ground) = entry.get("terrain") {
+		check(ground, &[names(Terrain::FIELDS, &[])], &[], "a terrain")?;
+		read(&mut terrain, ground, Terrain::FIELDS, "a terrain")?;
+	}
+
+	// and the decal under a key of its own, for the terrain's reason and
+	// with nothing by hand: a decal names no asset either, because what it
+	// throws is the entity's own material.
+	let mut decal = base.decal;
+	if let Some(painting) = entry.get("decal") {
+		check(painting, &[names(Decal::FIELDS, &[])], &[], "a decal")?;
+		read(&mut decal, painting, Decal::FIELDS, "a decal")?;
+	}
+
+	// and the mask under a key of its own, read by hand from end to end: it
+	// is a grid and a run of cells rather than a record with a table, so
+	// there is nothing for `read` to walk. @ref `mask_of`.
+	let mask = if entry.get("mask").is_none() {
+		base.mask
+	} else {
+		mask_of(entry.get("mask"))?
+	};
+
+	Ok(Thing {
+		name: said_of(entry.get("name"), &base.name),
+		slot: base.slot,
+		generation: 1,
+		transform,
+		mesh: said_of(entry.get("mesh"), &base.mesh),
+		material: said_of(entry.get("material"), &base.material),
+		color: look.color,
+		light: lamp,
+		emitter,
+		emitter_texture: picture,
+		terrain,
+		decal,
+		mask,
+		pose,
+		parent: base.parent,
+		hidden,
+		takes_decals,
+		records: noted(base.records, entry.get("records"))?,
+	})
+}
+
+/// A name a record wrote, or the one it is changing.
+fn said_of(value: Option<&Value>, base: &str) -> String {
+	match value {
+		| None => base.to_owned(),
+		| Some(written) => text(Some(written)),
+	}
+}
+
+/// What an entity's records hold after an entry has had its say.
+///
+/// A record and a field at a time, rather than the list at a time: an override
+/// that says one thing about `drawing.covers` should not take away what the
+/// prefab said about `door.speed`, and a whole-entity entry has an empty base
+/// so the two are the same code.
+///
+/// @param base - what it is changing, or nothing
+/// @param value - the entry's `records`, or nothing
+fn noted(base: Vec<Noted>, value: Option<&Value>) -> Result<Vec<Noted>> {
+	let mut held = base;
+
+	for written in records(value)? {
+		match held
+			.iter_mut()
+			.find(|it| it.record == written.record && it.field == written.field)
+		{
+			| Some(already) => already.value = written.value,
+			| None => held.push(written),
+		}
+	}
+
+	Ok(held)
 }
 
 /// What an entity's records hold, as the source spells it.
@@ -874,16 +1131,363 @@ fn said(entry: &Value, key: &str, usual: bool) -> Result<bool> {
 	}
 }
 
+/// One scene laid inside another, as the source spells it.
+///
+/// The entity is already in the list by the time this exists - it is an
+/// ordinary entity and goes through the ordinary reader - so what is left here
+/// is where its copies come from and what this instance wants different about
+/// them.
+struct Laid<'a> {
+	/// Which entity in the list is the instance's own, an index into it.
+	thing: usize,
+
+	/// What scene to lay in, by asset name, resolved from whatever the file
+	/// wrote.
+	scene: String,
+
+	/// What it wants different about what is inside, by the name the thing has
+	/// inside the prefab.
+	overrides: Option<&'a Value>,
+}
+
+/// Every scene this one lays inside itself, with an entity made for each.
+///
+/// **The entity is made here and the copies are laid in later**, in two passes
+/// for the reason parents are resolved in two: an instance may hang off an
+/// entity written below it, and the copies cannot be laid in until every name
+/// in the file is known. What this leaves in `things` is the instance's own
+/// entity, which is where it stands and what everything inside it hangs off.
+///
+/// **It is a group unless the source says otherwise.** That is the whole of
+/// what the editor knows about an instance: a click in the picture takes the
+/// outermost group around what was hit, so a lamp laid in as an instance is
+/// picked, moved and deleted as one thing, alt or the tree reaches inside it,
+/// and releasing the group is the gesture that turns a copy back into loose
+/// entities. @ref `colby_core::abi::Editing`.
+///
+/// @param value - the `instances` list, or nothing
+/// @param things - the entities read so far, to add each instance's own to
+/// @param by - the file's block, for a scene named by identity
+fn instances<'a>(
+	value: Option<&'a Value>,
+	things: &mut Vec<Thing>,
+	by: &Resolve<'_>,
+) -> Result<Vec<Laid<'a>>> {
+	let mut laid = Vec::new();
+
+	for entry in listed(value) {
+		check(
+			entry,
+			&[names(Transform::FIELDS, &[])],
+			&["name", "parent", "scene", "group", "overrides", "hidden"],
+			"an instance",
+		)?;
+
+		let scene = by.name(&text(entry.get("scene")))?;
+
+		if scene.is_empty() {
+			return Err(err!(Asset("an instance lays in no scene at all")));
+		}
+
+		let name = text(entry.get("name"));
+
+		// the one record a source must name. Everywhere else the empty name
+		// is what a thing nothing refers to holds, and that is still true of
+		// the copies; but the instance's name is what tells two copies of one
+		// prefab apart and what an override is written under, so an instance
+		// without one lays a second `bulb` beside the first and fails a line
+		// later with a message about a name nobody typed.
+		if name.is_empty() {
+			return Err(err!(Asset("an instance lays in {scene} and is not called anything")));
+		}
+
+		once(things.iter().any(|it| it.name == name), &name, "entity")?;
+
+		let mut transform = Transform::IDENTITY;
+		read(&mut transform, entry, Transform::FIELDS, "an instance")?;
+
+		let mut thing = Thing {
+			name,
+			transform,
+			hidden: said(entry, "hidden", false)?,
+			..blank_thing()
+		};
+
+		if said(entry, "group", true)? {
+			thing.records.push(Noted {
+				record: EDITING.name.to_owned(),
+				field: "group".to_owned(),
+				value: Spelled::Truth(true),
+			});
+		}
+
+		laid.push(Laid {
+			thing: things.len(),
+			scene,
+			overrides: entry.get("overrides"),
+		});
+		things.push(thing);
+	}
+
+	Ok(laid)
+}
+
+/// Lays one scene's copies into another.
+///
+/// Reads the named scene whole - which is where a prefab inside a prefab
+/// happens, and where a loop is caught - and appends its entities, bodies,
+/// joints and poses to this one, shifted so that every index the child held
+/// into its own lists points at the same record in the joined one. What the
+/// child's roots hang off is the instance's entity, so the one transform
+/// somebody wrote moves all of it and the copies keep the places the prefab
+/// put them.
+///
+/// **The child's settings are dropped.** A prefab's camera, gravity, sky and
+/// bake are claims about a world, and laying a lamp into a room is not a
+/// reason to move somebody's camera - the same rule
+/// `colby_core::abi::scene::instantiate` states for the same reason.
+///
+/// @param data - the scene being read, to add to
+/// @param laid - which scene, under which entity, with what changed
+/// @param ids - every id in the project, for the child's own references
+/// @param sources - where the child's text comes from
+/// @param nesting - what is being read already
+/// @param by - this file's block, for a name an override writes
+fn lay(
+	data: &mut SceneData,
+	laid: &Laid<'_>,
+	ids: &Ids,
+	sources: &dyn Sources,
+	nesting: &mut Nesting,
+	by: &Resolve<'_>,
+) -> Result<()> {
+	let Some(text) = sources.text(&laid.scene) else {
+		return Err(err!(Asset("a scene lays in {}, and no scene source is that", laid.scene)));
+	};
+
+	nesting.enter(&laid.scene)?;
+	let child = read_scene(&text, ids, sources, nesting)
+		.map_err(|error| err!(Asset("{}: {error}", laid.scene)))?;
+	nesting.leave();
+
+	let under = count(laid.thing, "a scene's records")?;
+	let called = data.things[laid.thing].name.clone();
+	let first_thing = data.things.len();
+	let first_solid = data.solids.len();
+	let first_pose = data.posed.len();
+
+	room(&child, data, &laid.scene)?;
+
+	for mut posed in child.posed {
+		posed.name = within(&called, &posed.name);
+		data.posed.push(posed);
+	}
+
+	for mut thing in child.things {
+		let inside = thing.name.clone();
+
+		thing.name = within(&called, &inside);
+		thing.pose = shifted(thing.pose, first_pose)?;
+		// a root of the prefab hangs off the instance's own entity, so what it
+		// wrote as its place in the world is its place inside that - which is
+		// what makes one transform move the whole of what was laid in
+		thing.parent = if thing.parent == NO_INDEX {
+			under
+		} else {
+			shifted(thing.parent, first_thing)?
+		};
+
+		once(data.things.iter().any(|it| it.name == thing.name), &thing.name, "entity")?;
+		data.things.push(thing);
+	}
+
+	for mut solid in child.solids {
+		solid.name = within(&called, &solid.name);
+		solid.thing = shifted(solid.thing, first_thing)?;
+
+		once(data.solids.iter().any(|it| it.name == solid.name), &solid.name, "body")?;
+		data.solids.push(solid);
+	}
+
+	for mut link in child.links {
+		link.name = within(&called, &link.name);
+		link.first = shifted(link.first, first_solid)?;
+		link.second = shifted(link.second, first_solid)?;
+
+		once(data.links.iter().any(|it| it.name == link.name), &link.name, "joint")?;
+		data.links.push(link);
+	}
+
+	changed(data, laid, first_thing, by)
+}
+
+/// Refuses a splice the world would have no room for.
+///
+/// Each of the four tables has a ceiling, and a scene that lays in more than
+/// one will hold is a file that half loads - which is the one thing the
+/// loaders are built not to do. Refusing it here names the scene that overran,
+/// which is where the name is still known.
+///
+/// @param child - what is about to be laid in
+/// @param data - what it is being laid into
+/// @param scene - what the child is called, for the message
+fn room(child: &SceneData, data: &SceneData, scene: &str) -> Result<()> {
+	for (held, coming, ceiling, what) in [
+		(data.things.len(), child.things.len(), MAX_ENTITIES, "entities"),
+		(data.solids.len(), child.solids.len(), MAX_BODIES, "bodies"),
+		(data.links.len(), child.links.len(), MAX_JOINTS, "joints"),
+		(data.posed.len(), child.posed.len(), MAX_POSES, "poses"),
+	] {
+		if held + coming > ceiling {
+			return Err(err!(Asset(
+				"laying in {scene} would make {} {what}, and a world holds {ceiling}",
+				held + coming
+			)));
+		}
+	}
+
+	Ok(())
+}
+
+/// What a copy laid in by an instance is called.
+///
+/// `left lamp/bulb`: the instance's name, a separator, and what the thing is
+/// called inside the prefab. Two lamps hold the same names inside and a name
+/// used twice is an error here, so the copies have to be told apart somehow,
+/// and the instance is the only thing that can tell them apart. Godot and
+/// Defold both do exactly this, and with the same separator.
+///
+/// A thing with no name inside the prefab stays nameless, because the empty
+/// name is not a name - nothing refers to it and any number of records may
+/// leave it out. @ref [`once`]. The *instance* always has one: @ref
+/// [`instances`] for why that is the one record a source must name.
+fn within(instance: &str, inside: &str) -> String {
+	if inside.is_empty() {
+		return String::new();
+	}
+
+	format!("{instance}/{inside}")
+}
+
+/// One index into a child's own list, as an index into the joined one.
+fn shifted(index: u32, first: usize) -> Result<u32> {
+	if index == NO_INDEX {
+		return Ok(NO_INDEX);
+	}
+
+	count(usize::try_from(index).unwrap_or(usize::MAX) + first, "a scene's records")
+}
+
+/// Puts what an instance wants different onto the copies it just laid in.
+///
+/// **Addressed by the name the thing has inside the prefab**, because that is
+/// the name somebody reading the prefab sees; what it is called out here is
+/// the instance's business and would change if the instance were renamed.
+///
+/// A name nothing inside answers to is an error rather than a line in a log,
+/// for the reason a parent nothing answers to is: it is a file somebody typed
+/// about a file they have in front of them, and the usual cause is a letter
+/// out of place.
+///
+/// @param data - the scene, with the copies in it
+/// @param laid - the instance and what it wants different
+/// @param first - where this instance's copies start in the entity list
+/// @param by - this file's block, for a mesh or a material an override names
+fn changed(data: &mut SceneData, laid: &Laid<'_>, first: usize, by: &Resolve<'_>) -> Result<()> {
+	let Some(value) = laid.overrides else {
+		return Ok(());
+	};
+
+	let called = data.things[laid.thing].name.clone();
+
+	for (inside, entry) in value.as_object() {
+		let name = within(&called, inside);
+		let at = data
+			.things
+			.iter()
+			.skip(first)
+			.position(|it| it.name == name)
+			.map(|found| found + first)
+			.ok_or_else(|| {
+				err!(Asset(
+					"the instance {called} changes {inside}, and nothing in {} is that",
+					laid.scene
+				))
+			})?;
+
+		// no poses: an override may not name one, so there is nothing for the
+		// reader to look a name up in
+		let mut thing = read_thing(entry, &[], data.things[at].clone(), false)?;
+
+		// the same three the reader resolves for every entity, and they are
+		// resolved here rather than in `resolved` because the copies were
+		// answers already by the time they were laid in: what an override
+		// writes is the only text in them this file ever had.
+		thing.mesh = by.name(&thing.mesh)?;
+		thing.material = by.name(&thing.material)?;
+		thing.emitter_texture = by.name(&thing.emitter_texture)?;
+
+		data.things[at] = thing;
+	}
+
+	Ok(())
+}
+
+/// Gives every record its place in the list as its slot, and one generation.
+///
+/// A source has no slots to write and the reader hands them out by position,
+/// which was one line in each of the readers until a scene could lay another
+/// inside itself - and then the position a record is read at stopped being the
+/// position it ends up at. So it is one pass over the finished lists, after
+/// everything that is going to be in them is.
+fn renumber(data: &mut SceneData) {
+	for (index, thing) in data.things.iter_mut().enumerate() {
+		thing.slot = u32::try_from(index).unwrap_or(0);
+		thing.generation = 1;
+	}
+
+	for (index, solid) in data.solids.iter_mut().enumerate() {
+		solid.slot = u32::try_from(index).unwrap_or(0);
+		solid.generation = 1;
+	}
+
+	for (index, link) in data.links.iter_mut().enumerate() {
+		link.slot = u32::try_from(index).unwrap_or(0);
+		link.generation = 1;
+	}
+
+	for (index, posed) in data.posed.iter_mut().enumerate() {
+		posed.slot = u32::try_from(index).unwrap_or(0);
+		posed.generation = 1;
+	}
+
+	data.thing_generations = vec![1; data.things.len()];
+	data.solid_generations = vec![1; data.solids.len()];
+	data.link_generations = vec![1; data.links.len()];
+	data.pose_generations = vec![1; data.posed.len()];
+}
+
 /// Resolves what every entity hangs off, once every name is known.
 ///
 /// A second pass on purpose: a child may be written above the thing it hangs
 /// off, and a person is not going to sort a file by depth to please a reader.
 /// A loop is caught here too, because one record at a time cannot see one.
 ///
-/// @param things - the entities, read
-/// @param value - the list they were read from
-fn hang(things: &mut [Thing], value: Option<&Value>) -> Result {
-	for (index, entry) in listed(value).iter().enumerate() {
+/// **Both lists at once**, because an instance's entity is an entity like any
+/// other: one may hang off an entity somebody typed and an entity somebody
+/// typed may hang off one, and neither should have to know which list the name
+/// it wrote came out of.
+///
+/// @param things - the entities, read, the instances' own after the rest
+/// @param written - the `entities` list they were read from
+/// @param laid - the `instances` list the rest were read from
+fn hang(things: &mut [Thing], written: Option<&Value>, laid: Option<&Value>) -> Result {
+	let entries: Vec<&Value> = listed(written)
+		.iter()
+		.chain(listed(laid).iter())
+		.collect();
+
+	for (index, entry) in entries.iter().enumerate() {
 		let named = text(entry.get("parent"));
 
 		if named.is_empty() {
@@ -3112,6 +3716,682 @@ mod tests {
 	fn text_that_is_not_json_at_all_is_an_error() {
 		assert!(import("this is not a scene").is_err(), "and it does not panic");
 		assert!(import("").is_err(), "nor does an empty file");
+	}
+
+	// ------------------------------------------------------------------
+	// one scene laid inside another
+	// ------------------------------------------------------------------
+
+	/// A handful of scene sources by name, standing in for a tree.
+	struct Shelf(Vec<(&'static str, &'static str)>);
+
+	impl Sources for Shelf {
+		fn text(&self, name: &str) -> Option<String> {
+			self.0
+				.iter()
+				.find(|(called, _)| *called == name)
+				.map(|(_, text)| (*text).to_owned())
+		}
+	}
+
+	/// A lamp: a post with a bulb hanging off it, and a body under the post.
+	const LAMP: &str = r#"{
+		"entities": [
+			{ "name": "post", "position": [0, 1, 0], "mesh": "meshes/post" },
+			{ "name": "bulb", "parent": "post", "position": [0, 1, 0],
+			  "mesh": "cube", "color": [1, 1, 0.8],
+			  "light": { "kind": "point", "range": 6 } }
+		],
+		"bodies": [ { "name": "foot", "entity": "post", "kind": "static" } ]
+	}"#;
+
+	/// A room with two of them in it.
+	const ROOM: &str = r#"{
+		"entities": [ { "name": "floor", "mesh": "cube", "scale": [10, 0.1, 10] } ],
+		"instances": [
+			{ "name": "left", "scene": "props/lamp", "position": [-3, 0, 0] },
+			{ "name": "right", "scene": "props/lamp", "position": [3, 0, 0] }
+		]
+	}"#;
+
+	/// Reads a source with a shelf of scenes behind it.
+	fn laid(text: &str, shelf: &[(&'static str, &'static str)]) -> Result<SceneData> {
+		import_over(text, &Ids::new(), &Shelf(shelf.to_vec()))
+	}
+
+	/// The same, panicking on a failure.
+	fn laid_out(text: &str, shelf: &[(&'static str, &'static str)]) -> SceneData {
+		laid(text, shelf).unwrap_or_else(|failure| panic!("it is a scene: {failure}"))
+	}
+
+	/// Where an entity called this is, or a panic.
+	fn at(data: &SceneData, name: &str) -> usize {
+		data.things
+			.iter()
+			.position(|it| it.name == name)
+			.unwrap_or_else(|| {
+				panic!(
+					"nothing is called {name}; there is {}",
+					data.things
+						.iter()
+						.map(|it| it.name.clone())
+						.collect::<Vec<_>>()
+						.join(", ")
+				)
+			})
+	}
+
+	#[test]
+	fn a_scene_laid_inside_another_comes_out_as_copies_named_after_the_instance() {
+		let data = laid_out(ROOM, &[("props/lamp", LAMP)]);
+
+		assert_eq!(data.things.len(), 7, "a floor, two instances and two lamps of two");
+		assert_eq!(data.solids.len(), 2, "and a body under each post");
+
+		for called in
+			["floor", "left", "right", "left/post", "left/bulb", "right/post", "right/bulb"]
+		{
+			assert!(data.things.iter().any(|it| it.name == called), "{called} is one of them");
+		}
+
+		assert_eq!(
+			data.solids
+				.iter()
+				.map(|it| it.name.as_str())
+				.collect::<Vec<_>>(),
+			["left/foot", "right/foot"],
+			"a body laid in is named after its instance too"
+		);
+	}
+
+	#[test]
+	fn what_an_instance_laid_in_hangs_off_the_instance_and_keeps_its_place_inside() {
+		let data = laid_out(ROOM, &[("props/lamp", LAMP)]);
+		let left = at(&data, "left");
+		let post = at(&data, "left/post");
+		let bulb = at(&data, "left/bulb");
+
+		assert_eq!(
+			data.things[post].parent,
+			u32::try_from(left).expect("it fits"),
+			"a root of the prefab hangs off the instance"
+		);
+		assert_eq!(
+			data.things[bulb].parent,
+			u32::try_from(post).expect("it fits"),
+			"and what hung off something inside it still does"
+		);
+		assert_eq!(
+			data.things[post].transform.position,
+			Vec3::new(0.0, 1.0, 0.0),
+			"the copy keeps the place the prefab put it, which is now a place inside"
+		);
+		assert_eq!(
+			data.things[left].transform.position,
+			Vec3::new(-3.0, 0.0, 0.0),
+			"and the instance stands where the room put it"
+		);
+	}
+
+	#[test]
+	fn a_body_laid_in_still_drives_the_copy_of_the_entity_it_drove() {
+		let data = laid_out(ROOM, &[("props/lamp", LAMP)]);
+
+		for (body, drives) in [(0, "left/post"), (1, "right/post")] {
+			assert_eq!(
+				data.solids[body].thing,
+				u32::try_from(at(&data, drives)).expect("it fits"),
+				"the body laid in with {drives} drives that copy and not the other one"
+			);
+		}
+	}
+
+	#[test]
+	fn every_record_of_a_spliced_scene_is_numbered_by_where_it_ended_up() {
+		let data = laid_out(ROOM, &[("props/lamp", LAMP)]);
+
+		for (index, thing) in data.things.iter().enumerate() {
+			assert_eq!(
+				thing.slot,
+				u32::try_from(index).expect("it fits"),
+				"{} sits at {index} and says it is at {}",
+				thing.name,
+				thing.slot
+			);
+		}
+
+		assert_eq!(
+			data.thing_generations.len(),
+			data.things.len(),
+			"and there is one generation per slot, counted after the splice"
+		);
+	}
+
+	#[test]
+	fn an_instance_is_a_group_unless_the_source_says_otherwise() {
+		let data = laid_out(ROOM, &[("props/lamp", LAMP)]);
+		let left = &data.things[at(&data, "left")];
+
+		assert_eq!(
+			left.records,
+			vec![Noted {
+				record: EDITING.name.to_owned(),
+				field: "group".to_owned(),
+				value: Spelled::Truth(true),
+			}],
+			"so a click in the editor takes the whole lamp"
+		);
+
+		let loose = laid_out(
+			r#"{ "instances": [ { "name": "left", "scene": "props/lamp", "group": false } ] }"#,
+			&[("props/lamp", LAMP)],
+		);
+
+		assert!(
+			loose.things[at(&loose, "left")]
+				.records
+				.is_empty(),
+			"and a source that says so gets loose entities instead"
+		);
+	}
+
+	#[test]
+	fn an_override_changes_what_it_names_and_leaves_the_rest_of_the_prefab_alone() {
+		let data = laid_out(
+			r#"{
+				"instances": [ { "name": "left", "scene": "props/lamp",
+				                 "overrides": { "bulb": { "color": [1, 0, 0],
+				                                          "light": { "range": 20 } } } } ]
+			}"#,
+			&[("props/lamp", LAMP)],
+		);
+		let bulb = &data.things[at(&data, "left/bulb")];
+		let post = &data.things[at(&data, "left/post")];
+
+		assert_eq!(bulb.color, Vec3::new(1.0, 0.0, 0.0), "the tint is the instance's");
+		assert!(
+			(bulb.light.range - 20.0).abs() < f32::EPSILON,
+			"and so is the range: {}",
+			bulb.light.range
+		);
+		assert_eq!(bulb.light.kind, LightKind::Point, "what it did not mention is the prefab's");
+		assert_eq!(bulb.mesh, "cube", "and so is the mesh");
+		assert_eq!(
+			bulb.transform.position,
+			Vec3::new(0.0, 1.0, 0.0),
+			"and so is where it stands"
+		);
+		assert_eq!(post.mesh, "meshes/post", "and nothing else in the lamp moved at all");
+	}
+
+	#[test]
+	fn two_instances_of_one_prefab_are_changed_apart() {
+		let data = laid_out(
+			r#"{
+				"instances": [
+					{ "name": "left", "scene": "props/lamp",
+					  "overrides": { "bulb": { "color": [1, 0, 0] } } },
+					{ "name": "right", "scene": "props/lamp" }
+				]
+			}"#,
+			&[("props/lamp", LAMP)],
+		);
+
+		assert_eq!(
+			data.things[at(&data, "left/bulb")].color,
+			Vec3::new(1.0, 0.0, 0.0),
+			"the one that was changed is"
+		);
+		assert_eq!(
+			data.things[at(&data, "right/bulb")].color,
+			Vec3::new(1.0, 1.0, 0.8),
+			"and the one that was not is what the prefab says"
+		);
+	}
+
+	#[test]
+	fn an_override_adds_a_record_field_without_taking_away_the_prefab_s() {
+		let prefab = r#"{
+			"entities": [ { "name": "door",
+			                "records": { "drawing": { "covers": true } } } ]
+		}"#;
+		let data = laid_out(
+			r#"{
+				"instances": [ { "name": "front", "scene": "props/door",
+				                 "overrides": { "door": {
+				                    "records": { "editing": { "group": true } } } } } ]
+			}"#,
+			&[("props/door", prefab)],
+		);
+		let held = &data.things[at(&data, "front/door")].records;
+
+		assert_eq!(held.len(), 2, "what the prefab said and what the instance said, both");
+		assert!(
+			held.iter()
+				.any(|it| it.record == "drawing" && it.field == "covers"),
+			"the prefab's is still there"
+		);
+		assert!(
+			held.iter()
+				.any(|it| it.record == "editing" && it.field == "group"),
+			"and the instance's is beside it"
+		);
+	}
+
+	#[test]
+	fn an_override_of_a_field_the_prefab_already_wrote_replaces_that_one_value() {
+		let prefab = r#"{
+			"entities": [ { "name": "door",
+			                "records": { "drawing": { "covers": true } } } ]
+		}"#;
+		let data = laid_out(
+			r#"{
+				"instances": [ { "name": "front", "scene": "props/door",
+				                 "overrides": { "door": {
+				                    "records": { "drawing": { "covers": false } } } } } ]
+			}"#,
+			&[("props/door", prefab)],
+		);
+		let held = &data.things[at(&data, "front/door")].records;
+
+		assert_eq!(held.len(), 1, "one field, said twice, is one field");
+		assert_eq!(held[0].value, Spelled::Truth(false), "and it holds what the instance said");
+	}
+
+	#[test]
+	fn an_override_naming_nothing_inside_the_prefab_is_refused_naming_it() {
+		let failed = laid(
+			r#"{
+				"instances": [ { "name": "left", "scene": "props/lamp",
+				                 "overrides": { "blub": { "color": [1, 0, 0] } } } ]
+			}"#,
+			&[("props/lamp", LAMP)],
+		)
+		.expect_err("a letter out of place is the usual cause");
+
+		let said = failed.to_string();
+
+		assert!(said.contains("blub"), "the message names what was written: {said}");
+		assert!(said.contains("props/lamp"), "and the prefab it was looked for in: {said}");
+	}
+
+	#[test]
+	fn an_override_may_not_rename_what_it_changes_nor_move_it_inside_the_prefab() {
+		for written in [r#""name": "other""#, r#""parent": "post""#] {
+			let failed = laid(
+				&format!(
+					r#"{{ "instances": [ {{ "name": "left", "scene": "props/lamp",
+					     "overrides": {{ "bulb": {{ {written} }} }} }} ] }}"#
+				),
+				&[("props/lamp", LAMP)],
+			)
+			.expect_err("an override says what a thing is like, not what it is");
+
+			assert!(
+				failed.to_string().contains("an override"),
+				"and the message says which kind of record refused it: {failed}"
+			);
+		}
+	}
+
+	#[test]
+	fn an_override_may_not_say_which_pose_moves_what_it_changes() {
+		let hero = r#"{
+			"poses": [ { "name": "walk", "skeleton": "models/hero/rig" } ],
+			"entities": [ { "name": "body", "pose": "walk" } ]
+		}"#;
+		let failed = laid(
+			r#"{
+				"poses": [ { "name": "idle", "skeleton": "models/other/rig" } ],
+				"instances": [ { "name": "one", "scene": "props/hero",
+				                 "overrides": { "body": { "pose": "idle" } } } ]
+			}"#,
+			&[("props/hero", hero)],
+		)
+		.expect_err("a pose belongs to the prefab, and the copies' are named after it");
+
+		// the exact message, because the two ways this can fail say different
+		// things: refused as a key an override may not write, which is the
+		// rule, or "no pose is that", which is the reader looking for `idle`
+		// among copies that are all called `one/something` - an accident that
+		// would go on looking like the rule until somebody wrote an override
+		// naming a pose the instance happens to have
+		assert_eq!(
+			failed.to_string(),
+			"asset: an override has no field called pose",
+			"it is refused as a key rather than by failing to find the pose"
+		);
+	}
+
+	#[test]
+	fn an_instance_that_is_not_called_anything_is_refused_naming_the_scene() {
+		let failed =
+			laid(r#"{ "instances": [ { "scene": "props/lamp" } ] }"#, &[("props/lamp", LAMP)])
+				.expect_err("the name is what tells two copies of one prefab apart");
+
+		assert!(
+			failed.to_string().contains("props/lamp"),
+			"and it says which instance: {failed}"
+		);
+	}
+
+	#[test]
+	fn a_prefab_inside_a_prefab_is_laid_in_through_both() {
+		let desk = r#"{
+			"entities": [ { "name": "top", "mesh": "cube" } ],
+			"instances": [ { "name": "reading", "scene": "props/lamp", "position": [0, 1, 0] } ]
+		}"#;
+		let data =
+			laid_out(r#"{ "instances": [ { "name": "corner", "scene": "props/desk" } ] }"#, &[
+				("props/lamp", LAMP),
+				("props/desk", desk),
+			]);
+
+		assert!(
+			data.things
+				.iter()
+				.any(|it| it.name == "corner/reading/bulb"),
+			"the name says the whole way down: {:?}",
+			data.things
+				.iter()
+				.map(|it| it.name.clone())
+				.collect::<Vec<_>>()
+		);
+
+		let bulb = at(&data, "corner/reading/bulb");
+		let post = at(&data, "corner/reading/post");
+
+		assert_eq!(
+			data.things[bulb].parent,
+			u32::try_from(post).expect("it fits"),
+			"and what hung off what still does, two deep"
+		);
+	}
+
+	#[test]
+	fn a_scene_that_lays_itself_inside_itself_is_refused_naming_the_chain() {
+		let over = r#"{ "instances": [ { "name": "again", "scene": "props/over" } ] }"#;
+		let failed =
+			laid(over, &[("props/over", over)]).expect_err("it would never finish otherwise");
+		let said = failed.to_string();
+
+		assert!(said.contains("props/over -> props/over"), "the chain is in it: {said}");
+		assert!(
+			said.contains("lays itself inside itself"),
+			"and it is refused as a loop rather than as a chain that got too deep, which 			 \
+			 would be the same message for a file that is merely nested: {said}"
+		);
+	}
+
+	#[test]
+	fn a_ring_of_scenes_is_refused_naming_every_link_of_it() {
+		let first = r#"{ "instances": [ { "name": "b", "scene": "props/second" } ] }"#;
+		let second = r#"{ "instances": [ { "name": "c", "scene": "props/third" } ] }"#;
+		let third = r#"{ "instances": [ { "name": "a", "scene": "props/first" } ] }"#;
+		let failed = laid(first, &[
+			("props/first", first),
+			("props/second", second),
+			("props/third", third),
+		])
+		.expect_err("a ring is a loop however many links it has");
+		let said = failed.to_string();
+
+		for link in ["props/first", "props/second", "props/third"] {
+			assert!(said.contains(link), "{link} is named in the message: {said}");
+		}
+
+		assert!(
+			said.contains("lays itself inside itself"),
+			"and a ring is a loop, not a chain that got too deep: {said}"
+		);
+	}
+
+	#[test]
+	fn scenes_laid_deeper_than_the_ceiling_are_refused_rather_than_running_out_of_stack() {
+		// each lays in the next and the last lays in nothing, so there is no
+		// loop at all - only a chain longer than anybody would build
+		let mut shelf: Vec<(&'static str, &'static str)> = Vec::new();
+		let names: Vec<String> = (0..=MOST_NESTING + 2)
+			.map(|step| format!("props/step{step}"))
+			.collect();
+		let texts: Vec<String> = (0..=MOST_NESTING + 2)
+			.map(|step| {
+				if step == MOST_NESTING + 2 {
+					r#"{ "entities": [ { "name": "end" } ] }"#.to_owned()
+				} else {
+					format!(
+						r#"{{ "instances": [ {{ "name": "next", "scene": "props/step{}" }} ] }}"#,
+						step + 1
+					)
+				}
+			})
+			.collect();
+
+		for (name, text) in names.iter().zip(&texts) {
+			shelf.push((name.clone().leak(), text.clone().leak()));
+		}
+
+		let failed = laid(&texts[0], &shelf).expect_err("that is deeper than the ceiling");
+
+		assert!(
+			failed
+				.to_string()
+				.contains(&MOST_NESTING.to_string()),
+			"and the message says what the ceiling is: {failed}"
+		);
+	}
+
+	#[test]
+	fn a_scene_nothing_answers_to_is_refused_naming_it() {
+		let failed = laid(ROOM, &[]).expect_err("there is no lamp on the shelf");
+
+		assert!(
+			failed.to_string().contains("props/lamp"),
+			"the message names what was asked for: {failed}"
+		);
+	}
+
+	#[test]
+	fn a_source_read_alone_refuses_an_instance_rather_than_quietly_dropping_it() {
+		let failed = import(ROOM).expect_err("nothing outside a project can say what a scene is");
+
+		assert!(
+			failed.to_string().contains("props/lamp"),
+			"and it says which one it could not find: {failed}"
+		);
+	}
+
+	#[test]
+	fn a_copy_whose_name_something_in_the_file_already_has_is_refused() {
+		let failed = laid(
+			r#"{
+				"entities": [ { "name": "left/post" } ],
+				"instances": [ { "name": "left", "scene": "props/lamp" } ]
+			}"#,
+			&[("props/lamp", LAMP)],
+		)
+		.expect_err("two things called one thing is what this format refuses everywhere");
+
+		assert!(
+			failed.to_string().contains("left/post"),
+			"and it names the one they share: {failed}"
+		);
+	}
+
+	#[test]
+	fn a_splice_the_world_would_have_no_room_for_is_refused_naming_the_scene() {
+		let many: String = (0..MAX_ENTITIES)
+			.map(|index| format!(r#"{{ "name": "thing {index}" }}"#))
+			.collect::<Vec<_>>()
+			.join(",");
+		let crowd = format!(r#"{{ "entities": [ {many} ] }}"#);
+		let failed = laid(
+			r#"{ "instances": [ { "name": "all", "scene": "props/crowd" } ] }"#,
+			&[("props/crowd", crowd.leak())],
+		)
+		.expect_err("a world holds what it holds");
+		let said = failed.to_string();
+
+		assert!(said.contains("props/crowd"), "the scene is named: {said}");
+		assert!(said.contains(&MAX_ENTITIES.to_string()), "and the ceiling: {said}");
+	}
+
+	#[test]
+	fn an_instance_may_hang_off_an_entity_and_an_entity_may_hang_off_an_instance() {
+		let data = laid_out(
+			r#"{
+				"entities": [ { "name": "table" },
+				              { "name": "book", "parent": "left" } ],
+				"instances": [ { "name": "left", "scene": "props/lamp", "parent": "table" } ]
+			}"#,
+			&[("props/lamp", LAMP)],
+		);
+
+		assert_eq!(
+			data.things[at(&data, "left")].parent,
+			u32::try_from(at(&data, "table")).expect("it fits"),
+			"the instance hangs off an entity written above it"
+		);
+		assert_eq!(
+			data.things[at(&data, "book")].parent,
+			u32::try_from(at(&data, "left")).expect("it fits"),
+			"and an entity written above the instance hangs off it"
+		);
+	}
+
+	#[test]
+	fn a_body_may_drive_an_instance_s_own_entity() {
+		let data = laid_out(
+			r#"{
+				"instances": [ { "name": "left", "scene": "props/lamp" } ],
+				"bodies": [ { "name": "cart", "entity": "left", "kind": "dynamic" } ]
+			}"#,
+			&[("props/lamp", LAMP)],
+		);
+		let cart = data
+			.solids
+			.iter()
+			.find(|it| it.name == "cart")
+			.expect("it is in there");
+
+		assert_eq!(
+			cart.thing,
+			u32::try_from(at(&data, "left")).expect("it fits"),
+			"so the whole lamp can be made to move"
+		);
+	}
+
+	#[test]
+	fn the_settings_of_a_scene_laid_in_are_dropped() {
+		let lit = r#"{
+			"stage": { "gravity": [0, -1, 0], "camera": { "position": [9, 9, 9] } },
+			"entities": [ { "name": "thing" } ]
+		}"#;
+		let data = laid_out(
+			r#"{ "instances": [ { "name": "one", "scene": "props/lit" } ] }"#,
+			&[("props/lit", lit)],
+		);
+
+		assert_eq!(
+			data.stage,
+			Stage::DEFAULT,
+			"laying a prop into a room is not a reason to move somebody's camera"
+		);
+	}
+
+	#[test]
+	fn a_scene_laid_in_carries_its_poses_and_the_copies_still_name_them() {
+		let hero = r#"{
+			"poses": [ { "name": "walk", "skeleton": "models/hero/rig" } ],
+			"entities": [ { "name": "body", "pose": "walk", "mesh": "models/hero/body" },
+			              { "name": "hat", "pose": "walk", "mesh": "models/hero/hat" } ]
+		}"#;
+		let data = laid_out(
+			r#"{
+				"poses": [ { "name": "idle", "skeleton": "models/other/rig" } ],
+				"entities": [ { "name": "other", "pose": "idle" } ],
+				"instances": [ { "name": "one", "scene": "props/hero" } ]
+			}"#,
+			&[("props/hero", hero)],
+		);
+
+		assert_eq!(data.posed.len(), 2, "the room's pose and the prefab's");
+		assert_eq!(
+			data.posed[1].name, "one/walk",
+			"and the prefab's is named after the instance"
+		);
+
+		let body = data.things[at(&data, "one/body")].pose;
+
+		assert_eq!(body, 1, "the copy is moved by the pose that came with it");
+		assert_eq!(
+			data.things[at(&data, "one/hat")].pose,
+			body,
+			"and two pieces of one character are moved by one pose, as they were"
+		);
+		assert_eq!(
+			data.things[at(&data, "other")].pose,
+			0,
+			"and what was already here still names its own"
+		);
+	}
+
+	#[test]
+	fn a_joint_laid_in_still_holds_the_copies_of_the_bodies_it_held() {
+		let rope = r#"{
+			"entities": [ { "name": "hook" }, { "name": "weight" } ],
+			"bodies": [ { "name": "top", "entity": "hook", "kind": "static" },
+			            { "name": "low", "entity": "weight", "kind": "dynamic" } ],
+			"joints": [ { "name": "line", "kind": "rope", "first": "top", "second": "low" } ]
+		}"#;
+		let data = laid_out(
+			r#"{
+				"bodies": [ { "name": "floor", "kind": "static" } ],
+				"instances": [ { "name": "one", "scene": "props/rope" } ]
+			}"#,
+			&[("props/rope", rope)],
+		);
+		let line = data
+			.links
+			.iter()
+			.find(|it| it.name == "one/line")
+			.expect("the joint came with it");
+		let held = |name: &str| {
+			u32::try_from(
+				data.solids
+					.iter()
+					.position(|it| it.name == name)
+					.expect("it is there"),
+			)
+			.expect("it fits")
+		};
+
+		assert_eq!(line.first, held("one/top"), "and it holds the copy rather than the floor");
+		assert_eq!(line.second, held("one/low"), "at both ends");
+	}
+
+	#[test]
+	fn a_scene_with_nothing_laid_in_reads_exactly_as_it_did_before_instances_existed() {
+		let with = laid_out(SOURCE, &[]);
+		let alone = import(SOURCE).expect("it is a scene");
+
+		assert_eq!(with, alone, "a file that lays nothing in is a file the seam never touches");
+	}
+
+	#[test]
+	fn what_a_spliced_scene_is_written_back_as_is_the_copies_it_became() {
+		let data = laid_out(ROOM, &[("props/lamp", LAMP)]);
+		let written = export(&data).expect("every number in it can be written");
+		let again = import(&written).expect("and what comes out is flat, so it reads alone");
+
+		assert_eq!(
+			again, data,
+			"the reference stopped at the compiler, so writing one out writes copies"
+		);
+		assert!(
+			!written.contains("instances"),
+			"and there is no instance left in the text: {written}"
+		);
 	}
 
 	// ------------------------------------------------------------------

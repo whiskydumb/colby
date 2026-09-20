@@ -1767,6 +1767,57 @@ mod tests {
 
 	use super::*;
 
+	/// A scene source with a lamp laid into it, read the way the compiler
+	/// reads one, with the lamp on a shelf instead of on disk.
+	fn yard() -> scene::SceneData {
+		struct Shelf;
+
+		/// The lamp, which is all this shelf holds.
+		const LAMP: &str = r#"{ "entities": [
+		     { "name": "base" },
+		     { "name": "bulb", "parent": "base", "mesh": "sphere" } ] }"#;
+
+		impl colby_asset::level::Sources for Shelf {
+			fn text(&self, name: &str) -> Option<String> {
+				(name == "props/lamp").then(|| LAMP.to_owned())
+			}
+		}
+
+		colby_asset::level::import_over(
+			r#"{
+				"entities": [ { "name": "floor", "mesh": "cube" } ],
+				"instances": [ { "name": "left", "scene": "props/lamp" } ]
+			}"#,
+			&colby_asset::ident::Ids::new(),
+			&Shelf,
+		)
+		.expect("it is a scene")
+	}
+
+	#[test]
+	fn a_click_on_something_laid_in_by_an_instance_takes_the_whole_instance() {
+		let mut world = World::new();
+		let remap = scene::instantiate(&mut world, &yard(), Vec3::ZERO);
+		let bulb = remap.entity_named("left/bulb");
+		let instance = remap.entity_named("left");
+
+		assert!(bulb.is_some() && instance.is_some(), "both landed in the world");
+		assert_eq!(
+			grouped(&world, Pick::Entity(bulb)),
+			Pick::Entity(instance),
+			"a prefab is one thing in the editor, which is the whole of what it is there"
+		);
+		assert!(
+			is_group(&world, instance),
+			"and the mark came out of the source rather than out of a gesture"
+		);
+		assert_eq!(
+			grouped(&world, Pick::Entity(remap.entity_named("floor"))),
+			Pick::Entity(remap.entity_named("floor")),
+			"while what was typed into the yard is still picked on its own"
+		);
+	}
+
 	#[test]
 	fn a_pool_is_one_body_and_one_entity_whose_two_boxes_are_the_same_box() {
 		let mut world = World::new();
